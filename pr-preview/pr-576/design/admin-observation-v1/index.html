@@ -10,7 +10,7 @@
       
       
       
-        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/050-realtime-subscriptions/">
+        <link rel="canonical" href="https://hardbyte.github.io/awa/design/admin-observation-v1/">
       
       
       
@@ -23,7 +23,7 @@
     
     
       
-        <title>ADR-050: Admin views use invalidation and authoritative refetch - AWA</title>
+        <title>Admin observation v1: polling, strict reads and bounded reconciliation - AWA</title>
       
     
     
@@ -68,10 +68,10 @@
   
   
   <meta name="theme-color" content="#17633e">
-  <meta property="og:title" content="ADR-050: Admin views use invalidation and authoritative refetch — AWA">
+  <meta property="og:title" content="Admin observation v1: polling, strict reads and bounded reconciliation — AWA">
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/050-realtime-subscriptions/">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/design/admin-observation-v1/">
   
     <link rel="alternate" type="text/markdown" href="index.md">
   
@@ -96,7 +96,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#adr-050-admin-views-use-invalidation-and-authoritative-refetch" class="md-skip">
+        <a href="#admin-observation-v1-polling-strict-reads-and-bounded-reconciliation" class="md-skip">
           Skip to content
         </a>
       
@@ -143,7 +143,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              ADR-050: Admin views use invalidation and authoritative refetch
+              Admin observation v1: polling, strict reads and bounded reconciliation
             
           </span>
         </div>
@@ -1891,7 +1891,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../" class="md-nav__link">
+      <a href="../../adr/" class="md-nav__link">
         
   
   
@@ -2080,10 +2080,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
+  <a href="#owning-reads-and-startup" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Status
+        Owning reads and startup
       
     </span>
   </a>
@@ -2091,10 +2091,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#problem-and-constraints" class="md-nav__link">
+  <a href="#filter-and-protocol-boundary" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Problem and constraints
+        Filter and protocol boundary
       
     </span>
   </a>
@@ -2102,132 +2102,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#decision-and-scope" class="md-nav__link">
+  <a href="#errors-deadlines-and-shared-read-budgets" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Decision and scope
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Decision and scope">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#why-experiment-with-sse" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Why experiment with SSE
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#alternatives-considered" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Alternatives considered
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Alternatives considered">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#improved-polling-with-the-same-observation-model" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Improved polling with the same observation model
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#fetch-based-sse" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Fetch-based SSE
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#websocket" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        WebSocket
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#pushed-snapshots-or-row-deltas" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Pushed snapshots or row deltas
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#durable-event-log-or-transactional-outbox" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Durable event log or transactional outbox
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#postgresql-listen-notify" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        PostgreSQL LISTEN / NOTIFY
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#logical-decoding-cdc" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Logical decoding / CDC
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#accepted-consequences" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Accepted consequences
+        Errors, deadlines and shared read budgets
       
     </span>
   </a>
@@ -2235,10 +2113,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#revisit-conditions" class="md-nav__link">
+  <a href="#cache-fencing-and-source-observations" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Revisit conditions
+        Cache fencing and source observations
       
     </span>
   </a>
@@ -2246,10 +2124,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#links-and-evidence" class="md-nav__link">
+  <a href="#ui-lifecycle-domain-guards-and-access" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Links and evidence
+        UI lifecycle, domain guards and access
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#incremental-delivery-and-acceptance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Incremental delivery and acceptance
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dependencies-and-source-evidence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dependencies and source evidence
       
     </span>
   </a>
@@ -2284,193 +2184,324 @@
   
 
 
-<h1 id="adr-050-admin-views-use-invalidation-and-authoritative-refetch">ADR-050: Admin views use invalidation and authoritative refetch<a class="headerlink" href="#adr-050-admin-views-use-invalidation-and-authoritative-refetch" title="Permanent link">&para;</a></h1>
-<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>Proposed. The SSE transport experiment is opt-in and disabled by default.
-<a href="https://github.com/hardbyte/awa/pull/576">Draft PR #576</a> contains this decision
-and its supporting design contract; it implements no subscription feature.</p>
-<h2 id="problem-and-constraints">Problem and constraints<a class="headerlink" href="#problem-and-constraints" title="Permanent link">&para;</a></h2>
-<p>The admin UI needs current views of jobs, queues, workers, schedules, the DLQ
-and operator progress. Those views answer operational questions, not just whether
-a job changed status. Today ordinary HTTP reads and TTL caches serve them, with
-polling spread across pages. Adding push without a common refresh policy risks
-multiplying reads while leaving missed notifications and stale cache fills
-unresolved.</p>
-<p>The priority order is job correctness, reliability and recovery first,
-performance second, UX third. Observation must not become a dependency of
-enqueue, claim, finalization or rescue. The initial consumer is the trusted admin
-UI; a future application API must not acquire stronger delivery or authorization
-promises by accident. The 0.6-to-0.7 transition permits interface simplification,
-while the rolling-upgrade and database safety contracts still apply.</p>
-<h2 id="decision-and-scope">Decision and scope<a class="headerlink" href="#decision-and-scope" title="Permanent link">&para;</a></h2>
-<p><strong>Admin views use disposable invalidation hints, authoritative API reads and
-independent bounded reconciliation.</strong> This observation model is the enduring
-choice. Fetch-based SSE is the proposed experimental transport for v1, not the
-source of correctness and not a commitment to permanent transport infrastructure.</p>
-<p>A hint means that a resource may have changed. The owning read API decides its
-current contents, eligibility and accuracy. Filtered job views reuse
-<a href="../049-job-filter-and-indexed-tags/">ADR-049's JobFilter</a>, including its bounds,
-strict parsing and separation of population from paging. Unsupported filters
-fail closed, including when successive requests reach servers of different
-versions. Routing hints does not create a second filter evaluator.</p>
-<p>The model has these invariants:</p>
+<h1 id="admin-observation-v1-polling-strict-reads-and-bounded-reconciliation">Admin observation v1: polling, strict reads and bounded reconciliation<a class="headerlink" href="#admin-observation-v1-polling-strict-reads-and-bounded-reconciliation" title="Permanent link">&para;</a></h1>
+<p>Status: proposed supporting contract for
+<a href="../../adr/050-admin-view-observation/">ADR-050</a>. V1 uses polling. It includes no
+SSE/WebSocket endpoint, browser subscription service, worker hooks, database
+notification listener, outbox or CDC integration. Future transport alternatives
+and their evidence gate belong in the ADR, not this delivery sequence.</p>
+<h2 id="owning-reads-and-startup">Owning reads and startup<a class="headerlink" href="#owning-reads-and-startup" title="Permanent link">&para;</a></h2>
+<p>The owning APIs remain authoritative for jobs, queues, workers, DLQ, schedules,
+operator progress, storage and existing statistics. Reuse their current meanings,
+accuracy and retention. Do not invent metrics or historical notices. Catalog/kinds
+keep their existing read behavior; <code>/storage?history=true</code> does not supply
+server-retained history. Application consumers and tenant authorization are
+outside v1.</p>
+<p>For each visible tab, the automatic-read startup sequence below excludes
+paused views and manually refreshed counts. Their explicit reads still share
+the budgets but do not acquire an automatic watchdog.</p>
+<ol>
+<li>Establish the backend identity and supported read protocols. Capabilities are
+   advisory; verify the actual response to every request.</li>
+<li>Register active exact query keys with the one tab-level scheduler, mark each
+   initially dirty and arm its independent reconciliation timer <strong>before</strong>
+   dispatching the first bounded read. A key includes backend, read scope, full
+   normalized filter and page. There is no stream registration, <code>ready</code> event or
+   snapshot cursor to wait for.</li>
+<li>Read through the shared client concurrency/cooldown policy. Capture the key's
+   dirty generation at request start. A response clears only that captured
+   demand; a mutation/focus mark arriving during the read leaves one pending
+   refresh. Successful data may render while still marked dirty/stale.</li>
+<li>Fence old filter/backend identities and late responses. A filter or active-view
+   change cancels/retires its old key before registering the replacement. Retain
+   already displayed data as stale where appropriate rather than claiming a new
+   successful observation.</li>
+</ol>
+<p>No active keys means no resource reads or resource timers. Enforce the active-key
+cap before registration; reject excess demand visibly rather than silently
+truncating or creating another scheduler. One pending marker per key prevents
+interleaved demand for different resources from overwriting each other.</p>
+<p>Polling and reconciliation use one request-dispatch path. The periodic refresh
+cadence may renew normal views sooner than the independent watchdog; neither a
+local dirty hint nor a failed request postpones the watchdog. Successful reads
+renew the observation. The watchdog marks demand through the same scheduler,
+never launches a second request loop. Overload/cooldown/backoff still apply, so
+these are scheduling bounds rather than a promised maximum data age.</p>
+<h2 id="filter-and-protocol-boundary">Filter and protocol boundary<a class="headerlink" href="#filter-and-protocol-boundary" title="Permanent link">&para;</a></h2>
+<p>Use the actual ADR-049 <code>JobFilter</code> compiler, deserializer <strong>and <code>validate()</code></strong>.
+Fields intersect, states are any-of, tags are all-of, and creation bounds refer
+to original insertion. Page/window semantics remain separate from the population.
+Refetching a page removes jobs that left and fills vacancies from current matches;
+there is no stable multi-page snapshot or guarantee of every transition.</p>
+<p>Add thin strict JSON read adapters:</p>
 <ul>
-<li><strong>Recovery does not depend on hints.</strong> Establish observation before acknowledging
-  readiness, then refetch. Reconnect and scope changes resynchronize. Independent
-  reconciliation repairs a missed final hint even while the transport looks
-  healthy. A hint received during a read remains pending rather than being
-  cleared by that response. Both entering and leaving a filtered population must
-  invalidate the view.</li>
-<li><strong>Demand is bounded and shared.</strong> Hints, polling, reconciliation, resume and
-  retries feed one paced refresh policy. Repeated demand coalesces without one
-  resource overwriting another. Read work, waiting work, fanout and slow clients
-  have finite budgets. Overload reduces freshness rather than creating more
-  polling or delaying job execution through an unbounded read backlog.</li>
-<li><strong>Invalidation cannot be undone by a late cache fill.</strong> Once local state is
-  invalidated, an older in-flight fill cannot reappear as current. Observation
-  timestamps retain the source sample's age. Transport activity is distinct from
-  source freshness; it cannot prove a worker alive or a replica caught up.</li>
-<li><strong>Observation stays off the job write path.</strong> V1 adds no worker hooks, database
-  triggers, mandatory listener, event log or subscription writes to job
-  transitions. Each admin process can refresh independently; peer-process and
-  worker changes converge through reads without a shared broker or leader.</li>
-<li><strong>Domain guards and access boundaries remain authoritative.</strong> Hints and
-  optimistic UI cannot enforce ownership, exclusivity or idempotency. Mutations
-  retain atomic server guards, and refresh preserves selections and operator
-  drafts. Read-only access remains sensitive admin access. Scopes cannot silently
-  widen, and a connection does not extend authorization indefinitely.</li>
+<li><code>POST /api/v1/jobs/query</code></li>
+<li><code>POST /api/v1/dlq/query</code></li>
+<li><code>POST /api/v1/jobs/count</code></li>
 </ul>
-<p>Authoritative reads retain their existing limitations. Composite loading can
-miss an in-flight claim or deferred-to-ready handoff; neither a stream nor
-Repeatable Read makes ring pruning an atomic snapshot. Convergence means retained
-state returned by ordinary APIs after changes settle and reads succeed, not
-observation of every job or transition. A completion pruned between reads may
-never be observed. Durable business reactions remain queue jobs through
-<a href="../029-transactional-followup-jobs/">ADR-029</a> and
-<a href="../046-handler-staged-follow-ups/">ADR-046</a> where applicable; existing best-effort
-rescue follow-ups are not strengthened.</p>
-<p>V1 remains within the existing trusted-admin boundary and existing read models.
-It adds no tenant authorization framework, presence ownership, new queue metrics
-or retained notification history. Protocol shapes, finite experimental limits,
-cache mechanisms, lifecycle handling and acceptance tests live in
-<a href="../../design/realtime-subscriptions-v1/">the supporting v1 contract</a>.</p>
-<h3 id="why-experiment-with-sse">Why experiment with SSE<a class="headerlink" href="#why-experiment-with-sse" title="Permanent link">&para;</a></h3>
-<p>A one-way HTTP stream fits invalidation from an admin process to its connected
-views. Its immediate incremental opportunity is fanout after a committed local
-admin mutation, so other views connected to the same process can refetch sooner
-than their next poll. This does not accelerate worker-originated or peer-process
-changes beyond the sampling cadence, and timer-driven SSE does not inherently
-reduce database reads.</p>
-<p>Streaming therefore stays disabled by default. The experiment must compare it
-with improved polling, measuring local-mutation freshness alongside total read,
-connection and operational costs. PostgreSQL load tests must show job execution
-and recovery remain protected; actual ingress/pooler tests must establish that
-authentication, buffering and connection lifecycle behave as intended. A useful
-observation model does not by itself justify enabling a transport.</p>
-<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
-<h3 id="improved-polling-with-the-same-observation-model">Improved polling with the same observation model<a class="headerlink" href="#improved-polling-with-the-same-observation-model" title="Permanent link">&para;</a></h3>
-<p>This is the strongest baseline and the default path while streaming is disabled.
-One scheduler,
-coalesced reads, bounded caches, clear stale state and reconciliation solve much
-of the problem without long-lived HTTP connections. It handles worker and
-peer-process changes at the same sampling cadence as timer-driven SSE.</p>
-<p>Polling lacks immediate server fanout of a local mutation to other connected
-views. SSE is worth retaining only if that incremental freshness, or another
-measured benefit, justifies its costs. If it does not, keep improved polling;
-none of the enduring invariants requires streaming.</p>
-<h3 id="fetch-based-sse">Fetch-based SSE<a class="headerlink" href="#fetch-based-sse" title="Permanent link">&para;</a></h3>
-<p>Selected for the opt-in v1 experiment because one-way hints fit the existing
-HTTP admin surface and ordinary requests still perform reads and mutations.
-It adds reconnect, parsing, proxy, authorization-lifetime and browser lifecycle
-work; using fetch does not provide EventSource's automatic recovery behavior.
-The supporting contract bounds that work and defines safe fallback, but those
-requirements are costs to validate, not evidence of an advantage already earned.</p>
-<h3 id="websocket">WebSocket<a class="headerlink" href="#websocket" title="Permanent link">&para;</a></h3>
-<p>WebSocket can change subscriptions bidirectionally without replacing a stream
-and would suit an actual interactive command protocol. V1 needs one-way hints,
-so that bidirectionality is unused and SSE fits the current HTTP request model.
-Both transports still need bounded state, parsing, reconnect, authorization and
-lifecycle handling. Choose between them on demonstrated requirements and deployed
-behavior, not on a claim that fetch-SSE avoids that complexity.</p>
-<h3 id="pushed-snapshots-or-row-deltas">Pushed snapshots or row deltas<a class="headerlink" href="#pushed-snapshots-or-row-deltas" title="Permanent link">&para;</a></h3>
-<p>Shared aggregate snapshots might save refetch round trips. Filtered snapshots
-and row deltas require server-side query or membership state, including page
-refill, population entry/exit and deletion semantics. Refetch keeps the existing
-read API authoritative and avoids maintaining that second view model. Consider
-pushed aggregates if measurements identify a material benefit without weakening
-recovery.</p>
-<h3 id="durable-event-log-or-transactional-outbox">Durable event log or transactional outbox<a class="headerlink" href="#durable-event-log-or-transactional-outbox" title="Permanent link">&para;</a></h3>
-<p>A log can retain transitions and support replay; a transactional outbox can couple
-publication to a committed state change. Those are appropriate capabilities when
-every transition is required. They also need complete writer coverage, commit-safe
-ordering, snapshot/replay boundaries, idempotence, retention and gap recovery. A
-sequence allocated before commit is not itself a safe replay watermark.</p>
-<p>Current admin views need retained state, while durable reactions already use
-jobs. Paying WAL, publication and retention costs on job writes to obtain UI
-freshness would introduce an unnecessary dependency. No log, outbox or
-transactional directory is selected here.</p>
-<h3 id="postgresql-listen-notify">PostgreSQL LISTEN / NOTIFY<a class="headerlink" href="#postgresql-listen-notify" title="Permanent link">&para;</a></h3>
-<p>Existing wakeups can be useful disposable hints but do not cover all admin
-resources or provide replay. New transactional emissions would add job-path cost;
-a full notification queue can make notifying transactions fail at commit.
-A mandatory listener would add session and deployment requirements without
-removing the need for reconciliation. A later optional hint optimization must
-preserve the observation model and earn its write/connection cost separately.</p>
-<h3 id="logical-decoding-cdc">Logical decoding / CDC<a class="headerlink" href="#logical-decoding-cdc" title="Permanent link">&para;</a></h3>
-<p>CDC can provide a change stream with a snapshot boundary, but requires slot,
-privilege, failover and retention operations. Mapping Awa's leases, cursors,
-compact completions and partition pruning into public changes would also require
-a semantic adapter. It remains useful for external history and analytics, not a
-required dependency of current admin views.</p>
-<h2 id="accepted-consequences">Accepted consequences<a class="headerlink" href="#accepted-consequences" title="Permanent link">&para;</a></h2>
-<p>Consumers can converge after lost hints, reconnects and process changes
-without introducing a second event-processing engine. Job execution and durable
-reactions remain independent of browser availability.</p>
-<p>The tradeoff is sampled freshness, potentially redundant reads and no guarantee
-of observing transient or already-pruned state. Coarse invalidation deliberately
-trades routing precision for simpler entry/exit correctness. Multiple admin
-processes have independent caches and read costs; their combined load still
-needs a budget. A successful stream does not imply a healthy queue or current
-source data.</p>
-<p>The transport adds operational and client lifecycle costs while it remains an
-experiment. Production SLOs and default enablement need evidence; documentation
-checks establish neither implementation correctness nor capacity.</p>
-<h2 id="revisit-conditions">Revisit conditions<a class="headerlink" href="#revisit-conditions" title="Permanent link">&para;</a></h2>
-<p>Revisit the rationale when:</p>
+<p>These paths are an additive, explicitly versioned <strong>read contract</strong>, alongside
+Awa's existing unversioned <code>/api/*</code> endpoints. They do not rename or version all
+existing APIs. In particular, retain <code>/api/dlq/retry-matching</code>,
+<code>/api/dlq/purge-matching</code> and legacy mutation routes; cosmetic consistency does
+not justify another mutation protocol change.</p>
+<p>A version in the URI or JSON is not proof of strict behavior. Enforce exact
+version agreement and reject unknown envelope/filter/page fields, using strict
+page wrappers where needed. Reuse existing response conversion and model logic;
+do not create a UI-side compiler. Query request:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span><span class="nt">"version"</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">"filter"</span><span class="p">:{},</span><span class="nt">"page"</span><span class="p">:{}}</span>
+</span></code></pre></div>
+<p>Count requests omit <code>page</code>. Apply shared filter bounds and a 64 KiB request-body
+limit while receiving/parsing, before allocation can grow without bound. Existing
+<code>JobFilter</code> and payload ID representations remain unchanged; the current browser
+rejects IDs outside JavaScript's safe-integer range rather than rounding them.
+Do not claim a new arbitrary-precision or decimal-string ID protocol here.</p>
+<p>Response envelope:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span><span class="nt">"data"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;existing response payload&gt;"</span><span class="p">,</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="nt">"observation"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="nt">"observed_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;source-fetch start time&gt;"</span><span class="p">,</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="nt">"served_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;response time&gt;"</span><span class="p">,</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span><span class="nt">"cache_age_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The example strings stand for real payloads/timestamps. Add optional structured
+<code>job_filter_protocols</code> capability metadata; absent support is unsupported, never
+inferred from semver. Do not advertise a <code>subscriptions</code> transport capability.
+Capabilities can come from a different server version than the next read, so
+check status, JSON MIME, complete envelope and exact response version every time.
+Unknown <code>/api/*</code> paths on the new router return API errors, not SPA HTML.</p>
+<p>An older server may return 200 HTML or 404/405 for the route. That is unsupported,
+not an empty result. Permit unfiltered legacy lists/details through the same
+scheduler; nonempty filters remain unsupported. Never retry by dropping
+predicates, switching a filtered request to a permissive GET, or displaying an
+unsupported count as zero. New-server budgets cover permitted legacy fallbacks
+too; they do not establish new server-side guarantees on old binaries.</p>
+<p>Fixing unknown/empty GET parsing on a current server is a separate improvement
+from this strict mixed-version read boundary. Neither strict JSON parsing in one
+path nor a <code>/v1</code> name makes an older GET implementation strict.</p>
+<h2 id="errors-deadlines-and-shared-read-budgets">Errors, deadlines and shared read budgets<a class="headerlink" href="#errors-deadlines-and-shared-read-budgets" title="Permanent link">&para;</a></h2>
+<p>Use structured JSON API errors: invalid versions/fields/values return 400,
+body-size excess 413, authorization/origin failure 401/403, admission excess
+429 with <code>Retry-After</code>, and temporary overload 503. Unsupported routes, wrong
+MIME and malformed envelopes are protocol errors, even with HTTP 200.</p>
+<p>Network/read failures retain stale data and one pending demand, with exponential
+backoff/jitter capped at 60 seconds. Honor 429/503 <code>Retry-After</code> across reads to
+the affected backend; do not turn overload into an immediate extra poll. Stop
+401/403 retries until credentials/user action change. Invalid filters/protocols
+show an error instead of an automatic retry loop. Reprobe absent read capability
+no more often than every 60 seconds unless explicitly requested.</p>
+<p>The following are finite experimental read/scheduler defaults, not production
+capacity commitments or freshness SLOs. Configure them with sanity checks; zero
+or unlimited settings must not defeat the bounds.</p>
+<table>
+<thead>
+<tr>
+<th>Bound</th>
+<th>Initial setting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active managed query keys</td>
+<td>16 per tab; no silent eviction.</td>
+</tr>
+<tr>
+<td>Client read concurrency</td>
+<td>2 per tab; one in flight and one pending marker per exact key.</td>
+</tr>
+<tr>
+<td>Debounced dirty demand</td>
+<td>100 ms target, 500 ms maximum before becoming eligible; cooldown/backoff still applies.</td>
+</tr>
+<tr>
+<td>Cached refresh floor</td>
+<td>At least advertised cache TTL/poll interval, currently at least 5 seconds.</td>
+</tr>
+<tr>
+<td>Uncached detail/page floor</td>
+<td>At least 2 seconds between reads.</td>
+</tr>
+<tr>
+<td>Independent reconciliation</td>
+<td>Nominal 30-second watchdog per active key, finite bounded jitter; expose the configured maximum.</td>
+</tr>
+<tr>
+<td>Server expensive reads</td>
+<td>4 simultaneous operations per process.</td>
+</tr>
+<tr>
+<td>Read admission</td>
+<td>At most 16 waiters; at most 250 ms waiting; excess receives 429.</td>
+</tr>
+<tr>
+<td>Whole-read deadline</td>
+<td>15 seconds including admission, pool acquisition, all queries/passes and serialization.</td>
+</tr>
+<tr>
+<td>SQL statement limit</td>
+<td>At most 5 seconds, also bounded by remaining whole-read deadline.</td>
+</tr>
+<tr>
+<td>SQL lock wait</td>
+<td>At most 1 second, also bounded by remaining deadline.</td>
+</tr>
+<tr>
+<td>Repeated failure</td>
+<td>Exponential backoff to 60 seconds; one pending demand retained.</td>
+</tr>
+</tbody>
+</table>
+<p>One frontend scheduler handles periodic reads, reconciliation, focus/resume,
+mutation refreshes, retry and manual refresh. Managed React Query queries disable
+independent automatic intervals, focus fetches and reconnect fetches. Migrate
+existing two-second job-detail/operation intervals into this scheduler explicitly.
+Repeated demand coalesces; continuous changes must neither starve results nor
+create an unbounded queue. The client deadline runs independently of pending
+network/body reads so a silent hung request is still aborted.</p>
+<p>A Rust future timeout does not prove SQL cancellation. Apply server-side limits
+to all candidate queries, loader transactions, repeated passes, aggregates and
+DLQ reads, bounded by the remaining whole-read budget. Cancellation must roll
+back or close outstanding work before pool reuse. Do not leak read timeout
+settings into mutation sessions. Cache hits may bypass expensive-read admission;
+each fill acquires it once. Bound obsolete fills, filter cache cardinality and
+pool/connection use. Do not create a database task per registered tab query.</p>
+<h2 id="cache-fencing-and-source-observations">Cache fencing and source observations<a class="headerlink" href="#cache-fencing-and-source-observations" title="Permanent link">&para;</a></h2>
+<p>Use one local post-commit invalidation helper across admin mutation families,
+including DLQ retry/purge/move and batch cancellation. After the authoritative
+mutation commits, advance the cache generation, retire its old cache entries,
+and mark affected server read state stale. Rolled-back mutations invalidate
+nothing. The initiating browser marks its own affected keys dirty after a
+successful action; other browsers/processes receive no v1 push and refresh on
+schedule. Broader local invalidation is acceptable until measured routing is
+worthwhile.</p>
+<p>A fill captures a bounded monotonic generation before starting. It may
+publish/return as current only if the generation still matches at completion.
+Requests after invalidation cannot join an obsolete fill. Use generation-keyed
+caches with bounded obsolete work or an explicit synchronized check, without
+holding a cache lock across a query. Discard/retry obsolete completions only
+within remaining read budget; never loop indefinitely or relabel old data fresh.
+Moka <code>invalidate_all()</code> alone is not proof of this invariant.</p>
+<p>Client dirty generations and server cache generations solve different races;
+both are required. <code>observed_at</code> is source-fetch start (a conservative start for
+composite reads), <code>served_at</code> is response time and <code>cache_age_ms</code> is cached
+observation age. Preserve source time on cache hits. Existing reads can carry
+common metadata/headers without changing payload meaning; strict adapters use
+the envelope above. A response served now is not necessarily a new observation.</p>
+<p>Each admin process owns its caches. Worker and peer mutations are covered by TTL
+and periodic authoritative reads; a local generation does not create a global
+snapshot. Heartbeat evidence determines worker liveness, never browser activity.
+Replica freshness/lag is unknown unless actually measured.</p>
+<h2 id="ui-lifecycle-domain-guards-and-access">UI lifecycle, domain guards and access<a class="headerlink" href="#ui-lifecycle-domain-guards-and-access" title="Permanent link">&para;</a></h2>
+<p>Hidden tabs pause managed reads and timers. <code>pagehide</code>, including BFCache entry,
+cancels them; persisted <code>pageshow</code> retires old request identities and starts
+exactly one scheduler with one paced refresh if visible and nonempty. Cancelled
+reads do not clear pending demand. Filter/view churn releases registrations and
+obsolete work without losing unrelated keys' demand.</p>
+<p>Preserve selected IDs and unsaved operator form/dialog values during refresh.
+Jobs with an active selection remain paused and stale until explicitly resumed;
+manual refresh re-enters the same scheduler. Filtered job-match counts are
+excluded from periodic/watchdog/focus refresh and prefix invalidation: mark them
+stale and fetch only on filter change, explicit refresh or the specified debounced
+operator action. Counts remain capped under ADR-049. Selection/draft state never
+replaces server-side eligibility, version/lease/fencing and idempotency guards.
+Viewing/presence does not confer ownership; no viewer membership protocol is added.</p>
+<p>This is the existing trusted-admin surface, protected by ingress/private network
+controls. <code>--read-only</code> disables mutations, not sensitive reads. Authenticate and
+authorize each read under that boundary; do not create longer-lived access via
+client cache state. There is no new tenant authorization model.</p>
+<p>The inspected router currently applies permissive CORS and a SPA fallback. Those
+are current observations, not verification of configured origins in a deployment.
+New strict JSON POST adapters must explicitly reject a present Origin unless it
+matches a configured public admin origin; do not derive trust from arbitrary
+forwarded-host headers. Isolate their route policy so outer permissive CORS
+cannot undo it. No wildcard credentialed CORS. Browser fetch uses
+<code>credentials: "same-origin"</code> and <code>cache: "no-store"</code>; reject cross-origin redirects
+and login HTML as protocol data. Origin-less non-browser requests still require
+ingress/private-network trust. Any later credentialed streaming proposal must
+resolve/tighten this boundary before exposure, not inherit permissive CORS.</p>
+<p>Never put credentials, args, outputs or secrets in URLs or observation logs.
+Strict reads carry filters in bodies. Existing shareable search URLs may contain
+documented nonsecret opaque values; no raw filter descriptors belong in automatic
+logs. An origin check does not authorize a filter or make public unauthenticated
+admin access safe.</p>
+<h2 id="incremental-delivery-and-acceptance">Incremental delivery and acceptance<a class="headerlink" href="#incremental-delivery-and-acceptance" title="Permanent link">&para;</a></h2>
+<p>Each increment is independently useful with polling:</p>
+<ol>
+<li>Harden owning reads: strict adapters/capability and response checks, API error
+   fallback, bounded admission, whole-read deadlines and cancellation coverage.
+   Reuse #572's compiler; GET parsing/deadline repairs are shared follow-up work,
+   not a transport dependency. Test empty install/read-only operation without a
+   worker. Do not rename mutation endpoints for URI consistency.</li>
+<li>Consolidate the tab scheduler and lifecycle. Register dirty demand before
+   initial reads, disable competing automatic fetch loops, enforce per-key
+   generations/concurrency/cooldowns/backoff and preserve paused selections/counts.</li>
+<li>Add generation-fenced caches, conservative source metadata and complete local
+   post-commit invalidation. Deterministic barriers must reproduce an old fill
+   completing after invalidation and prove it cannot become current.</li>
+<li>Complete independent reconciliation and failure recovery through that same
+   scheduler. Prove convergence after lost local marks and peer/worker changes,
+   request failure, scope changes, hidden/resume and BFCache restoration. No
+   listener or transport handshake is a prerequisite for any read.</li>
+<li>Measure the improved-polling baseline on PostgreSQL 17 and 18, with zero,
+   ordinary and maximum admitted views and multiple admin processes. Check job
+   enqueue/claim/finalization p95/p99, rescue progress, WAL, query QPS, pool counts,
+   cache fills and browser read/render freshness under supported ingress/poolers.</li>
+</ol>
+<p>Deterministic acceptance covers: initial/empty/over-cap registration; a dirty
+mark during the first or later read; interleaved resource demand; old responses
+following filter/backend changes; cache races; SQL timeout rollback and pool
+recovery; slow/hung/aborted reads; continuous demand; errors/backoff/Retry-After;
+old-server HTML/404/405 and capability/read requests routed to different versions;
+401/403; counts, paused selections and drafts; local rollback; peer mutations;
+heartbeat expiry without writes; page refill and retained-not-found presentation.
+Tests must not demand every transient transition or a stronger snapshot than
+the owning API provides.</p>
+<p>Keep correctness/read-budget work separate from claims of production freshness.
+Distinguish source/pipeline lag where measured, transport/network activity, API
+latency and browser render age. Missing lag remains unknown, consumer-stage
+metrics cannot establish universal subsecond freshness, and the last histogram
+bucket does not identify an exact delay. No numeric release/SLO commitment is
+introduced. A later transport requires the ADR's separate evidence/owner decision.</p>
+<h2 id="dependencies-and-source-evidence">Dependencies and source evidence<a class="headerlink" href="#dependencies-and-source-evidence" title="Permanent link">&para;</a></h2>
+<p>Source inspection on 2026-10-31 used #572 head
+<code>c09b23ebed0d65614025271611c720ea584a55c9</code>, which includes change
+<code>ac1e39440d89e6c0c5a5bb86a7d3af5d8db47d86</code>. These observations
+are evidence of current gaps/fixes, not a claim that this proposed contract ships.</p>
 <ul>
-<li>A consumer requires replay, audit history or guaranteed completion observation;
-  current-state refetch cannot provide those guarantees.</li>
-<li>Required worker or peer-process update latency cannot be met by sampled reads;
-  investigate a safe source of hints rather than treating SSE alone as a fix.</li>
-<li>Measured read/connection cost or ingress behavior makes streaming less useful
-  than improved polling, or makes shared pushed aggregates worthwhile.</li>
-<li>Application consumers require scoped authorization beyond trusted admin access,
-  or real bidirectional interaction changes the transport requirements.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-model/src/job_query.rs">Candidate listing</a>
+  loops up to 32 passes with a 30-second statement timeout per candidate query.
+  <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-model/src/queue_storage.rs">The loader</a>
+  starts a separate transaction using planning settings without installing that
+  timeout. This does not establish a whole-read deadline. Fixes belong in the
+  shared read layer/#572 follow-ups; verify the actual implementation base.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/filter_params.rs">GET parsing</a>
+  deliberately ignores unknown and empty values, including a test of that
+  behavior. <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/docs/finding-jobs.md">Finding-jobs documentation</a>
+  gives a general unknown-field rejection promise; it must not be interpreted as
+  current GET strictness. Parser/documentation repair and strict mixed-version
+  adapters are distinct work, both useful without this ADR or any streaming.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/dlq.rs">DLQ handlers</a>,
+  <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/lib.rs">router</a>
+  and <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/tests/admin_api_test.rs">API test</a>
+  use separate retry/purge-matching paths for the full filter, legacy bodies on
+  legacy paths and refusal of <code>all</code> with a nonempty filter. The obsolete richer-
+  body-on-legacy-route downgrade concern is not retained as an unresolved v1 gate.
+  The PR reports a real 0.6.9 rejection check; source inspection here is not a
+  fresh execution of that rehearsal.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/frontend/src/components/SearchBar.tsx">Search validation</a>
+  accepts positive whole IDs only when <code>Number.isSafeInteger</code> succeeds;
+  <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/frontend/src/routes/batch-ops.tsx">the batch form</a>
+  uses that validator. This rejects unsupported IDs; it is not full-precision
+  browser ID support.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/lib.rs">Router</a>
+  currently applies <code>CorsLayer::permissive()</code> and the SPA fallback. Access-policy
+  claims above are implementation requirements, not assertions about a deployed
+  origin configuration.</li>
 </ul>
-<p>Revising a transport or sampling policy must preserve the enduring invariants
-unless a later decision explicitly replaces them.</p>
-<h2 id="links-and-evidence">Links and evidence<a class="headerlink" href="#links-and-evidence" title="Permanent link">&para;</a></h2>
-<ul>
-<li><a href="../../design/realtime-subscriptions-v1/">V1 implementation contract</a>: protocol,
-  budgets, cache fencing, browser lifecycle, security policy and validation gates.</li>
-<li><a href="../049-job-filter-and-indexed-tags/">ADR-049</a> and
-  <a href="https://github.com/hardbyte/awa/pull/572">implementation PR #572</a>: shared job
-  selection and advisory read behavior. The proposed adapter reuses that compiler.</li>
-<li><a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/cache.rs">Existing dashboard cache</a>,
-  <a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/state.rs">admin state</a>
-  and <a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/frontend/src/hooks/use-poll-interval.ts">frontend polling</a>:
-  the current read/cache baseline, not a measured comparison with SSE.</li>
-<li><a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-worker/src/notify_hub.rs">Existing notification hub</a>:
-  hints with polling recovery, not complete admin change coverage.</li>
-<li><a href="https://www.postgresql.org/docs/17/sql-notify.html">PostgreSQL NOTIFY</a>,
-  <a href="https://www.postgresql.org/docs/17/sql-listen.html">LISTEN startup</a>,
-  <a href="https://www.postgresql.org/docs/17/logicaldecoding-explanation.html">logical decoding</a>
-  and <a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">SSE framing</a>:
-  substrate behavior, not proof of end-to-end freshness or delivery.</li>
-<li><a href="../041-rolling-upgrade-policy/">ADR-041</a> and
-  <a href="../045-hot-path-trigger-lock-contract/">ADR-045</a>: existing rolling-upgrade and
-  hot-path constraints remain in force.</li>
-</ul>
+<p>Other storage/uniqueness release concerns were not revalidated here; this
+contract neither clears nor replaces their existing release gates.</p>
 
 
 

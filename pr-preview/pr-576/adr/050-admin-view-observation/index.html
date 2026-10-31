@@ -10,7 +10,7 @@
       
       
       
-        <link rel="canonical" href="https://hardbyte.github.io/awa/design/realtime-subscriptions-v1/">
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/050-admin-view-observation/">
       
       
       
@@ -23,7 +23,7 @@
     
     
       
-        <title>Real-time subscriptions v1: implementation contract - AWA</title>
+        <title>ADR-050: Admin views use invalidation and authoritative refetch - AWA</title>
       
     
     
@@ -68,10 +68,10 @@
   
   
   <meta name="theme-color" content="#17633e">
-  <meta property="og:title" content="Real-time subscriptions v1: implementation contract — AWA">
+  <meta property="og:title" content="ADR-050: Admin views use invalidation and authoritative refetch — AWA">
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://hardbyte.github.io/awa/design/realtime-subscriptions-v1/">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/050-admin-view-observation/">
   
     <link rel="alternate" type="text/markdown" href="index.md">
   
@@ -96,7 +96,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#real-time-subscriptions-v1-implementation-contract" class="md-skip">
+        <a href="#adr-050-admin-views-use-invalidation-and-authoritative-refetch" class="md-skip">
           Skip to content
         </a>
       
@@ -143,7 +143,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Real-time subscriptions v1: implementation contract
+              ADR-050: Admin views use invalidation and authoritative refetch
             
           </span>
         </div>
@@ -1891,7 +1891,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../adr/" class="md-nav__link">
+      <a href="../" class="md-nav__link">
         
   
   
@@ -2080,10 +2080,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#streaming-request-and-validation" class="md-nav__link">
+  <a href="#status" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Streaming request and validation
+        Status
       
     </span>
   </a>
@@ -2091,10 +2091,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#initial-resources" class="md-nav__link">
+  <a href="#problem-and-constraints" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Initial resources
+        Problem and constraints
       
     </span>
   </a>
@@ -2102,10 +2102,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#events-and-stream-parsing" class="md-nav__link">
+  <a href="#decision-and-scope" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Events and stream parsing
+        Decision and scope
       
     </span>
   </a>
@@ -2113,22 +2113,66 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#capabilities-and-strict-versioned-reads" class="md-nav__link">
+  <a href="#alternatives-considered" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Capabilities and strict versioned reads
+        Alternatives considered
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Capabilities and strict versioned reads">
+    <nav class="md-nav" aria-label="Alternatives considered">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#errors-and-retry-policy" class="md-nav__link">
+  <a href="#improved-polling-chosen" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Errors and retry policy
+        Improved polling — chosen
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sse-or-websocket-deferred" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SSE or WebSocket — deferred
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#admin-to-admin-postgresql-hints-optional-future-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Admin-to-admin PostgreSQL hints — optional future optimization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pushed-snapshots-or-row-deltas" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pushed snapshots or row deltas
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#durable-event-logoutbox-or-logical-decoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Durable event log/outbox or logical decoding
       
     </span>
   </a>
@@ -2141,10 +2185,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#finite-experimental-budgets" class="md-nav__link">
+  <a href="#consequences" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Finite experimental budgets
+        Consequences
       
     </span>
   </a>
@@ -2179,560 +2223,153 @@
   
 
 
-<h1 id="real-time-subscriptions-v1-implementation-contract">Real-time subscriptions v1: implementation contract<a class="headerlink" href="#real-time-subscriptions-v1-implementation-contract" title="Permanent link">&para;</a></h1>
-<p>Status: proposed companion contract to
-<a href="../../adr/050-realtime-subscriptions/">ADR-050</a>. Streaming is <strong>disabled by
-default</strong>, enabled only by explicit server opt-in. The settings below are finite
-experimental engineering limits, not measured production SLOs. This document
-specifies a future implementation; it does not describe a shipped API.</p>
-<p>V1 serves the existing trusted admin UI. It uses process-local coarse
-invalidation, ordinary read semantics and mandatory reconciliation. No
-transactional directory, outbox, CDC integration, tenant authorization framework
-or worker change is required. Durable business triggers remain queue jobs.</p>
-<h2 id="streaming-request-and-validation">Streaming request and validation<a class="headerlink" href="#streaming-request-and-validation" title="Permanent link">&para;</a></h2>
-<p>Use <strong><code>POST /api/subscriptions/v1</code></strong>, accepting strict JSON and returning
-<code>text/event-stream</code>. The tab uses <code>fetch</code> and an AbortController. This is one
-streaming request/response, not a registration/session service. There is no native
-EventSource GET variant in v1. Resource changes abort the old stream before
-opening its replacement. Retain displayed data, marked stale, until successful
-reconciliation.</p>
-<div class="language-json highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span>
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="nt">"resources"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="p">{</span>
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">      </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"r1"</span><span class="p">,</span>
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"jobs"</span><span class="p">,</span>
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">      </span><span class="nt">"filter"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">        </span><span class="nt">"queue"</span><span class="p">:</span><span class="w"> </span><span class="s2">"emails"</span><span class="p">,</span>
-</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">        </span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"tenant:opaque"</span><span class="p">,</span><span class="w"> </span><span class="s2">"order:opaque"</span><span class="p">]</span>
-</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">      </span><span class="p">}</span>
-</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="p">},</span>
-</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="p">{</span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"r2"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"job"</span><span class="p">,</span><span class="w"> </span><span class="nt">"job_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"123"</span><span class="p">},</span>
-</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="p">{</span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"r3"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"workers"</span><span class="p">}</span>
-</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">  </span><span class="p">]</span>
-</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="p">}</span>
-</span></code></pre></div>
-<p>Validate the complete request before registration or HTTP 200:</p>
-<ul>
-<li>Exact protocol version; unknown fields rejected at envelope, resource and
-  filter levels; unique opaque keys and type-specific fields.</li>
-<li>Both <code>JobFilter</code> deserialization <strong>and <code>validate()</code></strong>, using the existing
-  implementation and bounds. Strict parsing alone does not enforce validation.</li>
-<li>Valid IDs/UUIDs and every byte/count bound. Subscription job IDs are decimal
-  strings to avoid another JavaScript integer-precision dependency.</li>
-</ul>
-<p>Body/descriptor limits apply while receiving and parsing, before allocation can
-grow without bound. Do not echo raw descriptors or filters in events or logs.
-After validation the hub may retain only keys and category mappings; it never
-evaluates filters. Opening a stream performs <strong>zero database connections and zero
-state queries</strong>.</p>
-<p>An empty active resource set opens no stream and schedules no resource reads.
-The server rejects an empty <code>resources</code> array with 400. More than 16 descriptors
-rejects the complete request under the size-limit policy; never silently truncate,
-partially subscribe or open extra streams to bypass the cap. Display the error
-while retaining safe, paced reads of supported views.</p>
-<h2 id="initial-resources">Initial resources<a class="headerlink" href="#initial-resources" title="Permanent link">&para;</a></h2>
-<p>These types invalidate existing read results; they promise no new metrics or
-retained history. The UI owns explicit active-query mappings.</p>
-<table>
-<thead>
-<tr>
-<th>Type</th>
-<th>Additional fields</th>
-<th>Existing reads invalidated</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>jobs</code></td>
-<td>Required <code>filter: JobFilter</code></td>
-<td>Jobs pages and dashboard job sample; count becomes stale only.</td>
-</tr>
-<tr>
-<td><code>job</code></td>
-<td>Required decimal-string <code>job_id</code></td>
-<td>One job's current detail, output, progress and source.</td>
-</tr>
-<tr>
-<td><code>dlq</code></td>
-<td>Required <code>filter: JobFilter</code></td>
-<td>DLQ page/detail and depth.</td>
-</tr>
-<tr>
-<td><code>queues</code></td>
-<td>None</td>
-<td>Queue list/detail and <code>/queues/runtime</code>.</td>
-</tr>
-<tr>
-<td><code>workers</code></td>
-<td>None</td>
-<td><code>/runtime</code>, derived runtime details, capabilities and coverage.</td>
-</tr>
-<tr>
-<td><code>schedules</code></td>
-<td>None</td>
-<td><code>/cron</code> and <code>/cron/reconciliation</code>.</td>
-</tr>
-<tr>
-<td><code>operations</code></td>
-<td>Optional <code>operation_id: UUID</code></td>
-<td>Batch-operation list or one operation.</td>
-</tr>
-<tr>
-<td><code>maintenance</code></td>
-<td>None</td>
-<td><code>/storage</code> and existing sampling behavior.</td>
-</tr>
-<tr>
-<td><code>stats</code></td>
-<td>None</td>
-<td><code>/stats</code> and current timeseries views.</td>
-</tr>
-</tbody>
-</table>
-<p>Exclude standalone <code>recovery</code>, retained notices/history, application consumers
-and named queue/worker/schedule selectors from v1. They need further read
-contracts or add little with coarse routing. <code>/storage?history=true</code> supplies no
-server-retained history; subscriptions must not imply otherwise. Catalog/kinds
-views keep existing read behavior. Queue health, throughput, age and recovery
-displays use only existing fields with documented accuracy.</p>
-<p><code>JobFilter</code> describes a population; pages remain separate. Invalidation refetches
-the active bounded page, removing jobs that left and filling vacancies from
-current matches. It does not promise stable multi-page snapshots, an infinite
-list or visibility of every transition. Unknown routing information invalidates
-the broader category rather than risking a missed leave.</p>
-<h2 id="events-and-stream-parsing">Events and stream parsing<a class="headerlink" href="#events-and-stream-parsing" title="Permanent link">&para;</a></h2>
-<p>The only data event types are <code>ready</code>, <code>invalidate</code> and <code>resync</code>:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>event: ready
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>data: {"version":1,"epoch":"opaque-connection-id","keys":["r1","r2","r3"],"refresh_ms":5000,"reconcile_ms":30000,"keepalive_ms":15000}
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>event: invalidate
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>data: {"version":1,"epoch":"opaque-connection-id","keys":["r1","r2"]}
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>event: resync
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>data: {"version":1,"epoch":"opaque-connection-id","reason":"overflow"}
-</span></code></pre></div>
-<p><code>ready.keys</code> equals the requested set: never partially accept. Registration
-precedes <code>ready</code>; a client displaying a preliminary read must refetch after
-<code>ready</code>. Epoch is connection identity, not a database position. No SSE <code>id</code>,
-offset, acknowledgement or transition payload is emitted. Keepalives are comments
-and do not increment dirty generations.</p>
-<p>Check version, envelope, accepted keys and epoch. Unknown versions or malformed
-events close the stream and enter safe fallback with a visible protocol error;
-invalid protocol does not cause an automatic stream retry loop. Enforce frame
-limits even when a peer never finishes a frame. Parse chunked SSE, comments,
-split UTF-8 and split line boundaries with finite buffers. A fetch client must
-implement reconnect itself; native EventSource reconnect behavior is not automatic.</p>
-<p>Run connect/ready and byte-liveness deadlines on independent timers, not inside
-or after the stream reader's await/iterator. A pending read that never returns
-must still be aborted at its deadline. Bytes/keepalives establish transport
-activity only; they neither establish source freshness nor reset reconciliation.</p>
-<h2 id="capabilities-and-strict-versioned-reads">Capabilities and strict versioned reads<a class="headerlink" href="#capabilities-and-strict-versioned-reads" title="Permanent link">&para;</a></h2>
-<p>Add optional structured <code>subscriptions</code> and separate <code>job_filter_protocols</code>
-fields to <code>/api/capabilities</code>. Advertise enabled protocols, accepted types,
-limits, refresh policy and disabled status. Absence means unsupported; do not
-infer support from semver. Capabilities are advisory: the next request can reach
-an older server.</p>
-<p>Add thin strict JSON adapters:</p>
-<ul>
-<li><code>POST /api/v1/jobs/query</code></li>
-<li><code>POST /api/v1/dlq/query</code></li>
-<li><code>POST /api/v1/jobs/count</code></li>
-</ul>
-<p>Query bodies use the existing filter and page semantics:</p>
-<div class="language-json highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span><span class="nt">"version"</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">"filter"</span><span class="p">:{},</span><span class="nt">"page"</span><span class="p">:{}}</span>
-</span></code></pre></div>
-<p>Count bodies omit <code>page</code>. Reject unknown fields, including page fields through
-strict wrappers where existing page deserializers are permissive. Reuse the
-model/compiler and existing response conversion, not a second evaluator or
-storage model. Responses wrap the existing payload without changing its meaning:</p>
-<div class="language-json highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">{</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="nt">"data"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;existing response payload&gt;"</span><span class="p">,</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nt">"observation"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="nt">"observed_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;source observation time&gt;"</span><span class="p">,</span>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="nt">"served_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;response time&gt;"</span><span class="p">,</span>
-</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">    </span><span class="nt">"cache_age_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
-</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">  </span><span class="p">}</span>
-</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="p">}</span>
-</span></code></pre></div>
-<p>The strings above mark payload/timestamp placeholders, not literal wire values.
-The new UI's filtered subscription/refetch path uses these adapters. Existing
-permissive GET endpoints may remain for compatibility. Unknown <code>/api/*</code> routes
-in the new router return API errors, not SPA HTML.</p>
-<p>Unsupported routes, wrong MIME, malformed envelopes and mismatched versions are
-errors. Check JSON/version agreement for every read and <code>text/event-stream</code> plus
-valid <code>ready</code> for streams. HTTP 200 alone proves nothing: an older server's SPA
-fallback may return login/HTML content. Never retry by dropping predicates.</p>
-<p>Without v1 reads, permit legacy polling of <strong>unfiltered</strong> lists/details only.
-Nonempty filters remain unsupported rather than rewritten; only a separately
-tested legacy subset may later relax this. Do not display an unsupported job-match count
-as zero. New-server read budgets apply to SSE-triggered reads and their legacy
-fallback paths alike; fallback does not establish new server-side guarantees on
-an old binary.</p>
-<p>Never place credentials, args, outputs or secrets in any URL. Do not place raw
-filter descriptors in subscription URLs or automatic subscription logs. Existing
-shareable search URLs may contain documented nonsecret opaque filter values.
-JSON adapters avoid filters in new API URLs without removing intentional search
-and bookmark URLs.</p>
-<h3 id="errors-and-retry-policy">Errors and retry policy<a class="headerlink" href="#errors-and-retry-policy" title="Permanent link">&para;</a></h3>
-<p>Before streaming headers, return structured JSON errors:</p>
-<table>
-<thead>
-<tr>
-<th>Condition</th>
-<th>Status</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Invalid/unsupported version, type or fields</td>
-<td>400</td>
-</tr>
-<tr>
-<td>Size limit</td>
-<td>413</td>
-</tr>
-<tr>
-<td>Authorization/origin failure</td>
-<td>401/403</td>
-</tr>
-<tr>
-<td>Admission limit</td>
-<td>429 with <code>Retry-After</code></td>
-</tr>
-<tr>
-<td>Temporary overload or disabled transport</td>
-<td>503</td>
-</tr>
-</tbody>
-</table>
-<p>404/405 or wrong MIME means unsupported transport. After streaming headers, use
-resync/close; do not pretend to change HTTP status.</p>
-<ul>
-<li>Network/transport failures retain stale data, use the <strong>same paced read
-  scheduler</strong>, and reconnect with exponential backoff/jitter capped at 60 seconds.</li>
-<li>429/503 honor <code>Retry-After</code> across stream attempts <strong>and refetches</strong>. Overload
-  must not create immediate additional polling.</li>
-<li>401/403 stop retries until credentials or user action change.</li>
-<li>Invalid protocol/request stops stream retries and shows the error. Safe read
-  fallback still requires supported filter semantics and the same scheduler.</li>
-<li>Reprobe absent transport capability no more than every 60 seconds, unless the
-  user explicitly requests it.</li>
-</ul>
-<h2 id="finite-experimental-budgets">Finite experimental budgets<a class="headerlink" href="#finite-experimental-budgets" title="Permanent link">&para;</a></h2>
-<p>All limits are configurable with sanity checks. Zero/unlimited must not defeat
-the contract. These values are the initial opt-in implementation contract, not
-production capacity or freshness promises.</p>
-<table>
-<thead>
-<tr>
-<th>Bound</th>
-<th>Initial setting</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Feature default</td>
-<td>Disabled; explicit server opt-in.</td>
-</tr>
-<tr>
-<td>Resources</td>
-<td>16 descriptors per stream.</td>
-</tr>
-<tr>
-<td>Resource keys</td>
-<td>Unique; 1–64 ASCII alphanumeric, <code>_</code> or <code>-</code> characters.</td>
-</tr>
-<tr>
-<td>Request size</td>
-<td>64 KiB total; 32 KiB per descriptor.</td>
-</tr>
-<tr>
-<td>Streams</td>
-<td>64 per process.</td>
-</tr>
-<tr>
-<td>Principal quotas</td>
-<td>No invented identities in no-auth mode; ingress may enforce quotas.</td>
-</tr>
-<tr>
-<td>Pending stream state</td>
-<td>One dirty bit per admitted key plus one resync flag.</td>
-</tr>
-<tr>
-<td>Event/frame budget</td>
-<td>4 KiB application pending/frame budget.</td>
-</tr>
-<tr>
-<td>Debounce</td>
-<td>100 ms target; 500 ms maximum from first dirty event.</td>
-</tr>
-<tr>
-<td>Keepalive</td>
-<td>Comment every 15 seconds.</td>
-</tr>
-<tr>
-<td>Client liveness</td>
-<td>Reconnect after 45 seconds without bytes.</td>
-</tr>
-<tr>
-<td>Connect/ready deadline</td>
-<td>10 seconds.</td>
-</tr>
-<tr>
-<td>Slow transport</td>
-<td>Abort after a frame is pending for 5 seconds without body-consumer progress.</td>
-</tr>
-<tr>
-<td>Stream lifetime</td>
-<td>5 minutes, then reconnect/resync.</td>
-</tr>
-<tr>
-<td>Periodic hints</td>
-<td>Existing <code>poll_interval_ms</code>, currently at least 5 seconds and cache TTL.</td>
-</tr>
-<tr>
-<td>Reconciliation</td>
-<td>Jittered 30-second watchdog per active resource.</td>
-</tr>
-<tr>
-<td>Client read concurrency</td>
-<td>2 per tab; one in flight and one pending marker per exact query key.</td>
-</tr>
-<tr>
-<td>Refresh floor</td>
-<td>Cached reads respect advertised TTL/poll interval; uncached detail/pages at least 2 seconds apart.</td>
-</tr>
-<tr>
-<td>Server expensive reads</td>
-<td>4 simultaneous operations per process.</td>
-</tr>
-<tr>
-<td>Read admission</td>
-<td>At most 16 waiters; 250 ms admission wait; excess gets 429.</td>
-</tr>
-<tr>
-<td>Whole-read deadline</td>
-<td>15 seconds, including admission, pool acquisition, all queries/passes and serialization.</td>
-</tr>
-<tr>
-<td>SQL statement limit</td>
-<td>At most 5 seconds, also bounded by remaining whole-read deadline.</td>
-</tr>
-<tr>
-<td>SQL lock-wait limit</td>
-<td>At most 1 second, also bounded by remaining deadline.</td>
-</tr>
-<tr>
-<td>Repeated failure</td>
-<td>Exponential backoff to 60 seconds; retain one pending demand.</td>
-</tr>
-</tbody>
-</table>
-<p>Bound request/descriptor parsing before large allocation. Coalesce repeated
-invalidation into dirty bits. Overflow collapses to one all-resources resync;
-close if that cannot make transport progress within budget. Slow consumers never
-block the shared hub, readers, workers or producers. Release stream permits on
-body drop, shutdown and failure. Idle time without a pending frame is not
-backpressure. Enqueueing into an application channel is not evidence of transport
-delivery; local body-consumer progress is not a remote receipt acknowledgement.</p>
-<p>The process-wide expensive-read budget covers SSE-triggered and fallback reads.
-Cache hits may bypass admission; each cache fill acquires it once. Do not create
-a database task or pool connection per subscription. Bound obsolete fills,
-filtered cache cardinality and total fanout as well as per-stream state. Share
-aggregate reads; any filtered coalescing key includes backend, authorization
-scope, full normalized filter and page.</p>
-<p>A Rust future timeout alone does not prove SQL cancellation. Apply server-side
-deadlines to <strong>all</strong> constituent queries through appropriately configured admin
-read connections or deadline-aware transaction helpers. Do not alter mutation
-session timeouts accidentally. Verify cancellation rolls back or closes
-outstanding work before a connection becomes reusable.</p>
-<p>Audit candidate queries, separate loader transactions, all listing passes,
-aggregates and DLQ reads. The document-specific review identified a gap in</p>
-<h1 id="572s-candidate-query-only-timing-its-loader-opens-a-separate-transaction-with">572's candidate-query-only timing: its loader opens a separate transaction with<a class="headerlink" href="#572s-candidate-query-only-timing-its-loader-opens-a-separate-transaction-with" title="Permanent link">&para;</a></h1>
-<p>planning settings, and listing may make 32 candidate passes. This contract
-requires the entire operation, not each pass independently, to fit the deadline.
-The implementation must verify coverage against its actual base revision.</p>
-<h2 id="one-frontend-refresh-scheduler">One frontend refresh scheduler<a class="headerlink" href="#one-frontend-refresh-scheduler" title="Permanent link">&para;</a></h2>
-<p>Use one tab-level scheduler for SSE hints, watchdogs, legacy polling,
-focus/resume, reconnect and mutation refreshes. Managed queries disable
-independent automatic intervals, focus fetching and reconnect fetching. Migrate
-the existing two-second detail/operation polling explicitly. Every cause marks
-the same bounded dirty state; no component opens its own stream.</p>
-<p>With healthy SSE, periodic hints and reconciliation drive reads. With unhealthy
-SSE, polling takes over <strong>through the same scheduler</strong>. Do not run both plus
-independent React Query timers. Hints and keepalives alone never postpone the
-reconciliation watchdog. Resync obeys admission, cooldown and backoff. A failed
-read does not count as successful reconciliation or clear pending demand.
-This includes a missed final invalidation: a retained completed job's detail
-must still refresh through reconciliation even when SSE continues sending bytes.</p>
-<p>A request captures its query's dirty generation at start. Its response clears
-only that captured demand. A hint during the request leaves one pending refresh;
-the client may render the successful response while still showing stale/dirty
-state. Fence superseded filter/stream epochs and late responses. Continuous hints
-must neither starve visible results nor build an unbounded queue.
-Keep demand by resource/query key, not one global latest-resource slot; hints
-for a second resource cannot overwrite the first resource's pending demand.</p>
-<p>Respect pauses and explicit actions:</p>
-<ul>
-<li>Jobs currently pause automatic refresh while IDs are selected. Hints mark the
-  view stale without replacing the selection. Resume/manual refresh re-enters
-  the scheduler; mutations still use explicit selected IDs and server guards.</li>
-<li>Filtered job-match counts are excluded from automatic SSE/watchdog/focus refresh. Mark them stale;
-  refresh only on filter change, explicit refresh or the specified debounced
-  operator action. Prefix invalidation must not accidentally poll counts.</li>
-<li>Hidden tabs pause streams and reads. Visible resume performs one paced resync.</li>
-</ul>
-<p>Resource-set changes cancel/fence old work before replacement. On <code>pagehide</code>,
-abort streams and managed reads and stop timers, including when entering the
-browser back-forward cache (BFCache). On persisted <code>pageshow</code>, discard the old
-transport epoch and resume exactly one scheduler, with one paced resync only if
-visible and nonempty. Cancelled reads do not clear demand or count as successful
-reconciliation. Test repeated scope churn and restore without leaked permits,
-read tasks or duplicate loops.</p>
-<p>Preserve unsaved operator form/dialog drafts as well as selected IDs during
-refetch; do not silently replace the values the operator is reviewing. Optimistic
-UI coordination is separate from atomic domain mutation guards. Destructive
-operations validate current eligibility and applicable version/lease/fencing
-conditions atomically on the server; notifications and disabled buttons cannot
-enforce exclusivity or idempotency. Retain the existing server guards rather
-than inventing a subscription ownership protocol. Viewing a job or observing
-worker presence grants no ownership; active attempt ownership remains a lease
-and domain-state question.</p>
+<h1 id="adr-050-admin-views-use-invalidation-and-authoritative-refetch">ADR-050: Admin views use invalidation and authoritative refetch<a class="headerlink" href="#adr-050-admin-views-use-invalidation-and-authoritative-refetch" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Proposed. V1 uses improved polling. SSE, WebSocket and inter-process notification
+listeners are deferred to a separate decision, not included as opt-in features.
+<a href="https://github.com/hardbyte/awa/pull/576">Draft PR #576</a> is documentation only.</p>
+<h2 id="problem-and-constraints">Problem and constraints<a class="headerlink" href="#problem-and-constraints" title="Permanent link">&para;</a></h2>
+<p>Operators need current views of jobs, queues, workers, schedules, the DLQ and
+administrative progress. The UI already reads those resources through HTTP and
+TTL caches, but independent page timers, ambiguous filter compatibility and
+in-flight cache fills make freshness and load difficult to reason about.</p>
+<p>The priority order is correctness, reliability and recovery first, performance
+second, UX third. A fresh view must not become a dependency of enqueue, claim,
+finalization or rescue. The initial consumer is the trusted admin UI. Durable
+business triggers and an application-facing notification API are different
+requirements.</p>
+<p>A common refresh scheduler, whole-read deadlines, fenced cache fills, truthful
+source timestamps and strict read contracts improve the current UI without a
+stream. There is no measured operator need or transport comparison that justifies
+adopting SSE alongside those changes.</p>
+<h2 id="decision-and-scope">Decision and scope<a class="headerlink" href="#decision-and-scope" title="Permanent link">&para;</a></h2>
+<p><strong>Use disposable invalidation hints, authoritative owning-API reads and independent
+bounded reconciliation, implemented with polling in v1.</strong> A local mutation can
+mark the initiating tab's views stale and invalidate that server's caches. Other
+tabs and admin processes discover changes through their own paced reads.</p>
+<p>The five invariants are:</p>
+<ol>
+<li><strong>Read authority.</strong> A hint only requests a read. The owning API and shared
+   <code>JobFilter</code> define contents; unsupported semantics fail closed. An older cache
+   fill cannot undo invalidation or be relabelled as newly observed state.</li>
+<li><strong>Independent recovery.</strong> Register active read demand and arm reconciliation
+   before the first read. Lost hints, errors and resumes are repaired by scheduled
+   reads; a dirty mark received during a read remains pending afterwards.</li>
+<li><strong>Bounded shared demand.</strong> Polling, reconciliation, focus, retries and mutations
+   use one scheduler and finite client/server budgets. Coalescing retains demand
+   for every resource; overload reduces freshness rather than multiplying reads.</li>
+<li><strong>Job-path independence.</strong> Observation adds no job-transition writes, worker
+   hooks, mandatory listener or event-processing engine. Reliable business work
+   remains durable queue jobs, not a reaction to a UI observation.</li>
+<li><strong>Trusted administration.</strong> Read-only still exposes sensitive admin data;
+   scopes cannot silently widen. UI refresh preserves selections/drafts and does
+   not replace atomic mutation guards or confer ownership through presence.</li>
+</ol>
+<p>V1 reuses existing read models and ADR-049's filter/compiler. It adds no new
+metrics, retained notice history, tenant authorization framework or application
+completion guarantee. The <a href="../../design/admin-observation-v1/">polling-first v1 contract</a>
+specifies startup, read protocols, deadlines, cache fencing and validation.</p>
 <p>Convergence means retained state returned by ordinary APIs after changes settle
-and reads succeed. It does not strengthen cross-table consistency or guarantee
-observation of every transient transition. Composite loading may miss ordinary
-deferred-to-ready handoffs as well as claims; Repeatable Read alone does not make
-ring <code>TRUNCATE</code> MVCC-safe. Preserve reconciliation rather than asserting a perfect
-snapshot/stream boundary. Absence after retention is not proof of never existing.</p>
-<h2 id="cache-generations-and-truthful-observations">Cache generations and truthful observations<a class="headerlink" href="#cache-generations-and-truthful-observations" title="Permanent link">&para;</a></h2>
-<p>Use a bounded monotonic generation per aggregate cache group. After a successful
-local mutation commits, one post-commit helper:</p>
-<ol>
-<li>Advances the cache generation.</li>
-<li>Invalidates or retires the old generation.</li>
-<li>Signals the hub.</li>
-</ol>
-<p>A fill captures its generation before starting. It may publish/return as current
-only if that generation matches at completion. Requests after invalidation must
-not join an old-generation fill. Use generation-keyed caches with bounded obsolete
-work or an explicit synchronized check; never hold a cache lock over a database
-query. Discard/retry obsolete completions only within the remaining read budget.
-Do not relabel them fresh or loop indefinitely under continuous invalidations.
-Existing Moka <code>invalidate_all()</code> alone is not an established proof. Require a
-deterministic old-fill-after-invalidation test.</p>
-<p>Client and server generation fences are both required. The client cannot detect
-an obsolete cache fill served as fresh. Read metadata distinguishes:</p>
+and reads succeed. It is not observation of every transition or a stronger
+cross-table snapshot. Composite reads can miss claims or deferred-to-ready
+handoffs; Repeatable Read does not make ring truncation MVCC-safe. A completed
+job pruned before a read may never be observed. Follow-up jobs in
+<a href="../029-transactional-followup-jobs/">ADR-029</a> and
+<a href="../046-handler-staged-follow-ups/">ADR-046</a> remain the durable mechanism where
+applicable; best-effort rescue follow-ups are not strengthened.</p>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="improved-polling-chosen">Improved polling — chosen<a class="headerlink" href="#improved-polling-chosen" title="Permanent link">&para;</a></h3>
+<p>One scheduler, strict read boundaries, bounded work and truthful stale state
+address current correctness and operational problems without persistent browser
+connections. Each increment is useful without a transport project. Reads remain
+sampled and worker/peer changes wait for the configured cadence. We accept that
+tradeoff rather than fund unproven low-latency delivery.</p>
+<h3 id="sse-or-websocket-deferred">SSE or WebSocket — deferred<a class="headerlink" href="#sse-or-websocket-deferred" title="Permanent link">&para;</a></h3>
+<p>A stream could invalidate other views immediately after a committed local admin
+mutation. A process-local hub reaches only viewers connected to that process.
+With independent uniform routing over N processes, a particular viewer shares
+the mutation's process with probability 1/N; other routing/topologies differ.
+Worker changes gain no speed from a timer-driven stream, and adding such a stream
+does not inherently reduce database reads.</p>
+<p>SSE fits one-way HTTP hints; WebSocket supplies bidirectionality and subscription
+changes on an existing connection. Both require bounded parsing/state, reconnect,
+expiry, ingress/authentication handling and browser lifecycle work. Those costs
+are not justified by the observation invariants, which polling already satisfies.
+There is no v1 stream endpoint, descriptor protocol, parser or stream budget.
+A future hint descriptor should carry only an opaque key, type and necessary job
+identity; full filters belong in authoritative reads unless measured filtered
+routing earns the extra complexity and privacy exposure.</p>
+<h3 id="admin-to-admin-postgresql-hints-optional-future-optimization">Admin-to-admin PostgreSQL hints — optional future optimization<a class="headerlink" href="#admin-to-admin-postgresql-hints-optional-future-optimization" title="Permanent link">&para;</a></h3>
+<p>A dedicated listener per admin process could invalidate peer caches after admin
+mutations, without touching worker/job-execution writes. It would not push new
+data to browsers: they still wait for polling. One replica already has local
+invalidation; two replicas need evidence that stale-cache windows and mutation
+frequency justify dedicated sessions and reconnect handling. A listener needs a
+direct/session-pooled connection; transaction pooling cannot preserve its session
+registration. We do not select this optimization for v1.</p>
+<p><code>NOTIFY</code> is delivered after its transaction commits, but queue exhaustion can
+fail that commit. To isolate hint failure from the authoritative mutation, a
+future design would use a separate bounded best-effort post-commit attempt.
+Crash/loss is acceptable because reconciliation remains independent. Commit
+<code>LISTEN</code> before the initial cache resync and resync on reconnect. Payloads are
+visible to database users, so use coarse nonsecret categories, never filters,
+args or outputs. No listener is required for correctness.</p>
+<h3 id="pushed-snapshots-or-row-deltas">Pushed snapshots or row deltas<a class="headerlink" href="#pushed-snapshots-or-row-deltas" title="Permanent link">&para;</a></h3>
+<p>Shared aggregate snapshots might save refetches. Filtered snapshots/deltas need
+membership, population entry/exit, deletion and page-refill semantics in a second
+view model. Current-state refetch keeps those responsibilities in existing APIs.
+Consider pushed aggregates only if measured read cost makes that complexity useful.</p>
+<h3 id="durable-event-logoutbox-or-logical-decoding">Durable event log/outbox or logical decoding<a class="headerlink" href="#durable-event-logoutbox-or-logical-decoding" title="Permanent link">&para;</a></h3>
+<p>A log/outbox can support retained events and replay, but needs complete writer
+coverage, commit-safe ordering, idempotence, retention and gap recovery. A sequence
+allocated before commit is not a replay watermark. CDC additionally requires
+slot/privilege/failover operations and a semantic adapter over leases, cursors,
+compact completions and pruning. Those can serve historical/event consumers;
+they impose unnecessary dependencies for sampled admin views.</p>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<p>Operators get bounded, recoverable views with explicit stale state. Missed hints
+cannot leave a retained job's detail stale indefinitely after successful polling
+resumes. Late fills and overlapping refreshes do not silently reverse invalidation.</p>
+<p>Freshness remains sampled. The initiating tab can refresh after its own mutation;
+other clients are not promised immediate invalidation. Separate processes have
+independent caches and aggregate read costs. Current-state reads cannot guarantee
+an audit trail, every completion, or an exact census during transitions.</p>
+<p>Shared read hardening and strict adapters are independently useful follow-ups to</p>
+<h1 id="572-they-should-not-wait-for-a-streaming-decision-existing-get-parsing-and">572. They should not wait for a streaming decision. Existing GET parsing and<a class="headerlink" href="#572-they-should-not-wait-for-a-streaming-decision-existing-get-parsing-and" title="Permanent link">&para;</a></h1>
+<p>per-statement timeouts must not be represented as strict mixed-version reads or
+an end-to-end deadline; the supporting contract records the verified gaps.</p>
+<h2 id="evidence-required-for-a-later-transport-decision">Evidence required for a later transport decision<a class="headerlink" href="#evidence-required-for-a-later-transport-decision" title="Permanent link">&para;</a></h2>
+<p>Reopen transport selection only with an unmet operator freshness requirement or
+a concrete push consumer, a measured improved-polling baseline and the intended
+deployment topology. Compare coverage of local mutations, worker changes and
+peer changes; database/read amplification, connections and browser freshness;
+and supported ingress, authentication, expiry and reconnect costs. Name an owner
+and explicit, measurable retain/reject criteria for benefit, coverage and cost
+before starting any experiment.
+This ADR invents no numeric success target or release deadline.</p>
+<p>A durable application event/completion requirement needs a different contract,
+not a faster version of these hints. Scoped application authorization or actual
+bidirectional interaction also changes the decision boundary.</p>
+<h2 id="links-and-evidence">Links and evidence<a class="headerlink" href="#links-and-evidence" title="Permanent link">&para;</a></h2>
 <ul>
-<li><code>observed_at</code>: source-fetch start, or a conservative start/end observation
-  window for a composite read.</li>
-<li><code>served_at</code>: response time.</li>
-<li><code>cache_age_ms</code>: age of the cached observation.</li>
+<li><a href="../../design/admin-observation-v1/">Polling-first v1 contract</a>: normative read,
+  scheduler, cache and access requirements with incremental delivery gates.</li>
+<li><a href="../049-job-filter-and-indexed-tags/">ADR-049</a> and
+  <a href="https://github.com/hardbyte/awa/pull/572">PR #572</a>: shared population semantics;
+  <a href="../../design/admin-observation-v1/#dependencies-and-source-evidence">current source evidence</a>
+  distinguishes remaining GET/deadline gaps from resolved DLQ/UI issues.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/cache.rs">Existing cache</a>,
+  <a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/state.rs">admin state</a>
+  and <a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/frontend/src/hooks/use-poll-interval.ts">polling policy</a>:
+  the baseline, not an SSE performance comparison.</li>
+<li><a href="https://www.postgresql.org/docs/current/sql-notify.html">PostgreSQL NOTIFY</a>
+  and <a href="https://www.postgresql.org/docs/current/sql-listen.html">LISTEN</a>:
+  transaction failure, payload visibility and registration behavior for the
+  deferred admin-cache optimization.</li>
+<li><a href="../041-rolling-upgrade-policy/">ADR-041</a> and
+  <a href="../045-hot-path-trigger-lock-contract/">ADR-045</a>: rolling-upgrade and hot-path
+  constraints remain in force.</li>
 </ul>
-<p>Preserve original observation time on cache hits. A fresh HTTP response does not
-make an old sample newly observed. Use a common wrapper or headers for existing
-payloads; the new v1 adapters use the envelope above. Worker liveness remains
-heartbeat evidence under its documented window. Replica freshness/lag is
-<strong>unknown</strong> unless actually measured; primary hints do not prove replica replay.</p>
-<p>V1 may conservatively invalidate all admitted categories and aggregate caches
-after any successful local mutation. Include every family, notably DLQ
-retry/purge/move and batch cancellation, whose current handlers do not uniformly
-invalidate caches. Rolled-back mutations emit no hints. Worker and peer-process
-activity is timer-covered, with no added hooks or triggers. Each admin process
-owns its hub/cache/timer and reads its backend; no broker or sticky routing is
-needed. Measure aggregate read costs across processes.</p>
-<h2 id="trusted-admin-origin-and-credentials">Trusted-admin origin and credentials<a class="headerlink" href="#trusted-admin-origin-and-credentials" title="Permanent link">&para;</a></h2>
-<p>V1 is the existing trusted admin surface, not an application tenant API.
-<code>--read-only</code> disables mutations, not access to sensitive data. Ingress/private
-network controls protect reads and streams; an origin check does not authorize a
-JobFilter or make a public unauthenticated admin safe.</p>
-<p>Default new adapters to same-origin browser access with existing ingress auth:</p>
-<ul>
-<li>Require JSON POST bodies. Reject a present Origin unless it matches the
-  configured public admin origin. Never derive an allowlist from arbitrary
-  forwarded-host headers.</li>
-<li>No wildcard credentialed CORS. Isolate new routes or deliberately replace
-  existing permissive CORS so an outer layer cannot undo this policy.</li>
-<li>Browser fetch uses <code>credentials: "same-origin"</code> and <code>cache: "no-store"</code>.
-  Reject cross-origin redirects/login HTML as protocol data.</li>
-<li>Non-browser requests without Origin retain the existing ingress/private-network
-  trust requirement.</li>
-</ul>
-<p>SSE response headers:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Content-Type: text/event-stream
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>Cache-Control: private, no-store, no-transform
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>X-Accel-Buffering: no
-</span></code></pre></div>
-<p>Use the actual ingress's buffering controls, testing authentication proxy,
-compression, idle timeouts and streaming behavior. The five-minute stream
-lifetime allows ingress reauthentication; a server without identity cannot
-promise immediate per-user revocation. Application-scoped consumers remain
-outside v1. Do not put secrets, args or output in notifications or transport logs.</p>
-<h2 id="implementation-and-acceptance">Implementation and acceptance<a class="headerlink" href="#implementation-and-acceptance" title="Permanent link">&para;</a></h2>
-<p>Use a separate draft implementation PR, stacked on #572 or after its merge,
-reusing its actual <code>JobFilter</code> compiler. Do not copy a second compiler into the
-UI crate. Adopting this contract permits opt-in implementation, not default
-enablement, release or merge.</p>
-<ol>
-<li>Adopt ADR-050 and this protocol/resource/fallback/privacy/limit/scheduler/cache/
-   origin contract. Keep experimental defaults and disabled-by-default status.</li>
-<li>Add protocol types/capabilities, strict read adapters and status/MIME checks.
-   Verify read-only and empty-install behavior without starting a worker.</li>
-<li>Add the bounded process-local hub/timer and post-commit helper. Prove stream
-   opening does zero state queries/connections. Test descriptor/frame bounds,
-   permits, disconnect cleanup, shutdown and blocked response bodies.</li>
-<li>Add cache generations, observations and whole-read budgets. Use deterministic
-   barriers for stale-fill races. Prove timed-out SQL stops/rolls back and pool
-   connections return to baseline before reuse.</li>
-<li>Add one tab-level fetch-SSE manager/scheduler with explicit active-query
-   mappings, dirty generations, abort/fencing, count/selection exceptions and
-   fallback. Test finite parsing across chunks, comments, UTF-8 and line splits.</li>
-<li>Cover every local mutation family. Prove rollback emits no hint and peer
-   changes converge through periodic reads. Test filter entry/exit, page refill,
-   retained-not-found presentation, errors, resume and heartbeat expiry without
-   writes. Preserve "where applicable" for follow-ups: rescue follow-ups remain
-   best effort after rescue.</li>
-<li>Test old-server 200-HTML/404, mixed-version routing of capabilities/stream/read,
-   401/403, 429 <code>Retry-After</code>, 503, healthy SSE with failed database reads,
-   restarts, continuous hints, overflow/resync, slow consumers and fallback
-   without duplicate loops. Counts/paused selections remain unchanged until
-   explicitly resumed/refreshed under their rules. Include a silently hung reader,
-   a missed final event with continuing keepalives, interleaved resource hints,
-   empty/over-cap scope, scope churn, cancellation, BFCache restore and preserved
-   operator drafts. Independently verify the existing atomic mutation guards.</li>
-<li>Benchmark PostgreSQL 17 and 18 with zero clients, current polling, opted-in SSE,
-   maximum admitted views and multiple admin processes. Measure p95/p99 enqueue,
-   claim and finalization latency, rescue progress, WAL, query QPS, permits,
-   database connections, cache fills and browser freshness. Validate through
-   supported ingress/pooler topology.</li>
-</ol>
-<p>Distinguish source/pipeline observation lag where measurable, transport activity,
-API refetch latency and browser read/render freshness in diagnostic evidence.
-Missing source/pipeline lag remains unknown. A healthy stream can coexist with
-an unhealthy queue or stale source, and a consumer-stage metric cannot establish
-universal subsecond browser freshness. Report histogram resolution and censored
-top-bucket observations rather than claiming an exact delay from the last bucket.
-These are measurement requirements, not additional v1 resource/metric APIs.</p>
-<p>Keep the implementation PR draft until deterministic correctness and
-read-budget/cancellation tests pass. Default enablement requires load/deployment
-evidence; missing evidence does not prevent writing an opt-in implementation.
-Timer-driven SSE is not inherently cheaper than polling: measure local-mutation
-freshness and total read/connection costs before default enablement.</p>
-<p>The earlier uniqueness-prune and DLQ downgrade findings remain separate release
-gates. This stream neither causes nor repairs them. No transactional-directory
-proposal is included. New metrics, retained notices/history and application
-authorization need separate work.</p>
-<h2 id="evidence-boundary">Evidence boundary<a class="headerlink" href="#evidence-boundary" title="Permanent link">&para;</a></h2>
-<p>This contract adopts the actual-document review of ADR-050 at
-<code>3dd7ee3696e706d80c4a2777d7d0642f1e3480cc</code>, verified blob
-<code>154f328a7249229ad3e0a25db83827595ea95f21</code>. The original repository and
-PostgreSQL/SSE source evidence remains linked in
-<a href="../../adr/050-realtime-subscriptions/#links-and-evidence">ADR-050</a>.
-Review agreement and documentation CI do not establish a tested subscription
-implementation, SQL cancellation, load safety or deployment correctness. The
-transferred review evidence paragraph was incomplete and executable model
-artifacts were not supplied here; this document claims no verified model result.</p>
 
 
 
