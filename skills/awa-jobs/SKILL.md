@@ -122,6 +122,13 @@ order is strict `priority ASC, run_at ASC, id ASC`. Priority aging then improves
 a waiting job's effective priority one level per aging interval (default 60s) so
 low-priority work cannot starve indefinitely.
 
+To find the jobs about something later, tag them at insert (`order:123`,
+`tenant:acme`) and filter by tag: `admin::find_jobs` with `JobFilter`, Python
+`client.find_jobs(tag="order:123")`, `awa job list --tag order:123`, or
+`GET /api/jobs?tag=order:123`. Tags are indexed on queue storage, every tag
+must match, and at most 20 are allowed per job. Keep secrets and personal data
+out of tags: they are shown in the admin UI and logs.
+
 **Unique jobs** deduplicate on a BLAKE3 key over kind + optionally queue + args +
 a time-period bucket. Defaults: dedup by args, not by queue. Conflict handling
 depends on the API: a single-row `insert` / `insert_with` and the row-by-row

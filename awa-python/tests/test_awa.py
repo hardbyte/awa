@@ -603,13 +603,11 @@ async def test_admin_queue_stats(client):
 
 
 @pytest.mark.asyncio
-async def test_admin_list_jobs(client):
-    """List jobs with filters via the Python client."""
+async def test_admin_list_jobs_needs_queue_storage(client):
+    """Listing jobs by filter is refused on the canonical engine (ADR-049)."""
     await client.insert(SendEmail(to="list@example.com", subject="List"), queue="list_py")
-    jobs = await client.list_jobs(queue="list_py", state="available")
-    assert len(jobs) == 1
-    assert jobs[0].queue == "list_py"
-    assert jobs[0].state == awa.JobState.Available
+    with pytest.raises(awa.ValidationError, match="queue_storage"):
+        await client.list_jobs(queue="list_py", state="available")
 
 
 # -- Worker registration tests --

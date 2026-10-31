@@ -6,7 +6,9 @@
 
 use crate::audited_sql;
 use crate::error::AwaError;
+use crate::filter::{DlqPage, JobFilter};
 use crate::job::JobRow;
+use crate::job_query::{dlq_predicate, Bind, Predicate};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,8 @@ impl DlqRow {
     }
 }
 
+/// Superseded by [`JobFilter`] with [`DlqPage`] (ADR-049), which keeps
+/// paging out of the filter that purge and bulk retry act on.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListDlqFilter {
     pub kind: Option<String>,
@@ -57,6 +61,50 @@ pub struct ListDlqFilter {
     pub before_id: Option<i64>,
     pub before_dlq_at: Option<DateTime<Utc>>,
     pub limit: Option<i64>,
+}
+
+impl ListDlqFilter {
+    /// The equivalent filter and page.
+    pub fn split(&self) -> (JobFilter, DlqPage) {
+        let filter = JobFilter {
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            tags: self.tag.clone().into_iter().collect(),
+            ..Default::default()
+        };
+        let page = DlqPage {
+            before_dlq_at: self.before_dlq_at,
+            before_id: self.before_id,
+            limit: self.limit.unwrap_or(crate::filter::DEFAULT_PAGE_LIMIT),
+        };
+        (filter, page)
+    }
+}
+
+/// Narrow `predicate` to rows before a `(dlq_at, id)` position, newest first.
+pub(crate) fn before_position(
+    predicate: &mut Predicate,
+    before_dlq_at: Option<DateTime<Utc>>,
+    before_id: Option<i64>,
+) {
+    match (before_dlq_at, before_id) {
+        (None, None) => {}
+        (None, Some(id)) => {
+            let p = predicate.param(Bind::Int(id));
+            predicate.conditions.push(format!("job_id < {p}"));
+        }
+        (Some(at), None) => {
+            let p = predicate.param(Bind::Time(at));
+            predicate.conditions.push(format!("dlq_at < {p}"));
+        }
+        (Some(at), Some(id)) => {
+            let at = predicate.param(Bind::Time(at));
+            let id = predicate.param(Bind::Int(id));
+            predicate
+                .conditions
+                .push(format!("(dlq_at, job_id) < ({at}, {id})"));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -165,10 +213,6 @@ async fn active_queue_storage(pool: &PgPool) -> Result<QueueStorage, AwaError> {
     QueueStorage::from_existing_schema(schema)
 }
 
-fn filter_requires_scope(filter: &ListDlqFilter) -> bool {
-    filter.kind.is_none() && filter.queue.is_none() && filter.tag.is_none()
-}
-
 pub async fn move_failed_to_dlq(
     pool: &PgPool,
     job_id: i64,
@@ -213,10 +257,37 @@ pub async fn bulk_move_failed_to_dlq(
         .await
 }
 
+/// Dead-lettered jobs matching `filter`, newest first by `(dlq_at, id)`.
+pub async fn find_dlq(
+    pool: &PgPool,
+    filter: &JobFilter,
+    page: DlqPage,
+) -> Result<Vec<DlqRow>, AwaError> {
+    filter.validate()?;
+    list_dlq_where(pool, filter, page).await
+}
+
+#[deprecated(
+    since = "0.7.0",
+    note = "use `find_dlq` with a `JobFilter` and `DlqPage`"
+)]
 pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRow>, AwaError> {
+    let (filter, page) = filter.split();
+    list_dlq_where(pool, &filter, page).await
+}
+
+async fn list_dlq_where(
+    pool: &PgPool,
+    filter: &JobFilter,
+    page: DlqPage,
+) -> Result<Vec<DlqRow>, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let schema = store.schema();
-    let rows: Vec<QueueStorageDlqRow> = sqlx::query_as(audited_sql(format!(
+    let Some(mut predicate) = dlq_predicate(filter) else {
+        return Ok(Vec::new());
+    };
+    before_position(&mut predicate, page.before_dlq_at, page.before_id);
+    let limit = predicate.param(Bind::Int(page.clamped_limit()));
+    let sql = format!(
         r#"
         SELECT
             job_id,
@@ -238,31 +309,17 @@ pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRo
             dlq_at,
             original_run_lease
         FROM {schema}.dlq_entries
-        WHERE ($1::text IS NULL OR kind = $1)
-          AND ($2::text IS NULL OR queue = $2)
-          AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-          AND (
-              ($4::bigint IS NULL AND $5::timestamptz IS NULL)
-              OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
-              OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
-              OR (
-                  $4::bigint IS NOT NULL
-                  AND $5::timestamptz IS NOT NULL
-                  AND (dlq_at, job_id) < ($5, $4)
-              )
-          )
+        {where_clause}
         ORDER BY dlq_at DESC, job_id DESC
-        LIMIT $6
-        "#
-    )))
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.before_id)
-    .bind(filter.before_dlq_at)
-    .bind(filter.limit.unwrap_or(100))
-    .fetch_all(pool)
-    .await?;
+        LIMIT {limit}
+        "#,
+        schema = store.schema(),
+        where_clause = predicate.where_clause(),
+    );
+    let rows: Vec<QueueStorageDlqRow> = predicate
+        .bind_query_as(sqlx::query_as(audited_sql(sql)))
+        .fetch_all(pool)
+        .await?;
 
     rows.into_iter()
         .map(QueueStorageDlqRow::into_dlq_row)
@@ -304,6 +361,42 @@ pub async fn get_dlq_job(pool: &PgPool, job_id: i64) -> Result<Option<DlqRow>, A
     .await?;
 
     row.map(QueueStorageDlqRow::into_dlq_row).transpose()
+}
+
+/// DLQ metadata for whichever of `job_ids` are dead-lettered. Empty when
+/// queue storage is not active, since only it has a DLQ.
+pub async fn dlq_metadata_for(
+    pool: &PgPool,
+    job_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, DlqMetadata>, AwaError> {
+    if job_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let Some(schema) = QueueStorage::active_schema(pool).await? else {
+        return Ok(Default::default());
+    };
+    let store = QueueStorage::from_existing_schema(schema)?;
+    let rows: Vec<(i64, String, DateTime<Utc>, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT DISTINCT ON (job_id) job_id, dlq_reason, dlq_at, original_run_lease \
+         FROM {}.dlq_entries WHERE job_id = ANY($1) ORDER BY job_id, dlq_at DESC",
+        store.schema()
+    )))
+    .bind(job_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(job_id, reason, dlq_at, original_run_lease)| {
+            (
+                job_id,
+                DlqMetadata {
+                    reason,
+                    dlq_at,
+                    original_run_lease,
+                },
+            )
+        })
+        .collect())
 }
 
 pub async fn dlq_depth(pool: &PgPool, queue: Option<&str>) -> Result<i64, AwaError> {
@@ -352,73 +445,130 @@ pub async fn retry_from_dlq(
     store.retry_from_dlq(pool, job_id, opts).await
 }
 
+/// Refuse a bulk DLQ action whose filter would select the whole DLQ unless
+/// the caller opted in. `states` and `dead_lettered` don't count: every DLQ
+/// row is a dead-lettered failed job, so neither narrows it.
+fn require_dlq_scope(filter: &JobFilter, allow_all: bool, action: &str) -> Result<(), AwaError> {
+    let scoped = filter.kind.is_some()
+        || filter.queue.is_some()
+        || !filter.tags.is_empty()
+        || filter.ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        || filter.created_at_gte.is_some()
+        || filter.created_at_lt.is_some();
+    if scoped || allow_all {
+        return Ok(());
+    }
+    Err(AwaError::Validation(format!(
+        "{action} needs a kind, queue, tag, ids or created_at bound (or allow_all=true)"
+    )))
+}
+
 /// Bulk-retry DLQ rows matching the filter.
 ///
-/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
-/// `true`. This guard prevents an empty payload from reviving the entire DLQ
-/// by accident.
+/// Requires a filter that narrows the DLQ unless `allow_all` is `true`. This
+/// guard prevents an empty payload from reviving the entire DLQ by accident.
 ///
 /// Like single-row retry, unique-claim conflicts abort the transaction and
 /// leave the affected DLQ rows untouched.
+pub async fn bulk_retry_from_dlq_matching(
+    pool: &PgPool,
+    filter: &JobFilter,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
+    filter.validate()?;
+    require_dlq_scope(filter, allow_all, "bulk retry from the DLQ")?;
+    let Some(predicate) = dlq_predicate(filter) else {
+        return Ok(0);
+    };
+    let store = active_queue_storage(pool).await?;
+    store.bulk_retry_from_dlq_where(pool, &predicate).await
+}
+
+#[deprecated(
+    since = "0.7.0",
+    note = "use `bulk_retry_from_dlq_matching` with a `JobFilter`"
+)]
 pub async fn bulk_retry_from_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
     allow_all: bool,
 ) -> Result<u64, AwaError> {
-    if !allow_all && filter_requires_scope(filter) {
+    if !allow_all && filter.kind.is_none() && filter.queue.is_none() && filter.tag.is_none() {
         return Err(AwaError::Validation(
             "bulk_retry_from_dlq requires at least one of kind, queue, or tag (or allow_all=true)"
                 .into(),
         ));
     }
-
+    let (job_filter, page) = filter.split();
+    let Some(mut predicate) = dlq_predicate(&job_filter) else {
+        return Ok(0);
+    };
+    before_position(&mut predicate, page.before_dlq_at, page.before_id);
     let store = active_queue_storage(pool).await?;
-    store.bulk_retry_from_dlq(pool, filter).await
+    store.bulk_retry_from_dlq_where(pool, &predicate).await
 }
 
 /// Purge DLQ rows matching the filter.
 ///
-/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
-/// `true`, which is the explicit "yes, purge the whole DLQ" escape hatch for
+/// Requires a filter that narrows the DLQ unless `allow_all` is `true`,
+/// which is the explicit "yes, purge the whole DLQ" escape hatch for
 /// operator tooling.
+pub async fn purge_dlq_matching(
+    pool: &PgPool,
+    filter: &JobFilter,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
+    purge_dlq_matching_before(pool, filter, None, None, allow_all).await
+}
+
+/// [`purge_dlq_matching`], limited to rows before a `(dlq_at, id)` position
+/// in `find_dlq`'s order: a page's last row, to purge everything older.
+pub async fn purge_dlq_matching_before(
+    pool: &PgPool,
+    filter: &JobFilter,
+    before_dlq_at: Option<DateTime<Utc>>,
+    before_id: Option<i64>,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
+    filter.validate()?;
+    require_dlq_scope(filter, allow_all, "purging the DLQ")?;
+    let Some(mut predicate) = dlq_predicate(filter) else {
+        return Ok(0);
+    };
+    before_position(&mut predicate, before_dlq_at, before_id);
+    purge_where(pool, &predicate).await
+}
+
+#[deprecated(since = "0.7.0", note = "use `purge_dlq_matching` with a `JobFilter`")]
 pub async fn purge_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
     allow_all: bool,
 ) -> Result<u64, AwaError> {
-    if !allow_all && filter_requires_scope(filter) {
+    if !allow_all && filter.kind.is_none() && filter.queue.is_none() && filter.tag.is_none() {
         return Err(AwaError::Validation(
             "purge_dlq requires at least one of kind, queue, or tag (or allow_all=true)".into(),
         ));
     }
+    let (job_filter, page) = filter.split();
+    let Some(mut predicate) = dlq_predicate(&job_filter) else {
+        return Ok(0);
+    };
+    before_position(&mut predicate, page.before_dlq_at, page.before_id);
+    purge_where(pool, &predicate).await
+}
 
+async fn purge_where(pool: &PgPool, predicate: &Predicate) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(audited_sql(format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE ($1::text IS NULL OR kind = $1)
-          AND ($2::text IS NULL OR queue = $2)
-          AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-          AND (
-              ($4::bigint IS NULL AND $5::timestamptz IS NULL)
-              OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
-              OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
-              OR (
-                  $4::bigint IS NOT NULL
-                  AND $5::timestamptz IS NOT NULL
-                  AND (dlq_at, job_id) < ($5, $4)
-              )
-          )
-        "#,
-        store.schema()
-    )))
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.before_id)
-    .bind(filter.before_dlq_at)
-    .execute(pool)
-    .await?;
+    let sql = format!(
+        "DELETE FROM {}.dlq_entries {}",
+        store.schema(),
+        predicate.where_clause()
+    );
+    let result = predicate
+        .bind_query(sqlx::query(audited_sql(sql)))
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 

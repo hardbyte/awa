@@ -4,12 +4,14 @@
 
 use awa::model::{
     admin, batch_operations, insert_many, insert_with, migrations, BatchOperationFilter,
-    BatchOperationSpec, InsertOpts, SubmitBatchOperation, UniqueOpts,
+    BatchOperationSpec, InsertOpts, QueueStorage, QueueStorageConfig, SubmitBatchOperation,
+    UniqueOpts,
 };
 use awa::{
     AwaError, BuildError, Client, InsertParams, JobArgs, JobContext, JobError, JobResult, JobState,
     QueueConfig, RateLimit, Worker,
 };
+use awa_testing::setup::TestDatabase;
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgListener, PgPoolOptions};
@@ -44,6 +46,18 @@ async fn setup() -> TestClient {
     setup_with_connections(2).await
 }
 
+/// Batch operations and filtered job lists need queue storage (ADR-049), so
+/// tests of them run on their own queue-storage database under either engine.
+async fn queue_storage_db(max_connections: u32) -> TestDatabase {
+    let db = TestDatabase::with_max_connections(max_connections).await;
+    QueueStorage::new(QueueStorageConfig::default())
+        .expect("default queue storage config should build")
+        .install(db.pool())
+        .await
+        .expect("installing queue storage should succeed");
+    db
+}
+
 /// Clean only jobs, queue_meta, and admin caches for a specific queue.
 /// Call this at the start of each test to remove leftovers from previous runs.
 /// Explicitly deletes the queue_state_counts row to prevent accumulated cache
@@ -54,24 +68,6 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
     // Engine-aware cleanup lives in the shared harness so a queue name can be
     // reused across tests and re-runs under either storage engine.
     awa_testing::setup::clean_queue(pool, queue).await;
-}
-
-async fn run_batch_operation_to_completion(
-    pool: &sqlx::PgPool,
-    operation_id: uuid::Uuid,
-) -> batch_operations::BatchOperation {
-    let runner = uuid::Uuid::new_v4();
-    for _ in 0..100 {
-        let outcome = batch_operations::run_one_batch_operation_chunk(pool, runner, 10)
-            .await
-            .expect("run batch operation chunk");
-        if outcome.finalized || !outcome.claimed {
-            break;
-        }
-    }
-    batch_operations::get_batch_operation(pool, operation_id)
-        .await
-        .expect("get batch operation")
 }
 
 async fn wait_for_runtime_snapshot(
@@ -193,106 +189,6 @@ async fn test_insert_and_retrieve() {
 }
 
 #[tokio::test]
-async fn test_batch_operation_set_priority_and_move_queue_canonical() {
-    let _guard = test_lock().lock().await;
-    let client = setup().await;
-    let source_queue = "integ_batch_ops_source";
-    let dest_queue = "integ_batch_ops_dest";
-    clean_queue(client.pool(), source_queue).await;
-    clean_queue(client.pool(), dest_queue).await;
-    sqlx::query("DELETE FROM awa.batch_operations")
-        .execute(client.pool())
-        .await
-        .expect("clean batch operations");
-
-    let job = insert_with(
-        client.pool(),
-        &SendEmail {
-            to: "ops@example.com".into(),
-            subject: "Escalate".into(),
-        },
-        InsertOpts {
-            queue: source_queue.into(),
-            priority: 4,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    let preview = batch_operations::preview_batch_operation(
-        client.pool(),
-        BatchOperationSpec::SetPriority { priority: 1 },
-        BatchOperationFilter {
-            queue: Some(source_queue.to_string()),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("preview set priority");
-    assert_eq!(preview.total_matched, 1);
-
-    let operation = batch_operations::submit_batch_operation(
-        client.pool(),
-        SubmitBatchOperation {
-            spec: BatchOperationSpec::SetPriority { priority: 1 },
-            filter: BatchOperationFilter {
-                queue: Some(source_queue.to_string()),
-                ..Default::default()
-            },
-            submitted_by: Some("test".to_string()),
-            allow_all: false,
-        },
-    )
-    .await
-    .expect("submit set priority");
-    let completed = run_batch_operation_to_completion(client.pool(), operation.id).await;
-    assert_eq!(
-        completed.state,
-        batch_operations::BatchOperationState::Completed
-    );
-    assert_eq!(completed.processed, 1);
-
-    let updated = admin::get_job(client.pool(), job.id).await.unwrap();
-    assert_eq!(updated.priority, 1);
-    assert_eq!(
-        updated.metadata.get("_awa_original_priority"),
-        Some(&serde_json::json!(4))
-    );
-
-    let operation = batch_operations::submit_batch_operation(
-        client.pool(),
-        SubmitBatchOperation {
-            spec: BatchOperationSpec::MoveQueue {
-                queue: dest_queue.to_string(),
-                priority: Some(2),
-            },
-            filter: BatchOperationFilter {
-                ids: Some(vec![job.id]),
-                ..Default::default()
-            },
-            submitted_by: Some("test".to_string()),
-            allow_all: false,
-        },
-    )
-    .await
-    .expect("submit move queue");
-    let completed = run_batch_operation_to_completion(client.pool(), operation.id).await;
-    assert_eq!(
-        completed.state,
-        batch_operations::BatchOperationState::Completed
-    );
-
-    let moved = admin::get_job(client.pool(), job.id).await.unwrap();
-    assert_eq!(moved.queue, dest_queue);
-    assert_eq!(moved.priority, 2);
-    assert_eq!(
-        moved.metadata.get("_awa_original_queue"),
-        Some(&serde_json::json!(source_queue))
-    );
-}
-
-#[tokio::test]
 async fn test_batch_operation_rejects_ineligible_state_filter() {
     let _guard = test_lock().lock().await;
     let client = setup().await;
@@ -305,10 +201,7 @@ async fn test_batch_operation_rejects_ineligible_state_filter() {
         client.pool(),
         SubmitBatchOperation {
             spec: BatchOperationSpec::SetPriority { priority: 1 },
-            filter: BatchOperationFilter {
-                state: Some(JobState::Failed),
-                ..Default::default()
-            },
+            filter: BatchOperationFilter::new().state(JobState::Failed),
             submitted_by: Some("test".to_string()),
             allow_all: false,
         },
@@ -322,18 +215,13 @@ async fn test_batch_operation_rejects_ineligible_state_filter() {
 
 #[tokio::test]
 async fn test_batch_operation_cancellation_marks_remaining_items_skipped() {
-    let _guard = test_lock().lock().await;
-    let client = setup().await;
+    let db = queue_storage_db(2).await;
+    let pool = db.pool();
     let queue = "integ_batch_cancel";
-    clean_queue(client.pool(), queue).await;
-    sqlx::query("DELETE FROM awa.batch_operations")
-        .execute(client.pool())
-        .await
-        .expect("clean batch operations");
 
     for id in 0..3 {
         insert_with(
-            client.pool(),
+            pool,
             &SendEmail {
                 to: format!("user{id}@example.com"),
                 subject: "Cancel batch".into(),
@@ -349,7 +237,7 @@ async fn test_batch_operation_cancellation_marks_remaining_items_skipped() {
     }
 
     let operation = batch_operations::submit_batch_operation(
-        client.pool(),
+        pool,
         SubmitBatchOperation {
             spec: BatchOperationSpec::SetPriority { priority: 1 },
             filter: BatchOperationFilter {
@@ -364,19 +252,19 @@ async fn test_batch_operation_cancellation_marks_remaining_items_skipped() {
     .expect("submit batch op");
 
     let runner = uuid::Uuid::new_v4();
-    let first = batch_operations::run_one_batch_operation_chunk(client.pool(), runner, 1)
+    let first = batch_operations::run_one_batch_operation_chunk(pool, runner, 1)
         .await
         .expect("first chunk");
     assert_eq!(first.processed, 1);
-    batch_operations::request_batch_operation_cancellation(client.pool(), operation.id)
+    batch_operations::request_batch_operation_cancellation(pool, operation.id)
         .await
         .expect("request cancellation");
-    let second = batch_operations::run_one_batch_operation_chunk(client.pool(), runner, 10)
+    let second = batch_operations::run_one_batch_operation_chunk(pool, runner, 10)
         .await
         .expect("cancellation chunk");
     assert!(second.finalized);
 
-    let operation = batch_operations::get_batch_operation(client.pool(), operation.id)
+    let operation = batch_operations::get_batch_operation(pool, operation.id)
         .await
         .expect("get operation");
     assert_eq!(
@@ -390,17 +278,12 @@ async fn test_batch_operation_cancellation_marks_remaining_items_skipped() {
 
 #[tokio::test]
 async fn test_maintenance_leader_processes_batch_operations() {
-    let _guard = test_lock().lock().await;
-    let client = setup_with_connections(8).await;
+    let db = queue_storage_db(8).await;
+    let pool = db.pool();
     let queue = "integ_batch_maintenance";
-    clean_queue(client.pool(), queue).await;
-    sqlx::query("DELETE FROM awa.batch_operations")
-        .execute(client.pool())
-        .await
-        .expect("clean batch operations");
 
     let job = insert_with(
-        client.pool(),
+        pool,
         &SendEmail {
             to: "maint@example.com".into(),
             subject: "Maintenance".into(),
@@ -415,7 +298,7 @@ async fn test_maintenance_leader_processes_batch_operations() {
     .unwrap();
 
     let operation = batch_operations::submit_batch_operation(
-        client.pool(),
+        pool,
         SubmitBatchOperation {
             spec: BatchOperationSpec::SetPriority { priority: 1 },
             filter: BatchOperationFilter {
@@ -429,7 +312,7 @@ async fn test_maintenance_leader_processes_batch_operations() {
     .await
     .expect("submit batch op");
 
-    let runtime = Client::builder(client.pool().clone())
+    let runtime = Client::builder(pool.clone())
         .queue("integ_batch_maintenance_idle", QueueConfig::default())
         .build()
         .unwrap();
@@ -437,7 +320,7 @@ async fn test_maintenance_leader_processes_batch_operations() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     loop {
-        let operation = batch_operations::get_batch_operation(client.pool(), operation.id)
+        let operation = batch_operations::get_batch_operation(pool, operation.id)
             .await
             .expect("get operation");
         if operation.state == batch_operations::BatchOperationState::Completed {
@@ -451,7 +334,7 @@ async fn test_maintenance_leader_processes_batch_operations() {
     }
     runtime.shutdown(Duration::from_secs(1)).await;
 
-    let updated = admin::get_job(client.pool(), job.id).await.unwrap();
+    let updated = admin::get_job(pool, job.id).await.unwrap();
     assert_eq!(updated.priority, 1);
 }
 
@@ -1930,13 +1813,12 @@ async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
 
 #[tokio::test]
 async fn test_admin_list_jobs() {
-    let _guard = test_lock().lock().await;
-    let client = setup().await;
+    let db = queue_storage_db(2).await;
+    let pool = db.pool();
     let queue = "integ_list_jobs";
-    clean_queue(client.pool(), queue).await;
 
     insert_with(
-        client.pool(),
+        pool,
         &SendEmail {
             to: "list@example.com".into(),
             subject: "List test".into(),
@@ -1954,7 +1836,9 @@ async fn test_admin_list_jobs() {
         queue: Some(queue.to_string()),
         ..Default::default()
     };
-    let jobs = admin::list_jobs(client.pool(), &filter).await.unwrap();
+    // The deprecated entry point still answers through the shared filter.
+    #[allow(deprecated)]
+    let jobs = admin::list_jobs(pool, &filter).await.unwrap();
     assert!(!jobs.is_empty());
     assert!(jobs.iter().all(|j| j.state == JobState::Available));
     assert!(jobs.iter().all(|j| j.queue == queue));

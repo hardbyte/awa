@@ -126,7 +126,7 @@ test.describe("Batch operations page", () => {
     });
 
     await page.goto("/batch-ops");
-    await page.locator("select").selectOption("move_queue");
+    await page.getByRole("combobox", { name: /^Operation/ }).selectOption("move_queue");
     await page.getByLabel("Queue filter").fill("e2e_test");
     await page.getByLabel("Kind filter").fill("e2e_job");
     await page.getByLabel("IDs filter").fill("800006");
@@ -136,6 +136,45 @@ test.describe("Batch operations page", () => {
     await expect(page.getByText("Preview matched 1 job(s)")).toBeVisible();
     await page.getByRole("button", { name: "Submit" }).click();
     await expect(page.getByRole("gridcell", { name: "move queue" })).toBeVisible();
+  });
+
+  test("sends tags, state and created bounds in the shared filter", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", async (route) => {
+      const body = route.request().postDataJSON();
+      expect(body.filter).toEqual({
+        queue: "e2e_test",
+        tag: ["e2e", "priority"],
+        state: "scheduled",
+        created_at_gte: "2026-10-01T00:00:00.000Z",
+      });
+      await route.fulfill({ json: { total_matched: 4, sample: [] } });
+    });
+
+    await page.goto("/batch-ops?queue=e2e_test&tags=e2e%2C%20priority&state=scheduled");
+    await page.getByLabel("Created from").fill("2026-10-01T00:00:00Z");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await expect(page.getByTestId("batch-preview-count")).toHaveText(
+      "4 eligible job(s) would change."
+    );
+  });
+
+  test("a created date that doesn't parse blocks preview and submit", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.goto("/batch-ops?queue=e2e_test");
+    await page.getByLabel("Created before").fill("2026-10-32");
+    await expect(page.getByRole("alert")).toHaveText("Created before is not a date");
+    await expect(page.getByRole("button", { name: "Preview" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();
+  });
+
+  test("an id beyond the exact range blocks preview and submit", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.goto("/batch-ops?queue=e2e_test");
+    await page.getByLabel("IDs filter").fill("9007199254740993");
+    await expect(page.getByRole("alert")).toHaveText("IDs must be whole job ids");
+    await expect(page.getByRole("button", { name: "Preview" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();
   });
 
   test("requests cancellation for an active operation", async ({ page }) => {

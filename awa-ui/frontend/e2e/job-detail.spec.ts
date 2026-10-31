@@ -1,4 +1,11 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
+
+/** Click the first job once the match count, which loads after the list
+ * and moves the rows, has rendered. */
+async function openFirstJob(page: Page, jobTable: Locator) {
+  await expect(page.getByTestId("match-count")).toBeVisible();
+  await jobTable.getByRole("row").nth(1).click();
+}
 
 test.describe("Job detail page", () => {
   test("dlq job detail redirects to /dlq/:id", async ({ page }) => {
@@ -30,7 +37,7 @@ test.describe("Job detail page", () => {
     const rows = jobTable.getByRole("row");
     await expect(rows).not.toHaveCount(1); // more than just header
 
-    await rows.nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
 
     await expect(
@@ -45,7 +52,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -64,7 +71,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -86,9 +93,10 @@ test.describe("Job detail page", () => {
       ),
       page.goto("/jobs?q=queue%3Alegacy_queue"),
     ]);
+    await expect(page.getByRole("heading", { name: "Queue: legacy_queue" })).toBeVisible();
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -113,7 +121,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
 
     await expect(page.getByText("Arguments")).toBeVisible({ timeout: 10000 });
@@ -131,7 +139,7 @@ test.describe("Job detail page", () => {
     await expect(jobTable).toBeVisible();
 
     // Seeded failed job should exist
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -147,7 +155,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
 
     await expect(
@@ -165,7 +173,7 @@ test.describe("Job detail page", () => {
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await expect(jobTable).toBeVisible();
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -194,7 +202,7 @@ test.describe("Job detail page", () => {
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await expect(jobTable).toBeVisible();
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -221,7 +229,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
 
     const backLink = page.getByRole("link", { name: /Back to jobs/ });
@@ -238,7 +246,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
     await page.waitForResponse((r) =>
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
@@ -260,7 +268,7 @@ test.describe("Job detail page", () => {
     ]);
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
-    await jobTable.getByRole("row").nth(1).click();
+    await openFirstJob(page, jobTable);
     await page.waitForURL(/\/jobs\/\d+/);
 
     // The copy button for arguments should be present

@@ -1,38 +1,26 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+use awa_model::dlq::{self, DlqRow, RetryFromDlqOpts};
+use awa_model::{AwaError, DlqPage, JobFilter};
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
-pub struct ListDlqParams {
-    pub kind: Option<String>,
-    pub queue: Option<String>,
-    pub tag: Option<String>,
-    pub before_id: Option<i64>,
-    /// Pair with `before_id` for a race-free `(dlq_at, id)` cursor that
-    /// matches the response sort order. Legacy callers omitting this get
-    /// the old id-only cursor.
-    pub before_dlq_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub limit: Option<i64>,
-}
-
+/// `GET /api/dlq`: the jobs endpoint's filter parameters, plus a
+/// `(before_dlq_at, before_id)` cursor matching the newest-first order.
 pub async fn list_dlq(
     State(state): State<AppState>,
-    Query(params): Query<ListDlqParams>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Vec<DlqRow>>, ApiError> {
-    let filter = ListDlqFilter {
-        kind: params.kind,
-        queue: params.queue,
-        tag: params.tag,
-        before_id: params.before_id,
-        before_dlq_at: params.before_dlq_at,
-        limit: params.limit,
+    let query = super::filter_params::parse(raw.as_deref())?;
+    let page = DlqPage {
+        before_dlq_at: query.before_dlq_at,
+        before_id: query.before_id,
+        limit: query.limit.unwrap_or(awa_model::filter::DEFAULT_PAGE_LIMIT),
     };
-    let rows = dlq::list_dlq(&state.pool, &filter).await?;
+    let rows = dlq::find_dlq(&state.pool, &query.filter, page).await?;
     Ok(Json(rows))
 }
 
@@ -105,7 +93,9 @@ pub async fn retry_dlq_job(
     Ok(Json(job))
 }
 
+/// The 0.6 body of `POST /api/dlq/bulk-retry` and `/bulk-purge`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkFilterPayload {
     #[serde(default)]
     pub kind: Option<String>,
@@ -119,6 +109,45 @@ pub struct BulkFilterPayload {
     pub all: bool,
 }
 
+impl BulkFilterPayload {
+    fn filter(&self) -> JobFilter {
+        JobFilter {
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            ..Default::default()
+        }
+        .tags(self.tag.clone())
+    }
+}
+
+/// The body of `POST /api/dlq/retry-matching` and `/purge-matching`: the full
+/// job filter (ADR-049). These are new paths rather than a new body on the
+/// 0.6 ones: a 0.6 server ignores fields it doesn't know, so any body it can
+/// reach is read as its flat fields, and `all: true` beside a filter it
+/// ignored would act on the whole DLQ. A 0.6 server answers these paths with
+/// 404 instead.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchingPayload {
+    pub filter: JobFilter,
+    /// Act on every row; only with an empty filter, where it is the explicit
+    /// opt-in the model layer requires.
+    #[serde(default)]
+    pub all: bool,
+}
+
+impl MatchingPayload {
+    fn filter(&self) -> Result<&JobFilter, ApiError> {
+        if self.all && !self.filter.is_empty() {
+            return Err(AwaError::Validation(
+                "`all` acts on the whole DLQ, so it can't be combined with a filter".to_string(),
+            )
+            .into());
+        }
+        Ok(&self.filter)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct CountResponse {
     pub count: u64,
@@ -128,19 +157,27 @@ pub async fn bulk_retry_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
+    retry_matching_filter(&state, &payload.filter(), payload.all).await
+}
+
+pub async fn retry_dlq_matching(
+    State(state): State<AppState>,
+    Json(payload): Json<MatchingPayload>,
+) -> Result<Json<CountResponse>, ApiError> {
+    retry_matching_filter(&state, payload.filter()?, payload.all).await
+}
+
+async fn retry_matching_filter(
+    state: &AppState,
+    filter: &JobFilter,
+    all: bool,
+) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
-    let queue_attr = payload.queue.clone();
-    let filter = ListDlqFilter {
-        kind: payload.kind,
-        queue: payload.queue,
-        tag: payload.tag,
-        ..Default::default()
-    };
-    let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
+    let count = dlq::bulk_retry_from_dlq_matching(&state.pool, filter, all).await?;
     if count > 0 {
         state
             .metrics
-            .record_dlq_retried(queue_attr.as_deref(), count);
+            .record_dlq_retried(filter.queue.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -167,19 +204,27 @@ pub async fn bulk_purge_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
+    purge_matching_filter(&state, &payload.filter(), payload.all).await
+}
+
+pub async fn purge_dlq_matching(
+    State(state): State<AppState>,
+    Json(payload): Json<MatchingPayload>,
+) -> Result<Json<CountResponse>, ApiError> {
+    purge_matching_filter(&state, payload.filter()?, payload.all).await
+}
+
+async fn purge_matching_filter(
+    state: &AppState,
+    filter: &JobFilter,
+    all: bool,
+) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
-    let queue_attr = payload.queue.clone();
-    let filter = ListDlqFilter {
-        kind: payload.kind,
-        queue: payload.queue,
-        tag: payload.tag,
-        ..Default::default()
-    };
-    let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
+    let count = dlq::purge_dlq_matching(&state.pool, filter, all).await?;
     if count > 0 {
         state
             .metrics
-            .record_dlq_purged(queue_attr.as_deref(), count);
+            .record_dlq_purged(filter.queue.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -226,4 +271,50 @@ pub async fn bulk_move_failed(
         );
     }
     Ok(Json(CountResponse { count }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(json: serde_json::Value) -> Result<BulkFilterPayload, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    fn matching(json: serde_json::Value) -> Result<MatchingPayload, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn the_06_paths_take_only_the_flat_fields() {
+        let body = flat(serde_json::json!({ "queue": "q", "tag": "a" })).unwrap();
+        assert_eq!(body.filter(), JobFilter::new().queue("q").tag("a"));
+        // A nested filter or a field 0.6 lacks belongs on the matching paths.
+        assert!(flat(serde_json::json!({ "filter": { "tag": "a" } })).is_err());
+        assert!(flat(serde_json::json!({ "queue": "q", "ids": [1] })).is_err());
+        assert!(flat(serde_json::json!({ "tag": ["a", "b"] })).is_err());
+    }
+
+    #[test]
+    fn the_matching_paths_take_the_whole_filter() {
+        let body = matching(serde_json::json!({
+            "filter": { "queue": "q", "tag": ["a", "b"], "ids": [1, 2] }
+        }))
+        .unwrap();
+        assert_eq!(
+            body.filter().unwrap(),
+            &JobFilter::new().queue("q").tags(["a", "b"]).ids([1, 2])
+        );
+        assert!(matching(serde_json::json!({ "queue": "q" })).is_err());
+        assert!(matching(serde_json::json!({ "filter": { "queue": "q" }, "kind": "k" })).is_err());
+    }
+
+    #[test]
+    fn all_is_only_for_an_empty_filter() {
+        let everything = matching(serde_json::json!({ "filter": {}, "all": true })).unwrap();
+        assert!(everything.filter().unwrap().is_empty());
+        let narrowed =
+            matching(serde_json::json!({ "filter": { "tag": ["a", "b"] }, "all": true })).unwrap();
+        assert!(narrowed.filter().is_err());
+    }
 }

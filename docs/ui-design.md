@@ -44,7 +44,12 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 GET  /api/stats                         Dashboard summary (state counts)
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
-GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=   (rows omit output)
+GET  /api/jobs?kind=&queue=&state=&tag=&ids=&dead_lettered=&created_at_gte=&created_at_lt=&limit=&before_id=
+                                        The shared job filter (ADR-049): `state` and `tag` repeat
+                                        (any of the states, all of the tags), `ids` is comma-separated.
+                                        Rows omit output. Unknown or empty parameters are a 400; a 0.6
+                                        server ignores unknown parameters and returns a wider list.
+GET  /api/jobs/count?<same filter>      { kind: "exact" | "at_least", value }; capped at 10,000
 GET  /api/jobs/:id                      Includes the job's output (ADR-048)
 POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
@@ -76,13 +81,15 @@ POST /api/cron/:name/trigger
 POST /api/cron/:name/pause              { paused_by? }
 POST /api/cron/:name/resume
 
-GET  /api/dlq?kind=&queue=&tag=&limit=&before_id=&before_dlq_at=
+GET  /api/dlq?<job filter>&limit=&before_id=&before_dlq_at=
 GET  /api/dlq/:id
 GET  /api/dlq/depth
 POST   /api/dlq/:id/retry
 DELETE /api/dlq/:id
-POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }
-POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }
+POST   /api/dlq/retry-matching          { filter, all? }   all only with an empty filter
+POST   /api/dlq/purge-matching          { filter, all? }   all only with an empty filter
+POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }   the 0.6 form
+POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }   the 0.6 form
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
 
 POST /api/callbacks/:callback_id/complete   { payload?, output? }

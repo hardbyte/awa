@@ -87,6 +87,7 @@ pub async fn router_with_identity(
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
+        .route("/jobs/count", get(handlers::jobs::count_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))
         .route("/jobs/{id}/retry", post(handlers::jobs::retry_job))
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))
@@ -155,6 +156,14 @@ pub async fn router_with_identity(
         .route("/dlq/{id}/retry", post(handlers::dlq::retry_dlq_job))
         .route("/dlq/bulk-retry", post(handlers::dlq::bulk_retry_dlq))
         .route("/dlq/bulk-purge", post(handlers::dlq::bulk_purge_dlq))
+        .route(
+            "/dlq/retry-matching",
+            post(handlers::dlq::retry_dlq_matching),
+        )
+        .route(
+            "/dlq/purge-matching",
+            post(handlers::dlq::purge_dlq_matching),
+        )
         .route("/dlq/bulk-move", post(handlers::dlq::bulk_move_failed))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime))

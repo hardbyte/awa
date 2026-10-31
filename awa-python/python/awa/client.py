@@ -51,14 +51,51 @@ BatchOperationState = Literal[
 ]
 
 
-class BatchOperationFilter(TypedDict, total=False):
+class JobFilter(TypedDict, total=False):
+    """Which jobs (ADR-049): every key set narrows the population.
+
+    ``tag`` takes one tag or a list, all of which a job must carry;
+    ``state`` takes one state or a list, any of which matches. An unknown
+    key is an error.
+    """
+
     kind: str
     queue: str
     ids: list[int]
-    tag: str
-    state: str
+    tag: str | list[str]
+    state: str | list[str]
+    dead_lettered: bool
     created_at_gte: dt.datetime | str
     created_at_lt: dt.datetime | str
+
+
+#: Batch operations take the shared job filter.
+BatchOperationFilter = JobFilter
+
+
+class JobCount(TypedDict):
+    """``exact`` is false when more than ``count`` jobs match."""
+
+    count: int
+    exact: bool
+
+
+def _merge_filter(filter: JobFilter | None, fields: dict[str, Any]) -> JobFilter | None:
+    """Layer keyword filter fields over a filter dict.
+
+    Every field narrows, so a keyword that disagrees with the dict is an
+    error rather than a replacement.
+    """
+    if not fields:
+        return filter
+    merged: dict[str, Any] = dict(filter or {})
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if merged.get(key) is not None and merged[key] != value:
+            raise ValueError(f"{key}={value!r} conflicts with the filter's {key} {merged[key]!r}")
+        merged[key] = value
+    return merged  # type: ignore[return-value]
 
 
 class BatchOperationPreview(TypedDict, total=False):
@@ -417,12 +454,41 @@ class AsyncClient:
         state: str | None = None,
         kind: str | None = None,
         queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
         limit: int = 100,
     ) -> list[Job]:
-        """List jobs with optional filters."""
+        """List jobs newest first. ``find_jobs`` takes the full filter."""
         return await self._raw.list_jobs(
-            state=state, kind=kind, queue=queue, limit=limit
+            state=state,
+            kind=kind,
+            queue=queue,
+            tag=tag,
+            before_id=before_id,
+            limit=limit,
         )
+
+    async def find_jobs(
+        self,
+        filter: JobFilter | None = None,
+        *,
+        before_id: int | None = None,
+        limit: int = 100,
+        **fields: Any,
+    ) -> list[Job]:
+        """Jobs matching a filter, newest first (ADR-049).
+
+        Filter fields may be passed as a dict, as keywords, or both, as
+        long as they agree. Pass the last job's id as ``before_id`` for the next
+        page.
+        """
+        return await self._raw.find_jobs(
+            _merge_filter(filter, fields), before_id=before_id, limit=limit
+        )
+
+    async def count_jobs(self, filter: JobFilter | None = None, **fields: Any) -> JobCount:
+        """How many jobs a filter selects, exact up to 10,000."""
+        return await self._raw.count_jobs(_merge_filter(filter, fields))
 
     # --- Durable batch operations -----------------------------------------
     #
@@ -562,6 +628,7 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: JobFilter | None = None,
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         limit: int = 100,
@@ -571,6 +638,7 @@ class AsyncClient:
             kind=kind,
             queue=queue,
             tag=tag,
+            filter=filter,
             before_id=before_id,
             before_dlq_at=before_dlq_at,
             limit=limit,
@@ -607,11 +675,12 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: JobFilter | None = None,
         allow_all: bool = False,
     ) -> int:
         """Bulk-retry DLQ rows matching the filter. Returns revived count."""
         return await self._raw.bulk_retry_from_dlq(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind, queue=queue, tag=tag, filter=filter, allow_all=allow_all
         )
 
     async def move_failed_to_dlq(
@@ -643,6 +712,7 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: JobFilter | None = None,
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
@@ -652,6 +722,7 @@ class AsyncClient:
             kind=kind,
             queue=queue,
             tag=tag,
+            filter=filter,
             before_id=before_id,
             before_dlq_at=before_dlq_at,
             allow_all=allow_all,
@@ -1271,12 +1342,36 @@ class Client:
         state: str | None = None,
         kind: str | None = None,
         queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
         limit: int = 100,
     ) -> list[Job]:
-        """List jobs with optional filters."""
+        """List jobs newest first. ``find_jobs`` takes the full filter."""
         return self._raw.list_jobs_sync(
-            state=state, kind=kind, queue=queue, limit=limit
+            state=state,
+            kind=kind,
+            queue=queue,
+            tag=tag,
+            before_id=before_id,
+            limit=limit,
         )
+
+    def find_jobs(
+        self,
+        filter: JobFilter | None = None,
+        *,
+        before_id: int | None = None,
+        limit: int = 100,
+        **fields: Any,
+    ) -> list[Job]:
+        """Jobs matching a filter, newest first (ADR-049)."""
+        return self._raw.find_jobs_sync(
+            _merge_filter(filter, fields), before_id=before_id, limit=limit
+        )
+
+    def count_jobs(self, filter: JobFilter | None = None, **fields: Any) -> JobCount:
+        """How many jobs a filter selects, exact up to 10,000."""
+        return self._raw.count_jobs_sync(_merge_filter(filter, fields))
 
     # --- Durable batch operations (sync) ----------------------------------
 
@@ -1456,6 +1551,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: JobFilter | None = None,
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         limit: int = 100,
@@ -1465,6 +1561,7 @@ class Client:
             kind=kind,
             queue=queue,
             tag=tag,
+            filter=filter,
             before_id=before_id,
             before_dlq_at=before_dlq_at,
             limit=limit,
@@ -1501,11 +1598,12 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: JobFilter | None = None,
         allow_all: bool = False,
     ) -> int:
         """Bulk-retry DLQ rows matching the filter."""
         return self._raw.bulk_retry_from_dlq_sync(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind, queue=queue, tag=tag, filter=filter, allow_all=allow_all
         )
 
     def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None:
@@ -1535,6 +1633,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: JobFilter | None = None,
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
@@ -1544,6 +1643,7 @@ class Client:
             kind=kind,
             queue=queue,
             tag=tag,
+            filter=filter,
             before_id=before_id,
             before_dlq_at=before_dlq_at,
             allow_all=allow_all,

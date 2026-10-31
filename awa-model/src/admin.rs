@@ -524,89 +524,6 @@ async fn notify_cancellation_tx<'a>(
     Ok(())
 }
 
-async fn list_queue_storage_jobs(
-    store: &QueueStorage,
-    pool: &PgPool,
-    filter: &ListJobsFilter,
-) -> Result<Vec<JobRow>, AwaError> {
-    let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
-    let candidate_limit = if filter.tag.is_some() {
-        limit.saturating_mul(10).min(5000)
-    } else {
-        limit.saturating_mul(3).min(2000)
-    };
-
-    let sql = format!(
-        "{} \
-         SELECT job_id \
-         FROM current_jobs \
-         WHERE ($1::awa.job_state IS NULL OR state = $1) \
-           AND ($2::text IS NULL OR kind = $2) \
-           AND ($3::text IS NULL OR queue = $3) \
-           AND ($4::bigint IS NULL OR job_id < $4) \
-         ORDER BY job_id DESC \
-         LIMIT $5",
-        queue_storage_current_jobs_cte(store.schema())
-    );
-
-    let mut jobs = Vec::new();
-    let mut cursor = filter.before_id;
-
-    loop {
-        let ids: Vec<i64> = sqlx::query_scalar(audited_sql(sql.clone()))
-            .bind(filter.state)
-            .bind(&filter.kind)
-            .bind(&filter.queue)
-            .bind(cursor)
-            .bind(candidate_limit)
-            .fetch_all(pool)
-            .await?;
-        if ids.is_empty() {
-            break;
-        }
-
-        for job_id in &ids {
-            let Some(job) = store.load_job_without_output(pool, *job_id).await? else {
-                continue;
-            };
-
-            if let Some(state) = filter.state {
-                if job.state != state {
-                    continue;
-                }
-            }
-            if let Some(kind) = &filter.kind {
-                if &job.kind != kind {
-                    continue;
-                }
-            }
-            if let Some(queue) = &filter.queue {
-                if &job.queue != queue {
-                    continue;
-                }
-            }
-            if let Some(tag) = &filter.tag {
-                if !job.tags.iter().any(|job_tag| job_tag == tag) {
-                    continue;
-                }
-            }
-
-            jobs.push(job);
-            if jobs.len() as i64 >= limit {
-                break;
-            }
-        }
-
-        if jobs.len() as i64 >= limit || ids.len() < candidate_limit as usize {
-            break;
-        }
-        cursor = ids.last().copied();
-    }
-
-    jobs.sort_by_key(|job| std::cmp::Reverse(job.id));
-    Ok(jobs)
-}
-
 /// Retry a single failed, cancelled, or waiting_external job.
 pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
@@ -2619,6 +2536,10 @@ where
 }
 
 /// List jobs with optional filters.
+///
+/// Superseded by [`JobFilter`](crate::filter::JobFilter) and [`find_jobs`]
+/// (ADR-049), which add multiple tags and states, ids, created-at bounds and
+/// dead-lettered jobs, and keep paging out of the filter.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ListJobsFilter {
     pub state: Option<JobState>,
@@ -2629,36 +2550,92 @@ pub struct ListJobsFilter {
     pub limit: Option<i64>,
 }
 
-/// List jobs matching the given filter.
-pub async fn list_jobs(pool: &PgPool, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
-        return list_queue_storage_jobs(&store, pool, filter).await;
+impl ListJobsFilter {
+    /// The equivalent filter and page.
+    pub fn split(&self) -> (crate::filter::JobFilter, crate::filter::JobPage) {
+        let filter = crate::filter::JobFilter {
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            states: self.state.into_iter().collect(),
+            tags: self.tag.clone().into_iter().collect(),
+            ..Default::default()
+        };
+        let page = crate::filter::JobPage {
+            before_id: self.before_id,
+            limit: self.limit.unwrap_or(crate::filter::DEFAULT_PAGE_LIMIT),
+        };
+        (filter, page)
     }
+}
 
-    let limit = filter.limit.unwrap_or(100);
+/// List jobs matching the given filter.
+#[deprecated(
+    since = "0.7.0",
+    note = "use `find_jobs` with a `JobFilter` and `JobPage`"
+)]
+pub async fn list_jobs(pool: &PgPool, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError> {
+    let (filter, page) = filter.split();
+    find_jobs(pool, &filter, page).await
+}
 
-    let rows = sqlx::query_as::<_, JobRow>(
-        r#"
-        SELECT * FROM awa.jobs
-        WHERE ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
-          AND ($5::bigint IS NULL OR id < $5)
-        ORDER BY id DESC
-        LIMIT $6
-        "#,
+/// Jobs matching `filter`, newest first, one page at a time (ADR-049).
+///
+/// Each job appears once, in its current state. A job whose claim is in
+/// flight may be missed or shown in its previous state; keyset paging on ids
+/// never repeats a job across pages, though a job can change state between
+/// them.
+pub async fn find_jobs(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+    page: crate::filter::JobPage,
+) -> Result<Vec<JobRow>, AwaError> {
+    filter.validate()?;
+    crate::job_query::find(
+        pool,
+        filter,
+        &crate::job_query::ALL_STATES,
+        crate::job_query::Window::NewestFirst {
+            before_id: page.before_id,
+            limit: page.clamped_limit(),
+        },
     )
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.before_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    .await
+}
 
-    Ok(rows)
+/// [`find_jobs`], with DLQ metadata for each job that is dead-lettered, so
+/// a caller can send actions on it through the DLQ rather than the job
+/// endpoints.
+pub async fn find_jobs_with_source(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+    page: crate::filter::JobPage,
+) -> Result<Vec<(JobRow, Option<DlqMetadata>)>, AwaError> {
+    let jobs = find_jobs(pool, filter, page).await?;
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    let mut dlq = crate::dlq::dlq_metadata_for(pool, &ids).await?;
+    Ok(jobs
+        .into_iter()
+        .map(|job| {
+            let metadata = dlq.remove(&job.id);
+            (job, metadata)
+        })
+        .collect())
+}
+
+/// How many jobs `filter` selects: exact up to
+/// [`COUNT_CAP`](crate::filter::COUNT_CAP), otherwise at least that many.
+pub async fn count_jobs(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+) -> Result<crate::filter::JobCount, AwaError> {
+    filter.validate()?;
+    crate::job_query::count(
+        pool,
+        filter,
+        &crate::job_query::ALL_STATES,
+        Some(crate::filter::COUNT_CAP),
+    )
+    .await
 }
 
 /// Get a single job by ID.

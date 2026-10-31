@@ -14,7 +14,7 @@ import {
 import type { DlqRow, ListDlqParams } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import { SearchBar, parseSearch } from "@/components/SearchBar";
+import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,11 +62,17 @@ export function DlqPage() {
   const poll = usePollInterval();
 
   const searchFilters = parseSearch(filters.search);
+  // A term that doesn't parse is left out of a request, so it would widen
+  // what is listed and what a bulk action touches.
+  const searchError = termError(filters.search);
 
   const params: ListDlqParams = {
     kind: searchFilters.kind,
     queue: searchFilters.queue,
-    tag: searchFilters.tag,
+    tags: searchFilters.tags,
+    ids: searchFilters.ids,
+    created_at_gte: toRfc3339(searchFilters.createdGte),
+    created_at_lt: toRfc3339(searchFilters.createdLt),
     before_id: filters.beforeId,
     before_dlq_at: filters.beforeDlqAt,
     limit: filters.limit,
@@ -75,6 +81,7 @@ export function DlqPage() {
   const dlqQuery = useQuery<DlqRow[]>({
     queryKey: ["dlq", params],
     queryFn: () => fetchDlq(params),
+    enabled: !searchError,
     refetchInterval: poll.interval,
     staleTime: poll.staleTime,
   });
@@ -91,7 +98,10 @@ export function DlqPage() {
       bulkRetryDlq({
         kind: searchFilters.kind,
         queue: searchFilters.queue,
-        tag: searchFilters.tag,
+        tags: searchFilters.tags,
+        ids: searchFilters.ids,
+        created_at_gte: toRfc3339(searchFilters.createdGte),
+        created_at_lt: toRfc3339(searchFilters.createdLt),
       }),
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: ["dlq"] });
@@ -107,7 +117,10 @@ export function DlqPage() {
       bulkPurgeDlq({
         kind: searchFilters.kind,
         queue: searchFilters.queue,
-        tag: searchFilters.tag,
+        tags: searchFilters.tags,
+        ids: searchFilters.ids,
+        created_at_gte: toRfc3339(searchFilters.createdGte),
+        created_at_lt: toRfc3339(searchFilters.createdLt),
       }),
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: ["dlq"] });
@@ -120,9 +133,9 @@ export function DlqPage() {
   const [showRetryConfirm, setShowRetryConfirm] = useState(false);
   const [showPurgeConfirm, setShowPurgeConfirm] = useState(false);
 
-  const rows = dlqQuery.data ?? [];
-  const hasActiveFilter =
-    !!searchFilters.kind || !!searchFilters.queue || !!searchFilters.tag;
+  // As on the jobs page: cached rows for the wider search stay hidden.
+  const rows = searchError ? [] : dlqQuery.data ?? [];
+  const hasActiveFilter = Object.keys(searchFilters).length > 0;
 
   const setUrlParams = useCallback(
     (updates: Record<string, string | undefined>) => {
@@ -172,7 +185,7 @@ export function DlqPage() {
           <Button
             size="xs"
             onPress={() => setShowRetryConfirm(true)}
-            isDisabled={retryFilterMutation.isPending}
+            isDisabled={retryFilterMutation.isPending || !!searchError}
           >
             Retry matching ({rows.length}+)
           </Button>
@@ -181,11 +194,18 @@ export function DlqPage() {
             size="xs"
             className="text-danger"
             onPress={() => setShowPurgeConfirm(true)}
-            isDisabled={purgeFilterMutation.isPending}
+            isDisabled={purgeFilterMutation.isPending || !!searchError}
           >
             Purge matching
           </Button>
         </div>
+      )}
+
+      {searchError && (
+        <p className="text-sm text-danger" role="alert">
+          {searchError}. Nothing is listed and bulk actions are off until the
+          search is fixed.
+        </p>
       )}
 
       <Table>

@@ -232,12 +232,20 @@ export type BatchOperationState =
   | "cancelled"
   | "failed";
 
+/**
+ * The JSON form of the shared job filter (ADR-049). Several tags or states go
+ * under `tag` or `state` as a list: a server from before ADR-049 refuses a
+ * list there, where it would ignore a new key and act on more jobs.
+ */
 export interface BatchOperationFilter {
   kind?: string;
   queue?: string;
   ids?: number[];
-  tag?: string;
-  state?: string;
+  /** All of these tags. */
+  tag?: string | string[];
+  /** Any of these states. */
+  state?: string | string[];
+  dead_lettered?: boolean;
   created_at_gte?: string;
   created_at_lt?: string;
 }
@@ -335,13 +343,49 @@ export function effectiveEngine(
   return routed ? "queue_storage" : "canonical";
 }
 
-export interface ListJobsParams {
-  state?: string;
+/** A job filter (ADR-049), as the jobs and DLQ endpoints take it. */
+export interface JobFilterParams {
   kind?: string;
   queue?: string;
+  /** Any of these states. */
+  states?: string[];
+  /** All of these tags. */
+  tags?: string[];
+  ids?: number[];
+  dead_lettered?: boolean;
+  created_at_gte?: string;
+  created_at_lt?: string;
+}
+
+export interface ListJobsParams extends JobFilterParams {
+  /** One state; kept for callers that predate `states`. */
+  state?: string;
+  /** One tag; kept for callers that predate `tags`. */
   tag?: string;
   before_id?: number;
   limit?: number;
+}
+
+/** `kind` is `at_least` when more jobs match than the server counts. */
+export interface JobCount {
+  kind: "exact" | "at_least";
+  value: number;
+}
+
+/** Query string for a filter: `tag` and `state` repeat, `ids` is a list. */
+function jobFilterQuery(params: ListJobsParams): URLSearchParams {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    if (k === "tags" || k === "states") {
+      for (const item of v as string[]) qs.append(k === "tags" ? "tag" : "state", item);
+    } else if (k === "ids") {
+      if ((v as number[]).length > 0) qs.set("ids", (v as number[]).join(","));
+    } else {
+      qs.append(k, String(v));
+    }
+  }
+  return qs;
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -358,12 +402,15 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
 // Jobs
 export function fetchJobs(params: ListJobsParams = {}): Promise<JobRow[]> {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
-  }
-  const query = qs.toString();
+  const query = jobFilterQuery(params).toString();
   return apiFetch(`/jobs${query ? `?${query}` : ""}`);
+}
+
+/** How many jobs a filter selects; exact up to the server's cap. */
+export function fetchJobCount(params: ListJobsParams = {}): Promise<JobCount> {
+  const { before_id: _before, limit: _limit, ...filter } = params;
+  const query = jobFilterQuery(filter).toString();
+  return apiFetch(`/jobs/count${query ? `?${query}` : ""}`);
 }
 
 export function fetchJob(id: number): Promise<JobRow> {
@@ -431,9 +478,7 @@ export function cancelBatchOperation(id: string): Promise<BatchOperation> {
 }
 
 // Dead Letter Queue
-export interface ListDlqParams {
-  kind?: string;
-  queue?: string;
+export interface ListDlqParams extends JobFilterParams {
   tag?: string;
   before_id?: number;
   /** Pair with `before_id` for a race-free `(dlq_at, id)` cursor matching
@@ -452,11 +497,7 @@ export interface DlqBulkResult {
 }
 
 export function fetchDlq(params: ListDlqParams = {}): Promise<DlqRow[]> {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
-  }
-  const query = qs.toString();
+  const query = jobFilterQuery(params).toString();
   return apiFetch(`/dlq${query ? `?${query}` : ""}`);
 }
 
@@ -482,25 +523,33 @@ export function purgeDlqJob(id: number): Promise<DlqBulkResult> {
   return apiFetch(`/dlq/${id}`, { method: "DELETE" });
 }
 
-export function bulkRetryDlq(filter: {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-}): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-retry", {
+/** A filter in its JSON form: one value bare, several as a list. */
+export function toWireFilter(filter: JobFilterParams): BatchOperationFilter {
+  const { tags = [], states = [], ids, ...rest } = filter;
+  const wire: BatchOperationFilter = {};
+  for (const [k, v] of Object.entries(rest)) {
+    if (v !== undefined && v !== null && v !== "") (wire as Record<string, unknown>)[k] = v;
+  }
+  if (ids && ids.length > 0) wire.ids = ids;
+  if (tags.length > 0) wire.tag = tags.length === 1 ? tags[0] : tags;
+  if (states.length > 0) wire.state = states.length === 1 ? states[0] : states;
+  return wire;
+}
+
+// The full filter goes to the `*-matching` endpoints, which a server from
+// before ADR-049 doesn't have, so it refuses rather than reading the body as
+// its flat fields.
+export function bulkRetryDlq(filter: JobFilterParams): Promise<DlqBulkResult> {
+  return apiFetch("/dlq/retry-matching", {
     method: "POST",
-    body: JSON.stringify(filter),
+    body: JSON.stringify({ filter: toWireFilter(filter) }),
   });
 }
 
-export function bulkPurgeDlq(filter: {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-}): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-purge", {
+export function bulkPurgeDlq(filter: JobFilterParams): Promise<DlqBulkResult> {
+  return apiFetch("/dlq/purge-matching", {
     method: "POST",
-    body: JSON.stringify(filter),
+    body: JSON.stringify({ filter: toWireFilter(filter) }),
   });
 }
 

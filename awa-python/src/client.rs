@@ -8,7 +8,7 @@ use crate::transaction::{
     PyTransaction,
 };
 use crate::worker::PythonWorker;
-use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
+use awa_model::admin::{JobKindDescriptor, QueueDescriptor};
 use awa_model::batch_operations::{
     BatchOperationFilter, BatchOperationKind, BatchOperationSpec, BatchOperationState,
     ListBatchOperationsFilter, SubmitBatchOperation,
@@ -1347,26 +1347,32 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, state=None, kind=None, queue=None, limit=100))]
+    #[pyo3(signature = (*, state=None, kind=None, queue=None, tag=None, before_id=None, limit=100))]
+    #[allow(clippy::too_many_arguments)]
     fn list_jobs<'py>(
         &self,
         py: Python<'py>,
         state: Option<String>,
         kind: Option<String>,
         queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
         limit: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let parsed_state = state.as_deref().map(parse_job_state).transpose()?;
         crate::async_bridge::future_into_py(py, async move {
-            let filter = ListJobsFilter {
-                state: parsed_state,
+            let mut filter = awa_model::JobFilter {
                 kind,
                 queue,
-                limit: Some(limit),
                 ..Default::default()
-            };
-            let jobs = awa_model::admin::list_jobs(&pool, &filter)
+            }
+            .tags(tag);
+            if let Some(state) = parsed_state {
+                filter = filter.state(state);
+            }
+            let page = awa_model::JobPage { before_id, limit };
+            let jobs = awa_model::admin::find_jobs(&pool, &filter, page)
                 .await
                 .map_err(map_awa_error)?;
             Python::attach(|py| {
@@ -1376,6 +1382,49 @@ impl PyClient {
                 }
                 Ok(list.unbind())
             })
+        })
+    }
+
+    /// Jobs matching a filter dict (ADR-049), newest first.
+    #[pyo3(signature = (filter=None, *, before_id=None, limit=100))]
+    fn find_jobs<'py>(
+        &self,
+        py: Python<'py>,
+        filter: Option<Py<PyAny>>,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let filter = crate::filter::parse_job_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        crate::async_bridge::future_into_py(py, async move {
+            let page = awa_model::JobPage { before_id, limit };
+            let jobs = awa_model::admin::find_jobs(&pool, &filter, page)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                let list = pyo3::types::PyList::empty(py);
+                for job in jobs {
+                    list.append(Py::new(py, PyJob::from(job))?)?;
+                }
+                Ok(list.unbind())
+            })
+        })
+    }
+
+    /// How many jobs a filter dict selects, capped (ADR-049).
+    #[pyo3(signature = (filter=None))]
+    fn count_jobs<'py>(
+        &self,
+        py: Python<'py>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let filter = crate::filter::parse_job_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        crate::async_bridge::future_into_py(py, async move {
+            let count = awa_model::admin::count_jobs(&pool, &filter)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| crate::filter::count_to_py(py, count))
         })
     }
 
@@ -1390,10 +1439,10 @@ impl PyClient {
         })
     }
 
-    /// List DLQ entries, optionally filtered by kind/queue/tag. `before_id`
-    /// enables cursor pagination (pass the smallest id from the previous
-    /// page). Rows are ordered by `dlq_at DESC, id DESC`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
+    /// List DLQ entries, filtered by a filter dict and/or kind/queue/tag,
+    /// newest first by `(dlq_at, id)`. Pass the last row's `dlq_at` and id as
+    /// `before_dlq_at` and `before_id` for the next page.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, before_id=None, before_dlq_at=None, limit=100))]
     #[allow(clippy::too_many_arguments)]
     fn list_dlq<'py>(
         &self,
@@ -1401,15 +1450,25 @@ impl PyClient {
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        filter: Option<Py<PyAny>>,
         before_id: Option<i64>,
         before_dlq_at: Option<DateTime<Utc>>,
         limit: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let filter = crate::filter::with_legacy_fields(
+            crate::filter::parse_job_filter(py, filter.as_ref())?,
+            kind,
+            queue,
+            tag,
+        )?;
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let filter =
-                crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
-            let rows = awa_model::dlq::list_dlq(&pool, &filter)
+            let page = awa_model::DlqPage {
+                before_dlq_at,
+                before_id,
+                limit,
+            };
+            let rows = awa_model::dlq::find_dlq(&pool, &filter, page)
                 .await
                 .map_err(map_awa_error)?;
             Python::attach(|py| {
@@ -1625,29 +1684,33 @@ impl PyClient {
         })
     }
 
-    /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
-    ///
-    /// Requires at least one of `kind`, `queue`, or `tag` unless
+    /// Bulk retry DLQ rows matching a filter dict and/or kind/queue/tag.
+    /// Returns the count of revived jobs. Requires a filter unless
     /// `allow_all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, allow_all=false))]
     fn bulk_retry_from_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        filter: Option<Py<PyAny>>,
         allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let filter = crate::filter::with_legacy_fields(
+            crate::filter::parse_job_filter(py, filter.as_ref())?,
+            kind,
+            queue,
+            tag,
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let queue_attr = queue.clone();
-            let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
-            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
+            let count = awa_model::dlq::bulk_retry_from_dlq_matching(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
             if count > 0 {
-                metrics.record_dlq_retried(queue_attr.as_deref(), count);
+                metrics.record_dlq_retried(filter.queue.as_deref(), count);
             }
             Ok(count)
         })
@@ -1739,11 +1802,9 @@ impl PyClient {
         })
     }
 
-    /// Bulk-purge DLQ rows matching the filter.
-    ///
-    /// Requires at least one of `kind`, `queue`, or `tag` unless
-    /// `allow_all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    /// Purge DLQ rows matching a filter dict and/or kind/queue/tag. Requires
+    /// a filter unless `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, before_id=None, before_dlq_at=None, allow_all=false))]
     #[allow(clippy::too_many_arguments)]
     fn purge_dlq<'py>(
         &self,
@@ -1751,20 +1812,31 @@ impl PyClient {
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        filter: Option<Py<PyAny>>,
         before_id: Option<i64>,
         before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let filter = crate::filter::with_legacy_fields(
+            crate::filter::parse_job_filter(py, filter.as_ref())?,
+            kind,
+            queue,
+            tag,
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let queue_attr = queue.clone();
-            let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
-            let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
-                .await
-                .map_err(map_awa_error)?;
+            let count = awa_model::dlq::purge_dlq_matching_before(
+                &pool,
+                &filter,
+                before_dlq_at,
+                before_id,
+                allow_all,
+            )
+            .await
+            .map_err(map_awa_error)?;
             if count > 0 {
-                metrics.record_dlq_purged(queue_attr.as_deref(), count);
+                metrics.record_dlq_purged(filter.queue.as_deref(), count);
             }
             Ok(count)
         })
@@ -2952,32 +3024,73 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, state=None, kind=None, queue=None, limit=100))]
+    #[pyo3(signature = (*, state=None, kind=None, queue=None, tag=None, before_id=None, limit=100))]
+    #[allow(clippy::too_many_arguments)]
     fn list_jobs_sync(
         &self,
         py: Python<'_>,
         state: Option<String>,
         kind: Option<String>,
         queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
         limit: i64,
     ) -> PyResult<Vec<PyJob>> {
         let pool = self.pool.clone();
         let parsed_state = state.as_deref().map(parse_job_state).transpose()?;
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let filter = ListJobsFilter {
-                    state: parsed_state,
+                let mut filter = awa_model::JobFilter {
                     kind,
                     queue,
-                    limit: Some(limit),
                     ..Default::default()
-                };
-                let jobs = awa_model::admin::list_jobs(&pool, &filter)
+                }
+                .tags(tag);
+                if let Some(state) = parsed_state {
+                    filter = filter.state(state);
+                }
+                let page = awa_model::JobPage { before_id, limit };
+                let jobs = awa_model::admin::find_jobs(&pool, &filter, page)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(jobs.into_iter().map(PyJob::from).collect())
             })
         })
+    }
+
+    #[pyo3(signature = (filter=None, *, before_id=None, limit=100))]
+    fn find_jobs_sync(
+        &self,
+        py: Python<'_>,
+        filter: Option<Py<PyAny>>,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> PyResult<Vec<PyJob>> {
+        let filter = crate::filter::parse_job_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let page = awa_model::JobPage { before_id, limit };
+                let jobs = awa_model::admin::find_jobs(&pool, &filter, page)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(jobs.into_iter().map(PyJob::from).collect())
+            })
+        })
+    }
+
+    #[pyo3(signature = (filter=None))]
+    fn count_jobs_sync(&self, py: Python<'_>, filter: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        let filter = crate::filter::parse_job_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        let count = py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::admin::count_jobs(&pool, &filter)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })?;
+        crate::filter::count_to_py(py, count)
     }
 
     #[pyo3(signature = (op_kind, spec, *, filter=None))]
@@ -3124,7 +3237,7 @@ impl PyClient {
 
     // --- DLQ sync versions -------------------------------------------------
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, before_id=None, before_dlq_at=None, limit=100))]
     #[allow(clippy::too_many_arguments)]
     fn list_dlq_sync(
         &self,
@@ -3132,16 +3245,26 @@ impl PyClient {
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        filter: Option<Py<PyAny>>,
         before_id: Option<i64>,
         before_dlq_at: Option<DateTime<Utc>>,
         limit: i64,
     ) -> PyResult<Vec<crate::dlq::PyDlqEntry>> {
+        let filter = crate::filter::with_legacy_fields(
+            crate::filter::parse_job_filter(py, filter.as_ref())?,
+            kind,
+            queue,
+            tag,
+        )?;
         let pool = self.pool.clone();
-        let filter =
-            crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let rows = awa_model::dlq::list_dlq(&pool, &filter)
+                let page = awa_model::DlqPage {
+                    before_dlq_at,
+                    before_id,
+                    limit,
+                };
+                let rows = awa_model::dlq::find_dlq(&pool, &filter, page)
                     .await
                     .map_err(map_awa_error)?;
                 Python::attach(|py| {
@@ -3217,26 +3340,31 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, allow_all=false))]
     fn bulk_retry_from_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        filter: Option<Py<PyAny>>,
         allow_all: bool,
     ) -> PyResult<u64> {
+        let filter = crate::filter::with_legacy_fields(
+            crate::filter::parse_job_filter(py, filter.as_ref())?,
+            kind,
+            queue,
+            tag,
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        let queue_attr = queue.clone();
-        let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
+                let count = awa_model::dlq::bulk_retry_from_dlq_matching(&pool, &filter, allow_all)
                     .await
                     .map_err(map_awa_error)?;
                 if count > 0 {
-                    metrics.record_dlq_retried(queue_attr.as_deref(), count);
+                    metrics.record_dlq_retried(filter.queue.as_deref(), count);
                 }
                 Ok(count)
             })
@@ -3321,7 +3449,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, filter=None, before_id=None, before_dlq_at=None, allow_all=false))]
     #[allow(clippy::too_many_arguments)]
     fn purge_dlq_sync(
         &self,
@@ -3329,21 +3457,32 @@ impl PyClient {
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        filter: Option<Py<PyAny>>,
         before_id: Option<i64>,
         before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
     ) -> PyResult<u64> {
+        let filter = crate::filter::with_legacy_fields(
+            crate::filter::parse_job_filter(py, filter.as_ref())?,
+            kind,
+            queue,
+            tag,
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        let queue_attr = queue.clone();
-        let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
-                    .await
-                    .map_err(map_awa_error)?;
+                let count = awa_model::dlq::purge_dlq_matching_before(
+                    &pool,
+                    &filter,
+                    before_dlq_at,
+                    before_id,
+                    allow_all,
+                )
+                .await
+                .map_err(map_awa_error)?;
                 if count > 0 {
-                    metrics.record_dlq_purged(queue_attr.as_deref(), count);
+                    metrics.record_dlq_purged(filter.queue.as_deref(), count);
                 }
                 Ok(count)
             })
@@ -3876,50 +4015,7 @@ fn parse_batch_operation_filter(
     py: Python<'_>,
     filter: Option<&Py<PyAny>>,
 ) -> PyResult<BatchOperationFilter> {
-    let Some(filter) = filter else {
-        return Ok(BatchOperationFilter::default());
-    };
-
-    let filter = filter.bind(py);
-    if filter.is_none() {
-        return Ok(BatchOperationFilter::default());
-    }
-
-    let dict: &Bound<'_, PyDict> = filter.cast().map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err("batch operation filter must be a dict or None")
-    })?;
-
-    let kind = optional_dict_item(dict, "kind")?
-        .map(|value| value.extract::<String>())
-        .transpose()?;
-    let queue = optional_dict_item(dict, "queue")?
-        .map(|value| value.extract::<String>())
-        .transpose()?;
-    let ids = optional_dict_item(dict, "ids")?
-        .map(|value| value.extract::<Vec<i64>>())
-        .transpose()?;
-    let tag = optional_dict_item(dict, "tag")?
-        .map(|value| value.extract::<String>())
-        .transpose()?;
-    let state = optional_dict_item(dict, "state")?
-        .map(|value| value.extract::<String>().and_then(|s| parse_job_state(&s)))
-        .transpose()?;
-    let created_at_gte = optional_dict_item(dict, "created_at_gte")?
-        .map(extract_datetime)
-        .transpose()?;
-    let created_at_lt = optional_dict_item(dict, "created_at_lt")?
-        .map(extract_datetime)
-        .transpose()?;
-
-    Ok(BatchOperationFilter {
-        kind,
-        queue,
-        ids,
-        tag,
-        state,
-        created_at_gte,
-        created_at_lt,
-    })
+    crate::filter::parse_job_filter(py, filter)
 }
 
 fn optional_dict_item<'py>(
@@ -3933,19 +4029,6 @@ fn required_dict_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bou
     optional_dict_item(dict, key)?.ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!("batch operation spec missing '{key}'"))
     })
-}
-
-fn extract_datetime(value: Bound<'_, PyAny>) -> PyResult<DateTime<Utc>> {
-    if let Ok(datetime) = value.extract::<DateTime<Utc>>() {
-        return Ok(datetime);
-    }
-
-    let text: String = value.extract()?;
-    DateTime::parse_from_rfc3339(&text)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid RFC3339 timestamp: {err}"))
-        })
 }
 
 fn batch_operation_to_py<T: serde::Serialize>(py: Python<'_>, value: &T) -> PyResult<Py<PyAny>> {

@@ -5,7 +5,7 @@
 //! that composes a `Job` with the extra metadata columns rather than
 //! duplicating every PyJob getter.
 
-use awa_model::dlq::{DlqRow, ListDlqFilter, RetryFromDlqOpts};
+use awa_model::dlq::{DlqRow, RetryFromDlqOpts};
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 
@@ -60,24 +60,6 @@ pub(crate) fn dlq_row_to_entry(py: Python<'_>, row: DlqRow) -> PyResult<PyDlqEnt
         dlq_at: meta.dlq_at,
         original_run_lease: meta.original_run_lease,
     })
-}
-
-pub(crate) fn build_filter(
-    kind: Option<String>,
-    queue: Option<String>,
-    tag: Option<String>,
-    before_id: Option<i64>,
-    before_dlq_at: Option<DateTime<Utc>>,
-    limit: Option<i64>,
-) -> ListDlqFilter {
-    ListDlqFilter {
-        kind,
-        queue,
-        tag,
-        before_id,
-        before_dlq_at,
-        limit,
-    }
 }
 
 pub(crate) fn build_retry_opts(
