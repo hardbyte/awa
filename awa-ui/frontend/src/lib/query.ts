@@ -3,8 +3,8 @@ import { QueryClient } from "@tanstack/react-query";
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      // Polling interval and staleTime are set per-query via
-      // usePollInterval() so the server can control the rate.
+      // Managed views use the tab observation scheduler. Catalog views
+      // retain their existing per-query polling and focus behavior.
       refetchInterval: false,
       refetchIntervalInBackground: false,
       refetchOnWindowFocus: "always",

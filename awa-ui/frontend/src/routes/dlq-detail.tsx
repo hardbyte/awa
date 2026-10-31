@@ -1,5 +1,5 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -22,7 +22,6 @@ import { JsonView } from "@/components/JsonView";
 import { OutputCard } from "@/components/OutputCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { timeAgo } from "@/lib/time";
-import { POLL } from "@/lib/constants";
 
 export function DlqDetailPage() {
   const { id } = useParams({ strict: false });
@@ -32,11 +31,10 @@ export function DlqDetailPage() {
   const readOnly = useReadOnly();
   const [showPurge, setShowPurge] = useState(false);
 
-  const rowQuery = useQuery<DlqRow | null>({
+  const rowQuery = useManagedQuery<DlqRow | null>({
     queryKey: ["dlq-job", jobId],
     queryFn: () => fetchDlqJob(jobId),
     enabled: !isNaN(jobId),
-    refetchInterval: POLL.SLOW,
   });
 
   const retryMutation = useMutation({
@@ -70,7 +68,7 @@ export function DlqDetailPage() {
   if (rowQuery.isLoading) {
     return <p className="p-4 text-sm">Loading…</p>;
   }
-  if (rowQuery.error) {
+  if (rowQuery.error && rowQuery.data === undefined) {
     return (
       <p className="p-4 text-sm text-danger">
         Error: {String(rowQuery.error)}
