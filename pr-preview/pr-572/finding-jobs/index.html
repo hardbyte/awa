@@ -2356,8 +2356,14 @@ nothing, and batch operations are still refused.</p>
 </tbody>
 </table>
 <p>A field that is not set does not narrow the population. Unknown fields are an
-error, so a typo cannot widen what a purge or batch operation acts on. In
-Rust the lists are the <code>states</code> and <code>tags</code> fields.</p>
+error, so a typo cannot widen what a purge or batch operation acts on. The
+same holds for the query parameters of <code>GET /api/jobs</code>, <code>/api/jobs/count</code> and
+<code>/api/dlq</code>, where an empty value is an error too. In Rust the lists are the
+<code>states</code> and <code>tags</code> fields.</p>
+<p>Listing and counting share one 30-second budget per request, across every
+pass over candidates and every load of their rows. A filter that needs longer
+fails with an error asking to narrow it. Batch operations scan without that
+budget, since a failed scan fails the operation.</p>
 <p>A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue,
 tag, ids or a created bound), or <code>allow_all</code>. Over HTTP the full filter goes
 to <code>POST /api/dlq/retry-matching</code> or <code>/api/dlq/purge-matching</code>:
