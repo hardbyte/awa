@@ -138,6 +138,7 @@ or unlimited settings must not defeat the bounds.
 | --- | --- |
 | Active managed query keys | 16 per tab; no silent eviction. |
 | Client read concurrency | 2 per tab; one in flight and one pending marker per exact key. |
+| Client request deadline | 20 seconds from dispatch through response-body decoding and protocol validation; finite and configured greater than the server whole-read deadline. |
 | Debounced dirty demand | 100 ms target, 500 ms maximum before becoming eligible; cooldown/backoff still applies. |
 | Cached refresh floor | At least advertised cache TTL/poll interval, currently at least 5 seconds. |
 | Uncached detail/page floor | At least 2 seconds between reads. |
@@ -156,6 +157,22 @@ existing two-second job-detail/operation intervals into this scheduler explicitl
 Repeated demand coalesces; continuous changes must neither starve results nor
 create an unbounded queue. The client deadline runs independently of pending
 network/body reads so a silent hung request is still aborted.
+
+The client deadline is one elapsed-time budget, not reset by headers, body bytes
+or retries within that attempt. On expiry, abort the request and fence its attempt
+identity before accepting any late completion. It cannot publish into the client
+cache/UI, clear dirty demand or renew successful-observation time after expiry;
+retain one pending demand under the normal backoff. Recheck expiry before
+publishing decoded data even if cancellation was ignored. The 20-second client
+default leaves transport margin over the 15-second server budget, not a network
+latency guarantee. Configuration must preserve a finite client budget greater
+than the server budget.
+
+The server independently enforces its 15-second whole-read deadline from entry
+to read admission (including waiting) through serialization. Client waiting/cancellation cannot extend it;
+candidate passes, loader queries and retries cannot reset it. Server cache-fill
+generation fences still apply: neither timeout nor late completion permits an
+obsolete fill to become current.
 
 A Rust future timeout does not prove SQL cancellation. Apply server-side limits
 to all candidate queries, loader transactions, repeated passes, aggregates and
@@ -263,6 +280,8 @@ Deterministic acceptance covers: initial/empty/over-cap registration; a dirty
 mark during the first or later read; interleaved resource demand; old responses
 following filter/backend changes; cache races; SQL timeout rollback and pool
 recovery; slow/hung/aborted reads; continuous demand; errors/backoff/Retry-After;
+client expiry with an ignored abort/late response and an invalidated late cache
+fill, proving neither is published as current and the server budget is not reset;
 old-server HTML/404/405 and capability/read requests routed to different versions;
 401/403; counts, paused selections and drafts; local rollback; peer mutations;
 heartbeat expiry without writes; page refill and retained-not-found presentation.
