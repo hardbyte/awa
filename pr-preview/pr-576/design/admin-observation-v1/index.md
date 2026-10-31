@@ -112,11 +112,28 @@ predicates, switching a filtered request to a permissive GET, or displaying an
 unsupported count as zero. New-server budgets cover permitted legacy fallbacks
 too; they do not establish new server-side guarantees on old binaries.
 
+When the strict adapters ship, their implementation must include upgrade notes
+and release notes for this availability tradeoff: a new UI routed to an older
+replica shows "filter unsupported" instead of filtered results. During a rolling
+deploy, filtered views can therefore alternate between success and unsupported
+as routing changes. Document that behavior and the deployment/routing mitigation;
+never hide it by falling back to a wider filtered GET. These adapters are proposed,
+not claimed to have shipped here.
+
 Fixing unknown/empty GET parsing on a current server is a separate improvement
 from this strict mixed-version read boundary. Neither strict JSON parsing in one
 path nor a `/v1` name makes an older GET implementation strict.
 
 ## Errors, deadlines and shared read budgets
+
+The admission, client/whole-read, statement and lock-wait budgets below apply to
+**interactive admin reads**: lists, details, previews, counts and status/aggregate
+reads. Batch-operation execution scans and DLQ bulk mutations keep their own
+policy and safeguards; this contract neither subjects them to the interactive
+budgets nor exempts them from all limits. Do not apply them globally to compiler
+paths or pooled sessions also used for execution scans or mutations. This preserves
+ADR-049's scan policy rather than making an interactive timeout fail a whole
+operation.
 
 Use structured JSON API errors: invalid versions/fields/values return 400,
 body-size excess 413, authorization/origin failure 401/403, admission excess
@@ -134,7 +151,7 @@ The following are finite experimental read/scheduler defaults, not production
 capacity commitments or freshness SLOs. Configure them with sanity checks; zero
 or unlimited settings must not defeat the bounds.
 
-| Bound | Initial setting |
+| Interactive-read bound | Initial setting |
 | --- | --- |
 | Active managed query keys | 16 per tab; no silent eviction. |
 | Client read concurrency | 2 per tab; one in flight and one pending marker per exact key. |
@@ -143,12 +160,18 @@ or unlimited settings must not defeat the bounds.
 | Cached refresh floor | At least advertised cache TTL/poll interval, currently at least 5 seconds. |
 | Uncached detail/page floor | At least 2 seconds between reads. |
 | Independent reconciliation | Nominal 30-second watchdog per active key, finite bounded jitter; expose the configured maximum. |
-| Server expensive reads | 4 simultaneous operations per process. |
-| Read admission | At most 16 waiters; at most 250 ms waiting; excess receives 429. |
-| Whole-read deadline | 15 seconds including admission, pool acquisition, all queries/passes and serialization. |
-| SQL statement limit | At most 5 seconds, also bounded by remaining whole-read deadline. |
-| SQL lock wait | At most 1 second, also bounded by remaining deadline. |
+| Server expensive interactive reads | 4 simultaneous operations per process. |
+| Interactive-read admission | At most 16 waiters; at most 250 ms waiting; excess receives 429. |
+| Interactive whole-read deadline | 15 seconds including admission, pool acquisition, all queries/passes and serialization. |
+| Interactive SQL statement limit | At most 5 seconds, also bounded by remaining whole-read deadline. |
+| Interactive SQL lock wait | At most 1 second, also bounded by remaining deadline. |
 | Repeated failure | Exponential backoff to 60 seconds; one pending demand retained. |
+
+During incidents, uncached filtered job pages are expected to degrade first as
+operators multiply demand: reads may receive 429 and the UI retains stale data.
+Cached aggregate views bypass expensive-read admission only on a cache hit.
+Their misses/refills compete for the same permits and waiters and can also be
+rejected; aggregate views have no blanket immunity from overload.
 
 One frontend scheduler handles periodic reads, reconciliation, focus/resume,
 mutation refreshes, retry and manual refresh. Managed React Query queries disable
@@ -168,17 +191,18 @@ default leaves transport margin over the 15-second server budget, not a network
 latency guarantee. Configuration must preserve a finite client budget greater
 than the server budget.
 
-The server independently enforces its 15-second whole-read deadline from entry
-to read admission (including waiting) through serialization. Client waiting/cancellation cannot extend it;
-candidate passes, loader queries and retries cannot reset it. Server cache-fill
+The server independently enforces its 15-second interactive whole-read deadline
+from entry to read admission (including waiting) through serialization. Client
+waiting/cancellation cannot extend it; candidate passes, loader queries and
+retries cannot reset it. Server cache-fill
 generation fences still apply: neither timeout nor late completion permits an
 obsolete fill to become current.
 
-A Rust future timeout does not prove SQL cancellation. Apply server-side limits
-to all candidate queries, loader transactions, repeated passes, aggregates and
-DLQ reads, bounded by the remaining whole-read budget. Cancellation must roll
-back or close outstanding work before pool reuse. Do not leak read timeout
-settings into mutation sessions. Cache hits may bypass expensive-read admission;
+A Rust future timeout does not prove SQL cancellation. For interactive reads,
+propagate server-side limits through all candidate queries, loader transactions,
+repeated passes, aggregates and DLQ inspection reads, bounded by the remaining
+interactive whole-read budget. Cancellation must roll back or close outstanding
+work before pool reuse. Do not leak read timeout settings into mutation sessions. Cache hits may bypass expensive-read admission;
 each fill acquires it once. Bound obsolete fills, filter cache cardinality and
 pool/connection use. Do not create a database task per registered tab query.
 
@@ -256,8 +280,10 @@ admin access safe.
 
 Each increment is independently useful with polling:
 
-1. Harden owning reads: strict adapters/capability and response checks, API error
-   fallback, bounded admission, whole-read deadlines and cancellation coverage.
+1. Harden interactive owning reads: strict adapters/capability and response checks,
+   API error fallback, bounded admission, whole-read deadlines and cancellation
+   coverage. Verify that batch execution scans and DLQ bulk mutations retain
+   their own policies. Ship the adapters' rolling-upgrade availability notes.
    Reuse #572's compiler; GET parsing/deadline repairs are shared follow-up work,
    not a transport dependency. Test empty install/read-only operation without a
    worker. Do not rename mutation endpoints for URI consistency.
@@ -288,12 +314,20 @@ heartbeat expiry without writes; page refill and retained-not-found presentation
 Tests must not demand every transient transition or a stronger snapshot than
 the owning API provides.
 
+Acceptance must distinguish interactive reads from execution/mutation paths:
+assert the interactive admission/whole-read/statement limits on the former
+without imposing them on batch scans or DLQ bulk mutations. Test uncached
+filtered-page overload, aggregate cache hits versus fills, and fail-closed filtered
+views when a new UI reaches an older replica; include the required upgrade notes
+with the adapters' release.
+
 Keep correctness/read-budget work separate from claims of production freshness.
 Distinguish source/pipeline lag where measured, transport/network activity, API
 latency and browser render age. Missing lag remains unknown, consumer-stage
 metrics cannot establish universal subsecond freshness, and the last histogram
-bucket does not identify an exact delay. No numeric release/SLO commitment is
-introduced. A later transport requires the ADR's separate evidence/owner decision.
+bucket does not identify an exact delay. Read-budget defaults are not freshness
+SLOs. Any later transport proposer supplies its numeric criteria and evaluation
+timeframe through the ADR's separate evidence/owner decision.
 
 ## Dependencies and source evidence
 
@@ -308,6 +342,8 @@ are evidence of current gaps/fixes, not a claim that this proposed contract ship
   starts a separate transaction using planning settings without installing that
   timeout. This does not establish a whole-read deadline. Fixes belong in the
   shared read layer/#572 follow-ups; verify the actual implementation base.
+  The batch-scan helpers deliberately pass no interactive timeout because a
+  timed-out scan fails the operation; those paths retain their separate policy.
 - [GET parsing](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/filter_params.rs)
   deliberately ignores unknown and empty values, including a test of that
   behavior. [Finding-jobs documentation](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/docs/finding-jobs.md)
