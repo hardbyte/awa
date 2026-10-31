@@ -196,7 +196,9 @@ export function JobsPage() {
     },
   });
 
-  const jobs = jobsQuery.data ?? [];
+  // A malformed term is left out of the query key, so the cache can hold the
+  // wider search's rows; show none of them beside the error.
+  const jobs = searchError ? [] : jobsQuery.data ?? [];
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 

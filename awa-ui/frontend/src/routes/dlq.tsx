@@ -133,7 +133,8 @@ export function DlqPage() {
   const [showRetryConfirm, setShowRetryConfirm] = useState(false);
   const [showPurgeConfirm, setShowPurgeConfirm] = useState(false);
 
-  const rows = dlqQuery.data ?? [];
+  // As on the jobs page: cached rows for the wider search stay hidden.
+  const rows = searchError ? [] : dlqQuery.data ?? [];
   const hasActiveFilter = Object.keys(searchFilters).length > 0;
 
   const setUrlParams = useCallback(

@@ -199,6 +199,23 @@ test.describe("Search bar filters", () => {
     expect(page.url()).not.toContain("abc");
   });
 
+  test("rows cached for the wider search are hidden beside the error", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs?") && r.ok()),
+      page.goto("/jobs?q=queue%3Ae2e_test"),
+    ]);
+    const rows = page.getByRole("row").filter({ hasText: "e2e_test" });
+    await expect(rows.first()).toBeVisible();
+    // An in-app navigation keeps the query cache, whose entry for the wider
+    // search shares a key with this one.
+    await page.evaluate(() => {
+      history.pushState({}, "", "/jobs?q=queue%3Ae2e_test%20id%3Aabc");
+      dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(page.getByRole("alert")).toContainText("whole job ids");
+    await expect(rows).toHaveCount(0);
+  });
+
   test("the DLQ keeps bulk actions off for a malformed term in the URL", async ({ page }) => {
     const bulkRequests: string[] = [];
     page.on("request", (r) => {

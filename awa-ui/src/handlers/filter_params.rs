@@ -30,7 +30,7 @@ fn parse_time(name: &str, value: &str) -> Result<DateTime<Utc>, ApiError> {
 
 /// Parse a raw query string. Unknown parameters and empty values are errors,
 /// as unknown fields are in the JSON filter: dropping either would return a
-/// wider list than the one asked for. (A 0.6 server ignores both.)
+/// wider list than the one asked for. (A 0.6 server ignores unknown ones.)
 pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
     let mut query = FilterQuery::default();
     let Some(raw) = raw else {

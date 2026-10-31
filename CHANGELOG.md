@@ -25,8 +25,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   [stability](docs/stability.md#job-filters-adr-049) for what is and isn't
   rehearsed across versions.
 - **HTTP: `GET /api/jobs`, `/api/jobs/count` and `/api/dlq` refuse unknown
-  or empty query parameters** with a 400, where they used to ignore them and
-  return a wider list. Listing and counting jobs by filter now share one
+  or empty query parameters** with a 400. A 0.6 server ignored unknown
+  parameters, returning a wider list. Listing and counting jobs by filter now share one
   30-second budget per request, across every candidate pass and row load;
   past it the request fails asking for a narrower filter.
 - **HTTP: DLQ retry and purge by the full filter use new endpoints,
