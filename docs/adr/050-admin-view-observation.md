@@ -140,6 +140,10 @@ Shared read hardening and strict adapters are independently useful follow-ups to
 #572. They should not wait for a streaming decision. Existing GET parsing and
 per-statement timeouts must not be represented as strict mixed-version reads or
 an end-to-end deadline; the supporting contract records the verified gaps.
+Its interactive-read budgets do not replace batch-scan or DLQ bulk-mutation
+policies. When strict adapters ship, upgrade notes must explain that a new UI
+routed to an old replica loses filtered-view availability rather than widening
+the query through a permissive GET fallback.
 
 ## Evidence required for a later transport decision
 
@@ -150,7 +154,8 @@ peer changes; database/read amplification, connections and browser freshness;
 and supported ingress, authentication, expiry and reconnect costs. Name an owner
 and explicit, measurable retain/reject criteria for benefit, coverage and cost
 before starting any experiment.
-This ADR invents no numeric success target or release deadline.
+The transport proposer supplies the numeric targets and evaluation timeframe
+from that baseline.
 
 A durable application event/completion requirement needs a different contract,
 not a faster version of these hints. Scoped application authorization or actual
