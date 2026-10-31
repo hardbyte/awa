@@ -104,9 +104,18 @@ impl<V: Clone + Send + Sync + 'static> FencedCache<V> {
     pub fn invalidate_all(&self) {
         // Saturation is fail-closed: the practically unreachable terminal
         // generation refuses all fills, rather than wrapping to an old key.
-        let _ = self
-            .generation
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| g.checked_add(1));
+        let mut generation = self.generation.load(Ordering::SeqCst);
+        while let Some(next) = generation.checked_add(1) {
+            match self.generation.compare_exchange_weak(
+                generation,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => generation = current,
+            }
+        }
         self.values.invalidate_all();
     }
     pub async fn get<F, Fut>(&self, fetch: F) -> Result<Observed<V>, Arc<CacheError>>

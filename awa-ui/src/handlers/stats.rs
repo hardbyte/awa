@@ -2,10 +2,8 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use std::collections::HashMap;
 
 use awa_model::admin;
-use awa_model::job::JobState;
 
 use crate::error::ApiError;
 use crate::state::{AppState, Capabilities};
