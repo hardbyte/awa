@@ -1,5 +1,5 @@
-use axum::response::{IntoResponse, Response};
 use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use awa_model::admin;
@@ -22,9 +22,7 @@ pub struct StorageQuery {
     pub history: bool,
 }
 
-pub async fn get_runtime(
-    State(state): State<AppState>,
-) -> Result<Response, ApiError> {
+pub async fn get_runtime(State(state): State<AppState>) -> Result<Response, ApiError> {
     let pool = state.pool.clone();
     let overview = state
         .cache
@@ -34,9 +32,7 @@ pub async fn get_runtime(
     Ok(overview.into_response())
 }
 
-pub async fn list_queue_runtime(
-    State(state): State<AppState>,
-) -> Result<Response, ApiError> {
+pub async fn list_queue_runtime(State(state): State<AppState>) -> Result<Response, ApiError> {
     let pool = state.pool.clone();
     let summary = state
         .cache

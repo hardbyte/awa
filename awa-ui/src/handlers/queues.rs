@@ -1,5 +1,5 @@
-use axum::response::{IntoResponse, Response};
 use axum::extract::{Path, State};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
@@ -8,9 +8,7 @@ use awa_model::admin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-pub async fn list_queues(
-    State(state): State<AppState>,
-) -> Result<Response, ApiError> {
+pub async fn list_queues(State(state): State<AppState>) -> Result<Response, ApiError> {
     let pool = state.pool.clone();
     let stats = state
         .cache

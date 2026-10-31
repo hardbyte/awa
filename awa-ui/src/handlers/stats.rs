@@ -1,5 +1,5 @@
-use axum::response::{IntoResponse, Response};
 use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -10,15 +10,9 @@ use awa_model::job::JobState;
 use crate::error::ApiError;
 use crate::state::{AppState, Capabilities};
 
-pub async fn get_stats(
-    State(state): State<AppState>,
-) -> Result<Response, ApiError> {
+pub async fn get_stats(State(state): State<AppState>) -> Result<Response, ApiError> {
     let pool = state.pool.clone();
-    let counts = state
-        .cache
-        .stats
-        .get(|| admin::state_counts(&pool))
-        .await?;
+    let counts = state.cache.stats.get(|| admin::state_counts(&pool)).await?;
     Ok(counts.into_response())
 }
 

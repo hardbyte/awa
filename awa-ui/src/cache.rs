@@ -74,44 +74,77 @@ struct FillBudget {
 impl FillBudget {
     fn shared() -> &'static Self {
         static BUDGET: OnceLock<FillBudget> = OnceLock::new();
-        BUDGET.get_or_init(|| Self { active: Arc::new(Semaphore::new(4)), waiters: Semaphore::new(16) })
+        BUDGET.get_or_init(|| Self {
+            active: Arc::new(Semaphore::new(4)),
+            waiters: Semaphore::new(16),
+        })
     }
-    async fn admit(&self, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit, CacheError> {
-        if let Ok(permit) = self.active.clone().try_acquire_owned() { return Ok(permit); }
+    async fn admit(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<OwnedSemaphorePermit, CacheError> {
+        if let Ok(permit) = self.active.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
         let _waiter = self.waiters.try_acquire().map_err(|_| CacheError::Busy)?;
         tokio::time::timeout_at(deadline, self.active.clone().acquire_owned())
-            .await.map_err(|_| CacheError::Busy)?.map_err(|_| CacheError::Busy)
+            .await
+            .map_err(|_| CacheError::Busy)?
+            .map_err(|_| CacheError::Busy)
     }
 }
 
 impl<V: Clone + Send + Sync + 'static> FencedCache<V> {
     fn new(ttl: Duration) -> Self {
-        Self { values: Cache::builder().time_to_live(ttl).max_capacity(2).build(),
-            generation: Arc::new(AtomicU64::new(0)) }
+        Self {
+            values: Cache::builder().time_to_live(ttl).max_capacity(2).build(),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
     }
     pub fn invalidate_all(&self) {
         // Saturation is fail-closed: the practically unreachable terminal
         // generation refuses all fills, rather than wrapping to an old key.
-        let _ = self.generation.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| g.checked_add(1));
+        let _ = self
+            .generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| g.checked_add(1));
         self.values.invalidate_all();
     }
     pub async fn get<F, Fut>(&self, fetch: F) -> Result<Observed<V>, Arc<CacheError>>
-    where F: Fn() -> Fut + Send + Sync, Fut: Future<Output = Result<V, AwaError>> + Send {
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: Future<Output = Result<V, AwaError>> + Send,
+    {
         let admission_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
         for _ in 0..2 {
             let generation = self.generation.load(Ordering::SeqCst);
-            if generation == u64::MAX { break; }
-            let observed = self.values.try_get_with(generation, async {
-                let _permit = FillBudget::shared().admit(admission_deadline).await?;
-                if self.generation.load(Ordering::SeqCst) != generation { return Err(CacheError::Changed); }
-                let observed_at = Utc::now();
-                let observed_since = Instant::now();
-                fetch().await.map(|data| Observed { data, observed_at, observed_since }).map_err(CacheError::from)
-            }).await;
+            if generation == u64::MAX {
+                break;
+            }
+            let observed = self
+                .values
+                .try_get_with(generation, async {
+                    let _permit = FillBudget::shared().admit(admission_deadline).await?;
+                    if self.generation.load(Ordering::SeqCst) != generation {
+                        return Err(CacheError::Changed);
+                    }
+                    let observed_at = Utc::now();
+                    let observed_since = Instant::now();
+                    fetch()
+                        .await
+                        .map(|data| Observed {
+                            data,
+                            observed_at,
+                            observed_since,
+                        })
+                        .map_err(CacheError::from)
+                })
+                .await;
             match observed {
-                Ok(sample) if self.generation.load(Ordering::SeqCst) == generation => return Ok(sample),
-                Ok(_) => {},
-                Err(error) if matches!(error.as_ref(), CacheError::Changed) => {},
+                Ok(sample) if self.generation.load(Ordering::SeqCst) == generation => {
+                    return Ok(sample)
+                }
+                Ok(_) => {}
+                Err(error) if matches!(error.as_ref(), CacheError::Changed) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -169,15 +202,24 @@ mod tests {
         let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
         let started = Arc::new(Mutex::new(Some(started_tx)));
         let old = tokio::spawn(async move {
-            old_cache.get(|| {
-                let release = release.clone(); let started = started.clone(); let calls = old_calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    if let Some(sender) = started.lock().unwrap().take() { let _ = sender.send(()); }
-                    if let Some(receiver) = release.lock().await.take() { let _ = receiver.await; }
-                    Ok(1)
-                }
-            }).await.unwrap()
+            old_cache
+                .get(|| {
+                    let release = release.clone();
+                    let started = started.clone();
+                    let calls = old_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if let Some(sender) = started.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                        if let Some(receiver) = release.lock().await.take() {
+                            let _ = receiver.await;
+                        }
+                        Ok(1)
+                    }
+                })
+                .await
+                .unwrap()
         });
         started_rx.await.unwrap();
         cache.invalidate_all();
@@ -186,7 +228,10 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(old.await.unwrap().data, 2);
         assert_eq!(current.data, 2);
-        let hit = cache.get(|| async { panic!("must be a cache hit") }).await.unwrap();
+        let hit = cache
+            .get(|| async { panic!("must be a cache hit") })
+            .await
+            .unwrap();
         assert_eq!(hit.data, 2);
         assert_eq!(hit.observed_at, current.observed_at);
         assert_eq!(hit.observed_since, current.observed_since);
@@ -194,26 +239,45 @@ mod tests {
     }
     #[test]
     fn cache_age_does_not_become_fresh_when_wall_time_moves_backwards() {
-        let sample = Observed { data: (), observed_at: Utc::now() + chrono::Duration::hours(1),
-            observed_since: Instant::now() - Duration::from_secs(2) };
+        let sample = Observed {
+            data: (),
+            observed_at: Utc::now() + chrono::Duration::hours(1),
+            observed_since: Instant::now() - Duration::from_secs(2),
+        };
         assert!(sample.age_ms() >= 2000);
     }
     #[tokio::test]
     async fn admission_bounds_waiters_and_cancellation_releases_capacity() {
-        let budget = FillBudget { active: Arc::new(Semaphore::new(4)), waiters: Semaphore::new(16) };
+        let budget = FillBudget {
+            active: Arc::new(Semaphore::new(4)),
+            waiters: Semaphore::new(16),
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut permits = Vec::new();
-        for _ in 0..4 { permits.push(budget.admit(deadline).await.unwrap()); }
-        let mut waiting = (0..16).map(|_| Box::pin(budget.admit(deadline))).collect::<Vec<_>>();
+        for _ in 0..4 {
+            permits.push(budget.admit(deadline).await.unwrap());
+        }
+        let mut waiting = (0..16)
+            .map(|_| Box::pin(budget.admit(deadline)))
+            .collect::<Vec<_>>();
         std::future::poll_fn(|cx| {
-            for future in &mut waiting { assert!(future.as_mut().poll(cx).is_pending()); }
+            for future in &mut waiting {
+                assert!(future.as_mut().poll(cx).is_pending());
+            }
             std::task::Poll::Ready(())
-        }).await;
+        })
+        .await;
         assert_eq!(budget.waiters.available_permits(), 0);
-        assert!(matches!(budget.admit(deadline).await, Err(CacheError::Busy)));
+        assert!(matches!(
+            budget.admit(deadline).await,
+            Err(CacheError::Busy)
+        ));
         drop(waiting);
         assert_eq!(budget.waiters.available_permits(), 16);
-        assert!(matches!(budget.admit(tokio::time::Instant::now()).await, Err(CacheError::Busy)));
+        assert!(matches!(
+            budget.admit(tokio::time::Instant::now()).await,
+            Err(CacheError::Busy)
+        ));
         assert_eq!(budget.waiters.available_permits(), 16);
         drop(permits);
         assert_eq!(budget.active.available_permits(), 4);
@@ -224,11 +288,13 @@ mod tests {
     async fn continuous_invalidations_have_a_finite_retry_bound() {
         let cache = FencedCache::new(Duration::from_secs(60));
         let calls = AtomicU64::new(0);
-        let result = cache.get(|| async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            cache.invalidate_all();
-            Ok(1)
-        }).await;
+        let result = cache
+            .get(|| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                cache.invalidate_all();
+                Ok(1)
+            })
+            .await;
         assert!(matches!(result, Err(error) if matches!(error.as_ref(), CacheError::Changed)));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -238,7 +304,9 @@ mod tests {
         let cache = FencedCache::<u8>::new(Duration::from_secs(60));
         cache.generation.store(u64::MAX, Ordering::SeqCst);
         cache.invalidate_all();
-        let result = cache.get(|| async { panic!("terminal generation cannot fetch") }).await;
+        let result = cache
+            .get(|| async { panic!("terminal generation cannot fetch") })
+            .await;
         assert!(matches!(result, Err(error) if matches!(error.as_ref(), CacheError::Changed)));
     }
 }

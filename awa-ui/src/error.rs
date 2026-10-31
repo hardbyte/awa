@@ -40,9 +40,11 @@ impl From<std::sync::Arc<crate::cache::CacheError>> for ApiError {
         match cache_err {
             crate::cache::CacheError::Busy => ApiError::ObservationBusy,
             crate::cache::CacheError::Changed => ApiError::ObservationChanged,
-            crate::cache::CacheError::Database(error) => ApiError::Awa(std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
-                awa_model::AwaError::Database(sqlx::Error::Protocol(arc.to_string()))
-            })),
+            crate::cache::CacheError::Database(error) => {
+                ApiError::Awa(std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
+                    awa_model::AwaError::Database(sqlx::Error::Protocol(arc.to_string()))
+                }))
+            }
         }
     }
 }
@@ -51,8 +53,14 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let retry = matches!(&self, Self::ObservationBusy | Self::ObservationChanged);
         let (status, message) = match self {
-            ApiError::ObservationBusy => (StatusCode::TOO_MANY_REQUESTS, "aggregate read admission is full".to_string()),
-            ApiError::ObservationChanged => (StatusCode::SERVICE_UNAVAILABLE, "aggregate changed during read; retry".to_string()),
+            ApiError::ObservationBusy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "aggregate read admission is full".to_string(),
+            ),
+            ApiError::ObservationChanged => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "aggregate changed during read; retry".to_string(),
+            ),
             ApiError::ReadOnly => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "awa serve is connected to a read-only database; admin actions are disabled"
@@ -89,8 +97,12 @@ impl IntoResponse for ApiError {
         let body = axum::Json(json!({ "error": message }));
         let mut response = (status, body).into_response();
         if retry {
-            response.headers_mut().insert("retry-after", "1".parse().unwrap());
-            response.headers_mut().insert("cache-control", "private, no-store".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("retry-after", "1".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("cache-control", "private, no-store".parse().unwrap());
         }
         response
     }
@@ -116,8 +128,14 @@ mod observation_tests {
     #[test]
     fn transient_cache_errors_preserve_status_and_retry_after() {
         for (error, status) in [
-            (crate::cache::CacheError::Busy, StatusCode::TOO_MANY_REQUESTS),
-            (crate::cache::CacheError::Changed, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                crate::cache::CacheError::Busy,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                crate::cache::CacheError::Changed,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let response = ApiError::from(std::sync::Arc::new(error)).into_response();
             assert_eq!(response.status(), status);
