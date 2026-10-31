@@ -28,10 +28,9 @@ fn parse_time(name: &str, value: &str) -> Result<DateTime<Utc>, ApiError> {
         .map_err(|_| invalid(name, value))
 }
 
-/// Parse a raw query string. Empty values are ignored, so a form that sends
-/// `kind=` leaves the field unset. Unknown parameters are ignored too: an
-/// older server answering a newer client returns a wider list, which the
-/// API documents, rather than an error.
+/// Parse a raw query string. Unknown parameters and empty values are errors,
+/// as unknown fields are in the JSON filter: dropping either would return a
+/// wider list than the one asked for. (A 0.6 server ignores both.)
 pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
     let mut query = FilterQuery::default();
     let Some(raw) = raw else {
@@ -39,8 +38,12 @@ pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
     };
     for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
         let value = value.trim();
+        // A parameter dropped here would widen the population, as an unknown
+        // field would in the JSON filter.
         if value.is_empty() {
-            continue;
+            return Err(ApiError::Awa(AwaError::Validation(format!(
+                "`{name}` needs a value"
+            ))));
         }
         let filter = std::mem::take(&mut query.filter);
         query.filter = match name.as_ref() {
@@ -78,7 +81,12 @@ pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
                 query.limit = Some(value.parse().map_err(|_| invalid("limit", value))?);
                 filter
             }
-            _ => filter,
+            other => {
+                return Err(ApiError::Awa(AwaError::Validation(format!(
+                    "unknown parameter `{other}`; filters take kind, queue, tag, state, \
+                     ids, dead_lettered, created_at_gte and created_at_lt"
+                ))))
+            }
         };
     }
     query.filter.validate()?;
@@ -105,9 +113,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_values_and_unknown_parameters_are_ignored() {
-        let parsed = parse(Some("kind=&queue=q&future=1")).unwrap();
-        assert_eq!(parsed.filter, JobFilter::new().queue("q"));
+    fn empty_values_and_unknown_parameters_are_refused() {
+        // Either would otherwise drop a term and widen the population.
+        assert!(parse(Some("kind=&queue=q")).is_err());
+        assert!(parse(Some("queue=q&tags=a")).is_err());
+        assert_eq!(
+            parse(Some("queue=q")).unwrap().filter,
+            JobFilter::new().queue("q")
+        );
     }
 
     #[test]

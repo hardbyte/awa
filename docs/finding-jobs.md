@@ -25,8 +25,15 @@ nothing, and batch operations are still refused.
 | `created_at_gte`, `created_at_lt` | The original insert time, unchanged by retries and moves. |
 
 A field that is not set does not narrow the population. Unknown fields are an
-error, so a typo cannot widen what a purge or batch operation acts on. In
-Rust the lists are the `states` and `tags` fields.
+error, so a typo cannot widen what a purge or batch operation acts on. The
+same holds for the query parameters of `GET /api/jobs`, `/api/jobs/count` and
+`/api/dlq`, where an empty value is an error too. In Rust the lists are the
+`states` and `tags` fields.
+
+Listing and counting share one 30-second budget per request, across every
+pass over candidates and every load of their rows. A filter that needs longer
+fails with an error asking to narrow it. Batch operations scan without that
+budget, since a failed scan fails the operation.
 
 A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue,
 tag, ids or a created bound), or `allow_all`. Over HTTP the full filter goes

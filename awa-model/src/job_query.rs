@@ -746,10 +746,10 @@ async fn statement(
     )
 }
 
-/// Run a candidate or count statement. Interactive reads run under
-/// [`READ_TIMEOUT`], so an expensive filter cannot hold a connection
-/// indefinitely; a batch operation's scan runs without one, as it did
-/// before ADR-049, because failing it fails the operation.
+/// Run a candidate or count statement. Interactive reads pass the time left
+/// in their [`ReadBudget`]; a batch operation's scan passes `None` and runs
+/// without one, as it did before ADR-049, because failing it fails the
+/// operation.
 async fn fetch_scalars(
     pool: &PgPool,
     statement: Statement,
@@ -758,13 +758,7 @@ async fn fetch_scalars(
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
     plan_reads(&mut tx, false).await?;
     if let Some(timeout) = timeout {
-        sqlx::query(audited_sql(format!(
-            "SET LOCAL statement_timeout = '{}ms'",
-            timeout.as_millis()
-        )))
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        set_statement_timeout(&mut tx, timeout).await?;
     }
     let rows = statement
         .query_scalar()
@@ -773,6 +767,21 @@ async fn fetch_scalars(
         .map_err(map_sqlx_error)?;
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(rows)
+}
+
+/// Cap each statement for the rest of `tx`.
+pub(crate) async fn set_statement_timeout(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    timeout: std::time::Duration,
+) -> Result<(), AwaError> {
+    sqlx::query(audited_sql(format!(
+        "SET LOCAL statement_timeout = '{}ms'",
+        timeout.as_millis().max(1)
+    )))
+    .execute(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok(())
 }
 
 /// Settings for the filter and loader reads, for the rest of `tx`.
@@ -801,8 +810,57 @@ pub(crate) async fn plan_reads(
     Ok(())
 }
 
-/// How long one filtered read may run.
+/// How long one interactive filtered read may run, from its first candidate
+/// query to its last loaded row.
 pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One interactive read's share of [`READ_TIMEOUT`]. Every candidate pass and
+/// load takes the time that is left as its statement timeout, so repeated
+/// passes cannot each spend the whole allowance.
+struct ReadBudget {
+    deadline: tokio::time::Instant,
+}
+
+impl ReadBudget {
+    fn start() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + READ_TIMEOUT,
+        }
+    }
+
+    fn remaining(&self) -> Result<std::time::Duration, AwaError> {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(over_budget());
+        }
+        Ok(left)
+    }
+
+    /// Run `read` within the budget. Statement timeouts end the SQL; this
+    /// also bounds the time spent waiting for a pool connection.
+    async fn run<T>(
+        &self,
+        read: impl std::future::Future<Output = Result<T, AwaError>>,
+    ) -> Result<T, AwaError> {
+        // A little past the deadline, so Postgres cancels a running statement
+        // itself rather than the connection being dropped mid-query.
+        let backstop = self.deadline + std::time::Duration::from_secs(1);
+        match tokio::time::timeout_at(backstop, read).await {
+            Ok(Err(err)) if err.is_statement_timeout() => Err(over_budget()),
+            Ok(result) => result,
+            Err(_) => Err(over_budget()),
+        }
+    }
+}
+
+fn over_budget() -> AwaError {
+    AwaError::Validation(format!(
+        "finding jobs took longer than {}s; narrow the filter",
+        READ_TIMEOUT.as_secs()
+    ))
+}
 
 /// Load the current rows of `ids`, in that order, each with whether it is
 /// dead-lettered.
@@ -810,11 +868,14 @@ async fn load(
     pool: &PgPool,
     store: &QueueStorage,
     ids: &[i64],
+    timeout: std::time::Duration,
 ) -> Result<Vec<(JobRow, bool)>, AwaError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    store.load_jobs_without_output(pool, ids).await
+    store
+        .load_jobs_without_output(pool, ids, Some(timeout))
+        .await
 }
 
 /// Jobs in `filter`'s population that `eligible` allows, in `window` order:
@@ -825,6 +886,19 @@ pub(crate) async fn find(
     filter: &JobFilter,
     eligible: &[JobState],
     window: Window,
+) -> Result<Vec<JobRow>, AwaError> {
+    let budget = ReadBudget::start();
+    budget
+        .run(find_within(pool, filter, eligible, window, &budget))
+        .await
+}
+
+async fn find_within(
+    pool: &PgPool,
+    filter: &JobFilter,
+    eligible: &[JobState],
+    window: Window,
+    budget: &ReadBudget,
 ) -> Result<Vec<JobRow>, AwaError> {
     let limit = match window {
         Window::NewestFirst { limit, .. } | Window::OldestFirst { limit, .. } => limit,
@@ -860,9 +934,9 @@ pub(crate) async fn find(
         else {
             return Ok(Vec::new());
         };
-        let ids = fetch_scalars(pool, statement, Some(READ_TIMEOUT)).await?;
+        let ids = fetch_scalars(pool, statement, Some(budget.remaining()?)).await?;
         let exhausted = (ids.len() as i64) < fetch;
-        for (job, dead_lettered) in load(pool, &store, &ids).await? {
+        for (job, dead_lettered) in load(pool, &store, &ids, budget.remaining()?).await? {
             if effective.contains(&job.state) && filter.matches(&job, dead_lettered) {
                 jobs.push(job);
                 if jobs.len() as i64 >= limit {
@@ -901,11 +975,24 @@ pub(crate) async fn count(
     eligible: &[JobState],
     cap: Option<i64>,
 ) -> Result<JobCount, AwaError> {
+    let budget = ReadBudget::start();
+    budget
+        .run(count_within(pool, filter, eligible, cap, &budget))
+        .await
+}
+
+async fn count_within(
+    pool: &PgPool,
+    filter: &JobFilter,
+    eligible: &[JobState],
+    cap: Option<i64>,
+    budget: &ReadBudget,
+) -> Result<JobCount, AwaError> {
     let Some((_, statement)) = statement(pool, filter, eligible, Window::Unbounded { cap }).await?
     else {
         return Ok(JobCount::Exact(0));
     };
-    let n = fetch_scalars(pool, statement, Some(READ_TIMEOUT))
+    let n = fetch_scalars(pool, statement, Some(budget.remaining()?))
         .await?
         .first()
         .copied()
@@ -958,6 +1045,22 @@ pub(crate) async fn scan_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_spent_budget_stops_the_read_with_a_hint() {
+        let spent = ReadBudget {
+            deadline: tokio::time::Instant::now(),
+        };
+        let err = spent.remaining().unwrap_err();
+        assert!(err.to_string().contains("narrow the filter"), "{err}");
+        // A read that never finishes, such as one waiting on the pool, is
+        // cut off at the backstop just past the deadline.
+        let err = spent
+            .run(std::future::pending::<Result<(), AwaError>>())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("narrow the filter"), "{err}");
+    }
 
     fn sql(filter: &JobFilter, eligible: &[JobState]) -> Option<String> {
         queue_storage_statement(

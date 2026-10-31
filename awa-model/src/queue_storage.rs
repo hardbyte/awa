@@ -13060,13 +13060,15 @@ impl QueueStorage {
     /// The current row of each job in `job_ids`, in that order, without
     /// outputs (ADR-048), with whether that row is dead-lettered. Ids with no
     /// retained row are skipped.
+    /// With a `timeout`, each statement is cancelled once it runs past it.
     #[doc(hidden)]
     pub async fn load_jobs_without_output(
         &self,
         pool: &PgPool,
         job_ids: &[i64],
+        timeout: Option<std::time::Duration>,
     ) -> Result<Vec<(JobRow, bool)>, AwaError> {
-        self.load_jobs_inner(pool, job_ids, false).await
+        self.load_jobs_inner(pool, job_ids, false, timeout).await
     }
 
     async fn load_job_inner(
@@ -13076,7 +13078,7 @@ impl QueueStorage {
         include_output: bool,
     ) -> Result<Option<JobRow>, AwaError> {
         Ok(self
-            .load_jobs_inner(pool, &[job_id], include_output)
+            .load_jobs_inner(pool, &[job_id], include_output, None)
             .await?
             .into_iter()
             .next()
@@ -13092,6 +13094,7 @@ impl QueueStorage {
         pool: &PgPool,
         job_ids: &[i64],
         include_output: bool,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Vec<(JobRow, bool)>, AwaError> {
         if job_ids.is_empty() {
             return Ok(Vec::new());
@@ -13114,6 +13117,9 @@ impl QueueStorage {
         // partition.
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         crate::job_query::plan_reads(&mut tx, true).await?;
+        if let Some(timeout) = timeout {
+            crate::job_query::set_statement_timeout(&mut tx, timeout).await?;
+        }
 
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
