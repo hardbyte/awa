@@ -1,7 +1,8 @@
 # Admin observation v1: polling, strict reads and bounded reconciliation
 
-Status: proposed supporting contract for
-[ADR-050](../adr/050-admin-view-observation.md). V1 uses polling. It includes no
+Status: supporting contract for the accepted
+[ADR-050](../adr/050-admin-view-observation.md). It specifies work that is not
+yet implemented. V1 uses polling. It includes no
 SSE/WebSocket endpoint, browser subscription service, worker hooks, database
 notification listener, outbox or CDC integration. Future transport alternatives
 and their evidence gate belong in the ADR, not this delivery sequence.
@@ -118,9 +119,10 @@ as routing changes. Document that behavior and the deployment/routing mitigation
 never hide it by falling back to a wider filtered GET. These adapters are proposed,
 not claimed to have shipped here.
 
-Fixing unknown/empty GET parsing on a current server is a separate improvement
-from this strict mixed-version read boundary. Neither strict JSON parsing in one
-path nor a `/v1` name makes an older GET implementation strict.
+#572 makes the current server's GET parsing refuse unknown and empty
+parameters. That is a separate improvement from this strict mixed-version read
+boundary: neither strict GET parsing on a new server nor a `/v1` name makes an
+older GET implementation strict.
 
 ## Errors, deadlines and shared read budgets
 
@@ -164,6 +166,11 @@ or unlimited settings must not defeat the bounds.
 | Interactive SQL statement limit | At most 5 seconds, also bounded by remaining whole-read deadline. |
 | Interactive SQL lock wait | At most 1 second, also bounded by remaining deadline. |
 | Repeated failure | Exponential backoff to 60 seconds; one pending demand retained. |
+
+#572 ships a 30-second whole-read budget for interactive listing and counting,
+passing the remaining time to each candidate query and row load as its
+statement timeout. The adapters tighten that to the 15-second whole-read and
+5-second statement defaults above.
 
 During incidents, uncached filtered job pages are expected to degrade first as
 operators multiply demand: reads may receive 429 and the UI retains stale data.
@@ -282,8 +289,8 @@ Each increment is independently useful with polling:
    API error fallback, bounded admission, whole-read deadlines and cancellation
    coverage. Verify that batch execution scans and DLQ bulk mutations retain
    their own policies. Ship the adapters' rolling-upgrade availability notes.
-   Reuse #572's compiler; GET parsing/deadline repairs are shared follow-up work,
-   not a transport dependency. Test empty install/read-only operation without a
+   Reuse #572's compiler, read budget and strict GET parsing; tightening the
+   budget to these defaults is not a transport dependency. Test empty install/read-only operation without a
    worker. Do not rename mutation endpoints for URI consistency.
 2. Consolidate the tab scheduler and lifecycle. Register dirty demand before
    initial reads, disable competing automatic fetch loops, enforce per-key
@@ -329,39 +336,38 @@ timeframe through the ADR's separate evidence/owner decision.
 
 ## Dependencies and source evidence
 
-Source inspection on 2026-10-31 used #572 head
-`c09b23ebed0d65614025271611c720ea584a55c9`, which includes change
-`ac1e39440d89e6c0c5a5bb86a7d3af5d8db47d86`. These observations
-are evidence of current gaps/fixes, not a claim that this proposed contract ships.
+Source inspection on 2026-11-01 used #572 head
+`15b8e3ff66282cac00b744b6d0483ce2eb4f8cea`. These observations describe what
+#572 provides, not a claim that this contract ships.
 
-- [Candidate listing](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-model/src/job_query.rs)
-  loops up to 32 passes with a 30-second statement timeout per candidate query.
-  [The loader](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-model/src/queue_storage.rs)
-  starts a separate transaction using planning settings without installing that
-  timeout. This does not establish a whole-read deadline. Fixes belong in the
-  shared read layer/#572 follow-ups; verify the actual implementation base.
-  The batch-scan helpers deliberately pass no interactive timeout because a
-  timed-out scan fails the operation; those paths retain their separate policy.
-- [GET parsing](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/filter_params.rs)
-  deliberately ignores unknown and empty values, including a test of that
-  behavior. [Finding-jobs documentation](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/docs/finding-jobs.md)
-  gives a general unknown-field rejection promise; it must not be interpreted as
-  current GET strictness. Parser/documentation repair and strict mixed-version
-  adapters are distinct work, both useful without this ADR or any streaming.
-- [DLQ handlers](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/dlq.rs),
-  [router](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/lib.rs)
-  and [API test](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/tests/admin_api_test.rs)
+- [Candidate listing](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-model/src/job_query.rs)
+  gives each interactive listing or count one 30-second `ReadBudget`. Every
+  candidate pass and [loader](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-model/src/queue_storage.rs)
+  transaction runs with the remaining time as its statement timeout, and a
+  backstop just past the deadline bounds pool waits. Running out is a 400 asking
+  for a narrower filter. Batch-scan helpers pass no budget, because a timed-out
+  scan fails the operation. The adapters' 15-second/5-second defaults and
+  admission limits are not yet implemented.
+- [GET parsing](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/handlers/filter_params.rs)
+  refuses unknown and empty parameters on `GET /api/jobs`, `/api/jobs/count`
+  and `/api/dlq`, matching [finding-jobs](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/docs/finding-jobs.md).
+  This is current-server strictness only; a 0.6 server still ignores unknown
+  parameters.
+- [DLQ handlers](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/handlers/dlq.rs),
+  [router](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/lib.rs)
+  and [API test](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/tests/admin_api_test.rs)
   use separate retry/purge-matching paths for the full filter, legacy bodies on
   legacy paths and refusal of `all` with a nonempty filter. The obsolete richer-
   body-on-legacy-route downgrade concern is not retained as an unresolved v1 gate.
   The PR reports a real 0.6.9 rejection check; source inspection here is not a
   fresh execution of that rehearsal.
-- [Search validation](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/frontend/src/components/SearchBar.tsx)
+- [Search validation](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/frontend/src/components/SearchBar.tsx)
   accepts positive whole IDs only when `Number.isSafeInteger` succeeds;
-  [the batch form](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/frontend/src/routes/batch-ops.tsx)
+  [the batch form](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/frontend/src/routes/batch-ops.tsx)
   uses that validator. This rejects unsupported IDs; it is not full-precision
-  browser ID support.
-- [Router](https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/lib.rs)
+  browser ID support. The jobs and DLQ pages also hide cached rows while the
+  search holds a malformed term.
+- [Router](https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/lib.rs)
   currently applies `CorsLayer::permissive()` and the SPA fallback. Access-policy
   claims above are implementation requirements, not assertions about a deployed
   origin configuration.
