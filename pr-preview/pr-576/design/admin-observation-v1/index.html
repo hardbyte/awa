@@ -2248,6 +2248,14 @@ operation.</p>
 body-size excess 413, authorization/origin failure 401/403, admission excess
 429 with <code>Retry-After</code>, and temporary overload 503. Unsupported routes, wrong
 MIME and malformed envelopes are protocol errors, even with HTTP 200.</p>
+<p>Whole-read deadline expiry is not an invalid request. Return 503 with
+<code>Retry-After</code> (at least the key's refresh floor) and a structured
+<code>read_deadline_exceeded</code> error code, so clients keep the request's demand
+pending and retry under the normal backoff instead of treating it like a bad
+filter. #572 currently reports expiry as a 400 asking for a narrower filter; the
+adapters must not inherit that mapping. A filter that exceeds the deadline
+repeatedly stays visible as stale with the error, rather than silently retrying
+forever without telling the operator.</p>
 <p>Network/read failures retain stale data and one pending demand, with exponential
 backoff/jitter capped at 60 seconds. Honor 429/503 <code>Retry-After</code> across reads to
 the affected backend; do not turn overload into an immediate extra poll. Stop
