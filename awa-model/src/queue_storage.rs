@@ -892,6 +892,50 @@ fn receipt_closed_evidence_sql(
     )
 }
 
+/// Each queue's available rows, exactly, as `(queue, available)`: every
+/// lane's unclaimed rows, read along the primary key from its claim cursor to
+/// its enqueue head, so the cost follows the backlog rather than the
+/// partition.
+pub fn available_by_queue_sql(schema: &str) -> String {
+    format!(
+        r#"
+        SELECT heads.queue, COALESCE(sum(lane.available), 0)::bigint AS available
+        FROM (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+        ) AS heads
+        CROSS JOIN LATERAL (
+            SELECT count(*)::bigint AS available
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.queue = heads.queue
+              AND ready.priority = heads.priority
+              AND ready.enqueue_shard = heads.enqueue_shard
+              AND ready.lane_seq >= heads.claim_seq
+              AND ready.lane_seq < heads.next_seq
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+              )
+        ) AS lane
+        GROUP BY heads.queue
+        "#
+    )
+}
+
 /// What [`queue_signals_sql`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueSignalReads {
@@ -935,34 +979,7 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
             "SELECT NULL::text AS queue, 0::bigint AS completed_last_hour WHERE false".to_string(),
         ),
         QueueSignalReads::Admin => (
-            // Exact: each lane's unclaimed rows, read from its claim cursor
-            // up to its enqueue head along the primary key, so the cost
-            // follows the backlog rather than the partition.
-            format!(
-                r#"
-                SELECT head_signal.queue, COALESCE(sum(lane.available), 0)::bigint AS available
-                FROM head_signal
-                CROSS JOIN LATERAL (
-                    SELECT count(*)::bigint AS available
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.queue = head_signal.queue
-                      AND ready.priority = head_signal.priority
-                      AND ready.enqueue_shard = head_signal.enqueue_shard
-                      AND ready.lane_seq >= head_signal.claim_seq
-                      AND ready.lane_seq < head_signal.next_seq
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                          WHERE tomb.ready_slot = ready.ready_slot
-                            AND tomb.ready_generation = ready.ready_generation
-                            AND tomb.queue = ready.queue
-                            AND tomb.priority = ready.priority
-                            AND tomb.enqueue_shard = ready.enqueue_shard
-                            AND tomb.lane_seq = ready.lane_seq
-                      )
-                ) AS lane
-                GROUP BY head_signal.queue
-                "#
-            ),
+            available_by_queue_sql(schema),
             format!(
                 "SELECT queue, count(*)::bigint AS running FROM ({}) AS open_claims GROUP BY queue",
                 open_receipt_running_claims_sql(schema)

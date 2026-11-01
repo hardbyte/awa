@@ -14,6 +14,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
   counts completions in the last hour from batch sizes. With 100,000
   retained completions and 100,000 queued jobs it drops from 7.7 s to
   0.27 s. JIT is off for the read; compiling it cost more than running it.
+- **The dashboard's state counts and timeseries no longer read retained
+  history on queue storage.** `admin::state_counts` counts completions from
+  batch sizes and available jobs per lane from its claim cursor (6.5 s to
+  0.24 s on the same data). `admin::state_timeseries` reads only rows
+  finalised within its window, since a job finishes after it is created. It
+  previously expanded every retained completion and sorted the result:
+  against that data it ran for over 10 minutes and filled the disk with
+  temporary files. It now takes 0.6 s, with all 100,000 completions inside
+  the window.
 
 ## [0.7.0-alpha.1] — 2026-10-29
 
