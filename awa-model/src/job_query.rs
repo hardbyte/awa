@@ -942,8 +942,11 @@ async fn find_within(
     let fetch = (limit * 2).clamp(limit, limit + 200);
     let mut cursor = window;
     let mut jobs = Vec::new();
-    // Bounded so a pathological stream of stale candidates cannot loop.
-    for _ in 0..32 {
+    // Each round moves the cursor past the ids it read, and the read budget
+    // ends a long run of stale candidates with an error. A fixed round limit
+    // would instead return a short page while matches remain, which a caller
+    // paging until a short page would take for the end.
+    loop {
         let cursor_window = match cursor {
             Window::NewestFirst { before_id, .. } => Window::NewestFirst {
                 before_id,
@@ -991,7 +994,6 @@ async fn find_within(
             Window::Unbounded { .. } => unreachable!("rejected above"),
         };
     }
-    Ok(jobs)
 }
 
 /// How many jobs `filter` selects among `eligible` states, counted in SQL
