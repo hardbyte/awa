@@ -2225,9 +2225,10 @@
 
 <h1 id="adr-050-admin-views-use-invalidation-and-authoritative-refetch">ADR-050: Admin views use invalidation and authoritative refetch<a class="headerlink" href="#adr-050-admin-views-use-invalidation-and-authoritative-refetch" title="Permanent link">&para;</a></h1>
 <h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>Proposed. V1 uses improved polling. SSE, WebSocket and inter-process notification
+<p>Accepted. V1 uses improved polling. SSE, WebSocket and inter-process notification
 listeners are deferred to a separate decision, not included as opt-in features.
-<a href="https://github.com/hardbyte/awa/pull/576">Draft PR #576</a> is documentation only.</p>
+The <a href="../../design/admin-observation-v1/">supporting contract</a> describes work not
+yet implemented.</p>
 <h2 id="problem-and-constraints">Problem and constraints<a class="headerlink" href="#problem-and-constraints" title="Permanent link">&para;</a></h2>
 <p>Operators need current views of jobs, queues, workers, schedules, the DLQ and
 administrative progress. The UI already reads those resources through HTTP and
@@ -2335,9 +2336,10 @@ other clients are not promised immediate invalidation. Separate processes have
 independent caches and aggregate read costs. Current-state reads cannot guarantee
 an audit trail, every completion, or an exact census during transitions.</p>
 <p>Shared read hardening and strict adapters are independently useful follow-ups to</p>
-<h1 id="572-they-should-not-wait-for-a-streaming-decision-existing-get-parsing-and">572. They should not wait for a streaming decision. Existing GET parsing and<a class="headerlink" href="#572-they-should-not-wait-for-a-streaming-decision-existing-get-parsing-and" title="Permanent link">&para;</a></h1>
-<p>per-statement timeouts must not be represented as strict mixed-version reads or
-an end-to-end deadline; the supporting contract records the verified gaps.
+<h1 id="572-they-should-not-wait-for-a-streaming-decision-572-makes-the-current">572. They should not wait for a streaming decision. #572 makes the current<a class="headerlink" href="#572-they-should-not-wait-for-a-streaming-decision-572-makes-the-current" title="Permanent link">&para;</a></h1>
+<p>server's GET parameters strict and gives each interactive listing one deadline,
+but neither makes an older server strict; mixed-version strictness needs the
+versioned adapters.
 Its interactive-read budgets do not replace batch-scan or DLQ bulk-mutation
 policies. When strict adapters ship, upgrade notes must explain that a new UI
 routed to an old replica loses filtered-view availability rather than widening
@@ -2362,7 +2364,7 @@ bidirectional interaction also changes the decision boundary.</p>
 <li><a href="../049-job-filter-and-indexed-tags/">ADR-049</a> and
   <a href="https://github.com/hardbyte/awa/pull/572">PR #572</a>: shared population semantics;
   <a href="../../design/admin-observation-v1/#dependencies-and-source-evidence">current source evidence</a>
-  distinguishes remaining GET/deadline gaps from resolved DLQ/UI issues.</li>
+  records what #572 already provides and what the adapters add.</li>
 <li><a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/cache.rs">Existing cache</a>,
   <a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/state.rs">admin state</a>
   and <a href="https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/frontend/src/hooks/use-poll-interval.ts">polling policy</a>:

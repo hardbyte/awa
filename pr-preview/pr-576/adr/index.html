@@ -2531,13 +2531,13 @@
 <td style="text-align: right;">049</td>
 <td><a href="049-job-filter-and-indexed-tags/">One job filter, and tags as the indexed handle</a></td>
 <td>One <code>JobFilter</code> describes "which jobs" for listing, counting, batch preview, batch execution and the DLQ, compiled once per engine with only the predicates a filter sets; SQL narrows candidates and a batched loader settles each job's current state. Tags are the indexed handle for "jobs about X": a partial GIN index over non-empty payload tags on each queue-storage partition, maintained by Postgres for every binary, emptied by pruning, and built online by the migrator.</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
+<td><span class="awa-status awa-status--accepted">Accepted</span></td>
 </tr>
 <tr>
 <td style="text-align: right;">050</td>
 <td><a href="050-admin-view-observation/">Admin views use invalidation and authoritative refetch</a></td>
 <td>Polling-first owning API reads, disposable invalidation and independent bounded reconciliation; push transport is deferred.</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
+<td><span class="awa-status awa-status--accepted">Accepted</span></td>
 </tr>
 </tbody>
 </table>

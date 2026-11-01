@@ -2101,61 +2101,6 @@
   
 </li>
       
-        <li class="md-nav__item">
-  <a href="#errors-deadlines-and-shared-read-budgets" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Errors, deadlines and shared read budgets
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#cache-fencing-and-source-observations" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Cache fencing and source observations
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#ui-lifecycle-domain-guards-and-access" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        UI lifecycle, domain guards and access
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#incremental-delivery-and-acceptance" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Incremental delivery and acceptance
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#dependencies-and-source-evidence" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Dependencies and source evidence
-      
-    </span>
-  </a>
-  
-</li>
-      
     </ul>
   
 </nav>
@@ -2185,8 +2130,9 @@
 
 
 <h1 id="admin-observation-v1-polling-strict-reads-and-bounded-reconciliation">Admin observation v1: polling, strict reads and bounded reconciliation<a class="headerlink" href="#admin-observation-v1-polling-strict-reads-and-bounded-reconciliation" title="Permanent link">&para;</a></h1>
-<p>Status: proposed supporting contract for
-<a href="../../adr/050-admin-view-observation/">ADR-050</a>. V1 uses polling. It includes no
+<p>Status: supporting contract for the accepted
+<a href="../../adr/050-admin-view-observation/">ADR-050</a>. It specifies work that is not
+yet implemented. V1 uses polling. It includes no
 SSE/WebSocket endpoint, browser subscription service, worker hooks, database
 notification listener, outbox or CDC integration. Future transport alternatives
 and their evidence gate belong in the ADR, not this delivery sequence.</p>
@@ -2285,9 +2231,10 @@ deploy, filtered views can therefore alternate between success and unsupported
 as routing changes. Document that behavior and the deployment/routing mitigation;
 never hide it by falling back to a wider filtered GET. These adapters are proposed,
 not claimed to have shipped here.</p>
-<p>Fixing unknown/empty GET parsing on a current server is a separate improvement
-from this strict mixed-version read boundary. Neither strict JSON parsing in one
-path nor a <code>/v1</code> name makes an older GET implementation strict.</p>
+<h1 id="572-makes-the-current-servers-get-parsing-refuse-unknown-and-empty">572 makes the current server's GET parsing refuse unknown and empty<a class="headerlink" href="#572-makes-the-current-servers-get-parsing-refuse-unknown-and-empty" title="Permanent link">&para;</a></h1>
+<p>parameters. That is a separate improvement from this strict mixed-version read
+boundary: neither strict GET parsing on a new server nor a <code>/v1</code> name makes an
+older GET implementation strict.</p>
 <h2 id="errors-deadlines-and-shared-read-budgets">Errors, deadlines and shared read budgets<a class="headerlink" href="#errors-deadlines-and-shared-read-budgets" title="Permanent link">&para;</a></h2>
 <p>The admission, client/whole-read, statement and lock-wait budgets below apply to
 <strong>interactive admin reads</strong>: lists, details, previews, counts and status/aggregate
@@ -2372,6 +2319,10 @@ or unlimited settings must not defeat the bounds.</p>
 </tr>
 </tbody>
 </table>
+<h1 id="572-ships-a-30-second-whole-read-budget-for-interactive-listing-and-counting">572 ships a 30-second whole-read budget for interactive listing and counting,<a class="headerlink" href="#572-ships-a-30-second-whole-read-budget-for-interactive-listing-and-counting" title="Permanent link">&para;</a></h1>
+<p>passing the remaining time to each candidate query and row load as its
+statement timeout. The adapters tighten that to the 15-second whole-read and
+5-second statement defaults above.</p>
 <p>During incidents, uncached filtered job pages are expected to degrade first as
 operators multiply demand: reads may receive 429 and the UI retains stale data.
 Cached aggregate views bypass expensive-read admission only on a cache hit.
@@ -2472,8 +2423,8 @@ admin access safe.</p>
    API error fallback, bounded admission, whole-read deadlines and cancellation
    coverage. Verify that batch execution scans and DLQ bulk mutations retain
    their own policies. Ship the adapters' rolling-upgrade availability notes.
-   Reuse #572's compiler; GET parsing/deadline repairs are shared follow-up work,
-   not a transport dependency. Test empty install/read-only operation without a
+   Reuse #572's compiler, read budget and strict GET parsing; tightening the
+   budget to these defaults is not a transport dependency. Test empty install/read-only operation without a
    worker. Do not rename mutation endpoints for URI consistency.</li>
 <li>Consolidate the tab scheduler and lifecycle. Register dirty demand before
    initial reads, disable competing automatic fetch loops, enforce per-key
@@ -2515,39 +2466,38 @@ bucket does not identify an exact delay. Read-budget defaults are not freshness
 SLOs. Any later transport proposer supplies its numeric criteria and evaluation
 timeframe through the ADR's separate evidence/owner decision.</p>
 <h2 id="dependencies-and-source-evidence">Dependencies and source evidence<a class="headerlink" href="#dependencies-and-source-evidence" title="Permanent link">&para;</a></h2>
-<p>Source inspection on 2026-10-31 used #572 head
-<code>c09b23ebed0d65614025271611c720ea584a55c9</code>, which includes change
-<code>ac1e39440d89e6c0c5a5bb86a7d3af5d8db47d86</code>. These observations
-are evidence of current gaps/fixes, not a claim that this proposed contract ships.</p>
+<p>Source inspection on 2026-11-01 used #572 head
+<code>15b8e3ff66282cac00b744b6d0483ce2eb4f8cea</code>. These observations describe what</p>
+<h1 id="572-provides-not-a-claim-that-this-contract-ships">572 provides, not a claim that this contract ships.<a class="headerlink" href="#572-provides-not-a-claim-that-this-contract-ships" title="Permanent link">&para;</a></h1>
 <ul>
-<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-model/src/job_query.rs">Candidate listing</a>
-  loops up to 32 passes with a 30-second statement timeout per candidate query.
-  <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-model/src/queue_storage.rs">The loader</a>
-  starts a separate transaction using planning settings without installing that
-  timeout. This does not establish a whole-read deadline. Fixes belong in the
-  shared read layer/#572 follow-ups; verify the actual implementation base.
-  The batch-scan helpers deliberately pass no interactive timeout because a
-  timed-out scan fails the operation; those paths retain their separate policy.</li>
-<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/filter_params.rs">GET parsing</a>
-  deliberately ignores unknown and empty values, including a test of that
-  behavior. <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/docs/finding-jobs.md">Finding-jobs documentation</a>
-  gives a general unknown-field rejection promise; it must not be interpreted as
-  current GET strictness. Parser/documentation repair and strict mixed-version
-  adapters are distinct work, both useful without this ADR or any streaming.</li>
-<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/handlers/dlq.rs">DLQ handlers</a>,
-  <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/lib.rs">router</a>
-  and <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/tests/admin_api_test.rs">API test</a>
+<li><a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-model/src/job_query.rs">Candidate listing</a>
+  gives each interactive listing or count one 30-second <code>ReadBudget</code>. Every
+  candidate pass and <a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-model/src/queue_storage.rs">loader</a>
+  transaction runs with the remaining time as its statement timeout, and a
+  backstop just past the deadline bounds pool waits. Running out is a 400 asking
+  for a narrower filter. Batch-scan helpers pass no budget, because a timed-out
+  scan fails the operation. The adapters' 15-second/5-second defaults and
+  admission limits are not yet implemented.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/handlers/filter_params.rs">GET parsing</a>
+  refuses unknown and empty parameters on <code>GET /api/jobs</code>, <code>/api/jobs/count</code>
+  and <code>/api/dlq</code>, matching <a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/docs/finding-jobs.md">finding-jobs</a>.
+  This is current-server strictness only; a 0.6 server still ignores unknown
+  parameters.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/handlers/dlq.rs">DLQ handlers</a>,
+  <a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/lib.rs">router</a>
+  and <a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/tests/admin_api_test.rs">API test</a>
   use separate retry/purge-matching paths for the full filter, legacy bodies on
   legacy paths and refusal of <code>all</code> with a nonempty filter. The obsolete richer-
   body-on-legacy-route downgrade concern is not retained as an unresolved v1 gate.
   The PR reports a real 0.6.9 rejection check; source inspection here is not a
   fresh execution of that rehearsal.</li>
-<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/frontend/src/components/SearchBar.tsx">Search validation</a>
+<li><a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/frontend/src/components/SearchBar.tsx">Search validation</a>
   accepts positive whole IDs only when <code>Number.isSafeInteger</code> succeeds;
-  <a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/frontend/src/routes/batch-ops.tsx">the batch form</a>
+  <a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/frontend/src/routes/batch-ops.tsx">the batch form</a>
   uses that validator. This rejects unsupported IDs; it is not full-precision
-  browser ID support.</li>
-<li><a href="https://github.com/hardbyte/awa/blob/c09b23ebed0d65614025271611c720ea584a55c9/awa-ui/src/lib.rs">Router</a>
+  browser ID support. The jobs and DLQ pages also hide cached rows while the
+  search holds a malformed term.</li>
+<li><a href="https://github.com/hardbyte/awa/blob/15b8e3ff66282cac00b744b6d0483ce2eb4f8cea/awa-ui/src/lib.rs">Router</a>
   currently applies <code>CorsLayer::permissive()</code> and the SPA fallback. Access-policy
   claims above are implementation requirements, not assertions about a deployed
   origin configuration.</li>

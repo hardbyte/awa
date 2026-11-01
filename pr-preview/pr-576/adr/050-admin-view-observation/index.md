@@ -4,9 +4,10 @@
 
 ## Status
 
-Proposed. V1 uses improved polling. SSE, WebSocket and inter-process notification
+Accepted. V1 uses improved polling. SSE, WebSocket and inter-process notification
 listeners are deferred to a separate decision, not included as opt-in features.
-[Draft PR #576](https://github.com/hardbyte/awa/pull/576) is documentation only.
+The [supporting contract](../../design/admin-observation-v1/index.md) describes work not
+yet implemented.
 
 ## Problem and constraints
 
@@ -139,9 +140,10 @@ independent caches and aggregate read costs. Current-state reads cannot guarante
 an audit trail, every completion, or an exact census during transitions.
 
 Shared read hardening and strict adapters are independently useful follow-ups to
-#572. They should not wait for a streaming decision. Existing GET parsing and
-per-statement timeouts must not be represented as strict mixed-version reads or
-an end-to-end deadline; the supporting contract records the verified gaps.
+#572. They should not wait for a streaming decision. #572 makes the current
+server's GET parameters strict and gives each interactive listing one deadline,
+but neither makes an older server strict; mixed-version strictness needs the
+versioned adapters.
 Its interactive-read budgets do not replace batch-scan or DLQ bulk-mutation
 policies. When strict adapters ship, upgrade notes must explain that a new UI
 routed to an old replica loses filtered-view availability rather than widening
@@ -170,7 +172,7 @@ bidirectional interaction also changes the decision boundary.
 - [ADR-049](../049-job-filter-and-indexed-tags/index.md) and
   [PR #572](https://github.com/hardbyte/awa/pull/572): shared population semantics;
   [current source evidence](../../design/admin-observation-v1/index.md#dependencies-and-source-evidence)
-  distinguishes remaining GET/deadline gaps from resolved DLQ/UI issues.
+  records what #572 already provides and what the adapters add.
 - [Existing cache](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/cache.rs),
   [admin state](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/state.rs)
   and [polling policy](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/frontend/src/hooks/use-poll-interval.ts):
