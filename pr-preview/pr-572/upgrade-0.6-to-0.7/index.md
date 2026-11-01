@@ -282,6 +282,11 @@ holding the new admin UI during a rolling deploy therefore gets an error
 from an old replica, never a wider operation. Scripts that call the 0.6
 `/api/dlq/bulk-retry` and `/bulk-purge` bodies keep working unchanged.
 
+A batch operation now needs a kind, queue, tag, ids or created bound, as a
+DLQ purge does, unless it sets `allow_all`. A script that submits one with
+only a state, such as `{"state": "available"}`, changed every job in that
+state on 0.6 and is refused on 0.7.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

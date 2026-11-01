@@ -37,8 +37,9 @@ pass over candidates and every load of their rows. A filter that needs longer
 fails with an error asking to narrow it. Batch operations scan without that
 budget, since a failed scan fails the operation.
 
-A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue,
-tag, ids or a created bound), or `allow_all`. Over HTTP the full filter goes
+A DLQ purge or bulk retry, and a batch operation, needs a field that picks
+out particular jobs (kind, queue, tag, ids or a created bound), or
+`allow_all`. A state alone isn't enough: it still names every job in it. Over HTTP the full filter goes
 to `POST /api/dlq/retry-matching` or `/api/dlq/purge-matching`:
 `{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`, or
 `{"filter": {}, "all": true}` for the whole DLQ.
@@ -139,7 +140,8 @@ awa storage build-tag-index --now    # build populated partitions now, CONCURREN
 ```
 
 `--now` holds back vacuum while each index builds and makes pruning of that
-partition report `Blocked` until it finishes. The build is safe to interrupt
+partition report `Blocked` until it finishes. Each concurrent build also
+waits for every transaction that started before it, however long that takes. The build is safe to interrupt
 and to repeat; an index an interrupted build left invalid is rebuilt.
-`awa storage status` reports how many indexes exist. Until they all do, tag
+`awa storage status` reports how many indexes exist under `tag_indexes`. Until they all do, tag
 lookups still work and scan the partitions that have no index.

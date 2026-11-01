@@ -2971,6 +2971,10 @@ purge by the full filter go to new endpoints (<code>/api/dlq/retry-matching</cod
 holding the new admin UI during a rolling deploy therefore gets an error
 from an old replica, never a wider operation. Scripts that call the 0.6
 <code>/api/dlq/bulk-retry</code> and <code>/bulk-purge</code> bodies keep working unchanged.</p>
+<p>A batch operation now needs a kind, queue, tag, ids or created bound, as a
+DLQ purge does, unless it sets <code>allow_all</code>. A script that submits one with
+only a state, such as <code>{"state": "available"}</code>, changed every job in that
+state on 0.6 and is refused on 0.7.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>

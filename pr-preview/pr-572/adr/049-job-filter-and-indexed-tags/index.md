@@ -186,7 +186,7 @@ There's no migration. A plain `CREATE INDEX` blocks writes for the whole build, 
     - **It holds back vacuum.** A partial expression index isn't exempt from the vacuum horizon, so the build holds `backend_xmin` while it runs. That delays vacuum on the HOT-updated lane tables and terminal-delta folding.
     - **It blocks pruning.** `prune_oldest`'s `NOWAIT` lock on that partition fails, so prune reports `Blocked` until the build finishes.
     - **It can lose a deadlock.** A build that loses one leaves an invalid index, which the next run repairs.
-- **It's resumable.** Each index has a pinned name (`{partition}_tags_idx`). An existing invalid index is rebuilt with `REINDEX INDEX CONCURRENTLY`, never skipped by `IF NOT EXISTS`. Lock attempts use `lock_timeout` and retry. `awa storage status` reports how many partitions are indexed.
+- **It's resumable.** Each index has a pinned name (`{partition}_tags_idx`). An existing invalid index is rebuilt with `REINDEX INDEX CONCURRENTLY`, never skipped by `IF NOT EXISTS`. A busy empty partition is retried on a later pass. Concurrent builds run on their own connection with no lock or statement timeout: one waits for every older transaction, and a timeout would abort it part-way and leave an invalid index that writes still maintain. `awa storage status` reports how many partitions are indexed.
 - **Callers can trigger it.** It runs from the CLI or from Rust as `tag_index::build_tag_indexes`. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.
 - **Lookups stay correct during the build.** Until the build finishes, the planner uses the indexes that exist and scans the partitions that have none.
 

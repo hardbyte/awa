@@ -2616,7 +2616,7 @@
 <li><strong>It can lose a deadlock.</strong> A build that loses one leaves an invalid index, which the next run repairs.</li>
 </ul>
 </li>
-<li><strong>It's resumable.</strong> Each index has a pinned name (<code>{partition}_tags_idx</code>). An existing invalid index is rebuilt with <code>REINDEX INDEX CONCURRENTLY</code>, never skipped by <code>IF NOT EXISTS</code>. Lock attempts use <code>lock_timeout</code> and retry. <code>awa storage status</code> reports how many partitions are indexed.</li>
+<li><strong>It's resumable.</strong> Each index has a pinned name (<code>{partition}_tags_idx</code>). An existing invalid index is rebuilt with <code>REINDEX INDEX CONCURRENTLY</code>, never skipped by <code>IF NOT EXISTS</code>. A busy empty partition is retried on a later pass. Concurrent builds run on their own connection with no lock or statement timeout: one waits for every older transaction, and a timeout would abort it part-way and leave an invalid index that writes still maintain. <code>awa storage status</code> reports how many partitions are indexed.</li>
 <li><strong>Callers can trigger it.</strong> It runs from the CLI or from Rust as <code>tag_index::build_tag_indexes</code>. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.</li>
 <li><strong>Lookups stay correct during the build.</strong> Until the build finishes, the planner uses the indexes that exist and scans the partitions that have none.</li>
 </ul>
