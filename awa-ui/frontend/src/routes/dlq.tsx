@@ -229,7 +229,7 @@ export function DlqPage() {
               </TableCell>
             </TableRow>
           )}
-          {rows.length === 0 && !dlqQuery.isLoading && !dlqQuery.isError && (
+          {rows.length === 0 && !dlqQuery.isLoading && !dlqQuery.isError && !searchError && (
             <TableRow>
               <TableCell colSpan={6}>
                 <div className="text-muted-fg py-6">

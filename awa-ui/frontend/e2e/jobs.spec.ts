@@ -217,6 +217,7 @@ test.describe("Search bar filters", () => {
     await page.goto("/jobs?q=queue%3Ae2e_test%20id%3Aabc");
     await expect(page.getByRole("alert")).toContainText("whole job ids");
     await expect(page.getByText("id:abc", { exact: true })).toBeVisible();
+    await expect(page.getByText("No jobs found.").filter({ visible: true })).toHaveCount(0);
     await expect(
       page.getByRole("button", { name: "Change priority or queue of matching jobs" })
     ).toHaveCount(0);
@@ -255,6 +256,7 @@ test.describe("Search bar filters", () => {
     });
     await page.goto("/dlq?q=queue%3Ae2e_dlq%20id%3Aabc");
     await expect(page.getByRole("alert")).toContainText("whole job ids");
+    await expect(page.getByText("DLQ is empty")).toHaveCount(0);
     await expect(page.getByRole("button", { name: /Retry matching/ })).toBeDisabled();
     await expect(page.getByRole("button", { name: "Purge matching" })).toBeDisabled();
     expect(bulkRequests).toEqual([]);

@@ -486,7 +486,7 @@ export function JobsPage() {
             Failed to load jobs: {jobsQuery.error.message}
           </p>
         )}
-        {!jobsQuery.isLoading && !jobsQuery.isError && jobs.length === 0 && (
+        {!jobsQuery.isLoading && !jobsQuery.isError && !searchError && jobs.length === 0 && (
           <p className="py-8 text-center text-sm text-muted-fg">No jobs found.</p>
         )}
         {jobs.map((job) => (
@@ -605,6 +605,8 @@ export function JobsPage() {
                 </div>
               );
             }
+            // The search error above says why nothing is listed.
+            if (searchError) return null;
             return (
               <div className="flex h-32 items-center justify-center text-sm text-muted-fg">
                 No jobs found.
