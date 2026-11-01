@@ -5,10 +5,10 @@
 //! against that backend.
 
 use crate::audited_sql;
-use crate::error::AwaError;
+use crate::error::{map_sqlx_error, AwaError};
 use crate::filter::{DlqPage, JobFilter};
 use crate::job::JobRow;
-use crate::job_query::{dlq_predicate, Bind, Predicate};
+use crate::job_query::{dlq_predicate, set_statement_timeout, Bind, Predicate, ReadBudget};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -316,9 +316,18 @@ async fn list_dlq_where(
         schema = store.schema(),
         where_clause = predicate.where_clause(),
     );
-    let rows: Vec<QueueStorageDlqRow> = predicate
-        .bind_query_as(sqlx::query_as(audited_sql(sql)))
-        .fetch_all(pool)
+    // Interactive, like the job listing, so it gets the same read budget.
+    let budget = ReadBudget::start();
+    let rows: Vec<QueueStorageDlqRow> = budget
+        .run(async {
+            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            set_statement_timeout(&mut tx, budget.remaining()?).await?;
+            predicate
+                .bind_query_as(sqlx::query_as(audited_sql(sql)))
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)
+        })
         .await?;
 
     rows.into_iter()
@@ -446,16 +455,10 @@ pub async fn retry_from_dlq(
 }
 
 /// Refuse a bulk DLQ action whose filter would select the whole DLQ unless
-/// the caller opted in. `states` and `dead_lettered` don't count: every DLQ
-/// row is a dead-lettered failed job, so neither narrows it.
+/// the caller opted in. Every DLQ row is a dead-lettered failed job, so
+/// neither `states` nor `dead_lettered` narrows it.
 fn require_dlq_scope(filter: &JobFilter, allow_all: bool, action: &str) -> Result<(), AwaError> {
-    let scoped = filter.kind.is_some()
-        || filter.queue.is_some()
-        || !filter.tags.is_empty()
-        || filter.ids.as_ref().is_some_and(|ids| !ids.is_empty())
-        || filter.created_at_gte.is_some()
-        || filter.created_at_lt.is_some();
-    if scoped || allow_all {
+    if filter.is_scoped() || allow_all {
         return Ok(());
     }
     Err(AwaError::Validation(format!(

@@ -1864,7 +1864,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Commands::Storage { command } => match command {
                     StorageCommands::Status => {
                         let report = awa_model::storage::status_report(&pool).await?;
-                        println!("{}", serde_json::to_string_pretty(&report)?);
                         let tag_indexes = awa_model::tag_index::tag_index_status(&pool).await?;
                         let valid = tag_indexes
                             .iter()
@@ -1872,15 +1871,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 status.state == awa_model::tag_index::TagIndexState::Valid
                             })
                             .count();
-                        println!(
-                            "Tag indexes: {valid} of {} built{}",
-                            tag_indexes.len(),
-                            if valid < tag_indexes.len() {
-                                " (run `awa storage build-tag-index` as the migrator)"
-                            } else {
-                                ""
-                            }
-                        );
+                        // Stdout stays one JSON document; the hint goes to
+                        // stderr.
+                        let mut json = serde_json::to_value(&report)?;
+                        if let Some(object) = json.as_object_mut() {
+                            object.insert(
+                                "tag_indexes".to_string(),
+                                serde_json::json!({
+                                    "valid": valid,
+                                    "total": tag_indexes.len(),
+                                }),
+                            );
+                        }
+                        println!("{}", serde_json::to_string_pretty(&json)?);
+                        if valid < tag_indexes.len() {
+                            eprintln!(
+                                "Tag indexes: {valid} of {} built; run `awa storage \
+                                 build-tag-index` as the migrator.",
+                                tag_indexes.len()
+                            );
+                        }
                     }
                     StorageCommands::BuildTagIndex {
                         now,

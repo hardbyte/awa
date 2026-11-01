@@ -125,7 +125,7 @@ impl BulkFilterPayload {
 /// 0.6 ones: a 0.6 server ignores fields it doesn't know, so any body it can
 /// reach is read as its flat fields, and `all: true` beside a filter it
 /// ignored would act on the whole DLQ. A 0.6 server answers these paths with
-/// 404 instead.
+/// 405 instead: it routes `/api/dlq/{id}` for GET and DELETE only.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatchingPayload {

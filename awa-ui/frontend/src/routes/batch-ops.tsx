@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useSearch } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -14,6 +14,8 @@ import {
   type BatchOperationPreview,
 } from "@/lib/api";
 import { isJobId, toRfc3339 } from "@/components/SearchBar";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { describeFilter, formatCount, isNarrowing, previewCount, sameFilter } from "@/lib/batch";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
@@ -128,6 +130,15 @@ function buildPayload(form: BatchForm): BatchOperationPayload {
   };
 }
 
+/** What submitting does, in words, for the confirm step. */
+function describeOperation(payload: BatchOperationPayload, preview: BatchOperationPreview): string {
+  const jobs = `${formatCount(previewCount(preview))} ${describeFilter(payload.filter)}`;
+  const priority = payload.spec.priority as number | undefined;
+  if (payload.op_kind === "set_priority") return `Set priority to ${priority} on ${jobs}.`;
+  const atPriority = priority === undefined ? "" : ` at priority ${priority}`;
+  return `Move ${jobs} to queue ${String(payload.spec.queue)}${atPriority}.`;
+}
+
 /** Form fields pre-filled from the jobs page's "batch change" link. The
  * router parses query values as JSON, so `?queue=123` arrives as a number. */
 function initialForm(search: Record<string, unknown>): BatchForm {
@@ -152,15 +163,25 @@ export function BatchOpsPage() {
   const readOnly = useReadOnly();
   const search = useSearch({ strict: false }) as Record<string, unknown>;
   const [form, setForm] = useState<BatchForm>(() => initialForm(search));
-  const [preview, setPreview] = useState<BatchOperationPreview | null>(null);
+  // A preview holds the filter it was taken with: it stands for the form
+  // only while the form's filter is the same.
+  const [preview, setPreview] = useState<{
+    filter: BatchOperationFilter;
+    result: BatchOperationPreview;
+  } | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const formFilterError = useMemo(() => filterError(form), [form]);
-  const isPayloadValid = useMemo(
-    () => isPayloadFormValid(form) && formFilterError === null,
-    [form, formFilterError]
-  );
   const payload = useMemo(() => buildPayload(form), [form]);
-  // A preview describes the form it was taken from.
-  useEffect(() => setPreview(null), [payload]);
+  const narrowing = isNarrowing(payload.filter);
+  const isPayloadValid = isPayloadFormValid(form) && formFilterError === null && narrowing;
+  const currentPreview =
+    preview && sameFilter(preview.filter, payload.filter) ? preview.result : null;
+  const currentCount = currentPreview ? previewCount(currentPreview) : null;
+  const submitHint = !isPayloadValid || currentPreview
+    ? null
+    : preview
+      ? "Filter changed; preview again"
+      : "Preview first";
 
   const operationsQuery = useQuery({
     queryKey: ["batch-ops"],
@@ -169,23 +190,24 @@ export function BatchOpsPage() {
   });
 
   const previewMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: (previewed: BatchOperationPayload) => {
       if (!isPayloadValid) throw new Error("Invalid batch operation payload");
-      return previewBatchOperation(payload);
+      return previewBatchOperation(previewed);
     },
-    onSuccess: (result) => {
-      setPreview(result);
-      toast.success(`Preview matched ${result.total_matched} job(s)`);
+    onSuccess: (result, previewed) => {
+      setPreview({ filter: previewed.filter, result });
+      toast.success(`Preview matched ${formatCount(previewCount(result))} job(s)`);
     },
     onError: (error) => toast.error(error.message),
   });
 
   const submitMutation = useMutation({
     mutationFn: () => {
-      if (!isPayloadValid) throw new Error("Invalid batch operation payload");
+      if (!isPayloadValid || !currentPreview) throw new Error("Invalid batch operation payload");
       return submitBatchOperation(payload);
     },
     onSuccess: (operation) => {
+      setPreview(null);
       void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
       toast.success(`Submitted batch operation ${operation.id.slice(0, 8)}`);
     },
@@ -282,16 +304,35 @@ export function BatchOpsPage() {
             {formFilterError}
           </p>
         )}
-        {preview && (
-          <p className="mt-2 text-sm" data-testid="batch-preview-count">
-            {preview.total_matched.toLocaleString()} eligible job(s) would change.
+        {!formFilterError && !narrowing && (
+          <p className="mt-2 text-sm text-muted-fg" data-testid="batch-narrowing">
+            Add a queue, kind, tag, ID or created bound.
           </p>
         )}
-        <div className="mt-4 flex gap-2">
-          <Button onPress={() => previewMutation.mutate()} isDisabled={readOnly || previewMutation.isPending || !isPayloadValid}>Preview</Button>
-          <Button intent="primary" onPress={() => submitMutation.mutate()} isDisabled={readOnly || submitMutation.isPending || !isPayloadValid}>Submit</Button>
+        {currentCount && (
+          <p className="mt-2 text-sm" data-testid="batch-preview-count">
+            {currentCount.kind === "at_least" ? "At least " : ""}
+            {currentCount.value.toLocaleString()} eligible job(s) would change.
+          </p>
+        )}
+        <div className="mt-4 flex items-center gap-2">
+          <Button onPress={() => previewMutation.mutate(payload)} isDisabled={readOnly || previewMutation.isPending || !isPayloadValid}>Preview</Button>
+          <Button intent="primary" onPress={() => setConfirming(true)} isDisabled={readOnly || submitMutation.isPending || !isPayloadValid || !currentPreview}>Submit</Button>
+          {submitHint && (
+            <span className="text-xs text-muted-fg" data-testid="batch-submit-hint">{submitHint}</span>
+          )}
         </div>
       </section>
+
+      <ConfirmDialog
+        isOpen={confirming && currentPreview !== null}
+        onOpenChange={setConfirming}
+        title="Submit batch operation"
+        description={currentPreview ? describeOperation(payload, currentPreview) : ""}
+        confirmLabel="Submit"
+        onConfirm={() => submitMutation.mutate()}
+        isPending={submitMutation.isPending}
+      />
 
       <Table aria-label="Batch operations">
         <TableHeader>

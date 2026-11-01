@@ -177,6 +177,38 @@ test.describe("Search bar filters", () => {
     await expect(page.getByLabel("State filter")).toHaveValue("available");
   });
 
+  test("a state tab alone offers no batch link", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
+      page.goto("/jobs?state=available"),
+    ]);
+    await expect(page.getByTestId("match-count")).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Change priority or queue of matching jobs" })
+    ).toHaveCount(0);
+  });
+
+  // A refused read shows within the default expect timeout only if the
+  // query doesn't retry the 4xx.
+  test("a refused list or count shows the server's message", async ({ page }) => {
+    await page.route(
+      (url) => url.pathname === "/api/jobs",
+      (route) => route.fulfill({ status: 400, json: { error: "narrow the filter" } })
+    );
+    await page.route(
+      (url) => url.pathname === "/api/jobs/count",
+      (route) => route.fulfill({ status: 400, json: { error: "count budget spent" } })
+    );
+    await page.goto("/jobs?q=queue%3Ae2e_test");
+    await expect(
+      page.getByText("Failed to load jobs: narrow the filter").filter({ visible: true })
+    ).toBeVisible();
+    await expect(page.getByText("No jobs found.").filter({ visible: true })).toHaveCount(0);
+    await expect(page.getByTestId("match-count-error")).toHaveText(
+      "Count failed: count budget spent"
+    );
+  });
+
   test("a malformed term in the URL lists nothing until it is removed", async ({ page }) => {
     const jobRequests: string[] = [];
     page.on("request", (r) => {

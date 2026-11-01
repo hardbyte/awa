@@ -1139,7 +1139,7 @@ async fn post_status(app: &axum::Router, path: &str, payload: Value) -> StatusCo
 
 /// A 0.6 server reads any body on the bulk-retry and bulk-purge paths as its
 /// flat fields, so the full filter lives on the matching paths, which it
-/// answers with 404. Neither path accepts a body that a 0.6 server would
+/// answers with 405. Neither path accepts a body that a 0.6 server would
 /// read as the whole DLQ while this one narrows it.
 #[tokio::test]
 async fn test_dlq_bulk_bodies_never_mean_more_on_an_older_server() {

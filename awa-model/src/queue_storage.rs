@@ -13115,7 +13115,16 @@ impl QueueStorage {
         // connection plans each once rather than once per call; a custom plan
         // costs more than running it, because each probe expands to every
         // partition.
+        //
+        // REPEATABLE READ gives every probe one snapshot. Under READ
+        // COMMITTED a job that moves to a table already read (a promotion,
+        // retry or DLQ retry committing between two probes) is in none of
+        // them, and reads as missing.
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         crate::job_query::plan_reads(&mut tx, true).await?;
         if let Some(timeout) = timeout {
             crate::job_query::set_statement_timeout(&mut tx, timeout).await?;

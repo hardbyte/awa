@@ -280,7 +280,8 @@ export interface BatchOperation {
 }
 
 export interface BatchOperationPreview {
-  total_matched: number;
+  /** A plain number is exact. */
+  total_matched: number | JobCount;
   sample: JobRow[];
 }
 
@@ -388,6 +389,17 @@ function jobFilterQuery(params: ListJobsParams): URLSearchParams {
   return qs;
 }
 
+/** A non-2xx response: `message` is the server's `error`, else the status text. */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -395,7 +407,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((body as { error?: string }).error ?? res.statusText);
+    throw new ApiError(res.status, (body as { error?: string }).error ?? res.statusText);
   }
   return res.json() as Promise<T>;
 }
@@ -650,7 +662,7 @@ export async function fetchStorage(
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((body as { error?: string }).error ?? res.statusText);
+    throw new ApiError(res.status, (body as { error?: string }).error ?? res.statusText);
   }
   return res.json() as Promise<StorageStatusReport>;
 }

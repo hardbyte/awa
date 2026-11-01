@@ -12,6 +12,7 @@ use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashSet;
 
 /// Most job ids a submitted filter may name.
 pub const MAX_FILTER_IDS: usize = 1000;
@@ -84,8 +85,14 @@ impl JobFilter {
     }
 
     pub fn tags<T: Into<String>>(mut self, tags: impl IntoIterator<Item = T>) -> Self {
+        // A set keeps de-duplication linear: a deserialised filter can carry
+        // a request body's worth of tags before `validate` sees the count.
+        let mut seen: HashSet<String> = self.tags.iter().cloned().collect();
         for tag in tags {
-            self = self.tag(tag);
+            let tag = tag.into();
+            if seen.insert(tag.clone()) {
+                self.tags.push(tag);
+            }
         }
         self
     }
@@ -110,22 +117,69 @@ impl JobFilter {
         self
     }
 
+    // Methods that read every field destructure `Self` without `..`, so a
+    // field added later fails to compile until each one decides what it
+    // means. That matters most where a filter bounds a DELETE or UPDATE.
+
     /// True when no field narrows the population.
     pub fn is_empty(&self) -> bool {
-        self.kind.is_none()
-            && self.queue.is_none()
-            && self.states.is_empty()
-            && self.tags.is_empty()
-            && self.dead_lettered.is_none()
-            && self.ids.as_ref().is_none_or(Vec::is_empty)
-            && self.created_at_gte.is_none()
-            && self.created_at_lt.is_none()
+        let JobFilter {
+            kind,
+            queue,
+            states,
+            tags,
+            dead_lettered,
+            ids,
+            created_at_gte,
+            created_at_lt,
+        } = self;
+        kind.is_none()
+            && queue.is_none()
+            && states.is_empty()
+            && tags.is_empty()
+            && dead_lettered.is_none()
+            && ids.is_none()
+            && created_at_gte.is_none()
+            && created_at_lt.is_none()
+    }
+
+    /// True when a field picks out particular jobs: kind, queue, tags, ids or
+    /// a created bound. `states` and `dead_lettered` only choose part of the
+    /// lifecycle, so a filter of those alone still names every job in it.
+    /// Bulk changes need a scoped filter unless the caller opts into all.
+    pub fn is_scoped(&self) -> bool {
+        let JobFilter {
+            kind,
+            queue,
+            states: _,
+            tags,
+            dead_lettered: _,
+            ids,
+            created_at_gte,
+            created_at_lt,
+        } = self;
+        kind.is_some()
+            || queue.is_some()
+            || !tags.is_empty()
+            || ids.is_some()
+            || created_at_gte.is_some()
+            || created_at_lt.is_some()
     }
 
     /// True when the filter needs more than ADR-030's shape: a runner from
     /// before ADR-049 cannot read it, or ignores `dead_lettered`.
     pub fn uses_extended_fields(&self) -> bool {
-        self.tags.len() > 1 || self.states.len() > 1 || self.dead_lettered.is_some()
+        let JobFilter {
+            kind: _,
+            queue: _,
+            states,
+            tags,
+            dead_lettered,
+            ids: _,
+            created_at_gte: _,
+            created_at_lt: _,
+        } = self;
+        tags.len() > 1 || states.len() > 1 || dead_lettered.is_some()
     }
 
     /// Bounds a submitted filter must respect. Stored filters are not
@@ -133,6 +187,13 @@ impl JobFilter {
     /// accepted batch operation.
     pub fn validate(&self) -> Result<(), AwaError> {
         if let Some(ids) = &self.ids {
+            // An empty list would match nothing while every other empty
+            // field matches anything; `None` is the way to say any id.
+            if ids.is_empty() {
+                return Err(AwaError::Validation(
+                    "ids needs at least one id; omit it to match any id".to_string(),
+                ));
+            }
             if ids.len() > MAX_FILTER_IDS {
                 return Err(AwaError::Validation(format!(
                     "a job filter may name at most {MAX_FILTER_IDS} ids, got {}",
@@ -169,16 +230,24 @@ impl JobFilter {
     /// Whether a loaded job, in its current state, belongs to the population.
     /// `dead_lettered` says whether the row came from the DLQ.
     pub fn matches(&self, job: &JobRow, dead_lettered: bool) -> bool {
-        self.kind.as_ref().is_none_or(|kind| &job.kind == kind)
-            && self.queue.as_ref().is_none_or(|queue| &job.queue == queue)
-            && (self.states.is_empty() || self.states.contains(&job.state))
-            && self.tags.iter().all(|tag| job.tags.contains(tag))
-            && self
-                .dead_lettered
-                .is_none_or(|wanted| wanted == dead_lettered)
-            && self.ids.as_ref().is_none_or(|ids| ids.contains(&job.id))
-            && self.created_at_gte.is_none_or(|gte| job.created_at >= gte)
-            && self.created_at_lt.is_none_or(|lt| job.created_at < lt)
+        let JobFilter {
+            kind,
+            queue,
+            states,
+            tags,
+            dead_lettered: wanted_dead_lettered,
+            ids,
+            created_at_gte,
+            created_at_lt,
+        } = self;
+        kind.as_ref().is_none_or(|kind| &job.kind == kind)
+            && queue.as_ref().is_none_or(|queue| &job.queue == queue)
+            && (states.is_empty() || states.contains(&job.state))
+            && tags.iter().all(|tag| job.tags.contains(tag))
+            && wanted_dead_lettered.is_none_or(|wanted| wanted == dead_lettered)
+            && ids.as_ref().is_none_or(|ids| ids.contains(&job.id))
+            && created_at_gte.is_none_or(|gte| job.created_at >= gte)
+            && created_at_lt.is_none_or(|lt| job.created_at < lt)
     }
 
     /// The states this filter can select once a consumer's eligible states
@@ -447,6 +516,14 @@ mod tests {
                 .tag("customer:acme")
                 .state(JobState::Available)
         );
+    }
+
+    #[test]
+    fn a_body_of_distinct_tags_deserialises_then_fails_validation() {
+        let tags: Vec<String> = (0..20_000).map(|i| format!("t{i}")).collect();
+        let filter: JobFilter = serde_json::from_value(serde_json::json!({ "tag": tags })).unwrap();
+        assert_eq!(filter.tags.len(), 20_000);
+        assert!(filter.validate().is_err());
     }
 
     #[test]

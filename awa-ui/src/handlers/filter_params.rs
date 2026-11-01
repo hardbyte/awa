@@ -2,6 +2,7 @@
 //! DLQ endpoints. `tag` and `state` may repeat (all of the tags, any of the
 //! states); `ids` is comma-separated.
 
+use awa_model::filter::{MAX_FILTER_IDS, MAX_FILTER_TAGS};
 use awa_model::{AwaError, JobFilter, JobState};
 use chrono::{DateTime, Utc};
 
@@ -19,6 +20,12 @@ pub struct FilterQuery {
 fn invalid(name: &str, value: &str) -> ApiError {
     ApiError::Awa(AwaError::Validation(format!(
         "invalid value for `{name}`: {value:?}"
+    )))
+}
+
+fn too_many(name: &str, cap: usize) -> ApiError {
+    ApiError::Awa(AwaError::Validation(format!(
+        "a job filter may take at most {cap} `{name}` values"
     )))
 }
 
@@ -45,49 +52,58 @@ pub fn parse(raw: Option<&str>) -> Result<FilterQuery, ApiError> {
                 "`{name}` needs a value"
             ))));
         }
-        let filter = std::mem::take(&mut query.filter);
-        query.filter = match name.as_ref() {
-            "kind" => filter.kind(value),
-            "queue" => filter.queue(value),
-            "tag" => filter.tag(value),
-            "state" => filter.state(
-                value
+        let filter = &mut query.filter;
+        match name.as_ref() {
+            "kind" => filter.kind = Some(value.to_string()),
+            "queue" => filter.queue = Some(value.to_string()),
+            "tag" => {
+                if !filter.tags.iter().any(|tag| tag == value) {
+                    // Checked per parameter so a long query string is
+                    // refused before it costs more than the cap.
+                    if filter.tags.len() == MAX_FILTER_TAGS {
+                        return Err(too_many("tag", MAX_FILTER_TAGS));
+                    }
+                    filter.tags.push(value.to_string());
+                }
+            }
+            "state" => {
+                let state = value
                     .parse::<JobState>()
-                    .map_err(|_| invalid("state", value))?,
-            ),
-            "dead_lettered" => filter.dead_lettered(match value {
-                "true" => true,
-                "false" => false,
-                _ => return Err(invalid("dead_lettered", value)),
-            }),
+                    .map_err(|_| invalid("state", value))?;
+                if !filter.states.contains(&state) {
+                    filter.states.push(state);
+                }
+            }
+            "dead_lettered" => {
+                filter.dead_lettered = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(invalid("dead_lettered", value)),
+                })
+            }
             "ids" => {
-                let mut ids = filter.ids.clone().unwrap_or_default();
+                let ids = filter.ids.get_or_insert_with(Vec::new);
                 for id in value.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+                    if ids.len() == MAX_FILTER_IDS {
+                        return Err(too_many("ids", MAX_FILTER_IDS));
+                    }
                     ids.push(id.parse().map_err(|_| invalid("ids", id))?);
                 }
-                filter.ids(ids)
             }
-            "created_at_gte" => filter.created_at_gte(parse_time("created_at_gte", value)?),
-            "created_at_lt" => filter.created_at_lt(parse_time("created_at_lt", value)?),
+            "created_at_gte" => filter.created_at_gte = Some(parse_time("created_at_gte", value)?),
+            "created_at_lt" => filter.created_at_lt = Some(parse_time("created_at_lt", value)?),
             "before_id" => {
-                query.before_id = Some(value.parse().map_err(|_| invalid("before_id", value))?);
-                filter
+                query.before_id = Some(value.parse().map_err(|_| invalid("before_id", value))?)
             }
-            "before_dlq_at" => {
-                query.before_dlq_at = Some(parse_time("before_dlq_at", value)?);
-                filter
-            }
-            "limit" => {
-                query.limit = Some(value.parse().map_err(|_| invalid("limit", value))?);
-                filter
-            }
+            "before_dlq_at" => query.before_dlq_at = Some(parse_time("before_dlq_at", value)?),
+            "limit" => query.limit = Some(value.parse().map_err(|_| invalid("limit", value))?),
             other => {
                 return Err(ApiError::Awa(AwaError::Validation(format!(
                     "unknown parameter `{other}`; filters take kind, queue, tag, state, \
                      ids, dead_lettered, created_at_gte and created_at_lt"
                 ))))
             }
-        };
+        }
     }
     query.filter.validate()?;
     Ok(query)
@@ -121,6 +137,17 @@ mod tests {
             parse(Some("queue=q")).unwrap().filter,
             JobFilter::new().queue("q")
         );
+    }
+
+    #[test]
+    fn caps_apply_while_parsing() {
+        let tags: Vec<String> = (0..=MAX_FILTER_TAGS).map(|i| format!("tag=t{i}")).collect();
+        assert!(parse(Some(&tags.join("&"))).is_err());
+        // Repeats of one tag count once.
+        let repeated = vec!["tag=t"; MAX_FILTER_TAGS * 2].join("&");
+        assert_eq!(parse(Some(&repeated)).unwrap().filter.tags, vec!["t"]);
+        let ids: Vec<String> = (0..=MAX_FILTER_IDS).map(|i| i.to_string()).collect();
+        assert!(parse(Some(&format!("ids={}", ids.join(",")))).is_err());
     }
 
     #[test]

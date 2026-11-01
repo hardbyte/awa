@@ -263,15 +263,13 @@ pub async fn submit_batch_operation(
     if request.filter.uses_extended_fields() {
         crate::filter::require_fleet_for_extended_filters(pool).await?;
     }
-    // `dead_lettered: false` excludes nothing a batch operation can reach, so
-    // it doesn't count as narrowing one.
-    let narrowing = BatchOperationFilter {
-        dead_lettered: None,
-        ..request.filter.clone()
-    };
-    if narrowing.is_empty() && !request.allow_all {
+    // A state alone still names every job in it, so it needs `allow_all`
+    // as an empty filter does.
+    if !request.filter.is_scoped() && !request.allow_all {
         return Err(AwaError::Validation(
-            "batch operation requires a filter or allow_all=true".to_string(),
+            "batch operation needs a kind, queue, tag, ids or created_at bound \
+             (or allow_all=true)"
+                .to_string(),
         ));
     }
     let op_kind = request.spec.kind();
@@ -399,8 +397,27 @@ async fn run_one_batch_operation_chunk_locked(
     chunk_size: i64,
 ) -> Result<BatchOperationRunOutcome, AwaError> {
     let chunk_size = chunk_size.max(1);
-    let Some(mut operation) = claim_next_operation(pool, runner_instance).await? else {
+    let Some(row) = claim_next_operation(pool, runner_instance).await? else {
         return Ok(BatchOperationRunOutcome::default());
+    };
+    // The oldest open operation is always claimed first, so one this runner
+    // cannot read would be claimed again on every tick and block the rest.
+    let mut operation = match BatchOperation::from_row(&row) {
+        Ok(operation) => operation,
+        Err(err) => {
+            let id: Uuid = row.try_get("id").map_err(map_sqlx_error)?;
+            fail_operation(
+                pool,
+                id,
+                format!("stored operation could not be read: {err}"),
+            )
+            .await?;
+            return Ok(BatchOperationRunOutcome {
+                claimed: true,
+                finalized: true,
+                ..Default::default()
+            });
+        }
     };
 
     if operation.state == BatchOperationState::Cancelling {
@@ -579,8 +596,8 @@ pub async fn finalize_expired_batch_operation_retention(
 async fn claim_next_operation(
     pool: &PgPool,
     runner_instance: Uuid,
-) -> Result<Option<BatchOperation>, AwaError> {
-    sqlx::query_as::<_, BatchOperation>(
+) -> Result<Option<PgRow>, AwaError> {
+    sqlx::query(
         r#"
         WITH target AS (
             SELECT id, state
@@ -610,7 +627,12 @@ async fn scan_operation(
     pool: &PgPool,
     operation: BatchOperation,
 ) -> Result<BatchOperation, AwaError> {
-    validate_filter_for_spec(&operation.spec.0, &operation.filter.0)?;
+    // Permanent, unlike a failed scan query: retrying on the next tick would
+    // block every later operation.
+    if let Err(err) = validate_filter_for_spec(&operation.spec.0, &operation.filter.0) {
+        fail_operation(pool, operation.id, err.to_string()).await?;
+        return get_batch_operation(pool, operation.id).await;
+    }
     let filter = operation.filter.0.clone();
     let max_job_id = crate::job_query::max_id(pool, &filter, &ELIGIBLE_STATES)
         .await?
@@ -676,6 +698,11 @@ async fn scan_operation(
         Some(operation) => Ok(operation),
         None => get_batch_operation(pool, operation_id).await,
     }
+}
+
+async fn fail_operation(pool: &PgPool, id: Uuid, reason: String) -> Result<(), AwaError> {
+    skip_pending_items(pool, id).await?;
+    finalize_operation(pool, id, BatchOperationState::Failed, Some(reason)).await
 }
 
 async fn finalize_operation(

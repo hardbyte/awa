@@ -15,7 +15,9 @@ import {
   pauseQueue,
   resumeQueue,
   drainQueue,
+  toWireFilter,
 } from "@/lib/api";
+import { isNarrowing } from "@/lib/batch";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
@@ -138,9 +140,12 @@ export function JobsPage() {
   });
 
   // A batch operation acts on available and scheduled jobs, so the jobs
-  // page offers one only when its filter can reach them. The batch form
-  // reads tags as a comma list, so a tag with a comma can't be carried over.
-  const batchEligible = ["all", "available", "scheduled"].includes(filters.state);
+  // page offers one only when its filter can reach them and names which of
+  // them (a state alone doesn't). The batch form reads tags as a comma list,
+  // so a tag with a comma can't be carried over.
+  const batchEligible =
+    ["all", "available", "scheduled"].includes(filters.state) &&
+    isNarrowing(toWireFilter(filterParams));
   const tagWithComma = (searchFilters.tags ?? []).some((tag) => tag.includes(","));
   const batchSearch: Record<string, string> = Object.fromEntries(
     Object.entries({
@@ -423,6 +428,11 @@ export function JobsPage() {
               matching
             </span>
           )}
+          {countQuery.isError && (
+            <span className="text-danger" data-testid="match-count-error">
+              Count failed: {countQuery.error.message}
+            </span>
+          )}
           {batchEligible && tagWithComma && (
             <span>A tag containing a comma can't be carried into a batch operation.</span>
           )}
@@ -472,7 +482,9 @@ export function JobsPage() {
           <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
         )}
         {!jobsQuery.isLoading && jobsQuery.isError && (
-          <p className="py-8 text-center text-sm text-danger-fg">Failed to load jobs.</p>
+          <p className="py-8 text-center text-sm text-danger-fg">
+            Failed to load jobs: {jobsQuery.error.message}
+          </p>
         )}
         {!jobsQuery.isLoading && !jobsQuery.isError && jobs.length === 0 && (
           <p className="py-8 text-center text-sm text-muted-fg">No jobs found.</p>
@@ -589,7 +601,7 @@ export function JobsPage() {
             if (jobsQuery.isError) {
               return (
                 <div className="flex h-32 items-center justify-center text-sm text-danger-fg">
-                  Failed to load jobs.
+                  Failed to load jobs: {jobsQuery.error.message}
                 </div>
               );
             }

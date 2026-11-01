@@ -136,6 +136,8 @@ export function DlqPage() {
   // As on the jobs page: cached rows for the wider search stay hidden.
   const rows = searchError ? [] : dlqQuery.data ?? [];
   const hasActiveFilter = Object.keys(searchFilters).length > 0;
+  // Bulk actions are judged from the list beside them, so they wait for one.
+  const listUnavailable = dlqQuery.isPending || dlqQuery.isError;
 
   const setUrlParams = useCallback(
     (updates: Record<string, string | undefined>) => {
@@ -185,7 +187,7 @@ export function DlqPage() {
           <Button
             size="xs"
             onPress={() => setShowRetryConfirm(true)}
-            isDisabled={retryFilterMutation.isPending || !!searchError}
+            isDisabled={retryFilterMutation.isPending || !!searchError || listUnavailable}
           >
             Retry matching ({rows.length}+)
           </Button>
@@ -194,7 +196,7 @@ export function DlqPage() {
             size="xs"
             className="text-danger"
             onPress={() => setShowPurgeConfirm(true)}
-            isDisabled={purgeFilterMutation.isPending || !!searchError}
+            isDisabled={purgeFilterMutation.isPending || !!searchError || listUnavailable}
           >
             Purge matching
           </Button>
@@ -218,7 +220,16 @@ export function DlqPage() {
           <TableColumn>DLQ'd</TableColumn>
         </TableHeader>
         <TableBody>
-          {rows.length === 0 && !dlqQuery.isLoading && (
+          {dlqQuery.isError && (
+            <TableRow>
+              <TableCell colSpan={6}>
+                <div className="text-danger py-6" role="alert">
+                  Failed to load the DLQ: {dlqQuery.error.message}
+                </div>
+              </TableCell>
+            </TableRow>
+          )}
+          {rows.length === 0 && !dlqQuery.isLoading && !dlqQuery.isError && (
             <TableRow>
               <TableCell colSpan={6}>
                 <div className="text-muted-fg py-6">

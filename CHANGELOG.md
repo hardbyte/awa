@@ -50,6 +50,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   queue, tag, ids or a created bound) unless `allow_all` is set; `state:
   failed` and `dead_lettered: true` alone are refused, since every DLQ row
   matches them.
+- **A batch operation needs the same:** a kind, queue, tag, ids or created
+  bound, unless `allow_all` is set. In 0.6 a state alone was enough, so
+  `{"state": "available"}` changed every available job; it is now refused.
+  Stored operations are unaffected. An empty `ids` list is refused in any
+  filter, since it would match nothing; omit `ids` to match any id.
+- **`awa storage status` prints one JSON document,** now with a
+  `tag_indexes: {valid, total}` field; the build hint goes to stderr.
 - **Deprecated:** `admin::list_jobs` and `ListJobsFilter` (use `find_jobs`
   with `JobFilter` and `JobPage`), and `dlq::list_dlq`, `purge_dlq`,
   `bulk_retry_from_dlq` and `ListDlqFilter` (use `find_dlq`,
@@ -87,6 +94,30 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `($n IS NULL OR …)` and degraded to minutes once Postgres switched it to a
   generic plan; at 50,000 retained jobs a rare-tag lookup now takes tens of
   milliseconds instead of more than two minutes.
+
+### Fixed
+
+- **Reading one job by id no longer misses a job that moved mid-read.** The
+  loader behind `get_job` and filtered listings reads every table from one
+  snapshot (`REPEATABLE READ READ ONLY`); a promotion or retry committing
+  between two of its statements could hide the job.
+- **A batch operation the runner can't read is marked failed** instead of
+  being claimed on every tick, which blocked every later operation. The same
+  goes for one whose stored filter no longer suits its operation.
+- **`awa storage build-tag-index --now` waits out long transactions** rather
+  than aborting after 5 s and leaving an invalid index that every write still
+  maintained. It runs on its own connection with no lock or statement
+  timeout, and also drops the `_ccold` copies a failed rebuild leaves.
+- **Job filters are bounded while they're parsed.** Tag de-duplication is
+  linear, and the query-string parser stops at 20 tags or 1,000 ids, so an
+  oversized request costs no more than the limit.
+- **The DLQ listing has the same 30-second read budget** as job listing.
+- **Admin UI:** the DLQ page shows the server's error instead of "DLQ is
+  empty" and disables bulk actions while its list is failing or loading; a
+  4xx response is not retried; the jobs page shows the server's message. A
+  batch operation needs a preview of the form's current filter and a
+  confirmation stating its scope and count, and the jobs page offers the
+  batch link only for a search that narrows the population.
 
 ## [0.7.0-alpha.1] — 2026-10-29
 
