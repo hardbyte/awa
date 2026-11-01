@@ -17217,6 +17217,104 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
     client.shutdown(Duration::from_secs(1)).await;
 }
 
+/// `queue_overviews` must not read `queue_state_counts`, which queue storage
+/// never maintains, nor expand retained completions: completions in the last
+/// hour come from batch sizes, and `available` stays exact past a
+/// tombstoned ready row, which the sequence-head signal would still count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_overview_counts";
+    let schema = "awa_qs_overview_counts";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    // A row left behind by the canonical engine before the cutover.
+    sqlx::query(
+        "INSERT INTO awa.queue_state_counts (queue, available, completed) VALUES ($1, 999, 999) \
+         ON CONFLICT (queue) DO UPDATE SET available = 999, completed = 999",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed a stale queue_state_counts row");
+
+    let mut completed = Vec::new();
+    for i in 0..5 {
+        completed.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: i },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+    for job_id in &completed {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    client.shutdown(Duration::from_secs(5)).await;
+    let batched: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT COALESCE(sum(completed_count), 0)::bigint \
+         FROM {schema}.receipt_completion_batches WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read completion batches");
+    assert!(
+        batched > 0,
+        "completions should take the compact batch path"
+    );
+
+    let mut waiting = Vec::new();
+    for i in 5..8 {
+        waiting.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: i },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    awa::model::admin::cancel(&pool, waiting[0])
+        .await
+        .expect("cancel an available job");
+
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.completed_last_hour, 5);
+    assert_eq!(overview.available, 2, "the cancelled job is not available");
+    assert_eq!(overview.total_queued, 2);
+    assert_eq!(overview.running, 0);
+}
+
 /// `ordering_key` pins a job to a deterministic shard based on a
 /// portable hash of the key bytes. Producers can use it to keep jobs
 /// for the same logical partition (customer, order, account) on the
