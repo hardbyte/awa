@@ -3360,7 +3360,6 @@ pub async fn state_timeseries(
     minutes: i32,
 ) -> Result<Vec<StateTimeseriesBucket>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
-        let since = chrono::Utc::now() - chrono::Duration::minutes(i64::from(minutes));
         let sql = format!(
             "{} \
              SELECT \
@@ -3376,6 +3375,14 @@ pub async fn state_timeseries(
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
+        // The window is measured on the database's clock, as on the canonical
+        // engine, but bound as a value: Postgres won't push an expression
+        // like `clock_timestamp()` into the `terminal_jobs` view.
+        let since: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp() - make_interval(mins => $1)")
+                .bind(minutes)
+                .fetch_one(tx.as_mut())
+                .await?;
         let rows =
             sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(audited_sql(sql))
                 .bind(since)

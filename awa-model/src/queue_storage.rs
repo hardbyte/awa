@@ -994,6 +994,23 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
                     FROM {schema}.receipt_completion_batches
                     WHERE finalized_at > clock_timestamp() - interval '1 hour'
                     UNION ALL
+                    -- Less its members deleted or retried since, as
+                    -- `terminal_jobs` drops them. A tombstone on a member
+                    -- finalised within the hour is itself newer than that.
+                    SELECT tomb.queue, -1::bigint
+                    FROM {schema}.receipt_completion_tombstones AS tomb
+                    WHERE tomb.deleted_at > clock_timestamp() - interval '1 hour'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM {schema}.receipt_completion_batches AS batch
+                          WHERE batch.ready_slot = tomb.ready_slot
+                            AND batch.ready_generation = tomb.ready_generation
+                            AND batch.queue = tomb.queue
+                            AND batch.finalized_at > clock_timestamp() - interval '1 hour'
+                            AND batch.run_leases[array_position(batch.job_ids, tomb.job_id)]
+                                = tomb.run_lease
+                      )
+                    UNION ALL
                     SELECT queue, 1::bigint
                     FROM {schema}.done_entries
                     WHERE state = 'completed'

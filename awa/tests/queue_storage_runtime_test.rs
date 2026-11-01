@@ -17219,9 +17219,9 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
 
 /// The dashboard's reads must not read `queue_state_counts`, which queue
 /// storage never maintains, nor expand every retained completion: completions
-/// are counted from batch sizes, the timeseries reads only batches finalised
-/// within its window, and `available` stays exact past a tombstoned ready
-/// row, which the sequence-head signal would still count.
+/// are counted from batch sizes less tombstoned members, the timeseries reads
+/// only batches finalised within its window, and `available` stays exact past
+/// a tombstoned ready row, which the sequence-head signal would still count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     let (_db_guard, pool) = setup_pool(8).await;
@@ -17306,11 +17306,18 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
         .await
         .expect("cancel an available job");
 
+    // A deleted completion leaves its batch as it was, with a tombstone.
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(completed[0])
+        .execute(&pool)
+        .await
+        .expect("delete a completed job");
+
     let overview = admin::queue_overview(&pool, queue)
         .await
         .expect("read queue overview")
         .expect("queue overview should include the queue");
-    assert_eq!(overview.completed_last_hour, 5);
+    assert_eq!(overview.completed_last_hour, 4);
     assert_eq!(overview.available, 2, "the cancelled job is not available");
     assert_eq!(overview.total_queued, 2);
     assert_eq!(overview.running, 0);
@@ -17319,7 +17326,7 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     let counts = admin::state_counts(&pool)
         .await
         .expect("read queue-storage state counts");
-    assert_eq!(counts.get(&JobState::Completed).copied(), Some(5));
+    assert_eq!(counts.get(&JobState::Completed).copied(), Some(4));
     assert_eq!(counts.get(&JobState::Available).copied(), Some(2));
     assert_eq!(counts.get(&JobState::Cancelled).copied(), Some(1));
 
@@ -17333,7 +17340,7 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     assert_eq!(
         by_state,
         HashMap::from([
-            (JobState::Completed, 5),
+            (JobState::Completed, 4),
             (JobState::Available, 2),
             (JobState::Cancelled, 1),
         ])
