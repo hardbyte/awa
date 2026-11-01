@@ -17219,8 +17219,9 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
 
 /// `queue_overviews` must not read `queue_state_counts`, which queue storage
 /// never maintains, nor expand retained completions: completions in the last
-/// hour come from batch sizes, and `available` stays exact past a
-/// tombstoned ready row, which the sequence-head signal would still count.
+/// hour come from batch sizes less tombstoned members, and `available` stays
+/// exact past a tombstoned ready row, which the sequence-head signal would
+/// still count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     let (_db_guard, pool) = setup_pool(8).await;
@@ -17305,11 +17306,18 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
         .await
         .expect("cancel an available job");
 
+    // A deleted completion leaves its batch as it was, with a tombstone.
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(completed[0])
+        .execute(&pool)
+        .await
+        .expect("delete a completed job");
+
     let overview = admin::queue_overview(&pool, queue)
         .await
         .expect("read queue overview")
         .expect("queue overview should include the queue");
-    assert_eq!(overview.completed_last_hour, 5);
+    assert_eq!(overview.completed_last_hour, 4);
     assert_eq!(overview.available, 2, "the cancelled job is not available");
     assert_eq!(overview.total_queued, 2);
     assert_eq!(overview.running, 0);
