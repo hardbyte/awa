@@ -190,6 +190,8 @@ The command provisions all four priorities in one transaction and is safe to rep
 
 Lane cursors need `UPDATE` on their sequences for `setval`, in addition to `USAGE` and `SELECT`; use the sequence grants above. A restricted runtime that reaches an unprovisioned lane fails with SQLSTATE `42501` and a provisioning hint. Schema owners keep lazy creation, so single-role installations need no extra step.
 
+On a database where a runtime role with `CREATE` has been creating lanes (any 0.6.9 deployment that ran without schema ownership), the runtime owns those lane sequences. `GRANT ... ON ALL SEQUENCES` run by the owner fails on them, so grant per sequence the owner owns, verify, and only then revoke `CREATE`. [Upgrading from 0.6.9 to 0.6.10](upgrade-0.6.9-to-0.6.10.md#optional-run-the-runtime-role-without-schema-create) has the full procedure and the SQL.
+
 ### 5. Configure your processes
 
 | Process | Role | Connection string |

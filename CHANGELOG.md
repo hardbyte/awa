@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.10] — 2026-11-02
 
-Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, a request the UI's client abandons no longer holds a database connection, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Operators deploying a runtime role without schema `CREATE` must run `awa storage prepare-queue` per queue and grant sequence `USAGE, SELECT, UPDATE` before starting workers; see `docs/security.md`.
+Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, a request the UI's client abandons no longer holds a database connection, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Upgrading from 0.6.9 is a rolling upgrade: run `awa migrate` once as the owner while traffic continues, then roll processes; binaries can roll back to 0.6.9 with the patch left in place. [`docs/upgrade-0.6.9-to-0.6.10.md`](docs/upgrade-0.6.9-to-0.6.10.md) has the steps, the rollback, and the optional procedure for running the runtime role without schema `CREATE`.
 
 - **Admin queue and dashboard reads on queue storage follow live work, not
   retained history** (backport of
@@ -61,6 +61,34 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   can run under live workers. New `awa storage prepare-queue` and
   `QueueStorage::prepare_queue` provision lanes as the migrator; runtime roles
   need `USAGE, SELECT, UPDATE` on the lane sequences.
+- **The patch counts as applied only when every queue-storage schema has it.**
+  The `prepared_lane_sequences` probe checked the helpers in `awa` alone, so a
+  custom schema restored or prepared with the 0.6.9 helpers was missed once
+  `awa` passed, and a database whose only active substrate was a custom schema
+  never passed. The probe now checks the installer, the refresh function and
+  every substrate's helpers, and the new `migrations::schema_patch_status`
+  names each schema still lacking the patch.
+- **`awa migrate` reports what it did and refuses ranges it cannot honour.**
+  It prints the schema version, each patch and what it updated, and storage
+  routing before and after, and exits 1 naming any schema a patch could not
+  reach (`migrations::run_with_report` returns the same report). `--from`,
+  `--to` and `--version` are refused when applying, where they used to be
+  ignored in favour of a full migration. `--sql` output is one transaction
+  holding the migration advisory lock, with `ON_ERROR_STOP` guidance in its
+  header; `--no-transaction` prints it bare.
+- **`awa storage prepare-queue` works on lanes a 0.6.9 runtime created.**
+  A runtime role with schema `CREATE` owns the lane sequences it creates, and
+  provisioning such a lane as the owner failed with `permission denied for
+  sequence`: the head tables' `BEFORE INSERT` triggers run even for a row that
+  `ON CONFLICT DO NOTHING` then skips. Lane provisioning now inserts only the
+  rows that are missing.
+- **The 0.6.9 → 0.6.10 → 0.6.9 journey is a release gate.** A new CI job,
+  `patch_upgrade_rehearsal_test` on PostgreSQL 17 and 18, installs with the
+  released 0.6.9 CLI, runs the released 0.6.9 Python worker as a separate
+  runtime role in a custom queue-storage schema, patches under that traffic
+  (no Awa table locks, sequence positions kept, routing unchanged), runs both
+  versions together through worker kills, retries and scheduled jobs, rolls
+  back to 0.6.9, tightens privileges, and accounts for every job.
 
 ## [0.6.9] — 2026-09-14
 

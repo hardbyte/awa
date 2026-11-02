@@ -250,6 +250,20 @@ is also available programmatically:
 - Rust: `awa::migrations::migration_sql()` and `awa::migrations::schema_patch_sql(SCHEMA_PATCHES)`
 - Python: `awa.migrations()` and `awa.schema_patches()`
 
+`awa migrate --sql` wraps its output in one transaction that takes the same
+advisory lock as `awa migrate`. Pipe it to `psql -v ON_ERROR_STOP=1`; without
+it psql exits 0 even when the transaction rolled back. `--no-transaction`
+prints the statements bare for runners that open the transaction themselves.
+`--from`, `--to` and `--version` choose what `--sql` and `--extract-to`
+render; `awa migrate` refuses them when applying, since it always migrates to
+the current version and its patches.
+
+`awa migrate` reports the schema version, each patch and what it updated, and
+storage routing before and after. It exits 1 if a patch is still missing
+somewhere, such as a queue-storage schema the migrating role cannot use, and
+names it. `awa::migrations::schema_patch_status` gives the same per-patch view
+from Rust.
+
 ## Checking Schema Version
 
 From SQL:
@@ -286,7 +300,10 @@ If a release has to be reverted but the Awa schema migration already ran:
 - roll back application code first
 - leave the Awa schema in place
 
-That is the expected path because the migrations are additive-only.
+That is the expected path because the migrations are additive-only. Schema
+patches are the same: after the 0.6.10 patch, roll binaries back to 0.6.9 and
+leave the patch installed (see
+[Upgrading from 0.6.9 to 0.6.10](upgrade-0.6.9-to-0.6.10.md#roll-back)).
 
 For the planned `0.5.x` -> `0.6` storage transition, there is an additional constraint:
 
