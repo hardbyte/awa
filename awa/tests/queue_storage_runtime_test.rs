@@ -19473,7 +19473,7 @@ async fn test_queue_storage_cancel_by_unique_key_finds_each_live_state() {
         .await
         .expect("claim the waiting job");
     assert_eq!(claimed[0].job.id, waiting);
-    store
+    let callback_id = store
         .register_callback(
             &pool,
             waiting,
@@ -19481,7 +19481,15 @@ async fn test_queue_storage_cancel_by_unique_key_finds_each_live_state() {
             Duration::from_secs(3600),
         )
         .await
-        .expect("park the job on a callback");
+        .expect("register the callback");
+    assert!(store
+        .enter_callback_wait(&pool, waiting, claimed[0].job.run_lease, callback_id)
+        .await
+        .expect("enter the callback wait"));
+    assert_eq!(
+        admin::get_job(&pool, waiting).await.unwrap().state,
+        JobState::WaitingExternal
+    );
     // Two live jobs sharing a key: uniqueness enforced only among failed jobs.
     let shared_opts = || InsertOpts {
         unique: Some(UniqueOpts {
