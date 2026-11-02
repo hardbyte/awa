@@ -21,7 +21,7 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17201,6 +17201,154 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
     );
 
     client.shutdown(Duration::from_secs(1)).await;
+}
+
+/// The dashboard's reads must not read `queue_state_counts`, which queue
+/// storage never maintains, nor expand every retained completion: completions
+/// are counted from batch sizes less tombstoned members, the timeseries reads
+/// only batches finalised within its window, and `available` stays exact past
+/// a tombstoned ready row, which the sequence-head signal would still count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_overview_counts";
+    let schema = "awa_qs_overview_counts";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    // A row left behind by the canonical engine before the cutover.
+    sqlx::query(
+        "INSERT INTO awa.queue_state_counts (queue, available, completed) VALUES ($1, 999, 999) \
+         ON CONFLICT (queue) DO UPDATE SET available = 999, completed = 999",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed a stale queue_state_counts row");
+
+    let mut completed = Vec::new();
+    for i in 0..5 {
+        completed.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: i },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+    for job_id in &completed {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    client.shutdown(Duration::from_secs(5)).await;
+    let batched: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT COALESCE(sum(completed_count), 0)::bigint \
+         FROM {schema}.receipt_completion_batches WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read completion batches");
+    assert!(
+        batched > 0,
+        "completions should take the compact batch path"
+    );
+
+    let mut waiting = Vec::new();
+    for i in 5..8 {
+        waiting.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: i },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    awa::model::admin::cancel(&pool, waiting[0])
+        .await
+        .expect("cancel an available job");
+
+    // A deleted completion leaves its batch as it was, with a tombstone.
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(completed[0])
+        .execute(&pool)
+        .await
+        .expect("delete a completed job");
+
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.completed_last_hour, 4);
+    assert_eq!(overview.available, 2, "the cancelled job is not available");
+    assert_eq!(overview.total_queued, 2);
+    assert_eq!(overview.running, 0);
+
+    // The dashboard's other two reads, over the same jobs.
+    let counts = admin::state_counts(&pool)
+        .await
+        .expect("read queue-storage state counts");
+    assert_eq!(counts.get(&JobState::Completed).copied(), Some(4));
+    assert_eq!(counts.get(&JobState::Available).copied(), Some(2));
+    assert_eq!(counts.get(&JobState::Cancelled).copied(), Some(1));
+
+    let mut by_state: HashMap<JobState, i64> = HashMap::new();
+    for bucket in admin::state_timeseries(&pool, 60)
+        .await
+        .expect("read queue-storage state timeseries")
+    {
+        *by_state.entry(bucket.state).or_default() += bucket.count;
+    }
+    assert_eq!(
+        by_state,
+        HashMap::from([
+            (JobState::Completed, 4),
+            (JobState::Available, 2),
+            (JobState::Cancelled, 1),
+        ])
+    );
+    // A window that ends before these jobs were created holds none of them.
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.receipt_completion_batches SET finalized_at = now() - interval '2 hours'"
+    )))
+    .execute(&pool)
+    .await
+    .expect("age the completion batches");
+    let recent_completed: i64 = admin::state_timeseries(&pool, 60)
+        .await
+        .expect("read queue-storage state timeseries")
+        .into_iter()
+        .filter(|bucket| bucket.state == JobState::Completed)
+        .map(|bucket| bucket.count)
+        .sum();
+    assert_eq!(
+        recent_completed, 0,
+        "a job finalised before the window began cannot have been created in it"
+    );
 }
 
 /// `ordering_key` pins a job to a deterministic shard based on a

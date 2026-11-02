@@ -119,6 +119,36 @@ Notable changes between releases. Detailed migration notes for storage transitio
   confirmation stating its scope and count, and the jobs page offers the
   batch link only for a search that narrows the population.
 
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, such as a statement timeout, sqlx 0.9 tried
+  to close the connection, and closing a TLS connection mid-stream hangs, so
+  the pool lost that slot permanently; a slow dashboard read polled often
+  enough could exhaust the pool. `awa serve` now sets a 60-second statement
+  timeout (`--statement-timeout`, `AWA_STATEMENT_TIMEOUT`), recovers such
+  connections when they are released, and on Postgres 14+ sets
+  `client_connection_check_interval` so a query stops when its connection
+  closes. Applications embedding `awa_ui::router` can build their pool with
+  the new `awa_ui::admin_pool_options` and `admin_connect_options`.
+- **Queue overviews on queue storage no longer read retained history.**
+  `admin::queue_overviews`, behind the admin UI's queues and dashboard pages
+  and `awa queue stats`, counted every current job through `terminal_jobs`,
+  which expands each completion batch and joins it back to `ready_entries`.
+  It now reads the live-work tables, as the workers' queue gauges do, and
+  counts completions in the last hour from batch sizes. With 100,000
+  retained completions and 100,000 queued jobs it drops from 7.7 s to
+  0.27 s. JIT is off for the read; compiling it cost more than running it.
+- **The dashboard's state counts and timeseries no longer read retained
+  history on queue storage.** `admin::state_counts` counts completions from
+  batch sizes and available jobs per lane from its claim cursor (6.5 s to
+  0.24 s on the same data). `admin::state_timeseries` reads only rows
+  finalised within its window, since a job finishes after it is created. It
+  previously expanded every retained completion and sorted the result:
+  against that data it ran for over 10 minutes and filled the disk with
+  temporary files. It now takes 0.6 s, with all 100,000 completions inside
+  the window.
+
 ## [0.7.0-alpha.1] — 2026-10-29
 
 ### Upgrading

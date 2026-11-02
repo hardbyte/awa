@@ -126,6 +126,11 @@ enum Commands {
         /// Seconds to wait when acquiring a connection
         #[arg(long, default_value = "10", env = "AWA_POOL_ACQUIRE_TIMEOUT")]
         pool_acquire_timeout: u64,
+        /// Seconds any one database statement from the UI may run; 0 leaves
+        /// the server's setting. Bounds queries a closed or timed-out request
+        /// leaves running, and the pool connections they hold.
+        #[arg(long, default_value = "60", env = "AWA_STATEMENT_TIMEOUT")]
+        statement_timeout: u64,
         /// Cache TTL for dashboard queries in seconds
         #[arg(long, default_value = "5", env = "AWA_CACHE_TTL")]
         cache_ttl: u64,
@@ -1237,6 +1242,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pool_idle_timeout,
             pool_max_lifetime,
             pool_acquire_timeout,
+            statement_timeout,
             cache_ttl,
             callback_hmac_secret,
             read_only,
@@ -1260,13 +1266,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Result<Vec<_>, _>>()?,
             };
             let db_url = resolve_db()?;
-            let pool = PgPoolOptions::new()
+            let connect_options = awa_ui::admin_connect_options(
+                db_url.parse()?,
+                Some(Duration::from_secs(statement_timeout)),
+            );
+            let pool = awa_ui::admin_pool_options(PgPoolOptions::new())
                 .max_connections(pool_max)
                 .min_connections(pool_min)
                 .idle_timeout(Duration::from_secs(pool_idle_timeout))
                 .max_lifetime(Duration::from_secs(pool_max_lifetime))
                 .acquire_timeout(Duration::from_secs(pool_acquire_timeout))
-                .connect(&db_url)
+                .connect_with(connect_options)
                 .await?;
 
             let cache_duration = Duration::from_secs(cache_ttl);

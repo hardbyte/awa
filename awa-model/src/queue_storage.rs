@@ -893,6 +893,287 @@ fn receipt_closed_evidence_sql(
     )
 }
 
+/// Each queue's available rows, exactly, as `(queue, available)`: every
+/// lane's unclaimed rows, read along the primary key from its claim cursor to
+/// its enqueue head, so the cost follows the backlog rather than the
+/// partition.
+pub fn available_by_queue_sql(schema: &str) -> String {
+    format!(
+        r#"
+        SELECT heads.queue, COALESCE(sum(lane.available), 0)::bigint AS available
+        FROM (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+        ) AS heads
+        CROSS JOIN LATERAL (
+            SELECT count(*)::bigint AS available
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.queue = heads.queue
+              AND ready.priority = heads.priority
+              AND ready.enqueue_shard = heads.enqueue_shard
+              AND ready.lane_seq >= heads.claim_seq
+              AND ready.lane_seq < heads.next_seq
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+              )
+        ) AS lane
+        GROUP BY heads.queue
+        "#
+    )
+}
+
+/// What [`queue_signals_sql`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSignalReads {
+    /// No receipt-claim table, so claim-ring rotation's `ACCESS EXCLUSIVE`
+    /// locks never block it: `running` counts materialised leases only, and
+    /// `completed_last_hour` is 0. For gauges polled by the maintenance loop.
+    Gauge,
+    /// Counts available rows exactly, and also counts receipt-backed running
+    /// claims and completions in the last hour from completion batches and
+    /// `done_entries`. For the admin queue views.
+    Admin,
+}
+
+/// Per-queue counts that never expand terminal history, ending in a
+/// `signals` CTE with `queue`, `available`, `running`, `waiting_external`,
+/// `scheduled`, `retryable`, `failed_done`, `failed_dlq`, `lag_seconds` and
+/// `completed_last_hour`.
+///
+/// With [`QueueSignalReads::Gauge`], `available` is the sequence-head signal,
+/// an upper bound as in [`QueueStorage::queue_counts_fast`]; with
+/// [`QueueSignalReads::Admin`] it is exact. Nothing here reads `terminal_jobs`,
+/// whose completion batches expand and join back to `ready_entries`, so the
+/// cost follows live work rather than retained history.
+pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
+    let (ready, receipt_running, completed_recent) = match reads {
+        QueueSignalReads::Gauge => (
+            // Enqueued minus claimed: an upper bound, since a tombstoned
+            // row or a sequence gap still counts until the claimer passes.
+            r#"
+            SELECT
+                head_signal.queue,
+                COALESCE(
+                    sum(GREATEST(head_signal.next_seq - head_signal.claim_seq, 0)),
+                    0
+                )::bigint AS available
+            FROM head_signal
+            GROUP BY head_signal.queue
+            "#
+            .to_string(),
+            "SELECT NULL::text AS queue, 0::bigint AS running WHERE false".to_string(),
+            "SELECT NULL::text AS queue, 0::bigint AS completed_last_hour WHERE false".to_string(),
+        ),
+        QueueSignalReads::Admin => (
+            available_by_queue_sql(schema),
+            format!(
+                "SELECT queue, count(*)::bigint AS running FROM ({}) AS open_claims GROUP BY queue",
+                open_receipt_running_claims_sql(schema)
+            ),
+            format!(
+                r#"
+                SELECT queue, sum(completed)::bigint AS completed_last_hour
+                FROM (
+                    -- A batch carries its queue and size, so it is counted
+                    -- without unnesting its members.
+                    SELECT queue, completed_count::bigint AS completed
+                    FROM {schema}.receipt_completion_batches
+                    WHERE finalized_at > clock_timestamp() - interval '1 hour'
+                    UNION ALL
+                    -- Less its members deleted or retried since, as
+                    -- `terminal_jobs` drops them. A tombstone on a member
+                    -- finalised within the hour is itself newer than that.
+                    SELECT tomb.queue, -1::bigint
+                    FROM {schema}.receipt_completion_tombstones AS tomb
+                    WHERE tomb.deleted_at > clock_timestamp() - interval '1 hour'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM {schema}.receipt_completion_batches AS batch
+                          WHERE batch.ready_slot = tomb.ready_slot
+                            AND batch.ready_generation = tomb.ready_generation
+                            AND batch.queue = tomb.queue
+                            AND batch.finalized_at > clock_timestamp() - interval '1 hour'
+                            AND batch.run_leases[array_position(batch.job_ids, tomb.job_id)]
+                                = tomb.run_lease
+                      )
+                    UNION ALL
+                    SELECT queue, 1::bigint
+                    FROM {schema}.done_entries
+                    WHERE state = 'completed'
+                      AND finalized_at > clock_timestamp() - interval '1 hour'
+                ) AS recent
+                GROUP BY queue
+                "#
+            ),
+        ),
+    };
+    format!(
+        r#"
+        WITH head_signal AS (
+            SELECT
+                enqueues.queue,
+                enqueues.priority,
+                enqueues.enqueue_shard,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq
+            FROM {schema}.queue_enqueue_heads AS enqueues
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = enqueues.queue
+             AND claims.priority = enqueues.priority
+             AND claims.enqueue_shard = enqueues.enqueue_shard
+        ),
+        queues AS (
+            SELECT DISTINCT queue
+            FROM (
+                SELECT queue FROM awa.queue_meta
+                UNION ALL
+                SELECT queue FROM head_signal
+                UNION ALL
+                SELECT queue FROM {schema}.leases
+                UNION ALL
+                SELECT queue FROM {schema}.deferred_jobs
+                UNION ALL
+                SELECT queue FROM {schema}.queue_terminal_live_counts
+                UNION ALL
+                SELECT queue FROM {schema}.queue_terminal_rollups
+                UNION ALL
+                SELECT queue FROM {schema}.dlq_entries
+            ) queues
+        ),
+        ready AS (
+            {ready}
+        ),
+        lag AS (
+            SELECT
+                head_signal.queue,
+                EXTRACT(EPOCH FROM clock_timestamp() - min(next_ready.run_at))::double precision
+                    AS lag_seconds
+            FROM head_signal
+            JOIN LATERAL (
+                SELECT next_in_segment.run_at
+                FROM {schema}.ready_segments AS segment
+                CROSS JOIN LATERAL (
+                    SELECT ready.run_at
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.ready_slot = segment.ready_slot
+                      AND ready.ready_generation = segment.ready_generation
+                      AND ready.queue = segment.queue
+                      AND ready.priority = segment.priority
+                      AND ready.enqueue_shard = segment.enqueue_shard
+                      AND ready.lane_seq >= GREATEST(segment.first_lane_seq, head_signal.claim_seq)
+                      AND ready.lane_seq < segment.next_lane_seq
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.ready_tombstones AS tomb
+                          WHERE tomb.ready_slot = ready.ready_slot
+                            AND tomb.ready_generation = ready.ready_generation
+                            AND tomb.queue = ready.queue
+                            AND tomb.priority = ready.priority
+                            AND tomb.enqueue_shard = ready.enqueue_shard
+                            AND tomb.lane_seq = ready.lane_seq
+                      )
+                    ORDER BY ready.lane_seq
+                    LIMIT 1
+                ) AS next_in_segment
+                WHERE segment.queue = head_signal.queue
+                  AND segment.priority = head_signal.priority
+                  AND segment.enqueue_shard = head_signal.enqueue_shard
+                  AND segment.next_lane_seq > head_signal.claim_seq
+                ORDER BY segment.next_lane_seq
+                LIMIT 1
+            ) AS next_ready ON TRUE
+            GROUP BY head_signal.queue
+        ),
+        leases AS (
+            -- Both legs are `leases`-only because this gauge must not touch
+            -- the receipt tables (see the function-level lock note). The
+            -- `running` leg is therefore an approximation (misses compact
+            -- lease_claim_batches claims, #246). `waiting_external` is exact
+            -- even so: a receipt claim cannot be `waiting_external` off the
+            -- `leases` plane — QueueStorage::register_callback runs
+            -- ensure_mutable_running_attempt_tx (materialises the claim into
+            -- `leases`) before enter_callback_wait_in_tx flips
+            -- `leases.state`. (Same waiting_external invariant, exact form,
+            -- at admin::state_counts.)
+            SELECT
+                queue,
+                count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                count(*) FILTER (WHERE state = 'waiting_external')::bigint
+                    AS waiting_external
+            FROM {schema}.leases
+            GROUP BY queue
+        ),
+        deferred AS (
+            SELECT
+                queue,
+                count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
+                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+            FROM {schema}.deferred_jobs
+            GROUP BY queue
+        ),
+        terminal AS (
+            SELECT
+                queue,
+                count(*)::bigint AS failed_done
+            FROM {schema}.done_entries
+            WHERE state = 'failed'
+            GROUP BY queue
+        ),
+        dlq AS (
+            SELECT
+                queue,
+                count(*)::bigint AS failed_dlq
+            FROM {schema}.dlq_entries
+            GROUP BY queue
+        ),
+        receipt_running AS (
+            {receipt_running}
+        ),
+        completed_recent AS (
+            {completed_recent}
+        ),
+        signals AS (
+            SELECT
+                queues.queue,
+                COALESCE(ready.available, 0)::bigint AS available,
+                (COALESCE(leases.running, 0) + COALESCE(receipt_running.running, 0))::bigint
+                    AS running,
+                COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
+                COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
+                COALESCE(deferred.retryable, 0)::bigint AS retryable,
+                COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
+                COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
+                lag.lag_seconds,
+                COALESCE(completed_recent.completed_last_hour, 0)::bigint AS completed_last_hour
+            FROM queues
+            LEFT JOIN ready ON ready.queue = queues.queue
+            LEFT JOIN lag ON lag.queue = queues.queue
+            LEFT JOIN leases ON leases.queue = queues.queue
+            LEFT JOIN receipt_running ON receipt_running.queue = queues.queue
+            LEFT JOIN deferred ON deferred.queue = queues.queue
+            LEFT JOIN terminal ON terminal.queue = queues.queue
+            LEFT JOIN dlq ON dlq.queue = queues.queue
+            LEFT JOIN completed_recent ON completed_recent.queue = queues.queue
+        )
+        "#
+    )
+}
+
 /// A subquery that yields the identity `(job_id, run_lease, queue)` of every
 /// receipt claim currently open (i.e. `running`) but not yet materialised
 /// into `leases`. Since #246 receipt claims — zero-deadline and
