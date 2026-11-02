@@ -6,6 +6,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, such as a statement timeout, sqlx 0.9 tried
+  to close the connection, and closing a TLS connection mid-stream hangs, so
+  the pool lost that slot permanently; a slow dashboard read polled often
+  enough could exhaust the pool. `awa serve` now sets a 60-second statement
+  timeout (`--statement-timeout`, `AWA_STATEMENT_TIMEOUT`), recovers such
+  connections when they are released, and on Postgres 14+ sets
+  `client_connection_check_interval` so a query stops when its connection
+  closes. Applications embedding `awa_ui::router` can build their pool with
+  the new `awa_ui::admin_pool_options` and `admin_connect_options`.
 - **Queue overviews on queue storage no longer read retained history.**
   `admin::queue_overviews`, behind the admin UI's queues and dashboard pages
   and `awa queue stats`, counted every current job through `terminal_jobs`,
