@@ -29,6 +29,16 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   (backport of [#584](https://github.com/hardbyte/awa/pull/584)).
 - **DLQ retries, purges and moves refresh the admin UI's cached stats and
   queue counts**, which otherwise lagged a DLQ action by up to the cache TTL.
+- **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
+  storage find running jobs and no longer read retained history**
+  (backport of [#586](https://github.com/hardbyte/awa/pull/586), for
+  [#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
+  built every available ready row before filtering by key, reading every
+  retained ready row, and missed jobs running on receipt claims not yet
+  materialised into `leases`. It now filters by key where each source is
+  read, walks available rows lane by lane from the claim cursor (only the
+  given queue's lanes when a queue is passed), and checks open receipt
+  claims.
 - **A request the admin UI's client abandons no longer holds a database
   connection for good.** When a browser closes a tab or a proxy times out,
   the server drops the request but Postgres keeps running its query. If that
