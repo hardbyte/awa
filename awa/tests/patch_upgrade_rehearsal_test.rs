@@ -73,7 +73,7 @@ fn workspace_root() -> PathBuf {
 
 fn env_path(var: &str) -> PathBuf {
     let path = PathBuf::from(
-        std::env::var_os(var).unwrap_or_else(|| panic!("{var} must name the released artifact")),
+        std::env::var_os(var).unwrap_or_else(|| panic!("{var} must name an artifact path")),
     );
     if path.is_absolute() {
         path
@@ -83,15 +83,18 @@ fn env_path(var: &str) -> PathBuf {
 }
 
 fn candidate_cli() -> PathBuf {
-    match std::env::var_os("AWA_CANDIDATE_CLI") {
-        Some(path) => PathBuf::from(path),
-        None => {
-            let target = std::env::var_os("CARGO_TARGET_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| workspace_root().join("target"));
-            target.join("debug").join("awa")
-        }
+    if std::env::var_os("AWA_CANDIDATE_CLI").is_some() {
+        return env_path("AWA_CANDIDATE_CLI");
     }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    let target = if target.is_absolute() {
+        target
+    } else {
+        workspace_root().join(target)
+    };
+    target.join("debug").join("awa")
 }
 
 // ── events ─────────────────────────────────────────────────────────────
