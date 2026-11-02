@@ -199,3 +199,108 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(database_error_code(&error).as_deref(), Some("42501"));
     Ok(())
 }
+
+/// Relation locks the current transaction holds on queue-storage objects, as
+/// `(relation, mode)` pairs.
+async fn queue_storage_relation_locks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT format('%I.%I', n.nspname, c.relname), l.mode \
+         FROM pg_locks AS l \
+         JOIN pg_class AS c ON c.oid = l.relation \
+         JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+         WHERE l.pid = pg_backend_pid() \
+           AND l.locktype = 'relation' \
+           AND n.nspname = ANY($1) \
+         ORDER BY 1, 2",
+    )
+    .bind(SCHEMAS.to_vec())
+    .fetch_all(&mut **tx)
+    .await
+}
+
+#[tokio::test]
+async fn prepared_lane_patch_replaces_helpers_without_table_locks() -> TestResult {
+    let url = std::env::var("DATABASE_URL")?;
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await?;
+    let database = format!("lane_lock_db_{}", uuid::Uuid::new_v4().simple());
+    run_sql(&admin, format!("CREATE DATABASE {database}")).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(PgConnectOptions::from_str(&url)?.database(&database))
+        .await?;
+    let result = exercise_patch_locks(&pool).await;
+    pool.close().await;
+    run_sql(&admin, format!("DROP DATABASE {database} WITH (FORCE)")).await?;
+    admin.close().await;
+    result
+}
+
+async fn exercise_patch_locks(pool: &PgPool) -> TestResult {
+    migrations::run(pool).await?;
+    for schema in SCHEMAS {
+        if schema != "awa" {
+            QueueStorage::new(QueueStorageConfig {
+                schema: schema.into(),
+                ..Default::default()
+            })?
+            .prepare_schema(pool)
+            .await?;
+        }
+        run_sql(
+            pool,
+            include_str!("fixtures/v06_ensure_lane_sequences.sql").replace("__schema__", schema),
+        )
+        .await?;
+    }
+    let patch = migrations::SCHEMA_PATCHES
+        .iter()
+        .find(|patch| patch.name == "prepared_lane_sequences")
+        .expect("prepared_lane_sequences patch");
+    let applied: bool = sqlx::query_scalar(patch.applied_probe)
+        .fetch_one(pool)
+        .await?;
+    assert!(!applied);
+
+    // The patch holds no lock on any queue-storage table or index until commit.
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(patch.sql).execute(&mut *tx).await?;
+    assert_eq!(queue_storage_relation_locks(&mut tx).await?, vec![]);
+    tx.commit().await?;
+
+    let applied: bool = sqlx::query_scalar(patch.applied_probe)
+        .fetch_one(pool)
+        .await?;
+    assert!(applied);
+    for schema in SCHEMAS {
+        let patched: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_proc \
+             WHERE pronamespace = $1::regnamespace \
+               AND proname IN ('ensure_lane_sequences', \
+                               'queue_enqueue_head_sequence_sync', \
+                               'queue_claim_head_sequence_sync') \
+               AND prosrc LIKE '%has not been provisioned%'",
+        )
+        .bind(schema)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(patched, 3, "schema {schema}");
+    }
+
+    // Re-running the installer instead would hold exclusive locks on live
+    // tables such as leases until commit, which is why the patch avoids it.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT awa.install_queue_storage_substrate('custom_lanes')")
+        .execute(&mut *tx)
+        .await?;
+    let locks = queue_storage_relation_locks(&mut tx).await?;
+    tx.rollback().await?;
+    assert!(locks.iter().any(|(relation, mode)| {
+        relation == "custom_lanes.leases" && mode == "AccessExclusiveLock"
+    }));
+    Ok(())
+}

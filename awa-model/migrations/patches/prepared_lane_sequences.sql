@@ -1,30 +1,29 @@
 -- Schema patch prepared_lane_sequences: use provisioned lane sequences without
--- runtime DDL (awa 0.7 migration v047, minus the schema_version row).
+-- runtime DDL (awa 0.7 migration v049, minus the schema_version row).
 --
--- Applied after the awa.install_queue_storage_substrate() definition from
--- v023, which this patch replaces, so the lane helpers and head-sync triggers
--- skip CREATE SEQUENCE when the sequence exists and report a provisioning
--- hint (SQLSTATE 42501) when it is missing and the caller lacks schema CREATE.
--- The block below re-runs the installer for every installed queue-storage
--- schema with its existing slot counts and receipt mode.
+-- Applied after the v023 definitions of awa.refresh_lane_sequence_helpers and
+-- awa.install_queue_storage_substrate, so new queue-storage schemas get the
+-- updated helpers from the installer. On each installed schema the block below
+-- replaces only the three lane helpers (ensure_lane_sequences and the two
+-- head-sync trigger functions). They skip CREATE SEQUENCE when the sequence
+-- exists and report a provisioning hint (SQLSTATE 42501) when it is missing and
+-- the caller lacks schema CREATE.
+--
+-- Live load: function replacement only. The patch takes no table locks, drops
+-- no triggers and reads no queue rows, so workers keep claiming and completing
+-- while it runs. It does not re-run the installer, which would lock hot tables
+-- such as leases and deferred_jobs for the rest of the transaction.
 --
 -- 0.6 delivery: the 0.6 series cannot add a migration version, so this ships as
 -- an idempotent schema patch. `awa migrate` applies it when the schema is
 -- exactly at v040 and the probe in migrations.rs reports it missing;
 -- `awa migrate --sql` prints it as a repeatable R__ script for external
 -- runners. Released 0.6 binaries call the same functions with the same
--- arguments and cursor semantics. Run it as the schema owner or migrator; it
--- takes the per-schema installer advisory lock and redefines functions only.
+-- arguments and cursor semantics. Run it as the schema owner or migrator.
 
 DO $$
 DECLARE
     v_schema TEXT;
-    v_queue_slots INT;
-    v_lease_slots INT;
-    v_claim_slots INT;
-    v_claim_runtime REGPROCEDURE;
-    v_claim_runtime_def TEXT;
-    v_lease_claim_receipts BOOLEAN;
 BEGIN
     FOR v_schema IN
         SELECT n.nspname
@@ -37,53 +36,22 @@ BEGIN
                 AND oidvectortypes(awa_p.proargtypes)
                     = 'text, bigint, double precision, double precision'
           )
+        ORDER BY n.nspname
     LOOP
-        IF to_regclass(format('%I.queue_ring_state', v_schema)) IS NULL
-           OR to_regclass(format('%I.lease_ring_state', v_schema)) IS NULL
-           OR to_regclass(format('%I.claim_ring_state', v_schema)) IS NULL THEN
+        IF to_regclass(format('%I.queue_enqueue_heads', v_schema)) IS NULL
+           OR to_regclass(format('%I.queue_claim_heads', v_schema)) IS NULL
+           OR to_regprocedure(format('%I.queue_lane_sequence_name(text,text,smallint,smallint)', v_schema)) IS NULL
+           OR to_regprocedure(format('%I.set_sequence_next(text,bigint)', v_schema)) IS NULL THEN
             CONTINUE;
         END IF;
 
-        EXECUTE format(
-            'SELECT slot_count FROM %I.queue_ring_state WHERE singleton = TRUE',
-            v_schema
-        )
-        INTO v_queue_slots;
-
-        EXECUTE format(
-            'SELECT slot_count FROM %I.lease_ring_state WHERE singleton = TRUE',
-            v_schema
-        )
-        INTO v_lease_slots;
-
-        EXECUTE format(
-            'SELECT slot_count FROM %I.claim_ring_state WHERE singleton = TRUE',
-            v_schema
-        )
-        INTO v_claim_slots;
-
-        IF v_queue_slots IS NULL OR v_lease_slots IS NULL OR v_claim_slots IS NULL THEN
-            CONTINUE;
-        END IF;
-
-        v_claim_runtime := to_regprocedure(format(
-            '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
-            v_schema
-        ));
-        v_claim_runtime_def := pg_get_functiondef(v_claim_runtime::oid);
-        -- Receipt mode writes lease_claims or lease_claim_batches (compact
-        -- path); legacy mode writes leases only.
-        v_lease_claim_receipts := v_schema = 'awa'
-            OR position(format('INSERT INTO %I.lease_claims', v_schema) IN v_claim_runtime_def) > 0
-            OR position(format('INSERT INTO %I.lease_claim_batches', v_schema) IN v_claim_runtime_def) > 0;
-
-        PERFORM awa.install_queue_storage_substrate(
-            v_schema,
-            v_queue_slots,
-            v_lease_slots,
-            v_claim_slots,
-            v_lease_claim_receipts
+        -- Serialize with a concurrent prepare_schema() of the same schema. This
+        -- is an advisory lock, not a table lock: claims and completions do not
+        -- take it.
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(format('awa.queue_storage.install:%I', v_schema), 0)
         );
+        PERFORM awa.refresh_lane_sequence_helpers(v_schema);
     END LOOP;
 END;
 $$;

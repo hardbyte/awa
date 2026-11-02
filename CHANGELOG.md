@@ -37,7 +37,9 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   skip `CREATE SEQUENCE` when the sequence exists and raise SQLSTATE `42501`
   with a provisioning hint when it does not. Ships as the schema patch
   `prepared_lane_sequences` (applied by `awa migrate`, exported as
-  `R__prepared_lane_sequences.sql`). New `awa storage prepare-queue` and
+  `R__prepared_lane_sequences.sql`). The patch replaces only those three
+  functions on each queue-storage schema, so it takes no table locks and
+  can run under live workers. New `awa storage prepare-queue` and
   `QueueStorage::prepare_queue` provision lanes as the migrator; runtime roles
   need `USAGE, SELECT, UPDATE` on the lane sequences.
 

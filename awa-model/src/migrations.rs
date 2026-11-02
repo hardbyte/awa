@@ -270,18 +270,22 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
     },
     SchemaPatch {
         name: "prepared_lane_sequences",
-        description: "Use provisioned lane sequences without runtime DDL (awa 0.7 migration v047)",
-        // The installer definition first, so the refresh re-runs the updated
-        // helper text for every installed queue-storage schema.
+        description: "Use provisioned lane sequences without runtime DDL (awa 0.7 migration v049)",
+        // The helper and installer definitions first, so new schemas pick up
+        // the updated helpers; the patch then replaces just those helpers on
+        // every installed queue-storage schema.
         sql: concat!(
             include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
             "\n",
             include_str!("../migrations/patches/prepared_lane_sequences.sql"),
         ),
-        applied_probe: "SELECT EXISTS (SELECT 1 FROM pg_proc \
-                                WHERE pronamespace = 'awa'::regnamespace \
-                                  AND proname = 'ensure_lane_sequences' \
-                                  AND pg_get_functiondef(oid) LIKE '%has not been provisioned%')",
+        applied_probe: "SELECT to_regprocedure('awa.refresh_lane_sequence_helpers(text)') IS NOT NULL \
+                        AND (SELECT count(*) FROM pg_proc \
+                             WHERE pronamespace = 'awa'::regnamespace \
+                               AND proname IN ('ensure_lane_sequences', \
+                                               'queue_enqueue_head_sequence_sync', \
+                                               'queue_claim_head_sequence_sync') \
+                               AND prosrc LIKE '%has not been provisioned%') = 3",
     },
 ];
 
@@ -677,6 +681,20 @@ mod tests {
             );
             assert!(!patch.applied_probe.is_empty());
         }
+    }
+
+    #[test]
+    fn prepared_lane_patch_does_not_rerun_the_installer() {
+        // The installer locks live queue-storage tables until commit; on an
+        // existing database the patch replaces only the lane helpers.
+        let patch = include_str!("../migrations/patches/prepared_lane_sequences.sql");
+        let code: String = patch
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("install_queue_storage_substrate"));
+        assert!(code.contains("PERFORM awa.refresh_lane_sequence_helpers(v_schema)"));
     }
 
     #[test]
