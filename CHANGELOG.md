@@ -4,6 +4,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Queue overviews on queue storage no longer read retained history.**
+  `admin::queue_overviews`, behind the admin UI's queues and dashboard pages
+  and `awa queue stats`, counted every current job through `terminal_jobs`,
+  which expands each completion batch and joins it back to `ready_entries`.
+  It now reads the live-work tables, as the workers' queue gauges do, and
+  counts completions in the last hour from batch sizes. With 100,000
+  retained completions and 100,000 queued jobs it drops from 7.7 s to
+  0.27 s. JIT is off for the read; compiling it cost more than running it.
+
 ## [0.7.0-alpha.1] — 2026-10-29
 
 ### Upgrading

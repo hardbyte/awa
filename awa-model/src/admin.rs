@@ -2288,9 +2288,13 @@ where
 
 /// Get queue overviews for all known queues.
 ///
-/// Hybrid read: per-state counts come from the `queue_state_counts`
-/// cache table (eventually consistent, ~2s lag), while `lag_seconds`
-/// and `completed_last_hour` are computed live from `jobs_hot`.
+/// On queue storage, counts come from the live-work tables through
+/// [`crate::queue_storage::queue_signals_sql`].
+///
+/// On the canonical engine it is a hybrid read: per-state counts come from
+/// the `queue_state_counts` cache table (eventually consistent, ~2s lag),
+/// while `lag_seconds` and `completed_last_hour` are computed live from
+/// `jobs_hot`.
 ///
 /// The cache is kept fresh by the maintenance leader's dirty-key
 /// recompute (~2s) and full reconciliation (~60s). Also warmed during
@@ -2300,11 +2304,14 @@ where
 /// leader, call `flush_dirty_admin_metadata()` first.
 pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
+        // `queue_state_counts` isn't maintained on queue storage, and the
+        // `current_jobs` view expands every retained completion, so counts
+        // come from the live-work tables instead.
         let sql = format!(
             r#"
-            {current_jobs_cte},
+            {signals_cte},
             all_queues AS (
-                SELECT queue FROM current_jobs
+                SELECT queue FROM signals
                 UNION
                 SELECT queue FROM awa.queue_descriptors
                 UNION
@@ -2324,35 +2331,6 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
                     secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
                 ) >= now()
                 GROUP BY descriptor.key
-            ),
-            queue_counts AS (
-                SELECT
-                    queue,
-                    count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
-                    count(*) FILTER (WHERE state = 'available')::bigint AS available,
-                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
-                    count(*) FILTER (WHERE state = 'running')::bigint AS running,
-                    count(*) FILTER (WHERE state = 'failed')::bigint AS failed,
-                    count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_external
-                FROM current_jobs
-                GROUP BY queue
-            ),
-            available_lag AS (
-                SELECT
-                    queue,
-                    EXTRACT(EPOCH FROM (clock_timestamp() - min(run_at)))::float8 AS lag_seconds
-                FROM current_jobs
-                WHERE state = 'available'
-                GROUP BY queue
-            ),
-            completed_recent AS (
-                SELECT
-                    queue,
-                    count(*)::bigint AS completed_last_hour
-                FROM current_jobs
-                WHERE state = 'completed'
-                  AND finalized_at > clock_timestamp() - interval '1 hour'
-                GROUP BY queue
             )
             SELECT
                 q.queue,
@@ -2370,31 +2348,40 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
                     ) < now()
                 END AS descriptor_stale,
                 COALESCE(qdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
-                COALESCE(qc.scheduled + qc.available + qc.running + qc.retryable + qc.waiting_external, 0) AS total_queued,
-                COALESCE(qc.scheduled, 0) AS scheduled,
-                COALESCE(qc.available, 0) AS available,
-                COALESCE(qc.retryable, 0) AS retryable,
-                COALESCE(qc.running, 0) AS running,
-                COALESCE(qc.failed, 0) AS failed,
-                COALESCE(qc.waiting_external, 0) AS waiting_external,
-                COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
-                al.lag_seconds,
+                COALESCE(sg.scheduled + sg.available + sg.running + sg.retryable + sg.waiting_external, 0)
+                    AS total_queued,
+                COALESCE(sg.scheduled, 0) AS scheduled,
+                COALESCE(sg.available, 0) AS available,
+                COALESCE(sg.retryable, 0) AS retryable,
+                COALESCE(sg.running, 0) AS running,
+                COALESCE(sg.failed_done + sg.failed_dlq, 0) AS failed,
+                COALESCE(sg.waiting_external, 0) AS waiting_external,
+                COALESCE(sg.completed_last_hour, 0) AS completed_last_hour,
+                sg.lag_seconds,
                 COALESCE(qm.paused, FALSE) AS paused
             FROM all_queues q
-            LEFT JOIN queue_counts qc ON qc.queue = q.queue
+            LEFT JOIN signals sg ON sg.queue = q.queue
             LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
             LEFT JOIN live_queue_descriptor_variants qdv ON qdv.queue = q.queue
-            LEFT JOIN available_lag al ON al.queue = q.queue
-            LEFT JOIN completed_recent cr ON cr.queue = q.queue
             LEFT JOIN awa.queue_meta qm ON qm.queue = q.queue
             ORDER BY q.queue
             "#,
-            current_jobs_cte = queue_storage_current_jobs_cte(store.schema())
+            signals_cte = crate::queue_storage::queue_signals_sql(
+                store.schema(),
+                crate::queue_storage::QueueSignalReads::Admin,
+            )
         );
 
-        let rows = sqlx::query_as::<_, QueueOverview>(audited_sql(sql))
-            .fetch_all(pool)
+        // JIT compiles this statement for longer than it runs (about 1.2 s
+        // against 0.35 s with 100k retained completions).
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .execute(tx.as_mut())
             .await?;
+        let rows = sqlx::query_as::<_, QueueOverview>(audited_sql(sql))
+            .fetch_all(tx.as_mut())
+            .await?;
+        tx.commit().await?;
         return Ok(rows);
     }
 
