@@ -20,6 +20,15 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   live-work tables the worker queue gauges read, count completions from
   batch sizes, and bound the timeseries to rows finalised within its window.
   Counts are unchanged; `running` keeps 0.6's leases-only definition.
+  Available rows are found through each lane's segments from its claim
+  cursor, as claims find them; recent deletions are matched against each
+  affected completion batch once, rather than one batch scan per deletion;
+  and queue lag is the age of the oldest available job, as in 0.6.9. A new
+  test, `admin_read_cost_test`, serves every endpoint the UI polls against
+  ten times more retained history and fails if a read does more work
+  (backport of [#584](https://github.com/hardbyte/awa/pull/584)).
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts**, which otherwise lagged a DLQ action by up to the cache TTL.
 - **A request the admin UI's client abandons no longer holds a database
   connection for good.** When a browser closes a tab or a proxy times out,
   the server drops the request but Postgres keeps running its query. If that
