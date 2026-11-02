@@ -511,6 +511,95 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
     )
 }
 
+/// Jobs created at or after `since` (a bind such as `$1`), each in its
+/// current state, as a `recent_jobs` CTE of `created_at` and `state`.
+///
+/// It selects what `current_jobs` would with the same bound, but bounds each
+/// source before any join: available rows are read per lane from its claim
+/// cursor, and terminal rows only from done rows and completion batches
+/// finalised since `since`, as a job finishes after it is created. `since`
+/// must be a bind rather than an expression such as `clock_timestamp()`,
+/// which Postgres won't push into the `terminal_jobs` view.
+fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
+    format!(
+        r#"
+        WITH head_signal AS (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+        ),
+        recent_jobs AS (
+            SELECT ready.created_at, 'available'::awa.job_state AS state
+            FROM head_signal
+            CROSS JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.queue = head_signal.queue
+                  AND ready.priority = head_signal.priority
+                  AND ready.enqueue_shard = head_signal.enqueue_shard
+                  AND ready.lane_seq >= head_signal.claim_seq
+                  AND ready.lane_seq < head_signal.next_seq
+                  AND ready.created_at >= {since}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
+            ) AS ready
+            UNION ALL
+            SELECT created_at, state
+            FROM {schema}.deferred_jobs
+            WHERE created_at >= {since}
+            UNION ALL
+            SELECT ready.created_at, leases.state
+            FROM {schema}.leases AS leases
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = leases.ready_slot
+             AND ready.ready_generation = leases.ready_generation
+             AND ready.queue = leases.queue
+             AND ready.priority = leases.priority
+             AND ready.enqueue_shard = leases.enqueue_shard
+             AND ready.lane_seq = leases.lane_seq
+            WHERE ready.created_at >= {since}
+            UNION ALL
+            -- A queue or priority move copies the row with its times, so
+            -- any one of a job's ready rows gives its creation time.
+            SELECT created.created_at, 'running'::awa.job_state
+            FROM ({open_running}) AS open_claims
+            CROSS JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                LIMIT 1
+            ) AS created
+            WHERE created.created_at >= {since}
+            UNION ALL
+            SELECT created_at, state
+            FROM {schema}.terminal_jobs
+            WHERE finalized_at >= {since}
+              AND created_at >= {since}
+            UNION ALL
+            SELECT created_at, 'failed'::awa.job_state
+            FROM {schema}.dlq_entries
+            WHERE created_at >= {since}
+        )
+        "#
+    )
+}
+
 async fn notify_cancellation_tx<'a>(
     tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     job_id: i64,
@@ -2825,27 +2914,16 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             r#"
             SELECT
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
-                COALESCE((
-                    SELECT count(*)::bigint
-                    FROM {schema}.ready_entries AS ready
-                    JOIN {schema}.queue_claim_heads AS claims
-                      ON claims.queue = ready.queue
-                     AND claims.priority = ready.priority
-                     AND claims.enqueue_shard = ready.enqueue_shard
-                    WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                          WHERE tomb.queue = ready.queue
-                            AND tomb.priority = ready.priority
-                            AND tomb.enqueue_shard = ready.enqueue_shard
-                            AND tomb.lane_seq = ready.lane_seq
-                            AND tomb.ready_slot = ready.ready_slot
-                            AND tomb.ready_generation = ready.ready_generation
-                      )
-                ), 0) AS available,
+                COALESCE((SELECT sum(available)::bigint FROM ({available}) AS lanes), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM ({open_running}) AS open_running), 0) AS running,
-                COALESCE((SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE state = 'completed'), 0) AS completed,
+                -- A completion batch carries its size, so completed jobs are
+                -- counted without expanding batches through `terminal_jobs`.
+                -- Tombstones mark batch members deleted or retried since.
+                COALESCE((SELECT sum(completed_count)::bigint FROM {schema}.receipt_completion_batches), 0)
+                  - COALESCE((SELECT count(*)::bigint FROM {schema}.receipt_completion_tombstones), 0)
+                  + COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'), 0)
+                  AS completed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'retryable'), 0) AS retryable,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'failed'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
@@ -2863,6 +2941,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                 -- publish_queue_storage_health_metrics.)
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
             "#,
+            available = crate::queue_storage::available_by_queue_sql(store.schema()),
             schema = store.schema(),
             // Compact receipt claims (#246) live in `lease_claim_batches` until
             // materialised; count them as running alongside the `leases` leg.
@@ -2878,8 +2957,18 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             failed,
             cancelled,
             waiting_external,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64) =
-            sqlx::query_as(audited_sql(sql)).fetch_one(pool).await?;
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
+            // As in `queue_overviews`: compiling costs more than running.
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET LOCAL jit = off")
+                .execute(tx.as_mut())
+                .await?;
+            let counts = sqlx::query_as(audited_sql(sql))
+                .fetch_one(tx.as_mut())
+                .await?;
+            tx.commit().await?;
+            counts
+        };
 
         return Ok(HashMap::from([
             (JobState::Scheduled, scheduled),
@@ -3277,17 +3366,29 @@ pub async fn state_timeseries(
                  date_trunc('minute', created_at) AS bucket, \
                  state, \
                  count(*) AS count \
-             FROM current_jobs \
-             WHERE created_at >= clock_timestamp() - make_interval(mins => $1) \
+             FROM recent_jobs \
              GROUP BY bucket, state \
              ORDER BY bucket",
-            queue_storage_current_jobs_cte(store.schema())
+            queue_storage_recent_jobs_cte(store.schema(), "$1")
         );
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .execute(tx.as_mut())
+            .await?;
+        // The window is measured on the database's clock, as on the canonical
+        // engine, but bound as a value: Postgres won't push an expression
+        // like `clock_timestamp()` into the `terminal_jobs` view.
+        let since: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp() - make_interval(mins => $1)")
+                .bind(minutes)
+                .fetch_one(tx.as_mut())
+                .await?;
         let rows =
             sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(audited_sql(sql))
-                .bind(minutes)
-                .fetch_all(pool)
+                .bind(since)
+                .fetch_all(tx.as_mut())
                 .await?;
+        tx.commit().await?;
 
         return Ok(rows
             .into_iter()
