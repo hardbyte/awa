@@ -31,7 +31,10 @@ pub fn admin_connect_options(
 ) -> PgConnectOptions {
     match statement_timeout.filter(|timeout| !timeout.is_zero()) {
         Some(timeout) => {
-            options.options([("statement_timeout", format!("{}ms", timeout.as_millis()))])
+            // Round up: a sub-millisecond timeout written as `0ms` would
+            // disable the limit instead of setting one.
+            let millis = timeout.as_micros().div_ceil(1000);
+            options.options([("statement_timeout", format!("{millis}ms"))])
         }
         None => options,
     }
@@ -78,4 +81,33 @@ pub fn admin_pool_options(options: PgPoolOptions) -> PgPoolOptions {
     options
         .after_connect(|conn, _meta| Box::pin(configure_admin_connection(conn)))
         .after_release(|conn, _meta| Box::pin(recover_admin_connection(conn)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timeout_option(timeout: Option<Duration>) -> Option<String> {
+        admin_connect_options(PgConnectOptions::new(), timeout)
+            .get_options()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn statement_timeout_is_written_in_whole_milliseconds() {
+        assert_eq!(
+            timeout_option(Some(Duration::from_secs(60))).as_deref(),
+            Some("-c statement_timeout=60000ms")
+        );
+        assert_eq!(
+            timeout_option(Some(Duration::from_micros(500))).as_deref(),
+            Some("-c statement_timeout=1ms")
+        );
+        assert_eq!(
+            timeout_option(Some(Duration::from_micros(1_500))).as_deref(),
+            Some("-c statement_timeout=2ms")
+        );
+        assert_eq!(timeout_option(Some(Duration::ZERO)), None);
+        assert_eq!(timeout_option(None), None);
+    }
 }
