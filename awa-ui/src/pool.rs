@@ -33,7 +33,7 @@ pub fn admin_connect_options(
         Some(timeout) => {
             // Round up: a sub-millisecond timeout written as `0ms` would
             // disable the limit instead of setting one.
-            let millis = timeout.as_micros().div_ceil(1000);
+            let millis = timeout.as_nanos().div_ceil(1_000_000);
             options.options([("statement_timeout", format!("{millis}ms"))])
         }
         None => options,
@@ -98,6 +98,10 @@ mod tests {
         assert_eq!(
             timeout_option(Some(Duration::from_secs(60))).as_deref(),
             Some("-c statement_timeout=60000ms")
+        );
+        assert_eq!(
+            timeout_option(Some(Duration::from_nanos(1))).as_deref(),
+            Some("-c statement_timeout=1ms")
         );
         assert_eq!(
             timeout_option(Some(Duration::from_micros(500))).as_deref(),
