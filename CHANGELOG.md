@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.10] — 2026-11-02
 
-Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Operators deploying a runtime role without schema `CREATE` must run `awa storage prepare-queue` per queue and grant sequence `USAGE, SELECT, UPDATE` before starting workers; see `docs/security.md`.
+Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, a request the UI's client abandons no longer holds a database connection, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Operators deploying a runtime role without schema `CREATE` must run `awa storage prepare-queue` per queue and grant sequence `USAGE, SELECT, UPDATE` before starting workers; see `docs/security.md`.
 
 - **Admin queue and dashboard reads on queue storage follow live work, not
   retained history** (backport of
@@ -20,6 +20,18 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   live-work tables the worker queue gauges read, count completions from
   batch sizes, and bound the timeseries to rows finalised within its window.
   Counts are unchanged; `running` keeps 0.6's leases-only definition.
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, sqlx closed the connection with a hard close,
+  which hangs on a TLS connection, so the pool lost that slot permanently.
+  `awa serve` now sets a 60-second statement timeout (`--statement-timeout`,
+  `AWA_STATEMENT_TIMEOUT`), recovers such connections when they are released,
+  and on Postgres 14+ sets `client_connection_check_interval` so a query stops
+  when its connection closes. Applications embedding `awa_ui::router` can
+  build their pool with the new `awa_ui::admin_pool_options` and
+  `admin_connect_options`. Backport of
+  [#583](https://github.com/hardbyte/awa/pull/583).
 - Restricted runtimes can use pre-provisioned queue lanes without schema
   `CREATE` ([#501](https://github.com/hardbyte/awa/pull/501)). The lane helpers
   skip `CREATE SEQUENCE` when the sequence exists and raise SQLSTATE `42501`

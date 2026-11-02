@@ -29,6 +29,18 @@ let app = awa_ui::callback_router(
 .await?;
 ```
 
+Give the UI its own pool built with `awa_ui::admin_pool_options` and `awa_ui::admin_connect_options`, as `awa serve` does. They set a statement timeout and a release hook. Without them, a request the client abandons leaves its query running and holds its connection, and over TLS sqlx can lose that connection for good (see [configuration](configuration.md#abandoned-requests)):
+
+```rust
+let pool = awa_ui::admin_pool_options(PgPoolOptions::new())
+    .max_connections(10)
+    .connect_with(awa_ui::admin_connect_options(
+        database_url.parse()?,
+        Some(Duration::from_secs(60)),
+    ))
+    .await?;
+```
+
 The frontend is a React 19 SPA built with Vite and embedded into the binary via `rust-embed`. The axum handler serves `index.html` for all non-API routes (SPA fallback), and JSON REST endpoints under `/api/`.
 
 ### Frontend Stack
