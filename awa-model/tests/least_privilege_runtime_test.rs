@@ -432,3 +432,98 @@ async fn lane_patch_status(pool: &PgPool) -> Result<migrations::SchemaPatchStatu
         .find(|status| status.name == "prepared_lane_sequences")
         .expect("lane patch status"))
 }
+
+/// A runtime with schema CREATE (a working 0.6.9 deployment) creates lane
+/// sequences it owns. Provisioning that queue as the owner, the first step of
+/// revoking runtime CREATE, must not touch those sequences or their cursors.
+#[tokio::test]
+async fn owner_provisions_a_lane_whose_sequences_the_runtime_created() -> TestResult {
+    let url = std::env::var("DATABASE_URL")?;
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("lazy_owner_{suffix}");
+    let runtime = format!("lazy_runtime_{suffix}");
+    let database = format!("lazy_lane_db_{suffix}");
+    run_sql(
+        &admin,
+        format!(
+            "CREATE ROLE {owner} LOGIN PASSWORD 'lane_test'; \
+             CREATE ROLE {runtime} LOGIN PASSWORD 'lane_test';"
+        ),
+    )
+    .await?;
+    run_sql(&admin, format!("CREATE DATABASE {database} OWNER {owner}")).await?;
+    let options = PgConnectOptions::from_str(&url)?
+        .database(&database)
+        .password("lane_test");
+    let result = exercise_lazy_lane(options, &owner, &runtime).await;
+    run_sql(&admin, format!("DROP DATABASE {database} WITH (FORCE)")).await?;
+    run_sql(&admin, format!("DROP ROLE {runtime}; DROP ROLE {owner};")).await?;
+    admin.close().await;
+    result
+}
+
+async fn exercise_lazy_lane(options: PgConnectOptions, owner: &str, runtime: &str) -> TestResult {
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.clone().username(owner))
+        .await?;
+    migrations::run(&owner_pool).await?;
+    run_sql(
+        &owner_pool,
+        format!(
+            "GRANT USAGE, CREATE ON SCHEMA awa TO {runtime}; \
+             GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO {runtime}; \
+             GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {runtime}; \
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime};"
+        ),
+    )
+    .await?;
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.username(runtime))
+        .await?;
+    run_sql(
+        &runtime_pool,
+        r#"
+        INSERT INTO awa.queue_lanes(queue, priority) VALUES ('lazy_queue', 2) ON CONFLICT DO NOTHING;
+        INSERT INTO awa.queue_enqueue_heads(queue, priority, enqueue_shard) VALUES ('lazy_queue', 2, 0) ON CONFLICT DO NOTHING;
+        INSERT INTO awa.queue_claim_heads(queue, priority, enqueue_shard) VALUES ('lazy_queue', 2, 0) ON CONFLICT DO NOTHING;
+        SELECT awa.reserve_enqueue_seq('lazy_queue', 2::smallint, 0::smallint, 5);
+        "#,
+    )
+    .await?;
+    let lane_owners: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT pg_get_userbyid(c.relowner)::text FROM awa.queue_enqueue_heads AS h \
+         JOIN pg_class AS c ON c.relname = h.seq_name \
+         WHERE h.queue = 'lazy_queue'",
+    )
+    .fetch_all(&owner_pool)
+    .await?;
+    assert_eq!(lane_owners, vec![runtime.to_string()]);
+    let cursor_sql = "SELECT awa.sequence_next_value(seq_name) FROM awa.queue_enqueue_heads \
+                      WHERE queue = 'lazy_queue' AND priority = 2 AND enqueue_shard = 0";
+    let before: i64 = sqlx::query_scalar(cursor_sql)
+        .fetch_one(&runtime_pool)
+        .await?;
+
+    QueueStorage::new(QueueStorageConfig::default())?
+        .prepare_queue(&owner_pool, "lazy_queue", 1)
+        .await?;
+
+    let after: i64 = sqlx::query_scalar(cursor_sql)
+        .fetch_one(&runtime_pool)
+        .await?;
+    assert_eq!(before, after);
+    let provisioned: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.queue_claim_heads WHERE queue = 'lazy_queue'")
+            .fetch_one(&owner_pool)
+            .await?;
+    assert_eq!(provisioned, 4, "every priority is provisioned");
+    runtime_pool.close().await;
+    owner_pool.close().await;
+    Ok(())
+}

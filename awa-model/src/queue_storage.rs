@@ -3439,10 +3439,18 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // The head tables' BEFORE INSERT triggers run even for a row that
+        // ON CONFLICT then skips, and they read and set the lane's sequence.
+        // Skipping rows that exist keeps provisioning a live lane off a
+        // sequence another role owns, such as one a 0.6.9 runtime created.
         sqlx::query(&format!(
             r#"
             INSERT INTO {schema}.queue_enqueue_heads (queue, priority, enqueue_shard)
-            VALUES ($1, $2, $3)
+            SELECT $1, $2, $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.queue_enqueue_heads
+                WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            )
             ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
             "#
         ))
@@ -3456,7 +3464,11 @@ impl QueueStorage {
         sqlx::query(&format!(
             r#"
             INSERT INTO {schema}.queue_claim_heads (queue, priority, enqueue_shard)
-            VALUES ($1, $2, $3)
+            SELECT $1, $2, $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.queue_claim_heads
+                WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            )
             ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
             "#
         ))
