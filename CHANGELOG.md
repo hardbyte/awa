@@ -29,6 +29,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   which hides an older job a queue move or priority aging appended behind
   newer ones: an hour's wait could show as a second. The workers' queue-lag
   gauge keeps the cheaper next-job reading.
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts.** They didn't invalidate the dashboard caches, so failed
+  counts lagged a DLQ action by up to the cache TTL. From #579.
 - **A request the admin UI's client abandons no longer holds a database
   connection for good.** When a browser closes a tab or a proxy times out,
   the server drops the request but Postgres keeps running its query. If that
