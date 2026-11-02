@@ -1782,6 +1782,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#abandoned-requests" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Abandoned requests
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#dashboard-cache" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3190,6 +3201,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#abandoned-requests" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Abandoned requests
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#dashboard-cache" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -4149,6 +4171,12 @@ the participation path for SQL-native producers.</p>
 <td>Connection acquire timeout (seconds)</td>
 </tr>
 <tr>
+<td><code>--statement-timeout</code></td>
+<td><code>AWA_STATEMENT_TIMEOUT</code></td>
+<td><code>60</code></td>
+<td>Longest any one UI statement may run (seconds); <code>0</code> leaves the server's setting</td>
+</tr>
+<tr>
 <td><code>--cache-ttl</code></td>
 <td><code>AWA_CACHE_TTL</code></td>
 <td><code>5</code></td>
@@ -4156,6 +4184,8 @@ the participation path for SQL-native producers.</p>
 </tr>
 </tbody>
 </table>
+<h3 id="abandoned-requests">Abandoned requests<a class="headerlink" href="#abandoned-requests" title="Permanent link">&para;</a></h3>
+<p>When a browser closes a tab or a proxy times out, the server drops the request, but Postgres keeps running its query and the pool keeps that query's connection until it ends. The statement timeout ends it, and the pool then reuses the connection. On Postgres 14 and later the pool also sets <code>client_connection_check_interval</code>, so a query stops within 5 s when its connection closes, for example when <code>awa serve</code> restarts. Raise <code>--statement-timeout</code> if a bulk action from the UI, such as purging a very large DLQ, needs longer.</p>
 <h3 id="dashboard-cache">Dashboard cache<a class="headerlink" href="#dashboard-cache" title="Permanent link">&para;</a></h3>
 <p>The cache deduplicates repeated poll requests — multiple browser tabs or rapid refresh cycles within the TTL window hit memory rather than the database. The frontend polling interval is derived from the cache TTL (minimum 5s) and served via <code>/api/capabilities</code>, so clients automatically back off to match the server's refresh rate.</p>
 <p>If you're connecting to a read replica, increase <code>--cache-ttl</code> to reduce load. The dashboard will feel slightly less real-time but won't overwhelm the replica.</p>
