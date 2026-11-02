@@ -244,14 +244,14 @@ profiles:
       - on: { type: table, name: "*" }
         privileges: [SELECT, INSERT, UPDATE, DELETE, TRUNCATE]
       - on: { type: sequence, name: "*" }
-        privileges: [USAGE, SELECT]
+        privileges: [USAGE, SELECT, UPDATE]
       - on: { type: function, name: "*" }
         privileges: [EXECUTE]
     default_privileges:
       - on_type: table
         privileges: [SELECT, INSERT, UPDATE, DELETE, TRUNCATE]
       - on_type: sequence
-        privileges: [USAGE, SELECT]
+        privileges: [USAGE, SELECT, UPDATE]
       - on_type: function
         privileges: [EXECUTE]
 
