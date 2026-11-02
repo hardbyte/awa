@@ -6,6 +6,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **`awa storage prepare-queue` provisions lanes a 0.6 runtime created.** A
+  runtime role with schema `CREATE` owns the lane sequences it creates.
+  Provisioning such a lane as the owner, the first step of revoking runtime
+  `CREATE`, failed with `permission denied for sequence`: the head tables'
+  `BEFORE INSERT` triggers run even for a row `ON CONFLICT DO NOTHING` then
+  skips, and they read and set the lane's sequence. Lane inserts now skip
+  rows that exist. Found by the 0.6.10 upgrade rehearsal.
 - **The admin UI's runtime page no longer shows the storage transition card
   once the transition is finalized.** It stayed up on every cluster running
   queue storage; it now appears only while an engine is prepared or a mixed
