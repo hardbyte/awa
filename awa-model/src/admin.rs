@@ -1137,6 +1137,9 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
             ) AS ready ON TRUE
             UNION ALL
             -- Running receipt claims not yet materialised into `leases`.
+            -- This leg reads the claims still in the claim ring (closed claim
+            -- batches are skipped whole) before the key filter, so its cost
+            -- follows claim-ring retention, not completed-job history.
             SELECT open_claims.job_id
             FROM ({open_running}) AS open_claims
             JOIN LATERAL (
