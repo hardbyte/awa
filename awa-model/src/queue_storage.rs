@@ -3485,7 +3485,7 @@ impl QueueStorage {
         format!("{queue}{QUEUE_STRIPE_DELIMITER}{stripe}")
     }
 
-    fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
+    pub(crate) fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
         if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
             return vec![queue.to_string()];
         }
