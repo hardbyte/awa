@@ -1196,9 +1196,21 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
             .unwrap_or_else(|error| panic!("job {job_id}: {error}"));
         assert_eq!(row.state, JobState::Completed, "job {job_id}");
         if enqueue.mode == "fail_once" {
+            // The first attempt either ran and asked for a retry, or was
+            // claimed by a worker killed before the handler returned, so a
+            // rescue started attempt 2 without a Retry event. A surviving
+            // worker's first attempt always ends in a Retry.
+            let first_attempt_starts: Vec<&Event> = events
+                .iter()
+                .filter(|e| e.kind == EventKind::Start && e.job_id == *job_id && e.attempt == 1)
+                .collect();
             assert!(
-                retries.contains(job_id),
-                "fail_once job {job_id} never retried"
+                retries.contains(job_id)
+                    || first_attempt_starts
+                        .iter()
+                        .all(|e| killed_sources.contains(&e.source)),
+                "fail_once job {job_id} ran attempt 1 on a surviving worker without retrying: \
+                 {first_attempt_starts:?}"
             );
             assert!(
                 row.attempt >= 2,
