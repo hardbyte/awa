@@ -19640,6 +19640,140 @@ async fn test_queue_storage_cancel_by_unique_key_finds_each_live_state() {
     );
 }
 
+/// The admin store is rebuilt from the schema name alone, with the default
+/// ring size. A schema installed with more ready-ring slots still has its
+/// higher slots searched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_reads_every_installed_slot() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_cancel_by_key_wide";
+    let schema = "awa_qs_cancel_by_key_wide";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            queue_slot_count: 20,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    // A job in another queue keeps the ring from idling, so each rotation
+    // advances the cursor.
+    enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("anchor"),
+        unique_cancel_opts("qs_cancel_by_key_anchor", None),
+    )
+    .await;
+    for _ in 0..16 {
+        let outcome = store.rotate(&pool).await.expect("rotate the ready ring");
+        assert!(
+            matches!(outcome, RotateOutcome::Rotated { .. }),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(ring_cursor(&pool, schema, "queue").await.0, 16);
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("running"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the running job");
+    assert_eq!(claimed[0].job.id, running);
+    let available = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("available"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let slots: Vec<i32> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT DISTINCT ready_slot FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(slots, vec![16]);
+
+    for (key, job_id) in [("available", available), ("running", running)] {
+        let cancelled = cancel_unique(&pool, Some(queue), key)
+            .await
+            .unwrap_or_else(|| panic!("the {key} job in slot 16 should be found"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+    }
+}
+
+/// A striped queue's jobs live in `queue#N` lanes. The admin store's default
+/// stripe count is 1, so a lookup by the logical queue name must find the
+/// stripes from the lanes the schema holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_finds_striped_lanes() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_cancel_by_key_striped";
+    let schema = "awa_qs_cancel_by_key_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            queue_stripe_count: 2,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("running"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the running job");
+    assert_eq!(claimed[0].job.id, running);
+    let available = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("available"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let scheduled = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("scheduled"),
+        unique_cancel_opts(queue, Some(Utc::now() + chrono::Duration::hours(1))),
+    )
+    .await;
+    let unstriped: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.ready_entries WHERE queue NOT LIKE $1"
+    )))
+    .bind(format!("{queue}#%"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unstriped, 0, "every ready row is in a stripe lane");
+
+    for (key, job_id) in [
+        ("scheduled", scheduled),
+        ("available", available),
+        ("running", running),
+    ] {
+        let cancelled = cancel_unique(&pool, Some(queue), key)
+            .await
+            .unwrap_or_else(|| panic!("a striped {key} job should be found"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+    }
+}
+
 /// A job moved to another queue while available keeps the key its original
 /// queue gave it. Once it runs or waits in the new queue, a lookup naming
 /// the original queue still finds it, through its retained ready row there.
