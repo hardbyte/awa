@@ -132,8 +132,8 @@ Cancel without storing the id via `cancel_by_unique_key(kind, queue=, args=,
 period_bucket=)` — the components must match those used at insert. It cancels
 the oldest live job holding the key. On queue storage, a `by_queue` key is
 looked up through that queue's ready rows, so a job moved to another queue
-while available can't be cancelled by key unless it is scheduled or retryable;
-cancel it by id.
+can't be cancelled by key while it is available there, or once its original
+ready row is pruned; cancel it by id.
 Args-based uniqueness relies on canonical (sorted-key) JSON, pinned by
 cross-language golden tests; the default state set includes `completed`, so a
 still-retained completed job suppresses a re-insert with the same args. Scope

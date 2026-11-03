@@ -1199,8 +1199,10 @@ pub fn open_receipt_running_claims_sql(schema: &str) -> String {
 
 /// [`open_receipt_running_claims_sql`] restricted to the jobs in `job_ids`,
 /// an SQL expression yielding `bigint[]`. The restriction applies before the
-/// closure and materialisation checks, through the `job_id` indexes, so the
-/// cost follows the number of jobs asked about rather than the claim ring.
+/// closure and materialisation checks. Row-local claims are found through the
+/// `job_id` index. Compact claim batches have no index on `job_ids`, so every
+/// retained batch header is read, but only batches holding one of the jobs
+/// are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
     let closure_rel = format!("{schema}.lease_claim_closures");
     let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
