@@ -2,7 +2,17 @@
 
 #420: late in a full run, one or two tests ERROR at *fixture setup* with
 `pool timed out while waiting for an open connection`, always ~15 minutes
-in, and a rerun always passes. Two things feed it, both addressed here.
+in, and a rerun always passes.
+
+**The cause** was in the library, not the suite: `AsyncClient.migrate()` ran
+the migrations on a throwaway tokio runtime with the client's own pool, so
+connections opened during the migration outlived their I/O driver and a
+later acquire could stall for the full 30 s acquire timeout. Fixtures that
+drop the schema, migrate and then query (`test_start_config.py`) hit it
+most. `migrate()` now runs on the shared runtime.
+
+Two suite-side measures from the earlier investigation stay, since they keep
+backend counts low and catch leaked clients.
 
 **Peak connection demand.** `AsyncClient`/`Client` default to a
 10-connection pool — a sensible application default, and far more than any
