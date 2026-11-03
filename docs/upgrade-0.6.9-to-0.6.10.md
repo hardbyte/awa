@@ -53,6 +53,14 @@ awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --sql --pending \
 
 Pass `--no-transaction` if your runner opens the transaction itself. With `--extract-to`, apply `R__prepared_lane_sequences.sql` as a repeatable script after `V40`. `--from`, `--to` and `--version` select a range to render with `--sql` or `--extract-to`; `awa migrate` refuses them when applying.
 
+The schema version stays at v40, so a runner that tracks only versions sees nothing new: add the `R__` script explicitly. Run it as the role that owns the Awa schemas. It updates only the queue-storage schemas the running role can use and skips the rest without an error, where `awa migrate` would exit 1. Afterwards, check that nothing is left:
+
+```bash
+awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --sql --pending
+```
+
+It prints `Schema is up to date (version 40).` once every schema has the patch, and the patch again otherwise. The check only reads the catalogs.
+
 ## Roll back
 
 Roll the application back to 0.6.9 and leave the patch installed. 0.6.9 workers, producers, `awa serve` and `awa migrate` all work against it: the helpers keep their 0.6.9 arguments and behaviour for a role with schema `CREATE`, and the 0.6.9 `awa migrate` changes nothing on a v40 database. No reverse SQL is needed or provided.
