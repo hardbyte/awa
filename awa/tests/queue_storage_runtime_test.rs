@@ -12905,6 +12905,7 @@ async fn unique_key_lookup_rows(
     conn: &mut sqlx::PgConnection,
     schema: &str,
     queue: Option<&str>,
+    key: &str,
 ) -> i64 {
     async fn rows_read(conn: &mut sqlx::PgConnection, schema: &str) -> i64 {
         sqlx::query_scalar(
@@ -12921,7 +12922,7 @@ async fn unique_key_lookup_rows(
         &mut *conn,
         UniqueCancelJob::kind(),
         queue,
-        Some(&serde_json::to_value(unique_cancel_job("absent")).unwrap()),
+        Some(&serde_json::to_value(unique_cancel_job(key)).unwrap()),
         None,
     )
     .await
@@ -12937,7 +12938,8 @@ async fn unique_key_lookup_rows(
 
 /// A unique-key lookup reads the live work, not retained history: rows
 /// read stay flat as completed jobs accumulate, and with a queue they stay
-/// flat as other queues' backlogs grow.
+/// flat as other queues' backlogs grow and as the claim ring retains more
+/// claims, which a long-running job elsewhere can keep from pruning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
     let (_db_guard, pool) = setup_pool(8).await;
@@ -12945,6 +12947,21 @@ async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
     let queue = "qs_cancel_by_key_cost";
     let other = "qs_cancel_by_key_cost_other";
     let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    // A finished job still holding a key: its retained ready row sends a
+    // lookup for that key through the full scoped query.
+    let finished = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("finished"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed[0].job.id, finished);
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
     store.enqueue_batch(&pool, queue, 2, 200).await.unwrap();
 
     let complete = |count: i64| {
@@ -12975,15 +12992,15 @@ async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
         .await
         .unwrap();
     sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
-    let scoped = unique_key_lookup_rows(&mut conn, schema, Some(queue)).await;
-    let unscoped = unique_key_lookup_rows(&mut conn, schema, None).await;
+    let scoped = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    let unscoped = unique_key_lookup_rows(&mut conn, schema, None, "absent").await;
 
     // Ten times the retained history.
     complete(4_500).await;
     sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
     let flat = |before: i64| before + before / 2 + 64;
-    let scoped_history = unique_key_lookup_rows(&mut conn, schema, Some(queue)).await;
-    let unscoped_history = unique_key_lookup_rows(&mut conn, schema, None).await;
+    let scoped_history = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    let unscoped_history = unique_key_lookup_rows(&mut conn, schema, None, "absent").await;
     assert!(
         scoped_history <= flat(scoped),
         "scoped lookup read {scoped} rows, then {scoped_history} with more history"
@@ -12998,9 +13015,35 @@ async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
         store.enqueue_batch(&pool, other, 2, 500).await.unwrap();
     }
     sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
-    let scoped_backlog = unique_key_lookup_rows(&mut conn, schema, Some(queue)).await;
+    let scoped_backlog = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
     assert!(
         scoped_backlog <= flat(scoped),
         "scoped lookup read {scoped} rows, then {scoped_backlog} beside another queue's backlog"
+    );
+
+    // Claims retained without pruning: a scoped lookup reads none of them.
+    // A deadline makes them row-local claims, as jobs with a deadline get.
+    let scoped_finished = unique_key_lookup_rows(&mut conn, schema, Some(queue), "finished").await;
+    let mut retained = 0;
+    while retained < 5_000 {
+        let claims = store
+            .claim_runtime_batch(&pool, other, 500, Duration::from_secs(300))
+            .await
+            .unwrap();
+        store.complete_runtime_batch(&pool, &claims).await.unwrap();
+        retained += 500;
+    }
+    sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
+    let scoped_claims = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    let scoped_finished_claims =
+        unique_key_lookup_rows(&mut conn, schema, Some(queue), "finished").await;
+    assert!(
+        scoped_claims <= flat(scoped),
+        "scoped lookup read {scoped} rows, then {scoped_claims} with retained claims"
+    );
+    assert!(
+        scoped_finished_claims <= flat(scoped_finished),
+        "scoped lookup of a finished job's key read {scoped_finished} rows, then \
+         {scoped_finished_claims} with retained claims"
     );
 }

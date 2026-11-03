@@ -35,10 +35,16 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   [#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
   built every available ready row before filtering by key, reading every
   retained ready row, and missed jobs running on receipt claims not yet
-  materialised into `leases`. It now filters by key where each source is
-  read, walks available rows lane by lane from the claim cursor (only the
-  given queue's lanes when a queue is passed), and checks open receipt
-  claims.
+  materialised into `leases`. Given a queue, the lookup now starts from that
+  queue's ready rows holding the key and checks only those jobs for being
+  available, leased or on an open receipt claim; with no such row, only the
+  `deferred_jobs` key index is read. Its cost follows that queue's own rows,
+  not other queues' backlogs or the claim ring, which a long-running job can
+  keep from pruning. On a database with 180,000 retained ready rows and
+  120,000 retained claims in other queues, a lookup took 1.7 ms for a missing
+  key and 11–20 ms to cancel a scheduled or available job, against 2.8 s for
+  0.6.9. Without a queue, available rows are walked lane by lane from the
+  claim cursor and open receipt claims are read in full.
 - **A request the admin UI's client abandons no longer holds a database
   connection for good.** When a browser closes a tab or a proxy times out,
   the server drops the request but Postgres keeps running its query. If that
