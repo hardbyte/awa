@@ -48,7 +48,14 @@ fn client_builder(pool: &sqlx::PgPool, canonical: bool) -> awa::ClientBuilder {
     if canonical {
         builder.canonical_storage()
     } else {
-        builder
+        // The default one-second ring rotation lets maintenance rotate the
+        // ready ring and prune completed rows while the test runs, so a later
+        // count of a completed job finds nothing on a slow machine.
+        builder.queue_storage(
+            awa::QueueStorageConfig::default(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
     }
 }
 
