@@ -516,12 +516,18 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
 ///
 /// It selects what `current_jobs` would with the same bound, but bounds each
 /// source before any join: available rows are read per lane from its claim
-/// cursor, and terminal rows only from done rows and completion batches
+/// cursor through its segments, and terminal rows only from done rows and completion batches
 /// finalised since `since`, as a job finishes after it is created. `since`
 /// must be a bind rather than an expression such as `clock_timestamp()`,
-/// which Postgres won't push into the `terminal_jobs` view.
+/// which Postgres can't push into a bound on `finalized_at`.
 fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
     let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
+    let available = crate::queue_storage::available_lane_rows_sql(
+        schema,
+        "head_signal",
+        "ready.created_at",
+        &format!("ready.created_at >= {since}"),
+    );
     format!(
         r#"
         WITH head_signal AS (
@@ -541,23 +547,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
             SELECT ready.created_at, 'available'::awa.job_state AS state
             FROM head_signal
             CROSS JOIN LATERAL (
-                SELECT ready.created_at
-                FROM {schema}.ready_entries AS ready
-                WHERE ready.queue = head_signal.queue
-                  AND ready.priority = head_signal.priority
-                  AND ready.enqueue_shard = head_signal.enqueue_shard
-                  AND ready.lane_seq >= head_signal.claim_seq
-                  AND ready.lane_seq < head_signal.next_seq
-                  AND ready.created_at >= {since}
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                      WHERE tomb.ready_slot = ready.ready_slot
-                        AND tomb.ready_generation = ready.ready_generation
-                        AND tomb.queue = ready.queue
-                        AND tomb.priority = ready.priority
-                        AND tomb.enqueue_shard = ready.enqueue_shard
-                        AND tomb.lane_seq = ready.lane_seq
-                  )
+                {available}
             ) AS ready
             UNION ALL
             SELECT created_at, state
@@ -587,10 +577,51 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
             ) AS created
             WHERE created.created_at >= {since}
             UNION ALL
-            SELECT created_at, state
-            FROM {schema}.terminal_jobs
-            WHERE finalized_at >= {since}
-              AND created_at >= {since}
+            -- What `terminal_jobs` holds, bounded the same way, with each
+            -- row's creation time probed along the ready key. Read through
+            -- the view, Postgres joins the window's members to a scan of
+            -- every retained ready row.
+            SELECT COALESCE(done.created_at, ready.created_at, done.finalized_at), done.state
+            FROM {schema}.done_entries AS done
+            LEFT JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = done.ready_slot
+                  AND ready.ready_generation = done.ready_generation
+                  AND ready.queue = done.queue
+                  AND ready.priority = done.priority
+                  AND ready.enqueue_shard = done.enqueue_shard
+                  AND ready.lane_seq = done.lane_seq
+                OFFSET 0
+            ) AS ready ON TRUE
+            WHERE done.finalized_at >= {since}
+              AND COALESCE(done.created_at, ready.created_at, done.finalized_at) >= {since}
+            UNION ALL
+            SELECT ready.created_at, 'completed'::awa.job_state
+            FROM {schema}.receipt_completion_batches AS batch
+            CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases, batch.lane_seqs)
+                AS item(job_id, run_lease, lane_seq)
+            CROSS JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = batch.ready_slot
+                  AND ready.ready_generation = batch.ready_generation
+                  AND ready.queue = batch.queue
+                  AND ready.priority = batch.priority
+                  AND ready.enqueue_shard = batch.enqueue_shard
+                  AND ready.lane_seq = item.lane_seq
+                  AND ready.job_id = item.job_id
+                OFFSET 0
+            ) AS ready
+            WHERE batch.finalized_at >= {since}
+              AND ready.created_at >= {since}
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
+                  WHERE tomb.ready_slot = batch.ready_slot
+                    AND tomb.ready_generation = batch.ready_generation
+                    AND tomb.job_id = item.job_id
+                    AND tomb.run_lease = item.run_lease
+              )
             UNION ALL
             SELECT created_at, 'failed'::awa.job_state
             FROM {schema}.dlq_entries
@@ -3587,7 +3618,7 @@ pub async fn state_timeseries(
             .await?;
         // The window is measured on the database's clock, as on the canonical
         // engine, but bound as a value: Postgres won't push an expression
-        // like `clock_timestamp()` into the `terminal_jobs` view.
+        // like `clock_timestamp()` into a bound on `finalized_at`.
         let since: chrono::DateTime<chrono::Utc> =
             sqlx::query_scalar("SELECT clock_timestamp() - make_interval(mins => $1)")
                 .bind(minutes)

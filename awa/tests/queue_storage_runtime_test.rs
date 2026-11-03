@@ -17363,6 +17363,90 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
         recent_completed, 0,
         "a job finalised before the window began cannot have been created in it"
     );
+
+    // Deleting a completion from before the last hour leaves the last hour's
+    // count alone, though the tombstone is recent.
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(completed[1])
+        .execute(&pool)
+        .await
+        .expect("delete an old completed job");
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.completed_last_hour, 0);
+    let counts = admin::state_counts(&pool)
+        .await
+        .expect("read queue-storage state counts");
+    assert_eq!(counts.get(&JobState::Completed).copied(), Some(3));
+}
+
+/// Queue lag is the age of the oldest available job, wherever it sits in its
+/// lane. A queue move appends the job with its original `run_at` behind newer
+/// jobs, as priority aging does, so the lane's first row need not be the
+/// oldest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_queue_overview_lag_is_the_oldest_available_job() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_overview_lag";
+    let source = "qs_overview_lag_source";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_overview_lag".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let older = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: source.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    // An available job that has waited an hour.
+    sqlx::query(
+        "UPDATE awa_qs_overview_lag.ready_entries SET run_at = run_at - interval '1 hour' \
+         WHERE job_id = $1",
+    )
+    .bind(older)
+    .execute(&pool)
+    .await
+    .expect("age the source job");
+    assert!(store
+        .move_queue(&pool, older, queue, None)
+        .await
+        .expect("move the older job"));
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.available, 2);
+    let lag = overview.lag_seconds.expect("an available job has a lag");
+    assert!(
+        lag > 3_500.0,
+        "lag should be the moved job's hour, not the newer job's age: {lag}"
+    );
 }
 
 /// `ordering_key` pins a job to a deterministic shard based on a
