@@ -6,6 +6,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **`awa storage prepare-queue` provisions lanes a 0.6 runtime created.** A
+  runtime role with schema `CREATE` owns the lane sequences it creates.
+  Provisioning such a lane as the owner, the first step of revoking runtime
+  `CREATE`, failed with `permission denied for sequence`: the head tables'
+  `BEFORE INSERT` triggers run even for a row `ON CONFLICT DO NOTHING` then
+  skips, and they read and set the lane's sequence. Lane inserts now skip
+  rows that exist. Found by the 0.6.10 upgrade rehearsal.
 - **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
   storage find running jobs and no longer read retained history**
   ([#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup

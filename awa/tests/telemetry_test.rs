@@ -694,6 +694,20 @@ fn build_otlp_meter_provider(endpoint: &str, service_name: &str) -> SdkMeterProv
         .build()
 }
 
+/// A client that keeps terminal rows for the whole test.
+///
+/// The default one-second ring rotation lets maintenance rotate the ready
+/// ring and prune completed rows while the test is still waiting to read
+/// them, so a count or lookup of completed jobs can miss them on a slow
+/// runner.
+fn client_builder(pool: &sqlx::PgPool) -> awa::ClientBuilder {
+    Client::builder(pool.clone()).queue_storage(
+        awa::QueueStorageConfig::default(),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    )
+}
+
 async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: i64) {
     let start = std::time::Instant::now();
     // 60s is tight when a rescue + retry path depends on the promote timer,
@@ -1250,7 +1264,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
 
     // 2. Build client with fast maintenance intervals, but keep retry/callback
     // transitions under explicit DB control to avoid CI timing flakes (#67).
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(
             queue,
             QueueConfig {
@@ -1682,7 +1696,7 @@ async fn dashboard_panels_have_observed_data() {
     let meter_provider = build_otlp_meter_provider(&otlp_endpoint(), "awa-grafana-demo");
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(
             queue,
             QueueConfig {
@@ -2440,7 +2454,7 @@ async fn test_trace_pipeline_reaches_tempo() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let handler_attempts = attempts.clone();
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(
             queue,
             QueueConfig {
