@@ -881,16 +881,14 @@ async fn cancel_in_tx<'a>(
 /// - running and waiting jobs are read from `leases` and from open receipt
 ///   claims that have not been materialised into `leases`.
 ///
-/// With `scoped`, the available-row walk covers only the lanes of the
-/// physical queues in `$2`, so a lookup in one queue doesn't read every
-/// queue's backlog. The other sources are indexed or small and are read for
-/// every queue.
-fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
-    let heads_scope = if scoped {
-        "WHERE claims.queue = ANY($2)"
-    } else {
-        ""
-    };
+/// Without a queue, the open receipt claims are read in full before the key
+/// filter, so this lookup costs what the claim ring retains. With `scoped`
+/// (the store's ready-ring slot count) see
+/// [`scoped_unique_key_candidate_sql`], which starts from the key.
+fn unique_key_candidate_sql(schema: &str, scoped: Option<usize>) -> String {
+    if let Some(queue_slots) = scoped {
+        return scoped_unique_key_candidate_sql(schema, queue_slots);
+    }
     let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     format!(
         r#"
@@ -906,7 +904,6 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
               ON enqueues.queue = claims.queue
              AND enqueues.priority = claims.priority
              AND enqueues.enqueue_shard = claims.enqueue_shard
-            {heads_scope}
         ),
         candidates AS (
             SELECT ready.job_id
@@ -994,25 +991,148 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
     )
 }
 
+/// The ready rows of the physical queues in `$2` that hold the key `$1`,
+/// probed one ring slot at a time: the ready key leads with `ready_slot`, so
+/// a filter on `queue` alone scans every retained ready row.
+fn keyed_ready_rows_sql(schema: &str, queue_slots: usize) -> String {
+    format!(
+        r#"
+            SELECT
+                ready.job_id,
+                ready.ready_slot,
+                ready.ready_generation,
+                ready.queue,
+                ready.priority,
+                ready.enqueue_shard,
+                ready.lane_seq
+            FROM generate_series(0, {last_slot}) AS slot(ready_slot)
+            CROSS JOIN LATERAL (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = slot.ready_slot
+                  AND ready.queue = ANY($2)
+                  AND ready.unique_key = $1
+                OFFSET 0
+            ) AS ready
+        "#,
+        last_slot = queue_slots.saturating_sub(1)
+    )
+}
+
+/// The queue-scoped candidate lookup: starts from the queue's ready rows that
+/// hold the key, read through the lane index, then keeps the ones still live.
+/// Its cost follows that queue's retained rows, not other queues' backlogs or
+/// the claim ring, which a large backlog elsewhere can keep from pruning.
+///
+/// - available: at or past the lane's claim cursor and not tombstoned;
+/// - scheduled and retryable: the `deferred_jobs` unique-key index;
+/// - running or waiting: in `leases`, or on an open receipt claim checked by
+///   `job_id` for just these jobs.
+///
+/// `$2` holds the physical queues of the logical queue.
+fn scoped_unique_key_candidate_sql(schema: &str, queue_slots: usize) -> String {
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql_for(
+        schema,
+        Some("ARRAY(SELECT keyed.job_id FROM keyed)"),
+    );
+    let keyed = keyed_ready_rows_sql(schema, queue_slots);
+    format!(
+        r#"
+        WITH keyed AS MATERIALIZED (
+            {keyed}
+        ),
+        candidates AS (
+            SELECT keyed.job_id
+            FROM keyed
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = keyed.queue
+             AND claims.priority = keyed.priority
+             AND claims.enqueue_shard = keyed.enqueue_shard
+            WHERE keyed.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = keyed.ready_slot
+                    AND tomb.ready_generation = keyed.ready_generation
+                    AND tomb.queue = keyed.queue
+                    AND tomb.priority = keyed.priority
+                    AND tomb.enqueue_shard = keyed.enqueue_shard
+                    AND tomb.lane_seq = keyed.lane_seq
+              )
+            UNION ALL
+            SELECT job_id
+            FROM {schema}.deferred_jobs
+            WHERE unique_key = $1
+            UNION ALL
+            SELECT keyed.job_id
+            FROM keyed
+            WHERE EXISTS (
+                SELECT 1 FROM {schema}.leases AS lease
+                WHERE lease.ready_slot = keyed.ready_slot
+                  AND lease.ready_generation = keyed.ready_generation
+                  AND lease.queue = keyed.queue
+                  AND lease.priority = keyed.priority
+                  AND lease.enqueue_shard = keyed.enqueue_shard
+                  AND lease.lane_seq = keyed.lane_seq
+            )
+            UNION ALL
+            SELECT open_claims.job_id
+            FROM ({open_running}) AS open_claims
+        )
+        SELECT job_id
+        FROM candidates
+        ORDER BY job_id ASC
+        LIMIT 1
+        "#
+    )
+}
+
 /// The oldest nonterminal queue-storage job holding `unique_key`.
 ///
 /// A queue is part of a key only when it was inserted with `by_queue`, so a
-/// job holding a queue-scoped key was enqueued there: available rows are
-/// read from that queue's lanes alone. A job moved to another queue while
-/// available is therefore not found by a queue-scoped lookup; scheduled,
-/// retryable, running and waiting jobs are found wherever they are.
+/// job holding a queue-scoped key was enqueued there: with a queue, its ready
+/// rows are read from that queue alone. A job moved to another queue while
+/// available is therefore not found by a queue-scoped lookup unless it is
+/// scheduled or retryable; cancel it by id.
 async fn queue_storage_unique_key_candidate(
     conn: &mut sqlx::PgConnection,
     store: &QueueStorage,
     unique_key: &[u8],
     queue: Option<&str>,
 ) -> Result<Option<i64>, AwaError> {
-    let sql = unique_key_candidate_sql(store.schema(), queue.is_some());
-    let mut query = sqlx::query_scalar(audited_sql(sql)).bind(unique_key);
-    if let Some(queue) = queue {
-        query = query.bind(store.physical_queues_for_logical(queue));
+    let schema = store.schema();
+    let Some(queue) = queue else {
+        let sql = unique_key_candidate_sql(schema, None);
+        return Ok(sqlx::query_scalar(audited_sql(sql))
+            .bind(unique_key)
+            .fetch_optional(&mut *conn)
+            .await?);
+    };
+    let queues = store.physical_queues_for_logical(queue);
+    // Available, running and waiting jobs all have a ready row in the queue.
+    // Without one, only a scheduled or retryable job can hold the key, and
+    // the deferred index answers that alone; the full lookup spans enough
+    // partitioned tables that planning it costs several milliseconds.
+    let keyed = keyed_ready_rows_sql(schema, store.queue_slot_count());
+    let has_ready_rows: bool = sqlx::query_scalar(audited_sql(format!("SELECT EXISTS ({keyed})")))
+        .bind(unique_key)
+        .bind(&queues)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !has_ready_rows {
+        return Ok(sqlx::query_scalar(audited_sql(format!(
+            "SELECT job_id FROM {schema}.deferred_jobs WHERE unique_key = $1 \
+             ORDER BY job_id LIMIT 1"
+        )))
+        .bind(unique_key)
+        .fetch_optional(&mut *conn)
+        .await?);
     }
-    Ok(query.fetch_optional(&mut *conn).await?)
+    let sql = unique_key_candidate_sql(schema, Some(store.queue_slot_count()));
+    Ok(sqlx::query_scalar(audited_sql(sql))
+        .bind(unique_key)
+        .bind(&queues)
+        .fetch_optional(&mut *conn)
+        .await?)
 }
 
 /// Canonical (non queue-storage) candidate lookup for a unique key.
