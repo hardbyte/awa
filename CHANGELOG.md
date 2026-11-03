@@ -48,7 +48,11 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   120,000 retained claims in other queues, a lookup took 1.7 ms for a missing
   key and 11–20 ms to cancel a scheduled or available job, against 2.8 s for
   0.6.9. Without a queue, available rows are walked lane by lane from the
-  claim cursor and open receipt claims are read in full.
+  claim cursor and open receipt claims are read in full. Two older gaps are
+  also closed: on a striped queue, a lookup by the logical name now finds
+  jobs in its `queue#N` lanes, and a job that finishes between the lookup
+  and the cancel returns `None` instead of `JobNotFound`, as on the
+  canonical engine.
 - **A request the admin UI's client abandons no longer holds a database
   connection for good.** When a browser closes a tab or a proxy times out,
   the server drops the request but Postgres keeps running its query. If that

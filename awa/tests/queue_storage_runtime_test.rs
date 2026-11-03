@@ -12825,6 +12825,70 @@ async fn test_queue_storage_cancel_by_unique_key_finds_each_live_state() {
     );
 }
 
+/// A striped queue's jobs live in `queue#N` lanes. The admin store's default
+/// stripe count is 1, so a lookup by the logical queue name must find the
+/// stripes from the lanes the schema holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_finds_striped_lanes() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_cancel_by_key_striped";
+    let schema = "awa_qs_cancel_by_key_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            queue_stripe_count: 2,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("running"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the running job");
+    assert_eq!(claimed[0].job.id, running);
+    let available = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("available"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let scheduled = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("scheduled"),
+        unique_cancel_opts(queue, Some(Utc::now() + chrono::Duration::hours(1))),
+    )
+    .await;
+    let unstriped: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.ready_entries WHERE queue NOT LIKE $1"
+    ))
+    .bind(format!("{queue}#%"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unstriped, 0, "every ready row is in a stripe lane");
+
+    for (key, job_id) in [
+        ("scheduled", scheduled),
+        ("available", available),
+        ("running", running),
+    ] {
+        let cancelled = cancel_unique(&pool, Some(queue), key)
+            .await
+            .unwrap_or_else(|| panic!("a striped {key} job should be found"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+    }
+}
+
 /// A job moved to another queue while available keeps the key its original
 /// queue gave it. Once it runs or waits in the new queue, a lookup naming
 /// the original queue still finds it, through its retained ready row there.

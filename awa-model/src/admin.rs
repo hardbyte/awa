@@ -1233,6 +1233,30 @@ fn scoped_unique_key_candidate_sql(schema: &str) -> String {
     )
 }
 
+/// The physical queues that hold a logical queue's lanes, read from the
+/// schema's `queue_lanes`: the queue itself and its `queue#N` stripes. The
+/// admin store is rebuilt from the schema name alone, so its configured
+/// stripe count is the default, not the one the runtime enqueues with.
+async fn persisted_physical_queues(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    queue: &str,
+) -> Result<Vec<String>, AwaError> {
+    let mut queues: Vec<String> = sqlx::query_scalar(&format!(
+        r#"
+        SELECT DISTINCT lanes.queue
+        FROM {schema}.queue_lanes AS lanes
+        WHERE left(lanes.queue, char_length($1) + 1) = $1 || '#'
+          AND substr(lanes.queue, char_length($1) + 2) ~ '^[0-9]+$'
+        "#
+    ))
+    .bind(queue)
+    .fetch_all(&mut *conn)
+    .await?;
+    queues.push(queue.to_string());
+    Ok(queues)
+}
+
 /// The oldest nonterminal queue-storage job holding `unique_key`.
 ///
 /// A queue is part of a key only when it was inserted with `by_queue`, so a
@@ -1254,7 +1278,7 @@ async fn queue_storage_unique_key_candidate(
             .fetch_optional(&mut *conn)
             .await?);
     };
-    let queues = store.physical_queues_for_logical(queue);
+    let queues = persisted_physical_queues(&mut *conn, schema, queue).await?;
     // Available, running and waiting jobs all have a ready row in the queue.
     // Without one, only a scheduled or retryable job can hold the key, and
     // the deferred index answers that alone; the full lookup spans enough
@@ -1327,11 +1351,15 @@ const UNIQUE_KEY_CANDIDATE_SQL_CANONICAL: &str = r#"
 /// `cancel(...)` locks it, the cancel becomes a no-op and returns `None`.
 ///
 /// On the canonical engine the lookup scans `unique_key` on both physical
-/// tables without a dedicated index. On queue storage it reads the live work:
-/// available rows along each lane from its claim cursor (only the lanes of
-/// `queue` when one is given), scheduled and retryable rows by their
-/// unique-key index, and running and waiting jobs, so its cost doesn't grow
-/// with retained history. A job moved to another queue while available is
+/// tables without a dedicated index. On queue storage, scheduled and
+/// retryable rows are found by their unique-key index. With a `queue`, the
+/// lookup reads that queue's ready rows (and its `queue#N` stripes') through
+/// the lane index, retained ones included, and checks only the rows holding
+/// the key for being available, leased or on an open receipt claim; its cost
+/// follows that queue's own retained rows, not other queues' backlogs.
+/// Without a `queue`, available rows are walked lane by lane from the claim
+/// cursor and open receipt claims are read in full, so the cost follows what
+/// the claim ring retains. A job moved to another queue while available is
 /// not found by a lookup that names its original queue.
 pub async fn cancel_by_unique_key(
     pool: &PgPool,
@@ -1349,7 +1377,10 @@ pub async fn cancel_by_unique_key(
         drop(conn);
 
         return match candidate {
-            Some(job_id) => cancel(pool, job_id).await,
+            Some(job_id) => match cancel(pool, job_id).await {
+                Err(AwaError::JobNotFound { .. }) => Ok(None),
+                other => other,
+            },
             None => Ok(None),
         };
     }
@@ -1413,7 +1444,10 @@ async fn cancel_by_unique_key_in_tx<'a>(
             queue_storage_unique_key_candidate(tx.as_mut(), &store, &unique_key, queue).await?;
 
         return match candidate {
-            Some(job_id) => cancel_in_tx(tx, job_id).await,
+            Some(job_id) => match cancel_in_tx(tx, job_id).await {
+                Err(AwaError::JobNotFound { .. }) => Ok(None),
+                other => other,
+            },
             None => Ok(None),
         };
     }
