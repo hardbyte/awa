@@ -1167,8 +1167,8 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
 ///
 /// - available: at or past the lane's claim cursor and not tombstoned;
 /// - scheduled and retryable: the `deferred_jobs` unique-key index;
-/// - running or waiting: in `leases`, or on an open receipt claim checked by
-///   `job_id` for just these jobs.
+/// - running or waiting: in `leases` or on an open receipt claim, both
+///   checked by `job_id` for just these jobs.
 ///
 /// `$2` holds the physical queues of the logical queue.
 fn scoped_unique_key_candidate_sql(schema: &str) -> String {
@@ -1213,16 +1213,13 @@ fn scoped_unique_key_candidate_sql(schema: &str) -> String {
             FROM {schema}.deferred_jobs
             WHERE unique_key = $1
             UNION ALL
+            -- By job id rather than lane: a job moved to another queue
+            -- while available is leased on its new lane.
             SELECT keyed.job_id
             FROM keyed
             WHERE EXISTS (
                 SELECT 1 FROM {schema}.leases AS lease
-                WHERE lease.ready_slot = keyed.ready_slot
-                  AND lease.ready_generation = keyed.ready_generation
-                  AND lease.queue = keyed.queue
-                  AND lease.priority = keyed.priority
-                  AND lease.enqueue_shard = keyed.enqueue_shard
-                  AND lease.lane_seq = keyed.lane_seq
+                WHERE lease.job_id = keyed.job_id
             )
             UNION ALL
             SELECT open_claims.job_id
@@ -1240,9 +1237,9 @@ fn scoped_unique_key_candidate_sql(schema: &str) -> String {
 ///
 /// A queue is part of a key only when it was inserted with `by_queue`, so a
 /// job holding a queue-scoped key was enqueued there: with a queue, its ready
-/// rows are read from that queue alone. A job moved to another queue while
-/// available is therefore not found by a queue-scoped lookup unless it is
-/// scheduled or retryable; cancel it by id.
+/// rows are read from that queue alone. A job moved to another queue is
+/// found through its original ready row while that row is retained, except
+/// while it is available in the new queue; cancel it by id otherwise.
 async fn queue_storage_unique_key_candidate(
     conn: &mut sqlx::PgConnection,
     store: &QueueStorage,
@@ -1262,22 +1259,20 @@ async fn queue_storage_unique_key_candidate(
     // Without one, only a scheduled or retryable job can hold the key, and
     // the deferred index answers that alone; the full lookup spans enough
     // partitioned tables that planning it costs several milliseconds.
-    let has_ready_rows: bool = sqlx::query_scalar(&format!(
+    // One statement, so a job promoted from deferred_jobs to a ready row
+    // between the two reads cannot be missed by both.
+    let (has_ready_rows, deferred): (bool, Option<i64>) = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM {schema}.ready_entries \
-         WHERE queue = ANY($2) AND unique_key = $1)"
+                        WHERE queue = ANY($2) AND unique_key = $1), \
+                (SELECT job_id FROM {schema}.deferred_jobs WHERE unique_key = $1 \
+                 ORDER BY job_id LIMIT 1)"
     ))
     .bind(unique_key)
     .bind(&queues)
     .fetch_one(&mut *conn)
     .await?;
     if !has_ready_rows {
-        return Ok(sqlx::query_scalar(&format!(
-            "SELECT job_id FROM {schema}.deferred_jobs WHERE unique_key = $1 \
-             ORDER BY job_id LIMIT 1"
-        ))
-        .bind(unique_key)
-        .fetch_optional(&mut *conn)
-        .await?);
+        return Ok(deferred);
     }
     let sql = unique_key_candidate_sql(schema, true);
     Ok(sqlx::query_scalar(&sql)

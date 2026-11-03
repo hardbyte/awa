@@ -12825,6 +12825,68 @@ async fn test_queue_storage_cancel_by_unique_key_finds_each_live_state() {
     );
 }
 
+/// A job moved to another queue while available keeps the key its original
+/// queue gave it. Once it runs or waits in the new queue, a lookup naming
+/// the original queue still finds it, through its retained ready row there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_finds_a_moved_running_job() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let origin = "qs_cancel_by_key_origin";
+    let target = "qs_cancel_by_key_target";
+    let store = create_store_with_config(
+        &pool,
+        unique_cancel_store_config("awa_qs_cancel_by_key_moved"),
+    )
+    .await;
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved-running"),
+        unique_cancel_opts(origin, None),
+    )
+    .await;
+    let waiting = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved-waiting"),
+        unique_cancel_opts(origin, None),
+    )
+    .await;
+    for job_id in [running, waiting] {
+        assert!(store.move_queue(&pool, job_id, target, None).await.unwrap());
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, target, 2, Duration::from_secs(300))
+        .await
+        .expect("claim the moved jobs");
+    assert_eq!(claimed.len(), 2);
+    let waiting_claim = claimed
+        .iter()
+        .find(|claim| claim.job.id == waiting)
+        .expect("waiting job claimed");
+    let callback_id = store
+        .register_callback(
+            &pool,
+            waiting,
+            waiting_claim.job.run_lease,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("register the callback");
+    assert!(store
+        .enter_callback_wait(&pool, waiting, waiting_claim.job.run_lease, callback_id)
+        .await
+        .expect("enter the callback wait"));
+
+    for (key, job_id) in [("moved-running", running), ("moved-waiting", waiting)] {
+        let cancelled = cancel_unique(&pool, Some(origin), key)
+            .await
+            .unwrap_or_else(|| panic!("the {key} job should be found by its original queue"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+    }
+}
+
 /// The transaction variant cancels only when the caller commits, and a
 /// running job's cancellation notice is sent on commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
