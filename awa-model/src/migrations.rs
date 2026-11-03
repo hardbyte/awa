@@ -207,7 +207,11 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
-const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+const V23_UP: &str = concat!(
+    include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+    "\n",
+    include_str!("../migrations/v023_install_default_queue_storage_substrate.sql"),
+);
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
 const V25_UP: &str = include_str!("../migrations/v025_drop_leases_state_hb_index.sql");
 const V26_UP: &str = include_str!("../migrations/v026_cron_jobs_pause.sql");
@@ -244,7 +248,67 @@ pub struct SchemaPatch {
     pub applied_probe: &'static str,
 }
 
-pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
+/// Rows naming what still lacks the `prepared_lane_sequences` patch: the
+/// helper refresh function, the installer, and each installed queue-storage
+/// substrate whose lane helpers predate it. A substrate is any schema the
+/// patch would refresh: it has `claim_ready_runtime` and the lane tables and
+/// functions the helpers call. Catalog lookups only, so a schema the probing
+/// role cannot use is still reported rather than skipped.
+macro_rules! prepared_lane_sequences_pending_sql {
+    () => {
+        "SELECT 'awa.refresh_lane_sequence_helpers'::text AS target \
+         WHERE to_regprocedure('awa.refresh_lane_sequence_helpers(text)') IS NULL \
+         UNION ALL \
+         SELECT 'awa.install_queue_storage_substrate' \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc NOT LIKE '%refresh_lane_sequence_helpers%') \
+         UNION ALL \
+         SELECT format('lane helpers in schema %s', n.nspname) \
+         FROM pg_namespace AS n \
+         WHERE EXISTS ( \
+                 SELECT 1 FROM pg_proc AS p \
+                 WHERE p.pronamespace = n.oid \
+                   AND p.proname = 'claim_ready_runtime' \
+                   AND oidvectortypes(p.proargtypes) \
+                       = 'text, bigint, double precision, double precision') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid AND c.relname = 'queue_enqueue_heads') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid AND c.relname = 'queue_claim_heads') \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname = 'queue_lane_sequence_name' \
+                         AND oidvectortypes(p.proargtypes) = 'text, text, smallint, smallint') \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname = 'set_sequence_next' \
+                         AND oidvectortypes(p.proargtypes) = 'text, bigint') \
+           AND (SELECT count(DISTINCT p.proname) FROM pg_proc AS p \
+                WHERE p.pronamespace = n.oid \
+                  AND p.proname IN ('ensure_lane_sequences', \
+                                    'queue_enqueue_head_sequence_sync', \
+                                    'queue_claim_head_sequence_sync') \
+                  AND p.prosrc LIKE '%has not been provisioned%') < 3"
+    };
+}
+
+/// SQL returning one `text` row per object or schema that still needs the
+/// named patch, for patches that touch more than one place.
+fn patch_targets_sql(name: &str) -> Option<&'static str> {
+    match name {
+        "prepared_lane_sequences" => Some(concat!(
+            prepared_lane_sequences_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        _ => None,
+    }
+}
+
+pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
+    SchemaPatch {
     name: "wait_free_dirty_marks",
     description: "Wait-free admin dirty-key marks (awa 0.7 migration v046)",
     sql: include_str!("../migrations/patches/wait_free_dirty_marks.sql"),
@@ -262,7 +326,28 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
                                   AND proname = 'refresh_admin_metadata' \
                                   AND prosrc LIKE '%admin_dirty_queue_marks%' \
                                   AND prosrc NOT LIKE '%TRUNCATE%')",
-}];
+    },
+    SchemaPatch {
+        name: "prepared_lane_sequences",
+        description: "Use provisioned lane sequences without runtime DDL (awa 0.7 migration v049)",
+        // The helper and installer definitions first, so new schemas pick up
+        // the updated helpers; the patch then replaces just those helpers on
+        // every installed queue-storage schema.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/prepared_lane_sequences.sql"),
+        ),
+        // Applied only when the installer and every installed substrate carry
+        // the new definitions, so a custom schema restored or prepared with
+        // the old helpers keeps the patch pending after `awa` passes.
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            prepared_lane_sequences_pending_sql!(),
+            ")"
+        ),
+    },
+];
 
 /// Schema patches a database still needs to reach this binary's schema shape.
 ///
@@ -297,6 +382,137 @@ async fn pending_schema_patches_conn(
     Ok(pending)
 }
 
+/// Whether one schema patch is present, and if not, where it is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaPatchStatus {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub applied: bool,
+    /// What still lacks the patch, such as a queue-storage schema whose lane
+    /// helpers predate it. Empty when the patch is applied.
+    pub needs_repair: Vec<String>,
+}
+
+/// Probe every schema patch against the database, naming what each missing
+/// patch still has to repair. Unlike [`pending_schema_patches`] this probes
+/// regardless of the schema version, so it describes a database that has not
+/// been migrated yet as well as one that has.
+pub async fn schema_patch_status(pool: &PgPool) -> Result<Vec<SchemaPatchStatus>, AwaError> {
+    let mut conn = pool.acquire().await?;
+    schema_patch_status_conn(&mut conn).await
+}
+
+async fn schema_patch_status_conn(
+    conn: &mut PgConnection,
+) -> Result<Vec<SchemaPatchStatus>, AwaError> {
+    let mut statuses = Vec::with_capacity(SCHEMA_PATCHES.len());
+    for patch in SCHEMA_PATCHES {
+        let applied: bool = sqlx::query_scalar(patch.applied_probe)
+            .fetch_one(&mut *conn)
+            .await?;
+        let needs_repair = match (applied, patch_targets_sql(patch.name)) {
+            (true, _) => Vec::new(),
+            (false, Some(targets)) => sqlx::query_scalar(targets).fetch_all(&mut *conn).await?,
+            (false, None) => vec![patch.name.to_string()],
+        };
+        statuses.push(SchemaPatchStatus {
+            name: patch.name,
+            description: patch.description,
+            applied,
+            needs_repair,
+        });
+    }
+    Ok(statuses)
+}
+
+/// Storage routing as recorded in `awa.storage_transition_state`.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StorageRouting {
+    pub state: String,
+    pub current_engine: String,
+    pub prepared_engine: Option<String>,
+    pub queue_storage_schema: Option<String>,
+    pub transition_epoch: i64,
+}
+
+impl std::fmt::Display for StorageRouting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "state {}, engine {}", self.state, self.current_engine)?;
+        if let Some(schema) = &self.queue_storage_schema {
+            write!(f, ", schema {schema}")?;
+        }
+        if let Some(prepared) = &self.prepared_engine {
+            write!(f, ", prepared {prepared}")?;
+        }
+        write!(f, ", epoch {}", self.transition_epoch)
+    }
+}
+
+async fn storage_routing_conn(conn: &mut PgConnection) -> Result<Option<StorageRouting>, AwaError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('awa.storage_transition_state') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        return Ok(None);
+    }
+    let routing = sqlx::query_as::<_, StorageRouting>(
+        "SELECT state, current_engine, prepared_engine, \
+                details ->> 'schema' AS queue_storage_schema, transition_epoch \
+         FROM awa.storage_transition_state WHERE singleton",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(routing)
+}
+
+/// What one schema patch did during a migration run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchOutcome {
+    /// Applied by this run.
+    Applied,
+    /// Already present before this run.
+    AlreadyPresent,
+    /// Not considered: the schema is newer than this binary, whose later
+    /// migrations own these repairs.
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchReport {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub outcome: PatchOutcome,
+    /// Places this run repaired, such as queue-storage schemas whose lane
+    /// helpers were replaced.
+    pub repaired: Vec<String>,
+    /// Places still lacking the patch after this run, usually a schema the
+    /// migrating role cannot use or does not own. Empty on success.
+    pub still_needs_repair: Vec<String>,
+}
+
+/// The result of [`run_with_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub version_before: i32,
+    pub version_after: i32,
+    pub migrations_applied: Vec<i32>,
+    pub patches: Vec<PatchReport>,
+    /// Storage routing before and after the run. Migrations and patches never
+    /// change routing; both are `None` before the storage tables exist.
+    pub storage_routing_before: Option<StorageRouting>,
+    pub storage_routing_after: Option<StorageRouting>,
+}
+
+impl MigrationReport {
+    /// Whether every patch this binary owns is present on every substrate.
+    pub fn complete(&self) -> bool {
+        self.patches
+            .iter()
+            .all(|patch| patch.still_needs_repair.is_empty())
+    }
+}
+
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
 /// Maps old max version → equivalent new version.
@@ -320,24 +536,35 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 ///
 /// Takes `&PgPool` for ergonomic use from Rust.
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
-    let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
+    run_with_report(pool).await.map(|_| ())
+}
+
+/// Advisory lock key that serializes migration runners, including SQL
+/// exported by `awa migrate --sql`. A session lock taken by [`run`] and a
+/// transaction lock taken by exported SQL on the same key exclude each other.
+pub const MIGRATION_LOCK_KEY: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
+
+/// [`run`], returning what the run changed: the schema version, the
+/// migrations and patches it applied, where each patch is still missing, and
+/// storage routing before and after.
+pub async fn run_with_report(pool: &PgPool) -> Result<MigrationReport, AwaError> {
     let mut conn = pool.acquire().await?;
     sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(lock_key)
+        .bind(MIGRATION_LOCK_KEY)
         .execute(&mut *conn)
         .await?;
 
     let result = run_inner(&mut conn).await;
 
     let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_key)
+        .bind(MIGRATION_LOCK_KEY)
         .execute(&mut *conn)
         .await;
 
     result
 }
 
-async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
+async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError> {
     let has_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
             .fetch_one(&mut *conn)
@@ -348,6 +575,8 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
     } else {
         0
     };
+    let storage_routing_before = storage_routing_conn(conn).await?;
+    let mut migrations_applied = Vec::new();
 
     if current > CURRENT_VERSION {
         info!(
@@ -365,6 +594,7 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
                 sqlx::raw_sql(step).execute(&mut *conn).await?;
             }
             info!(version, "Migration applied");
+            migrations_applied.push(version);
         }
     } else {
         info!(version = current, "Schema is up to date");
@@ -372,16 +602,62 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
 
     // Patches ride on the schema this binary owns. A newer schema belongs
     // to a newer binary whose migrations may have superseded them.
+    let mut patches = Vec::with_capacity(SCHEMA_PATCHES.len());
     if current <= CURRENT_VERSION {
-        for patch in pending_schema_patches_conn(conn).await? {
+        let before = schema_patch_status_conn(conn).await?;
+        for status in &before {
+            if status.applied {
+                continue;
+            }
+            let patch = SCHEMA_PATCHES
+                .iter()
+                .find(|patch| patch.name == status.name)
+                .expect("status comes from SCHEMA_PATCHES");
             info!(
                 patch = patch.name,
                 description = patch.description,
                 "Applying schema patch"
             );
+            // One simple-query round trip runs as one implicit transaction:
+            // an error or a cancelled statement leaves nothing applied.
             sqlx::raw_sql(patch.sql).execute(&mut *conn).await?;
             info!(patch = patch.name, "Schema patch applied");
         }
+        let after = schema_patch_status_conn(conn).await?;
+        for (before, after) in before.into_iter().zip(after) {
+            if !after.needs_repair.is_empty() {
+                tracing::warn!(
+                    patch = after.name,
+                    needs_repair = ?after.needs_repair,
+                    "Schema patch is still missing; run awa migrate as a role that owns these schemas"
+                );
+            }
+            let repaired = before
+                .needs_repair
+                .iter()
+                .filter(|target| !after.needs_repair.contains(target))
+                .cloned()
+                .collect();
+            patches.push(PatchReport {
+                name: after.name,
+                description: after.description,
+                outcome: if before.applied {
+                    PatchOutcome::AlreadyPresent
+                } else {
+                    PatchOutcome::Applied
+                },
+                repaired,
+                still_needs_repair: after.needs_repair,
+            });
+        }
+    } else {
+        patches.extend(SCHEMA_PATCHES.iter().map(|patch| PatchReport {
+            name: patch.name,
+            description: patch.description,
+            outcome: PatchOutcome::NotApplicable,
+            repaired: Vec::new(),
+            still_needs_repair: Vec::new(),
+        }));
     }
 
     // Ensure the admin metadata cache is warm. Since v006 removed the
@@ -406,7 +682,19 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         .await;
     }
 
-    Ok(())
+    let version_after = if current > CURRENT_VERSION {
+        current
+    } else {
+        current_version_conn(conn).await?
+    };
+    Ok(MigrationReport {
+        version_before: current,
+        version_after,
+        migrations_applied,
+        patches,
+        storage_routing_before,
+        storage_routing_after: storage_routing_conn(conn).await?,
+    })
 }
 
 /// Get the current schema version.
@@ -634,7 +922,13 @@ mod tests {
     #[test]
     fn schema_patches_are_idempotent_and_versionless() {
         for patch in SCHEMA_PATCHES {
-            let upper = patch.sql.to_uppercase();
+            // The installer body carries guarded DDL that only runs when the
+            // function is called; lint the statements the patch runs itself.
+            let top_level = match patch.sql.split("$install$").collect::<Vec<_>>().as_slice() {
+                [before, _body, after] => format!("{before}{after}"),
+                _ => patch.sql.to_string(),
+            };
+            let upper = top_level.to_uppercase();
             assert!(
                 !upper.contains("INSERT INTO AWA.SCHEMA_VERSION"),
                 "patch {} must not record a schema version",
@@ -650,6 +944,20 @@ mod tests {
             );
             assert!(!patch.applied_probe.is_empty());
         }
+    }
+
+    #[test]
+    fn prepared_lane_patch_does_not_rerun_the_installer() {
+        // The installer locks live queue-storage tables until commit; on an
+        // existing database the patch replaces only the lane helpers.
+        let patch = include_str!("../migrations/patches/prepared_lane_sequences.sql");
+        let code: String = patch
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("install_queue_storage_substrate"));
+        assert!(code.contains("PERFORM awa.refresh_lane_sequence_helpers(v_schema)"));
     }
 
     #[test]

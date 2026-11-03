@@ -601,6 +601,112 @@ fn receipt_closed_evidence_sql(
     )
 }
 
+/// A subquery that yields the identity `(job_id, run_lease, queue)` of every
+/// receipt claim currently open (i.e. `running`) but not yet materialised
+/// into `leases`. Since #246 receipt claims — zero-deadline and
+/// deadline-backed alike — are written as compact `lease_claim_batches` rows
+/// rather than one `lease_claims` row per job, so the "open receipt claims"
+/// set is the union of legacy row-local `lease_claims` and the unnested
+/// members of `lease_claim_batches`, each anti-joined against every durable
+/// closure/terminal/materialised-lease evidence shape.
+///
+/// This is the canonical open-receipt-claim shape (mirrors `queue_counts`'s
+/// `live_running` derivation). Compose it wherever a running enumeration must
+/// see receipt claims: wrap in `(SELECT count(*) FROM (<sql>) …)`, join it, or
+/// `UNION ALL` its rows into a `current_jobs`-style view. `waiting_external`
+/// deliberately does NOT read this set — a claim can only reach
+/// `waiting_external` after `register_callback` materialises it into `leases`
+/// (see `enter_callback_wait_in_tx`), so those legs stay `leases`-only.
+///
+/// `leases` here is materialised-claim evidence; a claim present in `leases`
+/// is reported by the caller's own `leases` leg, so it is excluded here to
+/// avoid double counting.
+pub(crate) fn open_receipt_running_claims_sql(schema: &str) -> String {
+    open_receipt_running_claims_sql_for(schema, None)
+}
+
+/// [`open_receipt_running_claims_sql`] restricted to the jobs in `job_ids`,
+/// an SQL expression yielding `bigint[]`. The restriction applies before the
+/// closure and materialisation checks. Row-local claims are found through the
+/// `job_id` index. Compact claim batches have no index on `job_ids`, so every
+/// retained batch header is read, but only batches holding one of the jobs
+/// are unnested and checked.
+pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
+    let closure_rel = format!("{schema}.lease_claim_closures");
+    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+    let row_closed =
+        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    let (row_filter, batch_filter) = match job_ids {
+        Some(ids) => (
+            format!("claims.job_id = ANY({ids}) AND "),
+            format!("batches.job_ids && {ids} AND items.job_id = ANY({ids}) AND "),
+        ),
+        None => (String::new(), String::new()),
+    };
+    format!(
+        r#"
+        SELECT claims.job_id, claims.run_lease, claims.queue
+        FROM {schema}.lease_claims AS claims
+        WHERE {row_filter}NOT {row_closed}
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.leases AS lease
+              WHERE lease.job_id = claims.job_id
+                AND lease.run_lease = claims.run_lease
+          )
+        UNION ALL
+        SELECT items.job_id, items.run_lease, batches.queue
+        FROM {schema}.lease_claim_batches AS batches
+        CROSS JOIN LATERAL unnest(
+            batches.job_ids,
+            batches.run_leases,
+            batches.receipt_ids
+        ) AS items(job_id, run_lease, receipt_id)
+        -- Skips, before unnesting, a batch whose receipts closure batches
+        -- have all closed: most retained batches, once their jobs finish.
+        WHERE {batch_filter}NOT (
+                  batches.receipt_ranges <@ COALESCE((
+                      SELECT range_agg(closed)
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      CROSS JOIN LATERAL unnest(closure_batches.receipt_ranges) AS closed
+                      WHERE closure_batches.claim_slot = batches.claim_slot
+                        AND closure_batches.receipt_ranges && batches.receipt_ranges
+                  ), '{{}}'::int8multirange)
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = batches.claim_slot
+                    AND closures.job_id = items.job_id
+                    AND closures.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  WHERE closure_batches.claim_slot = batches.claim_slot
+                    AND closure_batches.receipt_ranges @> items.receipt_id
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
+        "#
+    )
+}
+
 fn busy_indicator(has_rows: bool) -> i64 {
     if has_rows {
         1
@@ -2396,7 +2502,7 @@ impl QueueStorage {
         format!("{queue}{QUEUE_STRIPE_DELIMITER}{stripe}")
     }
 
-    fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
+    pub(crate) fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
         if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
             return vec![queue.to_string()];
         }
@@ -3290,6 +3396,33 @@ impl QueueStorage {
             .await
     }
 
+    /// Provision every priority and shard of a queue before deploying a runtime
+    /// role without schema CREATE. Run as the schema owner/migrator. This does
+    /// not change enqueue routing or the configured shard count.
+    pub async fn prepare_queue(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        enqueue_shards: i16,
+    ) -> Result<(), AwaError> {
+        if queue.is_empty() || !(1..=64).contains(&enqueue_shards) {
+            return Err(AwaError::Validation(
+                "prepare_queue requires a nonempty queue and 1..=64 enqueue shards".into(),
+            ));
+        }
+        let mut transaction = pool.begin().await.map_err(map_sqlx_error)?;
+        for physical_queue in self.physical_queues_for_logical(queue) {
+            for priority in 1..=4 {
+                for shard in 0..enqueue_shards {
+                    self.ensure_lane_inserts(&mut transaction, &physical_queue, priority, shard)
+                        .await?;
+                }
+            }
+        }
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
     /// Run the three lane-row inserts unconditionally and mark the
     /// `(queue, priority)` pair as cached on success. Skips the cache
     /// fast path so callers in the rollback-recovery path can force a
@@ -3323,10 +3456,18 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // The head tables' BEFORE INSERT triggers run even for a row that
+        // ON CONFLICT then skips, and they read and set the lane's sequence.
+        // Skipping rows that exist keeps provisioning a live lane off a
+        // sequence another role owns, such as one a 0.6.9 runtime created.
         sqlx::query(&format!(
             r#"
             INSERT INTO {schema}.queue_enqueue_heads (queue, priority, enqueue_shard)
-            VALUES ($1, $2, $3)
+            SELECT $1, $2, $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.queue_enqueue_heads
+                WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            )
             ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
             "#
         ))
@@ -3340,7 +3481,11 @@ impl QueueStorage {
         sqlx::query(&format!(
             r#"
             INSERT INTO {schema}.queue_claim_heads (queue, priority, enqueue_shard)
-            VALUES ($1, $2, $3)
+            SELECT $1, $2, $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.queue_claim_heads
+                WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            )
             ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
             "#
         ))

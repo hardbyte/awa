@@ -4,6 +4,106 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-11-03
+
+Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, a request the UI's client abandons no longer holds a database connection, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Upgrading from 0.6.9 is a rolling upgrade: run `awa migrate` once as the owner while traffic continues, then roll processes; binaries can roll back to 0.6.9 with the patch left in place. [`docs/upgrade-0.6.9-to-0.6.10.md`](https://github.com/hardbyte/awa/blob/v0.6.10/docs/upgrade-0.6.9-to-0.6.10.md) has the steps, the rollback, and the optional procedure for running the runtime role without schema `CREATE`.
+
+- **Admin queue and dashboard reads on queue storage follow live work, not
+  retained history** (backport of
+  [#580](https://github.com/hardbyte/awa/pull/580) and
+  [#581](https://github.com/hardbyte/awa/pull/581)). `admin::queue_overviews`
+  (the queues and dashboard pages, `awa queue stats`, the Python queue
+  stats), `admin::state_counts` and `admin::state_timeseries` built every
+  current job through `terminal_jobs`, expanding each completion batch and
+  joining it back to `ready_entries`. One production deployment saw the queue
+  overview take 22 s, re-run by an open dashboard. They now read the
+  live-work tables the worker queue gauges read, count completions from
+  batch sizes, and bound the timeseries to rows finalised within its window.
+  Counts are unchanged; `running` keeps 0.6's leases-only definition.
+  Available rows are found through each lane's segments from its claim
+  cursor, as claims find them; recent deletions are matched against each
+  affected completion batch once, rather than one batch scan per deletion;
+  and queue lag is the age of the oldest available job, as in 0.6.9. A new
+  test, `admin_read_cost_test`, serves every endpoint the UI polls against
+  ten times more retained history and fails if a read does more work
+  (backport of [#584](https://github.com/hardbyte/awa/pull/584)).
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts**, which otherwise lagged a DLQ action by up to the cache TTL.
+- **The admin UI's runtime page no longer shows the storage transition card
+  once the transition is finalized.** It stayed up on every cluster running
+  queue storage; it now appears only while an engine is prepared or a mixed
+  transition is in flight.
+- **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
+  storage find running jobs and no longer read retained history**
+  (backport of [#586](https://github.com/hardbyte/awa/pull/586), for
+  [#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
+  built every available ready row before filtering by key, reading every
+  retained ready row, and missed jobs running on receipt claims not yet
+  materialised into `leases`. Given a queue, the lookup now starts from that
+  queue's ready rows holding the key and checks only those jobs for being
+  available, leased or on an open receipt claim; with no such row, only the
+  `deferred_jobs` key index is read. Its cost follows that queue's own rows,
+  not other queues' backlogs or the claim ring, which a long-running job can
+  keep from pruning. On a database with 180,000 retained ready rows and
+  120,000 retained claims in other queues, a lookup took 1.7 ms for a missing
+  key and 11–20 ms to cancel a scheduled or available job, against 2.8 s for
+  0.6.9. Without a queue, available rows are walked lane by lane from the
+  claim cursor and open receipt claims are read in full. Two older gaps are
+  also closed: on a striped queue, a lookup by the logical name now finds
+  jobs in its `queue#N` lanes, and a job that finishes between the lookup
+  and the cancel returns `None` instead of `JobNotFound`, as on the
+  canonical engine.
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, sqlx closed the connection with a hard close,
+  which hangs on a TLS connection, so the pool lost that slot permanently.
+  `awa serve` now sets a 60-second statement timeout (`--statement-timeout`,
+  `AWA_STATEMENT_TIMEOUT`), recovers such connections when they are released,
+  and on Postgres 14+ sets `client_connection_check_interval` so a query stops
+  when its connection closes. Applications embedding `awa_ui::router` can
+  build their pool with the new `awa_ui::admin_pool_options` and
+  `admin_connect_options`. Backport of
+  [#583](https://github.com/hardbyte/awa/pull/583).
+- Restricted runtimes can use pre-provisioned queue lanes without schema
+  `CREATE` ([#501](https://github.com/hardbyte/awa/pull/501)). The lane helpers
+  skip `CREATE SEQUENCE` when the sequence exists and raise SQLSTATE `42501`
+  with a provisioning hint when it does not. Ships as the schema patch
+  `prepared_lane_sequences` (applied by `awa migrate`, exported as
+  `R__prepared_lane_sequences.sql`). The patch replaces only those three
+  functions on each queue-storage schema, so it takes no table locks and
+  can run under live workers. New `awa storage prepare-queue` and
+  `QueueStorage::prepare_queue` provision lanes as the migrator; runtime roles
+  need `USAGE, SELECT, UPDATE` on the lane sequences.
+- **The patch counts as applied only when every queue-storage schema has it.**
+  The `prepared_lane_sequences` probe checked the helpers in `awa` alone, so a
+  custom schema restored or prepared with the 0.6.9 helpers was missed once
+  `awa` passed, and a database whose only active substrate was a custom schema
+  never passed. The probe now checks the installer, the refresh function and
+  every substrate's helpers, and the new `migrations::schema_patch_status`
+  names each schema still lacking the patch.
+- **`awa migrate` reports what it did and refuses ranges it cannot honour.**
+  It prints the schema version, each patch and what it updated, and storage
+  routing before and after, and exits 1 naming any schema a patch could not
+  reach (`migrations::run_with_report` returns the same report). `--from`,
+  `--to` and `--version` are refused when applying, where they used to be
+  ignored in favour of a full migration. `--sql` output is one transaction
+  holding the migration advisory lock, with `ON_ERROR_STOP` guidance in its
+  header; `--no-transaction` prints it bare.
+- **`awa storage prepare-queue` works on lanes a 0.6.9 runtime created.**
+  A runtime role with schema `CREATE` owns the lane sequences it creates, and
+  provisioning such a lane as the owner failed with `permission denied for
+  sequence`: the head tables' `BEFORE INSERT` triggers run even for a row that
+  `ON CONFLICT DO NOTHING` then skips. Lane provisioning now inserts only the
+  rows that are missing.
+- **The 0.6.9 → 0.6.10 → 0.6.9 journey is a release gate.** A new CI job,
+  `patch_upgrade_rehearsal_test` on PostgreSQL 17 and 18, installs with the
+  released 0.6.9 CLI, runs the released 0.6.9 Python worker as a separate
+  runtime role in a custom queue-storage schema, patches under that traffic
+  (no Awa table locks, sequence positions kept, routing unchanged), runs both
+  versions together through worker kills, retries and scheduled jobs, rolls
+  back to 0.6.9, tightens privileges, and accounts for every job.
+
 ## [0.6.9] — 2026-09-14
 
 Patch release: widens the OpenTelemetry dependency range so `awa-metrics` unifies with a consumer's existing provider. No schema change, no migration, and no public API change.

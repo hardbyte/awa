@@ -17,7 +17,7 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12058,6 +12058,238 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
     client.shutdown(Duration::from_secs(1)).await;
 }
 
+/// The dashboard's reads must not read `queue_state_counts`, which queue
+/// storage never maintains, nor expand every retained completion: completions
+/// are counted from batch sizes, the timeseries reads only batches finalised
+/// within its window, and `available` stays exact past a tombstoned ready
+/// row, which the sequence-head signal would still count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_overview_counts";
+    let schema = "awa_qs_overview_counts";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    // A row left behind by the canonical engine before the cutover.
+    sqlx::query(
+        "INSERT INTO awa.queue_state_counts (queue, available, completed) VALUES ($1, 999, 999) \
+         ON CONFLICT (queue) DO UPDATE SET available = 999, completed = 999",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed a stale queue_state_counts row");
+
+    let mut completed = Vec::new();
+    for i in 0..5 {
+        completed.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: i },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+    for job_id in &completed {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    client.shutdown(Duration::from_secs(5)).await;
+    let batched: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(completed_count), 0)::bigint \
+         FROM {schema}.receipt_completion_batches WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read completion batches");
+    assert!(
+        batched > 0,
+        "completions should take the compact batch path"
+    );
+
+    let mut waiting = Vec::new();
+    for i in 5..8 {
+        waiting.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: i },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    awa::model::admin::cancel(&pool, waiting[0])
+        .await
+        .expect("cancel an available job");
+
+    // A deleted completion leaves its batch as it was, with a tombstone.
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(completed[0])
+        .execute(&pool)
+        .await
+        .expect("delete a completed job");
+
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.completed_last_hour, 4);
+    assert_eq!(overview.available, 2, "the cancelled job is not available");
+    assert_eq!(overview.total_queued, 2);
+    assert_eq!(overview.running, 0);
+
+    // The dashboard's other two reads, over the same jobs.
+    let counts = admin::state_counts(&pool)
+        .await
+        .expect("read queue-storage state counts");
+    assert_eq!(counts.get(&JobState::Completed).copied(), Some(4));
+    assert_eq!(counts.get(&JobState::Available).copied(), Some(2));
+    assert_eq!(counts.get(&JobState::Cancelled).copied(), Some(1));
+
+    let mut by_state: HashMap<JobState, i64> = HashMap::new();
+    for bucket in admin::state_timeseries(&pool, 60)
+        .await
+        .expect("read queue-storage state timeseries")
+    {
+        *by_state.entry(bucket.state).or_default() += bucket.count;
+    }
+    assert_eq!(
+        by_state,
+        HashMap::from([
+            (JobState::Completed, 4),
+            (JobState::Available, 2),
+            (JobState::Cancelled, 1),
+        ])
+    );
+    // A window that ends before these jobs were created holds none of them.
+    sqlx::query(&format!(
+        "UPDATE {schema}.receipt_completion_batches SET finalized_at = now() - interval '2 hours'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("age the completion batches");
+    let recent_completed: i64 = admin::state_timeseries(&pool, 60)
+        .await
+        .expect("read queue-storage state timeseries")
+        .into_iter()
+        .filter(|bucket| bucket.state == JobState::Completed)
+        .map(|bucket| bucket.count)
+        .sum();
+    assert_eq!(
+        recent_completed, 0,
+        "a job finalised before the window began cannot have been created in it"
+    );
+
+    // Deleting a completion from before the last hour leaves the last hour's
+    // count alone, though the tombstone is recent.
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(completed[1])
+        .execute(&pool)
+        .await
+        .expect("delete an old completed job");
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.completed_last_hour, 0);
+    let counts = admin::state_counts(&pool)
+        .await
+        .expect("read queue-storage state counts");
+    assert_eq!(counts.get(&JobState::Completed).copied(), Some(3));
+}
+
+/// Queue lag is the age of the oldest available job, wherever it sits in its
+/// lane. A queue move appends the job with its original `run_at` behind newer
+/// jobs, as priority aging does, so the lane's first row need not be the
+/// oldest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_queue_overview_lag_is_the_oldest_available_job() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_overview_lag";
+    let source = "qs_overview_lag_source";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_overview_lag".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let older = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: source.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    // An available job that has waited an hour.
+    sqlx::query(
+        "UPDATE awa_qs_overview_lag.ready_entries SET run_at = run_at - interval '1 hour' \
+         WHERE job_id = $1",
+    )
+    .bind(older)
+    .execute(&pool)
+    .await
+    .expect("age the source job");
+    assert!(store
+        .move_queue(&pool, older, queue, None)
+        .await
+        .expect("move the older job"));
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.available, 2);
+    let lag = overview.lag_seconds.expect("an available job has a lag");
+    assert!(
+        lag > 3_500.0,
+        "lag should be the moved job's hour, not the newer job's age: {lag}"
+    );
+}
+
 /// `ordering_key` pins a job to a deterministic shard based on a
 /// portable hash of the key bytes. Producers can use it to keep jobs
 /// for the same logical partition (customer, order, account) on the
@@ -12429,4 +12661,515 @@ async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
     );
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct UniqueCancelJob {
+    key: String,
+}
+
+fn unique_cancel_job(key: &str) -> UniqueCancelJob {
+    UniqueCancelJob { key: key.into() }
+}
+
+fn unique_cancel_opts(queue: &str, run_at: Option<DateTime<Utc>>) -> InsertOpts {
+    InsertOpts {
+        queue: queue.into(),
+        run_at,
+        unique: Some(UniqueOpts {
+            by_queue: true,
+            by_args: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn unique_cancel_store_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    }
+}
+
+async fn cancel_unique(pool: &sqlx::PgPool, queue: Option<&str>, key: &str) -> Option<JobRow> {
+    admin::cancel_by_unique_key(
+        pool,
+        UniqueCancelJob::kind(),
+        queue,
+        Some(&serde_json::to_value(unique_cancel_job(key)).unwrap()),
+        None,
+    )
+    .await
+    .expect("cancel by unique key")
+}
+
+/// `cancel_by_unique_key` finds a job in every live state on queue storage:
+/// scheduled, available, running on a receipt claim, and waiting on a
+/// callback. When two live jobs share a key, the oldest is cancelled first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_finds_each_live_state() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_cancel_by_key";
+    let store =
+        create_store_with_config(&pool, unique_cancel_store_config("awa_qs_cancel_by_key")).await;
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("running"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the running job");
+    assert_eq!(claimed[0].job.id, running);
+
+    let waiting = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("waiting"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the waiting job");
+    assert_eq!(claimed[0].job.id, waiting);
+    let callback_id = store
+        .register_callback(
+            &pool,
+            waiting,
+            claimed[0].job.run_lease,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("register the callback");
+    assert!(store
+        .enter_callback_wait(&pool, waiting, claimed[0].job.run_lease, callback_id)
+        .await
+        .expect("enter the callback wait"));
+    assert_eq!(
+        admin::get_job(&pool, waiting).await.unwrap().state,
+        JobState::WaitingExternal
+    );
+    // Two live jobs sharing a key: uniqueness enforced only among failed jobs.
+    let shared_opts = || InsertOpts {
+        unique: Some(UniqueOpts {
+            by_queue: true,
+            by_args: true,
+            states: 1 << JobState::Failed.bit_position(),
+            ..Default::default()
+        }),
+        ..unique_cancel_opts(queue, None)
+    };
+    let shared_older =
+        enqueue_job(&pool, &store, &unique_cancel_job("shared"), shared_opts()).await;
+    let shared_newer =
+        enqueue_job(&pool, &store, &unique_cancel_job("shared"), shared_opts()).await;
+
+    let available = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("available"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let scheduled = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("scheduled"),
+        unique_cancel_opts(queue, Some(Utc::now() + chrono::Duration::hours(1))),
+    )
+    .await;
+
+    assert!(cancel_unique(&pool, Some(queue), "absent").await.is_none());
+    for (key, job_id) in [
+        ("scheduled", scheduled),
+        ("available", available),
+        ("running", running),
+        ("waiting", waiting),
+        ("shared", shared_older),
+    ] {
+        let cancelled = cancel_unique(&pool, Some(queue), key)
+            .await
+            .unwrap_or_else(|| panic!("a {key} job should be found"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+        assert_eq!(
+            admin::get_job(&pool, job_id).await.unwrap().state,
+            JobState::Cancelled,
+            "{key}"
+        );
+    }
+    assert_eq!(
+        admin::get_job(&pool, shared_newer).await.unwrap().state,
+        JobState::Available,
+        "only the oldest job holding the key is cancelled"
+    );
+    assert!(
+        cancel_unique(&pool, None, "shared").await.is_none(),
+        "the key includes the queue, so a lookup without it matches nothing"
+    );
+    assert_eq!(
+        cancel_unique(&pool, Some(queue), "shared")
+            .await
+            .map(|job| job.id),
+        Some(shared_newer),
+        "the next lookup finds the newer job"
+    );
+}
+
+/// A striped queue's jobs live in `queue#N` lanes. The admin store's default
+/// stripe count is 1, so a lookup by the logical queue name must find the
+/// stripes from the lanes the schema holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_finds_striped_lanes() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_cancel_by_key_striped";
+    let schema = "awa_qs_cancel_by_key_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            queue_stripe_count: 2,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("running"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the running job");
+    assert_eq!(claimed[0].job.id, running);
+    let available = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("available"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let scheduled = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("scheduled"),
+        unique_cancel_opts(queue, Some(Utc::now() + chrono::Duration::hours(1))),
+    )
+    .await;
+    let unstriped: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.ready_entries WHERE queue NOT LIKE $1"
+    ))
+    .bind(format!("{queue}#%"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unstriped, 0, "every ready row is in a stripe lane");
+
+    for (key, job_id) in [
+        ("scheduled", scheduled),
+        ("available", available),
+        ("running", running),
+    ] {
+        let cancelled = cancel_unique(&pool, Some(queue), key)
+            .await
+            .unwrap_or_else(|| panic!("a striped {key} job should be found"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+    }
+}
+
+/// A job moved to another queue while available keeps the key its original
+/// queue gave it. Once it runs or waits in the new queue, a lookup naming
+/// the original queue still finds it, through its retained ready row there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_finds_a_moved_running_job() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let origin = "qs_cancel_by_key_origin";
+    let target = "qs_cancel_by_key_target";
+    let store = create_store_with_config(
+        &pool,
+        unique_cancel_store_config("awa_qs_cancel_by_key_moved"),
+    )
+    .await;
+
+    let running = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved-running"),
+        unique_cancel_opts(origin, None),
+    )
+    .await;
+    let waiting = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved-waiting"),
+        unique_cancel_opts(origin, None),
+    )
+    .await;
+    for job_id in [running, waiting] {
+        assert!(store.move_queue(&pool, job_id, target, None).await.unwrap());
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, target, 2, Duration::from_secs(300))
+        .await
+        .expect("claim the moved jobs");
+    assert_eq!(claimed.len(), 2);
+    let waiting_claim = claimed
+        .iter()
+        .find(|claim| claim.job.id == waiting)
+        .expect("waiting job claimed");
+    let callback_id = store
+        .register_callback(
+            &pool,
+            waiting,
+            waiting_claim.job.run_lease,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("register the callback");
+    assert!(store
+        .enter_callback_wait(&pool, waiting, waiting_claim.job.run_lease, callback_id)
+        .await
+        .expect("enter the callback wait"));
+
+    for (key, job_id) in [("moved-running", running), ("moved-waiting", waiting)] {
+        let cancelled = cancel_unique(&pool, Some(origin), key)
+            .await
+            .unwrap_or_else(|| panic!("the {key} job should be found by its original queue"));
+        assert_eq!(cancelled.id, job_id, "{key}");
+    }
+}
+
+/// The transaction variant cancels only when the caller commits, and a
+/// running job's cancellation notice is sent on commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_tx_follows_the_callers_transaction() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_cancel_by_key_tx";
+    let store =
+        create_store_with_config(&pool, unique_cancel_store_config("awa_qs_cancel_by_key_tx"))
+            .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("tx"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim the job");
+    let args = serde_json::to_value(unique_cancel_job("tx")).unwrap();
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener.listen("awa:cancel").await.expect("listen");
+
+    let mut tx = pool.begin().await.unwrap();
+    let cancelled = admin::cancel_by_unique_key_tx(
+        &mut tx,
+        UniqueCancelJob::kind(),
+        Some(queue),
+        Some(&args),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.map(|job| job.id), Some(job_id));
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        admin::get_job(&pool, job_id).await.unwrap().state,
+        JobState::Running,
+        "a rolled-back cancel leaves the job running"
+    );
+
+    let mut tx = pool.begin().await.unwrap();
+    admin::cancel_by_unique_key_tx(
+        &mut tx,
+        UniqueCancelJob::kind(),
+        Some(queue),
+        Some(&args),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the job is still found");
+    tx.commit().await.unwrap();
+    let notice = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notice = listener.recv().await.expect("receive notification");
+            let payload: serde_json::Value = serde_json::from_str(notice.payload()).unwrap();
+            if payload["job_id"] == job_id {
+                return payload;
+            }
+        }
+    })
+    .await
+    .expect("the cancellation notice arrives after commit");
+    assert_eq!(notice["job_id"], job_id);
+    assert_eq!(
+        admin::get_job(&pool, job_id).await.unwrap().state,
+        JobState::Cancelled
+    );
+}
+
+/// Rows the lookup reads on one connection, from that backend's statistics.
+async fn unique_key_lookup_rows(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    queue: Option<&str>,
+    key: &str,
+) -> i64 {
+    async fn rows_read(conn: &mut sqlx::PgConnection, schema: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COALESCE(sum(COALESCE(seq_tup_read, 0) + COALESCE(idx_tup_fetch, 0)), 0)::bigint \
+             FROM pg_stat_user_tables WHERE schemaname = $1",
+        )
+        .bind(schema)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    }
+    let before = rows_read(conn, schema).await;
+    let found = admin::cancel_by_unique_key_tx(
+        &mut *conn,
+        UniqueCancelJob::kind(),
+        queue,
+        Some(&serde_json::to_value(unique_cancel_job(key)).unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(found.is_none());
+    sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1").execute(&mut *conn).await.unwrap();
+    rows_read(conn, schema).await - before
+}
+
+/// A unique-key lookup reads the live work, not retained history: rows
+/// read stay flat as completed jobs accumulate, and with a queue they stay
+/// flat as other queues' backlogs grow and as the claim ring retains more
+/// claims, which a long-running job elsewhere can keep from pruning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_cancel_by_key_cost";
+    let queue = "qs_cancel_by_key_cost";
+    let other = "qs_cancel_by_key_cost_other";
+    let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    // A finished job still holding a key: its retained ready row sends a
+    // lookup for that key through the full scoped query.
+    let finished = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("finished"),
+        unique_cancel_opts(queue, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed[0].job.id, finished);
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+    store.enqueue_batch(&pool, queue, 2, 200).await.unwrap();
+
+    let complete = |count: i64| {
+        let (pool, store) = (pool.clone(), &store);
+        async move {
+            let mut remaining = count;
+            while remaining > 0 {
+                let n = remaining.min(500);
+                store.enqueue_batch(&pool, other, 2, n).await.unwrap();
+                let claims = store
+                    .claim_runtime_batch(&pool, other, n, Duration::ZERO)
+                    .await
+                    .unwrap();
+                store.complete_runtime_batch(&pool, &claims).await.unwrap();
+                remaining -= n;
+            }
+            for _ in 0..=store.claim_slot_count() {
+                store.rotate_claims(&pool).await.unwrap();
+                store.prune_oldest_claims(&pool).await.unwrap();
+            }
+        }
+    };
+    complete(500).await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql("SET max_parallel_workers_per_gather = 0; SET stats_fetch_consistency = 'none'")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
+    let scoped = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    let unscoped = unique_key_lookup_rows(&mut conn, schema, None, "absent").await;
+
+    // Ten times the retained history.
+    complete(4_500).await;
+    sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
+    let flat = |before: i64| before + before / 2 + 64;
+    let scoped_history = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    let unscoped_history = unique_key_lookup_rows(&mut conn, schema, None, "absent").await;
+    assert!(
+        scoped_history <= flat(scoped),
+        "scoped lookup read {scoped} rows, then {scoped_history} with more history"
+    );
+    assert!(
+        unscoped_history <= flat(unscoped),
+        "unscoped lookup read {unscoped} rows, then {unscoped_history} with more history"
+    );
+
+    // Another queue's backlog: a lookup given its queue doesn't read it.
+    for _ in 0..10 {
+        store.enqueue_batch(&pool, other, 2, 500).await.unwrap();
+    }
+    sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
+    let scoped_backlog = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    assert!(
+        scoped_backlog <= flat(scoped),
+        "scoped lookup read {scoped} rows, then {scoped_backlog} beside another queue's backlog"
+    );
+
+    // Claims retained without pruning: a scoped lookup reads none of them.
+    // A deadline makes them row-local claims, as jobs with a deadline get.
+    let scoped_finished = unique_key_lookup_rows(&mut conn, schema, Some(queue), "finished").await;
+    let mut retained = 0;
+    while retained < 5_000 {
+        let claims = store
+            .claim_runtime_batch(&pool, other, 500, Duration::from_secs(300))
+            .await
+            .unwrap();
+        store.complete_runtime_batch(&pool, &claims).await.unwrap();
+        retained += 500;
+    }
+    sqlx::query("ANALYZE").execute(&mut *conn).await.unwrap();
+    let scoped_claims = unique_key_lookup_rows(&mut conn, schema, Some(queue), "absent").await;
+    let scoped_finished_claims =
+        unique_key_lookup_rows(&mut conn, schema, Some(queue), "finished").await;
+    assert!(
+        scoped_claims <= flat(scoped),
+        "scoped lookup read {scoped} rows, then {scoped_claims} with retained claims"
+    );
+    assert!(
+        scoped_finished_claims <= flat(scoped_finished),
+        "scoped lookup of a finished job's key read {scoped_finished} rows, then \
+         {scoped_finished_claims} with retained claims"
+    );
 }

@@ -392,6 +392,378 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
     )
 }
 
+/// Each queue's available rows, exactly, and the oldest of them, as
+/// `(queue, available, oldest_run_at)`.
+///
+/// Each lane's unclaimed rows are found the way a claim finds them: through
+/// `ready_segments` from the lane's claim cursor, then along the ready
+/// primary key within each segment's ring slot. The ready key leads with the
+/// ring slot, so a lane range without it cannot use the index and would scan
+/// every retained ready row. The cost follows the backlog.
+///
+/// `oldest_run_at` is the earliest `run_at` among those rows, not the first
+/// row's: a queue move or priority aging appends an older job behind newer
+/// ones.
+fn queue_storage_available_by_queue_sql(schema: &str) -> String {
+    format!(
+        r#"
+        SELECT
+            heads.queue,
+            COALESCE(sum(lane.available), 0)::bigint AS available,
+            min(lane.oldest_run_at) AS oldest_run_at
+        FROM (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+        ) AS heads
+        CROSS JOIN LATERAL (
+            {lane_rows}
+        ) AS lane
+        GROUP BY heads.queue
+        "#,
+        lane_rows = queue_storage_available_lane_rows_sql(
+            schema,
+            "heads",
+            "count(*)::bigint AS available, min(ready.run_at) AS oldest_run_at",
+            "TRUE",
+        ),
+    )
+}
+
+/// A `SELECT {columns} FROM ready_segments JOIN ready_entries` over the
+/// unclaimed, untombstoned rows of the lane in `heads` (which must carry
+/// `queue`, `priority`, `enqueue_shard`, `claim_seq` and `next_seq`) that
+/// satisfy `condition` on `ready`. See [`queue_storage_available_by_queue_sql`] for why it
+/// walks segments.
+fn queue_storage_available_lane_rows_sql(
+    schema: &str,
+    heads: &str,
+    columns: &str,
+    condition: &str,
+) -> String {
+    format!(
+        r#"
+            SELECT {columns}
+            FROM (
+                -- The lane's segments from its claim cursor, in lane order
+                -- along the lane index. Without the order the planner can
+                -- prefer walking every segment by ring slot.
+                SELECT
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    GREATEST(segment.first_lane_seq, {heads}.claim_seq) AS from_seq,
+                    LEAST(segment.next_lane_seq, {heads}.next_seq) AS to_seq
+                FROM {schema}.ready_segments AS segment
+                WHERE segment.queue = {heads}.queue
+                  AND segment.priority = {heads}.priority
+                  AND segment.enqueue_shard = {heads}.enqueue_shard
+                  AND segment.next_lane_seq > {heads}.claim_seq
+                  AND segment.first_lane_seq < {heads}.next_seq
+                ORDER BY segment.next_lane_seq
+            ) AS segment
+            -- Each segment's rows along the ready key within its ring slot.
+            -- OFFSET 0 keeps this a per-segment probe: flattened into a
+            -- join, a filter such as a creation bound can lead the planner
+            -- to scan every retained ready row and match segments after.
+            CROSS JOIN LATERAL (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = segment.ready_slot
+                  AND ready.ready_generation = segment.ready_generation
+                  AND ready.queue = {heads}.queue
+                  AND ready.priority = {heads}.priority
+                  AND ready.enqueue_shard = {heads}.enqueue_shard
+                  AND ready.lane_seq >= segment.from_seq
+                  AND ready.lane_seq < segment.to_seq
+                OFFSET 0
+            ) AS ready
+            WHERE ({condition})
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+              )
+        "#
+    )
+}
+
+/// Per-queue counts for the admin queue views, ending in a `signals` CTE.
+/// They come from the live-work tables the worker queue gauges read, never
+/// from `terminal_jobs`, whose completion batches expand and join back to
+/// `ready_entries`: the cost follows live work rather than retained history.
+/// `available` is exact, and `completed_last_hour` comes from completion-batch
+/// sizes and completed `done_entries` rows.
+fn queue_storage_signals_cte(schema: &str) -> String {
+    format!(
+        r#"
+        WITH head_signal AS (
+            SELECT
+                enqueues.queue,
+                enqueues.priority,
+                enqueues.enqueue_shard,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq
+            FROM {schema}.queue_enqueue_heads AS enqueues
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = enqueues.queue
+             AND claims.priority = enqueues.priority
+             AND claims.enqueue_shard = enqueues.enqueue_shard
+        ),
+        queues AS (
+            SELECT DISTINCT queue
+            FROM (
+                SELECT queue FROM awa.queue_meta
+                UNION ALL
+                SELECT queue FROM head_signal
+                UNION ALL
+                SELECT queue FROM {schema}.leases
+                UNION ALL
+                SELECT queue FROM {schema}.deferred_jobs
+                UNION ALL
+                SELECT queue FROM {schema}.queue_terminal_live_counts
+                UNION ALL
+                SELECT queue FROM {schema}.queue_terminal_rollups
+                UNION ALL
+                SELECT queue FROM {schema}.dlq_entries
+            ) queues
+        ),
+        ready AS (
+            {available}
+        ),
+        lag AS (
+            -- The oldest available job, as before queue storage: it reads the
+            -- same backlog rows the exact count already reads.
+            SELECT
+                queue,
+                EXTRACT(EPOCH FROM clock_timestamp() - oldest_run_at)::double precision
+                    AS lag_seconds
+            FROM ready
+            WHERE oldest_run_at IS NOT NULL
+        ),
+        leases AS (
+            SELECT
+                queue,
+                count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_external
+            FROM {schema}.leases
+            GROUP BY queue
+        ),
+        deferred AS (
+            SELECT
+                queue,
+                count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
+                count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+            FROM {schema}.deferred_jobs
+            GROUP BY queue
+        ),
+        terminal AS (
+            SELECT queue, count(*)::bigint AS failed_done
+            FROM {schema}.done_entries
+            WHERE state = 'failed'
+            GROUP BY queue
+        ),
+        dlq AS (
+            SELECT queue, count(*)::bigint AS failed_dlq
+            FROM {schema}.dlq_entries
+            GROUP BY queue
+        ),
+        completed_recent AS (
+            WITH recent_tombstones AS MATERIALIZED (
+                SELECT ready_slot, ready_generation, queue, priority, enqueue_shard,
+                       job_id, run_lease
+                FROM {schema}.receipt_completion_tombstones
+                WHERE deleted_at > clock_timestamp() - interval '1 hour'
+            ),
+            -- Recent batches in a lane with a recent tombstone: the only ones
+            -- whose members need reading. Selected before expanding any
+            -- member array, so retained batches are never expanded.
+            tombstoned_batches AS MATERIALIZED (
+                SELECT batch.queue, batch.ready_slot, batch.job_ids, batch.run_leases
+                FROM {schema}.receipt_completion_batches AS batch
+                WHERE batch.finalized_at > clock_timestamp() - interval '1 hour'
+                  AND EXISTS (
+                      SELECT 1 FROM recent_tombstones AS tomb
+                      WHERE tomb.ready_slot = batch.ready_slot
+                        AND tomb.ready_generation = batch.ready_generation
+                        AND tomb.queue = batch.queue
+                        AND tomb.priority = batch.priority
+                        AND tomb.enqueue_shard = batch.enqueue_shard
+                  )
+            )
+            SELECT queue, sum(completed)::bigint AS completed_last_hour
+            FROM (
+                -- A batch carries its queue and size, so it is counted
+                -- without unnesting its members.
+                SELECT queue, completed_count::bigint AS completed
+                FROM {schema}.receipt_completion_batches
+                WHERE finalized_at > clock_timestamp() - interval '1 hour'
+                UNION ALL
+                -- Less its members deleted or retried since, as
+                -- `terminal_jobs` drops them. A tombstone on a member
+                -- finalised within the hour is itself newer than that. Each
+                -- tombstoned batch is expanded once and its members matched by
+                -- hash, so the work follows the last hour's completions and
+                -- deletions, never one batch scan per tombstone.
+                SELECT batch.queue, -1::bigint
+                FROM tombstoned_batches AS batch
+                CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases)
+                    AS member(job_id, run_lease)
+                JOIN recent_tombstones AS tomb
+                  ON tomb.ready_slot = batch.ready_slot
+                 AND tomb.job_id = member.job_id
+                 AND tomb.run_lease = member.run_lease
+                UNION ALL
+                SELECT queue, 1::bigint
+                FROM {schema}.done_entries
+                WHERE state = 'completed'
+                  AND finalized_at > clock_timestamp() - interval '1 hour'
+            ) AS recent
+            GROUP BY queue
+        ),
+        signals AS (
+            SELECT
+                queues.queue,
+                COALESCE(ready.available, 0)::bigint AS available,
+                COALESCE(leases.running, 0)::bigint AS running,
+                COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
+                COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
+                COALESCE(deferred.retryable, 0)::bigint AS retryable,
+                (COALESCE(terminal.failed_done, 0) + COALESCE(dlq.failed_dlq, 0))::bigint AS failed,
+                lag.lag_seconds,
+                COALESCE(completed_recent.completed_last_hour, 0)::bigint AS completed_last_hour
+            FROM queues
+            LEFT JOIN ready ON ready.queue = queues.queue
+            LEFT JOIN lag ON lag.queue = queues.queue
+            LEFT JOIN leases ON leases.queue = queues.queue
+            LEFT JOIN deferred ON deferred.queue = queues.queue
+            LEFT JOIN terminal ON terminal.queue = queues.queue
+            LEFT JOIN dlq ON dlq.queue = queues.queue
+            LEFT JOIN completed_recent ON completed_recent.queue = queues.queue
+        )
+        "#,
+        available = queue_storage_available_by_queue_sql(schema),
+    )
+}
+
+/// Jobs created at or after `since` (a bind such as `$1`), each in its
+/// current state, as a `recent_jobs` CTE of `created_at` and `state`.
+///
+/// It selects what `current_jobs` would with the same bound, but bounds each
+/// source before any join: available rows are read per lane from its claim
+/// cursor through its segments, and terminal rows only from done rows and completion batches
+/// finalised since `since`, as a job finishes after it is created. `since`
+/// must be a bind rather than an expression such as `clock_timestamp()`,
+/// which Postgres can't push into a bound on `finalized_at`.
+fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
+    let available = queue_storage_available_lane_rows_sql(
+        schema,
+        "head_signal",
+        "ready.created_at",
+        &format!("ready.created_at >= {since}"),
+    );
+    format!(
+        r#"
+        WITH head_signal AS (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+        ),
+        recent_jobs AS (
+            SELECT ready.created_at, 'available'::awa.job_state AS state
+            FROM head_signal
+            CROSS JOIN LATERAL (
+                {available}
+            ) AS ready
+            UNION ALL
+            SELECT created_at, state
+            FROM {schema}.deferred_jobs
+            WHERE created_at >= {since}
+            UNION ALL
+            SELECT ready.created_at, leases.state
+            FROM {schema}.leases AS leases
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = leases.ready_slot
+             AND ready.ready_generation = leases.ready_generation
+             AND ready.queue = leases.queue
+             AND ready.priority = leases.priority
+             AND ready.enqueue_shard = leases.enqueue_shard
+             AND ready.lane_seq = leases.lane_seq
+            WHERE ready.created_at >= {since}
+            UNION ALL
+            -- What `terminal_jobs` holds, bounded the same way, with each
+            -- row's creation time probed along the ready key. Read through
+            -- the view, Postgres joins the window's members to a scan of
+            -- every retained ready row.
+            SELECT COALESCE(done.created_at, ready.created_at, done.finalized_at), done.state
+            FROM {schema}.done_entries AS done
+            LEFT JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = done.ready_slot
+                  AND ready.ready_generation = done.ready_generation
+                  AND ready.queue = done.queue
+                  AND ready.priority = done.priority
+                  AND ready.enqueue_shard = done.enqueue_shard
+                  AND ready.lane_seq = done.lane_seq
+                OFFSET 0
+            ) AS ready ON TRUE
+            WHERE done.finalized_at >= {since}
+              AND COALESCE(done.created_at, ready.created_at, done.finalized_at) >= {since}
+            UNION ALL
+            SELECT ready.created_at, 'completed'::awa.job_state
+            FROM {schema}.receipt_completion_batches AS batch
+            CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases, batch.lane_seqs)
+                AS item(job_id, run_lease, lane_seq)
+            CROSS JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = batch.ready_slot
+                  AND ready.ready_generation = batch.ready_generation
+                  AND ready.queue = batch.queue
+                  AND ready.priority = batch.priority
+                  AND ready.enqueue_shard = batch.enqueue_shard
+                  AND ready.lane_seq = item.lane_seq
+                  AND ready.job_id = item.job_id
+                OFFSET 0
+            ) AS ready
+            WHERE batch.finalized_at >= {since}
+              AND ready.created_at >= {since}
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
+                  WHERE tomb.ready_slot = batch.ready_slot
+                    AND tomb.ready_generation = batch.ready_generation
+                    AND tomb.job_id = item.job_id
+                    AND tomb.run_lease = item.run_lease
+              )
+            UNION ALL
+            SELECT created_at, 'failed'::awa.job_state
+            FROM {schema}.dlq_entries
+            WHERE created_at >= {since}
+        )
+        "#
+    )
+}
+
 async fn notify_cancellation_tx<'a>(
     tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     job_id: i64,
@@ -658,34 +1030,92 @@ async fn cancel_in_tx<'a>(
     Ok(Some(job))
 }
 
-/// Queue-storage candidate lookup for a unique key. Shared by
-/// [`cancel_by_unique_key`] and [`cancel_by_unique_key_tx`] so the two cannot
-/// drift.
-fn unique_key_candidate_sql(schema: &str) -> String {
+/// Queue-storage candidate lookup for a unique key: the oldest nonterminal
+/// job holding key `$1`. Shared by [`cancel_by_unique_key`] and
+/// [`cancel_by_unique_key_tx`] so the two cannot drift.
+///
+/// Each source is filtered by the key where it is read, so a missing key
+/// costs no more than reading the live work:
+/// - available rows are walked lane by lane through `ready_segments` from the
+///   claim cursor, the way a claim finds them, and probed along the ready key
+///   within each segment's ring slot. The ready key leads with the ring slot,
+///   so a lane range without it scans every retained ready row, completed
+///   jobs included;
+/// - scheduled and retryable rows use the `deferred_jobs` unique-key index;
+/// - running and waiting jobs are read from `leases` and from open receipt
+///   claims that have not been materialised into `leases`.
+///
+/// Without a queue, the open receipt claims are read in full before the key
+/// filter, so this lookup costs what the claim ring retains. With `scoped`
+/// see [`scoped_unique_key_candidate_sql`], which starts from the key.
+fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
+    if scoped {
+        return scoped_unique_key_candidate_sql(schema);
+    }
+    let heads_scope = if scoped {
+        "WHERE claims.queue = ANY($2)"
+    } else {
+        ""
+    };
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     format!(
         r#"
-        WITH current_available AS (
-            SELECT ready.job_id, ready.unique_key
-            FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = ready.queue
-             AND claims.priority = ready.priority
-             AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-                    AND tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-              )
+        WITH heads AS (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+            {heads_scope}
         ),
         candidates AS (
-            SELECT job_id
-            FROM current_available
-            WHERE unique_key = $1
+            SELECT ready.job_id
+            FROM heads
+            CROSS JOIN LATERAL (
+                SELECT
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    GREATEST(segment.first_lane_seq, heads.claim_seq) AS from_seq,
+                    LEAST(segment.next_lane_seq, heads.next_seq) AS to_seq
+                FROM {schema}.ready_segments AS segment
+                WHERE segment.queue = heads.queue
+                  AND segment.priority = heads.priority
+                  AND segment.enqueue_shard = heads.enqueue_shard
+                  AND segment.next_lane_seq > heads.claim_seq
+                  AND segment.first_lane_seq < heads.next_seq
+                ORDER BY segment.next_lane_seq
+            ) AS segment
+            -- OFFSET 0 keeps this a per-segment probe along the ready key;
+            -- flattened, the key filter can lead the planner to scan every
+            -- retained ready row instead.
+            CROSS JOIN LATERAL (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = segment.ready_slot
+                  AND ready.ready_generation = segment.ready_generation
+                  AND ready.queue = heads.queue
+                  AND ready.priority = heads.priority
+                  AND ready.enqueue_shard = heads.enqueue_shard
+                  AND ready.lane_seq >= segment.from_seq
+                  AND ready.lane_seq < segment.to_seq
+                  AND ready.unique_key = $1
+                OFFSET 0
+            ) AS ready
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                WHERE tomb.ready_slot = ready.ready_slot
+                  AND tomb.ready_generation = ready.ready_generation
+                  AND tomb.queue = ready.queue
+                  AND tomb.priority = ready.priority
+                  AND tomb.enqueue_shard = ready.enqueue_shard
+                  AND tomb.lane_seq = ready.lane_seq
+            )
             UNION ALL
             SELECT job_id
             FROM {schema}.deferred_jobs
@@ -695,22 +1125,185 @@ fn unique_key_candidate_sql(schema: &str) -> String {
             -- reach it through the lease's lane identity.
             SELECT leases.job_id
             FROM {schema}.leases AS leases
-            JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = leases.ready_slot
-             AND ready.ready_generation = leases.ready_generation
-             AND ready.queue = leases.queue
-             AND ready.priority = leases.priority
-             AND ready.enqueue_shard = leases.enqueue_shard
-             AND ready.lane_seq = leases.lane_seq
-            WHERE ready.unique_key = $1
+            JOIN LATERAL (
+                SELECT 1
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = leases.ready_slot
+                  AND ready.ready_generation = leases.ready_generation
+                  AND ready.queue = leases.queue
+                  AND ready.priority = leases.priority
+                  AND ready.enqueue_shard = leases.enqueue_shard
+                  AND ready.lane_seq = leases.lane_seq
+                  AND ready.unique_key = $1
+                OFFSET 0
+            ) AS ready ON TRUE
+            UNION ALL
+            -- Running receipt claims not yet materialised into `leases`.
+            -- This leg reads the claims still in the claim ring (closed claim
+            -- batches are skipped whole) before the key filter, so its cost
+            -- follows claim-ring retention, not completed-job history.
+            SELECT open_claims.job_id
+            FROM ({open_running}) AS open_claims
+            JOIN LATERAL (
+                SELECT 1
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                  AND ready.unique_key = $1
+                LIMIT 1
+            ) AS ready ON TRUE
         )
         SELECT job_id
         FROM candidates
         ORDER BY job_id ASC
         LIMIT 1
-        "#,
-        schema = schema
+        "#
     )
+}
+
+/// The queue-scoped candidate lookup: starts from the queue's ready rows that
+/// hold the key, read through the lane index, then keeps the ones still live.
+/// Its cost follows that queue's retained rows, not other queues' backlogs or
+/// the claim ring, which a large backlog elsewhere can keep from pruning.
+///
+/// - available: at or past the lane's claim cursor and not tombstoned;
+/// - scheduled and retryable: the `deferred_jobs` unique-key index;
+/// - running or waiting: in `leases` or on an open receipt claim, both
+///   checked by `job_id` for just these jobs.
+///
+/// `$2` holds the physical queues of the logical queue.
+fn scoped_unique_key_candidate_sql(schema: &str) -> String {
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql_for(
+        schema,
+        Some("ARRAY(SELECT keyed.job_id FROM keyed)"),
+    );
+    format!(
+        r#"
+        WITH keyed AS MATERIALIZED (
+            SELECT
+                ready.job_id,
+                ready.ready_slot,
+                ready.ready_generation,
+                ready.queue,
+                ready.priority,
+                ready.enqueue_shard,
+                ready.lane_seq
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.queue = ANY($2)
+              AND ready.unique_key = $1
+        ),
+        candidates AS (
+            SELECT keyed.job_id
+            FROM keyed
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = keyed.queue
+             AND claims.priority = keyed.priority
+             AND claims.enqueue_shard = keyed.enqueue_shard
+            WHERE keyed.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = keyed.ready_slot
+                    AND tomb.ready_generation = keyed.ready_generation
+                    AND tomb.queue = keyed.queue
+                    AND tomb.priority = keyed.priority
+                    AND tomb.enqueue_shard = keyed.enqueue_shard
+                    AND tomb.lane_seq = keyed.lane_seq
+              )
+            UNION ALL
+            SELECT job_id
+            FROM {schema}.deferred_jobs
+            WHERE unique_key = $1
+            UNION ALL
+            -- By job id rather than lane: a job moved to another queue
+            -- while available is leased on its new lane.
+            SELECT keyed.job_id
+            FROM keyed
+            WHERE EXISTS (
+                SELECT 1 FROM {schema}.leases AS lease
+                WHERE lease.job_id = keyed.job_id
+            )
+            UNION ALL
+            SELECT open_claims.job_id
+            FROM ({open_running}) AS open_claims
+        )
+        SELECT job_id
+        FROM candidates
+        ORDER BY job_id ASC
+        LIMIT 1
+        "#
+    )
+}
+
+/// The physical queues that hold a logical queue's lanes, read from the
+/// schema's `queue_lanes`: the queue itself and its `queue#N` stripes. The
+/// admin store is rebuilt from the schema name alone, so its configured
+/// stripe count is the default, not the one the runtime enqueues with.
+async fn persisted_physical_queues(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    queue: &str,
+) -> Result<Vec<String>, AwaError> {
+    let mut queues: Vec<String> = sqlx::query_scalar(&format!(
+        r#"
+        SELECT DISTINCT lanes.queue
+        FROM {schema}.queue_lanes AS lanes
+        WHERE left(lanes.queue, char_length($1) + 1) = $1 || '#'
+          AND substr(lanes.queue, char_length($1) + 2) ~ '^[0-9]+$'
+        "#
+    ))
+    .bind(queue)
+    .fetch_all(&mut *conn)
+    .await?;
+    queues.push(queue.to_string());
+    Ok(queues)
+}
+
+/// The oldest nonterminal queue-storage job holding `unique_key`.
+///
+/// A queue is part of a key only when it was inserted with `by_queue`, so a
+/// job holding a queue-scoped key was enqueued there: with a queue, its ready
+/// rows are read from that queue alone. A job moved to another queue is
+/// found through its original ready row while that row is retained, except
+/// while it is available in the new queue; cancel it by id otherwise.
+async fn queue_storage_unique_key_candidate(
+    conn: &mut sqlx::PgConnection,
+    store: &QueueStorage,
+    unique_key: &[u8],
+    queue: Option<&str>,
+) -> Result<Option<i64>, AwaError> {
+    let schema = store.schema();
+    let Some(queue) = queue else {
+        let sql = unique_key_candidate_sql(schema, false);
+        return Ok(sqlx::query_scalar(&sql)
+            .bind(unique_key)
+            .fetch_optional(&mut *conn)
+            .await?);
+    };
+    let queues = persisted_physical_queues(&mut *conn, schema, queue).await?;
+    // Available, running and waiting jobs all have a ready row in the queue.
+    // Without one, only a scheduled or retryable job can hold the key, and
+    // the deferred index answers that alone; the full lookup spans enough
+    // partitioned tables that planning it costs several milliseconds.
+    // One statement, so a job promoted from deferred_jobs to a ready row
+    // between the two reads cannot be missed by both.
+    let (has_ready_rows, deferred): (bool, Option<i64>) = sqlx::query_as(&format!(
+        "SELECT EXISTS (SELECT 1 FROM {schema}.ready_entries \
+                        WHERE queue = ANY($2) AND unique_key = $1), \
+                (SELECT job_id FROM {schema}.deferred_jobs WHERE unique_key = $1 \
+                 ORDER BY job_id LIMIT 1)"
+    ))
+    .bind(unique_key)
+    .bind(&queues)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !has_ready_rows {
+        return Ok(deferred);
+    }
+    let sql = unique_key_candidate_sql(schema, true);
+    Ok(sqlx::query_scalar(&sql)
+        .bind(unique_key)
+        .bind(&queues)
+        .fetch_optional(&mut *conn)
+        .await?)
 }
 
 /// Canonical (non queue-storage) candidate lookup for a unique key.
@@ -757,10 +1350,17 @@ const UNIQUE_KEY_CANDIDATE_SQL_CANONICAL: &str = r#"
 /// in-flight cancellation notification. If the selected job completes before
 /// `cancel(...)` locks it, the cancel becomes a no-op and returns `None`.
 ///
-/// The lookup scans `unique_key` on both physical tables without a dedicated
-/// index. This is acceptable for low-volume use cases. For high-volume tables,
-/// consider adding a partial index on `unique_key WHERE unique_key IS NOT NULL`
-/// or routing through `job_unique_claims` (which is already indexed).
+/// On the canonical engine the lookup scans `unique_key` on both physical
+/// tables without a dedicated index. On queue storage, scheduled and
+/// retryable rows are found by their unique-key index. With a `queue`, the
+/// lookup reads that queue's ready rows (and its `queue#N` stripes') through
+/// the lane index, retained ones included, and checks only the rows holding
+/// the key for being available, leased or on an open receipt claim; its cost
+/// follows that queue's own retained rows, not other queues' backlogs.
+/// Without a `queue`, available rows are walked lane by lane from the claim
+/// cursor and open receipt claims are read in full, so the cost follows what
+/// the claim ring retains. A job moved to another queue while available is
+/// not found by a lookup that names its original queue.
 pub async fn cancel_by_unique_key(
     pool: &PgPool,
     kind: &str,
@@ -771,14 +1371,16 @@ pub async fn cancel_by_unique_key(
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
     if let Some(store) = active_queue_storage(pool).await? {
-        let sql = unique_key_candidate_sql(store.schema());
-        let candidate: Option<i64> = sqlx::query_scalar(&sql)
-            .bind(&unique_key)
-            .fetch_optional(pool)
-            .await?;
+        let mut conn = pool.acquire().await?;
+        let candidate =
+            queue_storage_unique_key_candidate(&mut conn, &store, &unique_key, queue).await?;
+        drop(conn);
 
         return match candidate {
-            Some(job_id) => cancel(pool, job_id).await,
+            Some(job_id) => match cancel(pool, job_id).await {
+                Err(AwaError::JobNotFound { .. }) => Ok(None),
+                other => other,
+            },
             None => Ok(None),
         };
     }
@@ -838,14 +1440,14 @@ async fn cancel_by_unique_key_in_tx<'a>(
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
     if let Some(store) = active_queue_storage_in_tx(tx).await? {
-        let sql = unique_key_candidate_sql(store.schema());
-        let candidate: Option<i64> = sqlx::query_scalar(&sql)
-            .bind(&unique_key)
-            .fetch_optional(tx.as_mut())
-            .await?;
+        let candidate =
+            queue_storage_unique_key_candidate(tx.as_mut(), &store, &unique_key, queue).await?;
 
         return match candidate {
-            Some(job_id) => cancel_in_tx(tx, job_id).await,
+            Some(job_id) => match cancel_in_tx(tx, job_id).await {
+                Err(AwaError::JobNotFound { .. }) => Ok(None),
+                other => other,
+            },
             None => Ok(None),
         };
     }
@@ -2030,7 +2632,10 @@ where
 
 /// Get queue overviews for all known queues.
 ///
-/// Hybrid read: per-state counts come from the `queue_state_counts`
+/// On queue storage, counts come from the live-work tables (see
+/// `queue_storage_signals_cte`).
+///
+/// On the canonical engine it is a hybrid read: per-state counts come from the `queue_state_counts`
 /// cache table (eventually consistent, ~2s lag), while `lag_seconds`
 /// and `completed_last_hour` are computed live from `jobs_hot`.
 ///
@@ -2042,11 +2647,14 @@ where
 /// leader, call `flush_dirty_admin_metadata()` first.
 pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
+        // `queue_state_counts` isn't maintained on queue storage, and the
+        // `current_jobs` view expands every retained completion, so counts
+        // come from the live-work tables instead.
         let sql = format!(
             r#"
-            {current_jobs_cte},
+            {signals_cte},
             all_queues AS (
-                SELECT queue FROM current_jobs
+                SELECT queue FROM signals
                 UNION
                 SELECT queue FROM awa.queue_descriptors
                 UNION
@@ -2066,35 +2674,6 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
                     secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
                 ) >= now()
                 GROUP BY descriptor.key
-            ),
-            queue_counts AS (
-                SELECT
-                    queue,
-                    count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
-                    count(*) FILTER (WHERE state = 'available')::bigint AS available,
-                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
-                    count(*) FILTER (WHERE state = 'running')::bigint AS running,
-                    count(*) FILTER (WHERE state = 'failed')::bigint AS failed,
-                    count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_external
-                FROM current_jobs
-                GROUP BY queue
-            ),
-            available_lag AS (
-                SELECT
-                    queue,
-                    EXTRACT(EPOCH FROM (clock_timestamp() - min(run_at)))::float8 AS lag_seconds
-                FROM current_jobs
-                WHERE state = 'available'
-                GROUP BY queue
-            ),
-            completed_recent AS (
-                SELECT
-                    queue,
-                    count(*)::bigint AS completed_last_hour
-                FROM current_jobs
-                WHERE state = 'completed'
-                  AND finalized_at > clock_timestamp() - interval '1 hour'
-                GROUP BY queue
             )
             SELECT
                 q.queue,
@@ -2112,31 +2691,36 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
                     ) < now()
                 END AS descriptor_stale,
                 COALESCE(qdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
-                COALESCE(qc.scheduled + qc.available + qc.running + qc.retryable + qc.waiting_external, 0) AS total_queued,
-                COALESCE(qc.scheduled, 0) AS scheduled,
-                COALESCE(qc.available, 0) AS available,
-                COALESCE(qc.retryable, 0) AS retryable,
-                COALESCE(qc.running, 0) AS running,
-                COALESCE(qc.failed, 0) AS failed,
-                COALESCE(qc.waiting_external, 0) AS waiting_external,
-                COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
-                al.lag_seconds,
+                COALESCE(sg.scheduled + sg.available + sg.running + sg.retryable + sg.waiting_external, 0)
+                    AS total_queued,
+                COALESCE(sg.scheduled, 0) AS scheduled,
+                COALESCE(sg.available, 0) AS available,
+                COALESCE(sg.retryable, 0) AS retryable,
+                COALESCE(sg.running, 0) AS running,
+                COALESCE(sg.failed, 0) AS failed,
+                COALESCE(sg.waiting_external, 0) AS waiting_external,
+                COALESCE(sg.completed_last_hour, 0) AS completed_last_hour,
+                sg.lag_seconds,
                 COALESCE(qm.paused, FALSE) AS paused
             FROM all_queues q
-            LEFT JOIN queue_counts qc ON qc.queue = q.queue
+            LEFT JOIN signals sg ON sg.queue = q.queue
             LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
             LEFT JOIN live_queue_descriptor_variants qdv ON qdv.queue = q.queue
-            LEFT JOIN available_lag al ON al.queue = q.queue
-            LEFT JOIN completed_recent cr ON cr.queue = q.queue
             LEFT JOIN awa.queue_meta qm ON qm.queue = q.queue
             ORDER BY q.queue
             "#,
-            current_jobs_cte = queue_storage_current_jobs_cte(store.schema())
+            signals_cte = queue_storage_signals_cte(store.schema())
         );
 
-        let rows = sqlx::query_as::<_, QueueOverview>(&sql)
-            .fetch_all(pool)
+        // JIT compiles this statement for longer than it runs.
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .execute(tx.as_mut())
             .await?;
+        let rows = sqlx::query_as::<_, QueueOverview>(&sql)
+            .fetch_all(tx.as_mut())
+            .await?;
+        tx.commit().await?;
         return Ok(rows);
     }
 
@@ -2575,33 +3159,23 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             r#"
             SELECT
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
-                COALESCE((
-                    SELECT count(*)::bigint
-                    FROM {schema}.ready_entries AS ready
-                    JOIN {schema}.queue_claim_heads AS claims
-                      ON claims.queue = ready.queue
-                     AND claims.priority = ready.priority
-                     AND claims.enqueue_shard = ready.enqueue_shard
-                    WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                          WHERE tomb.queue = ready.queue
-                            AND tomb.priority = ready.priority
-                            AND tomb.enqueue_shard = ready.enqueue_shard
-                            AND tomb.lane_seq = ready.lane_seq
-                            AND tomb.ready_slot = ready.ready_slot
-                            AND tomb.ready_generation = ready.ready_generation
-                      )
-                ), 0) AS available,
+                COALESCE((SELECT sum(available)::bigint FROM ({available}) AS lanes), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
-                COALESCE((SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE state = 'completed'), 0) AS completed,
+                -- A completion batch carries its size, so completed jobs are
+                -- counted without expanding batches through `terminal_jobs`.
+                -- Tombstones mark batch members deleted or retried since.
+                COALESCE((SELECT sum(completed_count)::bigint FROM {schema}.receipt_completion_batches), 0)
+                  - COALESCE((SELECT count(*)::bigint FROM {schema}.receipt_completion_tombstones), 0)
+                  + COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'), 0)
+                  AS completed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'retryable'), 0) AS retryable,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'failed'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'cancelled'), 0) AS cancelled,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
             "#,
-            schema = store.schema()
+            available = queue_storage_available_by_queue_sql(store.schema()),
+            schema = store.schema(),
         );
 
         let (
@@ -2613,7 +3187,16 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             failed,
             cancelled,
             waiting_external,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
+            // As in `queue_overviews`: compiling costs more than running.
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET LOCAL jit = off")
+                .execute(tx.as_mut())
+                .await?;
+            let counts = sqlx::query_as(&sql).fetch_one(tx.as_mut()).await?;
+            tx.commit().await?;
+            counts
+        };
 
         return Ok(HashMap::from([
             (JobState::Scheduled, scheduled),
@@ -3009,16 +3592,28 @@ pub async fn state_timeseries(
                  date_trunc('minute', created_at) AS bucket, \
                  state, \
                  count(*) AS count \
-             FROM current_jobs \
-             WHERE created_at >= clock_timestamp() - make_interval(mins => $1) \
+             FROM recent_jobs \
              GROUP BY bucket, state \
              ORDER BY bucket",
-            queue_storage_current_jobs_cte(store.schema())
+            queue_storage_recent_jobs_cte(store.schema(), "$1")
         );
-        let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(&sql)
-            .bind(minutes)
-            .fetch_all(pool)
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .execute(tx.as_mut())
             .await?;
+        // The window is measured on the database's clock, as on the canonical
+        // engine, but bound as a value: Postgres won't push an expression
+        // like `clock_timestamp()` into a bound on `finalized_at`.
+        let since: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp() - make_interval(mins => $1)")
+                .bind(minutes)
+                .fetch_one(tx.as_mut())
+                .await?;
+        let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(&sql)
+            .bind(since)
+            .fetch_all(tx.as_mut())
+            .await?;
+        tx.commit().await?;
 
         return Ok(rows
             .into_iter()

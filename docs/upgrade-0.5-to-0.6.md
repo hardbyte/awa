@@ -47,7 +47,7 @@ Read this before starting Phase 2. The rollout has one explicit one-way door —
 - **mixed_transition (queue-storage rows exist) — ONE-WAY**: `awa storage abort` is rejected. From this point onward you must either finish the transition (`finalize`) or restore from backup. A pure fleet downgrade to 0.5 is **not supported** because 0.5 workers don't know how to claim queue-storage work.
 - **active → anything**: not supported by `awa storage abort`. Use database restore.
 
-The `/api/storage` dashboard card surfaces the current boundary explicitly: "Rollback is still available" on `canonical` / `prepared`, "From here it's restore-only" once the cluster has crossed into `mixed_transition`, and "Finalized" once the transition has completed.
+The `/api/storage` dashboard card surfaces the current boundary explicitly: "Rollback is still available" on `canonical` / `prepared`, "From here it's restore-only" once the cluster has crossed into `mixed_transition`. Once the transition is finalized the card is no longer shown.
 
 ### The Storage transition card
 

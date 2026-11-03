@@ -668,7 +668,12 @@ Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 | `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Idle connection timeout (seconds) |
 | `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Max connection lifetime (seconds) |
 | `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Connection acquire timeout (seconds) |
+| `--statement-timeout` | `AWA_STATEMENT_TIMEOUT` | `60` | Longest any one UI statement may run (seconds); `0` leaves the server's setting |
 | `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Dashboard query cache TTL (seconds) |
+
+### Abandoned requests
+
+When a browser closes a tab or a proxy times out, the server drops the request, but Postgres keeps running its query and the pool keeps that query's connection until it ends. The statement timeout ends it, and the pool then reuses the connection. On Postgres 14 and later the pool also sets `client_connection_check_interval`, so a query stops within 5 s when its connection closes, for example when `awa serve` restarts. Raise `--statement-timeout` if a bulk action from the UI, such as purging a very large DLQ, needs longer.
 
 ### Dashboard cache
 
