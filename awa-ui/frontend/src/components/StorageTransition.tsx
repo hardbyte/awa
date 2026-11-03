@@ -98,10 +98,9 @@ interface StorageTransitionCardProps {
   report: StorageStatusReport;
 }
 
-// Shows storage transition readiness when an engine is prepared, a mixed
-// cutover is in flight, or a finalized migration is on a non-canonical
-// engine. On a canonical-only cluster this card does not render; the caller
-// should gate on `shouldShowStorageTransitionCard(report)`.
+// Shows storage transition readiness while an engine is prepared or a mixed
+// cutover is in flight. Once the cluster settles on one engine the card does
+// not render; the caller gates on `shouldShowStorageTransitionCard(report)`.
 export function StorageTransitionCard({ report }: StorageTransitionCardProps) {
   const hasPrepared = report.prepared_engine !== null;
   const inMixedTransition = report.state === "mixed_transition";
@@ -393,9 +392,7 @@ export function shouldShowStorageTransitionCard(
 ): boolean {
   if (!report) return false;
   if (report.prepared_engine !== null) return true;
-  // Also surface when the cluster is past canonical — e.g. finalized onto
-  // queue_storage — so operators see the engine name and live fleet.
-  if (report.state !== "canonical" && report.state !== "active") return true;
-  if (report.active_engine !== "canonical") return true;
-  return false;
+  // A finalized cluster has no transition left to show, whichever engine it
+  // runs; the live fleet is listed elsewhere on the runtime page.
+  return report.state !== "canonical" && report.state !== "active";
 }

@@ -29,6 +29,10 @@ Patch release: the admin UI's queue and dashboard reads on queue storage no long
   (backport of [#584](https://github.com/hardbyte/awa/pull/584)).
 - **DLQ retries, purges and moves refresh the admin UI's cached stats and
   queue counts**, which otherwise lagged a DLQ action by up to the cache TTL.
+- **The admin UI's runtime page no longer shows the storage transition card
+  once the transition is finalized.** It stayed up on every cluster running
+  queue storage; it now appears only while an engine is prepared or a mixed
+  transition is in flight.
 - **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
   storage find running jobs and no longer read retained history**
   (backport of [#586](https://github.com/hardbyte/awa/pull/586), for
