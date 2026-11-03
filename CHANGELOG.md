@@ -6,6 +6,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **The admin UI's runtime page no longer shows the storage transition card
+  once the transition is finalized.** It stayed up on every cluster running
+  queue storage; it now appears only while an engine is prepared or a mixed
+  transition is in flight.
 - **The admin dashboard's reads no longer grow with retained history on
   queue storage, and a test keeps them that way.** `awa-ui`'s
   `admin_read_cost_test` serves every endpoint the UI polls against ten
