@@ -6,6 +6,32 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **The admin dashboard's reads no longer grow with retained history on
+  queue storage, and a test keeps them that way.** `awa-ui`'s
+  `admin_read_cost_test` serves every endpoint the UI polls against ten
+  times more retained history and fails if a read does more work. It found
+  four more reads that grew with history:
+  - Available counts read every retained ready row. They now walk each
+    lane's segments from its claim cursor.
+  - Running counts expanded every retained claim batch. A batch whose
+    receipts have all closed is now skipped before it is expanded.
+  - The timeseries read its window's completions through `terminal_jobs`,
+    which joined them to every retained ready row.
+  - Completions in the last hour, less deletions, checked each recent
+    deletion against its lane's completion batches. One production-sized
+    fixture took 5.4 s for that check alone. Each affected batch is now read
+    once.
+  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and the job list
+  still read retained history; the test lists them and fails once one
+  stops, so the list can only shrink.
+- **Queue lag in the admin UI is the age of the oldest available job
+  again.** On queue storage it had become the age of each lane's next job,
+  which hides an older job a queue move or priority aging appended behind
+  newer ones: an hour's wait could show as a second. The workers' queue-lag
+  gauge keeps the cheaper next-job reading.
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts.** They didn't invalidate the dashboard caches, so failed
+  counts lagged a DLQ action by up to the cache TTL. From #579.
 - **A request the admin UI's client abandons no longer holds a database
   connection for good.** When a browser closes a tab or a proxy times out,
   the server drops the request but Postgres keeps running its query. If that
