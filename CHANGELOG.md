@@ -6,6 +6,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
+  tokio runtime but with the client's pool, so connections the pool opened
+  during the migration went back into it tied to a runtime that no longer
+  existed. A later query that picked one up could wait 30 s and fail with
+  `pool timed out while waiting for an open connection`. The migrations now
+  run on the bindings' shared runtime. This was the intermittent fixture
+  timeout in the Python test suite (#420).
 - **`awa storage prepare-queue` provisions lanes a 0.6 runtime created.** A
   runtime role with schema `CREATE` owns the lane sequences it creates.
   Provisioning such a lane as the owner, the first step of revoking runtime
