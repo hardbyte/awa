@@ -15,7 +15,7 @@
 #
 # Environment: PROMETHEUS_URL (default :9090), GRAFANA_URL (default :3000),
 # DATABASE_URL (default local test instance). Requires: jq, curl, psql,
-# python3.
+# python3 (with PyYAML, or uv to fetch it).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -110,6 +110,73 @@ if [ "$sql_failures" -gt 0 ]; then
   failures=$((failures + 1))
 else
   echo "  OK: all $count rawSql panels EXPLAIN cleanly"
+fi
+
+# ── 3b. Alert rule queries against the live sources ──────────────────
+# Each Prometheus rule's expression must evaluate (a typo in PromQL or a
+# label matcher returns an error, not an empty result), and each Postgres
+# rule's SQL must EXPLAIN against the live schema.
+echo "── evaluating alert rule queries"
+ALERTS_PG=docs/grafana/alerts/awa-alerts-postgres.yaml
+if python3 -c 'import yaml' 2>/dev/null; then
+  yaml_python=(python3)
+else
+  yaml_python=(uv run --quiet --no-project --with pyyaml python3)
+fi
+alert_failures=0
+alert_count=0
+# Every query needs a datasource and a model, and the rule's condition must
+# name one of its queries; Grafana refuses to provision a rule otherwise.
+if ! "${yaml_python[@]}" -c 'import sys, yaml
+bad = []
+for path in sys.argv[1:]:
+    for group in yaml.safe_load(open(path))["groups"]:
+        for rule in group["rules"]:
+            refs = [query.get("refId") for query in rule["data"]]
+            if rule.get("condition") not in refs or any(
+                "model" not in query or "datasourceUid" not in query for query in rule["data"]
+            ):
+                bad.append(rule["uid"])
+for uid in bad:
+    print(f"  FAILED: alert rule {uid} has an incomplete query or condition")
+sys.exit(1 if bad else 0)' "$ALERTS_PROM" "$ALERTS_PG"; then
+  alert_failures=$((alert_failures + 1))
+fi
+while IFS= read -r encoded; do
+  expr=$(jq -rn --arg s "$encoded" '$s | @base64d')
+  alert_count=$((alert_count + 1))
+  status=$(curl -s -G "$PROMETHEUS_URL/api/v1/query" --data-urlencode "query=$expr" | jq -r '.status // "error"')
+  if [ "$status" != "success" ]; then
+    echo "  FAILED Prometheus alert expr: $expr"
+    alert_failures=$((alert_failures + 1))
+  fi
+done < <("${yaml_python[@]}" -c 'import base64, sys, yaml
+for group in yaml.safe_load(open(sys.argv[1]))["groups"]:
+    for rule in group["rules"]:
+        for query in rule["data"]:
+            expr = query["model"].get("expr")
+            if expr:
+                print(base64.b64encode(expr.encode()).decode())' "$ALERTS_PROM")
+while IFS= read -r encoded; do
+  sql=$(jq -rn --arg s "$encoded" '$s | @base64d')
+  alert_count=$((alert_count + 1))
+  if ! psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -c "EXPLAIN $sql" >/dev/null 2>/tmp/explain-err.txt; then
+    echo "  FAILED Postgres alert SQL:"
+    sed 's/^/    /' /tmp/explain-err.txt
+    alert_failures=$((alert_failures + 1))
+  fi
+done < <("${yaml_python[@]}" -c 'import base64, sys, yaml
+for group in yaml.safe_load(open(sys.argv[1]))["groups"]:
+    for rule in group["rules"]:
+        for query in rule["data"]:
+            sql = query["model"].get("rawSql")
+            if sql:
+                print(base64.b64encode(sql.encode()).decode())' "$ALERTS_PG")
+if [ "$alert_failures" -gt 0 ]; then
+  echo "  $alert_failures of $alert_count alert queries failed"
+  failures=$((failures + 1))
+else
+  echo "  OK: all $alert_count alert queries evaluate"
 fi
 
 # ── 4. Traces readable through Grafana's Tempo datasource ───────────
