@@ -250,6 +250,8 @@ jobs:
     needs: [version-check, candidate-ci]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
       # The release body is the tag's `## [x.y.z]` section of CHANGELOG.md when
       # one exists; otherwise GitHub's generated pull-request list.
       - name: Extract release notes from CHANGELOG.md
