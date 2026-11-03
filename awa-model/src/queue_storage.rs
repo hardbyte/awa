@@ -1298,15 +1298,32 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
 /// is reported by the caller's own `leases` leg, so it is excluded here to
 /// avoid double counting.
 pub fn open_receipt_running_claims_sql(schema: &str) -> String {
+    open_receipt_running_claims_sql_for(schema, None)
+}
+
+/// [`open_receipt_running_claims_sql`] restricted to the jobs in `job_ids`,
+/// an SQL expression yielding `bigint[]`. The restriction applies before the
+/// closure and materialisation checks. Row-local claims are found through the
+/// `job_id` index. Compact claim batches have no index on `job_ids`, so every
+/// retained batch header is read, but only batches holding one of the jobs
+/// are unnested and checked.
+pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
     let closure_rel = format!("{schema}.lease_claim_closures");
     let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
     let row_closed =
         receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    let (row_filter, batch_filter) = match job_ids {
+        Some(ids) => (
+            format!("claims.job_id = ANY({ids}) AND "),
+            format!("batches.job_ids && {ids} AND items.job_id = ANY({ids}) AND "),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
         FROM {schema}.lease_claims AS claims
-        WHERE NOT {row_closed}
+        WHERE {row_filter}NOT {row_closed}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
               WHERE lease.job_id = claims.job_id
@@ -1322,7 +1339,7 @@ pub fn open_receipt_running_claims_sql(schema: &str) -> String {
         ) AS items(job_id, run_lease, receipt_id)
         -- Skips, before unnesting, a batch whose receipts closure batches
         -- have all closed: most retained batches, once their jobs finish.
-        WHERE NOT (
+        WHERE {batch_filter}NOT (
                   batches.receipt_ranges <@ COALESCE((
                       SELECT range_agg(closed)
                       FROM {schema}.lease_claim_closure_batches AS closure_batches
@@ -3600,7 +3617,7 @@ impl QueueStorage {
         format!("{queue}{QUEUE_STRIPE_DELIMITER}{stripe}")
     }
 
-    fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
+    pub(crate) fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
         if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
             return vec![queue.to_string()];
         }

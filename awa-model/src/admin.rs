@@ -897,34 +897,86 @@ async fn cancel_in_tx<'a>(
     Ok(Some(job))
 }
 
-/// Queue-storage candidate lookup for a unique key. Shared by
-/// [`cancel_by_unique_key`] and [`cancel_by_unique_key_tx`] so the two cannot
-/// drift.
-fn unique_key_candidate_sql(schema: &str) -> String {
+/// Queue-storage candidate lookup for a unique key: the oldest nonterminal
+/// job holding key `$1`. Shared by [`cancel_by_unique_key`] and
+/// [`cancel_by_unique_key_tx`] so the two cannot drift.
+///
+/// Each source is filtered by the key where it is read, so a missing key
+/// costs no more than reading the live work:
+/// - available rows are walked lane by lane through `ready_segments` from the
+///   claim cursor, the way a claim finds them, and probed along the ready key
+///   within each segment's ring slot. The ready key leads with the ring slot,
+///   so a lane range without it scans every retained ready row, completed
+///   jobs included;
+/// - scheduled and retryable rows use the `deferred_jobs` unique-key index;
+/// - running and waiting jobs are read from `leases` and from open receipt
+///   claims that have not been materialised into `leases`.
+///
+/// Without a queue, the open receipt claims are read in full before the key
+/// filter, so this lookup costs what the claim ring retains. With `scoped`
+/// see [`scoped_unique_key_candidate_sql`], which starts from the key.
+fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
+    if scoped {
+        return scoped_unique_key_candidate_sql(schema);
+    }
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     format!(
         r#"
-        WITH current_available AS (
-            SELECT ready.job_id, ready.unique_key
-            FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = ready.queue
-             AND claims.priority = ready.priority
-             AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-                    AND tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-              )
+        WITH heads AS (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
         ),
         candidates AS (
-            SELECT job_id
-            FROM current_available
-            WHERE unique_key = $1
+            SELECT ready.job_id
+            FROM heads
+            CROSS JOIN LATERAL (
+                SELECT
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    GREATEST(segment.first_lane_seq, heads.claim_seq) AS from_seq,
+                    LEAST(segment.next_lane_seq, heads.next_seq) AS to_seq
+                FROM {schema}.ready_segments AS segment
+                WHERE segment.queue = heads.queue
+                  AND segment.priority = heads.priority
+                  AND segment.enqueue_shard = heads.enqueue_shard
+                  AND segment.next_lane_seq > heads.claim_seq
+                  AND segment.first_lane_seq < heads.next_seq
+                ORDER BY segment.next_lane_seq
+            ) AS segment
+            -- OFFSET 0 keeps this a per-segment probe along the ready key;
+            -- flattened, the key filter can lead the planner to scan every
+            -- retained ready row instead.
+            CROSS JOIN LATERAL (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = segment.ready_slot
+                  AND ready.ready_generation = segment.ready_generation
+                  AND ready.queue = heads.queue
+                  AND ready.priority = heads.priority
+                  AND ready.enqueue_shard = heads.enqueue_shard
+                  AND ready.lane_seq >= segment.from_seq
+                  AND ready.lane_seq < segment.to_seq
+                  AND ready.unique_key = $1
+                OFFSET 0
+            ) AS ready
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                WHERE tomb.ready_slot = ready.ready_slot
+                  AND tomb.ready_generation = ready.ready_generation
+                  AND tomb.queue = ready.queue
+                  AND tomb.priority = ready.priority
+                  AND tomb.enqueue_shard = ready.enqueue_shard
+                  AND tomb.lane_seq = ready.lane_seq
+            )
             UNION ALL
             SELECT job_id
             FROM {schema}.deferred_jobs
@@ -934,22 +986,205 @@ fn unique_key_candidate_sql(schema: &str) -> String {
             -- reach it through the lease's lane identity.
             SELECT leases.job_id
             FROM {schema}.leases AS leases
-            JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = leases.ready_slot
-             AND ready.ready_generation = leases.ready_generation
-             AND ready.queue = leases.queue
-             AND ready.priority = leases.priority
-             AND ready.enqueue_shard = leases.enqueue_shard
-             AND ready.lane_seq = leases.lane_seq
-            WHERE ready.unique_key = $1
+            JOIN LATERAL (
+                SELECT 1
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = leases.ready_slot
+                  AND ready.ready_generation = leases.ready_generation
+                  AND ready.queue = leases.queue
+                  AND ready.priority = leases.priority
+                  AND ready.enqueue_shard = leases.enqueue_shard
+                  AND ready.lane_seq = leases.lane_seq
+                  AND ready.unique_key = $1
+                OFFSET 0
+            ) AS ready ON TRUE
+            UNION ALL
+            -- Running receipt claims not yet materialised into `leases`.
+            -- This leg reads every claim still in the claim ring before the
+            -- key filter, so its cost follows claim-ring retention (bounded
+            -- by claim rotation and pruning), not completed-job history.
+            SELECT open_claims.job_id
+            FROM ({open_running}) AS open_claims
+            JOIN LATERAL (
+                SELECT 1
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                  AND ready.unique_key = $1
+                LIMIT 1
+            ) AS ready ON TRUE
         )
         SELECT job_id
         FROM candidates
         ORDER BY job_id ASC
         LIMIT 1
-        "#,
-        schema = schema
+        "#
     )
+}
+
+/// The ready rows of the physical queues in `$2` that hold the key `$1`,
+/// probed one ring slot at a time: the ready key leads with `ready_slot`, so
+/// a filter on `queue` alone scans every retained ready row. The slot count
+/// is the schema's own; the admin store only knows the default.
+fn keyed_ready_rows_sql(schema: &str) -> String {
+    format!(
+        r#"
+            SELECT
+                ready.job_id,
+                ready.ready_slot,
+                ready.ready_generation,
+                ready.queue,
+                ready.priority,
+                ready.enqueue_shard,
+                ready.lane_seq
+            FROM {schema}.queue_ring_state AS ring
+            CROSS JOIN LATERAL generate_series(0, ring.slot_count - 1) AS slot(ready_slot)
+            CROSS JOIN LATERAL (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = slot.ready_slot
+                  AND ready.queue = ANY($2)
+                  AND ready.unique_key = $1
+                OFFSET 0
+            ) AS ready
+        "#
+    )
+}
+
+/// The queue-scoped candidate lookup: starts from the queue's ready rows that
+/// hold the key, read through the lane index, then keeps the ones still live.
+/// Its cost follows that queue's retained rows, not other queues' backlogs or
+/// the claim ring, which a large backlog elsewhere can keep from pruning.
+///
+/// - available: at or past the lane's claim cursor and not tombstoned;
+/// - scheduled and retryable: the `deferred_jobs` unique-key index;
+/// - running or waiting: in `leases` or on an open receipt claim, both
+///   checked by `job_id` for just these jobs.
+///
+/// `$2` holds the physical queues of the logical queue.
+fn scoped_unique_key_candidate_sql(schema: &str) -> String {
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql_for(
+        schema,
+        Some("ARRAY(SELECT keyed.job_id FROM keyed)"),
+    );
+    let keyed = keyed_ready_rows_sql(schema);
+    format!(
+        r#"
+        WITH keyed AS MATERIALIZED (
+            {keyed}
+        ),
+        candidates AS (
+            SELECT keyed.job_id
+            FROM keyed
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = keyed.queue
+             AND claims.priority = keyed.priority
+             AND claims.enqueue_shard = keyed.enqueue_shard
+            WHERE keyed.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = keyed.ready_slot
+                    AND tomb.ready_generation = keyed.ready_generation
+                    AND tomb.queue = keyed.queue
+                    AND tomb.priority = keyed.priority
+                    AND tomb.enqueue_shard = keyed.enqueue_shard
+                    AND tomb.lane_seq = keyed.lane_seq
+              )
+            UNION ALL
+            SELECT job_id
+            FROM {schema}.deferred_jobs
+            WHERE unique_key = $1
+            UNION ALL
+            -- By job id rather than lane: a job moved to another queue
+            -- while available is leased on its new lane.
+            SELECT keyed.job_id
+            FROM keyed
+            WHERE EXISTS (
+                SELECT 1 FROM {schema}.leases AS lease
+                WHERE lease.job_id = keyed.job_id
+            )
+            UNION ALL
+            SELECT open_claims.job_id
+            FROM ({open_running}) AS open_claims
+        )
+        SELECT job_id
+        FROM candidates
+        ORDER BY job_id ASC
+        LIMIT 1
+        "#
+    )
+}
+
+/// The physical queues that hold a logical queue's lanes, read from the
+/// schema's `queue_lanes`: the queue itself and its `queue#N` stripes. The
+/// admin store is rebuilt from the schema name alone, so its configured
+/// stripe count is the default, not the one the runtime enqueues with.
+async fn persisted_physical_queues(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    queue: &str,
+) -> Result<Vec<String>, AwaError> {
+    let mut queues: Vec<String> = sqlx::query_scalar(audited_sql(format!(
+        r#"
+        SELECT DISTINCT lanes.queue
+        FROM {schema}.queue_lanes AS lanes
+        WHERE left(lanes.queue, char_length($1) + 1) = $1 || '#'
+          AND substr(lanes.queue, char_length($1) + 2) ~ '^[0-9]+$'
+        "#
+    )))
+    .bind(queue)
+    .fetch_all(&mut *conn)
+    .await?;
+    queues.push(queue.to_string());
+    Ok(queues)
+}
+
+/// The oldest nonterminal queue-storage job holding `unique_key`.
+///
+/// A queue is part of a key only when it was inserted with `by_queue`, so a
+/// job holding a queue-scoped key was enqueued there: with a queue, its ready
+/// rows are read from that queue alone. A job moved to another queue is
+/// found through its original ready row while that row is retained, except
+/// while it is available in the new queue; cancel it by id otherwise.
+async fn queue_storage_unique_key_candidate(
+    conn: &mut sqlx::PgConnection,
+    store: &QueueStorage,
+    unique_key: &[u8],
+    queue: Option<&str>,
+) -> Result<Option<i64>, AwaError> {
+    let schema = store.schema();
+    let Some(queue) = queue else {
+        let sql = unique_key_candidate_sql(schema, false);
+        return Ok(sqlx::query_scalar(audited_sql(sql))
+            .bind(unique_key)
+            .fetch_optional(&mut *conn)
+            .await?);
+    };
+    let queues = persisted_physical_queues(&mut *conn, schema, queue).await?;
+    // Available, running and waiting jobs all have a ready row in the queue.
+    // Without one, only a scheduled or retryable job can hold the key, and
+    // the deferred index answers that alone; the full lookup spans enough
+    // partitioned tables that planning it costs several milliseconds.
+    // One statement, so a job promoted from deferred_jobs to a ready row
+    // between the two reads cannot be missed by both.
+    let keyed = keyed_ready_rows_sql(schema);
+    let (has_ready_rows, deferred): (bool, Option<i64>) = sqlx::query_as(audited_sql(format!(
+        "SELECT EXISTS ({keyed}), \
+                (SELECT job_id FROM {schema}.deferred_jobs WHERE unique_key = $1 \
+                 ORDER BY job_id LIMIT 1)"
+    )))
+    .bind(unique_key)
+    .bind(&queues)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !has_ready_rows {
+        return Ok(deferred);
+    }
+    let sql = unique_key_candidate_sql(schema, true);
+    Ok(sqlx::query_scalar(audited_sql(sql))
+        .bind(unique_key)
+        .bind(&queues)
+        .fetch_optional(&mut *conn)
+        .await?)
 }
 
 /// Canonical (non queue-storage) candidate lookup for a unique key.
@@ -996,10 +1231,17 @@ const UNIQUE_KEY_CANDIDATE_SQL_CANONICAL: &str = r#"
 /// in-flight cancellation notification. If the selected job completes before
 /// `cancel(...)` locks it, the cancel becomes a no-op and returns `None`.
 ///
-/// The lookup scans `unique_key` on both physical tables without a dedicated
-/// index. This is acceptable for low-volume use cases. For high-volume tables,
-/// consider adding a partial index on `unique_key WHERE unique_key IS NOT NULL`
-/// or routing through `job_unique_claims` (which is already indexed).
+/// On the canonical engine the lookup scans `unique_key` on both physical
+/// tables without a dedicated index. On queue storage, scheduled and
+/// retryable rows are found by their unique-key index. With a `queue`, the
+/// lookup reads that queue's ready rows in each ring slot, retained ones
+/// included, and checks only the rows holding the key for being available,
+/// leased or on an open receipt claim; its cost follows that queue's own
+/// retained rows, not other queues' backlogs. Without a `queue`, available
+/// rows are walked lane by lane from the claim cursor and open receipt claims
+/// are read in full, so the cost follows what the claim ring retains. A job
+/// moved to another queue while available is not found by a lookup that
+/// names its original queue.
 pub async fn cancel_by_unique_key(
     pool: &PgPool,
     kind: &str,
@@ -1010,14 +1252,16 @@ pub async fn cancel_by_unique_key(
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
     if let Some(store) = active_queue_storage(pool).await? {
-        let sql = unique_key_candidate_sql(store.schema());
-        let candidate: Option<i64> = sqlx::query_scalar(audited_sql(sql))
-            .bind(&unique_key)
-            .fetch_optional(pool)
-            .await?;
+        let mut conn = pool.acquire().await?;
+        let candidate =
+            queue_storage_unique_key_candidate(&mut conn, &store, &unique_key, queue).await?;
+        drop(conn);
 
         return match candidate {
-            Some(job_id) => cancel(pool, job_id).await,
+            Some(job_id) => match cancel(pool, job_id).await {
+                Err(AwaError::JobNotFound { .. }) => Ok(None),
+                other => other,
+            },
             None => Ok(None),
         };
     }
@@ -1077,14 +1321,14 @@ async fn cancel_by_unique_key_in_tx<'a>(
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
     if let Some(store) = active_queue_storage_in_tx(tx).await? {
-        let sql = unique_key_candidate_sql(store.schema());
-        let candidate: Option<i64> = sqlx::query_scalar(audited_sql(sql))
-            .bind(&unique_key)
-            .fetch_optional(tx.as_mut())
-            .await?;
+        let candidate =
+            queue_storage_unique_key_candidate(tx.as_mut(), &store, &unique_key, queue).await?;
 
         return match candidate {
-            Some(job_id) => cancel_in_tx(tx, job_id).await,
+            Some(job_id) => match cancel_in_tx(tx, job_id).await {
+                Err(AwaError::JobNotFound { .. }) => Ok(None),
+                other => other,
+            },
             None => Ok(None),
         };
     }

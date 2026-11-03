@@ -13,6 +13,21 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `BEFORE INSERT` triggers run even for a row `ON CONFLICT DO NOTHING` then
   skips, and they read and set the lane's sequence. Lane inserts now skip
   rows that exist. Found by the 0.6.10 upgrade rehearsal.
+- **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
+  storage find running jobs and no longer read retained history**
+  ([#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
+  built every available ready row before filtering by key, reading every
+  retained ready row, completed jobs included. A missing key cost as much
+  as a full scan, and the transaction variant held the caller's
+  transaction while it ran. Given a queue, it now starts from that queue's
+  ready rows holding the key and checks only those jobs for being available,
+  leased or on an open receipt claim; with no such row, only the
+  `deferred_jobs` key index is read. Its cost follows that queue's own rows,
+  not other queues' backlogs or the claim ring, which a long-running job can
+  keep from pruning. Without a queue, available rows are walked lane by lane
+  from the claim cursor and open receipt claims are read in full. It also
+  finds jobs running on receipt claims not yet materialised into `leases`,
+  which it missed, so they couldn't be cancelled by key.
 - **The admin UI's runtime page no longer shows the storage transition card
   once the transition is finalized.** It stayed up on every cluster running
   queue storage; it now appears only while an engine is prepared or a mixed
