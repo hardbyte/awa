@@ -25,6 +25,7 @@ const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
+const DRAIN_BATCH_SIZE: i64 = 1_000;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -8405,6 +8406,345 @@ impl QueueStorage {
         self.advance_claim_cursors(pool, &claim_cursor_advances)
             .await;
         Ok(rows)
+    }
+
+    /// Cancel every available, scheduled, retryable and waiting job in the
+    /// physical `queues`, returning how many were cancelled.
+    ///
+    /// Scheduled, retryable and available jobs are cancelled a chunk at a
+    /// time, each chunk in its own transaction, so a large backlog costs a
+    /// few statements per chunk rather than per job and holds row locks for
+    /// one chunk at a time. Waiting jobs go through [`Self::cancel_jobs_by_ids`].
+    /// Running jobs are left alone.
+    pub async fn drain_queues(&self, pool: &PgPool, queues: &[String]) -> Result<u64, AwaError> {
+        let mut drained = 0u64;
+
+        loop {
+            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let cancelled = self.cancel_deferred_chunk_tx(&mut tx, queues).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            drained += cancelled as u64;
+            if (cancelled as i64) < DRAIN_BATCH_SIZE {
+                break;
+            }
+        }
+
+        // After the deferred pass, so jobs promoted while it ran are drained
+        // from the ready lanes.
+        loop {
+            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let (cancelled, advances) = self.cancel_available_chunk_tx(&mut tx, queues).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            self.advance_claim_cursors(pool, &advances).await;
+            drained += cancelled as u64;
+            if (cancelled as i64) < DRAIN_BATCH_SIZE {
+                break;
+            }
+        }
+
+        let schema = self.schema();
+        let waiting: Vec<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT job_id
+            FROM {schema}.leases
+            WHERE queue = ANY($1)
+              AND state = 'waiting_external'
+            ORDER BY job_id
+            "#
+        ))
+        .bind(queues)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        drained += self.cancel_jobs_by_ids(pool, &waiting).await?.len() as u64;
+
+        Ok(drained)
+    }
+
+    async fn cancel_deferred_chunk_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queues: &[String],
+    ) -> Result<usize, AwaError> {
+        let schema = self.schema();
+        let deferred: Vec<DeferredJobRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.deferred_jobs
+            WHERE job_id IN (
+                SELECT job_id
+                FROM {schema}.deferred_jobs
+                WHERE queue = ANY($1)
+                  AND state IN ('scheduled', 'retryable')
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                COALESCE(payload, '{{}}'::jsonb) AS payload
+            "#
+        ))
+        .bind(queues)
+        .bind(DRAIN_BATCH_SIZE)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if deferred.is_empty() {
+            return Ok(0);
+        }
+
+        let cancelled = deferred.len();
+        let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
+        let lanes: BTreeSet<(String, i16)> = deferred
+            .iter()
+            .map(|row| (row.queue.clone(), row.priority))
+            .collect();
+        for (queue, priority) in &lanes {
+            self.ensure_lane(tx, queue, *priority, 0).await?;
+        }
+
+        let finalized_at = Utc::now();
+        let mut by_state: HashMap<JobState, Vec<DoneJobRow>> = HashMap::new();
+        for deferred in deferred {
+            // Same shape as a single deferred cancel: shard 0 and a negative
+            // lane_seq keep the done_entries key unique.
+            let done = DoneJobRow {
+                ready_slot,
+                ready_generation,
+                job_id: deferred.job_id,
+                kind: deferred.kind,
+                queue: deferred.queue,
+                args: deferred.args,
+                state: JobState::Cancelled,
+                priority: deferred.priority,
+                attempt: deferred.attempt,
+                run_lease: deferred.run_lease,
+                max_attempts: deferred.max_attempts,
+                lane_seq: -deferred.job_id,
+                enqueue_shard: 0,
+                run_at: deferred.run_at,
+                attempted_at: deferred.attempted_at,
+                finalized_at,
+                created_at: deferred.created_at,
+                unique_key: deferred.unique_key,
+                unique_states: deferred.unique_states,
+                payload: deferred.payload,
+            };
+            by_state.entry(deferred.state).or_default().push(done);
+        }
+        for (old_state, rows) in by_state {
+            self.insert_done_rows_tx(tx, &rows, Some(old_state)).await?;
+        }
+
+        Ok(cancelled)
+    }
+
+    async fn cancel_available_chunk_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queues: &[String],
+    ) -> Result<(usize, Vec<ClaimCursorAdvance>), AwaError> {
+        let schema = self.schema();
+        // Unclaimed rows are found the way a claim finds them: from each
+        // lane's claim cursor through its segments, then along the ready key
+        // within each segment's ring slot. The ready key leads with the ring
+        // slot, so a lane range without it scans every retained ready row.
+        // Only rows whose tombstone this statement inserts are cancelled, so a
+        // concurrent cancel of the same row cannot produce a second done row.
+        let ready: Vec<ReadyTransitionRow> = sqlx::query_as(&format!(
+            r#"
+            WITH heads AS (
+                SELECT
+                    claims.queue,
+                    claims.priority,
+                    claims.enqueue_shard,
+                    {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                    {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+                FROM {schema}.queue_claim_heads AS claims
+                JOIN {schema}.queue_enqueue_heads AS enqueues
+                  ON enqueues.queue = claims.queue
+                 AND enqueues.priority = claims.priority
+                 AND enqueues.enqueue_shard = claims.enqueue_shard
+                WHERE claims.queue = ANY($1)
+            ),
+            candidates AS (
+                SELECT
+                    ready.ready_slot,
+                    ready.ready_generation,
+                    ready.queue,
+                    ready.priority,
+                    ready.enqueue_shard,
+                    ready.lane_seq
+                FROM heads
+                CROSS JOIN LATERAL (
+                    SELECT
+                        segment.ready_slot,
+                        segment.ready_generation,
+                        GREATEST(segment.first_lane_seq, heads.claim_seq) AS from_seq,
+                        LEAST(segment.next_lane_seq, heads.next_seq) AS to_seq
+                    FROM {schema}.ready_segments AS segment
+                    WHERE segment.queue = heads.queue
+                      AND segment.priority = heads.priority
+                      AND segment.enqueue_shard = heads.enqueue_shard
+                      AND segment.next_lane_seq > heads.claim_seq
+                      AND segment.first_lane_seq < heads.next_seq
+                    ORDER BY segment.next_lane_seq
+                ) AS segment
+                CROSS JOIN LATERAL (
+                    SELECT
+                        ready.ready_slot,
+                        ready.ready_generation,
+                        ready.queue,
+                        ready.priority,
+                        ready.enqueue_shard,
+                        ready.lane_seq
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.ready_slot = segment.ready_slot
+                      AND ready.ready_generation = segment.ready_generation
+                      AND ready.queue = heads.queue
+                      AND ready.priority = heads.priority
+                      AND ready.enqueue_shard = heads.enqueue_shard
+                      AND ready.lane_seq >= segment.from_seq
+                      AND ready.lane_seq < segment.to_seq
+                    ORDER BY ready.lane_seq
+                    OFFSET 0
+                ) AS ready
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                    WHERE tomb.ready_slot = ready.ready_slot
+                      AND tomb.ready_generation = ready.ready_generation
+                      AND tomb.queue = ready.queue
+                      AND tomb.priority = ready.priority
+                      AND tomb.enqueue_shard = ready.enqueue_shard
+                      AND tomb.lane_seq = ready.lane_seq
+                )
+                LIMIT $2
+            ),
+            target AS (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                JOIN candidates
+                  ON candidates.ready_slot = ready.ready_slot
+                 AND candidates.ready_generation = ready.ready_generation
+                 AND candidates.queue = ready.queue
+                 AND candidates.priority = ready.priority
+                 AND candidates.enqueue_shard = ready.enqueue_shard
+                 AND candidates.lane_seq = ready.lane_seq
+                FOR UPDATE OF ready SKIP LOCKED
+            ),
+            tombstone AS (
+                INSERT INTO {schema}.ready_tombstones (
+                    ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                )
+                SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                FROM target
+                ON CONFLICT DO NOTHING
+                RETURNING ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq
+            )
+            SELECT
+                target.ready_slot,
+                target.ready_generation,
+                target.job_id,
+                target.kind,
+                target.queue,
+                target.args,
+                target.priority,
+                target.attempt,
+                target.run_lease,
+                target.max_attempts,
+                target.lane_seq,
+                target.enqueue_shard,
+                target.run_at,
+                target.attempted_at,
+                target.created_at,
+                target.unique_key,
+                target.unique_states,
+                COALESCE(target.payload, '{{}}'::jsonb) AS payload
+            FROM target
+            JOIN tombstone
+              ON tombstone.ready_slot = target.ready_slot
+             AND tombstone.ready_generation = target.ready_generation
+             AND tombstone.queue = target.queue
+             AND tombstone.priority = target.priority
+             AND tombstone.enqueue_shard = target.enqueue_shard
+             AND tombstone.lane_seq = target.lane_seq
+            "#
+        ))
+        .bind(queues)
+        .bind(DRAIN_BATCH_SIZE)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if ready.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        // One advance per run of consecutive cancelled positions on a lane:
+        // it applies only while the cursor sits at the start of the run, and
+        // every position it skips was tombstoned above.
+        let mut ready = ready;
+        ready.sort_unstable_by(|left, right| {
+            (
+                &left.queue,
+                left.priority,
+                left.enqueue_shard,
+                left.lane_seq,
+            )
+                .cmp(&(
+                    &right.queue,
+                    right.priority,
+                    right.enqueue_shard,
+                    right.lane_seq,
+                ))
+        });
+        let mut advances: Vec<ClaimCursorAdvance> = Vec::new();
+        for row in &ready {
+            if let Some(last) = advances.last_mut() {
+                if last.queue == row.queue
+                    && last.priority == row.priority
+                    && last.enqueue_shard == row.enqueue_shard
+                    && last.next_seq == row.lane_seq
+                {
+                    last.next_seq = row.lane_seq + 1;
+                    continue;
+                }
+            }
+            advances.push(ClaimCursorAdvance {
+                queue: row.queue.clone(),
+                priority: row.priority,
+                enqueue_shard: row.enqueue_shard,
+                next_seq: row.lane_seq + 1,
+                only_if_current: Some(row.lane_seq),
+            });
+        }
+
+        let finalized_at = Utc::now();
+        let done_rows: Vec<DoneJobRow> = ready
+            .into_iter()
+            .map(|row| {
+                let payload = row.payload.clone();
+                row.into_done_row(JobState::Cancelled, finalized_at, payload)
+            })
+            .collect();
+        self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Available))
+            .await?;
+
+        Ok((done_rows.len(), advances))
     }
 
     pub async fn set_priority(
