@@ -4383,6 +4383,46 @@ async fn test_queue_storage_promote_due_preserves_row_fields_across_lanes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_batch_writing_more_segments_than_the_old_bind_limit() {
+    // `enqueue_batch` stamps each row with its own run_at, and segments split
+    // on every run_at change, so one batch yields about one segment per row:
+    // more than the 8,191 rows an 8-bind-per-row statement could carry.
+    const JOBS: usize = 9_000;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_segments";
+    let schema = "awa_qs_bind_limit_segments";
+    let store = create_store(&pool, schema).await;
+
+    let inserted = store
+        .enqueue_batch(&pool, queue, 2, JOBS as i64)
+        .await
+        .expect("a batch producing one segment per row should insert");
+    assert_eq!(inserted, JOBS as i64);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        JOBS as i64
+    );
+
+    let segments: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.ready_segments WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready segments");
+    assert!(
+        segments > 8_191,
+        "expected more than 8,191 segments from one batch, got {segments}"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 100, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim jobs");
+    assert_eq!(claimed.len(), 100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_cancel_is_noop() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_late_cancel";
@@ -9048,6 +9088,182 @@ async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
         .expect("retry_job");
     assert!(retried.is_some(), "retry_job should succeed for cancelled");
     assert_invariant_holds(&pool, schema, queue, "after retry_job from terminal").await;
+}
+
+const DONE_BIND_LIMIT_READY_ROWS: i64 = 5_000;
+const DONE_BIND_LIMIT_SYNTHETIC_ROWS: i64 = 4_000;
+const DLQ_BIND_LIMIT_ROWS: i64 = 4_000;
+
+async fn claim_leased_jobs(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    count: i64,
+) -> Vec<(i64, i64)> {
+    store
+        .enqueue_batch(pool, queue, 1, count)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(pool, queue, count, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), count as usize, "claim must return every job");
+    claimed
+        .iter()
+        .map(|entry| (entry.job.id, entry.job.run_lease))
+        .collect()
+}
+
+async fn assert_completed_done_rows(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+    completions: &[(i64, i64)],
+) {
+    assert_eq!(
+        done_entries_count(pool, schema, queue).await,
+        completions.len() as i64
+    );
+    let completed: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1 AND state = 'completed'"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count completed done_entries");
+    assert_eq!(completed, completions.len() as i64);
+    let mut persisted: Vec<(i64, i64)> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease FROM {schema}.done_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("load completed done_entries");
+    persisted.sort_unstable();
+    let mut expected = completions.to_vec();
+    expected.sort_unstable();
+    assert_eq!(persisted, expected);
+    let leases: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count leases");
+    assert_eq!(leases, 0, "completion must delete every lease");
+    assert_invariant_holds(pool, schema, queue, "after batch completion").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_complete_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_complete_ready";
+    let schema = "awa_qs_bind_limit_complete_ready";
+    let store = create_store(&pool, schema).await;
+
+    let completions = claim_leased_jobs(&pool, &store, queue, DONE_BIND_LIMIT_READY_ROWS).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let completed = store
+        .complete_job_batch_by_id_in_tx(&mut tx, &completions)
+        .await
+        .expect("ready-backed completion above the 65,535 bind-parameter limit should succeed");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(completed.len(), completions.len());
+    assert_completed_done_rows(&pool, schema, queue, &completions).await;
+}
+
+/// A running lease with a negative `lane_seq` is written as a self-contained
+/// (synthetic) done row. No public path produces one for a multi-row batch, so
+/// the lane sequence of the claimed rows is negated in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_complete_synthetic_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_complete_synthetic";
+    let schema = "awa_qs_bind_limit_complete_synthetic";
+    let store = create_store(&pool, schema).await;
+
+    let completions = claim_leased_jobs(&pool, &store, queue, DONE_BIND_LIMIT_SYNTHETIC_ROWS).await;
+    for table in ["ready_entries", "leases"] {
+        sqlx::query(&format!(
+            "UPDATE {schema}.{table} SET lane_seq = -lane_seq - 1 WHERE queue = $1"
+        ))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("negate lane_seq");
+    }
+
+    let mut tx = pool.begin().await.expect("begin");
+    let completed = store
+        .complete_job_batch_by_id_in_tx(&mut tx, &completions)
+        .await
+        .expect("synthetic completion above the 65,535 bind-parameter limit should succeed");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(completed.len(), completions.len());
+    assert_completed_done_rows(&pool, schema, queue, &completions).await;
+    let self_contained: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries \
+         WHERE queue = $1 AND lane_seq < 0 AND args IS NOT NULL AND max_attempts IS NOT NULL"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count synthetic done rows");
+    assert_eq!(self_contained, completions.len() as i64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_bulk_move_failed_to_dlq_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_bulk_dlq";
+    let schema = "awa_qs_bind_limit_bulk_dlq";
+    let store = create_store(&pool, schema).await;
+
+    seed_terminal_rows(&pool, schema, queue, "failed", DLQ_BIND_LIMIT_ROWS).await;
+    seed_terminal_rows(&pool, schema, queue, "completed", 3).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET run_lease = job_id WHERE queue = $1 AND state = 'failed'"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("give each failed row its own run_lease");
+
+    let moved = store
+        .bulk_move_failed_to_dlq(&pool, None, Some(queue), "bind-limit")
+        .await
+        .expect("bulk DLQ move above the 65,535 bind-parameter limit should succeed");
+    assert_eq!(moved, DLQ_BIND_LIMIT_ROWS as u64);
+
+    let dlq_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.dlq_entries WHERE queue = $1 AND dlq_reason = 'bind-limit'"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count dlq_entries");
+    assert_eq!(dlq_count, DLQ_BIND_LIMIT_ROWS);
+    let kept_run_lease: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.dlq_entries WHERE queue = $1 AND dlq_reason = 'bind-limit' AND original_run_lease = job_id"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count dlq_entries keeping their run_lease");
+    assert_eq!(kept_run_lease, DLQ_BIND_LIMIT_ROWS);
+    let failed_left: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1 AND state = 'failed'"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count failed done_entries");
+    assert_eq!(failed_left, 0);
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 3);
+    assert_invariant_holds(&pool, schema, queue, "after bulk DLQ move").await;
 }
 
 /// ADR-026: prune folds terminal rows into queue_terminal_rollups and clears

@@ -6,7 +6,7 @@ use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::Acquire;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgPool, Postgres};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -1321,6 +1321,25 @@ fn terminal_storage_payload<'a>(
     } else {
         Some(value)
     }
+}
+
+fn terminal_payloads<'r>(
+    rows: &[&'r DoneJobRow],
+    ready_payloads: &HashMap<(i32, i64, &str, i16, i16, i64), serde_json::Value>,
+) -> Vec<Option<&'r serde_json::Value>> {
+    rows.iter()
+        .map(|row| {
+            let ready_key = (
+                row.ready_slot,
+                row.ready_generation,
+                row.queue.as_str(),
+                row.priority,
+                row.enqueue_shard,
+                row.lane_seq,
+            );
+            terminal_storage_payload(&row.payload, ready_payloads.get(&ready_key))
+        })
+        .collect()
 }
 
 fn is_storage_payload_empty(value: &serde_json::Value) -> bool {
@@ -4519,81 +4538,72 @@ impl QueueStorage {
             .partition(|row| keep_ready_backing && row.lane_seq >= 0);
 
         if !ready_backed.is_empty() {
-            let mut builder = QueryBuilder::<Postgres>::new(format!(
-                "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, state, priority, attempt, run_lease, lane_seq, enqueue_shard, attempted_at, finalized_at, payload) "
-            ));
-            builder.push_values(ready_backed, |mut b, row| {
-                let ready_key = (
-                    row.ready_slot,
-                    row.ready_generation,
-                    row.queue.as_str(),
-                    row.priority,
-                    row.enqueue_shard,
-                    row.lane_seq,
-                );
-                let ready_payload = ready_payloads.get(&ready_key);
-                b.push_bind(row.ready_slot)
-                    .push_bind(row.ready_generation)
-                    .push_bind(row.job_id)
-                    .push_bind(&row.kind)
-                    .push_bind(&row.queue)
-                    .push_bind(row.state)
-                    .push_bind(row.priority)
-                    .push_bind(row.attempt)
-                    .push_bind(row.run_lease)
-                    .push_bind(row.lane_seq)
-                    .push_bind(row.enqueue_shard)
-                    .push_bind(row.attempted_at)
-                    .push_bind(row.finalized_at)
-                    .push_bind(terminal_storage_payload(&row.payload, ready_payload));
-            });
-            builder
-                .build()
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, state, priority, attempt, run_lease, lane_seq, enqueue_shard, attempted_at, finalized_at, payload)
+                SELECT ready_slot, ready_generation, job_id, kind, queue, state::awa.job_state, priority, attempt, run_lease, lane_seq, enqueue_shard, attempted_at, finalized_at, payload
+                FROM unnest(
+                    $1::int[], $2::bigint[], $3::bigint[], $4::text[], $5::text[], $6::text[],
+                    $7::smallint[], $8::smallint[], $9::bigint[], $10::bigint[], $11::smallint[],
+                    $12::timestamptz[], $13::timestamptz[], $14::jsonb[]
+                ) AS rows (ready_slot, ready_generation, job_id, kind, queue, state, priority, attempt, run_lease, lane_seq, enqueue_shard, attempted_at, finalized_at, payload)
+                "#
+            ))
+            .bind(ready_backed.iter().map(|row| row.ready_slot).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.ready_generation).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.job_id).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.queue.as_str()).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.state.as_str()).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.priority).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.attempt).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.run_lease).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.lane_seq).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.attempted_at).collect::<Vec<_>>())
+            .bind(ready_backed.iter().map(|row| row.finalized_at).collect::<Vec<_>>())
+            .bind(terminal_payloads(&ready_backed, &ready_payloads))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         }
 
         if !synthetic.is_empty() {
-            let mut builder = QueryBuilder::<Postgres>::new(format!(
-                "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) "
-            ));
-            builder.push_values(synthetic, |mut b, row| {
-                let ready_key = (
-                    row.ready_slot,
-                    row.ready_generation,
-                    row.queue.as_str(),
-                    row.priority,
-                    row.enqueue_shard,
-                    row.lane_seq,
-                );
-                let ready_payload = ready_payloads.get(&ready_key);
-                b.push_bind(row.ready_slot)
-                    .push_bind(row.ready_generation)
-                    .push_bind(row.job_id)
-                    .push_bind(&row.kind)
-                    .push_bind(&row.queue)
-                    .push_bind(&row.args)
-                    .push_bind(row.state)
-                    .push_bind(row.priority)
-                    .push_bind(row.attempt)
-                    .push_bind(row.run_lease)
-                    .push_bind(row.max_attempts)
-                    .push_bind(row.lane_seq)
-                    .push_bind(row.enqueue_shard)
-                    .push_bind(row.run_at)
-                    .push_bind(row.attempted_at)
-                    .push_bind(row.finalized_at)
-                    .push_bind(row.created_at)
-                    .push_bind(&row.unique_key)
-                    .push_bind(&row.unique_states)
-                    .push_bind(terminal_storage_payload(&row.payload, ready_payload));
-            });
-            builder
-                .build()
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload)
+                SELECT ready_slot, ready_generation, job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload
+                FROM unnest(
+                    $1::int[], $2::bigint[], $3::bigint[], $4::text[], $5::text[], $6::jsonb[],
+                    $7::text[], $8::smallint[], $9::smallint[], $10::bigint[], $11::smallint[],
+                    $12::bigint[], $13::smallint[], $14::timestamptz[], $15::timestamptz[],
+                    $16::timestamptz[], $17::timestamptz[], $18::bytea[], $19::text[], $20::jsonb[]
+                ) AS rows (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload)
+                "#
+            ))
+            .bind(synthetic.iter().map(|row| row.ready_slot).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.ready_generation).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.job_id).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.queue.as_str()).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| &row.args).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.state.as_str()).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.priority).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.attempt).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.run_lease).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.max_attempts).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.lane_seq).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.run_at).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.attempted_at).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.finalized_at).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.created_at).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.unique_key.as_deref()).collect::<Vec<_>>())
+            .bind(synthetic.iter().map(|row| row.unique_states.as_deref()).collect::<Vec<_>>())
+            .bind(terminal_payloads(&synthetic, &ready_payloads))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         }
 
         // Terminal counts stay exact without mutating the hot live-counter
@@ -4954,35 +4964,40 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.dlq_entries (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease) "
-        ));
-        builder.push_values(rows.iter(), |mut b, row| {
-            b.push_bind(row.job_id)
-                .push_bind(&row.kind)
-                .push_bind(&row.queue)
-                .push_bind(&row.args)
-                .push_bind(row.state)
-                .push_bind(row.priority)
-                .push_bind(row.attempt)
-                .push_bind(row.run_lease)
-                .push_bind(row.max_attempts)
-                .push_bind(row.run_at)
-                .push_bind(row.attempted_at)
-                .push_bind(row.finalized_at)
-                .push_bind(row.created_at)
-                .push_bind(&row.unique_key)
-                .push_bind(&row.unique_states)
-                .push_bind(storage_payload(&row.payload))
-                .push_bind(&row.dlq_reason)
-                .push_bind(row.dlq_at)
-                .push_bind(row.original_run_lease);
-        });
-        builder
-            .build()
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.dlq_entries (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease)
+            SELECT job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease
+            FROM unnest(
+                $1::bigint[], $2::text[], $3::text[], $4::jsonb[], $5::text[], $6::smallint[],
+                $7::smallint[], $8::bigint[], $9::smallint[], $10::timestamptz[], $11::timestamptz[],
+                $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[], $16::jsonb[],
+                $17::text[], $18::timestamptz[], $19::bigint[]
+            ) AS rows (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload, dlq_reason, dlq_at, original_run_lease)
+            "#
+        ))
+        .bind(rows.iter().map(|row| row.job_id).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.queue.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| &row.args).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.state.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.priority).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.attempt).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_lease).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.max_attempts).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.attempted_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.finalized_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.created_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.unique_key.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.unique_states.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| storage_payload(&row.payload)).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.dlq_reason.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.dlq_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.original_run_lease).collect::<Vec<_>>())
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         Ok(rows.len())
     }
@@ -15290,5 +15305,27 @@ impl QueueStorage {
 
     fn attempt_state_table(&self) -> String {
         format!("{}.{}", self.schema(), self.attempt_state_relname())
+    }
+}
+
+#[cfg(test)]
+mod writer_bind_tests {
+    /// Multi-row `VALUES` writers bind one parameter per column per row, so a
+    /// large batch exceeds PostgreSQL's 65,535 bind-parameter limit. Writers
+    /// send one array per column through `unnest` instead.
+    #[test]
+    fn queue_storage_writers_do_not_bind_per_row() {
+        let needle = concat!(".push", "_values(");
+        let offenders: Vec<usize> = include_str!("queue_storage.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .map(|(index, _)| index + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "queue_storage.rs builds a per-row VALUES insert at lines {offenders:?}; \
+             use INSERT ... SELECT FROM unnest(...) with one array bind per column"
+        );
     }
 }

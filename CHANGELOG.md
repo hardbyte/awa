@@ -4,6 +4,24 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.12] — Unreleased
+
+Patch release: batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit. No migration and no public API change.
+
+- **Completing a large batch and moving many failed jobs to the DLQ no longer
+  fail on queue storage** (backport of the writer approach in
+  [#506](https://github.com/hardbyte/awa/pull/506)). The `done_entries` and
+  `dlq_entries` writers bound every column of every row as its own parameter,
+  so a single statement of more than 4,681 completed jobs (3,276 for rows
+  written without ready-entry backing) or more than 3,449 DLQ rows exceeded
+  PostgreSQL's 65,535-parameter limit and failed with
+  `too many arguments for query`, rolling the whole operation back. Bulk
+  "move failed to DLQ" on a queue with more than about 3,450 failed jobs
+  always failed this way, and completion batches could hit it when
+  `AWA_COMPLETION_BATCH_SIZE` is raised above the default of 512. Both writers
+  now send one array per column through a fixed-text
+  `INSERT ... SELECT FROM unnest(...)`.
+
 ## [0.6.11] — 2026-11-04
 
 Patch release: promotion of due scheduled and retryable jobs on queue storage no longer stalls once a backlog builds. No migration, no schema patch and no public API change. Upgrading from 0.6.10 is a rolling upgrade of processes; promotion runs on the maintenance leader, so a stalled deployment recovers once the leader runs 0.6.11, and any runtime can become leader, so roll all of them.
