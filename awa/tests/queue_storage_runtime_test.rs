@@ -3917,6 +3917,471 @@ async fn test_queue_storage_late_completion_cannot_finalize_reclaimed_running_at
     assert_eq!(current.run_lease, second_claim.job.run_lease);
 }
 
+const BIND_LIMIT_BATCH_ROWS: usize = 5_000;
+
+fn bind_limit_params(
+    queue: &str,
+    count: usize,
+    run_at: Option<DateTime<Utc>>,
+) -> Vec<awa::InsertParams> {
+    (0..count)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id: id as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at,
+                    ..Default::default()
+                },
+            )
+            .expect("Failed to build insert params")
+        })
+        .collect()
+}
+
+async fn table_row_count(pool: &sqlx::PgPool, schema: &str, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.{table}"))
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count rows")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_ready_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_enqueue_ready";
+    let schema = "awa_qs_bind_limit_enqueue_ready";
+    let store = create_store(&pool, schema).await;
+
+    let ready = bind_limit_params(queue, BIND_LIMIT_BATCH_ROWS, None);
+    let inserted = store
+        .enqueue_params_batch(&pool, &ready)
+        .await
+        .expect("ready batch above the 65,535 bind-parameter limit should insert");
+    assert_eq!(inserted, BIND_LIMIT_BATCH_ROWS);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_scheduled_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_enqueue_scheduled";
+    let schema = "awa_qs_bind_limit_enqueue_scheduled";
+    let store = create_store(&pool, schema).await;
+
+    let scheduled = bind_limit_params(
+        queue,
+        BIND_LIMIT_BATCH_ROWS,
+        Some(Utc::now() + chrono::Duration::hours(1)),
+    );
+    let inserted = store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("scheduled batch above the 65,535 bind-parameter limit should insert");
+    assert_eq!(inserted, BIND_LIMIT_BATCH_ROWS);
+    assert_eq!(
+        table_row_count(&pool, schema, "deferred_jobs").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_promote_due_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_promote";
+    let schema = "awa_qs_bind_limit_promote";
+    let store = create_store(&pool, schema).await;
+
+    for _ in 0..(BIND_LIMIT_BATCH_ROWS / 1_000) {
+        let chunk = bind_limit_params(queue, 1_000, Some(Utc::now() + chrono::Duration::hours(1)));
+        store
+            .enqueue_params_batch(&pool, &chunk)
+            .await
+            .expect("Failed to enqueue scheduled chunk");
+    }
+    sqlx::query(&format!(
+        "UPDATE {schema}.deferred_jobs SET run_at = clock_timestamp() - interval '1 minute'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("Failed to make scheduled jobs due");
+    assert_eq!(
+        table_row_count(&pool, schema, "deferred_jobs").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+
+    // Same batch size the maintenance loop uses for promotion.
+    let batch_size = 4_096;
+    let first = store
+        .promote_due(&pool, JobState::Scheduled, batch_size)
+        .await
+        .expect("promoting a full batch must not exceed the bind-parameter limit");
+    assert_eq!(first, batch_size as usize);
+    let second = store
+        .promote_due(&pool, JobState::Scheduled, batch_size)
+        .await
+        .expect("Failed to promote remaining due jobs");
+    assert_eq!(second, BIND_LIMIT_BATCH_ROWS - batch_size as usize);
+    let third = store
+        .promote_due(&pool, JobState::Scheduled, batch_size)
+        .await
+        .expect("Failed to run empty promotion");
+    assert_eq!(third, 0);
+
+    assert_eq!(table_row_count(&pool, schema, "deferred_jobs").await, 0);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 100, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim promoted jobs");
+    assert_eq!(claimed.len(), 100);
+}
+
+/// Wall-clock allowance for work the runtime finishes in seconds when it has
+/// a core to itself; loosened on shared CI runners.
+fn scaled_timeout(base: Duration) -> Duration {
+    if std::env::var_os("CI").is_some() {
+        base * 3
+    } else {
+        base
+    }
+}
+
+fn bind_limit_store_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    }
+}
+
+fn bind_limit_client<W: Worker + 'static>(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    schema: &str,
+    worker: W,
+) -> Client {
+    Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 64,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            bind_limit_store_config(schema),
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(worker)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("Failed to build queue_storage client")
+}
+
+async fn enqueue_in_chunks(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    params: &[awa::InsertParams],
+) {
+    // Chunks stay under the bind-parameter limit on every writer so setup
+    // does not depend on the behaviour under test.
+    for chunk in params.chunks(1_000) {
+        store
+            .enqueue_params_batch(pool, chunk)
+            .await
+            .expect("Failed to enqueue chunk");
+    }
+}
+
+async fn make_deferred_jobs_due(pool: &sqlx::PgPool, schema: &str) {
+    sqlx::query(&format!(
+        "UPDATE {schema}.deferred_jobs SET run_at = clock_timestamp() - interval '1 minute'"
+    ))
+    .execute(pool)
+    .await
+    .expect("Failed to make deferred jobs due");
+}
+
+async fn wait_for_completed_terminal_count(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    expected: i64,
+    timeout: Duration,
+) {
+    let start = Instant::now();
+    loop {
+        let completed = completed_terminal_count(pool, store, queue).await;
+        if completed == expected {
+            return;
+        }
+        if start.elapsed() > timeout {
+            let deferred = table_row_count(pool, store.schema(), "deferred_jobs").await;
+            panic!(
+                "timed out after {timeout:?}: {completed}/{expected} jobs completed, \
+                 {deferred} still in deferred_jobs"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_drains_scheduled_backlog_due_at_once() {
+    const JOBS: usize = 10_000;
+    let (_db_guard, pool) = setup_pool(20).await;
+    let queue = "qs_bind_limit_scheduled_drain";
+    let schema = "awa_qs_bind_limit_scheduled_drain";
+    let store = create_store(&pool, schema).await;
+
+    let params = bind_limit_params(queue, JOBS, Some(Utc::now() + chrono::Duration::hours(1)));
+    enqueue_in_chunks(&pool, &store, &params).await;
+    assert_eq!(
+        table_row_count(&pool, schema, "deferred_jobs").await,
+        JOBS as i64
+    );
+
+    let client = bind_limit_client(&pool, queue, schema, CompleteWorker);
+    client.start().await.expect("Failed to start client");
+    make_deferred_jobs_due(&pool, schema).await;
+
+    wait_for_completed_terminal_count(
+        &pool,
+        &store,
+        queue,
+        JOBS as i64,
+        scaled_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    assert_eq!(table_row_count(&pool, schema, "deferred_jobs").await, 0);
+
+    client.shutdown(Duration::from_secs(10)).await;
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct RetryAllJob {
+    id: i64,
+}
+
+struct RetryLaterWorker;
+
+#[async_trait::async_trait]
+impl Worker for RetryLaterWorker {
+    fn kind(&self) -> &'static str {
+        "retry_all_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if ctx.job.attempt == 1 {
+            Ok(JobResult::RetryAfter(Duration::from_secs(3600)))
+        } else {
+            Ok(JobResult::Completed)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_drains_retryable_backlog_due_at_once() {
+    const JOBS: usize = 4_000;
+    let (_db_guard, pool) = setup_pool(20).await;
+    let queue = "qs_bind_limit_retry_drain";
+    let schema = "awa_qs_bind_limit_retry_drain";
+    let store = create_store(&pool, schema).await;
+
+    let params: Vec<_> = (0..JOBS)
+        .map(|id| {
+            insert::params_with(
+                &RetryAllJob { id: id as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("Failed to build insert params")
+        })
+        .collect();
+    enqueue_in_chunks(&pool, &store, &params).await;
+
+    let client = bind_limit_client(&pool, queue, schema, RetryLaterWorker);
+    client.start().await.expect("Failed to start client");
+
+    let start = Instant::now();
+    let timeout = scaled_timeout(Duration::from_secs(60));
+    while table_row_count(&pool, schema, "deferred_jobs").await != JOBS as i64 {
+        assert!(
+            start.elapsed() < timeout,
+            "jobs did not all reach retryable within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let retryable: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.deferred_jobs WHERE state = 'retryable' AND attempted_at IS NOT NULL"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count retryable rows");
+    assert_eq!(retryable, JOBS as i64);
+
+    make_deferred_jobs_due(&pool, schema).await;
+    wait_for_completed_terminal_count(
+        &pool,
+        &store,
+        queue,
+        JOBS as i64,
+        scaled_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    assert_eq!(table_row_count(&pool, schema, "deferred_jobs").await, 0);
+
+    client.shutdown(Duration::from_secs(10)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_promote_due_preserves_row_fields_across_lanes() {
+    const JOBS: usize = 4_500;
+    const QUEUES: [&str; 3] = ["qs_fidelity_a", "qs_fidelity_b", "qs_fidelity_c"];
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_promote_fidelity";
+    let store = create_store(&pool, schema).await;
+
+    let run_at = Utc::now() + chrono::Duration::hours(1);
+    let params: Vec<awa::InsertParams> = (0..JOBS)
+        .map(|index| {
+            let args = match index % 4 {
+                0 => serde_json::json!({ "index": index, "text": "plain" }),
+                1 => serde_json::json!({
+                    "index": index,
+                    "text": "quote\" back\\slash \n newline ünïcode \u{1F980}",
+                    "nested": { "list": [1, 2.5, null, "x"], "empty": {} },
+                }),
+                2 => serde_json::json!({ "index": index, "flag": true, "none": null, "big": i64::MAX }),
+                _ => serde_json::json!({ "index": index, "items": (0..(index % 17)).collect::<Vec<_>>() }),
+            };
+            awa::InsertParams {
+                kind: "fidelity_job".to_string(),
+                args,
+                opts: InsertOpts {
+                    queue: QUEUES[index % QUEUES.len()].to_string(),
+                    priority: 1 + (index % 4) as i16,
+                    max_attempts: 3 + (index % 5) as i16,
+                    run_at: Some(run_at),
+                    metadata: serde_json::json!({ "origin": "fidelity", "index": index }),
+                    tags: vec![format!("tag-{}", index % 7), "fidelity".to_string()],
+                    unique: Some(awa::UniqueOpts::default()),
+                    ..Default::default()
+                },
+            }
+        })
+        .collect();
+    enqueue_in_chunks(&pool, &store, &params).await;
+
+    let with_unique_key: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.deferred_jobs WHERE unique_key IS NOT NULL AND unique_states IS NOT NULL AND payload IS NOT NULL AND payload <> '{{}}'::jsonb"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count unique deferred rows");
+    assert_eq!(with_unique_key, JOBS as i64);
+
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.deferred_snapshot AS SELECT * FROM {schema}.deferred_jobs"
+    ))
+    .execute(&pool)
+    .await
+    .expect("Failed to snapshot deferred rows");
+    make_deferred_jobs_due(&pool, schema).await;
+
+    let mut promoted = 0;
+    loop {
+        let moved = store
+            .promote_due(&pool, JobState::Scheduled, 4_096)
+            .await
+            .expect("Failed to promote");
+        if moved == 0 {
+            break;
+        }
+        promoted += moved;
+    }
+    assert_eq!(promoted, JOBS);
+    assert_eq!(table_row_count(&pool, schema, "deferred_jobs").await, 0);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        JOBS as i64
+    );
+
+    let mismatched: i64 = sqlx::query_scalar(&format!(
+        r#"
+        SELECT count(*)
+        FROM {schema}.deferred_snapshot d
+        LEFT JOIN {schema}.ready_entries r ON r.job_id = d.job_id
+        WHERE r.job_id IS NULL
+           OR r.kind IS DISTINCT FROM d.kind
+           OR r.queue IS DISTINCT FROM d.queue
+           OR r.args IS DISTINCT FROM d.args
+           OR r.priority IS DISTINCT FROM d.priority
+           OR r.attempt IS DISTINCT FROM d.attempt
+           OR r.run_lease IS DISTINCT FROM d.run_lease
+           OR r.max_attempts IS DISTINCT FROM d.max_attempts
+           OR r.attempted_at IS DISTINCT FROM d.attempted_at
+           OR r.created_at IS DISTINCT FROM d.created_at
+           OR r.unique_key IS DISTINCT FROM d.unique_key
+           OR r.unique_states IS DISTINCT FROM d.unique_states
+           OR COALESCE(r.payload, '{{}}'::jsonb) IS DISTINCT FROM COALESCE(d.payload, '{{}}'::jsonb)
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to compare rows");
+    assert_eq!(
+        mismatched, 0,
+        "ready rows differ from the deferred rows they came from"
+    );
+
+    let lanes: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(DISTINCT (queue, priority)) FROM {schema}.ready_entries"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count lanes");
+    assert_eq!(lanes, 12, "expected 3 queues x 4 priorities");
+    assert!(table_row_count(&pool, schema, "ready_segments").await >= lanes);
+
+    // The unique claim moved with the job: re-enqueueing any of these keys is
+    // rejected while the original is available.
+    for index in [0usize, 1, JOBS / 2, JOBS - 1] {
+        let duplicate = store
+            .enqueue_params_batch(&pool, std::slice::from_ref(&params[index]))
+            .await;
+        assert!(
+            matches!(duplicate, Err(AwaError::UniqueConflict { .. })),
+            "duplicate of job {index} should conflict, got {duplicate:?}"
+        );
+    }
+    let fresh = awa::InsertParams {
+        args: serde_json::json!({ "index": "never-enqueued" }),
+        ..params[0].clone()
+    };
+    store
+        .enqueue_params_batch(&pool, &[fresh])
+        .await
+        .expect("a different key must still enqueue");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_cancel_is_noop() {
     let (_db_guard, pool) = setup_pool(10).await;
