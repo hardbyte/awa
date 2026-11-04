@@ -2419,7 +2419,8 @@ themes from this document: <strong>operations</strong> (WS-3, D3, D5), <strong>o
   The tick()-only demo leaves its exit criterion.</li>
 <li><strong>M3</strong> keeps its exit criterion. Rust and Python propagation shipped (ADR-039); what remains is
   a Python retry trace-link test and the #375 timeline. #376 alerts and #391 join M3.</li>
-<li><strong>M4 and M5</strong> move to 0.8. Their ADRs (033, 034, 035, 042) stay Proposed.</li>
+<li><strong>M4 and M5</strong> move to 0.8. Their ADRs (033, 034, 035, 042) stay Proposed. M6's beta no longer
+  waits on them.</li>
 <li><strong>§7 gates.</strong> Gate 1 drops the dependency-promotion and claim-time key-gating models. Gate 2
   drops the ≥9k jobs/s partitioned preset and adds <code>claim_ready_runtime</code> p99 on the release
   candidate. Gate 3's 14 consecutive green runs count runs of the chaos workflow, which runs
@@ -2950,7 +2951,7 @@ all of the above).
 <em>Exit:</em> the four-surface reference topology (private admin, public signed callbacks, workers,
 maintenance-only) installable from the Helm chart with kind smoke in CI; tick()-only demo green.</p>
 <p><strong>M3 — Observability.</strong>
-Issue #110 (Rust path → Python boundary), the E8 gate, #375, and #376.
+Issue #110 (Rust path → Python boundary), the E8 gate, #375, #376 and #391.
 <em>Exit:</em> a job enqueued in a traced FastAPI request shows one connected trace through a Python
 worker retry to completion; UI attempt timeline links to it.</p>
 <p><strong>M4 — Flow &amp; tenancy.</strong>
@@ -2964,13 +2965,17 @@ the Gate-A restructuring migrations with TLA+ deltas and a fresh long-horizon ac
 the raised bar.
 <em>Exit:</em> §7 performance gate numbers hold on clean main.</p>
 <p><strong>M6 — Release train.</strong>
-<code>0.7.0-beta.1</code> when M0+M2+M3 are done and M4/M5 are merge-complete (judgment-call gates resolve
+<code>0.7.0-beta.1</code> when M0+M2+M3 are done (M4 and M5 moved to 0.8 and do not gate it; judgment-call gates resolve
 under beta exposure, per the 0.6 precedent). RC when every §7 gate is green. Stable when the
 tracker checklist is fully checked, release notes carry caveated evidence (not universal
 claims), and publish mechanics (crates in dependency order, wheels, chart OCI push, Docker,
 GitHub release) are green.</p>
 <hr />
 <h2 id="7-release-gates-for-070-stable">7. Release gates for 0.7.0 stable<a class="headerlink" href="#7-release-gates-for-070-stable" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p>The scope revision changes Gates 1, 2, 3 and 5 (see the top of this document). The list below
+is the original baseline; #383 holds the current checklist.</p>
+</blockquote>
 <p>The #383 tracker opens with these as live checklists (the #197 template, six gates):</p>
 <ol>
 <li><strong>Correctness.</strong> TLA+ green including new models: dependency promotion race (ADR-034),

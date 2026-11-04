@@ -34,7 +34,8 @@ Consequences for the sections below:
   The tick()-only demo leaves its exit criterion.
 - **M3** keeps its exit criterion. Rust and Python propagation shipped (ADR-039); what remains is
   a Python retry trace-link test and the #375 timeline. #376 alerts and #391 join M3.
-- **M4 and M5** move to 0.8. Their ADRs (033, 034, 035, 042) stay Proposed.
+- **M4 and M5** move to 0.8. Their ADRs (033, 034, 035, 042) stay Proposed. M6's beta no longer
+  waits on them.
 - **§7 gates.** Gate 1 drops the dependency-promotion and claim-time key-gating models. Gate 2
   drops the ≥9k jobs/s partitioned preset and adds `claim_ready_runtime` p99 on the release
   candidate. Gate 3's 14 consecutive green runs count runs of the chaos workflow, which runs
@@ -377,7 +378,7 @@ all of the above).
 maintenance-only) installable from the Helm chart with kind smoke in CI; tick()-only demo green.
 
 **M3 — Observability.**
-Issue #110 (Rust path → Python boundary), the E8 gate, #375, and #376.
+Issue #110 (Rust path → Python boundary), the E8 gate, #375, #376 and #391.
 *Exit:* a job enqueued in a traced FastAPI request shows one connected trace through a Python
 worker retry to completion; UI attempt timeline links to it.
 
@@ -394,7 +395,7 @@ the raised bar.
 *Exit:* §7 performance gate numbers hold on clean main.
 
 **M6 — Release train.**
-`0.7.0-beta.1` when M0+M2+M3 are done and M4/M5 are merge-complete (judgment-call gates resolve
+`0.7.0-beta.1` when M0+M2+M3 are done (M4 and M5 moved to 0.8 and do not gate it; judgment-call gates resolve
 under beta exposure, per the 0.6 precedent). RC when every §7 gate is green. Stable when the
 tracker checklist is fully checked, release notes carry caveated evidence (not universal
 claims), and publish mechanics (crates in dependency order, wheels, chart OCI push, Docker,
@@ -403,6 +404,9 @@ GitHub release) are green.
 ---
 
 ## 7. Release gates for 0.7.0 stable
+
+> The scope revision changes Gates 1, 2, 3 and 5 (see the top of this document). The list below
+> is the original baseline; #383 holds the current checklist.
 
 The #383 tracker opens with these as live checklists (the #197 template, six gates):
 
