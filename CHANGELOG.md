@@ -6,8 +6,25 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.12] — Unreleased
 
-Patch release: batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration and no public API change.
+Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration and no public API change.
 
+- **Queue storage no longer drives PostgreSQL 18 into a backend crash when a
+  rescue, cancel or claim close locks a claim that was just rewritten.** A
+  statement that locks a row another transaction updated after the
+  statement's snapshot rechecks the row (EvalPlanQual). In PostgreSQL 18
+  (reproduced on 18.6) that recheck rebuilds the statement's run-time partition
+  pruning state in memory that is freed when the lock runs out of rows, so a
+  later pruning pass in the same statement reads freed memory and the backend
+  segfaults ([pgsql-bugs report](https://www.postgresql.org/message-id/CAP2G_gGpV%3DrKMLuET4RW-qO41GvBvi6Czsjsj16eT9hAwHxG6w%40mail.gmail.com)).
+  The server then restarts, dropping every connection; on managed services
+  with `restart_after_crash` off it fails over instead. The deadline and
+  stale-heartbeat rescues hit this whenever a heartbeat rewrote an expired or
+  stale claim while they ran: they locked the claim, then marked it closed
+  through a pruned scan of `lease_claims`. The rescues now update the slot's
+  own claim partition, the completion, heartbeat, callback and close paths
+  lock their attempts' claims in a statement that prunes nothing before the
+  statements that lock them again, and cancel looks up row and batch receipts
+  in separate statements.
 - **Completing a large batch and moving many failed jobs to the DLQ no longer
   fail on queue storage** (backport of the writer approach in
   [#506](https://github.com/hardbyte/awa/pull/506)). The `done_entries` and
