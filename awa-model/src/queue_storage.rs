@@ -1578,6 +1578,25 @@ struct ReadyTransitionRow {
     payload: serde_json::Value,
 }
 
+/// A receipt-backed attempt found by a receipt-only cancel: claim slot, run
+/// lease, ready slot, ready generation, queue, priority, attempt, max
+/// attempts, lane position, claim time, receipt id and whether it is a compact
+/// batch claim.
+type ReceiptCancelRow = (
+    i32,
+    i64,
+    i32,
+    i64,
+    String,
+    i16,
+    i16,
+    i16,
+    i64,
+    DateTime<Utc>,
+    i64,
+    bool,
+);
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DrainLane {
     queue: String,
@@ -7892,6 +7911,156 @@ impl QueueStorage {
         sql
     }
 
+    /// The row and batch receipt lookups behind a receipt-only cancel, each
+    /// its own statement. A lookup that locks a claim another transaction has
+    /// just rewritten rechecks it, and PostgreSQL 18 frees the statement's
+    /// run-time partition pruning state when that lock runs out of rows; a
+    /// later pruning pass in the same statement would read freed memory.
+    fn receipt_cancel_lookup_sql(&self, lock: bool) -> [String; 2] {
+        let schema = self.schema();
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+        let row_sql = format!(
+            r#"
+            SELECT
+                claims.claim_slot,
+                claims.run_lease,
+                claims.ready_slot,
+                claims.ready_generation,
+                claims.queue,
+                claims.priority,
+                claims.attempt,
+                claims.max_attempts,
+                claims.lane_seq,
+                claims.claimed_at,
+                claims.receipt_id,
+                false AS compact_batch
+            FROM {schema}.lease_claims AS claims
+            WHERE claims.job_id = $1
+              AND NOT {closed_evidence}
+            ORDER BY claims.run_lease DESC
+            LIMIT 1
+            FOR UPDATE OF claims SKIP LOCKED
+            "#
+        );
+        let batch_sql = format!(
+            r#"
+            SELECT
+                claim_batches.claim_slot,
+                items.run_lease,
+                claim_batches.ready_slot,
+                claim_batches.ready_generation,
+                claim_batches.queue,
+                claim_batches.priority,
+                items.attempt,
+                items.max_attempts,
+                items.lane_seq,
+                claim_batches.claimed_at,
+                items.receipt_id,
+                true AS compact_batch
+            FROM {schema}.lease_claim_batches AS claim_batches
+            CROSS JOIN LATERAL unnest(
+                claim_batches.job_ids,
+                claim_batches.run_leases,
+                claim_batches.receipt_ids,
+                claim_batches.lane_seqs,
+                claim_batches.attempts,
+                claim_batches.max_attempts
+            ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+            WHERE items.job_id = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = claim_batches.claim_slot
+                    AND closures.job_id = items.job_id
+                    AND closures.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                    AND closure_batches.receipt_ranges @> items.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
+            ORDER BY items.run_lease DESC
+            LIMIT 1
+            FOR UPDATE OF claim_batches SKIP LOCKED
+            "#
+        );
+        if lock {
+            [row_sql, batch_sql]
+        } else {
+            [
+                row_sql.replace("FOR UPDATE OF claims SKIP LOCKED", ""),
+                batch_sql.replace("FOR UPDATE OF claim_batches SKIP LOCKED", ""),
+            ]
+        }
+    }
+
+    /// The run lease of the job's open receipt-backed attempt, read without
+    /// locking anything.
+    async fn open_receipt_run_lease_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<i64>, AwaError> {
+        let mut run_lease = None;
+        for sql in self.receipt_cancel_lookup_sql(false) {
+            let found: Option<ReceiptCancelRow> = sqlx::query_as(&sql)
+                .bind(job_id)
+                .fetch_optional(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            run_lease = run_lease.max(found.map(|receipt| receipt.1));
+        }
+        Ok(run_lease)
+    }
+
+    /// Lock the job's open receipt-backed attempt, preferring the newer run
+    /// lease when it has both a row and a batch receipt.
+    async fn lock_open_receipt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<ReceiptCancelRow>, AwaError> {
+        let mut newest: Option<ReceiptCancelRow> = None;
+        for sql in self.receipt_cancel_lookup_sql(true) {
+            let found: Option<ReceiptCancelRow> = sqlx::query_as(&sql)
+                .bind(job_id)
+                .fetch_optional(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            if let Some(found) = found {
+                if newest.as_ref().is_none_or(|current| found.1 > current.1) {
+                    newest = Some(found);
+                }
+            }
+        }
+        Ok(newest)
+    }
+
     async fn cancel_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -8051,129 +8220,20 @@ impl QueueStorage {
         // lease_claim_closures, cancel it by writing a closure and a
         // done row, and notify listening workers.
         if self.lease_claim_receipts() {
-            let closure_rel = format!("{schema}.lease_claim_closures");
-            let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-            let closed_evidence =
-                receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
-            type ReceiptCancelRow = (
-                i32,
-                i64,
-                i32,
-                i64,
-                String,
-                i16,
-                i16,
-                i16,
-                i64,
-                DateTime<Utc>,
-                i64,
-                bool,
-            );
-            // Each kind of receipt is looked up and locked by its own
-            // statement. A lookup that locks a claim another transaction has
-            // just rewritten rechecks it, and PostgreSQL 18 frees the
-            // statement's run-time partition pruning state when that lock runs
-            // out of rows; a later pruning pass in the same statement would
-            // read freed memory.
-            let row_receipt: Option<ReceiptCancelRow> = sqlx::query_as(&format!(
-                r#"
-                SELECT
-                    claims.claim_slot,
-                    claims.run_lease,
-                    claims.ready_slot,
-                    claims.ready_generation,
-                    claims.queue,
-                    claims.priority,
-                    claims.attempt,
-                    claims.max_attempts,
-                    claims.lane_seq,
-                    claims.claimed_at,
-                    claims.receipt_id,
-                    false AS compact_batch
-                FROM {schema}.lease_claims AS claims
-                WHERE claims.job_id = $1
-                  AND NOT {closed_evidence}
-                ORDER BY claims.run_lease DESC
-                LIMIT 1
-                FOR UPDATE OF claims SKIP LOCKED
-                "#
-            ))
-            .bind(job_id)
-            .fetch_optional(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-            let batch_receipt: Option<ReceiptCancelRow> = sqlx::query_as(&format!(
-                r#"
-                SELECT
-                    claim_batches.claim_slot,
-                    items.run_lease,
-                    claim_batches.ready_slot,
-                    claim_batches.ready_generation,
-                    claim_batches.queue,
-                    claim_batches.priority,
-                    items.attempt,
-                    items.max_attempts,
-                    items.lane_seq,
-                    claim_batches.claimed_at,
-                    items.receipt_id,
-                    true AS compact_batch
-                FROM {schema}.lease_claim_batches AS claim_batches
-                CROSS JOIN LATERAL unnest(
-                    claim_batches.job_ids,
-                    claim_batches.run_leases,
-                    claim_batches.receipt_ids,
-                    claim_batches.lane_seqs,
-                    claim_batches.attempts,
-                    claim_batches.max_attempts
-                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-                WHERE items.job_id = $1
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.claim_slot = claim_batches.claim_slot
-                        AND closures.job_id = items.job_id
-                        AND closures.run_lease = items.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closure_batches AS closure_batches
-                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
-                        AND closure_batches.receipt_ranges @> items.receipt_id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.leases AS lease
-                      WHERE lease.job_id = items.job_id
-                        AND lease.run_lease = items.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.done_entries AS done
-                      WHERE done.job_id = items.job_id
-                        AND done.run_lease = items.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                      WHERE deferred.job_id = items.job_id
-                        AND deferred.run_lease = items.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.dlq_entries AS dlq
-                      WHERE dlq.job_id = items.job_id
-                        AND dlq.run_lease = items.run_lease
-                  )
-                ORDER BY items.run_lease DESC
-                LIMIT 1
-                FOR UPDATE OF claim_batches SKIP LOCKED
-                "#
-            ))
-            .bind(job_id)
-            .fetch_optional(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-            let receipt = match (row_receipt, batch_receipt) {
-                (Some(row), Some(batch)) if batch.1 > row.1 => Some(batch),
-                (Some(row), _) => Some(row),
-                (None, batch) => batch,
+            // A fast completion closes an attempt under its completion lock
+            // without locking claim rows, so a cancel that only locked the
+            // rows could commit alongside it. Find the open attempt with plain
+            // reads, take its completion lock, then look again: a completion
+            // that got there first has committed its closure by then.
+            let receipt = match self.open_receipt_run_lease_tx(tx, job_id).await? {
+                Some(run_lease) => {
+                    self.lock_receipt_attempt_keys_tx(tx, &[(job_id, run_lease)])
+                        .await?;
+                    self.lock_open_receipt_tx(tx, job_id)
+                        .await?
+                        .filter(|receipt| receipt.1 == run_lease)
+                }
+                None => None,
             };
 
             if let Some((
@@ -8469,6 +8529,18 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         self.lock_claim_heads_of_jobs_tx(&mut tx, ids).await?;
+        if self.lease_claim_receipts() {
+            // Completion batches take these locks in one statement, in key
+            // order; taking them one job at a time could deadlock with one.
+            let mut attempts = Vec::new();
+            for job_id in ids {
+                if let Some(run_lease) = self.open_receipt_run_lease_tx(&mut tx, *job_id).await? {
+                    attempts.push((*job_id, run_lease));
+                }
+            }
+            self.lock_receipt_attempt_keys_tx(&mut tx, &attempts)
+                .await?;
+        }
         let mut rows = Vec::with_capacity(ids.len());
         let mut claim_cursor_advances = Vec::new();
         for job_id in ids {
