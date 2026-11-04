@@ -20567,9 +20567,10 @@ async fn test_queue_storage_drain_and_cancel_leave_claims_the_cursor_has_not_pas
     let cancelled = store
         .cancel_job(&pool, claimed[0].job.id)
         .await
-        .expect("cancel a claimed job");
-    assert!(
-        cancelled.is_none_or(|row| row.run_lease == claimed[0].job.run_lease),
+        .expect("cancel a claimed job")
+        .expect("cancel must reach the running attempt");
+    assert_eq!(
+        cancelled.run_lease, claimed[0].job.run_lease,
         "cancel must act on the running attempt, not the claimed ready row"
     );
     let moved = store
