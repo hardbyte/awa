@@ -4,6 +4,20 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- **Callback completion, `get_job` and lifecycle events find running jobs
+  that priority aging promoted on queue storage** (backport of #600). Claims
+  and leases record a job's aged effective priority while its ready row keeps
+  the lane priority, and three reads joined the two on priority. With aging on
+  (the default, every 60 s), a job that waited past a minute before it was
+  claimed could not be completed by callback with an expected kind, failed the
+  mixed-transition callback routing check, and read back from `get_job` in the
+  wrong state. They now match the attempt (`job_id` and `run_lease`). No
+  migration.
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing. It now reads all of them from one read-only snapshot.
+
 ## [0.6.11] — 2026-11-04
 
 Patch release: promotion of due scheduled and retryable jobs on queue storage no longer stalls once a backlog builds. No migration, no schema patch and no public API change. Upgrading from 0.6.10 is a rolling upgrade of processes; promotion runs on the maintenance leader, so a stalled deployment recovers once the leader runs 0.6.11, and any runtime can become leader, so roll all of them.
