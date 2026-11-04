@@ -9133,6 +9133,17 @@ async fn assert_completed_done_rows(
     .await
     .expect("count completed done_entries");
     assert_eq!(completed, completions.len() as i64);
+    let mut persisted: Vec<(i64, i64)> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease FROM {schema}.done_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("load completed done_entries");
+    persisted.sort_unstable();
+    let mut expected = completions.to_vec();
+    expected.sort_unstable();
+    assert_eq!(persisted, expected);
     let leases: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1"
     ))
@@ -9213,6 +9224,13 @@ async fn test_queue_storage_bulk_move_failed_to_dlq_exceeding_bind_parameter_lim
 
     seed_terminal_rows(&pool, schema, queue, "failed", DLQ_BIND_LIMIT_ROWS).await;
     seed_terminal_rows(&pool, schema, queue, "completed", 3).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET run_lease = job_id WHERE queue = $1 AND state = 'failed'"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("give each failed row its own run_lease");
 
     let moved = store
         .bulk_move_failed_to_dlq(&pool, None, Some(queue), "bind-limit")
@@ -9228,6 +9246,14 @@ async fn test_queue_storage_bulk_move_failed_to_dlq_exceeding_bind_parameter_lim
     .await
     .expect("count dlq_entries");
     assert_eq!(dlq_count, DLQ_BIND_LIMIT_ROWS);
+    let kept_run_lease: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.dlq_entries WHERE queue = $1 AND dlq_reason = 'bind-limit' AND original_run_lease = job_id"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count dlq_entries keeping their run_lease");
+    assert_eq!(kept_run_lease, DLQ_BIND_LIMIT_ROWS);
     let failed_left: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1 AND state = 'failed'"
     ))
