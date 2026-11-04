@@ -6,6 +6,20 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Callback completion, `get_job` and lifecycle events find running jobs
+  that priority aging promoted** (the Rust side of
+  [#569](https://github.com/hardbyte/awa/issues/569)). Claims and leases
+  record a job's aged effective priority while its ready row keeps the lane
+  priority, and three reads joined the two on priority. With aging on (the
+  default, every 60 s), a job that waited past a minute before it was claimed
+  could not be completed by callback with an expected kind, failed the
+  mixed-transition callback routing check, and read back from `get_job` in
+  the wrong state. They now match the attempt (`job_id` and `run_lease`).
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing; the weekly mixed-version rehearsal hit this on
+  2026-11-01. It now reads all of them from one read-only snapshot.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened
