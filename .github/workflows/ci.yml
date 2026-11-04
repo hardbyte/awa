@@ -54,6 +54,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Check CI test-shard membership
+        run: ./scripts/ci-test-shard.sh check
 
   rust-build:
     name: Rust build
@@ -70,16 +72,36 @@ jobs:
         run: cargo build --workspace
 
   rust-test:
-    name: Rust tests
+    name: Rust tests (pg${{ matrix.postgres }}, ${{ matrix.shard }})
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
-    # Migration replay tests are intentionally exhaustive for queue-storage
-    # upgrade safety and can take ~25m on GitHub-hosted runners by themselves.
-    timeout-minutes: 60
+    # The migration replay suite is partitioned per-test across four shards
+    # with cargo-nextest, the other slow awa binaries form `heavy`, every
+    # other awa test binary (including new test files, automatically) lands
+    # in `rest`, and the remaining workspace crates plus doctests run as
+    # `workspace`. Shard membership lives in scripts/ci-test-shard.sh; the
+    # lint job runs its `check` mode so renames can't silently drop coverage.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Postgres majors we support. The schema, its partitioning, and the
+        # planner behaviour the claim path depends on are all version-
+        # sensitive, so the whole sharded suite runs on each major rather
+        # than a smoke subset.
+        postgres: ["17", "18"]
+        shard:
+          - migrations-1
+          - migrations-2
+          - migrations-3
+          - migrations-4
+          - heavy
+          - rest
+          - workspace
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
@@ -93,13 +115,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
-      - name: Run tests
-        run: cargo test --workspace
+      - name: Run test shard
+        run: ./scripts/ci-test-shard.sh "${{ matrix.shard }}"
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
