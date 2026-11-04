@@ -4383,6 +4383,46 @@ async fn test_queue_storage_promote_due_preserves_row_fields_across_lanes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_batch_writing_more_segments_than_the_old_bind_limit() {
+    // `enqueue_batch` stamps each row with its own run_at, and segments split
+    // on every run_at change, so one batch yields about one segment per row:
+    // more than the 8,191 rows an 8-bind-per-row statement could carry.
+    const JOBS: usize = 9_000;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_segments";
+    let schema = "awa_qs_bind_limit_segments";
+    let store = create_store(&pool, schema).await;
+
+    let inserted = store
+        .enqueue_batch(&pool, queue, 2, JOBS as i64)
+        .await
+        .expect("a batch producing one segment per row should insert");
+    assert_eq!(inserted, JOBS as i64);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        JOBS as i64
+    );
+
+    let segments: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.ready_segments WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready segments");
+    assert!(
+        segments > 8_191,
+        "expected more than 8,191 segments from one batch, got {segments}"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 100, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim jobs");
+    assert_eq!(claimed.len(), 100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_cancel_is_noop() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_late_cancel";
@@ -9050,6 +9090,182 @@ async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
     assert_invariant_holds(&pool, schema, queue, "after retry_job from terminal").await;
 }
 
+const DONE_BIND_LIMIT_READY_ROWS: i64 = 5_000;
+const DONE_BIND_LIMIT_SYNTHETIC_ROWS: i64 = 4_000;
+const DLQ_BIND_LIMIT_ROWS: i64 = 4_000;
+
+async fn claim_leased_jobs(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    count: i64,
+) -> Vec<(i64, i64)> {
+    store
+        .enqueue_batch(pool, queue, 1, count)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(pool, queue, count, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), count as usize, "claim must return every job");
+    claimed
+        .iter()
+        .map(|entry| (entry.job.id, entry.job.run_lease))
+        .collect()
+}
+
+async fn assert_completed_done_rows(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+    completions: &[(i64, i64)],
+) {
+    assert_eq!(
+        done_entries_count(pool, schema, queue).await,
+        completions.len() as i64
+    );
+    let completed: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1 AND state = 'completed'"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count completed done_entries");
+    assert_eq!(completed, completions.len() as i64);
+    let mut persisted: Vec<(i64, i64)> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease FROM {schema}.done_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("load completed done_entries");
+    persisted.sort_unstable();
+    let mut expected = completions.to_vec();
+    expected.sort_unstable();
+    assert_eq!(persisted, expected);
+    let leases: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count leases");
+    assert_eq!(leases, 0, "completion must delete every lease");
+    assert_invariant_holds(pool, schema, queue, "after batch completion").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_complete_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_complete_ready";
+    let schema = "awa_qs_bind_limit_complete_ready";
+    let store = create_store(&pool, schema).await;
+
+    let completions = claim_leased_jobs(&pool, &store, queue, DONE_BIND_LIMIT_READY_ROWS).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let completed = store
+        .complete_job_batch_by_id_in_tx(&mut tx, &completions)
+        .await
+        .expect("ready-backed completion above the 65,535 bind-parameter limit should succeed");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(completed.len(), completions.len());
+    assert_completed_done_rows(&pool, schema, queue, &completions).await;
+}
+
+/// A running lease with a negative `lane_seq` is written as a self-contained
+/// (synthetic) done row. No public path produces one for a multi-row batch, so
+/// the lane sequence of the claimed rows is negated in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_complete_synthetic_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_complete_synthetic";
+    let schema = "awa_qs_bind_limit_complete_synthetic";
+    let store = create_store(&pool, schema).await;
+
+    let completions = claim_leased_jobs(&pool, &store, queue, DONE_BIND_LIMIT_SYNTHETIC_ROWS).await;
+    for table in ["ready_entries", "leases"] {
+        sqlx::query(&format!(
+            "UPDATE {schema}.{table} SET lane_seq = -lane_seq - 1 WHERE queue = $1"
+        ))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("negate lane_seq");
+    }
+
+    let mut tx = pool.begin().await.expect("begin");
+    let completed = store
+        .complete_job_batch_by_id_in_tx(&mut tx, &completions)
+        .await
+        .expect("synthetic completion above the 65,535 bind-parameter limit should succeed");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(completed.len(), completions.len());
+    assert_completed_done_rows(&pool, schema, queue, &completions).await;
+    let self_contained: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries \
+         WHERE queue = $1 AND lane_seq < 0 AND args IS NOT NULL AND max_attempts IS NOT NULL"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count synthetic done rows");
+    assert_eq!(self_contained, completions.len() as i64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_bulk_move_failed_to_dlq_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_bulk_dlq";
+    let schema = "awa_qs_bind_limit_bulk_dlq";
+    let store = create_store(&pool, schema).await;
+
+    seed_terminal_rows(&pool, schema, queue, "failed", DLQ_BIND_LIMIT_ROWS).await;
+    seed_terminal_rows(&pool, schema, queue, "completed", 3).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET run_lease = job_id WHERE queue = $1 AND state = 'failed'"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("give each failed row its own run_lease");
+
+    let moved = store
+        .bulk_move_failed_to_dlq(&pool, None, Some(queue), "bind-limit")
+        .await
+        .expect("bulk DLQ move above the 65,535 bind-parameter limit should succeed");
+    assert_eq!(moved, DLQ_BIND_LIMIT_ROWS as u64);
+
+    let dlq_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.dlq_entries WHERE queue = $1 AND dlq_reason = 'bind-limit'"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count dlq_entries");
+    assert_eq!(dlq_count, DLQ_BIND_LIMIT_ROWS);
+    let kept_run_lease: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.dlq_entries WHERE queue = $1 AND dlq_reason = 'bind-limit' AND original_run_lease = job_id"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count dlq_entries keeping their run_lease");
+    assert_eq!(kept_run_lease, DLQ_BIND_LIMIT_ROWS);
+    let failed_left: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1 AND state = 'failed'"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count failed done_entries");
+    assert_eq!(failed_left, 0);
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 3);
+    assert_invariant_holds(&pool, schema, queue, "after bulk DLQ move").await;
+}
+
 /// ADR-026: prune folds terminal rows into queue_terminal_rollups and clears
 /// the slot's folded counter and pending delta rows, keeping exact counts
 /// intact across rotate + prune even if the async rollup has not run.
@@ -13637,6 +13853,566 @@ async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
         "scoped lookup of a finished job's key read {scoped_finished} rows, then \
          {scoped_finished_claims} with retained claims"
     );
+}
+
+async fn queue_deferred_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count deferred jobs")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_cancels_a_backlog_larger_than_one_chunk() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_backlog";
+    let other_queue = "qs_drain_other";
+    let store = create_store(&pool, "awa_qs_drain_backlog").await;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 3_000)
+        .await
+        .expect("enqueue history");
+    loop {
+        let claimed = store
+            .claim_batch(&pool, queue, 1_000)
+            .await
+            .expect("claim history");
+        if claimed.is_empty() {
+            break;
+        }
+        store
+            .complete_batch(&pool, &claimed)
+            .await
+            .expect("complete history");
+    }
+
+    store
+        .enqueue_batch(&pool, queue, 2, 3)
+        .await
+        .expect("enqueue retry jobs");
+    let to_retry = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(30))
+        .await
+        .expect("claim retry jobs");
+    assert_eq!(to_retry.len(), 3);
+    for claimed in &to_retry {
+        store
+            .retry_after(
+                &pool,
+                claimed.job.id,
+                claimed.job.run_lease,
+                Duration::from_secs(3_600),
+                None,
+            )
+            .await
+            .expect("retry job")
+            .expect("running job should become retryable");
+    }
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("enqueue running job");
+    let running = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim running job");
+    assert_eq!(running.len(), 1);
+    let running_id = running[0].job.id;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 2_500)
+        .await
+        .expect("enqueue available backlog");
+    let scheduled: Vec<_> = (0..2_500)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("enqueue scheduled backlog");
+    let unique_opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    };
+    for id in 0..3 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 900_000 + id },
+            unique_opts.clone(),
+        )
+        .await;
+    }
+
+    store
+        .enqueue_batch(&pool, other_queue, 2, 10)
+        .await
+        .expect("enqueue other available");
+    let other_scheduled: Vec<_> = (0..10)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: other_queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("other scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &other_scheduled)
+        .await
+        .expect("enqueue other scheduled");
+
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    assert_eq!(drained, 3 + 2_500 + 2_500 + 3);
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts after drain");
+    assert_eq!(counts.available, 0);
+    assert_eq!(counts.running, 1);
+    assert_eq!(queue_deferred_count(&pool, &store, queue).await, 0);
+    let dispatcher_counts = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("dispatcher counts after drain");
+    assert_eq!(
+        dispatcher_counts.available, 0,
+        "the claim cursor should move past the drained rows"
+    );
+    let cancelled: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'cancelled'",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count cancelled jobs");
+    assert_eq!(cancelled, drained as i64);
+    let running_job = store
+        .load_job(&pool, running_id)
+        .await
+        .expect("load running job")
+        .expect("running job should exist");
+    assert_eq!(running_job.state, JobState::Running);
+
+    let other_counts = store
+        .queue_counts(&pool, other_queue)
+        .await
+        .expect("other queue counts");
+    assert_eq!(other_counts.available, 10);
+    assert_eq!(queue_deferred_count(&pool, &store, other_queue).await, 10);
+
+    // The drained unique jobs released their keys, and the lane's claim
+    // cursor moved past the cancelled rows.
+    let requeued = enqueue_job(&pool, &store, &CompleteJob { id: 900_000 }, unique_opts).await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(30))
+        .await
+        .expect("claim after drain");
+    let claimed_ids: Vec<i64> = claimed.iter().map(|claimed| claimed.job.id).collect();
+    assert_eq!(claimed_ids, vec![requeued]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_covers_every_stripe() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_drain_striped".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 20)
+        .await
+        .expect("enqueue striped available");
+    let scheduled: Vec<_> = (0..20)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("enqueue striped scheduled");
+
+    let drained = admin::drain_queue(&pool, queue)
+        .await
+        .expect("drain striped queue");
+    assert_eq!(drained, 40);
+    for stripe in 0..2 {
+        let physical = format!("{queue}#{stripe}");
+        let counts = store
+            .queue_counts(&pool, &physical)
+            .await
+            .expect("stripe counts");
+        assert_eq!(counts.available, 0, "{physical} available");
+        assert_eq!(
+            queue_deferred_count(&pool, &store, &physical).await,
+            0,
+            "{physical} deferred"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_covers_stripes_holding_only_scheduled_jobs() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_scheduled_stripes";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_drain_scheduled_stripes".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let scheduled: Vec<_> = (0..40)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("enqueue striped scheduled");
+    let stripes: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(DISTINCT queue)::bigint FROM {}.deferred_jobs",
+        store.schema()
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count scheduled stripes");
+    assert!(stripes > 1, "scheduled jobs should spread across stripes");
+
+    let drained = admin::drain_queue(&pool, queue)
+        .await
+        .expect("drain striped queue");
+    assert_eq!(drained, 40);
+    let remaining: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs",
+        store.schema()
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count remaining scheduled");
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_and_cancel_leave_claims_the_cursor_has_not_passed() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_claim_window";
+    let store = create_store(&pool, "awa_qs_drain_claim_window").await;
+    let schema = store.schema().to_string();
+
+    store
+        .enqueue_batch(&pool, queue, 2, 5)
+        .await
+        .expect("enqueue available");
+    let (seq_name, cursor_before): (String, i64) = sqlx::query_as(&format!(
+        "SELECT seq_name, {schema}.sequence_next_value(seq_name) \
+         FROM {schema}.queue_claim_heads WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read claim cursor");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim two jobs");
+    assert_eq!(claimed.len(), 2);
+    // The claim committed but its post-commit cursor advance has not run.
+    sqlx::query("SELECT setval(format('%I.%I', $1::text, $2::text)::regclass, $3, false)")
+        .bind(&schema)
+        .bind(&seq_name)
+        .bind(cursor_before)
+        .execute(&pool)
+        .await
+        .expect("rewind claim cursor");
+
+    let cancelled = store
+        .cancel_job(&pool, claimed[0].job.id)
+        .await
+        .expect("cancel a claimed job");
+    assert!(
+        cancelled.is_none_or(|row| row.run_lease == claimed[0].job.run_lease),
+        "cancel must act on the running attempt, not the claimed ready row"
+    );
+    let moved = store
+        .move_queue(
+            &pool,
+            claimed[1].job.id,
+            "qs_drain_claim_window_moved",
+            None,
+        )
+        .await
+        .expect("move a claimed job");
+    assert!(!moved, "a claimed job must not be re-enqueued elsewhere");
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    assert_eq!(drained, 3);
+
+    store
+        .complete_runtime_batch(&pool, &claimed[1..])
+        .await
+        .expect("complete the other claimed job");
+    let done_states: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT state::text FROM {schema}.done_entries WHERE job_id = $1"
+    ))
+    .bind(claimed[1].job.id)
+    .fetch_all(&pool)
+    .await
+    .expect("load done rows");
+    assert_eq!(done_states, vec!["completed".to_string()]);
+    let duplicated: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM (
+             SELECT job_id FROM {schema}.done_entries GROUP BY job_id HAVING count(*) > 1
+         ) AS duplicated"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count duplicated done rows");
+    assert_eq!(duplicated, 0);
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("enqueue after the drain");
+    let next = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim after the drain");
+    assert_eq!(
+        next.len(),
+        1,
+        "a job enqueued after a drain must be claimable on the next poll"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_waits_for_a_claim_in_flight() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_claim_in_flight";
+    let store = create_store(&pool, "awa_qs_drain_claim_in_flight").await;
+    let schema = store.schema().to_string();
+
+    store
+        .enqueue_batch(&pool, queue, 2, 5)
+        .await
+        .expect("enqueue available");
+    let mut claim_tx = pool.begin().await.expect("begin claim");
+    let claimed: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {schema}.claim_ready_runtime($1, 2, 0::float8, 0::float8)"
+    ))
+    .bind(queue)
+    .fetch_all(claim_tx.as_mut())
+    .await
+    .expect("claim two jobs");
+    assert_eq!(claimed.len(), 2);
+
+    let drain = tokio::spawn({
+        let pool = pool.clone();
+        async move { admin::drain_queue(&pool, queue).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !drain.is_finished(),
+        "the drain must wait for the claim on its lane"
+    );
+    claim_tx.commit().await.expect("commit claim");
+    let drained = drain.await.expect("join drain").expect("drain queue");
+    assert_eq!(drained, 3);
+
+    let cancelled_claims: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE job_id = ANY($1)"
+    ))
+    .bind(&claimed)
+    .fetch_one(&pool)
+    .await
+    .expect("count done rows of claimed jobs");
+    assert_eq!(cancelled_claims, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_skips_a_locked_row_without_stopping() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_locked_row";
+    let store = create_store(&pool, "awa_qs_drain_locked_row").await;
+    let schema = store.schema().to_string();
+
+    store
+        .enqueue_batch(&pool, queue, 2, 2_500)
+        .await
+        .expect("enqueue available backlog");
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    let locked_id: i64 = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {schema}.ready_entries WHERE queue = $1 \
+         ORDER BY lane_seq LIMIT 1 FOR UPDATE"
+    ))
+    .bind(queue)
+    .fetch_one(holder.as_mut())
+    .await
+    .expect("lock the first ready row");
+
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    assert_eq!(drained, 2_499);
+    holder.commit().await.expect("release lock");
+
+    let locked_job = store
+        .load_job(&pool, locked_id)
+        .await
+        .expect("load locked job")
+        .expect("locked job should exist");
+    assert_eq!(locked_job.state, JobState::Available);
+    let drained = admin::drain_queue(&pool, queue)
+        .await
+        .expect("drain the released row");
+    assert_eq!(drained, 1);
+}
+
+/// A heartbeat that rewrites an expired claim after the deadline rescue took
+/// its snapshot makes the rescue recheck that claim when it locks it.
+/// PostgreSQL 18 frees run-time partition pruning state when that recheck ends
+/// and a later pruning pass in the same statement reads the freed memory, which
+/// crashes an assert-enabled server. The rescue must close every expired claim
+/// without such a pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_deadline_rescue_after_a_heartbeat_recheck() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_deadline_rescue_recheck";
+    let schema = "awa_qs_deadline_rescue_recheck";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let mut job_ids = Vec::new();
+    for id in 0..3 {
+        job_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_millis(100))
+        .await
+        .expect("claim with a deadline");
+    assert_eq!(claimed.len(), 3);
+    let claim_slot: i32 = sqlx::query_scalar(&format!(
+        "UPDATE {schema}.lease_claims \
+         SET deadline_at = clock_timestamp() - interval '1 millisecond' \
+         WHERE job_id = ANY($1) \
+         RETURNING claim_slot"
+    ))
+    .bind(&job_ids)
+    .fetch_all(&pool)
+    .await
+    .expect("expire claim deadlines")
+    .into_iter()
+    .next()
+    .expect("claims have lease_claims rows");
+
+    // Hold the slot's cursor row so the rescue waits after taking its
+    // snapshot, then rewrite the expired claims the way a heartbeat does.
+    let mut holder = pool.begin().await.expect("begin cursor row holder");
+    sqlx::query(&format!(
+        "SELECT 1 FROM {schema}.claim_ring_slots WHERE slot = $1 FOR UPDATE"
+    ))
+    .bind(claim_slot)
+    .execute(holder.as_mut())
+    .await
+    .expect("lock cursor row");
+    let heartbeat_pool = pool.clone();
+    let heartbeat_ids = job_ids.clone();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claims \
+             SET materialized_at = COALESCE(materialized_at, clock_timestamp()) \
+             WHERE job_id = ANY($1)"
+        ))
+        .bind(&heartbeat_ids)
+        .execute(&heartbeat_pool)
+        .await
+        .expect("rewrite claims");
+        holder.commit().await.expect("release cursor row");
+    });
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue after the claim recheck");
+    release.await.expect("join holder");
+    let mut rescued_ids: Vec<i64> = rescued.iter().map(|job| job.id).collect();
+    rescued_ids.sort_unstable();
+    assert_eq!(rescued_ids, job_ids);
 }
 
 /// Claims and leases record a job's aged effective priority while its ready

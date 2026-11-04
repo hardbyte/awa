@@ -18,6 +18,66 @@ Notable changes between releases. Detailed migration notes for storage transitio
   statements, so a job promoted, claimed or completed between two of them
   could read as missing. It now reads all of them from one read-only snapshot.
 
+## [0.6.12] — 2026-11-05
+
+Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.
+
+- **Queue storage no longer drives PostgreSQL 18 into a backend crash when a
+  rescue, cancel or claim close locks a claim that was just rewritten.** A
+  statement that locks a row another transaction updated after the
+  statement's snapshot rechecks the row (EvalPlanQual). In PostgreSQL 18
+  (reproduced on 18.6) that recheck rebuilds the statement's run-time partition
+  pruning state in memory that is freed when the lock runs out of rows, so a
+  later pruning pass in the same statement reads freed memory and the backend
+  segfaults ([pgsql-bugs report](https://www.postgresql.org/message-id/CAP2G_gGpV%3DrKMLuET4RW-qO41GvBvi6Czsjsj16eT9hAwHxG6w%40mail.gmail.com)).
+  The server then restarts, dropping every connection; on managed services
+  with `restart_after_crash` off it fails over instead. The deadline and
+  stale-heartbeat rescues hit this whenever a heartbeat rewrote an expired or
+  stale claim while they ran: they locked the claim, then marked it closed
+  through a pruned scan of `lease_claims`. The rescues now update the slot's
+  own claim partition, the completion, heartbeat, callback and close paths
+  lock their attempts' claims in a statement that prunes nothing before the
+  statements that lock them again, and cancel looks up row and batch receipts
+  in separate statements.
+- **Completing a large batch and moving many failed jobs to the DLQ no longer
+  fail on queue storage** (backport of the writer approach in
+  [#506](https://github.com/hardbyte/awa/pull/506)). The `done_entries` and
+  `dlq_entries` writers bound every column of every row as its own parameter,
+  so a single statement of more than 4,681 completed jobs (3,276 for rows
+  written without ready-entry backing) or more than 3,449 DLQ rows exceeded
+  PostgreSQL's 65,535-parameter limit and failed with
+  `too many arguments for query`, rolling the whole operation back. Bulk
+  "move failed to DLQ" on a queue with more than about 3,450 failed jobs
+  always failed this way, and completion batches could hit it when
+  `AWA_COMPLETION_BATCH_SIZE` is raised above the default of 512. Both writers
+  now send one array per column through a fixed-text
+  `INSERT ... SELECT FROM unnest(...)`.
+- **`admin::drain_queue` on queue storage cancels a backlog in bulk and
+  drains every stripe of a striped queue.** It found the queue's jobs through
+  a lookup that read every retained ready row, then cancelled them one at a
+  time, several statements each, inside one transaction, so draining a large
+  backlog took minutes and held its row locks throughout. Scheduled,
+  retryable and available jobs are now cancelled 1,000 at a time, each chunk
+  one short transaction, with available rows read from each lane's claim
+  cursor; waiting jobs are still cancelled one by one and running jobs are
+  left alone. Jobs enqueued after the drain starts are left for a later
+  call, so draining a queue that keeps receiving work still returns, and
+  the drain moves each lane's claim cursor past the rows it cancelled, so
+  workers reach the jobs behind them on their next poll. It also matched
+  only the logical queue name, so draining a striped queue cancelled
+  nothing; it now covers every stripe. `awa queue drain` and the Python
+  `drain_queue` use this path.
+- **Cancelling, moving or reprioritising an available job on queue storage
+  no longer acts on a job a worker has already claimed.** A claim moves its
+  lane's claim cursor past the rows it took only after it commits, so
+  briefly, or until the next claim if that advance failed, a claimed row
+  still looked available. A cancel in that window wrote a cancelled terminal
+  row while the attempt kept running, and a move re-enqueued a job that was
+  already executing. A claim still in progress was missed the same way.
+  These paths now wait for any claim in progress on the job's lane and skip
+  rows a claim has recorded, the same evidence claims use to skip them, so a
+  cancel reaches the running attempt instead.
+
 ## [0.6.11] — 2026-11-04
 
 Patch release: promotion of due scheduled and retryable jobs on queue storage no longer stalls once a backlog builds. No migration, no schema patch and no public API change. Upgrading from 0.6.10 is a rolling upgrade of processes; promotion runs on the maintenance leader, so a stalled deployment recovers once the leader runs 0.6.11, and any runtime can become leader, so roll all of them.
