@@ -31,9 +31,18 @@ use uuid::Uuid;
 ///
 /// `migrations::run` is `!Send` (it holds a pooled connection / open
 /// transaction across awaits), so it cannot be awaited directly inside the
-/// `future_into_py` bridge, whose future must be `Send`. We drive it on a
-/// throwaway `current_thread` runtime inside `spawn_blocking` — this keeps the
-/// asyncio loop free. Note that `asyncio.wait_for()` cancellation only detaches
+/// `future_into_py` bridge, whose future must be `Send`. We drive it with
+/// `Handle::block_on` on the shared bridge runtime inside `spawn_blocking`,
+/// which keeps the asyncio loop free and accepts a `!Send` future.
+///
+/// It must be the shared runtime, not a throwaway one: connections the pool
+/// opens during the migration register their sockets with whichever runtime
+/// is driving them, and they go back into the client's pool afterwards. With
+/// a throwaway runtime those connections outlive their I/O driver, and the
+/// next acquire that picks one up can stall until the pool's acquire timeout
+/// ("pool timed out while waiting for an open connection").
+///
+/// Note that `asyncio.wait_for()` cancellation only detaches
 /// the outer await: a `spawn_blocking` task cannot be interrupted, so the
 /// migration keeps running to completion in the background. The migration
 /// itself stays crash/cancel-safe through its transaction-scoped advisory lock.
@@ -48,16 +57,11 @@ use uuid::Uuid;
 /// versions (observed on 1.97); routing through this helper keeps the outer
 /// future unambiguously `Send` across toolchains.
 async fn run_migrations_offthread(pool: PgPool) -> PyResult<()> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build current_thread runtime for migrate");
-        rt.block_on(awa_model::migrations::run(&pool))
-    })
-    .await
-    .map_err(|e| state_error(format!("migration task failed: {e}")))?
-    .map_err(map_awa_error)
+    let runtime = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
+    tokio::task::spawn_blocking(move || runtime.block_on(awa_model::migrations::run(&pool)))
+        .await
+        .map_err(|e| state_error(format!("migration task failed: {e}")))?
+        .map_err(map_awa_error)
 }
 
 fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {

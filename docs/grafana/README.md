@@ -39,7 +39,7 @@ The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job
 
 | Panel | Type | What it shows |
 | --- | --- | --- |
-| **Queue Lag** | Time series | Age of the oldest available job per queue |
+| **Queue Lag** | Time series | Age of the oldest available job per queue; on queue storage, of the oldest next-to-claim job across its lanes (the admin UI shows the oldest overall) |
 | **Queue Depth** | Stacked time series | Current jobs by queue and state (available, running, failed, scheduled, retryable, waiting external) |
 | **Job Wait Time (p50/p95/p99)** | Time series | Time from job creation to claim |
 | **Job Throughput** | Time series | Completed, failed, retried, cancelled jobs/sec |

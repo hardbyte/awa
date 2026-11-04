@@ -6,14 +6,103 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- `awa.jobs` keeps running jobs visible after priority aging changes their
-  effective priority. Migration v053 joins receipt claims and materialized leases
-  to the exact job attempt rather than comparing effective and lane priorities,
-  excluding tombstoned and older-attempt ready rows to prevent duplicates.
-  Receipt and materialized-lease rows consistently report the claimed effective
-  priority.
-  The migration only refreshes the compatibility function; storage and runtime
-  write protocols are unchanged.
+- **`awa.jobs` keeps running jobs visible after priority aging changes their
+  effective priority** ([#569](https://github.com/hardbyte/awa/issues/569)).
+  Migration v053 joins receipt claims and materialized leases to the exact
+  job attempt rather than comparing effective and lane priorities, and
+  excludes tombstoned and older-attempt ready rows so a job is not listed
+  twice. Receipt and materialized-lease rows report the claimed effective
+  priority. The migration only replaces the compatibility function; storage
+  and runtime write protocols are unchanged.
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
+  tokio runtime but with the client's pool, so connections the pool opened
+  during the migration went back into it tied to a runtime that no longer
+  existed. A later query that picked one up could wait 30 s and fail with
+  `pool timed out while waiting for an open connection`. The migrations now
+  run on the bindings' shared runtime. This was the intermittent fixture
+  timeout in the Python test suite (#420).
+- **`awa storage prepare-queue` provisions lanes a 0.6 runtime created.** A
+  runtime role with schema `CREATE` owns the lane sequences it creates.
+  Provisioning such a lane as the owner, the first step of revoking runtime
+  `CREATE`, failed with `permission denied for sequence`: the head tables'
+  `BEFORE INSERT` triggers run even for a row `ON CONFLICT DO NOTHING` then
+  skips, and they read and set the lane's sequence. Lane inserts now skip
+  rows that exist. Found by the 0.6.10 upgrade rehearsal.
+- **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
+  storage find running jobs and no longer read retained history**
+  ([#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
+  built every available ready row before filtering by key, reading every
+  retained ready row, completed jobs included. A missing key cost as much
+  as a full scan, and the transaction variant held the caller's
+  transaction while it ran. Given a queue, it now starts from that queue's
+  ready rows holding the key and checks only those jobs for being available,
+  leased or on an open receipt claim; with no such row, only the
+  `deferred_jobs` key index is read. Its cost follows that queue's own rows,
+  not other queues' backlogs or the claim ring, which a long-running job can
+  keep from pruning. Without a queue, available rows are walked lane by lane
+  from the claim cursor and open receipt claims are read in full. It also
+  finds jobs running on receipt claims not yet materialised into `leases`,
+  which it missed, so they couldn't be cancelled by key.
+- **The admin UI's runtime page no longer shows the storage transition card
+  once the transition is finalized.** It stayed up on every cluster running
+  queue storage; it now appears only while an engine is prepared or a mixed
+  transition is in flight.
+- **The admin dashboard's reads no longer grow with retained history on
+  queue storage, and a test keeps them that way.** `awa-ui`'s
+  `admin_read_cost_test` serves every endpoint the UI polls against ten
+  times more retained history and fails if a read does more work. It found
+  four more reads that grew with history:
+  - Available counts read every retained ready row. They now walk each
+    lane's segments from its claim cursor.
+  - Running counts expanded every retained claim batch. A batch whose
+    receipts have all closed is now skipped before it is expanded.
+  - The timeseries read its window's completions through `terminal_jobs`,
+    which joined them to every retained ready row.
+  - Completions in the last hour, less deletions, checked each recent
+    deletion against its lane's completion batches. One production-sized
+    fixture took 5.4 s for that check alone. Each affected batch is now read
+    once.
+  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and the job list
+  still read retained history; the test lists them and fails once one
+  stops, so the list can only shrink.
+- **Queue lag in the admin UI is the age of the oldest available job
+  again.** On queue storage it had become the age of each lane's next job,
+  which hides an older job a queue move or priority aging appended behind
+  newer ones: an hour's wait could show as a second. The workers' queue-lag
+  gauge keeps the cheaper next-job reading.
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts.** They didn't invalidate the dashboard caches, so failed
+  counts lagged a DLQ action by up to the cache TTL. From #579.
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, such as a statement timeout, sqlx 0.9 tried
+  to close the connection, and closing a TLS connection mid-stream hangs, so
+  the pool lost that slot permanently; a slow dashboard read polled often
+  enough could exhaust the pool. `awa serve` now sets a 60-second statement
+  timeout (`--statement-timeout`, `AWA_STATEMENT_TIMEOUT`), recovers such
+  connections when they are released, and on Postgres 14+ sets
+  `client_connection_check_interval` so a query stops when its connection
+  closes. Applications embedding `awa_ui::router` can build their pool with
+  the new `awa_ui::admin_pool_options` and `admin_connect_options`.
+- **Queue overviews on queue storage no longer read retained history.**
+  `admin::queue_overviews`, behind the admin UI's queues and dashboard pages
+  and `awa queue stats`, counted every current job through `terminal_jobs`,
+  which expands each completion batch and joins it back to `ready_entries`.
+  It now reads the live-work tables, as the workers' queue gauges do, and
+  counts completions in the last hour from batch sizes. With 100,000
+  retained completions and 100,000 queued jobs it drops from 7.7 s to
+  0.27 s. JIT is off for the read; compiling it cost more than running it.
+- **The dashboard's state counts and timeseries no longer read retained
+  history on queue storage.** `admin::state_counts` counts completions from
+  batch sizes and available jobs per lane from its claim cursor (6.5 s to
+  0.24 s on the same data). `admin::state_timeseries` reads only rows
+  finalised within its window, since a job finishes after it is created. It
+  previously expanded every retained completion and sorted the result:
+  against that data it ran for over 10 minutes and filled the disk with
+  temporary files. It now takes 0.6 s, with all 100,000 completions inside
+  the window.
 
 ## [0.7.0-alpha.1] — 2026-10-29
 

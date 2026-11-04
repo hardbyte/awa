@@ -129,7 +129,13 @@ depends on the API: a single-row `insert` / `insert_with` and the row-by-row
 corresponding error) on a duplicate — you must handle it, do not assume a silent
 no-op. Only the COPY bulk path (`insert_many_copy`) silently skips duplicates.
 Cancel without storing the id via `cancel_by_unique_key(kind, queue=, args=,
-period_bucket=)` — the components must match those used at insert.
+period_bucket=)` — the components must match those used at insert. It cancels
+the oldest live job holding the key. On queue storage, a `by_queue` key is
+looked up through that queue's ready rows, so a job moved to another queue
+can't be cancelled by key while it is available there. A moved running or
+waiting job can't be cancelled by key once its original ready row is pruned;
+cancel it by id. Scheduled and retryable jobs are found by key wherever they
+are.
 Args-based uniqueness relies on canonical (sorted-key) JSON, pinned by
 cross-language golden tests; the default state set includes `completed`, so a
 still-retained completed job suppresses a re-insert with the same args. Scope
