@@ -40,6 +40,10 @@ const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const DRAIN_BATCH_SIZE: i64 = 1_000;
+// The planner overestimates the drain statements enough to JIT-compile them,
+// which takes seconds against milliseconds of execution.
+const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -10257,6 +10261,7 @@ impl QueueStorage {
         job_id: i64,
     ) -> Result<Option<CancelJobTxResult>, AwaError> {
         let schema = self.schema();
+        self.lock_claim_heads_of_jobs_tx(tx, &[job_id]).await?;
         let claimed = self.ready_row_claimed_sql("ready");
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -10472,6 +10477,7 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.lock_claim_heads_of_jobs_tx(&mut tx, ids).await?;
         let mut rows = Vec::with_capacity(ids.len());
         let mut claim_cursor_advances = Vec::new();
         for job_id in ids {
@@ -10509,7 +10515,10 @@ impl QueueStorage {
         let mut drained = 0u64;
         let mut after_job_id = i64::MIN;
         loop {
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let mut tx = pool
+                .begin_with(DRAIN_TRANSACTION_BEGIN)
+                .await
+                .map_err(map_sqlx_error)?;
             let (cancelled, last_job_id) = self
                 .cancel_deferred_chunk_tx(&mut tx, queue, after_job_id, job_id_bound)
                 .await?;
@@ -10546,29 +10555,23 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
         lanes.retain(|lane| lane.from_seq < lane.to_seq);
 
+        let drained_lanes = lanes.clone();
         while !lanes.is_empty() {
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-            let (cancelled, advances) = self.cancel_available_chunk_tx(&mut tx, &lanes).await?;
+            let mut tx = pool
+                .begin_with(DRAIN_TRANSACTION_BEGIN)
+                .await
+                .map_err(map_sqlx_error)?;
+            self.lock_claim_heads_tx(&mut tx, &lanes).await?;
+            let cancelled = self.cancel_available_chunk_tx(&mut tx, &mut lanes).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
-            self.advance_claim_cursors(pool, &advances).await;
+            self.skip_spent_claim_prefixes(pool, &lanes).await?;
             drained += cancelled as u64;
             if (cancelled as i64) < DRAIN_BATCH_SIZE {
                 break;
             }
-            // The next chunk resumes after the rows this one cancelled, so
-            // each lane is read once even when its claim cursor cannot move
-            // past a claimed or locked row.
-            for advance in &advances {
-                if let Some(lane) = lanes.iter_mut().find(|lane| {
-                    lane.queue == advance.queue
-                        && lane.priority == advance.priority
-                        && lane.enqueue_shard == advance.enqueue_shard
-                }) {
-                    lane.from_seq = lane.from_seq.max(advance.next_seq);
-                }
-            }
             lanes.retain(|lane| lane.from_seq < lane.to_seq);
         }
+        self.skip_spent_claim_prefixes(pool, &drained_lanes).await?;
 
         let waiting: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
             r#"
@@ -10701,8 +10704,8 @@ impl QueueStorage {
     async fn cancel_available_chunk_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        lanes: &[DrainLane],
-    ) -> Result<(usize, Vec<ClaimCursorAdvance>), AwaError> {
+        lanes: &mut [DrainLane],
+    ) -> Result<usize, AwaError> {
         let schema = self.schema();
         let claimed = self.ready_row_claimed_sql("ready");
         // Unclaimed rows are found the way a claim finds them: from each
@@ -10710,7 +10713,11 @@ impl QueueStorage {
         // within each segment's ring slot. The ready key leads with the ring
         // slot, so a lane range without it scans every retained ready row.
         // Rows are locked before the limit applies, so a row another
-        // transaction holds does not shorten the chunk. Only rows whose
+        // transaction holds does not shorten the chunk. The tombstone check
+        // shares one NOT with the claim check: on its own, NOT EXISTS is
+        // planned as an anti join that reads the lane's tombstones again for
+        // every segment, and a lane enqueued one job at a time has a segment
+        // per row. Only rows whose
         // tombstone this statement inserts are cancelled, so a concurrent
         // cancel of the same row cannot produce a second done row.
         let ready: Vec<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
@@ -10756,16 +10763,18 @@ impl QueueStorage {
                       AND ready.enqueue_shard = heads.enqueue_shard
                       AND ready.lane_seq >= segment.from_seq
                       AND ready.lane_seq < segment.to_seq
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                          WHERE tomb.ready_slot = ready.ready_slot
-                            AND tomb.ready_generation = ready.ready_generation
-                            AND tomb.queue = ready.queue
-                            AND tomb.priority = ready.priority
-                            AND tomb.enqueue_shard = ready.enqueue_shard
-                            AND tomb.lane_seq = ready.lane_seq
+                      AND NOT (
+                          EXISTS (
+                              SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                              WHERE tomb.ready_slot = ready.ready_slot
+                                AND tomb.ready_generation = ready.ready_generation
+                                AND tomb.queue = ready.queue
+                                AND tomb.priority = ready.priority
+                                AND tomb.enqueue_shard = ready.enqueue_shard
+                                AND tomb.lane_seq = ready.lane_seq
+                          )
+                          OR {claimed}
                       )
-                      AND NOT ({claimed})
                     ORDER BY ready.lane_seq
                     FOR UPDATE OF ready SKIP LOCKED
                 ) AS ready
@@ -10820,47 +10829,19 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if ready.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok(0);
         }
 
-        // One advance per run of consecutive cancelled positions on a lane:
-        // it applies only while the cursor sits at the start of the run, and
-        // every position it skips was tombstoned above.
-        let mut ready = ready;
-        ready.sort_unstable_by(|left, right| {
-            (
-                &left.queue,
-                left.priority,
-                left.enqueue_shard,
-                left.lane_seq,
-            )
-                .cmp(&(
-                    &right.queue,
-                    right.priority,
-                    right.enqueue_shard,
-                    right.lane_seq,
-                ))
-        });
-        let mut advances: Vec<ClaimCursorAdvance> = Vec::new();
+        // The next chunk resumes after the rows this one cancelled, so each
+        // lane is read once even where a claimed or locked row stays behind.
         for row in &ready {
-            if let Some(last) = advances.last_mut() {
-                if last.queue == row.queue
-                    && last.priority == row.priority
-                    && last.enqueue_shard == row.enqueue_shard
-                    && last.next_seq == row.lane_seq
-                {
-                    last.next_seq = row.lane_seq + 1;
-                    continue;
-                }
+            if let Some(lane) = lanes.iter_mut().find(|lane| {
+                lane.queue == row.queue
+                    && lane.priority == row.priority
+                    && lane.enqueue_shard == row.enqueue_shard
+            }) {
+                lane.from_seq = lane.from_seq.max(row.lane_seq + 1);
             }
-            advances.push(ClaimCursorAdvance {
-                queue: row.queue.clone(),
-                priority: row.priority,
-                enqueue_shard: row.enqueue_shard,
-                next_seq: row.lane_seq + 1,
-                only_if_current: Some(row.lane_seq),
-                evidence: None,
-            });
         }
 
         let finalized_at = Utc::now();
@@ -10874,7 +10855,232 @@ impl QueueStorage {
         self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Available))
             .await?;
 
-        Ok((done_rows.len(), advances))
+        Ok(done_rows.len())
+    }
+
+    /// Lock the claim heads of the lanes holding ready rows of `job_ids`, so
+    /// the transaction's next statement sees any claim of those rows that was
+    /// in progress. See [`Self::lock_claim_heads_tx`].
+    async fn lock_claim_heads_of_jobs_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_ids: &[i64],
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        sqlx::query(audited_sql(format!(
+            r#"
+            SELECT 1
+            FROM {schema}.queue_claim_heads AS claims
+            WHERE (claims.queue, claims.priority, claims.enqueue_shard) IN (
+                SELECT ready.queue, ready.priority, ready.enqueue_shard
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = ANY($1)
+            )
+            ORDER BY claims.queue COLLATE "C", claims.priority, claims.enqueue_shard
+            FOR UPDATE OF claims
+            "#
+        )))
+        .bind(job_ids)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Lock the claim heads of `lanes`. A claim holds its lane's head until
+    /// it commits, so once this returns the transaction's next statement sees
+    /// every claim on these lanes. Heads are locked in the byte order that
+    /// cursor advances use.
+    async fn lock_claim_heads_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        lanes: &[DrainLane],
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        sqlx::query(audited_sql(format!(
+            r#"
+            SELECT 1
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN unnest($1::text[], $2::smallint[], $3::smallint[])
+                AS lanes(queue, priority, enqueue_shard)
+              ON claims.queue = lanes.queue
+             AND claims.priority = lanes.priority
+             AND claims.enqueue_shard = lanes.enqueue_shard
+            ORDER BY claims.queue COLLATE "C", claims.priority, claims.enqueue_shard
+            FOR UPDATE OF claims
+            "#
+        )))
+        .bind(
+            lanes
+                .iter()
+                .map(|lane| lane.queue.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+        .bind(
+            lanes
+                .iter()
+                .map(|lane| lane.enqueue_shard)
+                .collect::<Vec<_>>(),
+        )
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Move each lane's claim cursor over cancelled and claimed rows, up to
+    /// the lane's `to_seq`. A claim crosses cancelled rows only one claim
+    /// batch per poll, so without this the jobs behind a drained range wait
+    /// for many polls before a worker reaches them.
+    async fn skip_spent_claim_prefixes(
+        &self,
+        pool: &PgPool,
+        lanes: &[DrainLane],
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        let claimed = self.ready_row_claimed_sql("ready");
+        let mut lanes = lanes.to_vec();
+        while !lanes.is_empty() {
+            let mut tx = pool
+                .begin_with(DRAIN_TRANSACTION_BEGIN)
+                .await
+                .map_err(map_sqlx_error)?;
+            self.lock_claim_heads_tx(&mut tx, &lanes).await?;
+            // Each window is a range of positions, so a live row inside it is
+            // always seen. Untombstoned rows are checked for a claim only from
+            // the first, a few at a time: claims past the cursor are the few
+            // whose claimer has not yet moved it. The tombstone check is a
+            // column behind OFFSET 0, so it is not pushed down as a NOT EXISTS,
+            // for the reason given in `cancel_available_chunk_tx`. A gap before a visible row
+            // is an enqueue that rolled back: enqueues on a lane commit in
+            // position order.
+            let unfinished: Vec<(String, i16, i16)> = sqlx::query_as(audited_sql(format!(
+                r#"
+                WITH windows AS (
+                    SELECT
+                        lanes.queue,
+                        lanes.priority,
+                        lanes.enqueue_shard,
+                        claims.seq_name,
+                        {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                        LEAST({schema}.sequence_next_value(claims.seq_name) + $5, lanes.to_seq) AS window_end,
+                        lanes.to_seq
+                    FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[])
+                        AS lanes(queue, priority, enqueue_shard, to_seq)
+                    JOIN {schema}.queue_claim_heads AS claims
+                      ON claims.queue = lanes.queue
+                     AND claims.priority = lanes.priority
+                     AND claims.enqueue_shard = lanes.enqueue_shard
+                ),
+                scanned AS (
+                    SELECT
+                        windows.*,
+                        unclaimed.first_live,
+                        COALESCE(
+                            unclaimed.first_live,
+                            CASE
+                                WHEN unclaimed.checked = $6 THEN unclaimed.last_checked + 1
+                                ELSE visible.last_seen + 1
+                            END
+                        ) AS next_seq
+                    FROM windows
+                    CROSS JOIN LATERAL (
+                        SELECT max(ready.lane_seq) AS last_seen
+                        FROM {schema}.ready_segments AS segment
+                        CROSS JOIN LATERAL (
+                            SELECT ready.lane_seq
+                            FROM {schema}.ready_entries AS ready
+                            WHERE ready.ready_slot = segment.ready_slot
+                              AND ready.ready_generation = segment.ready_generation
+                              AND ready.queue = windows.queue
+                              AND ready.priority = windows.priority
+                              AND ready.enqueue_shard = windows.enqueue_shard
+                              AND ready.lane_seq >= GREATEST(segment.first_lane_seq, windows.claim_seq)
+                              AND ready.lane_seq < LEAST(segment.next_lane_seq, windows.window_end)
+                            ORDER BY ready.lane_seq
+                        ) AS ready
+                        WHERE segment.queue = windows.queue
+                          AND segment.priority = windows.priority
+                          AND segment.enqueue_shard = windows.enqueue_shard
+                          AND segment.next_lane_seq > windows.claim_seq
+                          AND segment.first_lane_seq < windows.window_end
+                    ) AS visible
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            min(ready.lane_seq) FILTER (WHERE NOT ({claimed})) AS first_live,
+                            max(ready.lane_seq) AS last_checked,
+                            count(*) AS checked
+                        FROM (
+                            SELECT ready.*
+                            FROM {schema}.ready_segments AS segment
+                            CROSS JOIN LATERAL (
+                                SELECT
+                                    ready.*,
+                                    EXISTS (
+                                        SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                                        WHERE tomb.ready_slot = ready.ready_slot
+                                          AND tomb.ready_generation = ready.ready_generation
+                                          AND tomb.queue = ready.queue
+                                          AND tomb.priority = ready.priority
+                                          AND tomb.enqueue_shard = ready.enqueue_shard
+                                          AND tomb.lane_seq = ready.lane_seq
+                                    ) AS tombstoned
+                                FROM {schema}.ready_entries AS ready
+                                WHERE ready.ready_slot = segment.ready_slot
+                                  AND ready.ready_generation = segment.ready_generation
+                                  AND ready.queue = windows.queue
+                                  AND ready.priority = windows.priority
+                                  AND ready.enqueue_shard = windows.enqueue_shard
+                                  AND ready.lane_seq >= GREATEST(segment.first_lane_seq, windows.claim_seq)
+                                  AND ready.lane_seq < LEAST(segment.next_lane_seq, windows.window_end)
+                                ORDER BY ready.lane_seq
+                                OFFSET 0
+                            ) AS ready
+                            WHERE segment.queue = windows.queue
+                              AND segment.priority = windows.priority
+                              AND segment.enqueue_shard = windows.enqueue_shard
+                              AND segment.next_lane_seq > windows.claim_seq
+                              AND segment.first_lane_seq < windows.window_end
+                              AND NOT ready.tombstoned
+                            ORDER BY ready.lane_seq
+                            LIMIT $6
+                        ) AS ready
+                    ) AS unclaimed
+                    WHERE windows.claim_seq < windows.to_seq
+                ),
+                advanced AS MATERIALIZED (
+                    SELECT
+                        scanned.*,
+                        {schema}.set_sequence_next(scanned.seq_name, scanned.next_seq) AS moved
+                    FROM scanned
+                    WHERE scanned.next_seq > scanned.claim_seq
+                )
+                SELECT queue, priority, enqueue_shard
+                FROM advanced
+                WHERE first_live IS NULL
+                  AND next_seq < to_seq
+                "#
+            )))
+            .bind(lanes.iter().map(|lane| lane.queue.as_str()).collect::<Vec<_>>())
+            .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+            .bind(lanes.iter().map(|lane| lane.enqueue_shard).collect::<Vec<_>>())
+            .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
+            .bind(DRAIN_BATCH_SIZE)
+            .bind(DRAIN_CLAIM_CHECK_ROWS)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            lanes.retain(|lane| {
+                unfinished.iter().any(|(queue, priority, enqueue_shard)| {
+                    &lane.queue == queue
+                        && lane.priority == *priority
+                        && lane.enqueue_shard == *enqueue_shard
+                })
+            });
+        }
+        Ok(())
     }
 
     pub async fn set_priority(
@@ -11079,6 +11285,7 @@ impl QueueStorage {
         priority: Option<i16>,
     ) -> Result<ReadyBatchMoveResult, AwaError> {
         let schema = self.schema();
+        self.lock_claim_heads_of_jobs_tx(tx, &[job_id]).await?;
         let claimed = self.ready_row_claimed_sql("ready");
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
             r#"

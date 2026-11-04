@@ -20606,6 +20606,64 @@ async fn test_queue_storage_drain_and_cancel_leave_claims_the_cursor_has_not_pas
     .await
     .expect("count duplicated done rows");
     assert_eq!(duplicated, 0);
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("enqueue after the drain");
+    let next = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim after the drain");
+    assert_eq!(
+        next.len(),
+        1,
+        "a job enqueued after a drain must be claimable on the next poll"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_waits_for_a_claim_in_flight() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_claim_in_flight";
+    let store = create_store(&pool, "awa_qs_drain_claim_in_flight").await;
+    let schema = store.schema().to_string();
+
+    store
+        .enqueue_batch(&pool, queue, 2, 5)
+        .await
+        .expect("enqueue available");
+    let mut claim_tx = pool.begin().await.expect("begin claim");
+    let claimed: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT job_id FROM {schema}.claim_ready_runtime($1, 2, 0::float8, 0::float8)"
+    )))
+    .bind(queue)
+    .fetch_all(claim_tx.as_mut())
+    .await
+    .expect("claim two jobs");
+    assert_eq!(claimed.len(), 2);
+
+    let drain = tokio::spawn({
+        let pool = pool.clone();
+        async move { admin::drain_queue(&pool, queue).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !drain.is_finished(),
+        "the drain must wait for the claim on its lane"
+    );
+    claim_tx.commit().await.expect("commit claim");
+    let drained = drain.await.expect("join drain").expect("drain queue");
+    assert_eq!(drained, 3);
+
+    let cancelled_claims: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE job_id = ANY($1)"
+    )))
+    .bind(&claimed)
+    .fetch_one(&pool)
+    .await
+    .expect("count done rows of claimed jobs");
+    assert_eq!(cancelled_claims, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

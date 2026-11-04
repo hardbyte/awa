@@ -15,8 +15,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   one short transaction, with available rows read from each lane's claim
   cursor; waiting jobs are still cancelled one by one and running jobs are
   left alone. Jobs enqueued after the drain starts are left for a later
-  call, so draining a queue that keeps receiving work still returns. It also
-  matched only the logical queue name, so draining a striped queue cancelled
+  call, so draining a queue that keeps receiving work still returns, and
+  the drain moves each lane's claim cursor past the rows it cancelled, so
+  workers reach the jobs behind them on their next poll. It also matched
+  only the logical queue name, so draining a striped queue cancelled
   nothing; it now covers every stripe. `awa queue drain` and the Python
   `drain_queue` use this path.
 - **Cancelling, moving or reprioritising an available job on queue storage
@@ -25,9 +27,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   briefly, or until the next claim if that advance failed, a claimed row
   still looked available. A cancel in that window wrote a cancelled terminal
   row while the attempt kept running, and a move re-enqueued a job that was
-  already executing. These paths now skip rows a claim has recorded, the
-  same evidence claims use to skip them, so a cancel reaches the running
-  attempt instead.
+  already executing. A claim still in progress was missed the same way.
+  These paths now wait for any claim in progress on the job's lane and skip
+  rows a claim has recorded, the same evidence claims use to skip them, so a
+  cancel reaches the running attempt instead.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened
