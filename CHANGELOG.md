@@ -4,6 +4,22 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.11] — Unreleased
+
+Patch release: promotion of due scheduled and retryable jobs on queue storage no longer stalls once a backlog builds. No migration and no public API change.
+
+- **Promoting due jobs no longer fails above 3,640 rows in one tick on queue
+  storage** (backport of the writer changes in
+  [#506](https://github.com/hardbyte/awa/pull/506)). Promotion moves up to
+  4,096 due rows from `deferred_jobs` to `ready_entries` in one statement that
+  bound every column of every row as its own parameter, so a tick with more
+  than 3,640 due rows exceeded PostgreSQL's 65,535-parameter limit and failed
+  with `too many arguments for query`. The transaction rolled back and every
+  later tick failed the same way, so the backlog only grew. The ready,
+  ready-segment and deferred writers now send one array per column through a
+  fixed-text `INSERT ... SELECT FROM unnest(...)`, which also lifts the same
+  ceiling from batch enqueues of more than 3,640 ready or 4,095 scheduled jobs.
+
 ## [0.6.10] — 2026-11-03
 
 Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, a request the UI's client abandons no longer holds a database connection, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Upgrading from 0.6.9 is a rolling upgrade: run `awa migrate` once as the owner while traffic continues, then roll processes; binaries can roll back to 0.6.9 with the patch left in place. [`docs/upgrade-0.6.9-to-0.6.10.md`](https://github.com/hardbyte/awa/blob/v0.6.10/docs/upgrade-0.6.9-to-0.6.10.md) has the steps, the rollback, and the optional procedure for running the runtime role without schema `CREATE`.

@@ -3917,6 +3917,133 @@ async fn test_queue_storage_late_completion_cannot_finalize_reclaimed_running_at
     assert_eq!(current.run_lease, second_claim.job.run_lease);
 }
 
+const BIND_LIMIT_BATCH_ROWS: usize = 5_000;
+
+fn bind_limit_params(
+    queue: &str,
+    count: usize,
+    run_at: Option<DateTime<Utc>>,
+) -> Vec<awa::InsertParams> {
+    (0..count)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id: id as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at,
+                    ..Default::default()
+                },
+            )
+            .expect("Failed to build insert params")
+        })
+        .collect()
+}
+
+async fn table_row_count(pool: &sqlx::PgPool, schema: &str, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.{table}"))
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count rows")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_ready_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_enqueue_ready";
+    let schema = "awa_qs_bind_limit_enqueue_ready";
+    let store = create_store(&pool, schema).await;
+
+    let ready = bind_limit_params(queue, BIND_LIMIT_BATCH_ROWS, None);
+    let inserted = store
+        .enqueue_params_batch(&pool, &ready)
+        .await
+        .expect("ready batch above the 65,535 bind-parameter limit should insert");
+    assert_eq!(inserted, BIND_LIMIT_BATCH_ROWS);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_scheduled_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_enqueue_scheduled";
+    let schema = "awa_qs_bind_limit_enqueue_scheduled";
+    let store = create_store(&pool, schema).await;
+
+    let scheduled = bind_limit_params(
+        queue,
+        BIND_LIMIT_BATCH_ROWS,
+        Some(Utc::now() + chrono::Duration::hours(1)),
+    );
+    let inserted = store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("scheduled batch above the 65,535 bind-parameter limit should insert");
+    assert_eq!(inserted, BIND_LIMIT_BATCH_ROWS);
+    assert_eq!(
+        table_row_count(&pool, schema, "deferred_jobs").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_promote_due_batch_exceeding_bind_parameter_limit() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_bind_limit_promote";
+    let schema = "awa_qs_bind_limit_promote";
+    let store = create_store(&pool, schema).await;
+
+    for _ in 0..(BIND_LIMIT_BATCH_ROWS / 1_000) {
+        let chunk = bind_limit_params(queue, 1_000, Some(Utc::now() + chrono::Duration::hours(1)));
+        store
+            .enqueue_params_batch(&pool, &chunk)
+            .await
+            .expect("Failed to enqueue scheduled chunk");
+    }
+    sqlx::query(&format!(
+        "UPDATE {schema}.deferred_jobs SET run_at = clock_timestamp() - interval '1 minute'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("Failed to make scheduled jobs due");
+    assert_eq!(
+        table_row_count(&pool, schema, "deferred_jobs").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+
+    // Same batch size the maintenance loop uses for promotion.
+    let batch_size = 4_096;
+    let first = store
+        .promote_due(&pool, JobState::Scheduled, batch_size)
+        .await
+        .expect("promoting a full batch must not exceed the bind-parameter limit");
+    assert_eq!(first, batch_size as usize);
+    let second = store
+        .promote_due(&pool, JobState::Scheduled, batch_size)
+        .await
+        .expect("Failed to promote remaining due jobs");
+    assert_eq!(second, BIND_LIMIT_BATCH_ROWS - batch_size as usize);
+    let third = store
+        .promote_due(&pool, JobState::Scheduled, batch_size)
+        .await
+        .expect("Failed to run empty promotion");
+    assert_eq!(third, 0);
+
+    assert_eq!(table_row_count(&pool, schema, "deferred_jobs").await, 0);
+    assert_eq!(
+        table_row_count(&pool, schema, "ready_entries").await,
+        BIND_LIMIT_BATCH_ROWS as i64
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 100, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim promoted jobs");
+    assert_eq!(claimed.len(), 100);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_cancel_is_noop() {
     let (_db_guard, pool) = setup_pool(10).await;
