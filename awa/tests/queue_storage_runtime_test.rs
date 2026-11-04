@@ -14320,3 +14320,97 @@ async fn test_queue_storage_drain_queue_skips_a_locked_row_without_stopping() {
         .expect("drain the released row");
     assert_eq!(drained, 1);
 }
+
+/// A heartbeat that rewrites an expired claim after the deadline rescue took
+/// its snapshot makes the rescue recheck that claim when it locks it.
+/// PostgreSQL 18 frees run-time partition pruning state when that recheck ends
+/// and a later pruning pass in the same statement reads the freed memory, which
+/// crashes an assert-enabled server. The rescue must close every expired claim
+/// without such a pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_deadline_rescue_after_a_heartbeat_recheck() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_deadline_rescue_recheck";
+    let schema = "awa_qs_deadline_rescue_recheck";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let mut job_ids = Vec::new();
+    for id in 0..3 {
+        job_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_millis(100))
+        .await
+        .expect("claim with a deadline");
+    assert_eq!(claimed.len(), 3);
+    let claim_slot: i32 = sqlx::query_scalar(&format!(
+        "UPDATE {schema}.lease_claims \
+         SET deadline_at = clock_timestamp() - interval '1 millisecond' \
+         WHERE job_id = ANY($1) \
+         RETURNING claim_slot"
+    ))
+    .bind(&job_ids)
+    .fetch_all(&pool)
+    .await
+    .expect("expire claim deadlines")
+    .into_iter()
+    .next()
+    .expect("claims have lease_claims rows");
+
+    // Hold the slot's cursor row so the rescue waits after taking its
+    // snapshot, then rewrite the expired claims the way a heartbeat does.
+    let mut holder = pool.begin().await.expect("begin cursor row holder");
+    sqlx::query(&format!(
+        "SELECT 1 FROM {schema}.claim_ring_slots WHERE slot = $1 FOR UPDATE"
+    ))
+    .bind(claim_slot)
+    .execute(holder.as_mut())
+    .await
+    .expect("lock cursor row");
+    let heartbeat_pool = pool.clone();
+    let heartbeat_ids = job_ids.clone();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claims \
+             SET materialized_at = COALESCE(materialized_at, clock_timestamp()) \
+             WHERE job_id = ANY($1)"
+        ))
+        .bind(&heartbeat_ids)
+        .execute(&heartbeat_pool)
+        .await
+        .expect("rewrite claims");
+        holder.commit().await.expect("release cursor row");
+    });
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue after the claim recheck");
+    release.await.expect("join holder");
+    let mut rescued_ids: Vec<i64> = rescued.iter().map(|job| job.id).collect();
+    rescued_ids.sort_unstable();
+    assert_eq!(rescued_ids, job_ids);
+}
