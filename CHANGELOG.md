@@ -6,6 +6,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **`admin::drain_queue` on queue storage cancels a backlog in bulk and
+  drains every stripe of a striped queue.** It found the queue's jobs through
+  a lookup that read every retained ready row, then cancelled them one at a
+  time, several statements each, inside one transaction, so draining a large
+  backlog took minutes and held its row locks throughout. Scheduled,
+  retryable and available jobs are now cancelled 1,000 at a time, each chunk
+  one short transaction, with available rows read from each lane's claim
+  cursor; waiting jobs are still cancelled one by one and running jobs are
+  left alone. It also matched only the logical queue name, so draining a
+  striped queue cancelled nothing; it now covers every stripe. `awa queue
+  drain` and the Python `drain_queue` use this path.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened

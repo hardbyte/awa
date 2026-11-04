@@ -1596,23 +1596,11 @@ where
 /// Drain a queue: cancel all non-running, non-terminal jobs.
 pub async fn drain_queue(pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
-        let sql = format!(
-            "{} \
-             SELECT job_id \
-             FROM current_jobs \
-             WHERE queue = $1 \
-               AND state IN ('available', 'scheduled', 'retryable', 'waiting_external') \
-             ORDER BY job_id ASC",
-            queue_storage_current_jobs_cte(store.schema())
-        );
-        let ids: Vec<i64> = sqlx::query_scalar(audited_sql(sql))
-            .bind(queue)
-            .fetch_all(pool)
-            .await?;
-        return store
-            .cancel_jobs_by_ids(pool, &ids)
-            .await
-            .map(|rows| rows.len() as u64);
+        let queues = {
+            let mut conn = pool.acquire().await?;
+            persisted_physical_queues(&mut conn, store.schema(), queue).await?
+        };
+        return store.drain_queues(pool, &queues).await;
     }
 
     let result = sqlx::query(

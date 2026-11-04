@@ -20234,3 +20234,241 @@ async fn test_queue_storage_cancel_by_unique_key_reads_live_work_only() {
          {scoped_finished_claims} with retained claims"
     );
 }
+
+async fn queue_deferred_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
+    sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count deferred jobs")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_cancels_a_backlog_larger_than_one_chunk() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_backlog";
+    let other_queue = "qs_drain_other";
+    let store = create_store(&pool, "awa_qs_drain_backlog").await;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 3_000)
+        .await
+        .expect("enqueue history");
+    loop {
+        let claimed = store
+            .claim_batch(&pool, queue, 1_000)
+            .await
+            .expect("claim history");
+        if claimed.is_empty() {
+            break;
+        }
+        store
+            .complete_batch(&pool, &claimed)
+            .await
+            .expect("complete history");
+    }
+
+    store
+        .enqueue_batch(&pool, queue, 2, 3)
+        .await
+        .expect("enqueue retry jobs");
+    let to_retry = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(30))
+        .await
+        .expect("claim retry jobs");
+    assert_eq!(to_retry.len(), 3);
+    for claimed in &to_retry {
+        store
+            .retry_after(
+                &pool,
+                claimed.job.id,
+                claimed.job.run_lease,
+                Duration::from_secs(3_600),
+                None,
+            )
+            .await
+            .expect("retry job")
+            .expect("running job should become retryable");
+    }
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("enqueue running job");
+    let running = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim running job");
+    assert_eq!(running.len(), 1);
+    let running_id = running[0].job.id;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 2_500)
+        .await
+        .expect("enqueue available backlog");
+    let scheduled: Vec<_> = (0..2_500)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("enqueue scheduled backlog");
+    let unique_opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    };
+    for id in 0..3 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 900_000 + id },
+            unique_opts.clone(),
+        )
+        .await;
+    }
+
+    store
+        .enqueue_batch(&pool, other_queue, 2, 10)
+        .await
+        .expect("enqueue other available");
+    let other_scheduled: Vec<_> = (0..10)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: other_queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("other scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &other_scheduled)
+        .await
+        .expect("enqueue other scheduled");
+
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    assert_eq!(drained, 3 + 2_500 + 2_500 + 3);
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts after drain");
+    assert_eq!(counts.available, 0);
+    assert_eq!(counts.running, 1);
+    assert_eq!(queue_deferred_count(&pool, &store, queue).await, 0);
+    let dispatcher_counts = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("dispatcher counts after drain");
+    assert_eq!(
+        dispatcher_counts.available, 0,
+        "the claim cursor should move past the drained rows"
+    );
+    let cancelled: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'cancelled'",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count cancelled jobs");
+    assert_eq!(cancelled, drained as i64);
+    let running_job = store
+        .load_job(&pool, running_id)
+        .await
+        .expect("load running job")
+        .expect("running job should exist");
+    assert_eq!(running_job.state, JobState::Running);
+
+    let other_counts = store
+        .queue_counts(&pool, other_queue)
+        .await
+        .expect("other queue counts");
+    assert_eq!(other_counts.available, 10);
+    assert_eq!(queue_deferred_count(&pool, &store, other_queue).await, 10);
+
+    // The drained unique jobs released their keys, and the lane's claim
+    // cursor moved past the cancelled rows.
+    let requeued = enqueue_job(&pool, &store, &CompleteJob { id: 900_000 }, unique_opts).await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(30))
+        .await
+        .expect("claim after drain");
+    let claimed_ids: Vec<i64> = claimed.iter().map(|claimed| claimed.job.id).collect();
+    assert_eq!(claimed_ids, vec![requeued]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_covers_every_stripe() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_drain_striped".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 20)
+        .await
+        .expect("enqueue striped available");
+    let scheduled: Vec<_> = (0..20)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("enqueue striped scheduled");
+
+    let drained = admin::drain_queue(&pool, queue)
+        .await
+        .expect("drain striped queue");
+    assert_eq!(drained, 40);
+    for stripe in 0..2 {
+        let physical = format!("{queue}#{stripe}");
+        let counts = store
+            .queue_counts(&pool, &physical)
+            .await
+            .expect("stripe counts");
+        assert_eq!(counts.available, 0, "{physical} available");
+        assert_eq!(
+            queue_deferred_count(&pool, &store, &physical).await,
+            0,
+            "{physical} deferred"
+        );
+    }
+}
