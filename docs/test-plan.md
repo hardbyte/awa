@@ -326,7 +326,7 @@ V25 adds a focused `AwaKeyedExecution` model for grant safety, partial-legacy co
 | V27 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
 | V28 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
 | V29 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
-| V30 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
+| V30 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | Not a 0.7 gate (moved to 0.8) |
 | V31 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
 
 ## Running Tests
