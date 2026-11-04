@@ -822,6 +822,16 @@ fn claim_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claims_{slot}")
 }
 
+/// SQL true when `column` names queue `param` or one of its stripes
+/// (`queue#N`).
+fn queue_and_stripes_sql(column: &str, param: &str) -> String {
+    format!(
+        "({column} = {param} \
+         OR (left({column}, char_length({param}) + 1) = {param} || '{QUEUE_STRIPE_DELIMITER}' \
+             AND substr({column}, char_length({param}) + 2) ~ '^[0-9]+$'))"
+    )
+}
+
 fn claim_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_batches_{slot}")
 }
@@ -2515,6 +2525,15 @@ struct ReadyTransitionRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DrainLane {
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    from_seq: i64,
+    to_seq: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -10192,12 +10211,53 @@ impl QueueStorage {
         Ok(locked)
     }
 
+    /// SQL true when the ready row `alias` has been claimed. A claim records
+    /// its attempt in its own transaction but moves the lane's claim cursor
+    /// past the row only after commit, so a claimed row can still sit at or
+    /// after the cursor; claims skip such rows on the same evidence. Receipt
+    /// claims leave an attempt batch, and materialized claims a later attempt
+    /// of the job, which is checked whatever this store's mode, since admin
+    /// callers build the store with default configuration.
+    fn ready_row_claimed_sql(&self, alias: &str) -> String {
+        let schema = self.schema();
+        let mut sql = format!(
+            "EXISTS (
+                SELECT 1 FROM {schema}.ready_claim_attempt_batches AS attempts
+                WHERE attempts.ready_slot = {alias}.ready_slot
+                  AND attempts.ready_generation = {alias}.ready_generation
+                  AND attempts.queue = {alias}.queue
+                  AND attempts.priority = {alias}.priority
+                  AND attempts.enqueue_shard = {alias}.enqueue_shard
+                  AND attempts.first_lane_seq <= {alias}.lane_seq
+                  AND attempts.next_lane_seq > {alias}.lane_seq
+                  AND attempts.lane_ranges @> int8range({alias}.lane_seq, {alias}.lane_seq + 1, '[)')
+            )"
+        );
+        for table in [
+            "leases",
+            "done_entries",
+            "deferred_jobs",
+            "dlq_entries",
+            "ready_entries",
+        ] {
+            sql.push_str(&format!(
+                " OR EXISTS (
+                    SELECT 1 FROM {schema}.{table} AS attempt
+                    WHERE attempt.job_id = {alias}.job_id
+                      AND attempt.run_lease = {alias}.run_lease + 1
+                )"
+            ));
+        }
+        sql
+    }
+
     async fn cancel_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
     ) -> Result<Option<CancelJobTxResult>, AwaError> {
         let schema = self.schema();
+        let claimed = self.ready_row_claimed_sql("ready");
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
             r#"
             WITH target AS (
@@ -10218,6 +10278,7 @@ impl QueueStorage {
                         AND tomb.ready_slot = ready.ready_slot
                         AND tomb.ready_generation = ready.ready_generation
                   )
+                  AND NOT ({claimed})
                 ORDER BY ready.lane_seq DESC
                 LIMIT 1
                 FOR UPDATE OF ready SKIP LOCKED
@@ -10427,51 +10488,101 @@ impl QueueStorage {
         Ok(rows)
     }
 
-    /// Cancel every available, scheduled, retryable and waiting job in the
-    /// physical `queues`, returning how many were cancelled.
+    /// Cancel every available, scheduled, retryable and waiting job in
+    /// `queue` and its stripes (`queue#N`), returning how many were cancelled.
     ///
-    /// Scheduled, retryable and available jobs are cancelled a chunk at a
-    /// time, each chunk in its own transaction, so a large backlog costs a
+    /// Jobs enqueued after the drain starts are left alone, and so are running
+    /// jobs. Scheduled, retryable and available jobs are cancelled a chunk at
+    /// a time, each chunk in its own transaction, so a large backlog costs a
     /// few statements per chunk rather than per job and holds row locks for
-    /// one chunk at a time. Waiting jobs go through [`Self::cancel_jobs_by_ids`].
-    /// Running jobs are left alone.
-    pub async fn drain_queues(&self, pool: &PgPool, queues: &[String]) -> Result<u64, AwaError> {
-        let mut drained = 0u64;
+    /// one chunk at a time. Rows another transaction has locked are skipped.
+    /// Waiting jobs go through [`Self::cancel_jobs_by_ids`].
+    pub(crate) async fn drain_queue(&self, pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let job_id_bound: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT {schema}.sequence_next_value('job_id_seq')"
+        )))
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
 
+        let mut drained = 0u64;
+        let mut after_job_id = i64::MIN;
         loop {
             let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-            let cancelled = self.cancel_deferred_chunk_tx(&mut tx, queues).await?;
+            let (cancelled, last_job_id) = self
+                .cancel_deferred_chunk_tx(&mut tx, queue, after_job_id, job_id_bound)
+                .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             drained += cancelled as u64;
             if (cancelled as i64) < DRAIN_BATCH_SIZE {
                 break;
             }
+            after_job_id = last_job_id;
         }
 
-        // After the deferred pass, so jobs promoted while it ran are drained
-        // from the ready lanes.
-        loop {
+        // Read after the deferred pass, so jobs promoted while it ran are
+        // drained from the ready lanes.
+        let mut lanes: Vec<DrainLane> = sqlx::query_as(audited_sql(format!(
+            r#"
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS from_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS to_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+            WHERE {queues}
+            "#,
+            queues = queue_and_stripes_sql("claims.queue", "$1"),
+        )))
+        .bind(queue)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        lanes.retain(|lane| lane.from_seq < lane.to_seq);
+
+        while !lanes.is_empty() {
             let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-            let (cancelled, advances) = self.cancel_available_chunk_tx(&mut tx, queues).await?;
+            let (cancelled, advances) = self.cancel_available_chunk_tx(&mut tx, &lanes).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             self.advance_claim_cursors(pool, &advances).await;
             drained += cancelled as u64;
             if (cancelled as i64) < DRAIN_BATCH_SIZE {
                 break;
             }
+            // The next chunk resumes after the rows this one cancelled, so
+            // each lane is read once even when its claim cursor cannot move
+            // past a claimed or locked row.
+            for advance in &advances {
+                if let Some(lane) = lanes.iter_mut().find(|lane| {
+                    lane.queue == advance.queue
+                        && lane.priority == advance.priority
+                        && lane.enqueue_shard == advance.enqueue_shard
+                }) {
+                    lane.from_seq = lane.from_seq.max(advance.next_seq);
+                }
+            }
+            lanes.retain(|lane| lane.from_seq < lane.to_seq);
         }
 
-        let schema = self.schema();
         let waiting: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
             r#"
             SELECT job_id
             FROM {schema}.leases
-            WHERE queue = ANY($1)
+            WHERE {queues}
               AND state = 'waiting_external'
+              AND job_id < $2
             ORDER BY job_id
-            "#
+            "#,
+            queues = queue_and_stripes_sql("queue", "$1"),
         )))
-        .bind(queues)
+        .bind(queue)
+        .bind(job_id_bound)
         .fetch_all(pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -10480,11 +10591,16 @@ impl QueueStorage {
         Ok(drained)
     }
 
+    /// Cancel up to [`DRAIN_BATCH_SIZE`] scheduled and retryable jobs of
+    /// `queue` with ids in `(after_job_id, job_id_bound)`, returning how many
+    /// were cancelled and the largest cancelled id.
     async fn cancel_deferred_chunk_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        queues: &[String],
-    ) -> Result<usize, AwaError> {
+        queue: &str,
+        after_job_id: i64,
+        job_id_bound: i64,
+    ) -> Result<(usize, i64), AwaError> {
         let schema = self.schema();
         let deferred: Vec<DeferredJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -10492,9 +10608,12 @@ impl QueueStorage {
             WHERE job_id IN (
                 SELECT job_id
                 FROM {schema}.deferred_jobs
-                WHERE queue = ANY($1)
+                WHERE {queues}
                   AND state IN ('scheduled', 'retryable')
-                LIMIT $2
+                  AND job_id > $2
+                  AND job_id < $3
+                ORDER BY job_id
+                LIMIT $4
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING
@@ -10514,17 +10633,20 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            "#
+            "#,
+            queues = queue_and_stripes_sql("queue", "$1"),
         )))
-        .bind(queues)
+        .bind(queue)
+        .bind(after_job_id)
+        .bind(job_id_bound)
         .bind(DRAIN_BATCH_SIZE)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        if deferred.is_empty() {
-            return Ok(0);
-        }
+        let Some(last_job_id) = deferred.iter().map(|row| row.job_id).max() else {
+            return Ok((0, after_job_id));
+        };
 
         let cancelled = deferred.len();
         let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
@@ -10570,45 +10692,45 @@ impl QueueStorage {
             self.insert_done_rows_tx(tx, &rows, Some(old_state)).await?;
         }
 
-        Ok(cancelled)
+        Ok((cancelled, last_job_id))
     }
 
+    /// Cancel up to [`DRAIN_BATCH_SIZE`] available jobs from `lanes`,
+    /// returning how many were cancelled and the claim-cursor advances that
+    /// skip them.
     async fn cancel_available_chunk_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        queues: &[String],
+        lanes: &[DrainLane],
     ) -> Result<(usize, Vec<ClaimCursorAdvance>), AwaError> {
         let schema = self.schema();
+        let claimed = self.ready_row_claimed_sql("ready");
         // Unclaimed rows are found the way a claim finds them: from each
         // lane's claim cursor through its segments, then along the ready key
         // within each segment's ring slot. The ready key leads with the ring
         // slot, so a lane range without it scans every retained ready row.
-        // Only rows whose tombstone this statement inserts are cancelled, so a
-        // concurrent cancel of the same row cannot produce a second done row.
+        // Rows are locked before the limit applies, so a row another
+        // transaction holds does not shorten the chunk. Only rows whose
+        // tombstone this statement inserts are cancelled, so a concurrent
+        // cancel of the same row cannot produce a second done row.
         let ready: Vec<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
             r#"
             WITH heads AS (
                 SELECT
-                    claims.queue,
-                    claims.priority,
-                    claims.enqueue_shard,
-                    {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                    {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
-                FROM {schema}.queue_claim_heads AS claims
-                JOIN {schema}.queue_enqueue_heads AS enqueues
-                  ON enqueues.queue = claims.queue
-                 AND enqueues.priority = claims.priority
-                 AND enqueues.enqueue_shard = claims.enqueue_shard
-                WHERE claims.queue = ANY($1)
+                    lanes.queue,
+                    lanes.priority,
+                    lanes.enqueue_shard,
+                    GREATEST(lanes.from_seq, {schema}.sequence_next_value(claims.seq_name)) AS claim_seq,
+                    lanes.to_seq AS next_seq
+                FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[], $5::bigint[])
+                    AS lanes(queue, priority, enqueue_shard, from_seq, to_seq)
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = lanes.queue
+                 AND claims.priority = lanes.priority
+                 AND claims.enqueue_shard = lanes.enqueue_shard
             ),
-            candidates AS (
-                SELECT
-                    ready.ready_slot,
-                    ready.ready_generation,
-                    ready.queue,
-                    ready.priority,
-                    ready.enqueue_shard,
-                    ready.lane_seq
+            target AS (
+                SELECT ready.*
                 FROM heads
                 CROSS JOIN LATERAL (
                     SELECT
@@ -10625,13 +10747,7 @@ impl QueueStorage {
                     ORDER BY segment.next_lane_seq
                 ) AS segment
                 CROSS JOIN LATERAL (
-                    SELECT
-                        ready.ready_slot,
-                        ready.ready_generation,
-                        ready.queue,
-                        ready.priority,
-                        ready.enqueue_shard,
-                        ready.lane_seq
+                    SELECT ready.*
                     FROM {schema}.ready_entries AS ready
                     WHERE ready.ready_slot = segment.ready_slot
                       AND ready.ready_generation = segment.ready_generation
@@ -10640,31 +10756,20 @@ impl QueueStorage {
                       AND ready.enqueue_shard = heads.enqueue_shard
                       AND ready.lane_seq >= segment.from_seq
                       AND ready.lane_seq < segment.to_seq
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                          WHERE tomb.ready_slot = ready.ready_slot
+                            AND tomb.ready_generation = ready.ready_generation
+                            AND tomb.queue = ready.queue
+                            AND tomb.priority = ready.priority
+                            AND tomb.enqueue_shard = ready.enqueue_shard
+                            AND tomb.lane_seq = ready.lane_seq
+                      )
+                      AND NOT ({claimed})
                     ORDER BY ready.lane_seq
-                    OFFSET 0
+                    FOR UPDATE OF ready SKIP LOCKED
                 ) AS ready
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                    WHERE tomb.ready_slot = ready.ready_slot
-                      AND tomb.ready_generation = ready.ready_generation
-                      AND tomb.queue = ready.queue
-                      AND tomb.priority = ready.priority
-                      AND tomb.enqueue_shard = ready.enqueue_shard
-                      AND tomb.lane_seq = ready.lane_seq
-                )
-                LIMIT $2
-            ),
-            target AS (
-                SELECT ready.*
-                FROM {schema}.ready_entries AS ready
-                JOIN candidates
-                  ON candidates.ready_slot = ready.ready_slot
-                 AND candidates.ready_generation = ready.ready_generation
-                 AND candidates.queue = ready.queue
-                 AND candidates.priority = ready.priority
-                 AND candidates.enqueue_shard = ready.enqueue_shard
-                 AND candidates.lane_seq = ready.lane_seq
-                FOR UPDATE OF ready SKIP LOCKED
+                LIMIT $6
             ),
             tombstone AS (
                 INSERT INTO {schema}.ready_tombstones (
@@ -10704,7 +10809,11 @@ impl QueueStorage {
              AND tombstone.lane_seq = target.lane_seq
             "#
         )))
-        .bind(queues)
+        .bind(lanes.iter().map(|lane| lane.queue.as_str()).collect::<Vec<_>>())
+        .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+        .bind(lanes.iter().map(|lane| lane.enqueue_shard).collect::<Vec<_>>())
+        .bind(lanes.iter().map(|lane| lane.from_seq).collect::<Vec<_>>())
+        .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
         .bind(DRAIN_BATCH_SIZE)
         .fetch_all(tx.as_mut())
         .await
@@ -10970,6 +11079,7 @@ impl QueueStorage {
         priority: Option<i16>,
     ) -> Result<ReadyBatchMoveResult, AwaError> {
         let schema = self.schema();
+        let claimed = self.ready_row_claimed_sql("ready");
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
             r#"
             WITH target AS (
@@ -10990,6 +11100,7 @@ impl QueueStorage {
                         AND tomb.ready_slot = ready.ready_slot
                         AND tomb.ready_generation = ready.ready_generation
                   )
+                  AND NOT ({claimed})
                 ORDER BY ready.lane_seq DESC
                 LIMIT 1
                 FOR UPDATE OF ready SKIP LOCKED

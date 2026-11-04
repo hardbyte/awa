@@ -1594,13 +1594,12 @@ where
 }
 
 /// Drain a queue: cancel all non-running, non-terminal jobs.
+///
+/// On queue storage this also drains the queue's stripes: queues named
+/// `<queue>#<digits>`. Jobs enqueued after the drain starts are left alone.
 pub async fn drain_queue(pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
-        let queues = {
-            let mut conn = pool.acquire().await?;
-            persisted_physical_queues(&mut conn, store.schema(), queue).await?
-        };
-        return store.drain_queues(pool, &queues).await;
+        return store.drain_queue(pool, queue).await;
     }
 
     let result = sqlx::query(

@@ -20472,3 +20472,175 @@ async fn test_queue_storage_drain_queue_covers_every_stripe() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_covers_stripes_holding_only_scheduled_jobs() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_scheduled_stripes";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_drain_scheduled_stripes".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let scheduled: Vec<_> = (0..40)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    run_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .expect("scheduled params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &scheduled)
+        .await
+        .expect("enqueue striped scheduled");
+    let stripes: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(DISTINCT queue)::bigint FROM {}.deferred_jobs",
+        store.schema()
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count scheduled stripes");
+    assert!(stripes > 1, "scheduled jobs should spread across stripes");
+
+    let drained = admin::drain_queue(&pool, queue)
+        .await
+        .expect("drain striped queue");
+    assert_eq!(drained, 40);
+    let remaining: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs",
+        store.schema()
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count remaining scheduled");
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_and_cancel_leave_claims_the_cursor_has_not_passed() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_claim_window";
+    let store = create_store(&pool, "awa_qs_drain_claim_window").await;
+    let schema = store.schema().to_string();
+
+    store
+        .enqueue_batch(&pool, queue, 2, 5)
+        .await
+        .expect("enqueue available");
+    let (seq_name, cursor_before): (String, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT seq_name, {schema}.sequence_next_value(seq_name) \
+         FROM {schema}.queue_claim_heads WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read claim cursor");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim two jobs");
+    assert_eq!(claimed.len(), 2);
+    // The claim committed but its post-commit cursor advance has not run.
+    sqlx::query(audited_sql(
+        "SELECT setval(format('%I.%I', $1::text, $2::text)::regclass, $3, false)".to_string(),
+    ))
+    .bind(&schema)
+    .bind(&seq_name)
+    .bind(cursor_before)
+    .execute(&pool)
+    .await
+    .expect("rewind claim cursor");
+
+    let cancelled = store
+        .cancel_job(&pool, claimed[0].job.id)
+        .await
+        .expect("cancel a claimed job");
+    assert!(
+        cancelled.is_none_or(|row| row.run_lease == claimed[0].job.run_lease),
+        "cancel must act on the running attempt, not the claimed ready row"
+    );
+    let moved = store
+        .move_queue(
+            &pool,
+            claimed[1].job.id,
+            "qs_drain_claim_window_moved",
+            None,
+        )
+        .await
+        .expect("move a claimed job");
+    assert!(!moved, "a claimed job must not be re-enqueued elsewhere");
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    assert_eq!(drained, 3);
+
+    store
+        .complete_runtime_batch(&pool, &claimed[1..])
+        .await
+        .expect("complete the other claimed job");
+    let done_states: Vec<String> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT state::text FROM {schema}.done_entries WHERE job_id = $1"
+    )))
+    .bind(claimed[1].job.id)
+    .fetch_all(&pool)
+    .await
+    .expect("load done rows");
+    assert_eq!(done_states, vec!["completed".to_string()]);
+    let duplicated: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM (
+             SELECT job_id FROM {schema}.done_entries GROUP BY job_id HAVING count(*) > 1
+         ) AS duplicated"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count duplicated done rows");
+    assert_eq!(duplicated, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_drain_queue_skips_a_locked_row_without_stopping() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_drain_locked_row";
+    let store = create_store(&pool, "awa_qs_drain_locked_row").await;
+    let schema = store.schema().to_string();
+
+    store
+        .enqueue_batch(&pool, queue, 2, 2_500)
+        .await
+        .expect("enqueue available backlog");
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    let locked_id: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT job_id FROM {schema}.ready_entries WHERE queue = $1 \
+         ORDER BY lane_seq LIMIT 1 FOR UPDATE"
+    )))
+    .bind(queue)
+    .fetch_one(holder.as_mut())
+    .await
+    .expect("lock the first ready row");
+
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    assert_eq!(drained, 2_499);
+    holder.commit().await.expect("release lock");
+
+    let locked_job = store
+        .load_job(&pool, locked_id)
+        .await
+        .expect("load locked job")
+        .expect("locked job should exist");
+    assert_eq!(locked_job.state, JobState::Available);
+    let drained = admin::drain_queue(&pool, queue)
+        .await
+        .expect("drain the released row");
+    assert_eq!(drained, 1);
+}
