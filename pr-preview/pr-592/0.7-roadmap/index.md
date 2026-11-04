@@ -25,7 +25,7 @@ themes from this document: **operations** (WS-3, D3, D5), **observability** (WS-
 | #118 serverless `tick()` | M2 |
 | #295 segment-engine RFC | M5. Gate A kept the incremental queue-storage design. |
 | #303 maintenance task split, #418 fragmented-backlog drain | M5 / evidence track |
-| #360 dual-engine harness | M0. The canonical engine is removed in 0.8. |
+| #360 residual triage | M0. The harness core (#362) and its `queue_storage` CI leg stay in 0.7 and already run green; only triage of leftover canonical-only test artifacts moves, and nothing in M0 depends on it. |
 | #377 versioned docs site, #385 hot reload | WS-6 / not scheduled |
 
 Consequences for the sections below:
@@ -372,10 +372,10 @@ named.
 closure with evidence.
 
 **M2 — Deployment shapes.**
-Issues #282, #372 (ADR-027/028 → Accepted), #118, #343, #373, #374, and #344 (last — consumes
+Issues #282, #372 (ADR-027/028 → Accepted), #343, #373, #374, #424, and #344 (last — consumes
 all of the above).
 *Exit:* the four-surface reference topology (private admin, public signed callbacks, workers,
-maintenance-only) installable from the Helm chart with kind smoke in CI; tick()-only demo green.
+maintenance-only) installable from the Helm chart with kind smoke in CI.
 
 **M3 — Observability.**
 Issue #110 (Rust path → Python boundary), the E8 gate, #375, #376 and #391.
