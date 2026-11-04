@@ -4,9 +4,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
-## [0.6.11] — Unreleased
+## [0.6.11] — 2026-11-04
 
-Patch release: promotion of due scheduled and retryable jobs on queue storage no longer stalls once a backlog builds. No migration and no public API change.
+Patch release: promotion of due scheduled and retryable jobs on queue storage no longer stalls once a backlog builds. No migration, no schema patch and no public API change. Upgrading from 0.6.10 is a rolling upgrade of processes; promotion runs on the maintenance leader, so a stalled deployment recovers once the leader runs 0.6.11, and any runtime can become leader, so roll all of them.
 
 - **Promoting due jobs no longer fails above 3,640 rows in one tick on queue
   storage** (backport of the writer changes in
