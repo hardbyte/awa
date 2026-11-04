@@ -4,9 +4,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
-## [0.6.12] — Unreleased
+## [0.6.12] — 2026-11-05
 
-Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration and no public API change.
+Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.
 
 - **Queue storage no longer drives PostgreSQL 18 into a backend crash when a
   rescue, cancel or claim close locks a claim that was just rewritten.** A
