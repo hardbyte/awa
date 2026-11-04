@@ -125,17 +125,25 @@ else
 fi
 alert_failures=0
 alert_count=0
-# Every query needs a datasource and a model, and the rule's condition must
-# name one of its queries; Grafana refuses to provision a rule otherwise.
+# Every query needs a datasource and a model, a datasource query needs a
+# PromQL or SQL body, and the rule's condition must name one of its queries.
+# Otherwise Grafana refuses the rule or the checks below skip its query.
 if ! "${yaml_python[@]}" -c 'import sys, yaml
 bad = []
 for path in sys.argv[1:]:
     for group in yaml.safe_load(open(path))["groups"]:
         for rule in group["rules"]:
             refs = [query.get("refId") for query in rule["data"]]
-            if rule.get("condition") not in refs or any(
-                "model" not in query or "datasourceUid" not in query for query in rule["data"]
-            ):
+            incomplete = any(
+                "model" not in query
+                or "datasourceUid" not in query
+                or (
+                    query["datasourceUid"] != "__expr__"
+                    and not (query["model"].get("expr") or query["model"].get("rawSql") or "").strip()
+                )
+                for query in rule["data"]
+            )
+            if rule.get("condition") not in refs or incomplete:
                 bad.append(rule["uid"])
 for uid in bad:
     print(f"  FAILED: alert rule {uid} has an incomplete query or condition")
