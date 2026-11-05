@@ -212,6 +212,9 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
 
+The leader also refreshes planner statistics on the two head tables and the ring parents when it is elected and every five minutes ([Planner statistics](configuration.md#planner-statistics)): autovacuum never analyses partitioned tables or reaches its threshold on the head tables. It runs beside the ring ticks rather than in them, so a slow `ANALYZE` never delays a rotate or prune tick.
+
+
 The common safety pattern is:
 
 1. Lock the ring-state row with `FOR UPDATE`.

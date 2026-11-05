@@ -224,6 +224,8 @@ The runtime also directly upserts into the descriptor catalogs on startup and on
 
 These writes are not trigger-driven; they come from `ClientBuilder::build()` / `AsyncClient.start()` and from the snapshot reporter. The broad grant already covers them.
 
+The maintenance leader refreshes planner statistics for the queue-storage head tables and ring parents (see [Planner statistics](configuration.md#planner-statistics)). `ANALYZE` skips a table its caller may not analyse, so a runtime that does not own the tables calls `awa.analyze_queue_storage_relation(schema, relation)`, a `SECURITY DEFINER` function installed by the `analyze_queue_storage_relation` schema patch under the migrator role and executable by `PUBLIC`. The runtime needs no `MAINTAIN` grant. The function only analyses a head table or partitioned table of a queue-storage schema that is owned by the owner of the `awa` schema, which is why migrations must run with the owner role as the effective role (step 2 above). A function owned by a role that may not analyse the tables makes every pass report `skipped_privilege` and logs one warning.
+
 Other PostgreSQL features used at runtime:
 
 | Feature | Purpose | Privilege needed |
