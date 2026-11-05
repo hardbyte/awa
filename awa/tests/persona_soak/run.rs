@@ -127,7 +127,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
 
     let load_deadline = Instant::now() + shared.config.load;
     let mut next_progress = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < load_deadline {
+    while Instant::now() < load_deadline && !shared.load_stop.is_stopped() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Some((persona, _)) = tasks.iter().find(|(_, task)| task.is_finished()) {
             // A persona only returns early on a setup failure or a panic.

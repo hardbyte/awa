@@ -446,7 +446,39 @@ impl Oracle {
         }
     }
 
+    /// Stops the run before it can fill the disk it shares with other work.
+    fn check_disk(&self) {
+        let output = std::process::Command::new("df")
+            .args(["--output=avail", "-BM"])
+            .arg(&self.shared.config.report_dir)
+            .output();
+        let Ok(output) = output else { return };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let Some(free_mb) = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.trim().trim_end_matches('M').parse::<i64>().ok())
+        else {
+            return;
+        };
+        self.shared.run.observe("free_disk_gb", free_mb / 1024);
+        if free_mb < self.shared.config.min_free_disk_gb * 1024
+            && !self.shared.load_stop.is_stopped()
+        {
+            self.shared.violation(
+                "disk_low",
+                format!(
+                    "only {} GB free on the report directory's filesystem; stopping the load phase",
+                    free_mb / 1024
+                ),
+                vec![],
+            );
+            self.shared.load_stop.trigger();
+        }
+    }
+
     async fn sample_resources(&self) {
+        self.check_disk();
         let connections: Result<i64, _> = sqlx::query_scalar(
             "SELECT count(*)::bigint FROM pg_stat_activity WHERE backend_type = 'client backend'",
         )
