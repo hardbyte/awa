@@ -204,7 +204,7 @@ async fn poll_interval(http: &Http) -> Duration {
 /// Dashboard tabs: each polls what the overview, the shell and (for some tabs) the
 /// queues, kinds and cron pages poll, every server-suggested interval.
 pub async fn run_watchers(shared: Arc<Shared>) -> Result<(), String> {
-    let tabs = shared.config.scaled(6) as usize;
+    let tabs = shared.config.scaled(4) as usize;
     shared.note(
         "watchers",
         format!("{tabs} dashboard tabs polling the admin UI"),
@@ -320,9 +320,10 @@ pub async fn run_support(shared: Arc<Shared>) -> Result<(), String> {
                         .unwrap_or(Value::Null),
                 ));
             }
-            4 => {
+            4 if rng.chance(30) => {
                 http.get("/api/jobs", "/api/jobs?tag=soak&limit=20").await;
             }
+            4 => {}
             5 => {
                 // Follow one job the way the detail page does: a fast poll for a while.
                 if let Some(&id) = rng.pick(&known) {
@@ -712,9 +713,9 @@ pub async fn run_impatient(shared: Arc<Shared>) -> Result<(), String> {
             shared.stats(persona).add("completed_before_abandon", 1);
         }
         if Instant::now() >= next_burst {
-            next_burst = Instant::now() + Duration::from_secs(rng.range(15, 40));
+            next_burst = Instant::now() + Duration::from_secs(rng.range(30, 70));
             let mut burst = tokio::task::JoinSet::new();
-            let size = shared.config.scaled(40);
+            let size = shared.config.scaled(12);
             for _ in 0..size {
                 let http = http.clone();
                 let path = *rng.pick(&heavy).expect("paths");

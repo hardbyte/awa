@@ -330,9 +330,11 @@ impl Shared {
                 .get("cron_fire_time")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            if !self
-                .ledger
-                .note_cron_fire(name.to_string(), fire.to_string(), job.id)
+            // Manually triggered jobs carry the schedule's name but no fire time.
+            if !fire.is_empty()
+                && !self
+                    .ledger
+                    .note_cron_fire(name.to_string(), fire.to_string(), job.id)
             {
                 self.violation(
                     "cron_double_fire",

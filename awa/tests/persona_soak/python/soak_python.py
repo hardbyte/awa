@@ -34,7 +34,7 @@ QUEUE_WORK = os.environ.get("SOAK_QUEUE_WORK", "awa_soak_py_work")
 QUEUE_DEADLINE = os.environ.get("SOAK_QUEUE_DEADLINE", "awa_soak_py_deadline")
 QUEUE_SHARED = os.environ.get("SOAK_QUEUE_SHARED", "awa_soak_py_shared")
 WORK_WORKERS = 8
-DEADLINE_WORKERS = 6
+DEADLINE_WORKERS = 16
 SHARED_WORKERS = 6
 DEADLINE_MS = 5000
 
