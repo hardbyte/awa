@@ -36,6 +36,10 @@ struct RawReceiptClaimRow {
     claim_slot: i32,
 }
 
+/// `AwaMetrics::from_global` reads the process-wide meter provider when a
+/// client starts, so tests that install their own provider must not overlap.
+static GLOBAL_METRICS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
 fn install_in_memory_metrics() -> (InMemoryMetricExporter, SdkMeterProvider) {
     let exporter = InMemoryMetricExporter::default();
     let meter_provider = SdkMeterProvider::builder()
@@ -5234,6 +5238,7 @@ async fn test_queue_storage_cancelled_compact_claim_closes_via_batch_and_queue_p
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_capacity_wake_drains_after_partial_drain() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     let (exporter, meter_provider) = install_in_memory_metrics();
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_capacity_wake_partial_drain";
@@ -11783,7 +11788,7 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
-    let (_db_guard, pool) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(20).await;
     let queue = "qs_prune_attempt_metric";
     let schema = "awa_qs_prune_attempt_metric";
     let store_config = QueueStorageConfig {
@@ -11795,6 +11800,18 @@ async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
     };
     let store = create_store_with_config(&pool, store_config.clone()).await;
 
+    // Enqueue before the client starts so the job's rows are in slot 0, the
+    // slot the ring prunes first, whatever the maintenance timing.
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4001 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
     let mut reader_tx = pool.begin().await.expect("begin reader tx");
     sqlx::query(&format!(
         "LOCK TABLE {schema}.ready_segments_0 IN ACCESS SHARE MODE"
@@ -11803,6 +11820,7 @@ async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
     .await
     .expect("reader lock");
 
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     let (exporter, meter_provider) = install_in_memory_metrics();
     let client = Client::builder(pool.clone())
         .queue(
@@ -11831,16 +11849,6 @@ async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
         .expect("build prune metric client");
     client.start().await.expect("start prune metric client");
 
-    let job_id = enqueue_job(
-        &pool,
-        &store,
-        &CompleteJob { id: 4001 },
-        InsertOpts {
-            queue: queue.to_string(),
-            ..Default::default()
-        },
-    )
-    .await;
     wait_for_job_state(
         &store,
         &pool,
@@ -11850,10 +11858,10 @@ async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
     )
     .await;
 
-    let queue_attempts = |outcome: &str| {
+    let attempts_by_outcome = || {
         meter_provider.force_flush().expect("flush metrics");
         let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
-        let mut total = 0;
+        let mut totals: std::collections::BTreeMap<String, u64> = Default::default();
         for resource in &resource_metrics {
             for scope in resource.scope_metrics() {
                 for metric in scope.metrics() {
@@ -11863,40 +11871,53 @@ async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
                     let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
                         continue;
                     };
-                    total += sum
-                        .data_points()
-                        .filter(|point| {
-                            let has = |key: &str, value: &str| {
-                                point
-                                    .attributes()
-                                    .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
-                            };
-                            has("awa.ring", "queue") && has("awa.ring.outcome", outcome)
-                        })
-                        .map(|point| point.value())
-                        .sum::<u64>();
+                    for point in sum.data_points() {
+                        let attribute = |key: &str| {
+                            point
+                                .attributes()
+                                .find(|kv| kv.key.as_str() == key)
+                                .map(|kv| kv.value.as_str().into_owned())
+                                .unwrap_or_default()
+                        };
+                        *totals
+                            .entry(format!(
+                                "{}/{}",
+                                attribute("awa.ring"),
+                                attribute("awa.ring.outcome")
+                            ))
+                            .or_default() += point.value();
+                    }
                 }
             }
         }
-        total
+        totals
+    };
+    let queue_attempts = |outcome: &str| {
+        attempts_by_outcome()
+            .get(&format!("queue/{outcome}"))
+            .copied()
+            .unwrap_or(0)
     };
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while queue_attempts("blocked") == 0 {
         assert!(
             Instant::now() < deadline,
-            "queue prune never reported blocked while a reader held the queue segment"
+            "queue prune never reported blocked while a reader held the queue segment; \
+             attempts so far: {:?}",
+            attempts_by_outcome()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(queue_attempts("pruned"), 0);
 
     reader_tx.rollback().await.expect("release reader lock");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while queue_attempts("pruned") == 0 {
         assert!(
             Instant::now() < deadline,
-            "queue prune never completed after the reader released"
+            "queue prune never completed after the reader released; attempts so far: {:?}",
+            attempts_by_outcome()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
