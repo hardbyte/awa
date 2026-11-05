@@ -89,7 +89,14 @@ start_container() {
         mkdir -p /data/log
         rm -f /data/log/pg.log /data/log/pg-filtered.log
         mkfifo /data/log/pg.log
-        awk -W interactive "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{skip=(\$0 ~ /AWAEPQ/)} !skip{print; fflush()}" \
+        awk -W interactive "
+          /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{
+            pid=\"\"; if (match(\$0,/\\[[0-9]+\\]/)) pid=substr(\$0,RSTART,RLENGTH)
+            if (\$0 ~ /AWAEPQ/) {skip=1; epq[pid]=1}
+            else if (\$0 ~ /STATEMENT:/ && (pid in epq)) {skip=1; delete epq[pid]}
+            else {skip=0; delete epq[pid]}
+          }
+          !skip{print; fflush()}" \
           </data/log/pg.log >>/data/log/pg-filtered.log &
         exec postgres -D /data -c listen_addresses="*" -c max_connections='"$MAX_CONNECTIONS"' \
           -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 \
