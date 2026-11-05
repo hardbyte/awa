@@ -605,6 +605,7 @@ class Client:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
+        statistics_refresh_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = 16,
         queue_storage_lease_slot_count: int = 8,

@@ -1,5 +1,6 @@
 use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
+use crate::statistics::{RefreshGuard, StatisticsRefresher};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::audited_sql;
 use awa_model::cron::{
@@ -738,6 +739,9 @@ pub struct MaintenanceService {
     priority_aging_interval: Duration,
     batch_operations_interval: Duration,
     terminal_count_rollup_interval: Duration,
+    /// How often the leader refreshes planner statistics for the queue-storage
+    /// tables autovacuum never analyses. Zero disables the refresh.
+    statistics_refresh_interval: Duration,
     /// How long a descriptor catalog row can sit without being refreshed
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
@@ -757,6 +761,8 @@ pub struct MaintenanceService {
     ring_authority_flip_aware_since: std::sync::Mutex<Option<Instant>>,
 }
 
+/// Default cadence of the planner-statistics refresh on the maintenance leader.
+pub(crate) const DEFAULT_STATISTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
 const CRON_CATCH_UP_LIMIT: usize = 1_000;
@@ -817,6 +823,7 @@ impl MaintenanceService {
             priority_aging_interval: Duration::from_secs(60),
             batch_operations_interval: Duration::from_secs(1),
             terminal_count_rollup_interval: Duration::from_secs(30),
+            statistics_refresh_interval: DEFAULT_STATISTICS_REFRESH_INTERVAL,
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
             ring_authority_auto_flip: true,
             ring_authority_auto_flip_stable_period: Duration::from_secs(600), // 10min
@@ -870,6 +877,14 @@ impl MaintenanceService {
     /// counter table for sealed queue segments (default: 30s).
     pub fn terminal_count_rollup_interval(mut self, interval: Duration) -> Self {
         self.terminal_count_rollup_interval = interval;
+        self
+    }
+
+    /// Set how often the leader runs `ANALYZE` on the queue-storage tables
+    /// autovacuum never analyses (default: 5 minutes). `Duration::ZERO`
+    /// disables the refresh.
+    pub fn statistics_refresh_interval(mut self, interval: Duration) -> Self {
+        self.statistics_refresh_interval = interval;
         self
     }
 
@@ -1121,6 +1136,7 @@ impl MaintenanceService {
                 cron_eval_cancel.clone(),
                 self.cron_eval_interval,
             ));
+            let _statistics_refresh = self.spawn_statistics_refresh();
 
             loop {
                 tokio::select! {
@@ -1312,6 +1328,24 @@ impl MaintenanceService {
                 }
             }
         }
+    }
+
+    /// Start the planner-statistics refresh for this leadership term. The
+    /// returned guard stops it when dropped.
+    fn spawn_statistics_refresh(&self) -> Option<RefreshGuard> {
+        if self.statistics_refresh_interval.is_zero() {
+            return None;
+        }
+        let runtime = self.storage.queue_storage()?;
+        Some(RefreshGuard::spawn(
+            StatisticsRefresher::new(
+                self.pool.clone(),
+                runtime.store.schema().to_string(),
+                self.metrics.clone(),
+            ),
+            self.statistics_refresh_interval,
+            &self.cancel,
+        ))
     }
 
     fn stop_cron_evaluator(cancel: &CancellationToken, task: &JoinHandle<()>) {

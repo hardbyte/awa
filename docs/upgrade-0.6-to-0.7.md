@@ -253,6 +253,22 @@ workers report not ready until the migration runs, as for any version bump.
 External migration runners apply the complete `awa migrate --sql --from 51
 --to 52` bundle, which defines the helper before the tail calls it.
 
+## v053: planner statistics helper
+
+v053 adds `awa.analyze_queue_storage_relation(schema, relation)`, a
+`SECURITY DEFINER` function owned by the migration role that lets the
+maintenance leader refresh planner statistics for the head tables and ring
+parents when the runtime role does not own them (see
+[Planner statistics](configuration.md#planner-statistics)). It creates one
+function and grants `EXECUTE` to `PUBLIC`; it takes no lock on any table and
+completes in milliseconds. Run the migration as the schema owner so the
+function's owner owns the tables.
+
+Binaries before v053 never call it. A 0.7 binary running before the migration
+logs once that the function is missing and skips the refresh; the
+`awa.maintenance.analyze.attempts` counter reports `unavailable`. External
+migration runners apply the `awa migrate --sql --from 52 --to 53` bundle.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

@@ -207,6 +207,8 @@ In Prometheus they appear under the OpenTelemetry [OTLP-to-Prometheus translatio
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
 | `awa.maintenance.prune.attempts` | Counter | ring, outcome, reason | Ring prune outcomes, including destructive `pruned` and no-DDL `already_pruned` |
 | `awa.maintenance.prune.duration` | Histogram (s) | ring, phase | Successful destructive prune time split into `lock`, `truncate`, and `commit` |
+| `awa.maintenance.analyze.attempts` | Counter | scope, outcome | Planner-statistics `ANALYZE` calls on the head tables and ring parents (`ok`, `skipped_privilege`, `skipped_lock`, `unavailable`, `failed`) |
+| `awa.maintenance.analyze.duration` | Histogram (s) | scope, outcome | Duration of one planner-statistics `ANALYZE` call |
 
 ### Heartbeat
 

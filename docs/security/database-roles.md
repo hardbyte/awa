@@ -63,6 +63,12 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
 
 If an existing installation created objects as `awa_migrator` without first setting the owner role, transfer every existing schema object to `awa_owner` before relying on owner-scoped defaults. New migrations should use the effective-role command above.
 
+## Planner statistics
+
+The maintenance leader runs `ANALYZE` on the queue-storage head tables and partitioned ring parents (see [Planner statistics](../configuration.md#planner-statistics)). `ANALYZE` skips a table its caller may not analyse, so a runtime that does not own the tables cannot do this itself; the leader calls `awa.analyze_queue_storage_relation(schema, relation)` instead, a `SECURITY DEFINER` function from migration v053 owned by whichever role ran the migration. Nothing is needed beyond the grants above: the function is executable by `PUBLIC`, and the runtime does not need `MAINTAIN`.
+
+Run migrations with the schema owner as the effective role, as shown above, so the function's owner owns the tables. A function owned by a role that may not analyse them (it is not the table owner, the database owner, or a `MAINTAIN` holder) makes every pass report `skipped_privilege` and logs one warning. The function only analyses a head table or partitioned table of a schema that `awa.queue_storage_schemas()` reports as trusted, and `ANALYZE` changes statistics only.
+
 ## Provision queues before starting restricted runtimes
 
 From schema v049, runtime calls use existing lane sequences without issuing

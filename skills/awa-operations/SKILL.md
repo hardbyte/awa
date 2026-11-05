@@ -135,7 +135,8 @@ processes. Exactly one worker per database is the elected maintenance leader
 (session-scoped advisory lock — if it dies, another is elected on the next
 tick). The leader alone runs cluster-wide scans: deferred→ready promotion, the
 three rescue paths (stale-heartbeat, hard-deadline, callback-timeout), ring
-rotation and prune, DLQ and descriptor cleanup, and cron evaluation. During an
+rotation and prune, planner-statistics refresh, DLQ and descriptor cleanup, and
+cron evaluation. During an
 unfinalized transition it promotes both planes' deferred backlogs, so drain and
 post-flip execution do not depend on which runtime holds leadership. Every
 worker dispatches and heartbeats its own attempts. There is no `pg_cron` or
@@ -312,6 +313,16 @@ blocked-prune metrics for capacity planning. It is not a retention policy or
 storage limit. Queue prune lock contention retries on the next decision tick;
 active-data gates retain exponential backoff. Persistent contention can still
 stall reclamation. See `docs/configuration.md` for the scheduling contract.
+
+On queue storage the leader runs `ANALYZE` on `queue_claim_heads`,
+`queue_enqueue_heads` and the partitioned ring parents when elected and every
+`statistics_refresh_interval` (default 5 minutes; Python
+`statistics_refresh_interval_ms`; zero disables), because autovacuum never
+analyses them. It goes through the `SECURITY DEFINER` function
+`awa.analyze_queue_storage_relation` from migration v053, so a non-owner runtime
+role needs no `MAINTAIN` grant. Watch `awa.maintenance.analyze.attempts`: any
+`skipped_privilege` or `unavailable` means it is not running (run `awa migrate`
+as the schema owner). See `docs/configuration.md#planner-statistics`.
 
 ## Managed Postgres
 
