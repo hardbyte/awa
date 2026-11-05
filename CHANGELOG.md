@@ -61,6 +61,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   options, still rolls the trigger back as before. The guide to
   [lifecycle hooks](docs/lifecycle-hooks.md) gains a section on deduplicating
   follow-ups.
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` and `install_queue_storage(reset=True)`
+  ran the migrations on a throwaway tokio runtime but with the client's pool,
+  so connections the pool opened during the migration went back into it tied
+  to a runtime that no longer existed. A later query that picked one up could
+  wait 30 s and fail with `pool timed out while waiting for an open
+  connection`. The migrations now run on the bindings' shared runtime.
 
 ## [0.6.12] — 2026-11-05
 
