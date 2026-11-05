@@ -6,6 +6,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Scheduled, snoozed and retry-after jobs are no longer held back while
+  the maintenance leader is overloaded.** The leader backs a maintenance
+  branch off for a cooldown after its body repeatedly runs longer than its
+  interval, and promotion, which makes every scheduled, snoozed and
+  retry-after job runnable, was backed off like the rest, so those jobs
+  waited out the cooldown. The cooldown also counted ticks, and under CPU
+  starvation the leader loop services a branch's tick only once many other
+  branches have run, so a cooldown of a few seconds could last several times
+  that. Promotion is no longer backed off; other branches (rescues, cleanup)
+  back off for a wall-clock duration of twice the overrunning body, capped
+  at five seconds. The leader's interval timers also delay rather than burst
+  after a stall, so a stall no longer queues back-to-back catch-up ticks.
 - **`admin::drain_queue` on queue storage cancels a backlog in bulk and
   drains every stripe of a striped queue.** It found the queue's jobs through
   a lookup that read every retained ready row, then cancelled them one at a
