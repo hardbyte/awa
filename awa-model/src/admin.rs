@@ -796,6 +796,274 @@ async fn notify_cancellation_tx<'a>(
     Ok(())
 }
 
+/// Candidate job ids for [`list_jobs`]: the newest `limit` ids below `cursor`
+/// matching `filter`'s state, kind and queue, newest first, with the binds the
+/// statement takes in order.
+///
+/// It selects what `current_jobs` would with the same filter, but each place a
+/// job can live is read and limited on its own, with only the legs that can
+/// hold the requested state, and the filter written into the statement rather
+/// than as `$n IS NULL OR` terms that a generic plan can't drop. Read through
+/// `current_jobs`, Postgres joins every retained completion to a scan of the
+/// ready rows, because that join and the `UNION ALL` are each estimated at one
+/// row. Available rows are found per lane as a claim finds them, and a
+/// completion batch's members are ordered by id before the ready primary key
+/// is probed for each, so a page of newest ids probes only as many as it
+/// returns.
+fn queue_storage_job_id_candidates_sql(
+    schema: &str,
+    filter: &ListJobsFilter,
+    cursor: Option<i64>,
+    limit: i64,
+) -> (String, Vec<CandidateBind>) {
+    let mut binds = Vec::new();
+    let mut bind = |value: CandidateBind| {
+        binds.push(value);
+        format!("${}", binds.len())
+    };
+    let state = filter.state.map(|state| bind(CandidateBind::State(state)));
+    let kind = filter
+        .kind
+        .as_ref()
+        .map(|kind| bind(CandidateBind::Text(kind.clone())));
+    let queue = filter
+        .queue
+        .as_ref()
+        .map(|queue| bind(CandidateBind::Text(queue.clone())));
+    let before = cursor.map(|cursor| bind(CandidateBind::Int(cursor)));
+    let limit = bind(CandidateBind::Int(limit));
+
+    // `AND column = $n` for each filter that is set; `kind` and `queue` name
+    // the columns, which differ by leg.
+    let predicates = |state_column: Option<&str>,
+                      kind_column: Option<&str>,
+                      queue_column: &str,
+                      id_column: &str| {
+        let mut sql = String::new();
+        if let (Some(param), Some(column)) = (&state, state_column) {
+            sql.push_str(&format!(" AND {column} = {param}::awa.job_state"));
+        }
+        if let (Some(param), Some(column)) = (&kind, kind_column) {
+            sql.push_str(&format!(" AND {column} = {param}"));
+        }
+        if let Some(param) = &queue {
+            sql.push_str(&format!(" AND {queue_column} = {param}"));
+        }
+        if let Some(param) = &before {
+            sql.push_str(&format!(" AND {id_column} < {param}::bigint"));
+        }
+        sql
+    };
+    let holds = |states: &[JobState]| {
+        filter
+            .state
+            .is_none_or(|requested| states.contains(&requested))
+    };
+
+    let mut legs: Vec<String> = Vec::new();
+    let mut with = String::new();
+    if holds(&[JobState::Available]) {
+        let lane_rows = crate::queue_storage::available_lane_rows_sql(
+            schema,
+            "heads",
+            "ready.job_id",
+            &format!(
+                "TRUE{}",
+                predicates(None, Some("ready.kind"), "ready.queue", "ready.job_id")
+            ),
+        );
+        let head_queue = queue
+            .as_ref()
+            .map(|param| format!("WHERE claims.queue = {param}"))
+            .unwrap_or_default();
+        with = format!(
+            r#"
+            WITH heads AS MATERIALIZED (
+                SELECT
+                    claims.queue,
+                    claims.priority,
+                    claims.enqueue_shard,
+                    {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                    {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+                FROM {schema}.queue_claim_heads AS claims
+                JOIN {schema}.queue_enqueue_heads AS enqueues
+                  ON enqueues.queue = claims.queue
+                 AND enqueues.priority = claims.priority
+                 AND enqueues.enqueue_shard = claims.enqueue_shard
+                {head_queue}
+            )
+            "#
+        );
+        legs.push(format!(
+            r#"(
+                SELECT lane.job_id
+                FROM heads
+                CROSS JOIN LATERAL ({lane_rows}) AS lane
+                ORDER BY lane.job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Scheduled, JobState::Retryable]) {
+        let predicates = predicates(Some("state"), Some("kind"), "queue", "job_id");
+        legs.push(format!(
+            r#"(
+                SELECT job_id
+                FROM {schema}.deferred_jobs
+                WHERE TRUE{predicates}
+                ORDER BY job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Running, JobState::WaitingExternal]) {
+        let predicates = predicates(
+            Some("leases.state"),
+            Some("ready.kind"),
+            "leases.queue",
+            "leases.job_id",
+        );
+        legs.push(format!(
+            r#"(
+                SELECT leases.job_id
+                FROM {schema}.leases AS leases
+                JOIN {schema}.ready_entries AS ready
+                  ON ready.ready_slot = leases.ready_slot
+                 AND ready.ready_generation = leases.ready_generation
+                 AND ready.queue = leases.queue
+                 AND ready.priority = leases.priority
+                 AND ready.enqueue_shard = leases.enqueue_shard
+                 AND ready.lane_seq = leases.lane_seq
+                WHERE TRUE{predicates}
+                ORDER BY leases.job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Running]) {
+        let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
+        let predicates = predicates(
+            None,
+            Some("created.kind"),
+            "open_claims.queue",
+            "open_claims.job_id",
+        );
+        legs.push(format!(
+            r#"(
+                SELECT open_claims.job_id
+                FROM ({open_running}) AS open_claims
+                CROSS JOIN LATERAL (
+                    SELECT ready.kind
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.job_id = open_claims.job_id
+                    LIMIT 1
+                ) AS created
+                WHERE TRUE{predicates}
+                ORDER BY open_claims.job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Completed, JobState::Failed, JobState::Cancelled]) {
+        let predicates = predicates(Some("state"), Some("kind"), "queue", "job_id");
+        legs.push(format!(
+            r#"(
+                SELECT job_id
+                FROM {schema}.done_entries
+                WHERE TRUE{predicates}
+                ORDER BY job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Completed]) {
+        let members = predicates(None, None, "batch.queue", "item.job_id");
+        let kind = kind
+            .as_ref()
+            .map(|param| format!(" AND ready.kind = {param}"))
+            .unwrap_or_default();
+        legs.push(format!(
+            r#"(
+                SELECT member.job_id
+                FROM (
+                    SELECT
+                        batch.ready_slot,
+                        batch.ready_generation,
+                        batch.queue,
+                        batch.priority,
+                        batch.enqueue_shard,
+                        item.job_id,
+                        item.run_lease,
+                        item.lane_seq
+                    FROM {schema}.receipt_completion_batches AS batch
+                    CROSS JOIN LATERAL unnest(
+                        batch.job_ids,
+                        batch.run_leases,
+                        batch.lane_seqs
+                    ) AS item(job_id, run_lease, lane_seq)
+                    WHERE TRUE{members}
+                    ORDER BY item.job_id DESC
+                    OFFSET 0
+                ) AS member
+                CROSS JOIN LATERAL (
+                    SELECT 1
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.ready_slot = member.ready_slot
+                      AND ready.ready_generation = member.ready_generation
+                      AND ready.queue = member.queue
+                      AND ready.priority = member.priority
+                      AND ready.enqueue_shard = member.enqueue_shard
+                      AND ready.lane_seq = member.lane_seq
+                      AND ready.job_id = member.job_id{kind}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
+                          WHERE tomb.ready_slot = member.ready_slot
+                            AND tomb.ready_generation = member.ready_generation
+                            AND tomb.job_id = member.job_id
+                            AND tomb.run_lease = member.run_lease
+                      )
+                    LIMIT 1
+                ) AS live
+                ORDER BY member.job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Failed]) {
+        let predicates = predicates(None, Some("kind"), "queue", "job_id");
+        legs.push(format!(
+            r#"(
+                SELECT job_id
+                FROM {schema}.dlq_entries
+                WHERE TRUE{predicates}
+                ORDER BY job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+
+    let sql = format!(
+        r#"
+        {with}
+        SELECT job_id
+        FROM ({legs}) AS candidates
+        ORDER BY job_id DESC
+        LIMIT {limit}
+        "#,
+        legs = legs.join(" UNION ALL "),
+    );
+    (sql, binds)
+}
+
+/// A value bound to the statement [`queue_storage_job_id_candidates_sql`]
+/// returns.
+#[derive(Debug)]
+enum CandidateBind {
+    State(JobState),
+    Text(String),
+    Int(i64),
+}
+
 async fn list_queue_storage_jobs(
     store: &QueueStorage,
     pool: &PgPool,
@@ -808,31 +1076,27 @@ async fn list_queue_storage_jobs(
         limit.saturating_mul(3).min(2000)
     };
 
-    let sql = format!(
-        "{} \
-         SELECT job_id \
-         FROM current_jobs \
-         WHERE ($1::awa.job_state IS NULL OR state = $1) \
-           AND ($2::text IS NULL OR kind = $2) \
-           AND ($3::text IS NULL OR queue = $3) \
-           AND ($4::bigint IS NULL OR job_id < $4) \
-         ORDER BY job_id DESC \
-         LIMIT $5",
-        queue_storage_current_jobs_cte(store.schema())
-    );
-
     let mut jobs = Vec::new();
     let mut cursor = filter.before_id;
 
     loop {
-        let ids: Vec<i64> = sqlx::query_scalar(audited_sql(sql.clone()))
-            .bind(filter.state)
-            .bind(&filter.kind)
-            .bind(&filter.queue)
-            .bind(cursor)
-            .bind(candidate_limit)
-            .fetch_all(pool)
+        let (sql, binds) =
+            queue_storage_job_id_candidates_sql(store.schema(), filter, cursor, candidate_limit);
+        let mut query = sqlx::query_scalar::<_, i64>(audited_sql(sql));
+        for value in binds {
+            query = match value {
+                CandidateBind::State(state) => query.bind(state),
+                CandidateBind::Text(text) => query.bind(text),
+                CandidateBind::Int(int) => query.bind(int),
+            };
+        }
+        // As in `queue_overviews`: compiling costs more than running.
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .execute(tx.as_mut())
             .await?;
+        let ids: Vec<i64> = query.fetch_all(tx.as_mut()).await?;
+        tx.commit().await?;
         if ids.is_empty() {
             break;
         }

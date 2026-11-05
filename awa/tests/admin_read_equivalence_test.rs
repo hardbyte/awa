@@ -8,7 +8,7 @@
 //! (`admin::queue_storage_current_jobs_cte`), so it follows that definition
 //! rather than a copy of it.
 
-use awa::model::admin::{self, JobKindOverview};
+use awa::model::admin::{self, JobKindOverview, ListJobsFilter};
 use awa::model::{insert_many, migrations, InsertOpts, InsertParams, QueueStorage};
 use awa::{JobRow, JobState, QueueStorageConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -464,6 +464,152 @@ async fn job_kind_overviews_match_the_current_jobs_definition() -> TestResult {
         assert_eq!(by_kind["idle_kind"].job_count, 0);
         assert_eq!(by_kind["runtime_only"].job_count, 0);
         assert!(by_kind["alpha"].descriptor_mismatch);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+/// The ids `list_jobs` selected before it stopped reading `current_jobs`,
+/// newest first, for a filter's state, kind, queue and `before_id`.
+async fn reference_job_ids(
+    pool: &PgPool,
+    schema: &str,
+    filter: &ListJobsFilter,
+    limit: i64,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let sql = format!(
+        "{} \
+         SELECT job_id \
+         FROM current_jobs \
+         WHERE ($1::awa.job_state IS NULL OR state = $1) \
+           AND ($2::text IS NULL OR kind = $2) \
+           AND ($3::text IS NULL OR queue = $3) \
+           AND ($4::bigint IS NULL OR job_id < $4) \
+         ORDER BY job_id DESC \
+         LIMIT $5",
+        admin::queue_storage_current_jobs_cte(schema)
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(filter.state)
+        .bind(&filter.kind)
+        .bind(&filter.queue)
+        .bind(filter.before_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+const ALL_STATES: [JobState; 8] = [
+    JobState::Available,
+    JobState::Scheduled,
+    JobState::Running,
+    JobState::WaitingExternal,
+    JobState::Retryable,
+    JobState::Completed,
+    JobState::Failed,
+    JobState::Cancelled,
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_jobs_matches_the_current_jobs_definition() -> TestResult {
+    let mut fixture = Fixture::new().await?;
+    let result = async {
+        fixture.build_mix().await?;
+        let schema = fixture.store.schema().to_string();
+
+        let states: Vec<Option<JobState>> = std::iter::once(None)
+            .chain(ALL_STATES.into_iter().map(Some))
+            .collect();
+        let kinds = [None, Some("alpha"), Some("gamma"), Some("no_such_kind")];
+        let queues = [None, Some("eq_terminal"), Some("eq_receipts")];
+        let mut non_empty = 0;
+        for state in &states {
+            for kind in kinds {
+                for queue in queues {
+                    for limit in [4, 100] {
+                        let filter = ListJobsFilter {
+                            state: *state,
+                            kind: kind.map(str::to_string),
+                            queue: queue.map(str::to_string),
+                            limit: Some(limit),
+                            ..Default::default()
+                        };
+                        let expected =
+                            reference_job_ids(&fixture.pool, &schema, &filter, limit).await?;
+                        let actual: Vec<i64> = admin::list_jobs(&fixture.pool, &filter)
+                            .await?
+                            .into_iter()
+                            .map(|job| job.id)
+                            .collect();
+                        assert_eq!(actual, expected, "list_jobs for {filter:?}");
+                        non_empty += usize::from(!actual.is_empty());
+                    }
+                }
+            }
+        }
+        assert!(non_empty > 40, "the filters match jobs: {non_empty}");
+
+        // Paging by `before_id` walks the same ids in the same order.
+        for state in [None, Some(JobState::Completed), Some(JobState::Running)] {
+            let everything = reference_job_ids(
+                &fixture.pool,
+                &schema,
+                &ListJobsFilter {
+                    state,
+                    ..Default::default()
+                },
+                1000,
+            )
+            .await?;
+            let mut paged = Vec::new();
+            let mut before_id = None;
+            loop {
+                let page = admin::list_jobs(
+                    &fixture.pool,
+                    &ListJobsFilter {
+                        state,
+                        before_id,
+                        limit: Some(5),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let Some(last) = page.last() else { break };
+                before_id = Some(last.id);
+                paged.extend(page.iter().map(|job| job.id));
+            }
+            assert_eq!(paged, everything, "paging through {state:?}");
+        }
+
+        // Tags are applied to the loaded jobs.
+        for tag in ["tenant:a", "tenant:b", "bulk", "absent"] {
+            let filter = ListJobsFilter {
+                tag: Some(tag.to_string()),
+                limit: Some(100),
+                ..Default::default()
+            };
+            let mut expected = Vec::new();
+            for id in
+                reference_job_ids(&fixture.pool, &schema, &ListJobsFilter::default(), 1000).await?
+            {
+                if admin::get_job(&fixture.pool, id)
+                    .await?
+                    .tags
+                    .iter()
+                    .any(|job_tag| job_tag == tag)
+                {
+                    expected.push(id);
+                }
+            }
+            let actual: Vec<i64> = admin::list_jobs(&fixture.pool, &filter)
+                .await?
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            assert_eq!(actual, expected, "list_jobs tagged {tag}");
+        }
         Ok::<_, Box<dyn std::error::Error>>(())
     }
     .await;

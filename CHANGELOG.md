@@ -151,9 +151,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
     deletion against its lane's completion batches. One production-sized
     fixture took 5.4 s for that check alone. Each affected batch is now read
     once.
-  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and the job list
-  still read retained history; the test lists them and fails once one
-  stops, so the list can only shrink.
+  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and job lists that
+  can include completed jobs still read retained history; the test lists
+  those it exercises and fails once one stops, so the list can only shrink.
 - **Queue lag in the admin UI is the age of the oldest available job
   again.** On queue storage it had become the age of each lane's next job,
   which hides an older job a queue move or priority aging appended behind
@@ -208,6 +208,23 @@ Notable changes between releases. Detailed migration notes for storage transitio
   PostgreSQL 17 and 18. It still reads each available job and each retained
   completion's ready row, because a job's kind lives there. JIT is off for
   the read.
+- **`admin::list_jobs` on queue storage reads only the places that can hold
+  the requested state.** It selected candidate ids from the `current_jobs`
+  view, so every listing, whatever its filter, planned around the same
+  single-row estimates and joined each retained completion to a scan of the
+  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
+  timeout. Each place a job can live is now read and limited on its own,
+  only those that can hold the state asked for, with a predicate for each
+  filter that is set rather than `$n IS NULL OR` terms, which a prepared
+  statement's generic plan can't drop. Completion batches are ordered by job
+  id before their ready rows are probed, so a page probes only as many as it
+  returns. The ids are identical, and a test compares them with the former
+  definition for every state, kind, queue, limit and page. On the dataset
+  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
+  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
+  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
+  from more than four minutes). Available jobs and completions are still read
+  in full when the state allows them. JIT is off for the read.
 
 ## [0.7.0-alpha.1] — 2026-10-29
 
