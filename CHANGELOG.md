@@ -31,6 +31,23 @@ Notable changes between releases. Detailed migration notes for storage transitio
   These paths now wait for any claim in progress on the job's lane and skip
   rows a claim has recorded, the same evidence claims use to skip them, so a
   cancel reaches the running attempt instead.
+- **Queue storage no longer drives PostgreSQL 18 into a backend crash when a
+  rescue, cancel or claim close locks a row-local claim that was just
+  rewritten.** A statement that locks a row another transaction updated after
+  the statement's snapshot rechecks the row (EvalPlanQual). In PostgreSQL 18
+  (reproduced on 18.6) that recheck rebuilds the statement's run-time
+  partition pruning state in memory that is freed when the lock runs out of
+  rows, so a later pruning pass in the same statement reads freed memory and
+  the backend segfaults
+  ([pgsql-bugs report](https://www.postgresql.org/message-id/CAP2G_gGpV%3DrKMLuET4RW-qO41GvBvi6Czsjsj16eT9hAwHxG6w%40mail.gmail.com)).
+  0.6 runtimes write a row-local claim for every deadline-bearing job, and
+  their deadline rescue crashed the server when a heartbeat rewrote an
+  expired claim mid-rescue; this branch writes compact claims, so it meets
+  row-local claims only while 0.6 runtimes are still in flight. The rescues
+  now update the slot's own claim partition, the completion, heartbeat,
+  progress, callback and close paths lock their attempts' row-local claims
+  in a statement that prunes nothing before the statements that lock them
+  again, and cancel locks row and batch receipts in separate statements.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened

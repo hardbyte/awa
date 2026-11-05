@@ -20703,3 +20703,127 @@ async fn test_queue_storage_drain_queue_skips_a_locked_row_without_stopping() {
         .expect("drain the released row");
     assert_eq!(drained, 1);
 }
+
+/// The receipt paths lock their attempts' row-local claims in a statement of
+/// their own before the statements that lock them again, so a claim rewritten
+/// meanwhile is rechecked where nothing is pruned. With a rewrite of a legacy
+/// row-local claim held open, the heartbeat must wait in that statement rather
+/// than a later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_legacy_row_claims_are_locked_before_the_heartbeat_statement() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_legacy_row_claim_prelock";
+    let schema = "awa_qs_legacy_row_claim_prelock";
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 71 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim job to transplant into legacy shape");
+    assert_eq!(claimed.len(), 1);
+    let entry = claimed[0].clone();
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.lease_claim_batches WHERE batch_id = $1"
+    )))
+    .bind(entry.claim.claim_batch_id)
+    .execute(&pool)
+    .await
+    .expect("remove compact batch row");
+    sqlx::query(audited_sql(format!(
+        r#"
+        INSERT INTO {schema}.lease_claims (
+            claim_slot, receipt_id, job_id, run_lease, ready_slot,
+            ready_generation, queue, priority, attempt, max_attempts,
+            lane_seq, enqueue_shard, deadline_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            clock_timestamp() + interval '5 minutes'
+        )
+        "#
+    )))
+    .bind(entry.claim.claim_slot)
+    .bind(entry.claim.receipt_id)
+    .bind(entry.job.id)
+    .bind(entry.job.run_lease)
+    .bind(entry.claim.ready_slot)
+    .bind(entry.claim.ready_generation)
+    .bind(&entry.claim.queue)
+    .bind(entry.claim.priority)
+    .bind(entry.job.attempt)
+    .bind(entry.job.max_attempts)
+    .bind(entry.claim.lane_seq)
+    .bind(entry.claim.enqueue_shard)
+    .execute(&pool)
+    .await
+    .expect("insert legacy row-local claim");
+
+    let mut writer = pool.begin().await.expect("begin claim rewrite");
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.lease_claims \
+         SET materialized_at = COALESCE(materialized_at, clock_timestamp()) \
+         WHERE job_id = $1 AND run_lease = $2"
+    )))
+    .bind(entry.job.id)
+    .bind(entry.job.run_lease)
+    .execute(writer.as_mut())
+    .await
+    .expect("rewrite claim");
+
+    let heartbeat = tokio::spawn({
+        let pool = pool.clone();
+        let job = (entry.job.id, entry.job.run_lease);
+        async move {
+            let store = QueueStorage::new(config).expect("store");
+            store.heartbeat_batch(&pool, &[job]).await
+        }
+    });
+
+    let waiting_since = Instant::now();
+    loop {
+        let waiting_query: Option<String> = sqlx::query_scalar(audited_sql(
+            "SELECT query FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE '%lease_claims%' LIMIT 1"
+                .to_string(),
+        ))
+        .fetch_optional(&pool)
+        .await
+        .expect("poll for the waiting heartbeat");
+        if let Some(query) = waiting_query {
+            assert!(
+                query.contains("AS input(job_id, run_lease)")
+                    && query.contains("FOR UPDATE OF claims"),
+                "the heartbeat waited outside the claim prelock: {query}"
+            );
+            break;
+        }
+        assert!(
+            waiting_since.elapsed() < Duration::from_secs(30),
+            "the heartbeat never waited on the rewritten claim"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    writer.commit().await.expect("commit claim rewrite");
+    heartbeat
+        .await
+        .expect("join heartbeat")
+        .expect("heartbeat after the rewrite");
+}
