@@ -7691,11 +7691,193 @@ async fn test_queue_storage_runtime_snooze() {
         &pool,
         job_id,
         &[JobState::Completed],
-        Duration::from_secs(30),
+        Duration::from_secs(10),
     )
     .await;
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(completed.attempt, 1, "snooze should not consume an attempt");
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct PromoteLatencyJob {
+    retry_once: bool,
+}
+
+/// Completes immediately, except that a `retry_once` job hands itself back
+/// with a short retry delay on its first attempt. Records when each job
+/// completed.
+#[derive(Clone, Default)]
+struct PromoteLatencyWorker {
+    completed_at: Arc<std::sync::Mutex<HashMap<i64, Instant>>>,
+}
+
+#[async_trait::async_trait]
+impl Worker for PromoteLatencyWorker {
+    fn kind(&self) -> &'static str {
+        "promote_latency_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: PromoteLatencyJob = serde_json::from_value(ctx.job.args.clone()).unwrap();
+        if args.retry_once && ctx.job.attempt == 1 {
+            return Ok(JobResult::RetryAfter(Duration::from_millis(50)));
+        }
+        self.completed_at
+            .lock()
+            .unwrap()
+            .insert(ctx.job.id, Instant::now());
+        Ok(JobResult::Completed)
+    }
+}
+
+/// Promotion is cheap, idempotent and the only thing that makes scheduled,
+/// snoozed and retry-after jobs runnable, so a run of slow promotion bodies
+/// must not suppress it afterwards, even when the leader loop is saturated.
+///
+/// The first three promotion bodies (two `DELETE`s each) take 1.2s against a
+/// 25ms promote interval, which arms an overrun cooldown on the maintenance
+/// branch. Every later body is fast. Every other maintenance branch runs on a
+/// 1ms interval, so the loop always has several branches ready and services
+/// each only occasionally, the way a CPU-starved leader does. Jobs that
+/// become due once the slow bodies are over must be promoted promptly instead
+/// of waiting for a cooldown to drain one serviced tick at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_bodies() {
+    const SLOW_STATEMENTS: i64 = 6;
+
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_promote_after_overrun";
+    let schema = "awa_qs_promote_after_overrun";
+    let store = create_store(&pool, schema).await;
+    for statement in [
+        format!("CREATE TABLE {schema}.promote_delete_log (at timestamptz NOT NULL)"),
+        format!(
+            "CREATE FUNCTION {schema}.slow_first_promote_deletes() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 IF (SELECT count(*) FROM {schema}.promote_delete_log) < {SLOW_STATEMENTS} THEN \
+                     PERFORM pg_sleep(0.6); \
+                 END IF; \
+                 INSERT INTO {schema}.promote_delete_log VALUES (clock_timestamp()); \
+                 RETURN NULL; \
+             END $$"
+        ),
+        format!(
+            "CREATE TRIGGER slow_first_promote_deletes BEFORE DELETE ON {schema}.deferred_jobs \
+             FOR EACH STATEMENT EXECUTE FUNCTION {schema}.slow_first_promote_deletes()"
+        ),
+    ] {
+        sqlx::query(&statement)
+            .execute(&pool)
+            .await
+            .expect("install slow promotion trigger");
+    }
+
+    let worker = PromoteLatencyWorker::default();
+    let saturating_interval = Duration::from_millis(1);
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(worker.clone())
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(saturating_interval)
+        .heartbeat_rescue_interval(saturating_interval)
+        .deadline_rescue_interval(saturating_interval)
+        .callback_rescue_interval(saturating_interval)
+        .cleanup_interval(saturating_interval)
+        .priority_aging_interval(saturating_interval)
+        .terminal_count_rollup_interval(saturating_interval)
+        .queue_stats_interval(saturating_interval)
+        .build()
+        .expect("Failed to build client");
+    client.start().await.expect("Failed to start client");
+
+    let slow_phase_started = Instant::now();
+    loop {
+        let logged: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.promote_delete_log"))
+                .fetch_one(&pool)
+                .await
+                .expect("count promotion statements");
+        if logged >= SLOW_STATEMENTS {
+            break;
+        }
+        assert!(
+            slow_phase_started.elapsed() < Duration::from_secs(30),
+            "the leader never ran the slow promotion bodies"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let enqueued_at = Instant::now();
+    let scheduled_job_id = enqueue_job(
+        &pool,
+        &store,
+        &PromoteLatencyJob { retry_once: false },
+        InsertOpts {
+            queue: queue.to_string(),
+            run_at: Some(Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let retried_job_id = enqueue_job(
+        &pool,
+        &store,
+        &PromoteLatencyJob { retry_once: true },
+        InsertOpts {
+            queue: queue.to_string(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for job_id in [scheduled_job_id, retried_job_id] {
+        wait_for_job_state(
+            &store,
+            &pool,
+            job_id,
+            &[JobState::Completed],
+            Duration::from_secs(30),
+        )
+        .await;
+    }
+
+    let completed_at = worker.completed_at.lock().unwrap().clone();
+    for (label, job_id) in [
+        ("scheduled", scheduled_job_id),
+        ("retry-after", retried_job_id),
+    ] {
+        let latency = completed_at[&job_id].duration_since(enqueued_at);
+        eprintln!("{label} job completed {latency:?} after enqueue");
+        assert!(
+            latency < Duration::from_millis(350),
+            "{label} job took {latency:?} to run; promotion must not be suppressed \
+             after overrunning bodies"
+        );
+    }
 
     client.shutdown(Duration::from_secs(5)).await;
 }
