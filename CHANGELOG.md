@@ -68,6 +68,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
   to a runtime that no longer existed. A later query that picked one up could
   wait 30 s and fail with `pool timed out while waiting for an open
   connection`. The migrations now run on the bindings' shared runtime.
+- **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
+  numbers in plain decimal, and serde_json's default parser could round a long
+  one to the neighbouring `f64`, so a value like `5.130112436774387e-96` in job
+  args read back one unit in the last place off. serde_json's
+  `float_roundtrip` feature is now enabled in the workspace and in the Python
+  bindings.
 
 ## [0.6.12] — 2026-11-05
 
