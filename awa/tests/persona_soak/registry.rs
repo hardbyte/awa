@@ -4,10 +4,22 @@
 
 use super::config::Persona;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 impl QueueInfo {
+    pub fn hold(&self) {
+        self.pause_holds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn release(&self) {
+        self.pause_holds.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.pause_holds.load(Ordering::Relaxed) > 0
+    }
+
     /// Jobs enqueued and not yet started, as far as the producers and workers know.
     pub fn backlog_estimate(&self) -> i64 {
         self.enqueued.load(Ordering::Relaxed) - self.started.load(Ordering::Relaxed)
@@ -25,7 +37,8 @@ pub struct QueueInfo {
     pub enqueued: AtomicI64,
     pub started: AtomicI64,
     /// An operator (or a rate limit) is deliberately holding jobs back.
-    pub paused: AtomicBool,
+    /// Operators currently holding the queue paused; the stall check skips it while non-zero.
+    pub pause_holds: AtomicI32,
     pub rate_limited: bool,
     /// Milliseconds since run start of the most recent operator drain, 0 if never.
     pub drained_at_ms: AtomicI64,
@@ -53,7 +66,7 @@ impl QueueRegistry {
             in_flight: AtomicI64::new(0),
             enqueued: AtomicI64::new(0),
             started: AtomicI64::new(0),
-            paused: AtomicBool::new(false),
+            pause_holds: AtomicI32::new(0),
             rate_limited,
             drained_at_ms: AtomicI64::new(0),
         });

@@ -36,6 +36,14 @@ pub mod flag {
     /// A DLQ row for this job was purged by an operator.
     pub const DLQ_PURGED: u32 = 1 << 11;
     pub const CHAOS_VICTIM: u32 = 1 << 12;
+    /// Terminal rows read from the store for jobs whose runtime reports no lifecycle events.
+    pub const DB_SEEN_COMPLETED: u32 = 1 << 13;
+    pub const DB_SEEN_FAILED: u32 = 1 << 14;
+    pub const DB_SEEN_CANCELLED: u32 = 1 << 15;
+    /// How a firehose job was enqueued.
+    pub const SRC_BURST: u32 = 1 << 16;
+    pub const SRC_COPY: u32 = 1 << 17;
+    pub const SRC_STEADY: u32 = 1 << 18;
 }
 
 #[derive(Debug, Clone)]

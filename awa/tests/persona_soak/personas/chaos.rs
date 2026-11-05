@@ -44,6 +44,23 @@ async fn kill_runtime(shared: &Arc<Shared>, rng: &mut Rng) {
     }
 }
 
+async fn kill_python(shared: &Arc<Shared>) {
+    let handle = shared.python.lock().expect("python handle").clone();
+    let Some(handle) = handle else { return };
+    shared.note("chaos", "killing the Python process without shutdown");
+    shared.chaos_window(Duration::from_secs(45));
+    if let Err(error) = handle
+        .kill_and_restart(shared, Duration::from_secs(4))
+        .await
+    {
+        shared.violation(
+            "restart_failed",
+            format!("restarting the Python process: {error}"),
+            vec![],
+        );
+    }
+}
+
 async fn terminate_leader(shared: &Arc<Shared>, pool: &PgPool) {
     // Maintenance leadership is an advisory lock held by one runtime connection.
     let holders: Result<Vec<(i32, String)>, _> = sqlx::query_as(
@@ -186,6 +203,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     let second = |seconds: f64| Duration::from_secs_f64(seconds * pace);
     let mut schedule: Vec<(&str, Duration, Instant)> = vec![
         ("kill", second(120.0), Instant::now() + second(60.0)),
+        ("python", second(200.0), Instant::now() + second(110.0)),
         ("leader", second(150.0), Instant::now() + second(90.0)),
         ("terminate", second(75.0), Instant::now() + second(45.0)),
         ("pool", second(240.0), Instant::now() + second(150.0)),
@@ -201,6 +219,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             *due = Instant::now() + *interval;
             match *name {
                 "kill" => kill_runtime(&shared, &mut rng).await,
+                "python" => kill_python(&shared).await,
                 "leader" => terminate_leader(&shared, &pool).await,
                 "terminate" => terminate_runtime_connections(&shared, &pool, &mut rng).await,
                 "pool" => {

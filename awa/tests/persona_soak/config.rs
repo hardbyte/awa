@@ -12,16 +12,28 @@ pub enum Persona {
     Sam,
     Alex,
     Chaos,
+    /// Admin UI users, through the real HTTP server.
+    Watchers,
+    Support,
+    UiOps,
+    Impatient,
+    /// A separate Python process: producers, async workers and the migrate path.
+    Python,
 }
 
 impl Persona {
-    pub const ALL: [Persona; 6] = [
+    pub const ALL: [Persona; 11] = [
         Persona::Mia,
         Persona::Tom,
         Persona::Priya,
         Persona::Sam,
         Persona::Alex,
         Persona::Chaos,
+        Persona::Watchers,
+        Persona::Support,
+        Persona::UiOps,
+        Persona::Impatient,
+        Persona::Python,
     ];
 
     pub fn name(self) -> &'static str {
@@ -32,6 +44,11 @@ impl Persona {
             Persona::Sam => "sam",
             Persona::Alex => "alex",
             Persona::Chaos => "chaos",
+            Persona::Watchers => "watchers",
+            Persona::Support => "support",
+            Persona::UiOps => "uiops",
+            Persona::Impatient => "impatient",
+            Persona::Python => "python",
         }
     }
 
@@ -52,7 +69,7 @@ impl FromStr for Persona {
             .into_iter()
             .find(|persona| persona.name() == value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos")
+                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python")
             })
     }
 }
@@ -80,6 +97,13 @@ pub struct SoakConfig {
     pub promotion_overdue: Duration,
     /// Seconds a queue may hold available jobs with idle workers before the stall check fails.
     pub stall_window: Duration,
+    /// The `awa` binary that serves the admin UI; located next to the test binary when unset.
+    pub awa_bin: Option<PathBuf>,
+    /// Python interpreter of a virtualenv with the `awa` extension installed.
+    pub python_bin: Option<PathBuf>,
+    /// Server-side statement timeout of the admin server, and the matching client timeout.
+    pub ui_statement_timeout: Duration,
+    pub ui_client_timeout: Duration,
     /// Extra tolerance added to the stall and promotion thresholds while chaos is active.
     pub chaos_slack: Duration,
 }
@@ -141,6 +165,14 @@ impl SoakConfig {
             pg_log_file: env_string("AWA_SOAK_PG_LOG").map(PathBuf::from),
             pg_container: env_string("AWA_SOAK_PG_CONTAINER"),
             pg_container_log: env_string("AWA_SOAK_PG_CONTAINER_LOG"),
+            awa_bin: env_string("AWA_SOAK_AWA_BIN").map(PathBuf::from),
+            python_bin: env_string("AWA_SOAK_PYTHON").map(PathBuf::from),
+            ui_statement_timeout: Duration::from_secs(
+                env_parse("AWA_SOAK_UI_STATEMENT_TIMEOUT_SECONDS").unwrap_or(30),
+            ),
+            ui_client_timeout: Duration::from_secs(
+                env_parse("AWA_SOAK_UI_CLIENT_TIMEOUT_SECONDS").unwrap_or(45),
+            ),
             promotion_overdue: Duration::from_secs(
                 env_parse("AWA_SOAK_PROMOTION_OVERDUE_SECONDS").unwrap_or(10),
             ),

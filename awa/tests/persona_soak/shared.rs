@@ -119,6 +119,9 @@ pub struct Shared {
     /// Problems that are not invariant violations (slow admin queries); reported, not fatal.
     pub findings: Mutex<Vec<Violation>>,
     pub stats: HashMap<Persona, Stats>,
+    pub ui: super::personas::ui::UiMetrics,
+    /// The running Python process, so the chaos persona can kill it.
+    pub python: Mutex<Option<Arc<super::personas::python::PythonHandle>>>,
     /// Run-wide measurements (resource use, oracle probes).
     pub run: Stats,
     pub fleets: Mutex<HashMap<String, Arc<Fleet>>>,
@@ -145,6 +148,8 @@ impl Shared {
             findings: Mutex::new(Vec::new()),
             stats,
             run: Stats::default(),
+            ui: Default::default(),
+            python: Mutex::new(None),
             fleets: Mutex::new(HashMap::new()),
             chaos_until_ms: AtomicI64::new(0),
         })
@@ -216,6 +221,34 @@ impl Shared {
             finding.summary
         );
         self.findings.lock().expect("findings").push(finding);
+    }
+
+    /// Records a successful operator cancel: the job may legitimately end cancelled, a
+    /// handler must not start after it, and it must not overwrite a completion.
+    pub fn record_operator_cancel(
+        &self,
+        persona: Persona,
+        job_id: i64,
+        completed_before: bool,
+        call_started_ms: u32,
+    ) {
+        let now = self.now_ms() as u32;
+        self.stats(persona).add("cancelled", 1);
+        self.ledger.with(
+            job_id,
+            || JobRecord::new(persona, u32::MAX, now, expect::ANY_TERMINAL, 0),
+            |record| {
+                record.flags |= flag::OPERATOR_REMOVED | flag::OPERATOR_CANCEL_OK;
+                record.operator_cancel_ms = now;
+            },
+        );
+        if completed_before {
+            self.violation(
+                "cancel_overwrote_completed",
+                format!("operator cancel of job {job_id} succeeded after it was reported completed (call began at {call_started_ms} ms)"),
+                vec![format!("{{\"job_id\":{job_id}}}")],
+            );
+        }
     }
 
     pub fn fleet(&self, name: &str) -> Option<Arc<Fleet>> {

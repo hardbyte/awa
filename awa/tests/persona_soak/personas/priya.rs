@@ -132,7 +132,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
                         persona,
                         &rows,
                         |_| expect::COMPLETED,
-                        flag::NO_EVENTS,
+                        flag::NO_EVENTS | flag::SRC_BURST,
                     );
                     shared.note(
                         "priya",
@@ -171,7 +171,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
                         persona,
                         &rows,
                         |_| expect::COMPLETED,
-                        flag::NO_EVENTS,
+                        flag::NO_EVENTS | flag::SRC_COPY,
                     );
                 }
                 Err(error) => {
@@ -188,7 +188,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
                     persona,
                     &rows,
                     |_| expect::COMPLETED,
-                    flag::NO_EVENTS,
+                    flag::NO_EVENTS | flag::SRC_STEADY,
                 );
             }
             Err(error) => backoff(&shared, error, persona).await,

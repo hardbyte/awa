@@ -10,14 +10,21 @@
 #
 # Environment:
 #   AWA_SOAK_SECONDS          load phase length per engine (default 900)
-#   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos
+#   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos,
+#                             watchers,support,uiops,impatient,python
 #   AWA_SOAK_SEED             fixes the workload mix and chaos schedule
 #   AWA_SOAK_SCALE            multiplies rates and queue counts (default 1)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
 #   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0-epqlog5)
+#   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
 #   CARGO_TARGET_DIR          cargo target directory, as for any cargo build
+#
+# The admin UI personas drive the real `awa serve` binary and the python persona runs
+# the awa-python bindings in a separate process; both are built once, before the first
+# engine, with `cargo build --release -p awa-cli` and `uv` + `maturin develop --release`
+# into awa-python/.venv.
 #
 # Every container is private to the run (name awa-soak-<engine>-<pid>) and is
 # removed on exit, including on failure or interruption. Containers that already
@@ -37,6 +44,21 @@ if [ ${#ENGINES[@]} -eq 0 ]; then
 fi
 
 mkdir -p "$RESULTS_DIR"
+
+prepare() {
+  echo "== building the awa binary and the Python bindings"
+  cargo build --release -p awa-cli || return 1
+  if [ ! -x awa-python/.venv/bin/python ]; then
+    uv venv --quiet awa-python/.venv || return 1
+    uv pip install --quiet --python awa-python/.venv maturin || return 1
+  fi
+  (cd awa-python && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" maturin develop --release) || return 1
+}
+if [ "${SOAK_SKIP_PREPARE:-0}" != 1 ]; then
+  prepare >"$RESULTS_DIR/prepare.log" 2>&1 || { echo "prepare failed; see $RESULTS_DIR/prepare.log" >&2; exit 2; }
+fi
+export AWA_SOAK_PYTHON="${AWA_SOAK_PYTHON:-$PWD/awa-python/.venv/bin/python}"
+export AWA_SOAK_AWA_BIN="${AWA_SOAK_AWA_BIN:-${CARGO_TARGET_DIR:-$PWD/target}/release/awa}"
 CONTAINERS=()
 STATS_PID=""
 
@@ -111,7 +133,7 @@ for index in "${!ENGINES[@]}"; do
   sample_stats "$name" "$out/container-stats.csv" &
   STATS_PID=$!
 
-  env AWA_SOAK_DATABASE_URL="postgres://postgres:test@localhost:$port/awa_soak_$engine" \
+  env AWA_SOAK_DATABASE_URL="postgres://postgres:test@localhost:$port/awa_soak_${engine//-/_}" \
     AWA_SOAK_SECONDS="$SECONDS_PER_ENGINE" \
     AWA_SOAK_REPORT_DIR="$out" \
     "${log_env[@]}" \

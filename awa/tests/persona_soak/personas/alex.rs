@@ -224,7 +224,7 @@ impl Context {
                 .or_else(|| self.queue_of(Persona::Mia)),
         };
         let Some(queue) = target else { return };
-        queue.paused.store(true, Ordering::Relaxed);
+        queue.hold();
         let pool = self.pool.clone();
         if self
             .timed(
@@ -243,7 +243,7 @@ impl Context {
         }
         // Give the claimers a moment to pick the queue back up before stall checks resume.
         self.shared.stop_sleep(Duration::from_secs(3)).await;
-        queue.paused.store(false, Ordering::Relaxed);
+        queue.release();
     }
 
     async fn drain(&mut self) {
@@ -261,6 +261,8 @@ impl Context {
             .await
         {
             self.stats().add("drains", 1);
+            self.shared
+                .note("alex", format!("drained {} ({count} job(s))", queue.name));
             self.stats().add("drained_jobs", count as i64);
         }
         queue
@@ -301,6 +303,10 @@ impl Context {
         if ids.is_empty() {
             return;
         }
+        self.shared.note(
+            "alex",
+            format!("cancelling jobs {ids:?} ({state:?}) in {}", queue.name),
+        );
         if self.rng.chance(50) {
             let started_ms = self.shared.now_ms() as u32;
             let first = ids[0];
@@ -324,31 +330,12 @@ impl Context {
     }
 
     fn after_cancel(&self, job_id: i64, completed_before: bool, call_started_ms: u32) {
-        let now = self.shared.now_ms() as u32;
-        self.stats().add("cancelled", 1);
-        self.shared.ledger.with(
+        self.shared.record_operator_cancel(
+            Persona::Alex,
             job_id,
-            || {
-                super::super::ledger::JobRecord::new(
-                    Persona::Alex,
-                    u32::MAX,
-                    now,
-                    expect::ANY_TERMINAL,
-                    0,
-                )
-            },
-            |record| {
-                record.flags |= flag::OPERATOR_REMOVED | flag::OPERATOR_CANCEL_OK;
-                record.operator_cancel_ms = now;
-            },
+            completed_before,
+            call_started_ms,
         );
-        if completed_before {
-            self.shared.violation(
-                "cancel_overwrote_completed",
-                format!("operator cancel of job {job_id} succeeded after it was reported completed (call began at {call_started_ms} ms)"),
-                vec![format!("{{\"job_id\":{job_id}}}")],
-            );
-        }
     }
 
     async fn dlq_operations(&mut self) {
@@ -459,7 +446,7 @@ impl Context {
         let pool = self.pool.clone();
         let held = self.shared.queues.get(source);
         if let Some(queue) = &held {
-            queue.paused.store(true, Ordering::Relaxed);
+            queue.hold();
             let _ = self
                 .timed(
                     "pause_queue",
@@ -480,7 +467,7 @@ impl Context {
                 .timed("resume_queue", admin::resume_queue(&pool, &queue.name))
                 .await;
             self.shared.stop_sleep(Duration::from_secs(3)).await;
-            queue.paused.store(false, Ordering::Relaxed);
+            queue.release();
         }
     }
 
@@ -553,7 +540,10 @@ impl Context {
             .note("alex", format!("rolling restart: {name} replica {index}"));
         self.shared.chaos_window(Duration::from_secs(20));
         let started = Instant::now();
-        match fleet.restart(index, Duration::from_secs(30)).await {
+        let restarted = fleet.restart(index, Duration::from_secs(30)).await;
+        // If the restarted runtime led, the next election can take a full interval.
+        self.shared.chaos_window(Duration::from_secs(45));
+        match restarted {
             Ok(_) => {
                 self.stats().add("rolling_restarts", 1);
                 self.stats()

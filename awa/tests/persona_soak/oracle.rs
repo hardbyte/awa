@@ -12,6 +12,9 @@ use std::time::Duration;
 
 const MAX_ROWS: usize = 25;
 
+/// count, min and max job id, min and max lane sequence.
+type ForensicRow = (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+
 fn schema(shared: &Shared) -> String {
     shared
         .info
@@ -272,7 +275,17 @@ impl Oracle {
                 || drained;
             if !explained {
                 // An operator flag is set just after its cancel commits; look again before accusing.
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let lag = if self
+                    .shared
+                    .ledger
+                    .get(job_id)
+                    .is_some_and(|record| record.persona == super::config::Persona::Python)
+                {
+                    4500
+                } else {
+                    1500
+                };
+                tokio::time::sleep(Duration::from_millis(lag)).await;
             }
             let explained = explained
                 || self.shared.ledger.get(job_id).is_some_and(|record| {
@@ -387,8 +400,7 @@ impl Oracle {
             };
             let capacity = queue.capacity.load(std::sync::atomic::Ordering::Relaxed);
             let in_flight = queue.in_flight.load(std::sync::atomic::Ordering::Relaxed);
-            let held =
-                queue.paused.load(std::sync::atomic::Ordering::Relaxed) || queue.rate_limited;
+            let held = queue.is_held() || queue.rate_limited;
             let idle_workers = capacity > 0 && in_flight < capacity;
             if !entry.2
                 && backlog > 0
@@ -551,12 +563,26 @@ impl Oracle {
             if record.has(flag::OPERATOR_REMOVED) || record.has(flag::DLQ_PURGED) {
                 return;
             }
+            let db_seen = flag::DB_SEEN_COMPLETED | flag::DB_SEEN_FAILED | flag::DB_SEEN_CANCELLED;
             let evidence = record.completed_events > 0
                 || record.exhausted_events > 0
                 || record.cancel_events > 0
+                || record.flags & db_seen != 0
                 || (record.has(flag::NO_EVENTS) && record.has(flag::RETURNED_COMPLETED));
             if evidence {
-                let completed = record.completed_events > 0 || record.has(flag::RETURNED_COMPLETED);
+                let completed = record.completed_events > 0
+                    || record.has(flag::RETURNED_COMPLETED)
+                    || record.has(flag::DB_SEEN_COMPLETED);
+                if record.has(flag::DB_SEEN_CANCELLED)
+                    && record.expect & expect::CANCELLED == 0
+                    && !record.has(flag::HANDLER_CANCELLED)
+                    && unexpected.len() < MAX_ROWS
+                {
+                    unexpected.push(format!(
+                        "{{\"job_id\":{id},\"outcome\":\"cancelled\",\"allowed\":{}}}",
+                        record.expect
+                    ));
+                }
                 if completed
                     && record.expect & expect::COMPLETED == 0
                     && unexpected.len() < MAX_ROWS
@@ -566,7 +592,7 @@ impl Oracle {
                         record.expect
                     ));
                 }
-                if record.exhausted_events > 0
+                if (record.exhausted_events > 0 || record.has(flag::DB_SEEN_FAILED))
                     && record.expect & expect::FAILED == 0
                     && unexpected.len() < MAX_ROWS
                 {
@@ -591,6 +617,7 @@ impl Oracle {
         }
 
         let mut live_stuck = Vec::new();
+        let mut forensic_ids: Vec<i64> = Vec::new();
         let mut lost = Vec::new();
         let mut lost_after_run = Vec::new();
         let mut terminal_in_db = 0usize;
@@ -623,10 +650,15 @@ impl Oracle {
                 let describe = |place: &str| {
                     let record = record.clone();
                     format!(
-                        "{{\"job_id\":{id},\"found\":\"{place}\",\"executions\":{},\"persona\":\"{}\",\"flags\":{}}}",
+                        "{{\"job_id\":{id},\"found\":\"{place}\",\"executions\":{},\"persona\":\"{}\",\"flags\":{},\"enqueued_at_s\":{:.1},\"queue\":\"{}\"}}",
                         record.as_ref().map_or(0, |r| r.executions),
                         record.as_ref().map_or("?", |r| r.persona.name()),
-                        record.as_ref().map_or(0, |r| r.flags)
+                        record.as_ref().map_or(0, |r| r.flags),
+                        record.as_ref().map_or(0.0, |r| f64::from(r.enqueued_ms) / 1000.0),
+                        record
+                            .as_ref()
+                            .and_then(|r| self.shared.queues.by_index(r.queue))
+                            .map_or("?".to_string(), |queue| queue.name.clone())
                     )
                 };
                 match found.get(id) {
@@ -649,6 +681,7 @@ impl Oracle {
                                     && record.expect & expect::CANCELLED == 0
                                 {
                                     lost_after_run.push(describe(place));
+                                    forensic_ids.push(*id);
                                 }
                             }
                         }
@@ -672,12 +705,17 @@ impl Oracle {
                         }
                         if !executed {
                             lost.push(describe("absent"));
+                            forensic_ids.push(*id);
                         } else if !returned {
                             lost_after_run.push(describe("absent"));
+                            forensic_ids.push(*id);
                         }
                     }
                 }
             }
+        }
+        if !forensic_ids.is_empty() {
+            self.record_forensics(&schema, &forensic_ids).await;
         }
         self.shared
             .run
@@ -710,6 +748,42 @@ impl Oracle {
             lost,
         );
         report("lost_job_after_run", "ran without a recorded terminal outcome and are in no table, or ended cancelled without cause", lost_after_run);
+    }
+
+    /// For jobs that look lost: everywhere the store could still mention them, written to
+    /// the timeline so the reproducer carries it.
+    async fn record_forensics(&self, schema: &str, ids: &[i64]) {
+        let sample: Vec<i64> = ids.iter().copied().take(200).collect();
+        let tables: [(&str, String); 8] = [
+            ("ready_entries", format!("SELECT count(*), min(job_id), max(job_id), min(lane_seq), max(lane_seq) FROM {schema}.ready_entries WHERE job_id = ANY($1)")),
+            ("ready_tombstones", format!("SELECT count(*), min(job_id), max(job_id), min(lane_seq), max(lane_seq) FROM {schema}.ready_tombstones WHERE job_id = ANY($1)")),
+            ("lease_claims", format!("SELECT count(*), min(job_id), max(job_id), min(lane_seq), max(lane_seq) FROM {schema}.lease_claims WHERE job_id = ANY($1)")),
+            ("lease_claim_batches", format!("SELECT count(*), min(j), max(j), 0::bigint, 0::bigint FROM {schema}.lease_claim_batches b, LATERAL unnest(b.job_ids) AS j WHERE b.job_ids && $1 AND j = ANY($1)")),
+            ("lease_claim_closures", format!("SELECT count(*), min(job_id), max(job_id), 0::bigint, 0::bigint FROM {schema}.lease_claim_closures WHERE job_id = ANY($1)")),
+            ("attempt_state", format!("SELECT count(*), min(job_id), max(job_id), 0::bigint, 0::bigint FROM {schema}.attempt_state WHERE job_id = ANY($1)")),
+            ("receipt_completion_tombstones", format!("SELECT count(*), 0::bigint, 0::bigint, 0::bigint, 0::bigint FROM {schema}.receipt_completion_tombstones")),
+            ("job_unique_claims", "SELECT count(*), min(job_id), max(job_id), 0::bigint, 0::bigint FROM awa.job_unique_claims WHERE job_id = ANY($1)".to_string()),
+        ];
+        let mut lines = Vec::new();
+        for (name, sql) in tables {
+            let row: Result<ForensicRow, _> = sqlx::query_as(&sql)
+                .bind(&sample)
+                .fetch_one(&self.pool)
+                .await;
+            match row {
+                Ok((count, min_id, max_id, min_seq, max_seq)) => lines.push(format!("{name}: {count} row(s) for the sampled ids (job ids {min_id:?}..{max_id:?}, lane_seq {min_seq:?}..{max_seq:?})")),
+                Err(error) => lines.push(format!("{name}: query failed: {error}")),
+            }
+        }
+        self.shared.note(
+            "oracle",
+            format!(
+                "forensics for {} lost-looking job(s), first {:?}: {}",
+                ids.len(),
+                &ids[..ids.len().min(5)],
+                lines.join("; ")
+            ),
+        );
     }
 
     pub fn crash_scan(&self) -> Vec<String> {

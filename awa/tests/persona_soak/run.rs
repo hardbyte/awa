@@ -1,6 +1,7 @@
 //! Orchestration: set up the database, start the personas and the oracle, run the
 //! load, let the system quiesce, reconcile, and report.
 
+use super::adminserver::AdminServer;
 use super::config::{Persona, SoakConfig};
 use super::db::{self, Budget};
 use super::oracle::Oracle;
@@ -55,38 +56,60 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     }
     let shared = Shared::new(config, info, budget);
 
-    // Personas start their runtimes and then produce until the load stops. Chaos and
-    // the operator reach other personas' fleets, so they start once the rest are up.
+    // The UI personas talk to the real admin server, run as a child process.
+    let ui_personas = [
+        Persona::Watchers,
+        Persona::Support,
+        Persona::UiOps,
+        Persona::Impatient,
+    ];
+    let admin_server = if ui_personas
+        .iter()
+        .any(|persona| shared.config.has(*persona))
+    {
+        std::fs::create_dir_all(&shared.config.report_dir).map_err(|error| error.to_string())?;
+        let server = AdminServer::start(&shared.config).await?;
+        shared.ui.set_base_url(server.base_url.clone());
+        shared.note(
+            "run",
+            format!(
+                "admin server at {} (statement timeout {}s, client timeout {}s)",
+                server.base_url,
+                server.statement_timeout.as_secs(),
+                shared.config.ui_client_timeout.as_secs()
+            ),
+        );
+        Some(server)
+    } else {
+        None
+    };
+
+    // Personas start their runtimes and then produce until the load stops. Chaos, the
+    // operator and the UI users reach other personas' fleets and queues, so they start
+    // once the rest are up.
     let mut tasks: Vec<(Persona, tokio::task::JoinHandle<Result<(), String>>)> = Vec::new();
-    for persona in [Persona::Mia, Persona::Tom, Persona::Priya, Persona::Sam] {
+    for persona in [
+        Persona::Mia,
+        Persona::Tom,
+        Persona::Priya,
+        Persona::Sam,
+        Persona::Python,
+    ] {
         if shared.config.has(persona) {
-            let shared = shared.clone();
-            tasks.push((
-                persona,
-                tokio::spawn(async move {
-                    match persona {
-                        Persona::Mia => personas::mia::run(shared).await,
-                        Persona::Tom => personas::tom::run(shared).await,
-                        Persona::Priya => personas::priya::run(shared).await,
-                        _ => personas::sam::run(shared).await,
-                    }
-                }),
-            ));
+            tasks.push((persona, spawn_persona(persona, shared.clone())));
         }
     }
     tokio::time::sleep(Duration::from_secs(8)).await;
-    for persona in [Persona::Alex, Persona::Chaos] {
+    for persona in [
+        Persona::Alex,
+        Persona::Chaos,
+        Persona::Watchers,
+        Persona::Support,
+        Persona::UiOps,
+        Persona::Impatient,
+    ] {
         if shared.config.has(persona) {
-            let shared = shared.clone();
-            tasks.push((
-                persona,
-                tokio::spawn(async move {
-                    match persona {
-                        Persona::Alex => personas::alex::run(shared).await,
-                        _ => personas::chaos::run(shared).await,
-                    }
-                }),
-            ));
+            tasks.push((persona, spawn_persona(persona, shared.clone())));
         }
     }
 
@@ -175,6 +198,17 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
     }
 
+    personas::ui::analyse(&shared);
+    if let Some(mut server) = admin_server {
+        if !server.is_running() {
+            shared.violation(
+                "admin_server_died",
+                "the awa serve process exited during the run; see awa-serve.log",
+                vec![],
+            );
+        }
+        server.stop();
+    }
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
@@ -186,6 +220,27 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     }
     oracle_pool.close().await;
     Ok(shared)
+}
+
+fn spawn_persona(
+    persona: Persona,
+    shared: Arc<Shared>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    tokio::spawn(async move {
+        match persona {
+            Persona::Mia => personas::mia::run(shared).await,
+            Persona::Tom => personas::tom::run(shared).await,
+            Persona::Priya => personas::priya::run(shared).await,
+            Persona::Sam => personas::sam::run(shared).await,
+            Persona::Alex => personas::alex::run(shared).await,
+            Persona::Chaos => personas::chaos::run(shared).await,
+            Persona::Watchers => personas::ui::run_watchers(shared).await,
+            Persona::Support => personas::ui::run_support(shared).await,
+            Persona::UiOps => personas::ui::run_ui_operator(shared).await,
+            Persona::Impatient => personas::ui::run_impatient(shared).await,
+            Persona::Python => personas::python::run(shared).await,
+        }
+    })
 }
 
 fn progress(shared: &Arc<Shared>) {

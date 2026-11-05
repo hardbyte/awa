@@ -5,8 +5,10 @@ pub mod alex;
 pub mod chaos;
 pub mod mia;
 pub mod priya;
+pub mod python;
 pub mod sam;
 pub mod tom;
+pub mod ui;
 
 use super::config::Persona;
 use super::ledger::{expect, JobRecord};
