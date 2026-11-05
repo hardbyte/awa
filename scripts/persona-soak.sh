@@ -17,6 +17,7 @@
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
+#   SOAK_PG_CPUS              CPU limit for each database container (default: none)
 #   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0-epqlog5)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
 #   CARGO_TARGET_DIR          cargo target directory, as for any cargo build
@@ -73,12 +74,14 @@ trap 'exit 130' INT TERM
 
 start_container() {
   local engine="$1" name="$2" port="$3"
+  local cpu_args=()
+  [ -n "${SOAK_PG_CPUS:-}" ] && cpu_args=(--cpus "$SOAK_PG_CPUS")
   local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB)
   case "$engine" in
     pg17)
-      docker run -d --name "$name" --shm-size=1g -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
+      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
     pg18)
-      docker run -d --name "$name" --shm-size=1g -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
+      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
     pg18-cassert)
       # The image ships an initialised, trust-authenticated cluster in /data. Its server
       # logs an AWAEPQ line, with the full query text, for every partition-pruning
@@ -86,7 +89,7 @@ start_container() {
       # collector therefore writes into a FIFO whose reader drops those messages and keeps
       # the rest (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
       # Parallel query is off here: at -O0 a handful of admin reads would otherwise take every core.
-      docker run -d --name "$name" --shm-size=1g -p "$port:5432" "$CASSERT_IMAGE" sh -c '
+      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" sh -c '
         mkdir -p /data/log
         rm -f /data/log/pg.log /data/log/pg-filtered.log
         mkfifo /data/log/pg.log
