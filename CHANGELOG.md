@@ -56,6 +56,24 @@ Notable changes between releases. Detailed migration notes for storage transitio
   statement over `unnest(...)`, so the bind count no longer depends on the
   batch size and the call keeps its single-statement, caller-transaction
   semantics, on both the canonical and queue-storage engines.
+- **Duration and size histograms now export explicit bucket boundaries, so
+  latency quantiles are accurate.** `awa.job.duration`,
+  `awa.dispatch.claim_duration`, `awa.dispatch.wake_to_claim_duration`,
+  `awa.completion.flush_duration` and `awa.maintenance.promote_duration`
+  record seconds but were exported with the OpenTelemetry SDK's default
+  millisecond-scale buckets (0, 5, 10, 25, ... 10000), so almost every
+  observation landed in the first bucket and `histogram_quantile` p50/p95/p99
+  were flat lines near 2.5 s, 4.75 s and 4.95 s whatever the real latency.
+  Latency histograms now use 0.5 ms to 30 s buckets and job duration uses
+  1 ms to 1 h buckets. The batch-size, capacity and skipped-row histograms
+  (`awa.enqueue.batch_size`, `awa.dispatch.capacity_available`,
+  `awa.dispatch.claim_batch_size`, `awa.completion.flush_batch_size`,
+  `awa.maintenance.promote_batch_size`,
+  `awa.maintenance.rotate.skipped_rows`,
+  `awa.maintenance.prune.skipped_rows`) now use power-of-two buckets from 0 to
+  8192. Quantile panels become accurate after upgrading. The `le` labels of
+  these histograms change, so a quantile computed over a range that spans the
+  upgrade mixes old and new buckets until the old series age out.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened
