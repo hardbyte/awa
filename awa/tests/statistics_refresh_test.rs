@@ -308,6 +308,26 @@ async fn leader_refreshes_statistics_on_election_and_every_interval() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leader_refreshes_statistics_on_election_before_the_first_interval() {
+    let database = TestDatabase::create(None, &[]).await;
+    let pool = &database.owner_pool;
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage config");
+    seed_ready_rows(&store, pool, 200).await;
+
+    let client = probe_client(pool.clone(), Duration::from_secs(300), None);
+    client.start().await.expect("start client");
+    wait_for(
+        "a statistics pass on election",
+        Duration::from_secs(30),
+        || async { stats_rows(pool, "awa", "ready_entries", true).await > 0 },
+    )
+    .await;
+
+    client.shutdown(Duration::from_secs(5)).await;
+    database.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_interval_disables_the_refresh() {
     let database = TestDatabase::create(None, &[]).await;
     let pool = &database.owner_pool;
@@ -354,6 +374,30 @@ async fn non_owner_runtime_role_refreshes_statistics() {
         "the runtime role must not be able to analyse the tables itself"
     );
 
+    for (schema, relation, message) in [
+        (
+            "public",
+            "queue_claim_heads",
+            "is not a queue-storage schema",
+        ),
+        ("awa", "jobs", "is not a partitioned or head table"),
+    ] {
+        let error =
+            sqlx::query_scalar::<_, String>("SELECT awa.analyze_queue_storage_relation($1, $2)")
+                .bind(schema)
+                .bind(relation)
+                .fetch_one(&runtime_pool)
+                .await
+                .expect_err("the helper rejects what it may not analyse");
+        let database_error = error.as_database_error().expect("database error");
+        assert_eq!(database_error.code().as_deref(), Some("22023"));
+        assert!(
+            database_error.message().contains(message),
+            "{schema}.{relation}: {}",
+            database_error.message()
+        );
+    }
+
     let client = probe_client(runtime_pool.clone(), Duration::from_secs(1), None);
     client
         .start()
@@ -371,6 +415,50 @@ async fn non_owner_runtime_role_refreshes_statistics() {
 
     client.shutdown(Duration::from_secs(5)).await;
     runtime_pool.close().await;
+    database.drop().await;
+}
+
+/// A conflicting lock on a ring parent fails the call with `lock_not_available`
+/// rather than letting `ANALYZE (SKIP_LOCKED)` skip every partition and report
+/// success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locked_ring_parent_fails_the_call_instead_of_reporting_analyzed() {
+    let database = TestDatabase::create(None, &[]).await;
+    let pool = &database.owner_pool;
+
+    let mut blocker = pool.begin().await.expect("begin blocker");
+    sqlx::query("LOCK TABLE ONLY awa.ready_entries IN SHARE UPDATE EXCLUSIVE MODE")
+        .execute(blocker.as_mut())
+        .await
+        .expect("lock the parent");
+
+    let mut call = pool.begin().await.expect("begin call");
+    sqlx::query("SELECT set_config('lock_timeout', '200ms', true)")
+        .execute(call.as_mut())
+        .await
+        .expect("set lock_timeout");
+    let error = sqlx::query_scalar::<_, String>(
+        "SELECT awa.analyze_queue_storage_relation('awa', 'ready_entries')",
+    )
+    .fetch_one(call.as_mut())
+    .await
+    .expect_err("the locked parent must not report analyzed");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55P03")
+    );
+    call.rollback().await.expect("rollback call");
+
+    blocker.rollback().await.expect("release the parent");
+    let status: String =
+        sqlx::query_scalar("SELECT awa.analyze_queue_storage_relation('awa', 'ready_entries')")
+            .fetch_one(pool)
+            .await
+            .expect("analyse once the lock is gone");
+    assert_eq!(status, "analyzed");
     database.drop().await;
 }
 

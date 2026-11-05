@@ -26,6 +26,25 @@ const STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 const HEAD_TABLES: [&str; 2] = ["queue_claim_heads", "queue_enqueue_heads"];
 
+/// The partitioned ring parents a queue-storage substrate installs. A schema
+/// can hold other partitioned tables (a substrate in an application schema),
+/// which this refresh must never analyse.
+const RING_PARENTS: [&str; 13] = [
+    "done_entries",
+    "lease_claim_batches",
+    "lease_claim_closure_batches",
+    "lease_claim_closures",
+    "lease_claims",
+    "leases",
+    "queue_terminal_count_deltas",
+    "ready_claim_attempt_batches",
+    "ready_entries",
+    "ready_segments",
+    "ready_tombstones",
+    "receipt_completion_batches",
+    "receipt_completion_tombstones",
+];
+
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
 const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
@@ -99,16 +118,26 @@ pub(crate) struct StatisticsRefresher {
     pool: PgPool,
     schema: String,
     metrics: AwaMetrics,
+    /// Set for a leader whose own storage is canonical and whose queue-storage
+    /// runtime is only a standby: a pass runs only once routing has flipped to
+    /// `schema`.
+    require_active_schema: bool,
     warned_privilege: AtomicBool,
     warned_unavailable: AtomicBool,
 }
 
 impl StatisticsRefresher {
-    pub(crate) fn new(pool: PgPool, schema: String, metrics: AwaMetrics) -> Self {
+    pub(crate) fn new(
+        pool: PgPool,
+        schema: String,
+        metrics: AwaMetrics,
+        require_active_schema: bool,
+    ) -> Self {
         Self {
             pool,
             schema,
             metrics,
+            require_active_schema,
             warned_privilege: AtomicBool::new(false),
             warned_unavailable: AtomicBool::new(false),
         }
@@ -135,6 +164,25 @@ impl StatisticsRefresher {
     pub(crate) async fn run_pass(&self) -> PassSummary {
         let started = Instant::now();
         let mut summary = PassSummary::default();
+
+        if self.require_active_schema {
+            match sqlx::query_scalar::<_, Option<String>>(
+                "SELECT awa.active_queue_storage_schema()",
+            )
+            .fetch_one(&self.pool)
+            .await
+            {
+                Ok(active) if active.as_deref() == Some(self.schema.as_str()) => {}
+                Ok(_) => {
+                    debug!(schema = %self.schema, "Routing has not flipped to this schema yet; skipping statistics refresh");
+                    return summary;
+                }
+                Err(err) => {
+                    warn!(error = %err, "Could not resolve the active queue-storage schema for statistics refresh");
+                    return summary;
+                }
+            }
+        }
 
         match awa_model::storage::queue_storage_schema_ready(&self.pool, &self.schema).await {
             Ok(true) => {}
@@ -209,10 +257,12 @@ impl StatisticsRefresher {
             FROM pg_class AS class
             JOIN pg_namespace AS namespace ON namespace.oid = class.relnamespace
             WHERE namespace.nspname = $1 AND class.relkind = 'p'
+              AND class.relname = ANY($2)
             ORDER BY class.relname
             "#,
         )
         .bind(&self.schema)
+        .bind(&RING_PARENTS[..])
         .fetch_all(&self.pool)
         .await
     }

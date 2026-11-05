@@ -17,8 +17,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   minutes. `ClientBuilder::statistics_refresh_interval` (Python
   `statistics_refresh_interval_ms`) changes the cadence; zero disables it. One
   pass takes under a second on a small ring and a few seconds on a large one.
-  It analyses one relation per transaction with a 2 s `lock_timeout`, skips
-  children that prune holds, and never makes prune wait: a prune attempt that
+  It analyses one relation per transaction with a 2 s `lock_timeout` (a call that
+  times out waiting for a lock is retried next interval and recorded as
+  `skipped_lock`) and never makes prune wait: a prune attempt that
   lands while ANALYZE samples the oldest slot's tables returns `blocked` and
   retries on its normal backoff. Results are in
   `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`

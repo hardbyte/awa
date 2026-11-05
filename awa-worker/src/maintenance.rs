@@ -1336,12 +1336,16 @@ impl MaintenanceService {
         if self.statistics_refresh_interval.is_zero() {
             return None;
         }
-        let runtime = self.storage.queue_storage()?;
+        let (runtime, standby) = match self.storage.queue_storage() {
+            Some(runtime) => (runtime, false),
+            None => (self.standby_queue_storage.as_ref()?, true),
+        };
         Some(RefreshGuard::spawn(
             StatisticsRefresher::new(
                 self.pool.clone(),
                 runtime.store.schema().to_string(),
                 self.metrics.clone(),
+                standby,
             ),
             self.statistics_refresh_interval,
             &self.cancel,

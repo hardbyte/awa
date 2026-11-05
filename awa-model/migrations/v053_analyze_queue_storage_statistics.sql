@@ -1,4 +1,4 @@
--- v053: Planner statistics for the queue-storage tables autovacuum never analyses
+-- v053: Planner statistics for the queue-storage tables autovacuum never analyses (#631)
 --
 -- Autovacuum does not analyse partitioned tables, so the ring parents
 -- (ready_entries, done_entries, leases, ...) have no inherited statistics. It
@@ -16,8 +16,16 @@
 -- The function analyses one relation per call and the caller runs each call as
 -- its own transaction, so the locks ANALYZE takes on a partitioned table's
 -- children are held for that table rather than for the whole refresh.
--- SKIP_LOCKED skips a child that ring prune holds ACCESS EXCLUSIVE instead of
--- waiting for it and aborting the statistics gathered so far.
+--
+-- Locking on a partitioned table, per the ANALYZE documentation: SKIP_LOCKED
+-- applies when ANALYZE starts work on a relation, so a child that ring prune
+-- holds ACCESS EXCLUSIVE is skipped during the per-child analysis, but
+-- sampling the children for the parent's statistics can still wait for it.
+-- That wait is bounded by the caller's lock_timeout and fails the call with
+-- SQLSTATE 55P03, which the caller records as skipped_lock. SKIP_LOCKED also
+-- skips every partition silently when the parent itself is locked, so the
+-- function takes the parent's SHARE UPDATE EXCLUSIVE lock first and lets that
+-- wait fail instead.
 --
 -- Definer boundary: the function only analyses a head table or a partitioned
 -- table of a schema that awa.queue_storage_schemas() reports, which requires
@@ -94,6 +102,9 @@ BEGIN
     END IF;
 
     IF v_relkind = 'p' THEN
+        EXECUTE format(
+            'LOCK TABLE ONLY %I.%I IN SHARE UPDATE EXCLUSIVE MODE', p_schema, p_relation
+        );
         EXECUTE format('ANALYZE (SKIP_LOCKED) %I.%I', p_schema, p_relation);
     ELSE
         EXECUTE format('ANALYZE %I.%I', p_schema, p_relation);
