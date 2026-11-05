@@ -99,7 +99,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   kept its permit: the rescued retry could not be claimed, and a one-worker
   queue stopped. A handler still running two `deadline_rescue_interval`s past
   its deadline is now dropped at its next `.await`. Blocking code that never
-  yields still keeps its slot.
+  yields still keeps its slot. For a Python handler the slot is freed but the
+  coroutine is not cancelled: it keeps running on its event loop until it
+  finishes on its own, so concurrency can exceed `max_workers` while it runs.
+  Python handlers should enforce their own timeouts.
 - **`JobResult::RetryAfter` now respects `max_attempts`.** `RetryAfter` is
   documented as "this attempt failed; try again after delay X", but the
   completion path never checked exhaustion: a handler that always returned
@@ -117,6 +120,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
   deadline rescued it (5 minutes by default), and its message was lost. The
   executor now catches the panic and records `handler panicked: <message>` as
   a retryable failure.
+- **An attempt lost to a stall or to a shutdown whose drain timed out now
+  costs a real attempt.** On the final attempt, the stale-heartbeat or deadline
+  rescue fails the job, or dead-letters it when the queue's DLQ is enabled,
+  instead of running it again, and the late completion from the original
+  worker is ignored as stale. A job with `max_attempts = 1` therefore fails if
+  a deploy's drain times out while it runs.
+- **Rescue-exhausted jobs are reported as rescues.** When a stale-heartbeat,
+  deadline or callback-timeout rescue takes a job's last attempt, the job emits
+  the `Rescued` lifecycle event and runs its `on_rescued_enqueue` follow-ups,
+  not `Exhausted` and `on_exhausted_enqueue`. It counts in `maintenance_rescues`
+  (and in `dlq_moved` when queue storage dead-letters it) rather than
+  `jobs_failed`, as an exhausted callback timeout already did.
 
 ## [0.6.12] — 2026-11-05
 
