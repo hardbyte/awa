@@ -14467,7 +14467,26 @@ async fn test_queue_storage_receipt_deadline_rescue_after_a_heartbeat_recheck() 
     let heartbeat_pool = pool.clone();
     let heartbeat_ids = job_ids.clone();
     let release = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Rewrite only once the rescue is waiting on the cursor row, so its
+        // snapshot predates the rewrite.
+        let waiting_since = Instant::now();
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query LIKE '%deadline_cursor_deadline_at%')",
+            )
+            .fetch_one(&heartbeat_pool)
+            .await
+            .expect("poll for the waiting rescue");
+            if waiting {
+                break;
+            }
+            assert!(
+                waiting_since.elapsed() < Duration::from_secs(30),
+                "the rescue never waited on the cursor row"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         sqlx::query(&format!(
             "UPDATE {schema}.lease_claims \
              SET materialized_at = COALESCE(materialized_at, clock_timestamp()) \
@@ -14667,4 +14686,175 @@ async fn test_many_queues_share_one_listener_and_notify_wakes_the_right_queue() 
     .await
     .unwrap();
     pool.close().await;
+}
+
+/// A fast completion closes an attempt under its completion lock without
+/// locking claim rows. A cancel of the same running attempt must not commit
+/// alongside it: each attempt ends either completed or cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_cancel_racing_a_fast_completion_leaves_one_outcome() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_cancel_fast_race";
+    let schema = "awa_qs_cancel_fast_race";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let mut both = 0;
+    let mut neither = 0;
+    for id in 0..60 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let job_id = claimed[0].job.id;
+        let (completed, cancelled) = tokio::join!(
+            store.complete_runtime_batch(&pool, &claimed),
+            store.cancel_job(&pool, job_id)
+        );
+        completed.expect("complete");
+        cancelled.expect("cancel");
+        let cancelled_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {schema}.done_entries WHERE job_id = $1 AND state = 'cancelled'"
+        ))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let completion_batches: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {schema}.receipt_completion_batches WHERE job_ids @> ARRAY[$1]::bigint[]"
+        ))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if cancelled_rows > 0 && completion_batches > 0 {
+            both += 1;
+        }
+        if cancelled_rows == 0 && completion_batches == 0 {
+            neither += 1;
+        }
+    }
+    assert_eq!(both, 0, "attempts both completed and cancelled");
+    assert_eq!(neither, 0, "attempts neither completed nor cancelled");
+}
+
+/// The receipt paths lock their attempts' row-local claims in a statement of
+/// their own before the statements that lock them again, so a claim rewritten
+/// meanwhile is rechecked where nothing is pruned. With a rewrite of the claim
+/// held open, the heartbeat must wait in that statement rather than a later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claims_are_locked_before_the_heartbeat_statement() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_claim_prelock";
+    let schema = "awa_qs_receipt_claim_prelock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 70 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .expect("claim with a deadline");
+    assert_eq!(claimed.len(), 1);
+    let run_lease = claimed[0].job.run_lease;
+
+    let mut writer = pool.begin().await.expect("begin claim rewrite");
+    let rewritten = sqlx::query(&format!(
+        "UPDATE {schema}.lease_claims \
+         SET materialized_at = COALESCE(materialized_at, clock_timestamp()) \
+         WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(writer.as_mut())
+    .await
+    .expect("rewrite claim")
+    .rows_affected();
+    assert_eq!(rewritten, 1, "the claim is row-local");
+
+    let heartbeat = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let store = QueueStorage::new(QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: true,
+                claim_slot_count: 2,
+            })
+            .expect("store");
+            store.heartbeat_batch(&pool, &[(job_id, run_lease)]).await
+        }
+    });
+
+    let waiting_since = Instant::now();
+    loop {
+        let waiting_query: Option<String> = sqlx::query_scalar(
+            "SELECT query FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE '%lease_claims%' LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("poll for the waiting heartbeat");
+        if let Some(query) = waiting_query {
+            assert!(
+                query.contains("AS input(job_id, run_lease)")
+                    && query.contains("FOR UPDATE OF claims"),
+                "the heartbeat waited outside the claim prelock: {query}"
+            );
+            break;
+        }
+        assert!(
+            waiting_since.elapsed() < Duration::from_secs(30),
+            "the heartbeat never waited on the rewritten claim"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    writer.commit().await.expect("commit claim rewrite");
+    heartbeat
+        .await
+        .expect("join heartbeat")
+        .expect("heartbeat after the rewrite");
 }

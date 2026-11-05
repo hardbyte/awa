@@ -27,6 +27,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
   batch size and the call keeps its single-statement, caller-transaction
   semantics, on both the canonical and queue-storage engines.
 
+- **Cancelling a running job on queue storage no longer races its completion
+  into two outcomes.** The fast completion path closes a receipt-backed
+  attempt under the attempt's completion lock without locking its claim, and
+  the receipt-only cancel locked only the claim. A cancel that ran while a
+  completion was uncommitted saw no closure, so both committed: the attempt
+  ended with a completion record and a cancelled terminal row. Cancel now finds
+  the open attempt, takes its completion lock, and looks again, so it either
+  sees the completion and leaves the job alone or cancels it before the
+  completion can close it. Bulk cancels take every attempt's lock up front, in
+  the order completion batches use.
+
 ## [0.6.12] — 2026-11-05
 
 Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.
