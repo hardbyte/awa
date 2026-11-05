@@ -38,6 +38,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
   completion can close it. Bulk cancels take every attempt's lock up front, in
   the order completion batches use.
 
+- **A slow maintenance branch no longer starves promotion and rescue for
+  minutes.** The per-branch overrun governor armed a fixed 120-tick cooldown
+  and re-armed it on every later overrun, so a branch whose body consistently
+  ran longer than 1.5x its interval fell to a 1/120 duty cycle, with one
+  warning at the first flip. A promotion pass that took 1.5x its 250 ms
+  interval silenced promotion for about 30 seconds at a time, and a slow
+  deadline or stale-heartbeat rescue sweep left expired claims waiting the
+  same way. The cooldown is now `2 x ceil(body_duration / interval)` ticks,
+  capped at the previous 120, so a merely slow branch settles at roughly a
+  third duty cycle while a pathologically slow one stays bounded.
+
 ## [0.6.12] — 2026-11-05
 
 Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.
