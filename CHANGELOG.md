@@ -6,6 +6,31 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **`admin::drain_queue` on queue storage cancels a backlog in bulk and
+  drains every stripe of a striped queue.** It found the queue's jobs through
+  a lookup that read every retained ready row, then cancelled them one at a
+  time, several statements each, inside one transaction, so draining a large
+  backlog took minutes and held its row locks throughout. Scheduled,
+  retryable and available jobs are now cancelled 1,000 at a time, each chunk
+  one short transaction, with available rows read from each lane's claim
+  cursor; waiting jobs are still cancelled one by one and running jobs are
+  left alone. Jobs enqueued after the drain starts are left for a later
+  call, so draining a queue that keeps receiving work still returns, and
+  the drain moves each lane's claim cursor past the rows it cancelled, so
+  workers reach the jobs behind them on their next poll. It also matched
+  only the logical queue name, so draining a striped queue cancelled
+  nothing; it now covers every stripe. `awa queue drain` and the Python
+  `drain_queue` use this path.
+- **Cancelling, moving or reprioritising an available job on queue storage
+  no longer acts on a job a worker has already claimed.** A claim moves its
+  lane's claim cursor past the rows it took only after it commits, so
+  briefly, or until the next claim if that advance failed, a claimed row
+  still looked available. A cancel in that window wrote a cancelled terminal
+  row while the attempt kept running, and a move re-enqueued a job that was
+  already executing. A claim still in progress was missed the same way.
+  These paths now wait for any claim in progress on the job's lane and skip
+  rows a claim has recorded, the same evidence claims use to skip them, so a
+  cancel reaches the running attempt instead.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened
