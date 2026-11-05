@@ -116,7 +116,11 @@ impl AdminServer {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(self) {}
+}
+
+impl Drop for AdminServer {
+    fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
