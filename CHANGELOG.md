@@ -16,8 +16,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   leader now runs `ANALYZE` on them when it is elected and then every five
   minutes. `ClientBuilder::statistics_refresh_interval` (Python
   `statistics_refresh_interval_ms`) changes the cadence; zero disables it. It
-  analyses one relation per transaction with a 2 s `lock_timeout`, skips
-  children that prune holds, and never makes prune wait: a prune attempt that
+  analyses one relation per transaction with a 2 s `lock_timeout` (a call that
+  times out waiting for a lock is retried next interval and recorded as
+  `skipped_lock`) and never makes prune wait: a prune attempt that
   lands while ANALYZE samples the oldest slot's tables returns `blocked` and
   retries on its normal backoff. Results are in
   `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`

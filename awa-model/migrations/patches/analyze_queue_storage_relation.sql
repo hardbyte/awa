@@ -1,5 +1,5 @@
 -- Schema patch analyze_queue_storage_relation: planner statistics helper for
--- the queue-storage tables autovacuum never analyses (#630).
+-- the queue-storage tables autovacuum never analyses (#631).
 -- Counterpart of awa 0.7 migration v053, minus the schema_version row; v053
 -- replaces this body with one that checks the schema through
 -- awa.queue_storage_schemas(), which 0.6 does not have.
@@ -19,11 +19,19 @@
 -- SECURITY DEFINER function owned by the role that applies the patch, which
 -- owns the tables.
 --
--- The function analyses one relation per call; the caller runs each call as
+-- The function analyses one relation per call and the caller runs each call as
 -- its own transaction, so the locks ANALYZE takes on a partitioned table's
 -- children are held for that table rather than for the whole refresh.
--- SKIP_LOCKED skips a child that ring prune holds ACCESS EXCLUSIVE instead of
--- waiting for it and aborting the statistics gathered so far.
+--
+-- Locking on a partitioned table, per the ANALYZE documentation: SKIP_LOCKED
+-- applies when ANALYZE starts work on a relation, so a child that ring prune
+-- holds ACCESS EXCLUSIVE is skipped during the per-child analysis, but
+-- sampling the children for the parent's statistics can still wait for it.
+-- That wait is bounded by the caller's lock_timeout and fails the call with
+-- SQLSTATE 55P03, which the caller records as skipped_lock. SKIP_LOCKED also
+-- skips every partition silently when the parent itself is locked, so the
+-- function takes the parent's SHARE UPDATE EXCLUSIVE lock first and lets that
+-- wait fail instead.
 --
 -- Definer boundary: only a head table or a partitioned table of a queue-storage
 -- schema (the AWA-specific claim_ready_runtime sentinel) that is owned by the
@@ -105,6 +113,9 @@ BEGIN
     END IF;
 
     IF v_relkind = 'p' THEN
+        EXECUTE format(
+            'LOCK TABLE ONLY %I.%I IN SHARE UPDATE EXCLUSIVE MODE', p_schema, p_relation
+        );
         EXECUTE format('ANALYZE (SKIP_LOCKED) %I.%I', p_schema, p_relation);
     ELSE
         EXECUTE format('ANALYZE %I.%I', p_schema, p_relation);
