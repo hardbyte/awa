@@ -82,14 +82,18 @@ start_container() {
     pg18-cassert)
       # The image ships an initialised, trust-authenticated cluster in /data. Its server
       # logs an AWAEPQ line, with the full query text, for every partition-pruning
-      # initialisation, which under this workload is tens of gigabytes per hour, so the
-      # server log goes through a filter that drops those lines and keeps the rest
-      # (including assertion failures and crash notices) in /data/log/pg.log.
+      # initialisation, which under this workload is tens of gigabytes per hour. The log
+      # collector therefore writes into a FIFO whose reader drops those messages and keeps
+      # the rest (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
       docker run -d --name "$name" --shm-size=1g -p "$port:5432" "$CASSERT_IMAGE" sh -c '
         mkdir -p /data/log
-        postgres -D /data -c listen_addresses="*" -c max_connections='"$MAX_CONNECTIONS"' \
-          -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 2>&1 |
-          awk "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{skip=(\$0 ~ /AWAEPQ/)} !skip{print; fflush()}" >>/data/log/pg.log' >/dev/null ;;
+        rm -f /data/log/pg.log /data/log/pg-filtered.log
+        mkfifo /data/log/pg.log
+        awk -W interactive "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{skip=(\$0 ~ /AWAEPQ/)} !skip{print; fflush()}" \
+          </data/log/pg.log >>/data/log/pg-filtered.log &
+        exec postgres -D /data -c listen_addresses="*" -c max_connections='"$MAX_CONNECTIONS"' \
+          -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 \
+          -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0' >/dev/null ;;
     *)
       echo "unknown engine: $engine (expected pg17, pg18 or pg18-cassert)" >&2
       return 1 ;;
@@ -133,7 +137,7 @@ for index in "${!ENGINES[@]}"; do
   wait_ready "$name" || exit 2
 
   log_env=(AWA_SOAK_PG_CONTAINER="$name")
-  [ "$engine" = pg18-cassert ] && log_env+=(AWA_SOAK_PG_CONTAINER_LOG=/data/log/pg.log)
+  [ "$engine" = pg18-cassert ] && log_env+=(AWA_SOAK_PG_CONTAINER_LOG=/data/log/pg-filtered.log)
 
   sample_stats "$name" "$out/container-stats.csv" &
   STATS_PID=$!
@@ -153,7 +157,7 @@ for index in "${!ENGINES[@]}"; do
     echo "   FAILED (exit $status); see $out/report.md and $out/reproducer.md"
     # Keep the server log with the reproducer when the run failed.
     docker logs "$name" >"$out/server.log" 2>&1 || true
-    [ "$engine" = pg18-cassert ] && docker exec "$name" cat /data/log/pg.log >"$out/server.log" 2>/dev/null
+    [ "$engine" = pg18-cassert ] && docker exec "$name" cat /data/log/pg-filtered.log >"$out/server.log" 2>/dev/null
   else
     echo "   passed; report in $out/report.md"
   fi

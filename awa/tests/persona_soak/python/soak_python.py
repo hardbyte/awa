@@ -293,7 +293,17 @@ async def migrate_probe_main():
     print("CLOSED", flush=True)
 
 
+async def exit_with_parent():
+    """The harness owns this process; if it dies without cleaning up, so do we."""
+    parent = os.getppid()
+    while True:
+        await asyncio.sleep(3)
+        if os.getppid() != parent:
+            os._exit(1)
+
+
 async def main():
+    asyncio.create_task(exit_with_parent())
     if ROLE == "migrate_probe":
         await migrate_probe_main()
         return
