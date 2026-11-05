@@ -689,7 +689,11 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     // Scale the cadence down for short runs so each action still happens a few times.
     let pace = (load / 900.0).clamp(0.1, 1.0);
     let mut schedule: Vec<(&str, f64, Instant)> = vec![
-        ("reads", 2.0, Instant::now()),
+        (
+            "reads",
+            shared.config.admin_read_every.as_secs_f64(),
+            Instant::now(),
+        ),
         (
             "pause",
             60.0 * pace,

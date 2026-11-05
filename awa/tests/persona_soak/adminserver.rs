@@ -77,7 +77,12 @@ impl AdminServer {
                 "--statement-timeout",
                 &statement_timeout.as_secs().to_string(),
             ])
-            .args(["--pool-max", "10", "--pool-min", "2"])
+            .args([
+                "--pool-max",
+                &config.ui_pool_max.to_string(),
+                "--pool-min",
+                "2",
+            ])
             .stdout(Stdio::from(
                 log.try_clone().map_err(|error| error.to_string())?,
             ))
@@ -88,7 +93,7 @@ impl AdminServer {
             child,
             base_url: format!("http://127.0.0.1:{port}"),
             statement_timeout,
-            pool_max: 10,
+            pool_max: config.ui_pool_max,
         };
         let client = reqwest::Client::new();
         let deadline = Instant::now() + Duration::from_secs(60);

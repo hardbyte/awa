@@ -104,6 +104,9 @@ pub struct SoakConfig {
     /// Server-side statement timeout of the admin server, and the matching client timeout.
     pub ui_statement_timeout: Duration,
     pub ui_client_timeout: Duration,
+    /// Connections of the admin server's pool, and seconds between the operator's admin reads.
+    pub ui_pool_max: u32,
+    pub admin_read_every: Duration,
     /// The load phase stops early when the report directory's filesystem has less free space.
     pub min_free_disk_gb: i64,
     /// Extra tolerance added to the stall and promotion thresholds while chaos is active.
@@ -174,6 +177,10 @@ impl SoakConfig {
             ),
             ui_client_timeout: Duration::from_secs(
                 env_parse("AWA_SOAK_UI_CLIENT_TIMEOUT_SECONDS").unwrap_or(45),
+            ),
+            ui_pool_max: env_parse("AWA_SOAK_UI_POOL_MAX").unwrap_or(10),
+            admin_read_every: Duration::from_secs(
+                env_parse("AWA_SOAK_ADMIN_READ_SECONDS").unwrap_or(2),
             ),
             min_free_disk_gb: env_parse("AWA_SOAK_MIN_FREE_DISK_GB").unwrap_or(8),
             promotion_overdue: Duration::from_secs(
