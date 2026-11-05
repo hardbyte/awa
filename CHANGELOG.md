@@ -100,6 +100,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
   queue stopped. A handler still running two `deadline_rescue_interval`s past
   its deadline is now dropped at its next `.await`. Blocking code that never
   yields still keeps its slot.
+- **`JobResult::RetryAfter` now respects `max_attempts`.** `RetryAfter` is
+  documented as "this attempt failed; try again after delay X", but the
+  completion path never checked exhaustion: a handler that always returned
+  `RetryAfter` looped forever, invisible to the DLQ and appending nothing to
+  `errors`. A retry requested on the final attempt (`attempt >= max_attempts`)
+  now exhausts the job exactly like a retryable error: `failed` state,
+  `dlq_reason = max_attempts_exhausted` when the DLQ is enabled, an `Exhausted`
+  event, and `on_exhausted_enqueue` follow-ups. A job gets exactly
+  `max_attempts` executions regardless of which failure primitive reports
+  them. **If your `RetryAfter` loop meant "not yet" rather than "failed",
+  return `Snooze`**, which reschedules without consuming the attempt budget.
+  `TestClient` (Rust and Python) mirrors the bound.
 - **A panicking Rust handler is a failed attempt.** A panic used to escape the
   job task: the job stayed registered in flight, kept heartbeating until its
   deadline rescued it (5 minutes by default), and its message was lost. The

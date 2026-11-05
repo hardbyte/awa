@@ -367,3 +367,50 @@ async fn canonical_deadline_loop_stops_at_max_attempts() {
     );
     client.shutdown(Duration::from_millis(200)).await;
 }
+
+/// `RetryAfter` reports a failed attempt, so a handler that always asks for
+/// one is bounded by `max_attempts` like any other poison job.
+async fn assert_retry_after_exhausts(engine: Engine, queue: &str) {
+    let db = database(engine, queue).await;
+    let pool = db.pool().clone();
+    let executions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let handler_executions = executions.clone();
+    let client = builder(&pool, engine)
+        .queue(queue, queue_config(1, Duration::from_secs(300)))
+        .register::<HangJob, _, _>(move |_args, _ctx| {
+            let executions = handler_executions.clone();
+            async move {
+                executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(awa::JobResult::RetryAfter(Duration::from_millis(50)))
+            }
+        })
+        .build()
+        .expect("build client");
+    let job = insert(&pool, &HangJob { n: 6 }, queue).await;
+    client.start().await.expect("start client");
+
+    let job = failed(&pool, job.id).await;
+    // Give a would-be third execution time to surface.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(job.attempt, 2);
+    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let messages = error_messages(&job);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("max_attempts exhausted")),
+        "{messages:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_retry_after_exhausts_at_max_attempts() {
+    assert_retry_after_exhausts(Engine::Canonical, "poison_retry_after_canonical").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_storage_retry_after_exhausts_at_max_attempts() {
+    assert_retry_after_exhausts(Engine::QueueStorage, "poison_retry_after_qs").await;
+}

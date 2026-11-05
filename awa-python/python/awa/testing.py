@@ -291,15 +291,19 @@ class AwaTestClient:
             job = await _get_job(self._client, job_id)
             return WorkResult(job=job, outcome="failed", error=str(e))
         except Exception as e:
-            # Retryable error
+            # Retryable error; the final attempt exhausts the job, mirroring
+            # the real executor.
+            new_state = (
+                "failed" if row["attempt"] >= row["max_attempts"] else "retryable"
+            )
             tx3 = await self._client.transaction()
             await tx3.execute(
-                "UPDATE awa.jobs SET state = 'retryable', finalized_at = now() WHERE id = $1",
+                f"UPDATE awa.jobs SET state = '{new_state}', finalized_at = now() WHERE id = $1",
                 job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome="retryable", error=str(e))
+            return WorkResult(job=job, outcome=new_state, error=str(e))
 
         # Handle return value
         tx3 = await self._client.transaction()
@@ -313,13 +317,18 @@ class AwaTestClient:
             job = await _get_job(self._client, job_id)
             return WorkResult(job=job, outcome="completed")
         elif isinstance(result, awa.RetryAfter):
+            # RetryAfter reports a failed attempt; the final attempt exhausts
+            # the job, mirroring the real executor.
+            new_state = (
+                "failed" if row["attempt"] >= row["max_attempts"] else "retryable"
+            )
             await tx3.execute(
-                "UPDATE awa.jobs SET state = 'retryable', finalized_at = now() WHERE id = $1",
+                f"UPDATE awa.jobs SET state = '{new_state}', finalized_at = now() WHERE id = $1",
                 job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome="retryable")
+            return WorkResult(job=job, outcome=new_state)
         elif isinstance(result, awa.Snooze):
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'available', attempt = attempt - 1 WHERE id = $1",
