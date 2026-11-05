@@ -223,8 +223,8 @@ pub struct AwaMetrics {
     /// Maintenance ring prune attempts, attributed to (ring, outcome, reason).
     /// Outcomes: `pruned`, `noop`, `blocked` (the exclusive locks were not
     /// available within the prune lock timeout), `skipped_active`,
-    /// `backed_off` (the tick skipped prune after repeated `skipped_active`
-    /// results) and `error`. reason="none" except for `skipped_active`, which
+    /// `backed_off` (the tick skipped prune while the ring's backoff after
+    /// consecutive `skipped_active` or `blocked` results ran down) and `error`. reason="none" except for `skipped_active`, which
     /// carries the SkipReason discriminator (e.g. "queue.active_leases",
     /// "queue.pending_ready", "claim.open").
     pub maintenance_prune_attempts: Counter<u64>,
@@ -1096,7 +1096,8 @@ impl AwaMetrics {
     }
 
     /// Record a maintenance tick that skipped prune because the ring's
-    /// backoff after repeated `skipped_active` results had not yet elapsed.
+    /// backoff after consecutive `skipped_active` or `blocked` results had not
+    /// yet elapsed.
     pub fn record_prune_backed_off(&self, ring: &'static str) {
         self.record_prune_attempt_without_reason(ring, "backed_off");
     }

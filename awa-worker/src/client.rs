@@ -936,7 +936,8 @@ impl ClientBuilder {
     /// `ACCESS EXCLUSIVE` request from stalling claims and enqueues behind it.
     /// Raise it when `blocked` outcomes persist and the rings stop recycling
     /// because short-lived readers (admin queries, dashboards) repeatedly hold
-    /// the ring partitions at the moment prune tries. A zero timeout makes
+    /// the ring partitions at the moment prune tries. A zero timeout, or one above
+    /// PostgreSQL's `lock_timeout` maximum (`i32::MAX` ms), makes
     /// [`Self::build`] fail. Only takes effect when queue storage is active.
     /// May be set before or after [`Self::queue_storage`]; retained across
     /// storage configuration changes.
@@ -2909,15 +2910,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_prune_lock_timeout_is_rejected_at_build() {
-        let result = Client::builder(lazy_pool())
+    async fn out_of_range_prune_lock_timeout_is_rejected_at_build() {
+        for timeout in [Duration::ZERO, Duration::from_millis(i32::MAX as u64 + 1)] {
+            let result = Client::builder(lazy_pool())
+                .queue("q", QueueConfig::default())
+                .prune_lock_timeout(timeout)
+                .build();
+            assert!(
+                matches!(result, Err(BuildError::InvalidQueueStorage(ref message)) if message.contains("prune lock timeout")),
+                "{timeout:?}: {:?}",
+                result.err()
+            );
+        }
+
+        let at_maximum = Duration::from_millis(i32::MAX as u64);
+        let client = Client::builder(lazy_pool())
             .queue("q", QueueConfig::default())
-            .prune_lock_timeout(Duration::ZERO)
-            .build();
-        assert!(
-            matches!(result, Err(BuildError::InvalidQueueStorage(ref message)) if message.contains("prune lock timeout")),
-            "{:?}",
-            result.err()
+            .prune_lock_timeout(at_maximum)
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage_store()
+                .unwrap()
+                .prune_lock_timeout(),
+            at_maximum
         );
     }
 
