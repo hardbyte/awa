@@ -269,7 +269,7 @@ async def wait_or_stop(stop, seconds):
 
 async def reporter(stop):
     while True:
-        await asyncio.sleep(15)
+        await asyncio.sleep(2)
         print(f"STAT active={active} max_active={max_active} started={started} enqueued={enqueued} errors={errors}", flush=True)
 
 

@@ -120,6 +120,8 @@ pub struct Shared {
     pub findings: Mutex<Vec<Violation>>,
     pub stats: HashMap<Persona, Stats>,
     pub ui: super::personas::ui::UiMetrics,
+    /// Handlers currently running in the Python process, from its own reports.
+    pub python_active: AtomicI64,
     /// The running Python process, so the chaos persona can kill it.
     pub python: Mutex<Option<Arc<super::personas::python::PythonHandle>>>,
     /// Run-wide measurements (resource use, oracle probes).
@@ -149,6 +151,7 @@ impl Shared {
             stats,
             run: Stats::default(),
             ui: Default::default(),
+            python_active: AtomicI64::new(0),
             python: Mutex::new(None),
             fleets: Mutex::new(HashMap::new()),
             chaos_until_ms: AtomicI64::new(0),

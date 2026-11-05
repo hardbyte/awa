@@ -513,8 +513,14 @@ impl Oracle {
                 .iter()
                 .map(|queue| queue.in_flight.load(std::sync::atomic::Ordering::Relaxed))
                 .sum();
+            let python_active = self
+                .shared
+                .python_active
+                .load(std::sync::atomic::Ordering::Relaxed);
             match live {
-                Ok(count) if in_flight == 0 && count_is_idle(count) => quiet_polls += 1,
+                Ok(count) if in_flight == 0 && python_active == 0 && count_is_idle(count) => {
+                    quiet_polls += 1
+                }
                 _ => quiet_polls = 0,
             }
             if quiet_polls >= 3 {

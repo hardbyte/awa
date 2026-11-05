@@ -306,7 +306,7 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 
 ## Persona soak
 
-`awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`) runs several
+`awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`, Python side in `awa/tests/persona_soak/python/`) runs several
 application-shaped workloads concurrently against one database, the way different
 applications share an `awa` schema, and fails the run on any invariant violation.
 
@@ -317,7 +317,12 @@ applications share an `awa` schema, and fails the run on any invariant violation
 | Priya, firehose | one hot queue, 100k-row `insert_many` bursts, COPY batches, steady small batches, tiny jobs, three runtimes | bind-parameter limit, ring rotation and prune, claim contention |
 | Sam, ordered streams | a queue with 4 enqueue shards and 64 ordering keys, a 4-stripe queue (`queue_stripe_count`), scheduled jobs, a rate-limited queue | routing, promotion, fairness |
 | Alex, operator | pause/resume, drain, cancel and bulk cancel, move and reprioritise batch operations, DLQ retry and purge, the admin read queries, rolling restarts of other personas' runtimes | admin paths under live load |
-| Chaos | kills a runtime without a shutdown handshake, terminates the maintenance leader's connection and random runtime connections, exhausts a runtime's pool, holds an idle-in-transaction session | recovery paths |
+| Chaos | kills a runtime or the Python process without a shutdown handshake, terminates the maintenance leader's connection and random runtime connections, exhausts a runtime's pool, holds an idle-in-transaction session | recovery paths |
+| Watchers | six dashboard tabs polling overview, queues, counts, timeseries, runtime and storage at the UI's refresh interval, some also the kinds, queue-runtime and cron pages | admin read queries under load, through the real `awa serve` HTTP server |
+| Support engineer | searches jobs by kind, queue, state and tag, pages through large result sets with `before_id`, opens job detail and follows a job at the detail page's poll rate, pages the DLQ, opens runtime, cron and kind pages | search and paging cost against retained history and backlog |
+| UI operator | the UI's mutations over HTTP: pause and resume queues and cron schedules, cancel and bulk-cancel, DLQ retry and purge (single and by filter), batch operation preview and submit | mutation endpoints racing live work |
+| Impatient user | requests abandoned after a few milliseconds, bursts of refreshes, while sampling the server's database sessions | an abandoned request must not keep a pool connection past the statement timeout |
+| Python users | a separate process using `awa-python`: single inserts, a 6,500-row `insert_many` in one transaction and a COPY batch, enqueues in transactions that sometimes roll back; async workers that complete, raise, `RetryAfter`, `Snooze`, report progress, overrun a queue deadline and ignore their deadline; a queue shared with a Rust runtime; a periodic migrate-then-query probe | Python bindings against live load, mixed Rust and Python runtimes on one lane, the documented slot behaviour of an ignored deadline, connections stranded after `migrate()` |
 
 The oracle checks, while the load runs and again after it stops:
 
@@ -325,7 +330,11 @@ The oracle checks, while the load runs and again after it stops:
 - a cancelled job nobody asked to cancel, an operator cancel that overwrote a completion, and a handler that started after its operator cancel committed
 - a queue with claimable jobs and idle workers whose claim cursor stops advancing (stall), and scheduled jobs overdue beyond a threshold (promotion stall)
 - a lost job: enqueued, never terminal after the system quiesces, and not removed by an operator action; a cron fire that produced more than one job
+- a transaction the Python application rolled back that left a job in the store, and database sessions left stranded by the Python `migrate()` path
+- an admin-server query that outlives its statement timeout, and sessions still running a query after every UI client has stopped
 - a server crash: `pg_postmaster_start_time()` changing, or `terminated by signal`, `TRAP:`, `server process (PID` and similar lines in the Postgres log
+
+Slow or failing admin endpoints, latency that grows with retained history or backlog, and admin queries cancelled by the statement timeout are reported as non-fatal findings in the report, next to the violations.
 
 Terminal rows are pruned by ring rotation within seconds, so the oracle keeps a
 client-side ledger (job ids per persona, executions per job, lifecycle events,
@@ -337,7 +346,10 @@ Environment:
 | Variable | Meaning |
 | --- | --- |
 | `AWA_SOAK_DATABASE_URL` | required; database name must match `awa_soak[A-Za-z0-9_]*` and is dropped and recreated |
-| `AWA_SOAK_PERSONAS` | comma list of `mia,tom,priya,sam,alex,chaos`, default all |
+| `AWA_SOAK_PERSONAS` | comma list of `mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python`, default all |
+| `AWA_SOAK_AWA_BIN` | the `awa` binary for the UI personas (`cargo build --release -p awa-cli`); defaults to the one next to the test binary |
+| `AWA_SOAK_PYTHON` | interpreter of a virtualenv with `awa-python` installed (`uv venv awa-python/.venv`, `uv pip install maturin`, `maturin develop --release` in `awa-python/`); required by the `python` persona |
+| `AWA_SOAK_UI_STATEMENT_TIMEOUT_SECONDS`, `AWA_SOAK_UI_CLIENT_TIMEOUT_SECONDS` | the admin server's statement timeout (default 30) and the UI personas' request timeout (default 45); a request that hits either is reported as a finding |
 | `AWA_SOAK_SECONDS` | load phase length, default 900 |
 | `AWA_SOAK_SEED` | fixes the workload mix and chaos schedule; printed at start |
 | `AWA_SOAK_SCALE` | multiplies rates, burst sizes and queue counts, default 1 |

@@ -162,6 +162,11 @@ fn absorb_output(shared: &Shared, line: &str) {
             .and_then(|value| value.parse::<f64>().ok())
     };
     if line.starts_with("STAT ") {
+        if let Some(active) = field("active") {
+            shared
+                .python_active
+                .store(active as i64, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(max_active) = field("max_active") {
             stats.set_max("python_max_concurrent_handlers", max_active as i64);
         }
@@ -200,6 +205,9 @@ impl PythonHandle {
             let _ = child.kill().await;
         }
         tokio::time::sleep(downtime).await;
+        shared
+            .python_active
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         process.restarts += 1;
         let child = spawn(
             shared,
@@ -491,6 +499,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?;
     let mut tail_tick = 0u64;
+    let mut probes = tokio::task::JoinSet::new();
     let mut importer = Importer {
         path: ledger_path.clone(),
         offset: 0,
@@ -517,10 +526,13 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         }
         if Instant::now() >= next_probe {
             next_probe = Instant::now() + probe_every;
-            migrate_probe(&shared, &python, &ledger_path).await;
+            let (shared, python, ledger_path) =
+                (shared.clone(), python.clone(), ledger_path.clone());
+            probes.spawn(async move { migrate_probe(&shared, &python, &ledger_path).await });
         }
     }
 
+    while probes.join_next().await.is_some() {}
     // Stop producing; the workers keep running while the system drains.
     if let Some(pid) = handle
         .process
@@ -576,7 +588,19 @@ async fn tail_terminal_rows(shared: &Arc<Shared>, pool: &sqlx::PgPool, tick: &mu
     .bind(&queues)
     .fetch_all(pool)
     .await;
-    let Ok(rows) = rows else { return };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            shared.stats(Persona::Python).add("python_tail_errors", 1);
+            if shared.stats(Persona::Python).get("python_tail_errors") <= 3 {
+                shared.note("python", format!("terminal row tail failed: {error}"));
+            }
+            return;
+        }
+    };
+    shared
+        .stats(Persona::Python)
+        .add("python_tail_rows", rows.len() as i64);
     let now = shared.now_ms() as u32;
     for (id, state) in rows {
         shared.ledger.with(
