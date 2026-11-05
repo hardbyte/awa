@@ -20,6 +20,11 @@ struct PanicJob {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct PanicHoldingProgressJob {
+    n: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct HangJob {
     n: i32,
 }
@@ -232,6 +237,68 @@ async fn queue_storage_handler_panic_fails_fast_and_dead_letters() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canonical_handler_panic_fails_fast() {
     assert_panics_fail_fast(Engine::Canonical).await;
+}
+
+/// A handler that panics while holding the guard from the public
+/// `ctx.progress_buffer()` poisons the progress mutex. Settling the attempt and
+/// leaving the in-flight registry must still work.
+async fn assert_panic_holding_progress_lock_settles(engine: Engine) {
+    let queue = "poison_panic_progress_lock";
+    let db = database(engine, queue).await;
+    let pool = db.pool().clone();
+    let client = builder(&pool, engine)
+        .queue(queue, queue_config(1, Duration::from_secs(300)))
+        .register::<PanicHoldingProgressJob, _, _>(|args, ctx| {
+            let buffer = ctx.progress_buffer();
+            async move {
+                let _guard = buffer.lock().expect("progress lock");
+                panic!("poisoned progress {}", args.n);
+            }
+        })
+        .register::<HealthyJob, _, _>(|_args, _ctx| async move { Ok(awa::JobResult::Completed) })
+        .build()
+        .expect("build client");
+    let poison = insert(&pool, &PanicHoldingProgressJob { n: 3 }, queue).await;
+    client.start().await.expect("start client");
+
+    let job = failed(&pool, poison.id).await;
+    assert_eq!(job.attempt, 2);
+    let messages = error_messages(&job);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.contains("handler panicked: poisoned progress 3"))
+            .count(),
+        2,
+        "each attempt should record the panic message: {messages:?}"
+    );
+
+    let healthy = insert(&pool, &HealthyJob { n: 1 }, queue).await;
+    eventually(EXHAUST_WITHIN, "the healthy job to complete", || async {
+        admin::get_job(&pool, healthy.id)
+            .await
+            .ok()
+            .filter(|job| job.state == JobState::Completed)
+    })
+    .await;
+    eventually(
+        EXHAUST_WITHIN,
+        "in-flight count to return to zero",
+        || async { queue_in_flight(&pool, queue).await.filter(|n| *n == 0) },
+    )
+    .await;
+
+    client.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_storage_panic_holding_progress_lock_settles_the_attempt() {
+    assert_panic_holding_progress_lock_settles(Engine::QueueStorage).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_panic_holding_progress_lock_settles_the_attempt() {
+    assert_panic_holding_progress_lock_settles(Engine::Canonical).await;
 }
 
 /// A worker that never heartbeats and never finishes: every attempt is

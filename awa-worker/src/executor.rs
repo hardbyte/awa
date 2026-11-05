@@ -1,7 +1,7 @@
 use crate::completion::CompletionBatcherHandle;
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
-use crate::runtime::{InFlightMap, InFlightState, ProgressState};
+use crate::runtime::{lock_progress, InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
@@ -426,7 +426,7 @@ impl JobExecutor {
 
             // Snapshot progress for state transition
             let progress_snapshot = {
-                let guard = progress_state.lock().expect("progress lock poisoned");
+                let guard = lock_progress(&progress_state);
                 guard.clone_latest()
             };
 
