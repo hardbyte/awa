@@ -327,3 +327,9 @@ Model checking results:
 `queue_storage_runtime_test` (103 tests) covers the lifecycle: partition routing, rotation isolation, partition migration on schema upgrade, the rotate / prune busy-and-safety predicates, admin cancel of running attempts, the open-receipt-claims absence invariant, the full short-job lifecycle, and the rescue paths for heartbeat / deadline / receipt-only attempts.
 
 `receipt_plane_chaos_test` (4 `#[ignore]`-d nightly tests) covers flood / concurrency / lock-order scenarios: rescue throughput under overload, prune-skips-active under concurrent traffic, the bounded `ACCESS EXCLUSIVE` barrier between TRUNCATE and concurrent inserts, and admin-cancel-during-materialize orphan-lease cleanup.
+
+## Dispatcher scheduling (#510)
+
+The shared LISTEN hub, capped empty-poll backoff and runtime semaphore change scheduling, not `Claim` ownership. Durable SQL claim evidence remains authoritative. A saturated semaphore is cancellable and refunds worker permits/rate tokens. A claim already in progress can finish during shutdown; each spawned execution observes the dispatcher cancellation token, including before in-flight registration. Dispatcher exit and worker drain share a timeout, after which pending dispatchers are aborted and unexecuted claims rely on lease rescue.
+
+Executable scheduler regressions cover saturated-gate cancellation (including a simultaneously available permit), late task registration, cancellation during pending execution, bounded dispatcher shutdown and draining both queues after terminating the shared listener. These tests establish these concrete scheduling behaviors; storage TLC does not prove eventual execution under arbitrary database outages, unfair runtime scheduling or handlers that ignore cancellation.
