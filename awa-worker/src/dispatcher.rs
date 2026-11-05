@@ -326,7 +326,14 @@ pub struct Dispatcher {
     /// Runtime-wide bound on concurrent claim round-trips.
     claim_gate: Arc<Semaphore>,
     claimer_owner_id: Uuid,
+    /// How long past the deadline a handler may keep running before the
+    /// executor drops it; see [`Self::abandon_after`].
+    abandon_grace: Duration,
 }
+
+/// Two default deadline-rescue scans.
+const DEFAULT_ABANDON_GRACE: Duration =
+    crate::maintenance::DEFAULT_DEADLINE_RESCUE_INTERVAL.saturating_mul(2);
 
 impl Dispatcher {
     /// Create a dispatcher with a specific concurrency mode (used for weighted mode).
@@ -368,7 +375,26 @@ impl Dispatcher {
             notify_wake,
             claim_gate,
             claimer_owner_id,
+            abandon_grace: DEFAULT_ABANDON_GRACE,
         }
+    }
+
+    /// Grace past the deadline before an unresponsive handler is dropped.
+    /// Set it to cover maintenance's deadline-rescue cadence, so the attempt
+    /// has been rescued (and its retry is waiting) by the time its worker slot
+    /// is reclaimed.
+    pub(crate) fn abandon_grace(mut self, grace: Duration) -> Self {
+        self.abandon_grace = grace;
+        self
+    }
+
+    /// When the executor gives up on a handler that ignores cancellation.
+    /// Without this a handler stuck on an await that never resolves holds
+    /// its permit forever: the rescued retry cannot be claimed, and with
+    /// one worker the queue stops. `None` when the queue has no deadline.
+    fn abandon_after(&self) -> Option<Duration> {
+        let deadline = self.config.deadline_duration;
+        (!deadline.is_zero()).then(|| deadline + self.abandon_grace)
     }
 
     /// Run the poll loop. Returns when cancelled.
@@ -560,6 +586,7 @@ impl Dispatcher {
         // (priority ASC, run_at ASC, id ASC); cross-priority fairness is handled
         // by the maintenance leader's age_waiting_priorities task (ADR-005).
         let deadline_secs = self.config.deadline_duration.as_secs_f64();
+        let abandon_after = self.abandon_after();
         let claim_start = Instant::now();
 
         let jobs: Vec<DispatchedJob> = match &self.storage {
@@ -604,6 +631,7 @@ impl Dispatcher {
                         job,
                         queue_storage_claim: None,
                         queue_storage_unique_states: None,
+                        abandon_after,
                     })
                     .collect(),
                 Err(err) => {
@@ -649,6 +677,7 @@ impl Dispatcher {
                             job: claimed.job,
                             queue_storage_claim: Some(claimed.claim),
                             queue_storage_unique_states: claimed.unique_states,
+                            abandon_after,
                         })
                         .collect(),
                     Err(err) => {
