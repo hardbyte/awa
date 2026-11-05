@@ -10874,9 +10874,9 @@ impl QueueStorage {
         let claim_batch_child = claim_batch_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+        let candidate_ctes = format!(
             r#"
-            WITH cursor_row AS (
+            cursor_row AS (
                 SELECT
                     rescue_cursor_claimed_at,
                     rescue_cursor_job_id,
@@ -11055,7 +11055,39 @@ impl QueueStorage {
                   AND is_stale
                 ORDER BY rn
                 LIMIT $4
-            ),
+            )"#
+        );
+        // Closers take the attempt's advisory lock before their statement
+        // snapshot. Rescue takes the same locks in a statement of its own, so
+        // the statement that decides and writes the closure starts after any
+        // closer that held a lock first has committed, and sees its evidence.
+        // Only attempts locked here may be closed below.
+        let (locked_job_ids, locked_run_leases): (Vec<i64>, Vec<i64>) =
+            sqlx::query_as::<_, (i64, i64)>(&format!(
+                r#"
+                WITH {candidate_ctes}
+                SELECT job_id, run_lease
+                FROM stale_candidates
+                WHERE pg_catalog.pg_try_advisory_xact_lock(
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', job_id, run_lease),
+                        0
+                    )
+                )
+                "#
+            ))
+            .bind(slot)
+            .bind(cutoff)
+            .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(rescue_limit)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .unzip();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH {candidate_ctes},
             stale_row_locked AS (
                 SELECT stale_candidates.*
                 FROM stale_candidates
@@ -11091,11 +11123,9 @@ impl QueueStorage {
                       WHERE dlq.job_id = claims.job_id
                         AND dlq.run_lease = claims.run_lease
                   )
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
-                          0
-                      )
+                  AND (claims.job_id, claims.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($5::bigint[], $6::bigint[]) AS locked(job_id, run_lease)
                   )
                   -- A claim that already materialized into `leases` is
                   -- on the lease-side heartbeat-rescue path (see
@@ -11142,11 +11172,9 @@ impl QueueStorage {
                       WHERE dlq.job_id = stale_candidates.job_id
                         AND dlq.run_lease = stale_candidates.run_lease
                   )
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', stale_candidates.job_id, stale_candidates.run_lease),
-                          0
-                      )
+                  AND (stale_candidates.job_id, stale_candidates.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($5::bigint[], $6::bigint[]) AS locked(job_id, run_lease)
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
@@ -11283,6 +11311,8 @@ impl QueueStorage {
         .bind(cutoff)
         .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
         .bind(rescue_limit)
+        .bind(&locked_job_ids)
+        .bind(&locked_run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -11385,9 +11415,9 @@ impl QueueStorage {
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_child, &closure_batch_child, "claims");
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+        let candidate_ctes = format!(
             r#"
-            WITH cursor_row AS (
+            cursor_row AS (
                 SELECT
                     deadline_cursor_deadline_at,
                     deadline_cursor_job_id,
@@ -11488,7 +11518,34 @@ impl QueueStorage {
                   AND is_expired
                 ORDER BY rn
                 LIMIT $3
-            ),
+            )"#
+        );
+        // Lock before deciding; see `rescue_stale_receipt_claims_for_slot_tx`.
+        let (locked_job_ids, locked_run_leases): (Vec<i64>, Vec<i64>) =
+            sqlx::query_as::<_, (i64, i64)>(&format!(
+                r#"
+                WITH {candidate_ctes}
+                SELECT job_id, run_lease
+                FROM expired_candidates
+                WHERE pg_catalog.pg_try_advisory_xact_lock(
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', job_id, run_lease),
+                        0
+                    )
+                )
+                "#
+            ))
+            .bind(slot)
+            .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(rescue_limit)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .unzip();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH {candidate_ctes},
             expired_locked AS (
                 SELECT expired_candidates.*
                 FROM expired_candidates
@@ -11498,11 +11555,9 @@ impl QueueStorage {
                  AND claims.run_lease = expired_candidates.run_lease
                 WHERE NOT {closed_evidence}
                   AND claims.deadline_at < clock_timestamp()
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
-                          0
-                      )
+                  AND (claims.job_id, claims.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($4::bigint[], $5::bigint[]) AS locked(job_id, run_lease)
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
@@ -11595,6 +11650,8 @@ impl QueueStorage {
         .bind(slot)
         .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
         .bind(rescue_limit)
+        .bind(&locked_job_ids)
+        .bind(&locked_run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
