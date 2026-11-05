@@ -33,11 +33,11 @@
     "handler_per_s": 160.3
   },
   "rust/enqueue_lane_16p_unique_185": {
-    "enqueue_per_s": 2000.0,
-    "p99_ms": 6000.0
+    "enqueue_per_s": 10000.0,
+    "p99_ms": 2500.0
   },
   "rust/enqueue_lane_16p_unique_185_shards4": {
-    "enqueue_per_s": 2000.0
+    "enqueue_per_s": 10000.0
   },
   "rust/mvcc_horizon_overlap": {
     "min_overlap_vs_baseline": 0.75,

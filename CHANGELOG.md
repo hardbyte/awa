@@ -4,6 +4,34 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **`insert_many_skip_unique_conflicts` inserts a batch and skips the jobs
+  whose unique key is already claimed.** `insert_many` fails the whole batch
+  with a unique violation, so a producer that replays work had to insert the
+  batch again one job at a time, taking the lane lock once per job. The new
+  function returns the inserted rows in input order, with skipped jobs absent.
+
+### Changed
+
+- **Batch enqueues hold a lane lock for the lane write only.** `insert_many`
+  and `insert_many_copy` called `awa.insert_job_compat` per row, which takes
+  the `(queue, priority, shard)` lane lock on the batch's first row and holds
+  it, because the lock lasts to commit, while every remaining row is
+  processed: concurrent producers on one lane queued behind whole batches.
+  Migration v053 adds `awa.insert_jobs_compat_batch`, which allocates job ids,
+  claims unique keys (in key order), registers new lanes and builds the rows
+  first, then reserves each lane's sequence range once, in lane order, and
+  writes the ready rows and segments in two statements. A 185-row batch into
+  one lane holds the lock for a fraction of the time it did, which raises the
+  per-lane ceiling several times over and cuts the time producers, promotion
+  and rescue spend waiting for the lane. `insert_many_copy` skips unique
+  conflicts in one pass instead of one savepoint per row. Run `awa migrate`
+  before upgrading producers: a binary that calls the new function against a
+  database without v053 fails with `function awa.insert_jobs_compat_batch ...
+  does not exist`. Binaries before this release keep calling
+  `awa.insert_job_compat` and share the lane lock with the new path.
+
 ### Fixed
 
 - **Batch enqueues take their lane locks in one order, so they no longer
@@ -15,10 +43,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   a `QueueStorage` enqueue could deadlock with it (`40P01`). The two insert
   paths now sort rows by `(queue, priority, shard)`, queues compared bytewise,
   before they reach `awa.insert_job_compat`, the order `QueueStorage` already
-  used, and still return rows in input order. Job ids within a batch that
-  spans several lanes are now allocated lane by lane rather than in input
-  order, and when an `insert_many_copy` batch carries the same unique key in
-  more than one lane, the row in the lowest lane is the one inserted. A
+  used, and still return rows in input order. A
   transaction that enqueues with separate statements still takes locks in
   statement order; see "`deadlock detected` while enqueueing" in the
   troubleshooting guide.

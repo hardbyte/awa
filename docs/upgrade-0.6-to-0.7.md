@@ -253,6 +253,25 @@ workers report not ready until the migration runs, as for any version bump.
 External migration runners apply the complete `awa migrate --sql --from 51
 --to 52` bundle, which defines the helper before the tail calls it.
 
+## v053: batch producer insert
+
+v053 adds `awa.insert_jobs_compat_batch`, the function `insert_many` and
+`insert_many_copy` call. It is one `CREATE OR REPLACE FUNCTION`: no table DDL,
+no scan, no lock beyond the catalog, so it applies instantly under live load.
+`awa.insert_job_compat` is unchanged, and binaries before v053 keep calling it;
+both paths take the same per-lane reservation lock, so producers on either
+version serialise on a lane as before.
+
+The runtime role needs `EXECUTE` on the new function; the
+[default privileges](security/database-roles.md#runtime-grants) cover functions
+the migrator creates.
+
+A 0.7 binary that calls the new function before the migration has run fails
+its `insert_many` and `insert_many_copy` calls with `function
+awa.insert_jobs_compat_batch(...) does not exist`. Migrate before rolling
+producers. External migration runners apply the `awa migrate --sql --from 52
+--to 53` bundle.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

@@ -434,6 +434,26 @@ Fix:
 awa --database-url "$DATABASE_URL" migrate
 ```
 
+### Producers wait on one queue's enqueue lane
+
+Symptoms:
+
+- many connections wait with `wait_event = 'advisory'` while the database is otherwise idle
+- `insert_many` takes seconds although the work per batch is milliseconds, and single-job inserts into the same queue take much longer than usual
+- scheduled-job promotion and rescue of the same queue run slowly while producers saturate it
+
+Cause:
+
+- on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until it commits, so concurrent producers for one lane run one at a time; a lane's ceiling is a batch's rows divided by the time the lock is held
+- from migration v053, `insert_many` and `insert_many_copy` hold the lock across the lane write only, a few milliseconds for a 185-row batch; before it, the lock was held while every row of the batch was processed
+- maintenance promotion moves due scheduled and retryable jobs into the lane under the same lock; a promotion batch is one transaction across every queue it touches, and the leader runs its branches one at a time, so a batch parked behind a hot lane delays the due jobs of other queues in that batch and the leader's other branches. Rescue itself does not take the lane lock; it writes retryable rows that promotion moves later
+
+Fix:
+
+- run `awa migrate` so producers use the batch function
+- when `insert_many` fails on a unique conflict, retry with `insert_many_skip_unique_conflicts` rather than inserting the batch again row by row: each single-row insert queues for the lane separately
+- raise `awa.queue_meta.enqueue_shards` for a queue whose producers still saturate one lane, accepting partitioned rather than strict FIFO ([ADR-025](adr/025-sharded-enqueue-heads.md))
+
 ### `deadlock detected` while enqueueing
 
 Cause:

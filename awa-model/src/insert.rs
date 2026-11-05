@@ -11,13 +11,14 @@ use sqlx::{PgExecutor, PgPool};
 // On queue storage every available-state insert holds a transaction-scoped
 // advisory lock on its `(queue, priority, enqueue_shard)` lane until the
 // enclosing transaction ends, so two transactions that enqueue into the same
-// lanes in opposite orders can deadlock. Every multi-row enqueue therefore
-// takes its lane locks in one canonical order: `(queue, priority, shard)`
-// ascending, queues compared bytewise (`COLLATE "C"`, the order of Rust's
-// `str`). The batch inserts here sort rows by that key, stably, before they
-// reach `awa.insert_job_compat`, and put the rows back in input order for the
-// caller. `QueueStorage` batch enqueues group rows in a `BTreeMap` keyed the
-// same way.
+// lanes in opposite orders can deadlock. The batch inserts here go through
+// `awa.insert_jobs_compat_batch`, which does the lane-independent work first
+// and then reserves its lanes in one canonical order: `(queue, priority,
+// shard)` ascending, queues compared bytewise (`COLLATE "C"`, the order of
+// Rust's `str`). `QueueStorage` batch enqueues group rows in a `BTreeMap`
+// keyed the same way. Holding the lanes only across the reservation and the
+// ready-row writes keeps a lane's lock window independent of the batch's
+// unique-claim and payload work.
 //
 // The shard is derived as `insert_job_compat` derives it: rows with an
 // ordering key use `ordering_key_hash64 % enqueue_shards`, other rows
@@ -211,65 +212,27 @@ impl PreparedJobInsert {
 /// job, because sqlx has no array encoding for the enum, the bit string, or a
 /// ragged array of arrays. `ordering_hash` carries each row's
 /// [`ordering_key_hash64`] as decimal text (the value exceeds `bigint`) so the
-/// statement can place keyed rows on the shard `insert_job_compat` will pick.
+/// function can place keyed rows on the shard `insert_job_compat` would pick.
 ///
-/// Rows are inserted in canonical lane order (see "Lane lock order" above) and
-/// returned in input order.
-const INSERT_MANY_SQL: &str = r#"
-    WITH input AS MATERIALIZED (
-        SELECT
-            raw.*,
-            MOD(
-                CASE WHEN raw.ordering_hash IS NULL
-                     THEN pg_backend_pid()::numeric
-                     ELSE raw.ordering_hash::numeric
-                END,
-                COALESCE(
-                    (SELECT meta.enqueue_shards FROM awa.queue_meta AS meta WHERE meta.queue = raw.queue),
-                    1
-                )::numeric
-            ) AS lane_shard
-        FROM unnest(
-            $1::text[],
-            $2::text[],
-            $3::jsonb[],
-            $4::text[],
-            $5::smallint[],
-            $6::smallint[],
-            $7::timestamptz[],
-            $8::jsonb[],
-            $9::jsonb[],
-            $10::bytea[],
-            $11::text[],
-            $12::bytea[],
-            $13::text[]
-        ) WITH ORDINALITY AS raw(
-            kind, queue, args, state, priority, max_attempts, run_at,
-            metadata, tags, unique_key, unique_states, ordering_key, ordering_hash, ord
-        )
-        ORDER BY raw.queue COLLATE "C", raw.priority, lane_shard, raw.ord
+/// `$13` skips rows whose unique key is already claimed instead of failing the
+/// batch. Rows come back in input order; skipped rows are absent.
+const INSERT_MANY_BATCH_SQL: &str = r#"
+    SELECT *
+    FROM awa.insert_jobs_compat_batch(
+        $1::text[],
+        $2::text[],
+        $3::jsonb[],
+        $4::text[],
+        $5::smallint[],
+        $6::smallint[],
+        $7::timestamptz[],
+        $8::jsonb[],
+        $9::jsonb[],
+        $10::bytea[],
+        $11::text[],
+        $12::text[],
+        $13
     )
-    SELECT inserted.*
-    FROM input
-    CROSS JOIN LATERAL awa.insert_job_compat(
-        input.kind,
-        input.queue,
-        input.args,
-        input.state::awa.job_state,
-        input.priority,
-        input.max_attempts,
-        input.run_at,
-        input.metadata,
-        ARRAY(
-            SELECT tag.value
-            FROM jsonb_array_elements_text(input.tags) WITH ORDINALITY AS tag(value, ord)
-            ORDER BY tag.ord
-        ),
-        input.unique_key,
-        input.unique_states::bit(8),
-        input.ordering_key
-    ) AS inserted
-    ORDER BY input.ord
 "#;
 
 /// Compute unique_key and unique_states from opts.
@@ -476,7 +439,9 @@ fn ordering_hash_text(row: &PreparedRow) -> Option<String> {
 /// Insert multiple jobs in a single statement.
 ///
 /// Supports uniqueness constraints — jobs with `unique` opts will have their
-/// `unique_key` and `unique_states` computed and included.
+/// `unique_key` and `unique_states` computed and included. A job whose unique
+/// key is already claimed fails the whole batch with a unique violation; use
+/// [`insert_many_skip_unique_conflicts`] to insert the rest instead.
 #[tracing::instrument(
     skip(executor, jobs),
     fields(
@@ -492,12 +457,49 @@ pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Ve
 where
     E: PgExecutor<'e>,
 {
+    insert_many_batch(executor, jobs, false).await
+}
+
+/// Insert multiple jobs in a single statement, skipping those whose unique key
+/// is already claimed.
+///
+/// Returns the rows that were inserted, in input order; a skipped job has no
+/// entry in the result. Jobs without `unique` opts are always inserted.
+#[tracing::instrument(
+    skip(executor, jobs),
+    fields(
+        job.count = jobs.len(),
+        otel.name = "send",
+        otel.kind = "producer",
+        messaging.system = "awa",
+        messaging.operation.r#type = "send",
+        messaging.batch.message_count = jobs.len(),
+    )
+)]
+pub async fn insert_many_skip_unique_conflicts<'e, E>(
+    executor: E,
+    jobs: &[InsertParams],
+) -> Result<Vec<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    insert_many_batch(executor, jobs, true).await
+}
+
+async fn insert_many_batch<'e, E>(
+    executor: E,
+    jobs: &[InsertParams],
+    skip_unique_conflicts: bool,
+) -> Result<Vec<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
 
     let rows = precompute_rows(jobs)?;
-    let results = sqlx::query_as::<_, JobRow>(INSERT_MANY_SQL)
+    let results = sqlx::query_as::<_, JobRow>(INSERT_MANY_BATCH_SQL)
         .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
         .bind(
             rows.iter()
@@ -529,46 +531,12 @@ where
                 .map(|row| row.unique_states.as_deref())
                 .collect::<Vec<_>>(),
         )
-        .bind(
-            rows.iter()
-                .map(|row| row.ordering_key.as_deref())
-                .collect::<Vec<_>>(),
-        )
         .bind(rows.iter().map(ordering_hash_text).collect::<Vec<_>>())
+        .bind(skip_unique_conflicts)
         .fetch_all(executor)
         .await?;
 
     Ok(results)
-}
-
-/// CTEs that number the staged rows in staging order and re-sort them into
-/// canonical lane order (see "Lane lock order" above); `staged_in_lane_order`
-/// carries the staging-order position as `ord`.
-macro_rules! staged_in_lane_order_ctes {
-    () => {
-        r#"
-        staged AS (
-            SELECT *, row_number() OVER () AS ord
-            FROM pg_temp.awa_copy_staging
-        ),
-        staged_in_lane_order AS MATERIALIZED (
-            SELECT
-                staged.*,
-                MOD(
-                    CASE WHEN staged.ordering_hash IS NULL
-                         THEN pg_backend_pid()::numeric
-                         ELSE staged.ordering_hash::numeric
-                    END,
-                    COALESCE(
-                        (SELECT meta.enqueue_shards FROM awa.queue_meta AS meta WHERE meta.queue = staged.queue),
-                        1
-                    )::numeric
-                ) AS lane_shard
-            FROM staged
-            ORDER BY staged.queue COLLATE "C", staged.priority, lane_shard, staged.ord
-        )
-        "#
-    };
 }
 
 /// Insert many jobs through the compatibility COPY surface.
@@ -646,150 +614,53 @@ pub async fn insert_many_copy(
         copy_in.finish().await?;
     }
 
-    // 3. INSERT...SELECT from staging into real table
+    // 3. Insert the staged rows through the batch function, which skips rows
+    // whose unique key is already claimed when the batch has any.
     let has_unique = rows.iter().any(|r| r.unique_key.is_some());
-
-    let results = if has_unique {
-        // The compatibility `awa.jobs` surface is now a view backed by hot and
-        // deferred tables, so the old `ON CONFLICT` path is no longer available
-        // here. Keep COPY for staging/parsing, then insert unique rows one at a
-        // time and skip duplicates explicitly.
-        let staged_rows = sqlx::query_as::<
-            _,
-            (
-                i64,
-                String,
-                String,
-                serde_json::Value,
-                String,
-                i16,
-                i16,
-                Option<chrono::DateTime<chrono::Utc>>,
-                serde_json::Value,
-                Vec<String>,
-                Option<Vec<u8>>,
-                Option<String>,
-                Option<Vec<u8>>,
-            ),
-        >(concat!(
-            "WITH",
-            staged_in_lane_order_ctes!(),
-            r#"
+    let results = sqlx::query_as::<_, JobRow>(
+        r#"
+        WITH staged AS (
+            SELECT *, row_number() OVER () AS ord
+            FROM pg_temp.awa_copy_staging
+        ),
+        columns AS (
             SELECT
-                ord,
-                kind,
-                queue,
-                args,
-                state::text,
-                priority,
-                max_attempts,
-                run_at,
-                metadata,
-                tags,
-                unique_key,
-                unique_states::text,
-                ordering_key
-            FROM staged_in_lane_order
-            ORDER BY queue COLLATE "C", priority, lane_shard, ord
-            "#
-        ))
-        .fetch_all(&mut *conn)
-        .await?;
-
-        let mut inserted = Vec::with_capacity(staged_rows.len());
-        for (
-            staged_position,
-            kind,
-            queue,
-            args,
-            state,
-            priority,
-            max_attempts,
-            run_at,
-            metadata,
-            tags,
-            unique_key,
-            unique_states,
-            ordering_key,
-        ) in staged_rows
-        {
-            sqlx::query("SAVEPOINT awa_copy_unique_row")
-                .execute(&mut *conn)
-                .await?;
-
-            let result = sqlx::query_as::<_, JobRow>(POSTGRES_INSERT_JOB_SQL)
-                .bind(&kind)
-                .bind(&queue)
-                .bind(&args)
-                .bind(&state)
-                .bind(priority)
-                .bind(max_attempts)
-                .bind(run_at)
-                .bind(&metadata)
-                .bind(&tags)
-                .bind(&unique_key)
-                .bind(&unique_states)
-                .bind(&ordering_key)
-                .fetch_one(&mut *conn)
-                .await;
-
-            match result {
-                Ok(row) => {
-                    inserted.push((staged_position, row));
-                    sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
-                        .execute(&mut *conn)
-                        .await?;
-                }
-                Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT awa_copy_unique_row")
-                        .execute(&mut *conn)
-                        .await?;
-                    sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
-                        .execute(&mut *conn)
-                        .await?;
-                    continue;
-                }
-                Err(err) => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT awa_copy_unique_row")
-                        .execute(&mut *conn)
-                        .await?;
-                    sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
-                        .execute(&mut *conn)
-                        .await?;
-                    return Err(AwaError::Database(err));
-                }
-            }
-        }
-
-        inserted.sort_unstable_by_key(|(staged_position, _)| *staged_position);
-        inserted.into_iter().map(|(_, row)| row).collect()
-    } else {
-        sqlx::query_as::<_, JobRow>(concat!(
-            "WITH",
-            staged_in_lane_order_ctes!(),
-            r#"
-            SELECT inserted.*
-            FROM staged_in_lane_order AS staged
-            CROSS JOIN LATERAL awa.insert_job_compat(
-                staged.kind,
-                staged.queue,
-                staged.args,
-                staged.state,
-                staged.priority,
-                staged.max_attempts,
-                staged.run_at,
-                staged.metadata,
-                staged.tags,
-                staged.unique_key,
-                staged.unique_states,
-                staged.ordering_key
-            ) AS inserted
-            ORDER BY staged.ord
-            "#
-        ))
-        .fetch_all(&mut *conn)
-        .await?
-    };
+                array_agg(kind ORDER BY ord) AS kinds,
+                array_agg(queue ORDER BY ord) AS queues,
+                array_agg(args ORDER BY ord) AS args,
+                array_agg(state::text ORDER BY ord) AS states,
+                array_agg(priority ORDER BY ord) AS priorities,
+                array_agg(max_attempts ORDER BY ord) AS max_attempts,
+                array_agg(run_at ORDER BY ord) AS run_ats,
+                array_agg(metadata ORDER BY ord) AS metadata,
+                array_agg(to_jsonb(tags) ORDER BY ord) AS tags,
+                array_agg(unique_key ORDER BY ord) AS unique_keys,
+                array_agg(unique_states::text ORDER BY ord) AS unique_states,
+                array_agg(ordering_hash ORDER BY ord) AS ordering_hashes
+            FROM staged
+        )
+        SELECT inserted.*
+        FROM columns
+        CROSS JOIN LATERAL awa.insert_jobs_compat_batch(
+            columns.kinds,
+            columns.queues,
+            columns.args,
+            columns.states,
+            columns.priorities,
+            columns.max_attempts,
+            columns.run_ats,
+            columns.metadata,
+            columns.tags,
+            columns.unique_keys,
+            columns.unique_states,
+            columns.ordering_hashes,
+            $1
+        ) AS inserted
+        "#,
+    )
+    .bind(has_unique)
+    .fetch_all(&mut *conn)
+    .await?;
 
     // Keep the session-local staging table reusable across multiple COPY calls
     // within the same outer transaction.

@@ -22,8 +22,8 @@
 //!   AWA_LANE_BENCH_BATCH          jobs per batch, default 185
 //!   AWA_LANE_BENCH_UNIQUE         0|1, default 1
 //!   AWA_LANE_BENCH_SHARDS         `enqueue_shards` for the queue, default 1
-//!   AWA_LANE_BENCH_MODE           insert_many | insert_many_copy | queue_storage |
-//!                                 legacy_row_function
+//!   AWA_LANE_BENCH_MODE           insert_many | insert_many_copy | insert_many_skip |
+//!                                 queue_storage | legacy_row_function
 //!   AWA_LANE_BENCH_DUP_PCT        % of batches carrying one duplicate key that
 //!                                 fall back to row-at-a-time inserts, default 0
 //!   AWA_LANE_BENCH_SECS           measured seconds per scenario, default 8
@@ -43,7 +43,8 @@ mod ci_timing;
 
 use awa::model::insert_prepared;
 use awa::model::{
-    insert_many, insert_many_copy_from_pool, prepare_raw_job_insert, AwaError, QueueStorage,
+    insert_many, insert_many_copy_from_pool, insert_many_skip_unique_conflicts,
+    prepare_raw_job_insert, AwaError, QueueStorage,
 };
 use awa::{InsertOpts, InsertParams, QueueStorageConfig, UniqueOpts};
 use awa_testing::setup;
@@ -64,6 +65,7 @@ const WARMUP: Duration = Duration::from_millis(1_500);
 enum Mode {
     InsertMany,
     InsertManyCopy,
+    InsertManySkip,
     QueueStorage,
     LegacyRowFunction,
 }
@@ -73,6 +75,7 @@ impl Mode {
         match raw {
             "insert_many" => Mode::InsertMany,
             "insert_many_copy" => Mode::InsertManyCopy,
+            "insert_many_skip" => Mode::InsertManySkip,
             "queue_storage" => Mode::QueueStorage,
             "legacy_row_function" => Mode::LegacyRowFunction,
             other => panic!("unknown AWA_LANE_BENCH_MODE {other}"),
@@ -83,6 +86,7 @@ impl Mode {
         match self {
             Mode::InsertMany => "insert_many",
             Mode::InsertManyCopy => "insert_many_copy",
+            Mode::InsertManySkip => "insert_many_skip",
             Mode::QueueStorage => "queue_storage",
             Mode::LegacyRowFunction => "legacy_row_function",
         }
@@ -379,6 +383,9 @@ async fn producer_loop(
             }
             Mode::InsertMany => insert_many(&pool, &jobs).await.map(|_| ()),
             Mode::InsertManyCopy => insert_many_copy_from_pool(&pool, &jobs).await.map(|_| ()),
+            Mode::InsertManySkip => insert_many_skip_unique_conflicts(&pool, &jobs)
+                .await
+                .map(|_| ()),
             Mode::QueueStorage => store.enqueue_params_batch(&pool, &jobs).await.map(|_| ()),
             Mode::LegacyRowFunction => legacy_row_function_insert(&pool, &jobs).await,
         };
@@ -677,10 +684,12 @@ fn scenario(
 /// Absolute floors sit well below the rates a shared runner sustains, and the
 /// latency ceiling well above, so they only catch a lane that has stopped
 /// making progress; `benchmarks/baseline.json` carries the regression
-/// thresholds on rate and p99. The one-producer scenarios measure what a batch
-/// costs the lane lock, through `insert_many` and through the per-row
-/// function, and are reported for comparison. Every bound goes through
-/// `ci_timing` so a contended runner loosens it.
+/// thresholds on rate and p99. What the gate asserts about lock hold time is
+/// relative, because it must hold on any runner: one producer's 185-row batch
+/// has to take well under the time the same rows take through the per-row
+/// function, measured in the same run, and sixteen producers on one lane have
+/// to out-run what the per-row function could ever sustain for it. Every
+/// bound goes through `ci_timing` so a contended runner loosens it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore]
 async fn test_enqueue_lane_contention_gate() {
@@ -730,10 +739,35 @@ async fn test_enqueue_lane_contention_gate() {
         single_lane.p99_ms,
         p99_ceiling
     );
+
+    // The batch holds the lane lock for a fraction of the per-row function's
+    // time, and the lane's ceiling follows. Both bounds are ratios of numbers
+    // measured moments apart on the same machine.
+    let max_hold_ratio = (GATE_MAX_HOLD_RATIO * ci_timing::chaos_timeout_multiplier()).min(0.9);
+    let hold_ratio = one_producer.p50_ms / row_function.p50_ms;
+    assert!(
+        hold_ratio <= max_hold_ratio,
+        "a 185-row batch took {:.1}ms against {:.1}ms through the per-row function \
+         (ratio {hold_ratio:.2}, limit {max_hold_ratio:.2})",
+        one_producer.p50_ms,
+        row_function.p50_ms
+    );
+    let min_scaling = GATE_MIN_LANE_SCALING / ci_timing::chaos_timeout_multiplier();
+    let lane_scaling = single_lane.jobs_per_s / row_function.jobs_per_s;
+    assert!(
+        lane_scaling >= min_scaling.max(1.0),
+        "16 producers on one lane sustain {:.0}/s, {lane_scaling:.1}x the per-row function's \
+         single-producer {:.0}/s (need {:.1}x)",
+        single_lane.jobs_per_s,
+        row_function.jobs_per_s,
+        min_scaling.max(1.0)
+    );
 }
 
 const GATE_MIN_JOBS_PER_S: i64 = 2_000;
 const GATE_MAX_P99_MS: u64 = 15_000;
+const GATE_MAX_HOLD_RATIO: f64 = 0.4;
+const GATE_MIN_LANE_SCALING: f64 = 2.0;
 
 /// Exploration sweep; see the module docs for the tunables.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
