@@ -4,6 +4,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
+  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
+  take a per-queue predicate and dead-letter exhausted attempts in the rescue
+  transaction. The existing methods keep their behaviour and fail exhausted
+  attempts into `done_entries`.
+
 ### Changed
 
 - **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
@@ -80,7 +88,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   it, on both storage engines. Those rescues now fail the job once its attempts
   are spent, as callback timeouts already did, and on queue storage a
   DLQ-enabled queue dead-letters it with reason `heartbeat_stale` or
-  `deadline_exceeded`. A job with `max_attempts = 1` that loses its worker
+  `deadline_exceeded`. On queue storage the DLQ row is written in the rescue
+  transaction for all three rescue reasons, including `callback_timeout`; an
+  exhausted callback timeout used to be moved in a second transaction, so an
+  error between the two left it `failed` outside the DLQ. A job with `max_attempts = 1` that loses its worker
   therefore fails instead of running again. Rescue runs on the maintenance
   leader, so the new behaviour applies once the leader runs this release.
 - **A panicking Rust handler is a failed attempt.** A panic used to escape the
