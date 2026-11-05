@@ -4,6 +4,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.13-alpha.1] — 2026-11-05
+
 ### Added
 
 - **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
@@ -29,7 +31,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
   that. Promotion is no longer backed off; other branches (rescues, cleanup)
   back off for a wall-clock duration of twice the overrunning body, capped
   at five seconds. The leader's interval timers also delay rather than burst
-  after a stall, so a stall no longer queues back-to-back catch-up ticks.
+  after a stall, so a stall no longer queues back-to-back catch-up ticks. This replaces the fixed 120-tick
+  cooldown, which a branch running slightly over 1.5x its interval re-armed
+  on every overrun: a 250 ms promote interval could go quiet for about 30
+  seconds at a time, and slow rescue sweeps left expired claims waiting the
+  same way.
 - **Queue storage's admin counts no longer report zero running jobs when
   lease-claim receipts are on** (backport of the running count in
   [#581](https://github.com/hardbyte/awa/pull/581)). A receipt-held job is
@@ -58,16 +64,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
   completion can close it. Bulk cancels take every attempt's lock up front, in
   the order completion batches use.
 
-- **A slow maintenance branch no longer starves promotion and rescue for
-  minutes.** The per-branch overrun governor armed a fixed 120-tick cooldown
-  and re-armed it on every later overrun, so a branch whose body consistently
-  ran longer than 1.5x its interval fell to a 1/120 duty cycle, with one
-  warning at the first flip. A promotion pass that took 1.5x its 250 ms
-  interval silenced promotion for about 30 seconds at a time, and a slow
-  deadline or stale-heartbeat rescue sweep left expired claims waiting the
-  same way. The cooldown is now `2 x ceil(body_duration / interval)` ticks,
-  capped at the previous 120, so a merely slow branch settles at roughly a
-  third duty cycle while a pathologically slow one stays bounded.
 - **A duplicate unique follow-up no longer fails the job that triggered it.**
   A follow-up enqueued with unique options whose key already existed returned
   `UniqueConflict` from the follow-up `INSERT`, which aborted the trigger's
