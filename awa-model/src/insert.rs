@@ -180,57 +180,52 @@ impl PreparedJobInsert {
     }
 }
 
-fn build_multi_insert_query(count: usize) -> String {
-    let mut query = String::from(
-        "WITH input (ord, kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key) AS (VALUES ",
-    );
-
-    let params_per_row = 12u32;
-    let mut param_index = 1u32;
-    for i in 0..count {
-        if i > 0 {
-            query.push_str(", ");
-        }
-        query.push_str(&format!(
-            "({}, ${}, ${}::text, ${}::jsonb, ${}::awa.job_state, ${}::smallint, ${}::smallint, ${}::timestamptz, ${}::jsonb, ${}::text[], ${}, ${}::bit(8), ${})",
-            i,
-            param_index,
-            param_index + 1,
-            param_index + 2,
-            param_index + 3,
-            param_index + 4,
-            param_index + 5,
-            param_index + 6,
-            param_index + 7,
-            param_index + 8,
-            param_index + 9,
-            param_index + 10,
-            param_index + 11,
-        ));
-        param_index += params_per_row;
-    }
-    query.push_str(
-        ") \
-         SELECT inserted.* \
-         FROM input \
-         CROSS JOIN LATERAL awa.insert_job_compat(\
-             input.kind, \
-             input.queue, \
-             input.args, \
-             input.state, \
-             input.priority, \
-             input.max_attempts, \
-             input.run_at, \
-             input.metadata, \
-             input.tags, \
-             input.unique_key, \
-             input.unique_states, \
-             input.ordering_key\
-         ) AS inserted \
-         ORDER BY input.ord",
-    );
-    query
-}
+/// Multi-row insert with one array bind per column, so the statement text and
+/// bind count do not depend on the number of jobs (Postgres allows at most
+/// 65,535 bind parameters per statement).
+///
+/// `state` and `unique_states` travel as text and `tags` as one JSON array per
+/// job, because sqlx has no array encoding for the enum, the bit string, or a
+/// ragged array of arrays.
+const INSERT_MANY_SQL: &str = r#"
+    SELECT inserted.*
+    FROM unnest(
+        $1::text[],
+        $2::text[],
+        $3::jsonb[],
+        $4::text[],
+        $5::smallint[],
+        $6::smallint[],
+        $7::timestamptz[],
+        $8::jsonb[],
+        $9::jsonb[],
+        $10::bytea[],
+        $11::text[],
+        $12::bytea[]
+    ) WITH ORDINALITY AS input(
+        kind, queue, args, state, priority, max_attempts, run_at,
+        metadata, tags, unique_key, unique_states, ordering_key, ord
+    )
+    CROSS JOIN LATERAL awa.insert_job_compat(
+        input.kind,
+        input.queue,
+        input.args,
+        input.state::awa.job_state,
+        input.priority,
+        input.max_attempts,
+        input.run_at,
+        input.metadata,
+        ARRAY(
+            SELECT tag.value
+            FROM jsonb_array_elements_text(input.tags) WITH ORDINALITY AS tag(value, ord)
+            ORDER BY tag.ord
+        ),
+        input.unique_key,
+        input.unique_states::bit(8),
+        input.ordering_key
+    ) AS inserted
+    ORDER BY input.ord
+"#;
 
 /// Compute unique_key and unique_states from opts.
 fn compute_unique_fields(
@@ -392,27 +387,45 @@ where
     }
 
     let rows = precompute_rows(jobs)?;
-    let query = build_multi_insert_query(rows.len());
-
-    let mut sql_query = sqlx::query_as::<_, JobRow>(&query);
-
-    for row in &rows {
-        sql_query = sql_query
-            .bind(&row.kind)
-            .bind(&row.queue)
-            .bind(&row.args)
-            .bind(row.state)
-            .bind(row.priority)
-            .bind(row.max_attempts)
-            .bind(row.run_at)
-            .bind(&row.metadata)
-            .bind(&row.tags)
-            .bind(&row.unique_key)
-            .bind(&row.unique_states)
-            .bind(&row.ordering_key);
-    }
-
-    let results = sql_query.fetch_all(executor).await?;
+    let results = sqlx::query_as::<_, JobRow>(INSERT_MANY_SQL)
+        .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+        .bind(
+            rows.iter()
+                .map(|row| row.queue.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(rows.iter().map(|row| &row.args).collect::<Vec<_>>())
+        .bind(
+            rows.iter()
+                .map(|row| row.state_db_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(rows.iter().map(|row| row.priority).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.max_attempts).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| &row.metadata).collect::<Vec<_>>())
+        .bind(
+            rows.iter()
+                .map(|row| serde_json::json!(row.tags))
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            rows.iter()
+                .map(|row| row.unique_key.as_deref())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            rows.iter()
+                .map(|row| row.unique_states.as_deref())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            rows.iter()
+                .map(|row| row.ordering_key.as_deref())
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(executor)
+        .await?;
 
     Ok(results)
 }

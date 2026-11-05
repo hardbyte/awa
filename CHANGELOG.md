@@ -18,6 +18,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
   counted only `leases`, so `awa queue stats` and the web UI showed no running
   jobs. They now also count open receipt claims.
 
+- **`insert_many` no longer fails above 5,461 jobs in one call.** It built one
+  multi-row `VALUES` statement with twelve bind parameters per job, so a call
+  with more than 5,461 jobs exceeded PostgreSQL's 65,535-parameter limit and
+  failed client-side with `too many arguments for query` before reaching the
+  server. It now sends one array per column through a single fixed-text
+  statement over `unnest(...)`, so the bind count no longer depends on the
+  batch size and the call keeps its single-statement, caller-transaction
+  semantics, on both the canonical and queue-storage engines.
+
 ## [0.6.12] — 2026-11-05
 
 Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.
