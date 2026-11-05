@@ -48,6 +48,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
   progress, callback and close paths lock their attempts' row-local claims
   in a statement that prunes nothing before the statements that lock them
   again, and cancel locks row and batch receipts in separate statements.
+- **`insert_many` no longer fails above 5,461 jobs in one call.** It built one
+  multi-row `VALUES` statement with twelve bind parameters per job, so a call
+  with more than 5,461 jobs exceeded PostgreSQL's 65,535-parameter limit and
+  failed client-side with `too many arguments for query` before reaching the
+  server. It now sends one array per column through a single fixed-text
+  statement over `unnest(...)`, so the bind count no longer depends on the
+  batch size and the call keeps its single-statement, caller-transaction
+  semantics, on both the canonical and queue-storage engines.
 - **Python: a query after `AsyncClient.migrate()` no longer stalls until the
   pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
   tokio runtime but with the client's pool, so connections the pool opened
