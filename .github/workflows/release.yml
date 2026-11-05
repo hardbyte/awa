@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, sys, tomllib
+          import os, re, sys, tomllib
 
           expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
           print(f"Git tag:          {os.environ['GITHUB_REF_NAME']}")
@@ -83,7 +83,15 @@ jobs:
                   for entry in data.get("package", [])
                   if entry.get("name") == package
               ]
-              return matches[0] if len(matches) == 1 else None
+              if len(matches) != 1:
+                  return None
+              # uv.lock records PEP 440 versions (0.6.13a1); read them back
+              # in the tag's form (0.6.13-alpha.1).
+              pre = re.fullmatch(r"(\d+\.\d+\.\d+)(a|b|rc)(\d+)", matches[0])
+              if pre is None:
+                  return matches[0]
+              base, kind, number = pre.groups()
+              return f"{base}-{ {'a': 'alpha', 'b': 'beta', 'rc': 'rc'}[kind] }.{number}"
 
           def pyproject_version(path: str) -> str | None:
               with open(path, "rb") as f:
