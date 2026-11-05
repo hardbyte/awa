@@ -11782,6 +11782,322 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_attempt_metric";
+    let schema = "awa_qs_prune_attempt_metric";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    let mut reader_tx = pool.begin().await.expect("begin reader tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.ready_segments_0 IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("reader lock");
+
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .prune_lock_timeout(Duration::from_millis(20))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("build prune metric client");
+    client.start().await.expect("start prune metric client");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4001 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let queue_attempts = |outcome: &str| {
+        meter_provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+        let mut total = 0;
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != "awa.maintenance.prune.attempts" {
+                        continue;
+                    }
+                    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                        continue;
+                    };
+                    total += sum
+                        .data_points()
+                        .filter(|point| {
+                            let has = |key: &str, value: &str| {
+                                point
+                                    .attributes()
+                                    .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                            };
+                            has("awa.ring", "queue") && has("awa.ring.outcome", outcome)
+                        })
+                        .map(|point| point.value())
+                        .sum::<u64>();
+                }
+            }
+        }
+        total
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while queue_attempts("blocked") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "queue prune never reported blocked while a reader held the queue segment"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(queue_attempts("pruned"), 0);
+
+    reader_tx.rollback().await.expect("release reader lock");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while queue_attempts("pruned") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "queue prune never completed after the reader released"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PruneRing {
+    Queue,
+    Lease,
+    Claim,
+}
+
+async fn prune_ring(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    ring: PruneRing,
+) -> Result<PruneOutcome, AwaError> {
+    match ring {
+        PruneRing::Queue => store.prune_oldest(pool, Duration::ZERO).await,
+        PruneRing::Lease => store.prune_oldest_leases(pool).await,
+        PruneRing::Claim => store.prune_oldest_claims(pool).await,
+    }
+}
+
+/// A reader holds `locked_relation` so prune must wait for its exclusive lock.
+/// With a short timeout prune gives up as `Blocked` only after that timeout;
+/// with a long timeout it waits out a reader that releases part-way and then
+/// completes.
+async fn assert_prune_waits_for_configured_lock_timeout(
+    pool: &sqlx::PgPool,
+    config: &QueueStorageConfig,
+    ring: PruneRing,
+    locked_relation: &str,
+) {
+    let short_timeout = Duration::from_millis(300);
+    let short_store = QueueStorage::new(config.clone())
+        .expect("short-timeout store")
+        .with_prune_lock_timeout(short_timeout)
+        .expect("short prune lock timeout");
+    assert_eq!(short_store.prune_lock_timeout(), short_timeout);
+
+    let mut reader_tx = pool.begin().await.expect("begin reader tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {locked_relation} IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("reader lock");
+
+    let started = Instant::now();
+    let blocked = prune_ring(&short_store, pool, ring)
+        .await
+        .expect("prune under reader lock");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(blocked, PruneOutcome::Blocked { .. }),
+        "{ring:?} prune must report Blocked while the reader holds its lock, got {blocked:?}"
+    );
+    assert!(
+        elapsed >= short_timeout,
+        "{ring:?} prune gave up after {elapsed:?}, before the {short_timeout:?} lock timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "{ring:?} prune waited {elapsed:?} for a {short_timeout:?} lock timeout"
+    );
+
+    let long_store = QueueStorage::new(config.clone())
+        .expect("long-timeout store")
+        .with_prune_lock_timeout(Duration::from_secs(60))
+        .expect("long prune lock timeout");
+    let reader_hold = Duration::from_millis(600);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(reader_hold).await;
+        reader_tx.rollback().await.expect("release reader lock");
+    });
+    let started = Instant::now();
+    let outcome = prune_ring(&long_store, pool, ring)
+        .await
+        .expect("prune after reader release");
+    let elapsed = started.elapsed();
+    release.await.expect("release task");
+    assert!(
+        !matches!(outcome, PruneOutcome::Blocked { .. }),
+        "{ring:?} prune with a long lock timeout must outwait the reader, got {outcome:?}"
+    );
+    assert!(
+        elapsed >= short_timeout,
+        "{ring:?} prune returned after {elapsed:?} instead of waiting for the reader"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_prune_lock_timeout_is_configurable() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_lt_queue";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claims = store.claim_batch(&pool, "q", 1).await.unwrap();
+    assert_eq!(store.complete_batch(&pool, &claims).await.unwrap(), 1);
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    };
+    assert_prune_waits_for_configured_lock_timeout(
+        &pool,
+        &config,
+        PruneRing::Queue,
+        &format!("{schema}.ready_segments_0"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_lease_prune_lock_timeout_is_configurable() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_lt_lease";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 2).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "q", 2, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    };
+    assert_prune_waits_for_configured_lock_timeout(
+        &pool,
+        &config,
+        PruneRing::Lease,
+        &format!("{schema}.leases_0"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_claim_prune_lock_timeout_is_configurable() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_lt_claim";
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 4,
+        lease_claim_receipts: true,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.lease_claims (
+            claim_slot, job_id, run_lease, ready_slot, ready_generation,
+            queue, priority, attempt, max_attempts, lane_seq
+        ) VALUES (0, 1001, 1, 0, 0, 'synthetic', 2, 1, 25, 1001)
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed claim");
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome) \
+         VALUES (0, 1001, 1, 'completed')"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed closure");
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    assert_prune_waits_for_configured_lock_timeout(
+        &pool,
+        &config,
+        PruneRing::Claim,
+        &format!("{schema}.lease_claims_0"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_prune_reader_lock";

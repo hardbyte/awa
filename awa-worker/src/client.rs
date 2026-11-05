@@ -164,6 +164,7 @@ pub struct ClientBuilder {
     storage: RuntimeStorage,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
+    prune_lock_timeout: Option<Duration>,
 }
 
 impl ClientBuilder {
@@ -222,6 +223,7 @@ impl ClientBuilder {
             storage,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
+            prune_lock_timeout: None,
         }
     }
 
@@ -924,6 +926,25 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the PostgreSQL `lock_timeout` the maintenance leader applies to
+    /// the exclusive-lock steps of queue, lease and claim ring prune and of
+    /// terminal-delta rollup (default 10 ms).
+    ///
+    /// A prune that cannot take its locks within the timeout rolls back and is
+    /// recorded as `blocked` in `awa.maintenance.prune.attempts`; it retries on
+    /// the next maintenance tick. The short default keeps the pending
+    /// `ACCESS EXCLUSIVE` request from stalling claims and enqueues behind it.
+    /// Raise it when `blocked` outcomes persist and the rings stop recycling
+    /// because short-lived readers (admin queries, dashboards) repeatedly hold
+    /// the ring partitions at the moment prune tries. A zero timeout makes
+    /// [`Self::build`] fail. Only takes effect when queue storage is active.
+    /// May be set before or after [`Self::queue_storage`]; retained across
+    /// storage configuration changes.
+    pub fn prune_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.prune_lock_timeout = Some(timeout);
+        self
+    }
+
     /// Force the worker runtime onto canonical storage.
     ///
     /// This is primarily useful for migration/testing and benchmark
@@ -951,13 +972,21 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    pub fn build(self) -> Result<Client, BuildError> {
+    pub fn build(mut self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
         }
 
         if let Some(err) = self.storage_error.clone() {
             return Err(err);
+        }
+
+        if let (RuntimeStorage::QueueStorage(runtime), Some(timeout)) =
+            (&mut self.storage, self.prune_lock_timeout)
+        {
+            runtime
+                .set_prune_lock_timeout(timeout)
+                .map_err(|err| BuildError::InvalidQueueStorage(err.to_string()))?;
         }
 
         let mut queue_names = HashSet::with_capacity(self.queues.len());
@@ -2842,6 +2871,54 @@ mod tests {
         builder.storage = RuntimeStorage::Canonical;
         builder.storage_error = None;
         builder
+    }
+
+    #[tokio::test]
+    async fn prune_lock_timeout_reaches_the_store_in_either_builder_order() {
+        let timeout = Duration::from_millis(750);
+        for configure_first in [true, false] {
+            let mut builder = Client::builder(lazy_pool()).queue("q", QueueConfig::default());
+            if configure_first {
+                builder = builder.prune_lock_timeout(timeout);
+            }
+            builder = builder.queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            );
+            if !configure_first {
+                builder = builder.prune_lock_timeout(timeout);
+            }
+            let client = builder.build().unwrap();
+            let store = client.storage.queue_storage_store().unwrap();
+            assert_eq!(store.prune_lock_timeout(), timeout);
+        }
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage_store()
+                .unwrap()
+                .prune_lock_timeout(),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_prune_lock_timeout_is_rejected_at_build() {
+        let result = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .prune_lock_timeout(Duration::ZERO)
+            .build();
+        assert!(
+            matches!(result, Err(BuildError::InvalidQueueStorage(ref message)) if message.contains("prune lock timeout")),
+            "{:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

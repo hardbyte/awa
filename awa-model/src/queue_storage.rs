@@ -2503,15 +2503,37 @@ impl QueueStorage {
         })
     }
 
-    #[doc(hidden)]
+    /// Set the PostgreSQL `lock_timeout` applied to the exclusive-lock steps of
+    /// ring prune (queue, lease and claim rings) and terminal-delta rollup.
+    ///
+    /// A prune that cannot take its locks within the timeout rolls back and
+    /// reports [`PruneOutcome::Blocked`]; the maintenance loop retries on its
+    /// next tick. The default is 10 ms, which keeps prune from queueing behind
+    /// readers and so from stalling claims and enqueues behind its pending
+    /// `ACCESS EXCLUSIVE` request. Raise it when prune is persistently
+    /// `Blocked` by short-lived readers of the ring partitions. The timeout is
+    /// applied at millisecond granularity.
+    ///
+    /// Returns a validation error for a zero timeout.
     pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
+        self.set_prune_lock_timeout(timeout)?;
+        Ok(self)
+    }
+
+    /// In-place form of [`Self::with_prune_lock_timeout`].
+    pub fn set_prune_lock_timeout(&mut self, timeout: Duration) -> Result<(), AwaError> {
         if timeout.is_zero() {
             return Err(AwaError::Validation(
                 "queue storage prune lock timeout must be greater than zero".into(),
             ));
         }
         self.prune_lock_timeout = timeout;
-        Ok(self)
+        Ok(())
+    }
+
+    /// The `lock_timeout` applied to prune's exclusive-lock steps.
+    pub fn prune_lock_timeout(&self) -> Duration {
+        self.prune_lock_timeout
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {

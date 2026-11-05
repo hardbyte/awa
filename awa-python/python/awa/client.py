@@ -867,6 +867,7 @@ class AsyncClient:
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 250,
         queue_storage_claim_rotate_interval_ms: int | None = None,
+        queue_storage_prune_lock_timeout_ms: int | None = None,
         storage_transition_role: Literal[
             "auto", "canonical_drain", "queue_storage_target"
         ] = "auto",
@@ -900,6 +901,12 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``queue_storage_prune_lock_timeout_ms`` sets the PostgreSQL
+        ``lock_timeout`` the maintenance leader uses when pruning the queue,
+        lease and claim rings (default 10 ms). A prune that cannot lock its
+        partitions in time is counted as ``blocked`` and retried on the next
+        tick; raise it when ``blocked`` outcomes persist. Must be > 0.
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -929,6 +936,7 @@ class AsyncClient:
             queue_storage_queue_rotate_interval_ms=queue_storage_queue_rotate_interval_ms,
             queue_storage_lease_rotate_interval_ms=queue_storage_lease_rotate_interval_ms,
             queue_storage_claim_rotate_interval_ms=queue_storage_claim_rotate_interval_ms,
+            queue_storage_prune_lock_timeout_ms=queue_storage_prune_lock_timeout_ms,
             storage_transition_role=storage_transition_role,
         )
 
