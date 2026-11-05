@@ -553,11 +553,25 @@ fn queue_storage_signals_cte(schema: &str) -> String {
             WHERE oldest_run_at IS NOT NULL
         ),
         leases AS (
+            -- Receipt-held jobs are running without a `leases` row. A claim
+            -- reaches `waiting_external` only once materialised into
+            -- `leases`, so that count needs no claim leg.
             SELECT
                 queue,
-                count(*) FILTER (WHERE state = 'running')::bigint AS running,
-                count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_external
-            FROM {schema}.leases
+                sum(running)::bigint AS running,
+                sum(waiting_external)::bigint AS waiting_external
+            FROM (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                    count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_external
+                FROM {schema}.leases
+                GROUP BY queue
+                UNION ALL
+                SELECT queue, count(*)::bigint, 0::bigint
+                FROM ({open_running}) AS open_claims
+                GROUP BY queue
+            ) AS live
             GROUP BY queue
         ),
         deferred AS (
@@ -654,6 +668,7 @@ fn queue_storage_signals_cte(schema: &str) -> String {
         )
         "#,
         available = queue_storage_available_by_queue_sql(schema),
+        open_running = crate::queue_storage::open_receipt_running_claims_sql(schema),
     )
 }
 
@@ -673,6 +688,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
         "ready.created_at",
         &format!("ready.created_at >= {since}"),
     );
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     format!(
         r#"
         WITH head_signal AS (
@@ -709,6 +725,18 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             WHERE ready.created_at >= {since}
+            UNION ALL
+            -- A queue or priority move copies the row with its times, so
+            -- any one of a job's ready rows gives its creation time.
+            SELECT created.created_at, 'running'::awa.job_state
+            FROM ({open_running}) AS open_claims
+            CROSS JOIN LATERAL (
+                SELECT ready.created_at
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                LIMIT 1
+            ) AS created
+            WHERE created.created_at >= {since}
             UNION ALL
             -- What `terminal_jobs` holds, bounded the same way, with each
             -- row's creation time probed along the ready key. Read through
@@ -3150,7 +3178,8 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             SELECT
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
                 COALESCE((SELECT sum(available)::bigint FROM ({available}) AS lanes), 0) AS available,
-                COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0)
+                  + COALESCE((SELECT count(*)::bigint FROM ({open_running}) AS open_running), 0) AS running,
                 -- A completion batch carries its size, so completed jobs are
                 -- counted without expanding batches through `terminal_jobs`.
                 -- Tombstones mark batch members deleted or retried since.
@@ -3165,6 +3194,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
             "#,
             available = queue_storage_available_by_queue_sql(store.schema()),
+            open_running = crate::queue_storage::open_receipt_running_claims_sql(store.schema()),
             schema = store.schema(),
         );
 

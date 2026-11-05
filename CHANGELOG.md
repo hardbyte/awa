@@ -4,6 +4,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Queue storage's admin counts no longer report zero running jobs when
+  lease-claim receipts are on** (backport of the running count in
+  [#581](https://github.com/hardbyte/awa/pull/581)). A receipt-held job is
+  running without a `leases` row, and `admin::queue_overviews`,
+  `admin::queue_overview`, `admin::state_counts` and `admin::state_timeseries`
+  counted only `leases`, so `awa queue stats` and the web UI showed no running
+  jobs. They now also count open receipt claims.
+
 ## [0.6.12] — 2026-11-05
 
 Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.
