@@ -32,6 +32,19 @@ pub struct ProgressState {
     pub(crate) in_flight: Option<(u64, serde_json::Value)>,
 }
 
+/// Lock a progress buffer, recovering the guard if a handler panicked while
+/// holding it. `ProgressState` is plain data with no cross-field invariant a
+/// mid-update panic can leave half-applied, and the panic itself is reported
+/// through the handler outcome, so a poisoned buffer must not also take down
+/// the heartbeat or settle path.
+pub(crate) fn lock_progress(
+    progress: &std::sync::Mutex<ProgressState>,
+) -> std::sync::MutexGuard<'_, ProgressState> {
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ProgressState {
     pub fn new(initial: Option<serde_json::Value>) -> Self {
         Self {
@@ -185,7 +198,7 @@ impl InFlightRegistry {
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
             for (&(job_id, run_lease), state) in guard.iter() {
-                let mut progress = state.progress.lock().expect("progress lock poisoned");
+                let mut progress = lock_progress(&state.progress);
                 if progress.has_pending() && progress.in_flight.is_none() {
                     if let Some(ref value) = progress.latest {
                         let gen = progress.generation;
@@ -208,7 +221,7 @@ impl InFlightRegistry {
                 .read()
                 .expect("in_flight shard poisoned");
             if let Some(state) = guard.get(&key) {
-                let mut progress = state.progress.lock().expect("progress lock poisoned");
+                let mut progress = lock_progress(&state.progress);
                 if progress
                     .in_flight
                     .as_ref()
@@ -230,7 +243,7 @@ impl InFlightRegistry {
                 .read()
                 .expect("in_flight shard poisoned");
             if let Some(state) = guard.get(&key) {
-                let mut progress = state.progress.lock().expect("progress lock poisoned");
+                let mut progress = lock_progress(&state.progress);
                 if progress
                     .in_flight
                     .as_ref()

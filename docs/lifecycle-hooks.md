@@ -34,7 +34,7 @@ let client = Client::builder(pool)
 | `WaitingForCallback` | the handler returned `WaitForCallback` and the job parked (`job.state == waiting_external`; `job.callback_id` is set) |
 | `Completed` | the job finished successfully |
 | `Retried` | the attempt failed (or `RetryAfter`) and the job will run again |
-| `Exhausted` | the job exhausted its retries, or failed terminally, and moved to `failed` |
+| `Exhausted` | the handler's result exhausted the job's retries, or failed it terminally, and it moved to `failed` |
 | `Cancelled` | the job was cancelled |
 | `Rescued` | maintenance rescued the job (expired callback, stale heartbeat, or exceeded deadline) — `reason: RescueReason` carries which |
 
@@ -45,7 +45,8 @@ How `JobResult` / outcomes map to events:
 | claim commits | `Started` |
 | `Ok(Completed)` | `Completed` |
 | `Ok(RetryAfter)` / retryable `Err` (retries left) | `Retried` |
-| retries exhausted, or `Err(Terminal)` | `Exhausted` |
+| retries exhausted (final attempt returned `RetryAfter` or a retryable `Err`, or the handler panicked), or `Err(Terminal)` | `Exhausted` |
+| maintenance rescue: stale heartbeat, exceeded deadline or expired callback, whether the job retries or the rescued attempt was its last | `Rescued` |
 | `Ok(Cancel)` | `Cancelled` |
 | `Ok(Snooze)` | none — an internal reschedule, not an outcome |
 | `Ok(WaitForCallback)` | `WaitingForCallback` |

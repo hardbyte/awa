@@ -817,6 +817,37 @@ async fn test_work_one_retryable() {
 }
 
 #[tokio::test]
+async fn test_work_one_retryable_final_attempt_reports_handler_error() {
+    let client = setup().await;
+    let queue = "integ_work_one_retryable_final";
+    clean_queue(client.pool(), queue).await;
+
+    insert_with(
+        client.pool(),
+        &ProcessPayment {
+            order_id: 43,
+            amount_cents: 100,
+        },
+        InsertOpts {
+            queue: queue.into(),
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = client
+        .work_one_in_queue(&FailingWorker, Some(queue))
+        .await
+        .unwrap();
+    match result {
+        WorkResult::Failed(_, message) => assert_eq!(message, "payment gateway unavailable"),
+        other => panic!("Expected failed, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_work_one_no_job() {
     let client = setup().await;
     let queue = "integ_work_one_no_job";

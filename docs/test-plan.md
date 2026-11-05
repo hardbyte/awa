@@ -13,6 +13,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | T1 | No duplicate processing (100k jobs) | ✓ |  |
 | T4 | `kill -9` crash recovery | ✓ |  |
 | T5 | Deadline rescue (hung job) | ✓ |  |
+| T5a | Poison jobs (handler panic, crash loop, deadline loop) stop at `max_attempts` on both engines | ✓ |  |
 | T6 | Transactional atomicity | ✓ |  |
 | T7 | Transactional atomicity (Python) |  | ✓ |
 | T8 | Uniqueness under contention | ✓ | ✓ |
@@ -21,6 +22,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | T12 | Queue isolation | ✓ |  |
 | T18 | Backoff timing | ✓ |  |
 | T19 | Snooze semantics | ✓ |  |
+| T19a | `RetryAfter` bounded by `max_attempts`: exhausts to failed/DLQ (`max_attempts_exhausted`) on the final attempt, exactly `max_attempts` executions, `Retried` semantics preserved below the bound | ✓ |  |
 | T20 | Terminal error semantics | ✓ |  |
 | T21 | Deserialization failure | ✓ |  |
 | B1 | Late completion after rescue is no-op | ✓ |  |

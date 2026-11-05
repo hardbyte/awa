@@ -105,12 +105,12 @@ Core transitions:
 | `scheduled` / `retryable` | `available` | Maintenance promotion when `run_at <= now()`. |
 | `available` | `running` | Dispatcher claim; `run_lease` increments. |
 | `running` | `completed` | Handler succeeds. |
-| `running` | `retryable` | Handler returns a retryable failure, or `RetryAfter`. |
+| `running` | `retryable` | Handler returns a retryable failure or `RetryAfter` with attempts left, or a rescue takes an attempt that has retries left. |
 | `running` | `scheduled` | Handler snoozes; the attempt is not counted. |
 | `running` | `waiting_external` | Handler parks for callback or sequential wait. |
 | `waiting_external` | `running` | `resume_external` resumes a sequential wait. |
 | `running` / `waiting_external` | `cancelled` | Handler cancel, admin cancel, rescue cancellation, or a transition-time re-schedule superseded by a newer unique-claim holder. |
-| `running` / `waiting_external` | `failed` | Attempts exhausted, terminal error, or callback timeout exhaustion. |
+| `running` / `waiting_external` | `failed` | Attempts exhausted (a retryable failure or `RetryAfter` on the final attempt, a handler panic, a stale-heartbeat or deadline rescue, or a callback timeout), or a terminal error. |
 | `failed` | `dlq_entries` | Optional per-queue DLQ routing. |
 
 `run_lease` increments at claim time. Runtime mutations carry `(job_id, run_lease)`, so stale completions, retries, snoozes, cancels, and callback resumes lose after rescue, admin cancellation, or re-claim.
@@ -176,7 +176,7 @@ Handler results finalize through guarded storage transitions:
 ```text
 handler result
     ├── Completed      -> close attempt, append receipt_completion_batches or done_entries
-    ├── RetryAfter     -> close attempt, append deferred_jobs(retryable)
+    ├── RetryAfter     -> close attempt, append deferred retry or terminal failure
     ├── Snooze         -> close attempt, append deferred_jobs without attempt bump
     ├── Cancel         -> close attempt, append done_entries(cancelled)
     ├── Terminal error -> close attempt, append done_entries(failed) or dlq_entries

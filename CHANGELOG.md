@@ -4,6 +4,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
+  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
+  take a per-queue predicate and dead-letter exhausted attempts in the rescue
+  transaction. The existing methods keep their behaviour and fail exhausted
+  attempts into `done_entries`.
+
 ### Changed
 
 - **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
@@ -74,6 +82,56 @@ Notable changes between releases. Detailed migration notes for storage transitio
   args read back one unit in the last place off. serde_json's
   `float_roundtrip` feature is now enabled in the workspace and in the Python
   bindings.
+- **Poison jobs no longer cycle forever.** A job whose worker crashed or hung
+  on every attempt was rescued back to `retryable` indefinitely: stale-heartbeat
+  and deadline rescue never checked `max_attempts`, so `attempt` climbed past
+  it, on both storage engines. Those rescues now fail the job once its attempts
+  are spent, as callback timeouts already did, and on queue storage a
+  DLQ-enabled queue dead-letters it with reason `heartbeat_stale` or
+  `deadline_exceeded`. On queue storage the DLQ row is written in the rescue
+  transaction for all three rescue reasons, including `callback_timeout`; an
+  exhausted callback timeout used to be moved in a second transaction, so an
+  error between the two left it `failed` outside the DLQ. A job with `max_attempts = 1` that loses its worker
+  therefore fails instead of running again. Rescue runs on the maintenance
+  leader, so the new behaviour applies once the leader runs this release.
+- **A hung handler no longer holds its worker slot forever.** Rescue only
+  signalled cancellation, so a handler awaiting something that never resolved
+  kept its permit: the rescued retry could not be claimed, and a one-worker
+  queue stopped. A handler still running two `deadline_rescue_interval`s past
+  its deadline is now dropped at its next `.await`. Blocking code that never
+  yields still keeps its slot. For a Python handler the slot is freed but the
+  coroutine is not cancelled: it keeps running on its event loop until it
+  finishes on its own, so concurrency can exceed `max_workers` while it runs.
+  Python handlers should enforce their own timeouts.
+- **`JobResult::RetryAfter` now respects `max_attempts`.** `RetryAfter` is
+  documented as "this attempt failed; try again after delay X", but the
+  completion path never checked exhaustion: a handler that always returned
+  `RetryAfter` looped forever, invisible to the DLQ and appending nothing to
+  `errors`. A retry requested on the final attempt (`attempt >= max_attempts`)
+  now exhausts the job exactly like a retryable error: `failed` state,
+  `dlq_reason = max_attempts_exhausted` when the DLQ is enabled, an `Exhausted`
+  event, and `on_exhausted_enqueue` follow-ups. A job gets exactly
+  `max_attempts` executions regardless of which failure primitive reports
+  them. **If your `RetryAfter` loop meant "not yet" rather than "failed",
+  return `Snooze`**, which reschedules without consuming the attempt budget.
+  `TestClient` (Rust and Python) mirrors the bound.
+- **A panicking Rust handler is a failed attempt.** A panic used to escape the
+  job task: the job stayed registered in flight, kept heartbeating until its
+  deadline rescued it (5 minutes by default), and its message was lost. The
+  executor now catches the panic and records `handler panicked: <message>` as
+  a retryable failure.
+- **An attempt lost to a stall or to a shutdown whose drain timed out now
+  costs a real attempt.** On the final attempt, the stale-heartbeat or deadline
+  rescue fails the job, or dead-letters it when the queue's DLQ is enabled,
+  instead of running it again, and the late completion from the original
+  worker is ignored as stale. A job with `max_attempts = 1` therefore fails if
+  a deploy's drain times out while it runs.
+- **Rescue-exhausted jobs are reported as rescues.** When a stale-heartbeat,
+  deadline or callback-timeout rescue takes a job's last attempt, the job emits
+  the `Rescued` lifecycle event and runs its `on_rescued_enqueue` follow-ups,
+  not `Exhausted` and `on_exhausted_enqueue`. It counts in `maintenance_rescues`
+  (and in `dlq_moved` when queue storage dead-letters it) rather than
+  `jobs_failed`, as an exhausted callback timeout already did.
 
 ## [0.6.12] — 2026-11-05
 
