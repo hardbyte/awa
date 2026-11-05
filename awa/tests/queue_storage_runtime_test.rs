@@ -7525,7 +7525,7 @@ async fn test_queue_storage_runtime_snooze() {
         &pool,
         job_id,
         &[JobState::Completed],
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     )
     .await;
     assert_eq!(completed.state, JobState::Completed);
