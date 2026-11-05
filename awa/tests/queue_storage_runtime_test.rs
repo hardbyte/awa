@@ -5898,6 +5898,172 @@ async fn test_queue_storage_receipt_rescue_skips_attempt_locked_for_completion()
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 }
 
+/// Holds the claim slot's cursor row so the rescue waits after taking its
+/// snapshot while the attempt completes and commits. Once released, rescue
+/// must see that completion instead of reopening the attempt from its
+/// pre-completion snapshot.
+async fn assert_receipt_rescue_sees_completion_committed_mid_statement(
+    schema: &str,
+    deadline_rescue: bool,
+) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_rescue_snapshot_race";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue one job");
+    let deadline = if deadline_rescue {
+        Duration::from_secs(300)
+    } else {
+        Duration::ZERO
+    };
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, deadline)
+        .await
+        .expect("claim receipt-backed job");
+    assert_eq!(claimed.len(), 1);
+    let job = &claimed[0];
+    assert!(job.claim.lease_claim_receipt);
+    let job_id = job.job.id;
+    let run_lease = job.job.run_lease;
+    let receipt_id = job.claim.receipt_id.expect("receipt identity");
+
+    // Deadline claims are row-local in `lease_claims`; zero-deadline claims
+    // are compact batches.
+    if deadline_rescue {
+        assert!(job.claim.claim_batch_id.is_none());
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claims \
+             SET deadline_at = clock_timestamp() - interval '1 second' \
+             WHERE job_id = $1 AND run_lease = $2"
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .execute(&pool)
+        .await
+        .expect("expire the claim deadline");
+    } else {
+        assert!(job.claim.claim_batch_id.is_some());
+        age_receipt_claim(&pool, &store, job_id, run_lease, Duration::from_secs(600)).await;
+    }
+
+    let mut blocker = pool.begin().await.expect("begin cursor row holder");
+    sqlx::query(&format!(
+        "SELECT slot FROM {schema}.claim_ring_slots WHERE slot = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(job.claim.claim_slot)
+    .execute(blocker.as_mut())
+    .await
+    .expect("lock cursor row");
+
+    let cursor_column = if deadline_rescue {
+        "deadline_cursor_job_id"
+    } else {
+        "rescue_cursor_claimed_at"
+    };
+    let rescue = async {
+        if deadline_rescue {
+            store.rescue_expired_deadlines(&pool).await
+        } else {
+            store
+                .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+                .await
+        }
+    };
+    let complete_while_rescue_waits = async {
+        let wait_started = Instant::now();
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND pid <> pg_backend_pid()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE '%' || $1 || '%'
+                 )",
+            )
+            .bind(cursor_column)
+            .fetch_one(&pool)
+            .await
+            .expect("poll for the waiting rescue");
+            if waiting {
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(10),
+                "rescue never waited on the claim slot cursor row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let completed = store
+            .complete_runtime_batch(&pool, std::slice::from_ref(job))
+            .await
+            .expect("complete while rescue waits");
+        blocker.rollback().await.expect("release cursor row");
+        completed
+    };
+    let (rescued, completed) = tokio::join!(rescue, complete_while_rescue_waits);
+    assert_eq!(completed.len(), 1, "completion commits while rescue waits");
+    let rescued = rescued.expect("rescue after completion");
+    assert!(
+        rescued.iter().all(|rescued_job| rescued_job.id != job_id),
+        "rescue must not reopen an attempt that completed after its snapshot"
+    );
+
+    let closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT (SELECT count(*) FROM {schema}.lease_claim_closures \
+                 WHERE job_id = $1 AND run_lease = $2) \
+              + (SELECT count(*) FROM {schema}.lease_claim_closure_batches \
+                 WHERE receipt_ranges @> $3::bigint)"
+    ))
+    .bind(job_id)
+    .bind(run_lease)
+    .bind(receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count closures");
+    assert_eq!(closures, 1, "one durable closure per receipt");
+    let deferred: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.deferred_jobs WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deferred rows");
+    assert_eq!(deferred, 0, "a completed attempt is not queued for retry");
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_stale_receipt_rescue_sees_completion_committed_mid_statement() {
+    assert_receipt_rescue_sees_completion_committed_mid_statement(
+        "awa_qs_stale_rescue_snapshot",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_deadline_receipt_rescue_sees_completion_committed_mid_statement() {
+    assert_receipt_rescue_sees_completion_committed_mid_statement(
+        "awa_qs_deadline_rescue_snapshot",
+        true,
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
