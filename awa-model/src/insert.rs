@@ -1,9 +1,32 @@
 use crate::error::{map_sqlx_error, AwaError};
 use crate::job::{InsertOpts, InsertParams, JobRow, JobState};
+use crate::queue_storage::ordering_key_hash64;
 use crate::unique::compute_unique_key;
 use crate::JobArgs;
 use sqlx::postgres::PgConnection;
 use sqlx::{PgExecutor, PgPool};
+
+// ── Lane lock order ─────────────────────────────────────────────────────
+//
+// On queue storage every available-state insert holds a transaction-scoped
+// advisory lock on its `(queue, priority, enqueue_shard)` lane until the
+// enclosing transaction ends, so two transactions that enqueue into the same
+// lanes in opposite orders can deadlock. Every multi-row enqueue therefore
+// takes its lane locks in one canonical order: `(queue, priority, shard)`
+// ascending, queues compared bytewise (`COLLATE "C"`, the order of Rust's
+// `str`). The batch inserts here sort rows by that key, stably, before they
+// reach `awa.insert_job_compat`, and put the rows back in input order for the
+// caller. `QueueStorage` batch enqueues group rows in a `BTreeMap` keyed the
+// same way.
+//
+// The shard is derived as `insert_job_compat` derives it: rows with an
+// ordering key use `ordering_key_hash64 % enqueue_shards`, other rows
+// `pg_backend_pid() % enqueue_shards`, with `enqueue_shards` read from
+// `awa.queue_meta` (default 1).
+//
+// A transaction that enqueues with separate statements takes its locks in
+// statement order and is not covered; it must enqueue lanes in canonical order
+// itself, or enqueue them with one batch call.
 
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const INSERT_COMPAT_SQL: &str = r#"
@@ -186,26 +209,48 @@ impl PreparedJobInsert {
 ///
 /// `state` and `unique_states` travel as text and `tags` as one JSON array per
 /// job, because sqlx has no array encoding for the enum, the bit string, or a
-/// ragged array of arrays.
+/// ragged array of arrays. `ordering_hash` carries each row's
+/// [`ordering_key_hash64`] as decimal text (the value exceeds `bigint`) so the
+/// statement can place keyed rows on the shard `insert_job_compat` will pick.
+///
+/// Rows are inserted in canonical lane order (see "Lane lock order" above) and
+/// returned in input order.
 const INSERT_MANY_SQL: &str = r#"
-    SELECT inserted.*
-    FROM unnest(
-        $1::text[],
-        $2::text[],
-        $3::jsonb[],
-        $4::text[],
-        $5::smallint[],
-        $6::smallint[],
-        $7::timestamptz[],
-        $8::jsonb[],
-        $9::jsonb[],
-        $10::bytea[],
-        $11::text[],
-        $12::bytea[]
-    ) WITH ORDINALITY AS input(
-        kind, queue, args, state, priority, max_attempts, run_at,
-        metadata, tags, unique_key, unique_states, ordering_key, ord
+    WITH input AS MATERIALIZED (
+        SELECT
+            raw.*,
+            MOD(
+                CASE WHEN raw.ordering_hash IS NULL
+                     THEN pg_backend_pid()::numeric
+                     ELSE raw.ordering_hash::numeric
+                END,
+                COALESCE(
+                    (SELECT meta.enqueue_shards FROM awa.queue_meta AS meta WHERE meta.queue = raw.queue),
+                    1
+                )::numeric
+            ) AS lane_shard
+        FROM unnest(
+            $1::text[],
+            $2::text[],
+            $3::jsonb[],
+            $4::text[],
+            $5::smallint[],
+            $6::smallint[],
+            $7::timestamptz[],
+            $8::jsonb[],
+            $9::jsonb[],
+            $10::bytea[],
+            $11::text[],
+            $12::bytea[],
+            $13::text[]
+        ) WITH ORDINALITY AS raw(
+            kind, queue, args, state, priority, max_attempts, run_at,
+            metadata, tags, unique_key, unique_states, ordering_key, ordering_hash, ord
+        )
+        ORDER BY raw.queue COLLATE "C", raw.priority, lane_shard, raw.ord
     )
+    SELECT inserted.*
+    FROM input
     CROSS JOIN LATERAL awa.insert_job_compat(
         input.kind,
         input.queue,
@@ -373,6 +418,14 @@ fn precompute_rows(jobs: &[InsertParams]) -> Result<Vec<PreparedRow>, AwaError> 
         .collect()
 }
 
+/// [`ordering_key_hash64`] of a row's ordering key as decimal text, the form
+/// the batch statements cast to `numeric` to derive the row's shard.
+fn ordering_hash_text(row: &PreparedRow) -> Option<String> {
+    row.ordering_key
+        .as_deref()
+        .map(|key| ordering_key_hash64(key).to_string())
+}
+
 /// Insert multiple jobs in a single statement.
 ///
 /// Supports uniqueness constraints — jobs with `unique` opts will have their
@@ -424,10 +477,41 @@ where
                 .map(|row| row.ordering_key.as_deref())
                 .collect::<Vec<_>>(),
         )
+        .bind(rows.iter().map(ordering_hash_text).collect::<Vec<_>>())
         .fetch_all(executor)
         .await?;
 
     Ok(results)
+}
+
+/// CTEs that number the staged rows in staging order and re-sort them into
+/// canonical lane order (see "Lane lock order" above); `staged_in_lane_order`
+/// carries the staging-order position as `ord`.
+macro_rules! staged_in_lane_order_ctes {
+    () => {
+        r#"
+        staged AS (
+            SELECT *, row_number() OVER () AS ord
+            FROM pg_temp.awa_copy_staging
+        ),
+        staged_in_lane_order AS MATERIALIZED (
+            SELECT
+                staged.*,
+                MOD(
+                    CASE WHEN staged.ordering_hash IS NULL
+                         THEN pg_backend_pid()::numeric
+                         ELSE staged.ordering_hash::numeric
+                    END,
+                    COALESCE(
+                        (SELECT meta.enqueue_shards FROM awa.queue_meta AS meta WHERE meta.queue = staged.queue),
+                        1
+                    )::numeric
+                ) AS lane_shard
+            FROM staged
+            ORDER BY staged.queue COLLATE "C", staged.priority, lane_shard, staged.ord
+        )
+        "#
+    };
 }
 
 /// Insert many jobs through the compatibility COPY surface.
@@ -468,7 +552,8 @@ pub async fn insert_many_copy(
             tags        TEXT[] NOT NULL,
             unique_key  BYTEA,
             unique_states BIT(8),
-            ordering_key BYTEA
+            ordering_key BYTEA,
+            ordering_hash TEXT
         ) ON COMMIT DELETE ROWS
         "#,
     )
@@ -483,7 +568,7 @@ pub async fn insert_many_copy(
 
     let mut copy_in = conn
         .copy_in_raw(
-            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
+            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key, ordering_hash) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
         )
         .await?;
     copy_in.send(csv_buf).await?;
@@ -500,6 +585,7 @@ pub async fn insert_many_copy(
         let staged_rows = sqlx::query_as::<
             _,
             (
+                i64,
                 String,
                 String,
                 serde_json::Value,
@@ -513,9 +599,12 @@ pub async fn insert_many_copy(
                 Option<String>,
                 Option<Vec<u8>>,
             ),
-        >(
+        >(concat!(
+            "WITH",
+            staged_in_lane_order_ctes!(),
             r#"
             SELECT
+                ord,
                 kind,
                 queue,
                 args,
@@ -528,14 +617,16 @@ pub async fn insert_many_copy(
                 unique_key,
                 unique_states::text,
                 ordering_key
-            FROM pg_temp.awa_copy_staging
-            "#,
-        )
+            FROM staged_in_lane_order
+            ORDER BY queue COLLATE "C", priority, lane_shard, ord
+            "#
+        ))
         .fetch_all(&mut *conn)
         .await?;
 
         let mut inserted = Vec::with_capacity(staged_rows.len());
         for (
+            staged_position,
             kind,
             queue,
             args,
@@ -572,7 +663,7 @@ pub async fn insert_many_copy(
 
             match result {
                 Ok(row) => {
-                    inserted.push(row);
+                    inserted.push((staged_position, row));
                     sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
                         .execute(&mut *conn)
                         .await?;
@@ -598,17 +689,15 @@ pub async fn insert_many_copy(
             }
         }
 
-        inserted
+        inserted.sort_unstable_by_key(|(staged_position, _)| *staged_position);
+        inserted.into_iter().map(|(_, row)| row).collect()
     } else {
-        let insert_sql = r#"
-            WITH staged AS (
-                SELECT
-                    *,
-                    row_number() OVER () AS ord
-                FROM pg_temp.awa_copy_staging
-            )
+        sqlx::query_as::<_, JobRow>(concat!(
+            "WITH",
+            staged_in_lane_order_ctes!(),
+            r#"
             SELECT inserted.*
-            FROM staged
+            FROM staged_in_lane_order AS staged
             CROSS JOIN LATERAL awa.insert_job_compat(
                 staged.kind,
                 staged.queue,
@@ -624,11 +713,10 @@ pub async fn insert_many_copy(
                 staged.ordering_key
             ) AS inserted
             ORDER BY staged.ord
-        "#;
-
-        sqlx::query_as::<_, JobRow>(insert_sql)
-            .fetch_all(&mut *conn)
-            .await?
+            "#
+        ))
+        .fetch_all(&mut *conn)
+        .await?
     };
 
     // Keep the session-local staging table reusable across multiple COPY calls
@@ -718,6 +806,12 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
             let bytea_hex = format!("\\x{}", hex::encode(key));
             write_csv_field(buf, &bytea_hex);
         }
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+    }
+    buf.push(b',');
+    // ordering_hash (decimal text, or the COPY null sentinel)
+    match ordering_hash_text(row) {
+        Some(hash) => write_csv_field(buf, &hash),
         None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
     }
     buf.push(b'\n');
