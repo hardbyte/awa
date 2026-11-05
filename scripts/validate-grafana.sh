@@ -3,11 +3,11 @@
 # stack — run AFTER a telemetry workload has exported metrics, so drift
 # between dashboards/alerts and what awa actually emits fails loudly:
 #
-#   1. Every awa_* identifier referenced by the OTel dashboard's PromQL and
+#   1. Every awa_* identifier referenced by the OTel dashboards' PromQL and
 #      the Prometheus alert rules must be a name awa exports under the
 #      OpenTelemetry OTLP-to-Prometheus translation, and every awa_* name
 #      Prometheus holds must be one that translation predicts.
-#   2. Both dashboard JSONs must import cleanly through the Grafana API
+#   2. Every dashboard JSON must import cleanly through the Grafana API
 #      (schema validity, not just JSON well-formedness).
 #   3. Every rawSql panel on the Postgres dashboard must EXPLAIN against a
 #      live awa schema (catches schema drift — views/columns the dashboard
@@ -24,6 +24,7 @@ GRAFANA_URL="${GRAFANA_URL:-http://localhost:3000}"
 DATABASE_URL="${DATABASE_URL:-postgres://postgres:test@localhost:15432/awa_test}"
 GRAFANA_AUTH="${GRAFANA_AUTH:-admin:admin}"
 DASHBOARD_OTEL=docs/grafana/awa-dashboard.json
+DASHBOARD_QUEUE=docs/grafana/awa-queue-detail.json
 DASHBOARD_PG=docs/grafana/awa-dashboard-postgres.json
 ALERTS_PROM=docs/grafana/alerts/awa-alerts-prometheus.yaml
 failures=0
@@ -37,7 +38,7 @@ echo "── validating awa_* references against the OTel→Prometheus names and
 expected=$(python3 scripts/otel-prometheus-names.py)
 referenced=$(
   {
-    jq -r '[.. | .expr? // empty] | .[]' "$DASHBOARD_OTEL"
+    jq -r '[.. | .expr? // empty] | .[]' "$DASHBOARD_OTEL" "$DASHBOARD_QUEUE"
     grep -E '^\s*(expr|summary|description):' "$ALERTS_PROM" || true
   } | grep -oE 'awa_[a-z0-9_]+' | sort -u
 )
@@ -77,7 +78,7 @@ fi
 
 # ── 2. Grafana API import ────────────────────────────────────────────
 echo "── importing dashboards through the Grafana API"
-for dashboard in "$DASHBOARD_OTEL" "$DASHBOARD_PG"; do
+for dashboard in "$DASHBOARD_OTEL" "$DASHBOARD_QUEUE" "$DASHBOARD_PG"; do
   payload=$(jq '{dashboard: (. | .id = null), overwrite: true}' "$dashboard")
   status=$(curl -s -o /tmp/grafana-import-response.json -w '%{http_code}' \
     -u "$GRAFANA_AUTH" -H 'Content-Type: application/json' \
