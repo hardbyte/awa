@@ -450,7 +450,7 @@ Cause:
 
 Fix:
 
-- run `awa migrate` so producers use the batch function
+- run `awa migrate`: producers on the per-row path (a schema before v053) hold the lane for the whole batch, and switch to the batch function as soon as it exists
 - when `insert_many` fails on a unique conflict, retry with `insert_many_skip_unique_conflicts` rather than inserting the batch again row by row: each single-row insert queues for the lane separately
 - raise `awa.queue_meta.enqueue_shards` for a queue whose producers still saturate one lane, accepting partitioned rather than strict FIFO ([ADR-025](adr/025-sharded-enqueue-heads.md))
 

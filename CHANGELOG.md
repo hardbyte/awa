@@ -11,6 +11,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   with a unique violation, so a producer that replays work had to insert the
   batch again one job at a time, taking the lane lock once per job. The new
   function returns the inserted rows in input order, with skipped jobs absent.
+  It needs migration v053 and returns a validation error on an older schema;
+  `insert_many_copy` (and Python's `insert_many_copy`) skips unique conflicts on
+  every schema.
 
 ### Changed
 
@@ -26,11 +29,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
   one lane holds the lock for a fraction of the time it did, which raises the
   per-lane ceiling several times over and cuts the time producers, promotion
   and rescue spend waiting for the lane. `insert_many_copy` skips unique
-  conflicts in one pass instead of one savepoint per row. Run `awa migrate`
-  before upgrading producers: a binary that calls the new function against a
-  database without v053 fails with `function awa.insert_jobs_compat_batch ...
-  does not exist`. Binaries before this release keep calling
-  `awa.insert_job_compat` and share the lane lock with the new path.
+  conflicts in one pass instead of one savepoint per row. A binary that runs
+  ahead of the migration keeps working: `insert_many` and `insert_many_copy`
+  look for the function in the catalog and use the per-row path until it
+  exists, then switch to the batch function without a restart (the process
+  keeps the answer; a call that finds a cached function gone fails once with
+  `undefined_function` and the next call probes again). Binaries before this
+  release keep calling `awa.insert_job_compat` and share the lane lock with the
+  new path, so a mixed fleet keeps each batch contiguous and in order.
 
 ### Fixed
 

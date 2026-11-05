@@ -424,3 +424,100 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
     assert_eq!(inserted.len(), 50);
     assert_eq!(ready_lane_seqs(&pool, &queue).await.len(), 51);
 }
+
+/// Producers on the per-row function, as binaries before v053 are, and
+/// producers on the batch function share one lane at the same time. Each batch
+/// still occupies a contiguous run of `lane_seq`, in input order, and the lane
+/// has no duplicate or missing positions.
+#[tokio::test]
+async fn old_and_new_producers_share_a_lane_without_reordering() {
+    const TASKS: usize = 8;
+    const BATCHES: usize = 25;
+    const BATCH: i64 = 40;
+
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = setup::setup(TASKS as u32 + 4).await;
+    setup::activate_queue_storage(&pool).await;
+    let queue = unique_queue("mixed_fleet");
+
+    // Make sure the batch function is the one `insert_many` uses.
+    insert_many(&pool, &[job(&queue, -1, false)])
+        .await
+        .expect("warm up");
+
+    let mut tasks = Vec::new();
+    for task in 0..TASKS {
+        let pool = pool.clone();
+        let queue = queue.clone();
+        tasks.push(tokio::spawn(async move {
+            for batch in 0..BATCHES {
+                let jobs: Vec<InsertParams> = (0..BATCH)
+                    .map(|seq| InsertParams {
+                        kind: "insert_many_batch_job".to_string(),
+                        args: serde_json::json!({ "seq": seq, "batch": format!("{task}-{batch}") }),
+                        opts: InsertOpts {
+                            queue: queue.clone(),
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                if task % 2 == 0 {
+                    insert_through_row_function(&pool, &jobs).await;
+                } else {
+                    insert_many(&pool, &jobs)
+                        .await
+                        .expect("batch function insert");
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("producer task");
+    }
+
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT args->>'batch', (args->>'seq')::bigint, lane_seq FROM awa.ready_entries
+         WHERE queue = $1 AND args ? 'batch' ORDER BY lane_seq",
+    )
+    .bind(&queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read lane");
+    assert_eq!(rows.len(), TASKS * BATCHES * BATCH as usize);
+    for pair in rows.windows(2) {
+        assert!(pair[1].2 > pair[0].2, "lane_seq is unique and ascending");
+    }
+    let mut by_batch: std::collections::HashMap<&str, Vec<(i64, i64)>> =
+        std::collections::HashMap::new();
+    for (batch, seq, lane_seq) in &rows {
+        by_batch.entry(batch).or_default().push((*seq, *lane_seq));
+    }
+    for (batch, members) in by_batch {
+        for (offset, (seq, lane_seq)) in members.iter().enumerate() {
+            assert_eq!(*seq, offset as i64, "batch {batch} keeps input order");
+            assert_eq!(
+                *lane_seq,
+                members[0].1 + offset as i64,
+                "batch {batch} occupies a contiguous run of the lane"
+            );
+        }
+    }
+}
+
+/// What a binary from before v053 sends: one `insert_job_compat` call per row.
+async fn insert_through_row_function(pool: &PgPool, jobs: &[InsertParams]) {
+    sqlx::query(
+        r#"
+        SELECT inserted.*
+        FROM unnest($1::text[], $2::text[], $3::jsonb[]) WITH ORDINALITY AS input(kind, queue, args, ord)
+        CROSS JOIN LATERAL awa.insert_job_compat(input.kind, input.queue, input.args) AS inserted
+        ORDER BY input.ord
+        "#,
+    )
+    .bind(jobs.iter().map(|job| job.kind.as_str()).collect::<Vec<_>>())
+    .bind(jobs.iter().map(|job| job.opts.queue.as_str()).collect::<Vec<_>>())
+    .bind(jobs.iter().map(|job| &job.args).collect::<Vec<_>>())
+    .fetch_all(pool)
+    .await
+    .expect("per-row function insert");
+}

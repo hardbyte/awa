@@ -521,6 +521,8 @@ Direct-copy producers must use the same queue-storage routing config as the work
 
 `insert_many_copy()` is the compatibility insert API. It is still useful when a caller needs the canonical insert surface, but in queue-storage mode it routes through the compatibility function rather than being the primary producer fast path.
 
+The Rust compatibility inserts differ in how they treat a unique-key conflict. `insert_many` fails the whole batch with a unique violation (SQLSTATE `23505`). `insert_many_skip_unique_conflicts` inserts the rest of the batch and returns only the rows it inserted, in input order, so a producer that replays work does not have to insert the batch again one job at a time (each of those inserts takes the lane lock separately, which on a busy lane is slower than the batch itself). `insert_many_copy` also skips conflicting jobs, and is what Python's `insert_many_copy()` calls; Python has no separate skip function because that is already its behaviour. `insert_many_skip_unique_conflicts` needs migration v053; the other two use `awa.insert_jobs_compat_batch` when the schema has it and the per-row function when it does not.
+
 ### Terminal count rollup
 
 Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. `done_entries` terminal inserts append positive rows to `queue_terminal_count_deltas_*`; retry, discard, DLQ move, and compatibility delete of `done_entries` rows append negative rows. Compact receipt completions do not write count deltas: exact count reads add retained `receipt_completion_batches_*` counts and subtract retained `receipt_completion_tombstones_*`.

@@ -22,7 +22,12 @@
 -- N-1 binaries: unchanged. They keep calling awa.insert_job_compat, whose
 -- definition this migration does not touch, and the two paths share the lane
 -- lock, so producers on either version serialise exactly as before.
--- Binaries that call the new function need this migration first.
+-- Binaries that know the function: insert_many and insert_many_copy look for it
+-- in the catalog and use the per-row function until it exists, so they run
+-- unchanged before this migration and pick the function up after it, without a
+-- restart. insert_many_skip_unique_conflicts needs it and reports a schema
+-- without it.
+-- External runners: apply this file; nothing else reads it.
 -- Live load: one CREATE OR REPLACE FUNCTION, no table DDL.
 
 CREATE OR REPLACE FUNCTION awa.insert_jobs_compat_batch(
