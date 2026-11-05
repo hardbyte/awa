@@ -18,7 +18,9 @@
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
 #   SOAK_PG_CPUS              CPU limit for each database container (default: none)
-#   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0-epqlog5)
+#   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0; the
+#                             -epqlog5 build, which logs every partition-pruning setup with its
+#                             query text, is opt-in for diagnosing pruning crashes)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
 #   CARGO_TARGET_DIR          cargo target directory, as for any cargo build
 #
@@ -37,7 +39,7 @@ cd "$(dirname "$0")/.."
 SECONDS_PER_ENGINE="${AWA_SOAK_SECONDS:-900}"
 BASE_PORT="${SOAK_BASE_PORT:-15471}"
 MAX_CONNECTIONS="${SOAK_MAX_CONNECTIONS:-400}"
-CASSERT_IMAGE="${SOAK_CASSERT_IMAGE:-awa-pg18-cassert:18.6-O0-epqlog5}"
+CASSERT_IMAGE="${SOAK_CASSERT_IMAGE:-awa-pg18-cassert:18.6-O0}"
 RESULTS_DIR="${SOAK_RESULTS_DIR:-$PWD/soak-results/$(date +%Y%m%d-%H%M%S)}"
 ENGINES=("$@")
 if [ ${#ENGINES[@]} -eq 0 ]; then
@@ -83,29 +85,35 @@ start_container() {
     pg18)
       docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
     pg18-cassert)
-      # The image ships an initialised, trust-authenticated cluster in /data. Its server
-      # logs an AWAEPQ line, with the full query text, for every partition-pruning
-      # initialisation, which under this workload is tens of gigabytes per hour. The log
-      # collector therefore writes into a FIFO whose reader drops those messages and keeps
-      # the rest (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
-      # Parallel query is off here: at -O0 a handful of admin reads would otherwise take every core.
-      docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" sh -c '
-        mkdir -p /data/log
-        rm -f /data/log/pg.log /data/log/pg-filtered.log
-        mkfifo /data/log/pg.log
-        awk -W interactive "
-          /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{
-            pid=\"\"; if (match(\$0,/\\[[0-9]+\\]/)) pid=substr(\$0,RSTART,RLENGTH)
-            if (\$0 ~ /AWAEPQ/) {skip=1; epq[pid]=1}
-            else if (\$0 ~ /STATEMENT:/ && (pid in epq)) {skip=1; delete epq[pid]}
-            else {skip=0; delete epq[pid]}
-          }
-          !skip{print; fflush()}" \
-          </data/log/pg.log >>/data/log/pg-filtered.log &
-        exec postgres -D /data -c listen_addresses="*" -c max_connections='"$MAX_CONNECTIONS"' \
-          -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 \
-          -c max_parallel_workers_per_gather=0 \
-          -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0' >/dev/null ;;
+      # The image ships an initialised, trust-authenticated cluster in /data. Parallel query is
+      # off: at -O0 a handful of admin reads would otherwise take every core.
+      local pgargs='-c listen_addresses=0.0.0.0 -c max_connections='"$MAX_CONNECTIONS"' -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 -c max_parallel_workers_per_gather=0 -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0'
+      case "$CASSERT_IMAGE" in
+        *epqlog*)
+          # The instrumented build logs an AWAEPQ line, with the full query text, for every
+          # partition-pruning setup: tens of gigabytes per hour under this workload. The log
+          # collector writes into a FIFO whose reader drops those messages and keeps the rest
+          # (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
+          SOAK_PG_LOG_FILE=/data/log/pg-filtered.log
+          docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" sh -c '
+            mkdir -p /data/log
+            rm -f /data/log/pg.log /data/log/pg-filtered.log
+            mkfifo /data/log/pg.log
+            awk -W interactive "
+              /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{
+                pid=\"\"; if (match(\$0,/\\[[0-9]+\\]/)) pid=substr(\$0,RSTART,RLENGTH)
+                if (\$0 ~ /AWAEPQ/) {skip=1; epq[pid]=1}
+                else if (\$0 ~ /STATEMENT:/ && (pid in epq)) {skip=1; delete epq[pid]}
+                else {skip=0; delete epq[pid]}
+              }
+              !skip{print; fflush()}" \
+              </data/log/pg.log >>/data/log/pg-filtered.log &
+            exec postgres -D /data '"$pgargs"'' >/dev/null ;;
+        *)
+          SOAK_PG_LOG_FILE=/data/log/pg.log
+          docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -p "$port:5432" "$CASSERT_IMAGE" \
+            sh -c 'mkdir -p /data/log && exec postgres -D /data '"$pgargs" >/dev/null ;;
+      esac ;;
     *)
       echo "unknown engine: $engine (expected pg17, pg18 or pg18-cassert)" >&2
       return 1 ;;
@@ -149,7 +157,7 @@ for index in "${!ENGINES[@]}"; do
   wait_ready "$name" || exit 2
 
   log_env=(AWA_SOAK_PG_CONTAINER="$name")
-  [ "$engine" = pg18-cassert ] && log_env+=(AWA_SOAK_PG_CONTAINER_LOG=/data/log/pg-filtered.log)
+  [ "$engine" = pg18-cassert ] && log_env+=(AWA_SOAK_PG_CONTAINER_LOG="$SOAK_PG_LOG_FILE")
 
   sample_stats "$name" "$out/container-stats.csv" &
   STATS_PID=$!
@@ -169,7 +177,7 @@ for index in "${!ENGINES[@]}"; do
     echo "   FAILED (exit $status); see $out/report.md and $out/reproducer.md"
     # Keep the server log with the reproducer when the run failed.
     docker logs "$name" >"$out/server.log" 2>&1 || true
-    [ "$engine" = pg18-cassert ] && docker exec "$name" cat /data/log/pg-filtered.log >"$out/server.log" 2>/dev/null
+    [ "$engine" = pg18-cassert ] && docker exec "$name" cat "$SOAK_PG_LOG_FILE" >"$out/server.log" 2>/dev/null
   else
     echo "   passed; report in $out/report.md"
   fi
