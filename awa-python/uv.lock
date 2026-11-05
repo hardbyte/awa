@@ -88,12 +88,12 @@ wheels = [
 
 [[package]]
 name = "awa-cli"
-version = "0.6.13a1"
+version = "0.6.13"
 source = { directory = "../awa-cli" }
 
 [[package]]
 name = "awa-pg"
-version = "0.6.13a1"
+version = "0.6.13"
 source = { editable = "." }
 
 [package.optional-dependencies]
