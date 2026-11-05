@@ -5703,6 +5703,11 @@ impl QueueStorage {
     /// Mixing keyed and rotor rows in one call is supported — the
     /// keyed rows fan out by key while the rotor rows collapse into
     /// a single shard-sub-batch.
+    ///
+    /// The map's key order, `(queue, priority, shard)` ascending, is the
+    /// order callers reserve lanes in. It is the canonical lane-lock order
+    /// that `insert_many` and `insert_many_copy` also follow, so batches
+    /// from either path cannot deadlock on each other's lane locks.
     async fn group_ready_rows_by_shard<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,

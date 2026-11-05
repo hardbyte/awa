@@ -6,6 +6,22 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Batch enqueues take their lane locks in one order, so they no longer
+  deadlock with each other.** On queue storage every enqueue holds a
+  transaction-scoped advisory lock on its `(queue, priority, shard)` lane
+  until commit. `insert_many` and `insert_many_copy` took those locks in input
+  order, while `QueueStorage` batch enqueues took them in sorted order, so a
+  batch spanning several queues listed differently from another batch or from
+  a `QueueStorage` enqueue could deadlock with it (`40P01`). The two insert
+  paths now sort rows by `(queue, priority, shard)`, queues compared bytewise,
+  before they reach `awa.insert_job_compat`, the order `QueueStorage` already
+  used, and still return rows in input order. Job ids within a batch that
+  spans several lanes are now allocated lane by lane rather than in input
+  order, and when an `insert_many_copy` batch carries the same unique key in
+  more than one lane, the row in the lowest lane is the one inserted. A
+  transaction that enqueues with separate statements still takes locks in
+  statement order; see "`deadlock detected` while enqueueing" in the
+  troubleshooting guide.
 - **Scheduled, snoozed and retry-after jobs are no longer held back while
   the maintenance leader is overloaded.** The leader backs a maintenance
   branch off for a cooldown after its body repeatedly runs longer than its
