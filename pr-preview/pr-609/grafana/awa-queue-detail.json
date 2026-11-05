@@ -318,7 +318,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\", awa_job_kind=~\"$kind\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\"}[5m])))",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -747,7 +747,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\", awa_job_kind=~\"$kind\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "datasource": {
             "type": "prometheus",
@@ -756,7 +756,7 @@
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\", awa_job_kind=~\"$kind\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "datasource": {
             "type": "prometheus",
@@ -765,7 +765,7 @@
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\", awa_job_kind=~\"$kind\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=\"$queue\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "datasource": {
             "type": "prometheus",
@@ -2257,10 +2257,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(awa_job_completed_total{awa_job_queue=\"$queue\"}, awa_job_kind)",
+          "query": "label_values({__name__=~\"awa_job_completed_total|awa_job_failed_total|awa_job_retried_total\", awa_job_queue=\"$queue\"}, awa_job_kind)",
           "refId": "kind"
         },
-        "definition": "label_values(awa_job_completed_total{awa_job_queue=\"$queue\"}, awa_job_kind)",
+        "definition": "label_values({__name__=~\"awa_job_completed_total|awa_job_failed_total|awa_job_retried_total\", awa_job_queue=\"$queue\"}, awa_job_kind)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,

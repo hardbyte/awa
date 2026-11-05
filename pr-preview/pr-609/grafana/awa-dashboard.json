@@ -356,7 +356,7 @@
       },
       "targets": [
         {
-          "expr": "sum(max by (awa_job_queue) (awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=~\"scheduled|retryable\"}))",
+          "expr": "sum(max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=~\"scheduled|retryable\"}))",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -472,7 +472,7 @@
       },
       "targets": [
         {
-          "expr": "max(awa_storage_live_runtime_capability)",
+          "expr": "sum(max by (awa_storage_capability) (awa_storage_live_runtime_capability))",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
