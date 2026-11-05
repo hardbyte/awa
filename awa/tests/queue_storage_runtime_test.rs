@@ -7746,6 +7746,81 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+/// With lease-claim receipts on, a running job is an open receipt claim and
+/// `leases` stays empty, so every running count must read the claims too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_admin_counts_include_receipt_held_running_jobs() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_admin_receipt_running";
+    let schema = "awa_qs_admin_receipt_running";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: true,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let gate = BlockingCompleteWorkerGate::new();
+    let client = queue_storage_client(&pool, queue, store_config, gate.worker());
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 93 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    client
+        .start()
+        .await
+        .expect("Failed to start receipt-mode admin client");
+    wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(10),
+    )
+    .await;
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+
+    let leases_rows: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*)::bigint FROM {schema}.leases"))
+            .fetch_one(&pool)
+            .await
+            .expect("count leases");
+    assert_eq!(
+        leases_rows, 0,
+        "the job must be held by a receipt claim, not a materialised lease"
+    );
+
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include the queue");
+    assert_eq!(overview.running, 1, "queue_overview running");
+    assert_eq!(overview.total_queued, 1);
+
+    let counts = admin::state_counts(&pool).await.expect("read state counts");
+    assert_eq!(counts.get(&JobState::Running).copied(), Some(1));
+
+    let running_in_timeseries: i64 = admin::state_timeseries(&pool, 60)
+        .await
+        .expect("read state timeseries")
+        .into_iter()
+        .filter(|bucket| bucket.state == JobState::Running)
+        .map(|bucket| bucket.count)
+        .sum();
+    assert_eq!(running_in_timeseries, 1, "state_timeseries running");
+
+    gate.release();
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     let (_db_guard, pool) = setup_pool(10).await;
