@@ -38,6 +38,43 @@ Notable changes between releases. Detailed migration notes for storage transitio
   completion can close it. Bulk cancels take every attempt's lock up front, in
   the order completion batches use.
 
+- **A slow maintenance branch no longer starves promotion and rescue for
+  minutes.** The per-branch overrun governor armed a fixed 120-tick cooldown
+  and re-armed it on every later overrun, so a branch whose body consistently
+  ran longer than 1.5x its interval fell to a 1/120 duty cycle, with one
+  warning at the first flip. A promotion pass that took 1.5x its 250 ms
+  interval silenced promotion for about 30 seconds at a time, and a slow
+  deadline or stale-heartbeat rescue sweep left expired claims waiting the
+  same way. The cooldown is now `2 x ceil(body_duration / interval)` ticks,
+  capped at the previous 120, so a merely slow branch settles at roughly a
+  third duty cycle while a pathologically slow one stays bounded.
+- **A duplicate unique follow-up no longer fails the job that triggered it.**
+  A follow-up enqueued with unique options whose key already existed returned
+  `UniqueConflict` from the follow-up `INSERT`, which aborted the trigger's
+  transaction and rolled back its completion (or other outcome). The executor
+  does not retry a unique conflict, so the attempt stayed running until
+  rescue, re-ran, hit the same conflict, and failed once its attempts ran out;
+  every trigger after the first failed this way. Each follow-up with unique
+  options now inserts under a savepoint, and a conflict on the unique-key
+  index skips the duplicate while the trigger commits and the existing
+  follow-up stands. Any other unique violation, or a follow-up without unique
+  options, still rolls the trigger back as before. The guide to
+  [lifecycle hooks](docs/lifecycle-hooks.md) gains a section on deduplicating
+  follow-ups.
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` and `install_queue_storage(reset=True)`
+  ran the migrations on a throwaway tokio runtime but with the client's pool,
+  so connections the pool opened during the migration went back into it tied
+  to a runtime that no longer existed. A later query that picked one up could
+  wait 30 s and fail with `pool timed out while waiting for an open
+  connection`. The migrations now run on the bindings' shared runtime.
+- **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
+  numbers in plain decimal, and serde_json's default parser could round a long
+  one to the neighbouring `f64`, so a value like `5.130112436774387e-96` in job
+  args read back one unit in the last place off. serde_json's
+  `float_roundtrip` feature is now enabled in the workspace and in the Python
+  bindings.
+
 ## [0.6.12] — 2026-11-05
 
 Patch release: queue storage no longer drives PostgreSQL 18 into a backend crash when a rescue, cancel or claim close locks a claim that was just rewritten, batch completion and bulk "move failed to DLQ" on queue storage no longer fail once a batch grows past PostgreSQL's bind-parameter limit, draining a queue cancels its backlog in bulk, and cancelling or moving an available job no longer acts on one a worker has already claimed. No migration, no schema patch and no public API change. Upgrading from 0.6.11 is a rolling upgrade of processes; the rescues run on the maintenance leader and any runtime can become leader, so roll all of them.

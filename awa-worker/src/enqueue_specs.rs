@@ -18,9 +18,9 @@
 //! impls of [`EnqueueFollowUp`] and accumulate them in a two-level
 //! `outcome -> kind -> specs` registry.
 
-use awa_model::{insert_with, AwaError, InsertOpts, JobArgs, JobRow};
+use awa_model::{insert_with, map_sqlx_error, AwaError, InsertOpts, JobArgs, JobRow};
 use serde::de::DeserializeOwned;
-use sqlx::PgConnection;
+use sqlx::{Connection, PgConnection};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -180,6 +180,52 @@ fn catch_make_panic<R>(
     })
 }
 
+/// Insert one follow-up inside the trigger's transaction, under a savepoint.
+///
+/// A unique conflict means the follow-up already exists: the request carried
+/// unique options precisely so that duplicates collapse, so the duplicate is
+/// skipped and the trigger's transition still commits. Without the savepoint
+/// the conflict would abort the whole transaction and roll the trigger back,
+/// and every retry of the trigger would hit the same conflict until it ran
+/// out of attempts. Any other error still fails the dispatch. Follow-ups
+/// without unique options cannot conflict and skip the savepoint.
+async fn insert_follow_up<F: JobArgs>(
+    conn: &mut PgConnection,
+    trigger_kind: &str,
+    args: &F,
+    opts: InsertOpts,
+) -> Result<(), AwaError> {
+    if opts.unique.is_none() {
+        return insert_with(&mut *conn, args, opts).await.map(|_| ());
+    }
+    let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
+    match insert_with(&mut *savepoint, args, opts).await {
+        Ok(_) => savepoint.commit().await.map_err(map_sqlx_error),
+        Err(AwaError::UniqueConflict { constraint })
+            if is_duplicate_follow_up(constraint.as_deref()) =>
+        {
+            savepoint.rollback().await.map_err(map_sqlx_error)?;
+            tracing::debug!(
+                trigger_kind,
+                follow_up_kind = F::kind(),
+                constraint = constraint.as_deref().unwrap_or(""),
+                "Follow-up already enqueued; skipping the duplicate"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The constraint a unique-key conflict reports on both storage engines.
+/// Any other unique violation (a primary-key collision, say) is not a
+/// duplicate of the follow-up and must still fail the dispatch.
+const JOB_UNIQUE_KEY_CONSTRAINT: &str = "idx_awa_jobs_unique";
+
+fn is_duplicate_follow_up(constraint: Option<&str>) -> bool {
+    constraint == Some(JOB_UNIQUE_KEY_CONSTRAINT)
+}
+
 /// Spec for the `Completed` outcome. Captures a typed closure that maps the
 /// trigger's deserialised args plus its post-completion `JobRow` to an
 /// [`EnqueueRequest<F>`] describing the follow-up.
@@ -206,7 +252,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
             )?;
-            insert_with(&mut *conn, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -251,7 +297,7 @@ where
                     (self.make)(args, job, error, *attempt, *next_run_at)
                 }),
             )?;
-            insert_with(&mut *conn, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -286,7 +332,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, error, *attempt)),
             )?;
-            insert_with(&mut *conn, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -321,7 +367,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, reason)),
             )?;
-            insert_with(&mut *conn, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -351,7 +397,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
             )?;
-            insert_with(&mut *conn, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -388,7 +434,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, *reason)),
             )?;
-            insert_with(&mut *conn, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -406,4 +452,16 @@ pub(crate) async fn dispatch_specs_in_tx(
         spec.run(conn, job, outcome_context).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_duplicate_follow_up;
+
+    #[test]
+    fn only_the_unique_key_constraint_counts_as_a_duplicate() {
+        assert!(is_duplicate_follow_up(Some("idx_awa_jobs_unique")));
+        assert!(!is_duplicate_follow_up(Some("jobs_hot_pkey")));
+        assert!(!is_duplicate_follow_up(None));
+    }
 }
