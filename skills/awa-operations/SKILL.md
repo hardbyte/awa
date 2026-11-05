@@ -294,11 +294,12 @@ The condition to alert on is a frozen generation *with* accumulating rows
 
 Ring prune takes exclusive locks under a `lock_timeout` of 10 ms by default;
 when it cannot, it rolls back and counts `blocked` in
-`awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. Persistent
-`blocked` (or `error`) means the rings are not recycling. Raise
+`awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. A sustained
+`increase()` of `blocked` (or `error`) means the rings are not recycling. Raise
 `ClientBuilder::prune_lock_timeout` (Python
 `queue_storage_prune_lock_timeout_ms`) in steps when short readers of the ring
-partitions are the cause. `backed_off` means prune was skipped for a few ticks
+partitions are the cause. Queue-ring prune waits under the timeout only on the
+`ready_segments` partition and takes its other partitions with `NOWAIT`. `backed_off` means prune was skipped for a few ticks
 after repeated `skipped_active`.
 
 ## Ring Rotation Cadence

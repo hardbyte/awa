@@ -3594,6 +3594,10 @@ impl QueueStorage {
     /// Set the PostgreSQL `lock_timeout` applied to the exclusive-lock steps of
     /// ring prune (queue, lease and claim rings) and terminal-delta rollup.
     ///
+    /// Queue ring prune waits only on its `ready_segments` lock; its other
+    /// partition locks use `NOWAIT`, so a reader holding one of them makes it
+    /// `Blocked` immediately whatever the timeout.
+    ///
     /// A prune that cannot take its locks within the timeout rolls back and
     /// reports [`PruneOutcome::Blocked`]; the maintenance loop retries on its
     /// next tick. The default is 10 ms, which
@@ -3602,7 +3606,8 @@ impl QueueStorage {
     /// when prune is persistently `Blocked` by short-lived readers of the
     /// ring partitions. The timeout is applied at millisecond granularity.
     ///
-    /// Returns a validation error for a zero timeout.
+    /// Returns a validation error for a zero timeout or one above PostgreSQL's
+    /// `lock_timeout` maximum (`i32::MAX` milliseconds, about 24.8 days).
     pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
         self.set_prune_lock_timeout(timeout)?;
         Ok(self)
@@ -3614,6 +3619,12 @@ impl QueueStorage {
             return Err(AwaError::Validation(
                 "queue storage prune lock timeout must be greater than zero".into(),
             ));
+        }
+        if timeout.as_millis() > i32::MAX as u128 {
+            return Err(AwaError::Validation(format!(
+                "queue storage prune lock timeout must not exceed {} ms",
+                i32::MAX
+            )));
         }
         self.prune_lock_timeout = timeout;
         Ok(())

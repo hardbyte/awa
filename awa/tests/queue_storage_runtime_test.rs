@@ -15727,6 +15727,7 @@ async fn assert_prune_waits_for_configured_lock_timeout(
     config: &QueueStorageConfig,
     ring: PruneRing,
     locked_relation: &str,
+    expected_after_release: fn(&PruneOutcome) -> bool,
 ) {
     let short_timeout = Duration::from_millis(300);
     let short_store = QueueStorage::new(config.clone())
@@ -15777,8 +15778,8 @@ async fn assert_prune_waits_for_configured_lock_timeout(
     let elapsed = started.elapsed();
     release.await.expect("release task");
     assert!(
-        !matches!(outcome, PruneOutcome::Blocked { .. }),
-        "{ring:?} prune with a long lock timeout must outwait the reader, got {outcome:?}"
+        expected_after_release(&outcome),
+        "{ring:?} prune with a long lock timeout must outwait the reader and finish, got {outcome:?}"
     );
     assert!(
         elapsed >= short_timeout,
@@ -15811,6 +15812,7 @@ async fn test_queue_prune_lock_timeout_is_configurable() {
         &config,
         PruneRing::Queue,
         &format!("{schema}.ready_segments_0"),
+        |outcome| matches!(outcome, PruneOutcome::Pruned { .. }),
     )
     .await;
 }
@@ -15852,6 +15854,7 @@ async fn test_lease_prune_lock_timeout_is_configurable() {
         &config,
         PruneRing::Lease,
         &format!("{schema}.leases_0"),
+        |outcome| matches!(outcome, PruneOutcome::Pruned { .. }),
     )
     .await;
 }
@@ -15899,6 +15902,7 @@ async fn test_claim_prune_lock_timeout_is_configurable() {
         &config,
         PruneRing::Claim,
         &format!("{schema}.lease_claims_0"),
+        |outcome| matches!(outcome, PruneOutcome::Pruned { .. }),
     )
     .await;
 }
