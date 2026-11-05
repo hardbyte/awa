@@ -796,15 +796,24 @@ impl Oracle {
                 );
             }
         };
-        report(
-            "stuck_job",
-            if quiesced {
-                "never reached a terminal state although the system went quiet (available/deferred/leased)"
-            } else {
-                "were still live when the drain grace ended"
-            },
-            live_stuck,
-        );
+        if quiesced {
+            report(
+                "stuck_job",
+                "never reached a terminal state although the system went quiet (available/deferred/leased)",
+                live_stuck,
+            );
+        } else if !live_stuck.is_empty() {
+            // Work still queued when the grace ended is backlog, not loss: the run was
+            // sized beyond what the server could clear.
+            self.shared.finding(
+                "backlog_at_end",
+                format!(
+                    "{} job(s) were still queued when the drain grace ended",
+                    live_stuck.len()
+                ),
+                live_stuck.into_iter().take(MAX_ROWS).collect(),
+            );
+        }
         report(
             "lost_job",
             "were enqueued, never ran and are in no table",

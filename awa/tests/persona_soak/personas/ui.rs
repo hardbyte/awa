@@ -414,6 +414,21 @@ pub async fn run_support(shared: Arc<Shared>) -> Result<(), String> {
     Ok(())
 }
 
+/// POSTs a resume until it succeeds; a queue or schedule left paused looks like a stall.
+async fn resume_until_ok(http: &Http, shared: &Shared, path: &str, endpoint: &str) {
+    for attempt in 0..8 {
+        if http.post(endpoint, path, json!({})).await.json().is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2 + attempt)).await;
+    }
+    shared.violation(
+        "resume_failed",
+        format!("{path} did not succeed after eight attempts"),
+        vec![],
+    );
+}
+
 pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
     let persona = Persona::UiOps;
     let http = Http::new(&shared, persona);
@@ -430,7 +445,7 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                 candidates.extend(shared.queues.of(Persona::Tom));
                 if let Some(queue) = rng.pick(&candidates).cloned() {
                     queue.hold();
-                    if http
+                    let paused = http
                         .post(
                             "/api/queues/{queue}/pause",
                             &format!("/api/queues/{}/pause", queue.name),
@@ -438,19 +453,21 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                         )
                         .await
                         .json()
-                        .is_some()
-                    {
+                        .is_some();
+                    if paused {
                         shared.stats(persona).add("pauses", 1);
                         shared
                             .stop_sleep_load(Duration::from_secs(rng.range(3, 6)))
                             .await;
-                        http.post(
-                            "/api/queues/{queue}/resume",
-                            &format!("/api/queues/{}/resume", queue.name),
-                            json!({}),
-                        )
-                        .await;
                     }
+                    // A pause whose answer was lost may still have applied, so always resume.
+                    resume_until_ok(
+                        &http,
+                        &shared,
+                        &format!("/api/queues/{}/resume", queue.name),
+                        "/api/queues/{queue}/resume",
+                    )
+                    .await;
                     shared.stop_sleep_load(Duration::from_secs(3)).await;
                     queue.release();
                 }
@@ -579,7 +596,7 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
             }
             6 => {
                 let name = format!("soak_tom_cron_{}", rng.below(4));
-                if http
+                let paused = http
                     .post(
                         "/api/cron/{name}/pause",
                         &format!("/api/cron/{name}/pause"),
@@ -587,16 +604,17 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                     )
                     .await
                     .json()
-                    .is_some()
-                {
+                    .is_some();
+                if paused {
                     shared.stop_sleep_load(Duration::from_secs(8)).await;
-                    http.post(
-                        "/api/cron/{name}/resume",
-                        &format!("/api/cron/{name}/resume"),
-                        json!({}),
-                    )
-                    .await;
                 }
+                resume_until_ok(
+                    &http,
+                    &shared,
+                    &format!("/api/cron/{name}/resume"),
+                    "/api/cron/{name}/resume",
+                )
+                .await;
             }
             7 => {
                 let name = format!("soak_tom_cron_{}", rng.below(4));

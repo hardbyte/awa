@@ -164,6 +164,9 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         .await
         .map_err(|error| format!("oracle task: {error}"))?;
     let quiesced = oracle.wait_quiescent(shared.config.drain_grace).await;
+    shared
+        .quiesced
+        .store(quiesced, std::sync::atomic::Ordering::Relaxed);
     shared.note("run", format!("quiesced: {quiesced}"));
     oracle.final_check(quiesced).await;
     let excerpts = oracle.crash_scan();

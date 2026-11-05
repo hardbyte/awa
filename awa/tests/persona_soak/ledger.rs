@@ -118,8 +118,22 @@ impl Ledger {
         &self.shards[(id as u64 % SHARDS as u64) as usize]
     }
 
+    /// Records an enqueue. A fast worker can run the job before its producer gets here, so
+    /// an existing record keeps what the workers already reported.
     pub fn register(&self, id: i64, record: JobRecord) {
-        self.shard(id).lock().expect("ledger").insert(id, record);
+        let mut shard = self.shard(id).lock().expect("ledger");
+        match shard.get_mut(&id) {
+            Some(existing) => {
+                existing.persona = record.persona;
+                existing.queue = record.queue;
+                existing.enqueued_ms = record.enqueued_ms;
+                existing.expect = record.expect;
+                existing.flags = (existing.flags | record.flags) & !flag::UNREGISTERED;
+            }
+            None => {
+                shard.insert(id, record);
+            }
+        }
     }
 
     /// Applies `update` to the job's record, creating an unregistered record when the

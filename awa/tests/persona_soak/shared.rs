@@ -122,6 +122,8 @@ pub struct Shared {
     pub ui: super::personas::ui::UiMetrics,
     /// Handlers currently running in the Python process, from its own reports.
     pub python_active: AtomicI64,
+    /// Set once the post-load drain finished with no live work left.
+    pub quiesced: std::sync::atomic::AtomicBool,
     /// The running Python process, so the chaos persona can kill it.
     pub python: Mutex<Option<Arc<super::personas::python::PythonHandle>>>,
     /// Run-wide measurements (resource use, oracle probes).
@@ -152,6 +154,7 @@ impl Shared {
             run: Stats::default(),
             ui: Default::default(),
             python_active: AtomicI64::new(0),
+            quiesced: std::sync::atomic::AtomicBool::new(false),
             python: Mutex::new(None),
             fleets: Mutex::new(HashMap::new()),
             chaos_until_ms: AtomicI64::new(0),

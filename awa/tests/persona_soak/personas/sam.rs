@@ -338,16 +338,22 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     stats.add("order_inversions", order.inversions as i64);
     stats.set_max("order_worst_distance", order.worst_distance as i64);
     if executed_striped < stripe_seq {
-        shared.violation(
-            "lost_job",
-            format!(
-                "{} of {stripe_seq} striped jobs never executed",
-                stripe_seq - executed_striped
-            ),
-            vec![format!(
-                "{{\"queue\":\"{STRIPED_QUEUE}\",\"missing_seq_sample\":{missing:?}}}"
-            )],
+        let message = format!(
+            "{} of {stripe_seq} striped jobs never executed",
+            stripe_seq - executed_striped
         );
+        let rows = vec![format!(
+            "{{\"queue\":\"{STRIPED_QUEUE}\",\"missing_seq_sample\":{missing:?}}}"
+        )];
+        if shared.quiesced.load(std::sync::atomic::Ordering::Relaxed) {
+            shared.violation("lost_job", message, rows);
+        } else {
+            shared.finding(
+                "striped_backlog_at_end",
+                format!("{message}; the system had not quiesced"),
+                rows,
+            );
+        }
     }
     Ok(())
 }

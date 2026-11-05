@@ -213,6 +213,25 @@ impl Context {
         }
     }
 
+    /// Resumes a queue, retrying: a queue left paused would look like a stall.
+    async fn resume_with_retry(&self, queue: &str) {
+        for attempt in 0..8 {
+            if self
+                .timed("resume_queue", admin::resume_queue(&self.pool, queue))
+                .await
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2 + attempt)).await;
+        }
+        self.shared.violation(
+            "resume_failed",
+            format!("queue {queue} could not be resumed after eight attempts"),
+            vec![],
+        );
+    }
+
     async fn pause_resume(&mut self) {
         let target = match self.rng.below(3) {
             0 => self.shared.queues.get(QUEUE_B),
@@ -226,21 +245,21 @@ impl Context {
         let Some(queue) = target else { return };
         queue.hold();
         let pool = self.pool.clone();
-        if self
+        let paused = self
             .timed(
                 "pause_queue",
                 admin::pause_queue(&pool, &queue.name, Some("soak")),
             )
             .await
-            .is_some()
-        {
+            .is_some();
+        if paused {
             self.stats().add("pauses", 1);
             self.shared
                 .stop_sleep(Duration::from_secs(self.rng.range(3, 8)))
                 .await;
-            self.timed("resume_queue", admin::resume_queue(&pool, &queue.name))
-                .await;
         }
+        // A pause whose answer was lost may still have applied, so always resume.
+        self.resume_with_retry(&queue.name).await;
         // Give the claimers a moment to pick the queue back up before stall checks resume.
         self.shared.stop_sleep(Duration::from_secs(3)).await;
         queue.release();
@@ -463,9 +482,7 @@ impl Context {
         };
         self.run_batch(request, label).await;
         if let Some(queue) = &held {
-            let _ = self
-                .timed("resume_queue", admin::resume_queue(&pool, &queue.name))
-                .await;
+            self.resume_with_retry(&queue.name).await;
             self.shared.stop_sleep(Duration::from_secs(3)).await;
             queue.release();
         }
