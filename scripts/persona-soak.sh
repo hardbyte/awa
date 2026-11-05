@@ -85,6 +85,7 @@ start_container() {
       # initialisation, which under this workload is tens of gigabytes per hour. The log
       # collector therefore writes into a FIFO whose reader drops those messages and keeps
       # the rest (assertion failures, crash notices, errors) in /data/log/pg-filtered.log.
+      # Parallel query is off here: at -O0 a handful of admin reads would otherwise take every core.
       docker run -d --name "$name" --shm-size=1g -p "$port:5432" "$CASSERT_IMAGE" sh -c '
         mkdir -p /data/log
         rm -f /data/log/pg.log /data/log/pg-filtered.log
@@ -100,6 +101,7 @@ start_container() {
           </data/log/pg.log >>/data/log/pg-filtered.log &
         exec postgres -D /data -c listen_addresses="*" -c max_connections='"$MAX_CONNECTIONS"' \
           -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 \
+          -c max_parallel_workers_per_gather=0 \
           -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0' >/dev/null ;;
     *)
       echo "unknown engine: $engine (expected pg17, pg18 or pg18-cassert)" >&2
