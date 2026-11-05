@@ -146,10 +146,7 @@ impl TestClient {
                     .bind(&progress_snapshot)
                     .execute(&self.pool)
                     .await?;
-                    return Ok(WorkResult::Failed(
-                        job,
-                        "max_attempts exhausted".to_string(),
-                    ));
+                    return Ok(WorkResult::Failed(job, exhausted_message(&result)));
                 }
                 sqlx::query(
                     "UPDATE awa.jobs SET state = 'retryable', finalized_at = now(), progress = $2 WHERE id = $1",
@@ -303,19 +300,17 @@ impl TestClient {
                 // The final attempt exhausts the job, mirroring the real
                 // executor.
                 if job.attempt >= job.max_attempts {
+                    let message = exhausted_message(&result);
                     store
                         .fail_terminal(
                             &self.pool,
                             job.id,
                             job.run_lease,
-                            "max_attempts exhausted",
+                            &message,
                             progress_snapshot,
                         )
                         .await?;
-                    return Ok(WorkResult::Failed(
-                        job,
-                        "max_attempts exhausted".to_string(),
-                    ));
+                    return Ok(WorkResult::Failed(job, message));
                 }
                 store
                     .retry_after(&self.pool, job.id, job.run_lease, *delay, progress_snapshot)
@@ -326,19 +321,17 @@ impl TestClient {
                 // The final attempt exhausts the job, mirroring the real
                 // executor.
                 if job.attempt >= job.max_attempts {
+                    let message = exhausted_message(&result);
                     store
                         .fail_terminal(
                             &self.pool,
                             job.id,
                             job.run_lease,
-                            "max_attempts exhausted",
+                            &message,
                             progress_snapshot,
                         )
                         .await?;
-                    return Ok(WorkResult::Failed(
-                        job,
-                        "max_attempts exhausted".to_string(),
-                    ));
+                    return Ok(WorkResult::Failed(job, message));
                 }
                 // A retryable error reschedules the job. Canonical leaves it in
                 // a finalized `retryable` state (not re-claimable by a later
@@ -405,6 +398,18 @@ impl TestClient {
     /// Get a job by ID.
     pub async fn get_job(&self, job_id: i64) -> Result<JobRow, AwaError> {
         awa_model::admin::get_job(&self.pool, job_id).await
+    }
+}
+
+/// The error recorded when a retryable failure or `RetryAfter` lands on the
+/// final attempt, matching what the real executor writes.
+fn exhausted_message(result: &Result<JobResult, JobError>) -> String {
+    match result {
+        Ok(JobResult::RetryAfter(delay)) => {
+            format!("max_attempts exhausted (handler requested retry after {delay:?})")
+        }
+        Err(JobError::Retryable(err)) => err.to_string(),
+        _ => "max_attempts exhausted".to_string(),
     }
 }
 
