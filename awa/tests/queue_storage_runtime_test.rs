@@ -7701,48 +7701,114 @@ async fn test_queue_storage_runtime_snooze() {
 }
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
-struct PromoteLatencyJob {
+struct PromoteAfterOverrunJob {
     retry_once: bool,
 }
 
 /// Completes immediately, except that a `retry_once` job hands itself back
-/// with a short retry delay on its first attempt. Records when each job
-/// completed.
-#[derive(Clone, Default)]
-struct PromoteLatencyWorker {
-    completed_at: Arc<std::sync::Mutex<HashMap<i64, Instant>>>,
-}
+/// with a short retry delay on its first attempt.
+struct PromoteAfterOverrunWorker;
 
 #[async_trait::async_trait]
-impl Worker for PromoteLatencyWorker {
+impl Worker for PromoteAfterOverrunWorker {
     fn kind(&self) -> &'static str {
-        "promote_latency_job"
+        "promote_after_overrun_job"
     }
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let args: PromoteLatencyJob = serde_json::from_value(ctx.job.args.clone()).unwrap();
+        let args: PromoteAfterOverrunJob = serde_json::from_value(ctx.job.args.clone()).unwrap();
         if args.retry_once && ctx.job.attempt == 1 {
             return Ok(JobResult::RetryAfter(Duration::from_millis(50)));
         }
-        self.completed_at
-            .lock()
-            .unwrap()
-            .insert(ctx.job.id, Instant::now());
         Ok(JobResult::Completed)
     }
 }
 
+/// One maintenance-branch overrun warning: the branch and every numeric
+/// field describing a cooldown the warning reports as armed.
+#[derive(Clone, Debug)]
+struct BranchOverrun {
+    branch: String,
+    cooldowns: Vec<u64>,
+}
+
+#[derive(Default)]
+struct BranchOverrunVisitor {
+    message: String,
+    branch: String,
+    cooldowns: Vec<u64>,
+}
+
+impl tracing::field::Visit for BranchOverrunVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "branch" {
+            self.branch = value.to_string();
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name().starts_with("cooldown") {
+            self.cooldowns.push(value);
+        }
+    }
+}
+
+struct BranchOverrunLayer(Arc<std::sync::Mutex<Vec<BranchOverrun>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BranchOverrunLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = BranchOverrunVisitor::default();
+        event.record(&mut visitor);
+        if visitor.message == "maintenance branch overran tick interval" {
+            self.0.lock().unwrap().push(BranchOverrun {
+                branch: visitor.branch,
+                cooldowns: visitor.cooldowns,
+            });
+        }
+    }
+}
+
+/// Process-wide record of maintenance-branch overrun warnings. Installed once
+/// as the global subscriber; this binary installs no other.
+fn branch_overruns() -> Arc<std::sync::Mutex<Vec<BranchOverrun>>> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    static OVERRUNS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<BranchOverrun>>>> =
+        std::sync::OnceLock::new();
+    OVERRUNS
+        .get_or_init(|| {
+            let overruns = Arc::new(std::sync::Mutex::new(Vec::new()));
+            tracing_subscriber::registry()
+                .with(BranchOverrunLayer(overruns.clone()))
+                .try_init()
+                .expect("no other tracing subscriber in this test binary");
+            overruns
+        })
+        .clone()
+}
+
 /// Promotion is cheap, idempotent and the only thing that makes scheduled,
-/// snoozed and retry-after jobs runnable, so a run of slow promotion bodies
-/// must not suppress it afterwards, even when the leader loop is saturated.
+/// snoozed and retry-after jobs runnable, so overrunning promotion bodies must
+/// never arm a cooldown on it.
 ///
 /// The first three promotion bodies (two `DELETE`s each) take 1.2s against a
-/// 25ms promote interval, which arms an overrun cooldown on the maintenance
-/// branch. Every later body is fast. Every other maintenance branch runs on a
-/// 1ms interval, so the loop always has several branches ready and services
-/// each only occasionally, the way a CPU-starved leader does. Jobs that
-/// become due once the slow bodies are over must be promoted promptly instead
-/// of waiting for a cooldown to drain one serviced tick at a time.
+/// 25ms promote interval, so the maintenance branch tracker flags promotion as
+/// overrunning. The test asserts on that overrun warning rather than on job
+/// latency: the promotion warning must report no cooldown, while another
+/// branch in the same run (cleanup, whose bodies exceed its 1ms interval)
+/// does report one, so the check cannot pass vacuously. Jobs that fall due
+/// afterwards must still complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_bodies() {
     const SLOW_STATEMENTS: i64 = 6;
@@ -7775,7 +7841,7 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
             .expect("install slow promotion trigger");
     }
 
-    let worker = PromoteLatencyWorker::default();
+    let overruns = branch_overruns();
     let saturating_interval = Duration::from_millis(1);
     let client = Client::builder(pool.clone())
         .queue(
@@ -7798,7 +7864,7 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
             Duration::from_secs(60),
         )
         .claim_rotate_interval(Duration::from_secs(60))
-        .register_worker(worker.clone())
+        .register_worker(PromoteAfterOverrunWorker)
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(saturating_interval)
@@ -7830,11 +7896,10 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let enqueued_at = Instant::now();
     let scheduled_job_id = enqueue_job(
         &pool,
         &store,
-        &PromoteLatencyJob { retry_once: false },
+        &PromoteAfterOverrunJob { retry_once: false },
         InsertOpts {
             queue: queue.to_string(),
             run_at: Some(Utc::now()),
@@ -7845,7 +7910,7 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
     let retried_job_id = enqueue_job(
         &pool,
         &store,
-        &PromoteLatencyJob { retry_once: true },
+        &PromoteAfterOverrunJob { retry_once: true },
         InsertOpts {
             queue: queue.to_string(),
             max_attempts: 3,
@@ -7860,24 +7925,42 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
             &pool,
             job_id,
             &[JobState::Completed],
-            Duration::from_secs(30),
+            Duration::from_secs(10),
         )
         .await;
     }
 
-    let completed_at = worker.completed_at.lock().unwrap().clone();
-    for (label, job_id) in [
-        ("scheduled", scheduled_job_id),
-        ("retry-after", retried_job_id),
-    ] {
-        let latency = completed_at[&job_id].duration_since(enqueued_at);
-        eprintln!("{label} job completed {latency:?} after enqueue");
+    let promote_overruns_seen = |overruns: &[BranchOverrun]| {
+        overruns
+            .iter()
+            .any(|overrun| overrun.branch == "promote_scheduled")
+    };
+    let overrun_wait_started = Instant::now();
+    while !promote_overruns_seen(&overruns.lock().unwrap()) {
         assert!(
-            latency < Duration::from_millis(350),
-            "{label} job took {latency:?} to run; promotion must not be suppressed \
-             after overrunning bodies"
+            overrun_wait_started.elapsed() < Duration::from_secs(30),
+            "promotion bodies overran but the tracker never flagged the branch"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let overruns = overruns.lock().unwrap().clone();
+    for overrun in overruns
+        .iter()
+        .filter(|overrun| overrun.branch == "promote_scheduled")
+    {
+        assert!(
+            overrun.cooldowns.iter().all(|&cooldown| cooldown == 0),
+            "promotion must not be backed off when it overruns: {overrun:?}"
         );
     }
+    assert!(
+        overruns.iter().any(|overrun| {
+            overrun.branch != "promote_scheduled"
+                && overrun.cooldowns.iter().any(|&cooldown| cooldown > 0)
+        }),
+        "a cooldown-bearing branch should have armed a cooldown in this run: {overruns:?}"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
