@@ -324,7 +324,11 @@ async fn callback_job_queue_storage_in_tx(
     Ok(Some(store))
 }
 
-fn queue_storage_current_jobs_cte(schema: &str) -> String {
+/// Every job a queue-storage schema holds, in the state it is in, as a
+/// `current_jobs` CTE. Admin reads that can't afford to expand it use bounded
+/// forms of their own; this is the definition they must agree with.
+#[doc(hidden)]
+pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
     format!(
         r#"
         WITH current_available AS (
@@ -626,6 +630,154 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
             SELECT created_at, 'failed'::awa.job_state
             FROM {schema}.dlq_entries
             WHERE created_at >= {since}
+        )
+        "#
+    )
+}
+
+/// The per-kind, per-queue counts behind [`job_kind_overviews`], as a
+/// `kind_counts` CTE of `kind`, `job_count`, `queue_count` and
+/// `completed_last_hour`.
+///
+/// It counts what `current_jobs` holds without expanding it. Each place a job
+/// can live is aggregated to `(kind, queue)` on its own, as a `MATERIALIZED`
+/// CTE, and only those few rows are combined. Read through `current_jobs`,
+/// the receipt-batch join to `ready_entries` and the `UNION ALL` are both
+/// estimated at one row whatever the statistics say, so Postgres chooses
+/// nested loops that probe once per retained row, and a join on
+/// `queue_claim_heads` is only as good as that table's estimate.
+///
+/// Available rows are found per lane as a claim finds them (see
+/// [`crate::queue_storage::available_by_queue_sql`]). A completion batch
+/// member's kind lives on its ready row, so that leg unnests each batch and
+/// probes the ready primary key.
+fn queue_storage_kind_counts_cte(schema: &str) -> String {
+    let available =
+        crate::queue_storage::available_lane_rows_sql(schema, "heads", "ready.kind", "TRUE");
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
+    format!(
+        r#"
+        heads AS MATERIALIZED (
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+        ),
+        available_by_kind AS MATERIALIZED (
+            SELECT lane.kind, heads.queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            FROM heads
+            CROSS JOIN LATERAL (
+                {available}
+            ) AS lane
+            GROUP BY lane.kind, heads.queue
+        ),
+        leased_by_kind AS MATERIALIZED (
+            SELECT ready.kind, leases.queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            FROM {schema}.leases AS leases
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = leases.ready_slot
+             AND ready.ready_generation = leases.ready_generation
+             AND ready.queue = leases.queue
+             AND ready.priority = leases.priority
+             AND ready.enqueue_shard = leases.enqueue_shard
+             AND ready.lane_seq = leases.lane_seq
+            GROUP BY ready.kind, leases.queue
+        ),
+        deferred_by_kind AS MATERIALIZED (
+            SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            FROM {schema}.deferred_jobs
+            GROUP BY kind, queue
+        ),
+        -- Receipt claims that are still open are running; a queue or priority
+        -- move copies a ready row with its kind, so any one of the job's
+        -- ready rows gives it.
+        running_by_kind AS MATERIALIZED (
+            SELECT created.kind, open_claims.queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            FROM ({open_running}) AS open_claims
+            CROSS JOIN LATERAL (
+                SELECT ready.kind
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                LIMIT 1
+            ) AS created
+            GROUP BY created.kind, open_claims.queue
+        ),
+        done_by_kind AS MATERIALIZED (
+            SELECT
+                kind,
+                queue,
+                count(*)::bigint AS n,
+                count(*) FILTER (
+                    WHERE state = 'completed'
+                      AND finalized_at > clock_timestamp() - interval '1 hour'
+                )::bigint AS n_recent
+            FROM {schema}.done_entries
+            GROUP BY kind, queue
+        ),
+        receipts_by_kind AS MATERIALIZED (
+            SELECT
+                ready.kind,
+                batch.queue,
+                count(*)::bigint AS n,
+                count(*) FILTER (
+                    WHERE batch.finalized_at > clock_timestamp() - interval '1 hour'
+                )::bigint AS n_recent
+            FROM {schema}.receipt_completion_batches AS batch
+            CROSS JOIN LATERAL unnest(
+                batch.job_ids,
+                batch.run_leases,
+                batch.lane_seqs
+            ) AS item(job_id, run_lease, lane_seq)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = batch.ready_slot
+             AND ready.ready_generation = batch.ready_generation
+             AND ready.queue = batch.queue
+             AND ready.priority = batch.priority
+             AND ready.enqueue_shard = batch.enqueue_shard
+             AND ready.lane_seq = item.lane_seq
+             AND ready.job_id = item.job_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
+                WHERE tomb.ready_slot = batch.ready_slot
+                  AND tomb.ready_generation = batch.ready_generation
+                  AND tomb.job_id = item.job_id
+                  AND tomb.run_lease = item.run_lease
+            )
+            GROUP BY ready.kind, batch.queue
+        ),
+        dlq_by_kind AS MATERIALIZED (
+            SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            FROM {schema}.dlq_entries
+            GROUP BY kind, queue
+        ),
+        kind_queue AS (
+            SELECT kind, queue, sum(n)::bigint AS n, sum(n_recent)::bigint AS n_recent
+            FROM (
+                SELECT * FROM available_by_kind
+                UNION ALL SELECT * FROM leased_by_kind
+                UNION ALL SELECT * FROM deferred_by_kind
+                UNION ALL SELECT * FROM running_by_kind
+                UNION ALL SELECT * FROM done_by_kind
+                UNION ALL SELECT * FROM receipts_by_kind
+                UNION ALL SELECT * FROM dlq_by_kind
+            ) AS legs
+            GROUP BY kind, queue
+        ),
+        kind_counts AS (
+            SELECT
+                kind,
+                sum(n)::bigint AS job_count,
+                count(*)::bigint AS queue_count,
+                sum(n_recent)::bigint AS completed_last_hour
+            FROM kind_queue
+            GROUP BY kind
         )
         "#
     )
@@ -3283,9 +3435,9 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
-            {current_jobs_cte},
+            WITH {kind_counts_cte},
             all_kinds AS (
-                SELECT kind FROM current_jobs
+                SELECT kind FROM kind_counts
                 UNION
                 SELECT kind FROM awa.job_kind_descriptors
                 UNION
@@ -3303,23 +3455,6 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
                     secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
                 ) >= now()
                 GROUP BY descriptor.key
-            ),
-            kind_counts AS (
-                SELECT
-                    kind,
-                    count(*)::bigint AS job_count,
-                    count(DISTINCT queue)::bigint AS queue_count
-                FROM current_jobs
-                GROUP BY kind
-            ),
-            completed_recent AS (
-                SELECT
-                    kind,
-                    count(*)::bigint AS completed_last_hour
-                FROM current_jobs
-                WHERE state = 'completed'
-                  AND finalized_at > clock_timestamp() - interval '1 hour'
-                GROUP BY kind
             )
             SELECT
                 k.kind,
@@ -3340,20 +3475,25 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
                 COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
                 COALESCE(kc.job_count, 0) AS job_count,
                 COALESCE(kc.queue_count, 0) AS queue_count,
-                COALESCE(cr.completed_last_hour, 0) AS completed_last_hour
+                COALESCE(kc.completed_last_hour, 0) AS completed_last_hour
             FROM all_kinds k
             LEFT JOIN kind_counts kc ON kc.kind = k.kind
             LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
             LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
-            LEFT JOIN completed_recent cr ON cr.kind = k.kind
             ORDER BY k.kind
             "#,
-            current_jobs_cte = queue_storage_current_jobs_cte(store.schema())
+            kind_counts_cte = queue_storage_kind_counts_cte(store.schema())
         );
 
-        let rows = sqlx::query_as::<_, JobKindOverview>(audited_sql(sql))
-            .fetch_all(pool)
+        // As in `queue_overviews`: compiling costs more than running.
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .execute(tx.as_mut())
             .await?;
+        let rows = sqlx::query_as::<_, JobKindOverview>(audited_sql(sql))
+            .fetch_all(tx.as_mut())
+            .await?;
+        tx.commit().await?;
         return Ok(rows);
     }
 
