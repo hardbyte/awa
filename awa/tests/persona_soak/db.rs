@@ -16,7 +16,20 @@ pub async fn connect_pool(
     application_name: &str,
     max_connections: u32,
 ) -> Result<PgPool, sqlx::Error> {
-    let options = PgConnectOptions::from_str(url)?.application_name(application_name);
+    connect_pool_with_timeout(url, application_name, max_connections, None).await
+}
+
+/// As [`connect_pool`], with a server-side `statement_timeout` on every connection.
+pub async fn connect_pool_with_timeout(
+    url: &str,
+    application_name: &str,
+    max_connections: u32,
+    statement_timeout: Option<Duration>,
+) -> Result<PgPool, sqlx::Error> {
+    let mut options = PgConnectOptions::from_str(url)?.application_name(application_name);
+    if let Some(timeout) = statement_timeout {
+        options = options.options([("statement_timeout", timeout.as_millis().to_string())]);
+    }
     PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(60))

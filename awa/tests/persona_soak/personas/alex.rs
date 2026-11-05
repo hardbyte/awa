@@ -3,7 +3,7 @@
 //! queries the UI issues, and rolls a client restart through another persona's fleet.
 
 use super::super::config::Persona;
-use super::super::db::{connect_pool, ClientFactory};
+use super::super::db::{connect_pool, connect_pool_with_timeout, ClientFactory};
 use super::super::fleet::Fleet;
 use super::super::ledger::{expect, flag};
 use super::super::registry::QueueInfo;
@@ -61,9 +61,9 @@ impl Worker for AlexWorker {
 fn client_factory(shared: Arc<Shared>) -> ClientFactory {
     Arc::new(move |pool| {
         let builder = Client::builder(pool)
-            .queue(QUEUE_A, queue(1))
-            .queue(QUEUE_B, queue(2))
-            .queue(QUEUE_DRAIN, queue(1))
+            .queue(QUEUE_A, queue(4))
+            .queue(QUEUE_B, queue(4))
+            .queue(QUEUE_DRAIN, queue(4))
             .register_worker(AlexWorker {
                 shared: shared.clone(),
             });
@@ -86,6 +86,8 @@ type BackendRow = (i32, String, String, String, i32, String, String);
 
 /// An admin call this slow under load is a finding in its own right.
 const SLOW_CALL: Duration = Duration::from_secs(30);
+/// Server-side limit on the operator's statements; hitting it is reported as a finding.
+const ADMIN_STATEMENT_TIMEOUT: Duration = Duration::from_secs(150);
 const STALLED_CALL: Duration = Duration::from_secs(120);
 
 impl Context {
@@ -109,7 +111,7 @@ impl Context {
         };
         let ms = started.elapsed().as_millis() as i64;
         if started.elapsed() > STALLED_CALL {
-            self.shared.violation(
+            self.shared.finding(
                 "admin_call_stalled",
                 format!("admin call {name} took {ms} ms under load"),
                 self.stalled_rows.lock().expect("stalled rows").clone(),
@@ -123,6 +125,16 @@ impl Context {
         match result {
             Ok(value) => Some(value),
             Err(error) => {
+                if error.to_string().contains("statement timeout") {
+                    self.shared.finding(
+                        "admin_call_timeout",
+                        format!(
+                            "admin call {name} was cancelled by the {}s statement timeout",
+                            ADMIN_STATEMENT_TIMEOUT.as_secs()
+                        ),
+                        self.stalled_rows.lock().expect("stalled rows").clone(),
+                    );
+                }
                 self.stats().add(&format!("{name}_errors"), 1);
                 if self.stats().get(&format!("{name}_errors")) <= 3 {
                     self.shared.note("alex", format!("{name} failed: {error}"));
@@ -417,8 +429,7 @@ impl Context {
     }
 
     async fn batch_operations(&mut self) {
-        let pool = self.pool.clone();
-        let (spec, filter, label) = if self.rng.chance(50) {
+        let (spec, filter, label, source) = if self.rng.chance(50) {
             (
                 BatchOperationSpec::MoveQueue {
                     queue: QUEUE_B.to_string(),
@@ -430,6 +441,7 @@ impl Context {
                     ..Default::default()
                 },
                 "move_queue",
+                QUEUE_A,
             )
         } else {
             (
@@ -440,14 +452,40 @@ impl Context {
                     ..Default::default()
                 },
                 "set_priority",
+                QUEUE_B,
             )
         };
+        // Hold the source queue so a backlog builds for the operation to act on.
+        let pool = self.pool.clone();
+        let held = self.shared.queues.get(source);
+        if let Some(queue) = &held {
+            queue.paused.store(true, Ordering::Relaxed);
+            let _ = self
+                .timed(
+                    "pause_queue",
+                    admin::pause_queue(&pool, &queue.name, Some("soak")),
+                )
+                .await;
+            self.shared.stop_sleep(Duration::from_secs(6)).await;
+        }
         let request = SubmitBatchOperation {
             spec,
             filter,
             submitted_by: Some("soak".into()),
             allow_all: false,
         };
+        self.run_batch(request, label).await;
+        if let Some(queue) = &held {
+            let _ = self
+                .timed("resume_queue", admin::resume_queue(&pool, &queue.name))
+                .await;
+            self.shared.stop_sleep(Duration::from_secs(3)).await;
+            queue.paused.store(false, Ordering::Relaxed);
+        }
+    }
+
+    async fn run_batch(&mut self, request: SubmitBatchOperation, label: &str) {
+        let pool = self.pool.clone();
         let Some(operation) = self
             .timed("batch_submit", submit_batch_operation(&pool, request))
             .await
@@ -551,15 +589,16 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         2,
         10,
         2,
-        vec![(queue_a, 1), (queue_b, 2), (queue_drain, 1)],
+        vec![(queue_a, 4), (queue_b, 4), (queue_drain, 4)],
         client_factory(shared.clone()),
     )
     .await?;
 
-    let pool = connect_pool(
+    let pool = connect_pool_with_timeout(
         &shared.config.database_url,
         "soak_alex_operator",
         shared.budget.reserve("alex-operator", 4, 2),
+        Some(ADMIN_STATEMENT_TIMEOUT),
     )
     .await
     .map_err(|error| error.to_string())?;

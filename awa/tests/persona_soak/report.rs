@@ -116,6 +116,22 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     }
     let _ = writeln!(out);
 
+    let findings = shared.findings.lock().expect("findings");
+    let _ = writeln!(out, "## Findings, not fatal ({})", findings.len());
+    for finding in findings.iter() {
+        let _ = writeln!(
+            out,
+            "- [{:.1}s] {}: {}",
+            finding.at_ms as f64 / 1000.0,
+            finding.kind,
+            finding.summary
+        );
+        for row in finding.rows.iter().take(6) {
+            let _ = writeln!(out, "    {row}");
+        }
+    }
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Violations ({})", violations.len());
     for violation in violations.iter() {
         let _ = writeln!(
@@ -177,6 +193,7 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "personas_stats": per_persona,
         "run": { "counters": shared.run.counters(), "samples": shared.run.summaries() },
         "violations": violations,
+        "findings": shared.findings.lock().expect("findings").clone(),
         "timeline": timeline,
     });
     std::fs::write(

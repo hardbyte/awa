@@ -11,7 +11,7 @@ use super::super::rng::Rng;
 use super::super::shared::Shared;
 use super::{attach_events, backoff, queue, register_rows, tune};
 use awa::model::{insert, insert_many};
-use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, Worker};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +19,8 @@ use std::time::Duration;
 pub const TRAIN_QUEUE: &str = "awa_soak_mia_train";
 pub const INFER_QUEUE: &str = "awa_soak_mia_infer";
 pub const DEADLINE_QUEUE: &str = "awa_soak_mia_deadline";
-/// Per-queue deadline for the deadline queue; its jobs run longer than this.
-const DEADLINE: Duration = Duration::from_secs(6);
+/// Deadline given to jobs in the deadline queue; they run longer than this.
+const DEADLINE: chrono::Duration = chrono::Duration::seconds(6);
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 pub struct MiaJob {
@@ -96,14 +96,7 @@ fn client_factory(shared: Arc<Shared>) -> ClientFactory {
         let builder = Client::builder(pool)
             .queue(TRAIN_QUEUE, queue(24))
             .queue(INFER_QUEUE, queue(16))
-            .queue(
-                DEADLINE_QUEUE,
-                QueueConfig {
-                    max_workers: 12,
-                    deadline_duration: DEADLINE,
-                    ..QueueConfig::default()
-                },
-            )
+            .queue(DEADLINE_QUEUE, queue(12))
             .register_worker(MiaWorker {
                 shared: shared.clone(),
             });
@@ -239,6 +232,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
                     InsertOpts {
                         queue: plan.queue.to_string(),
                         max_attempts: plan.max_attempts,
+                        deadline_duration: (plan.queue == DEADLINE_QUEUE).then_some(DEADLINE),
                         ..Default::default()
                     },
                 )

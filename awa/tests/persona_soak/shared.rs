@@ -116,6 +116,8 @@ pub struct Shared {
     pub drain_stop: Stop,
     pub timeline: Mutex<Vec<TimelineEvent>>,
     pub violations: Mutex<Vec<Violation>>,
+    /// Problems that are not invariant violations (slow admin queries); reported, not fatal.
+    pub findings: Mutex<Vec<Violation>>,
     pub stats: HashMap<Persona, Stats>,
     /// Run-wide measurements (resource use, oracle probes).
     pub run: Stats,
@@ -140,6 +142,7 @@ impl Shared {
             drain_stop: Stop::new(),
             timeline: Mutex::new(Vec::new()),
             violations: Mutex::new(Vec::new()),
+            findings: Mutex::new(Vec::new()),
             stats,
             run: Stats::default(),
             fleets: Mutex::new(HashMap::new()),
@@ -194,6 +197,25 @@ impl Shared {
             violation.summary
         );
         self.violations.lock().expect("violations").push(violation);
+    }
+
+    /// Records a non-fatal finding: something worth a bug report that is not one of the
+    /// invariants the soak fails on.
+    pub fn finding(&self, kind: &str, summary: impl Into<String>, rows: Vec<String>) {
+        let finding = Violation {
+            kind: kind.to_string(),
+            at_ms: self.now_ms(),
+            during_chaos: self.chaos_active(),
+            summary: summary.into(),
+            rows,
+        };
+        eprintln!(
+            "[{:>7.1}s] FINDING {}: {}",
+            finding.at_ms as f64 / 1000.0,
+            finding.kind,
+            finding.summary
+        );
+        self.findings.lock().expect("findings").push(finding);
     }
 
     pub fn fleet(&self, name: &str) -> Option<Arc<Fleet>> {
