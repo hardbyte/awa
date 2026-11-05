@@ -80,11 +80,16 @@ start_container() {
     pg18)
       docker run -d --name "$name" --shm-size=1g -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:18 "${common[@]}" >/dev/null ;;
     pg18-cassert)
-      # The image ships an initialised, trust-authenticated cluster in /data and
-      # logs to a file so the crash scan can read assertion failures.
-      docker run -d --name "$name" --shm-size=1g -p "$port:5432" "$CASSERT_IMAGE" postgres -D /data \
-        -c listen_addresses='*' "${common[@]}" -c track_activity_query_size=65536 \
-        -c logging_collector=on -c log_directory=/data/log -c log_filename=pg.log -c log_rotation_size=0 >/dev/null ;;
+      # The image ships an initialised, trust-authenticated cluster in /data. Its server
+      # logs an AWAEPQ line, with the full query text, for every partition-pruning
+      # initialisation, which under this workload is tens of gigabytes per hour, so the
+      # server log goes through a filter that drops those lines and keeps the rest
+      # (including assertion failures and crash notices) in /data/log/pg.log.
+      docker run -d --name "$name" --shm-size=1g -p "$port:5432" "$CASSERT_IMAGE" sh -c '
+        mkdir -p /data/log
+        postgres -D /data -c listen_addresses="*" -c max_connections='"$MAX_CONNECTIONS"' \
+          -c max_locks_per_transaction=256 -c shared_buffers=512MB -c track_activity_query_size=65536 2>&1 |
+          awk "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{skip=(\$0 ~ /AWAEPQ/)} !skip{print; fflush()}" >>/data/log/pg.log' >/dev/null ;;
     *)
       echo "unknown engine: $engine (expected pg17, pg18 or pg18-cassert)" >&2
       return 1 ;;

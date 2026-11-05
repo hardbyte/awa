@@ -73,6 +73,7 @@ pub struct Oracle {
     last_cancel_scan_ms: i64,
     reported_duplicates: std::collections::HashSet<(i64, i64)>,
     reported_cancel: std::collections::HashSet<i64>,
+    initial_stats_reset: std::sync::Mutex<Option<Option<String>>>,
 }
 
 impl Oracle {
@@ -85,6 +86,7 @@ impl Oracle {
             last_cancel_scan_ms: 0,
             reported_duplicates: Default::default(),
             reported_cancel: Default::default(),
+            initial_stats_reset: Default::default(),
         }
     }
 
@@ -109,7 +111,30 @@ impl Oracle {
         }
     }
 
+    /// Crash recovery discards the cumulative statistics, so a changed reset time means the
+    /// server restarted its processes even though the postmaster, and its start time, survived.
+    async fn probe_stats_reset(&self) {
+        let reset: Result<Option<String>, _> =
+            sqlx::query_scalar("SELECT stats_reset::text FROM pg_stat_bgwriter")
+                .fetch_one(&self.pool)
+                .await;
+        let Ok(reset) = reset else { return };
+        let mut initial = self.initial_stats_reset.lock().expect("stats reset");
+        match initial.as_ref() {
+            None => *initial = Some(reset),
+            Some(first) if *first != reset => {
+                let message = format!("pg_stat_bgwriter.stats_reset changed from {first:?} to {reset:?}: the server went through crash recovery");
+                *initial = Some(reset);
+                drop(initial);
+                self.shared
+                    .violation("server_crash_recovery", message, vec![]);
+            }
+            Some(_) => {}
+        }
+    }
+
     async fn probe_server(&self) {
+        self.probe_stats_reset().await;
         let mut last_error = String::new();
         for attempt in 0..4 {
             match PgWatch::postmaster_start(&self.pool).await {
