@@ -82,6 +82,24 @@ const WAIT_DURATION_BUCKETS_SECONDS: [f64; 14] = [
     0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Latency histograms for sub-millisecond-to-seconds operations (claim,
+/// wake-to-claim, completion flush, promote), 0.5 ms to 30 s.
+const LATENCY_BUCKETS_SECONDS: [f64; 15] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
+    30.0,
+];
+
+/// Job execution time, 1 ms to 1 hour.
+const JOB_DURATION_BUCKETS_SECONDS: [f64; 16] = [
+    0.001, 0.005, 0.010, 0.050, 0.100, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0,
+    1800.0, 3600.0,
+];
+
+/// Batch sizes, capacities and row counts, powers of two up to 8192.
+const COUNT_BUCKETS: [f64; 15] = [
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+];
+
 /// Awa worker metrics backed by OpenTelemetry.
 #[derive(Clone)]
 pub struct AwaMetrics {
@@ -255,6 +273,7 @@ impl AwaMetrics {
                     "Direct queue-storage COPY enqueue: per-batch job count",
                 )
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             enqueue_duration_seconds: meter
                 .f64_histogram(names::ENQUEUE_DURATION)
@@ -310,11 +329,13 @@ impl AwaMetrics {
                 .f64_histogram(names::DISPATCH_WAKE_TO_CLAIM_DURATION)
                 .with_description("Time from dispatcher wake-up to first claim attempt")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             dispatch_capacity_available: meter
                 .u64_histogram(names::DISPATCH_CAPACITY_AVAILABLE)
                 .with_description("Number of permits available when a dispatcher wake is processed")
                 .with_unit("{permit}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             dispatch_empty_claims: meter
                 .u64_counter(names::DISPATCH_EMPTY_CLAIMS)
@@ -335,16 +356,19 @@ impl AwaMetrics {
                 .u64_histogram(names::DISPATCH_CLAIM_BATCH_SIZE)
                 .with_description("Dispatcher claim batch size")
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             claim_duration_seconds: meter
                 .f64_histogram(names::DISPATCH_CLAIM_DURATION)
                 .with_description("Dispatcher claim query duration")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             job_duration_seconds: meter
                 .f64_histogram(names::JOB_DURATION)
                 .with_description("Job execution duration")
                 .with_unit("s")
+                .with_boundaries(JOB_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             completion_flushes: meter
                 .u64_counter(names::COMPLETION_FLUSHES)
@@ -355,11 +379,13 @@ impl AwaMetrics {
                 .u64_histogram(names::COMPLETION_FLUSH_BATCH_SIZE)
                 .with_description("Completion batch flush size")
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             completion_flush_duration_seconds: meter
                 .f64_histogram(names::COMPLETION_FLUSH_DURATION)
                 .with_description("Completion batch flush duration")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             promotion_batches: meter
                 .u64_counter(names::MAINTENANCE_PROMOTE_BATCHES)
@@ -370,11 +396,13 @@ impl AwaMetrics {
                 .u64_histogram(names::MAINTENANCE_PROMOTE_BATCH_SIZE)
                 .with_description("Promotion batch size")
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             promotion_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_PROMOTE_DURATION)
                 .with_description("Promotion batch duration")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             jobs_in_flight: meter
                 .i64_up_down_counter(names::JOB_IN_FLIGHT)
@@ -481,6 +509,7 @@ impl AwaMetrics {
                     "Row count for the blocker side of a SkippedBusy rotation",
                 )
                 .with_unit("{row}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             maintenance_prune_attempts: meter
                 .u64_counter(names::MAINTENANCE_PRUNE_ATTEMPTS)
@@ -491,6 +520,7 @@ impl AwaMetrics {
                 .u64_histogram(names::MAINTENANCE_PRUNE_SKIPPED_ROWS)
                 .with_description("Magnitude of the reason count on a SkippedActive prune")
                 .with_unit("{row}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             maintenance_branch_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_BRANCH_DURATION)
@@ -1094,6 +1124,10 @@ impl Default for AwaMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+    use std::collections::BTreeMap;
 
     /// The info gauges are no-op under a default (global) meter provider —
     /// this just confirms the method signatures build and don't panic when
@@ -1126,5 +1160,160 @@ mod tests {
             &["outbound".to_string()],
         );
         metrics.record_job_kind_info("minimal", None, None, None, None, &[]);
+    }
+
+    /// A second-scale observation must not fall in the SDK's default
+    /// millisecond-scale buckets (upper bounds 5, 10, 25, ...), and every
+    /// histogram must export the intended explicit boundaries.
+    #[test]
+    fn histograms_export_explicit_boundaries() {
+        const SECONDS_SAMPLE: f64 = 0.02;
+        const COUNT_SAMPLE: u64 = 4096;
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        let seconds: [(&str, &Histogram<f64>, &[f64]); 8] = [
+            (
+                names::ENQUEUE_DURATION,
+                &metrics.enqueue_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::JOB_WAIT_DURATION,
+                &metrics.wait_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_BRANCH_DURATION,
+                &metrics.maintenance_branch_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::DISPATCH_WAKE_TO_CLAIM_DURATION,
+                &metrics.dispatch_wake_to_claim_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::DISPATCH_CLAIM_DURATION,
+                &metrics.claim_duration_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::COMPLETION_FLUSH_DURATION,
+                &metrics.completion_flush_duration_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_PROMOTE_DURATION,
+                &metrics.promotion_duration_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::JOB_DURATION,
+                &metrics.job_duration_seconds,
+                &JOB_DURATION_BUCKETS_SECONDS,
+            ),
+        ];
+        let counts: [(&str, &Histogram<u64>); 7] = [
+            (names::ENQUEUE_BATCH_SIZE, &metrics.enqueue_batch_size),
+            (
+                names::DISPATCH_CAPACITY_AVAILABLE,
+                &metrics.dispatch_capacity_available,
+            ),
+            (names::DISPATCH_CLAIM_BATCH_SIZE, &metrics.claim_batch_size),
+            (
+                names::COMPLETION_FLUSH_BATCH_SIZE,
+                &metrics.completion_flush_batch_size,
+            ),
+            (
+                names::MAINTENANCE_PROMOTE_BATCH_SIZE,
+                &metrics.promotion_batch_size,
+            ),
+            (
+                names::MAINTENANCE_ROTATE_SKIPPED_ROWS,
+                &metrics.maintenance_rotate_skipped_rows,
+            ),
+            (
+                names::MAINTENANCE_PRUNE_SKIPPED_ROWS,
+                &metrics.maintenance_prune_skipped_rows,
+            ),
+        ];
+
+        for (_, histogram, _) in &seconds {
+            histogram.record(SECONDS_SAMPLE, &[]);
+        }
+        for (_, histogram) in &counts {
+            histogram.record(COUNT_SAMPLE, &[]);
+        }
+        provider.force_flush().expect("flush metrics");
+
+        let mut exported: BTreeMap<String, (Vec<f64>, Vec<u64>)> = BTreeMap::new();
+        for resource in exporter.get_finished_metrics().expect("read metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let point = match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                            histogram.data_points().next().map(|point| {
+                                (point.bounds().collect(), point.bucket_counts().collect())
+                            })
+                        }
+                        AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                            histogram.data_points().next().map(|point| {
+                                (point.bounds().collect(), point.bucket_counts().collect())
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(point) = point {
+                        exported.insert(metric.name().to_string(), point);
+                    }
+                }
+            }
+        }
+
+        let mut expected_names: Vec<&str> = seconds
+            .iter()
+            .map(|(name, _, _)| *name)
+            .chain(counts.iter().map(|(name, _)| *name))
+            .collect();
+        expected_names.sort_unstable();
+        let exported_names: Vec<&str> = exported.keys().map(String::as_str).collect();
+        assert_eq!(
+            exported_names, expected_names,
+            "every histogram must be covered by this test"
+        );
+
+        // Index of the bucket holding the single recorded sample; the last
+        // bucket is unbounded.
+        let upper_bound_of_sample = |name: &str| -> Option<f64> {
+            let (bounds, bucket_counts) = &exported[name];
+            let index = bucket_counts
+                .iter()
+                .position(|count| *count == 1)
+                .unwrap_or_else(|| panic!("{name}: sample not recorded"));
+            bounds.get(index).copied()
+        };
+
+        for (name, _, expected_bounds) in &seconds {
+            assert_eq!(&exported[*name].0, expected_bounds, "{name} boundaries");
+            let upper = upper_bound_of_sample(name)
+                .unwrap_or_else(|| panic!("{name}: sample in the overflow bucket"));
+            assert!(
+                upper < 1.0,
+                "{name}: a {SECONDS_SAMPLE}s observation landed in the le={upper} bucket"
+            );
+        }
+        for (name, _) in &counts {
+            assert_eq!(&exported[*name].0, &COUNT_BUCKETS, "{name} boundaries");
+            assert_eq!(
+                upper_bound_of_sample(name),
+                Some(COUNT_SAMPLE as f64),
+                "{name}: sample bucket"
+            );
+        }
     }
 }
