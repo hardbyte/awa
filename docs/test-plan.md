@@ -13,6 +13,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | T1 | No duplicate processing (100k jobs) | ✓ |  |
 | T4 | `kill -9` crash recovery | ✓ |  |
 | T5 | Deadline rescue (hung job) | ✓ |  |
+| T5a | Poison jobs (handler panic, crash loop, deadline loop) stop at `max_attempts` on both engines | ✓ |  |
 | T6 | Transactional atomicity | ✓ |  |
 | T7 | Transactional atomicity (Python) |  | ✓ |
 | T8 | Uniqueness under contention | ✓ | ✓ |

@@ -74,6 +74,20 @@ Notable changes between releases. Detailed migration notes for storage transitio
   args read back one unit in the last place off. serde_json's
   `float_roundtrip` feature is now enabled in the workspace and in the Python
   bindings.
+- **Poison jobs no longer cycle forever.** A job whose worker crashed or hung
+  on every attempt was rescued back to `retryable` indefinitely: stale-heartbeat
+  and deadline rescue never checked `max_attempts`, so `attempt` climbed past
+  it, on both storage engines. Those rescues now fail the job once its attempts
+  are spent, as callback timeouts already did, and on queue storage a
+  DLQ-enabled queue dead-letters it with reason `heartbeat_stale` or
+  `deadline_exceeded`. A job with `max_attempts = 1` that loses its worker
+  therefore fails instead of running again. Rescue runs on the maintenance
+  leader, so the new behaviour applies once the leader runs this release.
+- **A panicking Rust handler is a failed attempt.** A panic used to escape the
+  job task: the job stayed registered in flight, kept heartbeating until its
+  deadline rescued it (5 minutes by default), and its message was lost. The
+  executor now catches the panic and records `handler panicked: <message>` as
+  a retryable failure.
 
 ## [0.6.12] — 2026-11-05
 

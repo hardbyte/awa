@@ -109,7 +109,7 @@ If `heartbeat_alive` or `maintenance_alive` is false for the active runtime, fix
 ### Recovery Options
 
 - if the job is still making progress, leave it alone
-- if the worker is gone, wait for rescue to move it back to `retryable`
+- if the worker is gone, wait for rescue to move it back to `retryable`, or to `failed` (or the DLQ) when that attempt was the job's last
 - if you need operator intervention now, cancel it:
 
 ```bash
@@ -397,8 +397,12 @@ awa --database-url "$DATABASE_URL" dlq list --queue email
 
 - `terminal_error`
 - `max_attempts_exhausted`
+- `heartbeat_stale`
+- `deadline_exceeded`
 - `callback_timeout`
 - an operator-supplied reason from `awa dlq move`
+
+A burst of `heartbeat_stale` or `deadline_exceeded` from one kind usually means a poison job: one that crashes or hangs its worker on every attempt. Each of those attempts counts against `max_attempts`, so the job stops after its last one instead of cycling.
 
 Useful actions:
 
@@ -498,7 +502,7 @@ Escalate beyond normal operator actions when:
 
 - `running` jobs are accumulating and no instance reports a healthy leader
 - `last_seen_at` is stale for every runtime instance
-- jobs repeatedly rescue and retry without making progress
+- jobs repeatedly rescue and retry without making progress (rescued attempts count against `max_attempts`, so a job that does this ends in `failed` or the DLQ)
 - you need to change the schema state manually
 
 At that point, inspect worker logs, Postgres health, and recent deployment events together.
