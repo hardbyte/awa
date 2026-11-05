@@ -290,6 +290,17 @@ Rings rotate only when active — a frozen generation on an idle queue is health
 The condition to alert on is a frozen generation *with* accumulating rows
 (`skipped_busy`): a pinned ring, almost always caused by a long-held snapshot.
 
+## Prune Lock Timeout
+
+Ring prune takes exclusive locks under a `lock_timeout` of 10 ms by default;
+when it cannot, it rolls back and counts `blocked` in
+`awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. Persistent
+`blocked` (or `error`) means the rings are not recycling. Raise
+`ClientBuilder::prune_lock_timeout` (Python
+`queue_storage_prune_lock_timeout_ms`) in steps when short readers of the ring
+partitions are the cause. `backed_off` means prune was skipped for a few ticks
+after repeated `skipped_active`.
+
 ## Ring Rotation Cadence
 
 For queue storage, `ClientBuilder::ring_rotation_cadence` seals a slot after a
