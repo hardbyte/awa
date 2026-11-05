@@ -11,7 +11,7 @@
 # Environment:
 #   AWA_SOAK_SECONDS          load phase length per engine (default 900)
 #   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos,
-#                             watchers,support,uiops,impatient,python
+#                             watchers,support,uiops,impatient,python,fanout
 #   AWA_SOAK_SEED             fixes the workload mix and chaos schedule
 #   AWA_SOAK_SCALE            multiplies rates and queue counts (default 1)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)

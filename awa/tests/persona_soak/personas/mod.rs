@@ -3,6 +3,7 @@
 
 pub mod alex;
 pub mod chaos;
+pub mod fanout;
 pub mod mia;
 pub mod priya;
 pub mod python;

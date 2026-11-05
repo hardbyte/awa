@@ -19,10 +19,12 @@ pub enum Persona {
     Impatient,
     /// A separate Python process: producers, async workers and the migrate path.
     Python,
+    /// Handlers that batch-insert unique child jobs into their own queue.
+    Fanout,
 }
 
 impl Persona {
-    pub const ALL: [Persona; 11] = [
+    pub const ALL: [Persona; 12] = [
         Persona::Mia,
         Persona::Tom,
         Persona::Priya,
@@ -34,6 +36,7 @@ impl Persona {
         Persona::UiOps,
         Persona::Impatient,
         Persona::Python,
+        Persona::Fanout,
     ];
 
     pub fn name(self) -> &'static str {
@@ -49,6 +52,7 @@ impl Persona {
             Persona::UiOps => "uiops",
             Persona::Impatient => "impatient",
             Persona::Python => "python",
+            Persona::Fanout => "fanout",
         }
     }
 
@@ -69,7 +73,7 @@ impl FromStr for Persona {
             .into_iter()
             .find(|persona| persona.name() == value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python")
+                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout")
             })
     }
 }

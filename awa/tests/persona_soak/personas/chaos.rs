@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 /// The advisory lock the maintenance leader holds for as long as it leads.
 const MAINTENANCE_LEADER_LOCK_KEY: i64 = 0x4157_415f_4d41_494e;
-const RUNTIME_FLEETS: [&str; 5] = ["mia", "tom", "priya", "sam", "sam-stripe"];
+const RUNTIME_FLEETS: [&str; 6] = ["mia", "tom", "priya", "sam", "sam-stripe", "fanout"];
 
 async fn kill_runtime(shared: &Arc<Shared>, rng: &mut Rng) {
     let Some(&name) = rng.pick(&RUNTIME_FLEETS) else {
