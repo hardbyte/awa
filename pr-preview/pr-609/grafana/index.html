@@ -2695,7 +2695,7 @@
 <p>The dashboards never reference a deployment label directly, so no edit is needed when a fleet runs in several environments behind one datasource: pick the environment in <code>filters</code>.</p>
 <p>Queue depth, queue lag, DLQ depth and the descriptor info gauges are published by the maintenance leader (or by every runtime, for the info gauges), so the dashboards collapse them with <code>max by (...)</code> to stay correct during a leader handover and when the metrics pipeline keeps per-instance labels.</p>
 <h3 id="overview-panels">Overview panels<a class="headerlink" href="#overview-panels" title="Permanent link">&para;</a></h3>
-<p>The overview opens with fleet stats (error rate, oldest available job, deferred jobs, DLQ depth, throughput, in-flight, rescues, live runtimes) followed by these rows:</p>
+<p>The overview opens with fleet stats in triage order (oldest job, DLQ, error rate, throughput, in flight, deferred, rescues, runtimes; the first four carry a sparkline) followed by these rows:</p>
 <table>
 <thead>
 <tr>
@@ -2739,6 +2739,9 @@
 </tbody>
 </table>
 <p>Panels backed by metrics that a release does not emit render empty; the job output, staged follow-up, <code>awa_completion_reconnect_retry_total</code> and prune duration series arrive in 0.7.</p>
+<p>Fleets can have hundreds of queues, so the per-queue panels (queue lag, deepest queues, deferred backlog, throughput, in-flight and claim rate by queue, top kinds, and the queue detail dashboard's other-queue panels) draw the ten series with the highest value over the selected time range. The set is fixed for the whole range, and the legend is a table sorted by its maximum. Use the <strong>Queue</strong> variable to look at a specific queue.</p>
+<p>Event counters such as failures, retries, DLQ moves and parked jobs only exist after their first event, so those panels read "None in range" on a healthy fleet.</p>
+<p>Quantiles of the duration histograms (job duration, claim latency, wake-to-first-claim, completion flush, promotion duration) need AWA 0.6.13 or later; earlier versions export buckets that are too coarse below 5 s. Each of those panels also plots a dashed <code>mean</code> series, which is correct on every version.</p>
 <h3 id="panel-reference">Panel reference<a class="headerlink" href="#panel-reference" title="Permanent link">&para;</a></h3>
 <table>
 <thead>

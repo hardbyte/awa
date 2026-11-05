@@ -56,7 +56,7 @@ Queue depth, queue lag, DLQ depth and the descriptor info gauges are published b
 
 ### Overview panels
 
-The overview opens with fleet stats (error rate, oldest available job, deferred jobs, DLQ depth, throughput, in-flight, rescues, live runtimes) followed by these rows:
+The overview opens with fleet stats in triage order (oldest job, DLQ, error rate, throughput, in flight, deferred, rescues, runtimes; the first four carry a sparkline) followed by these rows:
 
 | Row | What it answers |
 | --- | --- |
@@ -70,6 +70,12 @@ The overview opens with fleet stats (error rate, oldest available job, deferred 
 | **Job outputs & follow-ups (0.7+)**, **Descriptor catalogs**, **Storage transition** | Collapsed by default. |
 
 Panels backed by metrics that a release does not emit render empty; the job output, staged follow-up, `awa_completion_reconnect_retry_total` and prune duration series arrive in 0.7.
+
+Fleets can have hundreds of queues, so the per-queue panels (queue lag, deepest queues, deferred backlog, throughput, in-flight and claim rate by queue, top kinds, and the queue detail dashboard's other-queue panels) draw the ten series with the highest value over the selected time range. The set is fixed for the whole range, and the legend is a table sorted by its maximum. Use the **Queue** variable to look at a specific queue.
+
+Event counters such as failures, retries, DLQ moves and parked jobs only exist after their first event, so those panels read "None in range" on a healthy fleet.
+
+Quantiles of the duration histograms (job duration, claim latency, wake-to-first-claim, completion flush, promotion duration) need AWA 0.6.13 or later; earlier versions export buckets that are too coarse below 5 s. Each of those panels also plots a dashed `mean` series, which is correct on every version.
 
 ### Panel reference
 
