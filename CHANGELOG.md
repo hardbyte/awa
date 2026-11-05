@@ -48,6 +48,19 @@ Notable changes between releases. Detailed migration notes for storage transitio
   same way. The cooldown is now `2 x ceil(body_duration / interval)` ticks,
   capped at the previous 120, so a merely slow branch settles at roughly a
   third duty cycle while a pathologically slow one stays bounded.
+- **A duplicate unique follow-up no longer fails the job that triggered it.**
+  A follow-up enqueued with unique options whose key already existed returned
+  `UniqueConflict` from the follow-up `INSERT`, which aborted the trigger's
+  transaction and rolled back its completion (or other outcome). The executor
+  does not retry a unique conflict, so the attempt stayed running until
+  rescue, re-ran, hit the same conflict, and failed once its attempts ran out;
+  every trigger after the first failed this way. Each follow-up with unique
+  options now inserts under a savepoint, and a conflict on the unique-key
+  index skips the duplicate while the trigger commits and the existing
+  follow-up stands. Any other unique violation, or a follow-up without unique
+  options, still rolls the trigger back as before. The guide to
+  [lifecycle hooks](docs/lifecycle-hooks.md) gains a section on deduplicating
+  follow-ups.
 
 ## [0.6.12] — 2026-11-05
 
