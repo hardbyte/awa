@@ -4,6 +4,22 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.13] — 2026-11-06
+
+Ships everything in 0.6.13-alpha.1, which soaked without regressions, plus the batch-enqueue deadlock fix.
+
+### Added
+
+- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
+  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
+  take a per-queue predicate and dead-letter exhausted attempts in the rescue
+  transaction. The existing methods keep their behaviour and fail exhausted
+  attempts into `done_entries`.
+
+### Changed
+
+- **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
+
 ### Fixed
 
 - **Batch enqueues take their lane locks in one order, so they no longer
@@ -22,22 +38,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
   transaction that enqueues with separate statements still takes locks in
   statement order; see "`deadlock detected` while enqueueing" in the
   troubleshooting guide.
-
-## [0.6.13-alpha.1] — 2026-11-05
-
-### Added
-
-- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
-  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
-  take a per-queue predicate and dead-letter exhausted attempts in the rescue
-  transaction. The existing methods keep their behaviour and fail exhausted
-  attempts into `done_entries`.
-
-### Changed
-
-- **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
-
-### Fixed
 
 - **Scheduled, snoozed and retry-after jobs are no longer held back while
   the maintenance leader is overloaded.** The leader backs a maintenance
