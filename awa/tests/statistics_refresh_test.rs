@@ -548,7 +548,24 @@ async fn statistics_refresh_does_not_stop_prune_reclaiming_slots() {
     );
     assert!(pruned >= 20, "prune reclaimed {pruned} slots");
 
-    // With the refresh stopped, the oldest sealed slot reclaims immediately.
+    // Shutdown can leave one ANALYZE statement finishing server-side; once it
+    // is gone the oldest sealed slot reclaims without being blocked.
+    wait_for(
+        "the last ANALYZE to finish",
+        Duration::from_secs(30),
+        || async {
+            let running: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+             WHERE state = 'active' AND query LIKE '%analyze_queue_storage_relation%'
+               AND pid <> pg_backend_pid()",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read pg_stat_activity");
+            running == 0
+        },
+    )
+    .await;
     store.rotate(pool).await.expect("rotate");
     assert!(!matches!(
         store
