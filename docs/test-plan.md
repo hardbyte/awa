@@ -304,6 +304,55 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V28 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
 | V29 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
 
+## Persona soak
+
+`awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`) runs several
+application-shaped workloads concurrently against one database, the way different
+applications share an `awa` schema, and fails the run on any invariant violation.
+
+| Persona | Workload | Stresses |
+| --- | --- | --- |
+| Mia, ML pipeline | jobs of 0.1-60 s with per-job deadlines, progress updates, retries into the DLQ, handler cancels, latency spikes | deadline and stale-heartbeat rescues racing heartbeats and completions, DLQ |
+| Tom, multi-tenant | 100 queues at a low rate each, unique jobs, scheduled jobs, cron every 10 s on two runtimes, mixed priorities with aging | lane and queue cardinality, per-queue maintenance, cron fencing |
+| Priya, firehose | one hot queue, 100k-row `insert_many` bursts, COPY batches, steady small batches, tiny jobs, three runtimes | bind-parameter limit, ring rotation and prune, claim contention |
+| Sam, ordered streams | a queue with 4 enqueue shards and 64 ordering keys, a 4-stripe queue (`queue_stripe_count`), scheduled jobs, a rate-limited queue | routing, promotion, fairness |
+| Alex, operator | pause/resume, drain, cancel and bulk cancel, move and reprioritise batch operations, DLQ retry and purge, the admin read queries, rolling restarts of other personas' runtimes | admin paths under live load |
+| Chaos | kills a runtime without a shutdown handshake, terminates the maintenance leader's connection and random runtime connections, exhausts a runtime's pool, holds an idle-in-transaction session | recovery paths |
+
+The oracle checks, while the load runs and again after it stops:
+
+- a job attempt with more than one terminal row (`done_entries`, `dlq_entries`, compact receipt completions), a job reported completed twice, and a job that is terminal and still available, deferred or leased
+- a cancelled job nobody asked to cancel, an operator cancel that overwrote a completion, and a handler that started after its operator cancel committed
+- a queue with claimable jobs and idle workers whose claim cursor stops advancing (stall), and scheduled jobs overdue beyond a threshold (promotion stall)
+- a lost job: enqueued, never terminal after the system quiesces, and not removed by an operator action; a cron fire that produced more than one job
+- a server crash: `pg_postmaster_start_time()` changing, or `terminated by signal`, `TRAP:`, `server process (PID` and similar lines in the Postgres log
+
+Terminal rows are pruned by ring rotation within seconds, so the oracle keeps a
+client-side ledger (job ids per persona, executions per job, lifecycle events,
+operator actions) and reconciles it with the database. Time-based checks are widened
+while a chaos action is recovering.
+
+Environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `AWA_SOAK_DATABASE_URL` | required; database name must match `awa_soak[A-Za-z0-9_]*` and is dropped and recreated |
+| `AWA_SOAK_PERSONAS` | comma list of `mia,tom,priya,sam,alex,chaos`, default all |
+| `AWA_SOAK_SECONDS` | load phase length, default 900 |
+| `AWA_SOAK_SEED` | fixes the workload mix and chaos schedule; printed at start |
+| `AWA_SOAK_SCALE` | multiplies rates, burst sizes and queue counts, default 1 |
+| `AWA_SOAK_DRAIN_GRACE_SECONDS` | how long to wait for the system to quiesce after load stops, default 120 |
+| `AWA_SOAK_PG_LOG` / `AWA_SOAK_PG_CONTAINER` / `AWA_SOAK_PG_CONTAINER_LOG` | where to read the server log for the crash scan: a file on this host, or a Docker container (with an optional log path inside it, otherwise `docker logs`) |
+| `AWA_SOAK_REPORT_DIR` | where `report.md`, `report.json` and, for a failed run, `reproducer.md` are written |
+| `AWA_SOAK_STALL_SECONDS`, `AWA_SOAK_PROMOTION_OVERDUE_SECONDS`, `AWA_SOAK_CHAOS_SLACK_SECONDS` | oracle thresholds |
+
+The report records the engine, server version, `max_connections`, connections at
+start and the per-persona connection budget. A failed run leaves `reproducer.md`
+with the seed, personas and duration, the violating rows, the timeline around each
+violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the
+engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18
+image) in private containers on separate ports and removes them afterwards.
+
 ## Running Tests
 
 ```bash
@@ -327,6 +376,17 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python" \
   cargo test --package awa --test chaos_suite_test \
   -- --ignored --test-threads=1 --nocapture
+
+# Persona soak: Mia (ML pipeline), Tom (multi-tenant fan-out), Priya (firehose),
+# Sam (ordered streams), Alex (operator) and a chaos agent run together against one
+# disposable database on the queue-storage engine, checked by an invariant oracle.
+# The database name must start with `awa_soak`; it is dropped and recreated.
+AWA_SOAK_DATABASE_URL=postgres://postgres:test@localhost:15432/awa_soak_run \
+  AWA_SOAK_SECONDS=900 \
+  cargo test --release -p awa --test persona_soak_test -- --ignored --nocapture
+
+# The same soak against throwaway PostgreSQL 17, 18 and assert-enabled 18 containers
+scripts/persona-soak.sh            # or: scripts/persona-soak.sh pg17
 
 # Postgres hot-standby promotion smoke (boots primary + replica + stable proxy endpoint via Docker Compose)
 cargo test --package awa --test postgres_failover_smoke_test -- --ignored --nocapture
