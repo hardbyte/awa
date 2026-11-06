@@ -627,7 +627,11 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     wait_until(
         scaled_timeout(Duration::from_secs(120)),
         "the retried jobs to complete",
-        || async { recovered.lock().expect("recovered").len() as i64 >= ABANDONED - exhausted },
+        || async {
+            count(&pool, format!(
+                "SELECT count(*) FROM awa.terminal_jobs WHERE queue = '{ABANDONED_QUEUE}' AND state = 'completed'"
+            )).await == ABANDONED - exhausted
+        },
     )
     .await;
     recovery.shutdown(Duration::from_secs(10)).await;
@@ -636,12 +640,12 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         assert_eq!(recovered.len() as i64, ABANDONED - exhausted);
         let unexpected: Vec<_> = recovered
             .iter()
-            .filter(|(_, runs)| runs.first() != Some(&(2, true)))
+            .filter(|(_, runs)| runs.as_slice() != [(2, true)])
             .take(5)
             .collect();
         assert!(
             unexpected.is_empty(),
-            "each retried job first runs on attempt 2, with the rescue recorded: {unexpected:?}"
+            "each retried job runs exactly once on attempt 2, with the rescue recorded: {unexpected:?}"
         );
     }
 
@@ -668,19 +672,13 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         0,
         "rescue took a claim from the live runtime"
     );
-    // On this line a retried job's finished attempt can still be rescued
-    // from the recovery runtime, as it was before bounded rescue, so only
-    // the live runtime's claims are checked here.
     {
         let rescues = rescues.lock().expect("rescues");
-        let live_rescued: Vec<_> = rescues
-            .iter()
-            .filter(|(_, rescued)| rescued.iter().any(|(queue, _)| *queue == LIVE_QUEUE))
-            .take(5)
-            .collect();
+        assert_eq!(rescues.len() as i64, ABANDONED);
+        let unexpected = rescued_twice(&rescues);
         assert!(
-            live_rescued.is_empty(),
-            "no claim of the live runtime was rescued: {live_rescued:?}"
+            unexpected.is_empty(),
+            "neither live nor recovered attempts may be rescued: {unexpected:?}"
         );
     }
     let live_runs = live_runs.lock().expect("live runs");
