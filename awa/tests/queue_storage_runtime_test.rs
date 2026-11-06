@@ -15762,9 +15762,9 @@ async fn test_queue_storage_prune_lock_timeout_after_child_locks_reports_blocked
         .await;
     }
 
-    // Hosted Postgres background workers can briefly hold a partition after
-    // the test's own locks are gone. Only Blocked may defer the prune; every
-    // error or other outcome still fails below.
+    // Other activity can briefly hold a partition after the test's own
+    // locks are gone. Only Blocked may defer the prune; every error or other
+    // outcome still fails below.
     let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
     let pruned = loop {
         let pruned = store
@@ -15839,7 +15839,7 @@ async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_re
     assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
 
-    // As above, a background lock may briefly block a slot after ours is
+    // As above, a transient lock may briefly block a slot after ours is
     // released. Slots rolled by a partly blocked pass stay rolled, so count
     // them across attempts.
     let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
@@ -21917,4 +21917,215 @@ async fn test_point_read_uses_live_ready_queue_after_ring_wrap() {
         job.queue, "point_read_destination",
         "point read must ignore the tombstoned source"
     );
+}
+
+/// A reader's first query can establish its snapshot before waiting on its
+/// ready relation lock. Queue prune must finish its failed-row carry before
+/// that snapshot, or TRUNCATE hides the source and the new carried version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_point_read_first_snapshot_follows_ready_prune_carry() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_first_snapshot_ready_carry";
+    let queue = "first_snapshot_ready_carry";
+    let bound = ci_timing::scaled_timeout(Duration::from_secs(10));
+    let store = Arc::new(
+        create_store(&pool, schema)
+            .await
+            .with_prune_lock_timeout(ci_timing::scaled_timeout(Duration::from_secs(20)))
+            .expect("bound the controlled prune lock wait"),
+    );
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 315 },
+        InsertOpts {
+            queue: queue.into(),
+            metadata: serde_json::json!({"ready_prune_guard": "retained payload"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim the retained failed job");
+    assert_eq!(claimed.len(), 1);
+    let run_lease = claimed[0].job.run_lease;
+    store
+        .fail_terminal(&pool, job_id, run_lease, "retained failure", None)
+        .await
+        .expect("fail the retained job")
+        .expect("the attempt was running");
+    let before = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load the original failed job")
+        .expect("the failed job exists");
+    assert_eq!(before.state, JobState::Failed);
+    assert!(matches!(
+        store.rotate(&pool).await.expect("seal slot zero"),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    // Distinct one-connection pools keep the observed backend identities
+    // stable across the two public operations and their relation waits.
+    let pruner_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .application_name("awa_ready_carry_pruner"),
+        )
+        .await
+        .expect("connect the controlled pruner");
+    let reader_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .application_name("awa_ready_carry_reader"),
+        )
+        .await
+        .expect("connect the controlled reader");
+    let pruner_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&pruner_pool)
+        .await
+        .expect("identify the pruner");
+    let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&reader_pool)
+        .await
+        .expect("identify the reader");
+
+    let mut carry_gate = pool.begin().await.expect("begin the carry gate");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_1 IN SHARE MODE"
+    )))
+    .execute(carry_gate.as_mut())
+    .await
+    .expect("hold the live carry destination");
+    let prune_store = store.clone();
+    let prune_connection = pruner_pool.clone();
+    let mut pruner = tokio::spawn(async move {
+        prune_store
+            .prune_oldest(&prune_connection, Duration::from_secs(3600))
+            .await
+    });
+    let mut reader = None;
+    let wait_sql = r#"
+        SELECT activity.query
+        FROM pg_stat_activity AS activity
+        JOIN pg_locks AS locks ON locks.pid = activity.pid
+        WHERE activity.pid = $1
+          AND activity.datid = (SELECT oid FROM pg_database
+                                WHERE datname = current_database())
+          AND activity.state = 'active'
+          AND activity.wait_event_type = 'Lock'
+          AND activity.query LIKE $3
+          AND locks.locktype = 'relation'
+          AND locks.relation = to_regclass($2)
+          AND NOT locks.granted
+        LIMIT 1
+    "#;
+    let observed = tokio::time::timeout(bound, async {
+        loop {
+            let waiting: Option<String> = sqlx::query_scalar(wait_sql)
+                .bind(pruner_pid)
+                .bind(format!("{schema}.done_entries_1"))
+                .bind(format!("%INSERT INTO {schema}.done_entries%"))
+                .fetch_optional(&pool)
+                .await?;
+            if waiting.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let read_store = store.clone();
+        let read_connection = reader_pool.clone();
+        reader = Some(tokio::spawn(async move {
+            read_store.load_job(&read_connection, job_id).await
+        }));
+        loop {
+            let waiting: Option<String> = sqlx::query_scalar(wait_sql)
+                .bind(reader_pid)
+                .bind(format!("{schema}.ready_entries_0"))
+                .bind(format!("%{schema}.ready_entries%"))
+                .fetch_optional(&pool)
+                .await?;
+            if let Some(query) = waiting {
+                return Ok::<_, sqlx::Error>(query);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    // Release every gate and join both tasks before outcome assertions, so
+    // the old-source negative control cannot strand a read or lock holder.
+    let released = tokio::time::timeout(bound, carry_gate.rollback()).await;
+    let prune_result = match tokio::time::timeout(bound, &mut pruner).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            pruner.abort();
+            let _ = pruner.await;
+            None
+        }
+    };
+    let read_result = match reader {
+        Some(mut task) => match tokio::time::timeout(bound, &mut task).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                None
+            }
+        },
+        None => None,
+    };
+    let pruner_closed = tokio::time::timeout(bound, pruner_pool.close()).await;
+    let reader_closed = tokio::time::timeout(bound, reader_pool.close()).await;
+
+    released
+        .expect("release the carry gate within the bound")
+        .expect("roll back the carry gate");
+    pruner_closed.expect("close the pruner pool");
+    reader_closed.expect("close the reader pool");
+    let waiting_query = observed
+        .expect("observe both exact relation waits within the bound")
+        .expect("query the relation waits");
+    let pruned = prune_result
+        .expect("prune finishes within the bound")
+        .expect("join the pruner")
+        .expect("prune succeeds after the carry gate releases");
+    assert!(
+        matches!(
+            pruned,
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 1,
+                ..
+            }
+        ),
+        "the real prune must carry the failed row: {pruned:?}"
+    );
+    let loaded = read_result
+        .expect("reader finishes within the bound")
+        .expect("join the reader")
+        .expect("the public read succeeds")
+        .unwrap_or_else(|| {
+            panic!("retained failed job disappeared; reader waited in {waiting_query}")
+        });
+    let fresh = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load after prune commits")
+        .expect("the retained failed job still exists");
+    for row in [&loaded, &fresh] {
+        assert_eq!(row.id, job_id);
+        assert_eq!(row.state, JobState::Failed);
+        assert_eq!(row.run_lease, run_lease);
+        assert_eq!(row.args, before.args);
+        assert_eq!(row.metadata, before.metadata);
+        assert_eq!(row.finalized_at, before.finalized_at);
+    }
 }
