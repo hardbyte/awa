@@ -6,6 +6,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
@@ -254,8 +259,12 @@ for each step.
   runtime role keeps working; only the migration is refused. Before upgrading,
   remove `TRIGGER` from runtime-role grants, which `GRANT ALL ON ALL TABLES`
   includes, remove runtime roles' `CREATE` on the schema, and remove triggers
-  of your own from awa tables. Revoking a running 0.6 fleet's `CREATE` needs
-  the order in the upgrade guide.
+  of your own from awa tables. A 0.6 fleet whose runtime role holds `CREATE`
+  keeps running throughout: as the migrator, run
+  `awa storage prepare-create-revoke`, run the sequence grants it prints as
+  the role it names, then its `REVOKE` statements, then `awa migrate`. A queue
+  first used after that needs `awa storage prepare-queue` before its first
+  enqueue.
 - **External migration runners.** Generate the pending SQL with an upgraded
   binary, for example `awa migrate --pending --extract-to ./pending`, apply
   complete bundles, and keep the files already applied unchanged. Apply
@@ -353,6 +362,14 @@ for each step.
 
 ### Added
 
+- **`awa storage prepare-create-revoke`** prepares a database still used by
+  0.6 runtimes for revoking their schema `CREATE` without stopping them. It
+  swaps 0.6's lane helpers for ones that create a lane sequence only when it
+  is missing, provisions every priority and shard of each queue in use, and
+  prints the `REVOKE` statements and the sequence grants to run next. A schema
+  that breaks any other migration trust rule is reported and left unchanged.
+  In a rehearsal with released awa-pg 0.6.9, revoking without it failed every
+  enqueue; with it, nothing failed.
 - **Job output ([ADR-048](docs/adr/048-retained-job-output.md), [guide](docs/job-output.md)).**
   A handler can record a JSON output of up to 4 KiB with `ctx.set_output`
   (`ctx.output_slot()` for `register` closures) or `job.set_output` in Python.
@@ -763,6 +780,9 @@ for each step.
   `running = 0` while workers held receipt claims, and scanned every ready
   partition with a catalog lookup per row (about 90 ms to 6 ms for that part
   on a 20,000-row backlog). Released 0.6.x workers keep working against v044.
+- **`awa storage prepare-queue` works on lanes a 0.6 runtime created.** It
+  failed with `42501` on any such lane, because inserting the lane's existing
+  head rows fired a trigger that read a sequence the runtime role owns.
 - **Queue pruning no longer deadlocks with claims.** It takes child-partition
   locks without waiting and, on contention, retries on the next maintenance
   tick.

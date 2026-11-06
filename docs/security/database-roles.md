@@ -86,7 +86,9 @@ Apply the sequence grants above after provisioning, or set the owner's default
 privileges first. Lane cursors need `UPDATE` for `setval`, in addition to `USAGE`
 and `SELECT`. `CREATE SEQUENCE IF NOT EXISTS` requires schema CREATE even when
 the sequence already exists, so provisioning alone does not repair pre-v049
-helpers: apply the migration first. Schema owners retain lazy creation for
+helpers: apply the migration first, or, under a running 0.6 fleet, run
+`awa storage prepare-create-revoke` as described in the
+[0.6→0.7 upgrade guide](../upgrade-0.6-to-0.7.md#custom-schema-discovery-during-migration). Schema owners retain lazy creation for
 single-role installations; a restricted runtime encountering an unprepared
 lane fails with a provisioning hint.
 

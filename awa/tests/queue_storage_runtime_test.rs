@@ -6,6 +6,8 @@
 #[path = "../../awa-model/src/storage_footprint_sql.rs"]
 mod storage_footprint_sql;
 
+mod ci_timing;
+
 use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
@@ -447,6 +449,32 @@ async fn create_store_with_config(pool: &sqlx::PgPool, config: QueueStorageConfi
     store.reset(pool).await.expect("Failed to reset store");
     activate_queue_storage_transition(pool, store.schema()).await;
     store
+}
+
+/// Prune's success/accounting assertions allow a transient competing lock.
+/// Retry only the expected slot's Blocked result; errors and other outcomes
+/// still reach the caller's original assertions without being retried.
+async fn prune_until_not_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+    slot: i32,
+) -> PruneOutcome {
+    tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(5)), async {
+        loop {
+            let outcome = store
+                .prune_oldest(pool, retention)
+                .await
+                .expect("prune_oldest");
+            if matches!(outcome, PruneOutcome::Blocked { slot: blocked } if blocked == slot) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("prune remained Blocked past the assertion deadline")
 }
 
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
@@ -13332,11 +13360,7 @@ async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 0).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 2,
@@ -13614,11 +13638,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 0).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
@@ -13662,11 +13682,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
 
     // Second prune: current slot is 0, so the oldest sealed non-current
     // slot is slot 1 (the carried row). It is carried again into slot 0.
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest re-carry")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 1).await {
         PruneOutcome::Pruned {
             slot: 1,
             carried_failed_rows: 1,
@@ -15622,10 +15638,7 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         .await
         .expect("Failed to release reader lock");
 
-    let pruned = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune after reader lock release");
+    let pruned = prune_until_not_blocked(&store, &pool, Duration::ZERO, 0).await;
     assert!(
         matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
@@ -21092,4 +21105,115 @@ async fn test_queue_storage_legacy_row_claims_are_locked_before_the_heartbeat_st
         .await
         .expect("join heartbeat")
         .expect("heartbeat after the rewrite");
+}
+
+/// A lane move leaves immutable source rows behind. Wrap the ring so the
+/// destination is in an earlier partition: point reads must use live evidence,
+/// rather than depending on which equal-timestamp ready row the plan emits last.
+async fn ready_point_read_wrap_fixture() -> (TestDbGuard, sqlx::PgPool, QueueStorage, i64) {
+    let (guard, pool) = setup_pool(4).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_point_read_wrap".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // A fresh empty ring can be positioned just before wrap without retaining
+    // unrelated jobs. This is the state reached after three rotations/prunes.
+    let schema = store.schema();
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) VALUES (3, 3)"
+    )))
+    .execute(&pool)
+    .await
+    .expect("position empty ring before wrap");
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_ring_slots SET generation = 3 WHERE slot = 3"
+    )))
+    .execute(&pool)
+    .await
+    .expect("set current slot generation");
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: "point_read_source".to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        store.rotate(&pool).await.expect("wrap to slot zero"),
+        RotateOutcome::Rotated { slot: 0, .. }
+    ));
+    (guard, pool, store, job_id)
+}
+
+async fn assert_live_ready_row(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+    expected_queue: &str,
+    expected_priority: i16,
+) {
+    let schema = store.schema();
+    let live: Vec<(String, i16, i32)> = sqlx::query_as(audited_sql(format!(
+        "SELECT ready.queue, ready.priority, ready.ready_slot
+         FROM {schema}.ready_entries AS ready
+         WHERE ready.job_id = $1
+           AND NOT EXISTS (
+               SELECT 1 FROM {schema}.ready_tombstones AS tomb
+               WHERE tomb.ready_slot = ready.ready_slot
+                 AND tomb.ready_generation = ready.ready_generation
+                 AND tomb.queue = ready.queue
+                 AND tomb.priority = ready.priority
+                 AND tomb.enqueue_shard = ready.enqueue_shard
+                 AND tomb.lane_seq = ready.lane_seq
+           )"
+    )))
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .expect("read live ready evidence");
+    assert_eq!(
+        live,
+        vec![(expected_queue.to_string(), expected_priority, 0)]
+    );
+}
+
+#[tokio::test]
+async fn test_point_read_uses_live_ready_priority_after_ring_wrap() {
+    let (_guard, pool, store, job_id) = ready_point_read_wrap_fixture().await;
+    assert!(store
+        .set_priority(&pool, job_id, 1)
+        .await
+        .expect("set priority"));
+    assert_live_ready_row(&pool, &store, job_id, "point_read_source", 1).await;
+    let job = admin::get_job(&pool, job_id).await.expect("read moved job");
+    assert_eq!(
+        job.priority, 1,
+        "point read must ignore the tombstoned source"
+    );
+}
+
+#[tokio::test]
+async fn test_point_read_uses_live_ready_queue_after_ring_wrap() {
+    let (_guard, pool, store, job_id) = ready_point_read_wrap_fixture().await;
+    assert!(store
+        .move_queue(&pool, job_id, "point_read_destination", None)
+        .await
+        .expect("move queue"));
+    assert_live_ready_row(&pool, &store, job_id, "point_read_destination", 4).await;
+    let job = admin::get_job(&pool, job_id).await.expect("read moved job");
+    assert_eq!(
+        job.queue, "point_read_destination",
+        "point read must ignore the tombstoned source"
+    );
 }

@@ -469,3 +469,312 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
         history: None,
     })
 }
+
+/// One queue-storage schema's outcome from [`prepare_create_revoke`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateRevokeSchema {
+    pub schema: String,
+    /// Lane helpers refreshed and every known lane provisioned.
+    pub prepared: bool,
+    /// Lanes that had no rows before and were provisioned.
+    pub provisioned_lanes: i64,
+    /// Statements revoking `CREATE` on the schema from untrusted roles.
+    pub revoke: Vec<String>,
+    /// Grants each sequence owner must run so the migrator can read and set
+    /// the lane sequences that runtime roles created.
+    pub sequence_grants: Vec<SequenceGrant>,
+    /// Trust violations other than a `CREATE` grant. They must be fixed
+    /// before the schema can be prepared or migrated.
+    pub blocking: Vec<String>,
+}
+
+/// A grant that only a sequence's owner can make.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SequenceGrant {
+    pub run_as: String,
+    pub statement: String,
+}
+
+/// Prepare a database still used by 0.6 runtimes for revoking those roles'
+/// `CREATE` on its queue-storage schemas, without stopping them.
+///
+/// 0.6 lane helpers issue `CREATE SEQUENCE IF NOT EXISTS` on every
+/// reservation, which needs `CREATE` even when the sequence exists. This
+/// replaces them with the helpers v049 installs, which only create a
+/// sequence that is missing, and provisions every priority and shard of
+/// every queue already in use. Run it as the migrator. A schema with any
+/// trust violation other than a `CREATE` grant is reported and left
+/// unchanged.
+pub async fn prepare_create_revoke(pool: &PgPool) -> Result<Vec<CreateRevokeSchema>, AwaError> {
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(crate::migrations::schema_trust_functions_sql())
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::raw_sql(crate::migrations::lane_sequence_helper_refresh_sql())
+        .execute(tx.as_mut())
+        .await?;
+
+    let foreign_helpers: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT routine.oid::regprocedure::text
+        FROM pg_proc AS routine
+        JOIN pg_namespace AS namespace ON namespace.oid = routine.pronamespace
+        WHERE namespace.nspname = 'awa'
+          AND routine.proname IN (
+              'queue_storage_canonical_triggers', 'queue_storage_schema_trust_violations',
+              'queue_storage_schema_is_trusted', 'queue_storage_schema_trust_summary',
+              'queue_storage_schemas', 'refresh_lane_sequence_helpers'
+          )
+          AND routine.proowner NOT IN (
+              SELECT nspowner FROM pg_namespace WHERE nspname = 'awa'
+              UNION SELECT oid FROM pg_roles WHERE rolname = current_user
+          )
+        ORDER BY 1
+        "#,
+    )
+    .fetch_all(tx.as_mut())
+    .await?;
+    if !foreign_helpers.is_empty() {
+        return Err(AwaError::Validation(format!(
+            "awa helper functions are owned by another role: {}",
+            foreign_helpers.join(", ")
+        )));
+    }
+
+    let schemas: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT namespace.nspname::text
+        FROM pg_namespace AS namespace
+        WHERE has_schema_privilege(current_user, namespace.oid, 'USAGE')
+          AND EXISTS (
+              SELECT 1 FROM pg_proc AS claim_fn
+              WHERE claim_fn.pronamespace = namespace.oid
+                AND claim_fn.proname = 'claim_ready_runtime'
+                AND oidvectortypes(claim_fn.proargtypes)
+                    = 'text, bigint, double precision, double precision'
+          )
+          AND EXISTS (
+              SELECT 1 FROM pg_class AS heads
+              WHERE heads.relnamespace = namespace.oid AND heads.relname = 'queue_enqueue_heads'
+          )
+          AND EXISTS (
+              SELECT 1 FROM pg_class AS heads
+              WHERE heads.relnamespace = namespace.oid AND heads.relname = 'queue_claim_heads'
+          )
+        ORDER BY 1
+        "#,
+    )
+    .fetch_all(tx.as_mut())
+    .await?;
+
+    let mut outcomes = Vec::with_capacity(schemas.len());
+    for schema in schemas {
+        let mut blocking = non_create_trust_violations(&mut tx, &schema).await?;
+        if crate::queue_storage::validate_ident(&schema).is_err() {
+            blocking.push(format!(
+                "schema {}: name is not a lowercase identifier",
+                quote_identifier(&schema)
+            ));
+        }
+        let create_grantees: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT CASE privilege.grantee WHEN 0 THEN 'PUBLIC'
+                       ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END
+            FROM pg_namespace AS namespace
+            CROSS JOIN LATERAL aclexplode(
+                COALESCE(namespace.nspacl, acldefault('n', namespace.nspowner))
+            ) AS privilege
+            WHERE namespace.nspname = $1
+              AND privilege.privilege_type = 'CREATE'
+              AND privilege.grantee NOT IN (
+                  SELECT nspowner FROM pg_namespace WHERE nspname = 'awa'
+                  UNION SELECT oid FROM pg_roles WHERE rolname = current_user
+              )
+            ORDER BY 1
+            "#,
+        )
+        .bind(&schema)
+        .fetch_all(tx.as_mut())
+        .await?;
+        let revoke = create_grantees
+            .iter()
+            .map(|grantee| {
+                format!(
+                    "REVOKE CREATE ON SCHEMA {} FROM {grantee};",
+                    quote_identifier(&schema)
+                )
+            })
+            .collect();
+
+        let sequence_grants = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT pg_get_userbyid(sequence.relowner)::text,
+                   format(
+                       'GRANT SELECT, UPDATE ON SEQUENCE %s TO %I;',
+                       string_agg(format('%I.%I', namespace.nspname, sequence.relname), ', '
+                                  ORDER BY sequence.relname),
+                       current_user
+                   )
+            FROM pg_class AS sequence
+            JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+            WHERE namespace.nspname = $1
+              AND sequence.relkind = 'S'
+              AND NOT (has_sequence_privilege(current_user, sequence.oid, 'SELECT')
+                       AND has_sequence_privilege(current_user, sequence.oid, 'UPDATE'))
+            GROUP BY sequence.relowner
+            ORDER BY 1
+            "#,
+        )
+        .bind(&schema)
+        .fetch_all(tx.as_mut())
+        .await?
+        .into_iter()
+        .map(|(run_as, statement)| SequenceGrant { run_as, statement })
+        .collect();
+
+        if !blocking.is_empty() {
+            outcomes.push(CreateRevokeSchema {
+                schema,
+                prepared: false,
+                provisioned_lanes: 0,
+                revoke,
+                sequence_grants,
+                blocking,
+            });
+            continue;
+        }
+
+        sqlx::query("SELECT awa.refresh_lane_sequence_helpers($1)")
+            .bind(&schema)
+            .execute(tx.as_mut())
+            .await?;
+        let provisioned_lanes = provision_known_lanes(&mut tx, &schema, &create_grantees).await?;
+        outcomes.push(CreateRevokeSchema {
+            schema,
+            prepared: true,
+            provisioned_lanes,
+            revoke,
+            sequence_grants,
+            blocking,
+        });
+    }
+
+    for outcome in outcomes.iter().filter(|outcome| outcome.prepared) {
+        let appeared = non_create_trust_violations(&mut tx, &outcome.schema).await?;
+        if !appeared.is_empty() {
+            return Err(AwaError::Validation(format!(
+                "schema {} changed while it was being prepared: {}",
+                outcome.schema,
+                appeared.join(", ")
+            )));
+        }
+    }
+    tx.commit().await?;
+    Ok(outcomes)
+}
+
+async fn non_create_trust_violations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+) -> Result<Vec<String>, AwaError> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT violation.object || ': ' || violation.rule
+        FROM awa.queue_storage_schema_trust_violations($1) AS violation
+        WHERE violation.rule NOT LIKE 'CREATE granted to %'
+        ORDER BY 1
+        "#,
+    )
+    .bind(schema)
+    .fetch_all(tx.as_mut())
+    .await?)
+}
+
+/// Provision all four priorities of every shard a runtime may enqueue to for
+/// each queue that already has lanes: the configured `enqueue_shards` or the
+/// highest shard in use, whichever is larger. The runtimes losing `CREATE`
+/// get the sequence privileges they need on the sequences this creates.
+/// Returns how many lanes were new.
+async fn provision_known_lanes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+    runtime_roles: &[String],
+) -> Result<i64, AwaError> {
+    let lanes: Vec<(String, i16)> = sqlx::query_as(crate::audited_sql(format!(
+        r#"
+        SELECT known.queue,
+               GREATEST(
+                   COALESCE(MAX(heads.enqueue_shard) + 1, 1),
+                   COALESCE((
+                       SELECT MAX(meta.enqueue_shards)
+                       FROM awa.queue_meta AS meta
+                       WHERE meta.queue IN (known.queue, split_part(known.queue, '#', 1))
+                   ), 1)
+               )::smallint AS shard_count
+        FROM (
+            SELECT queue FROM {schema}.queue_lanes
+            UNION
+            SELECT queue FROM {schema}.queue_enqueue_heads
+        ) AS known
+        LEFT JOIN {schema}.queue_enqueue_heads AS heads ON heads.queue = known.queue
+        GROUP BY known.queue
+        ORDER BY known.queue
+        "#
+    )))
+    .fetch_all(tx.as_mut())
+    .await?;
+
+    let sequences_sql = "SELECT relation.relname::text FROM pg_class AS relation \
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+         WHERE namespace.nspname = $1 AND relation.relkind = 'S'";
+    let sequences_before: std::collections::BTreeSet<String> = sqlx::query_scalar(sequences_sql)
+        .bind(schema)
+        .fetch_all(tx.as_mut())
+        .await?
+        .into_iter()
+        .collect();
+    let count_heads = format!("SELECT count(*) FROM {schema}.queue_enqueue_heads");
+    let before: i64 = sqlx::query_scalar(crate::audited_sql(count_heads.clone()))
+        .fetch_one(tx.as_mut())
+        .await?;
+    for (queue, shard_count) in lanes {
+        for priority in 1..=4 {
+            for shard in 0..shard_count {
+                crate::queue_storage::insert_lane_rows(
+                    tx.as_mut(),
+                    schema,
+                    &queue,
+                    priority,
+                    shard,
+                )
+                .await?;
+            }
+        }
+    }
+    let after: i64 = sqlx::query_scalar(crate::audited_sql(count_heads))
+        .fetch_one(tx.as_mut())
+        .await?;
+
+    let sequences_after: Vec<String> = sqlx::query_scalar(sequences_sql)
+        .bind(schema)
+        .fetch_all(tx.as_mut())
+        .await?;
+    for sequence in sequences_after
+        .iter()
+        .filter(|sequence| !sequences_before.contains(*sequence))
+    {
+        for role in runtime_roles {
+            sqlx::query(crate::audited_sql(format!(
+                "GRANT USAGE, SELECT, UPDATE ON SEQUENCE {schema}.{} TO {role}",
+                quote_identifier(sequence)
+            )))
+            .execute(tx.as_mut())
+            .await?;
+        }
+    }
+    Ok(after - before)
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
