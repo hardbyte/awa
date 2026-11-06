@@ -10,7 +10,7 @@ use sqlx::{PgPool, Postgres};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
@@ -2455,6 +2455,13 @@ pub struct QueueStorage {
     /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
     /// (head row gone after a rolled-back ensure_lane).
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
+    /// Whether `{schema}.provision_lane` (the `definer_lane_provisioning`
+    /// schema patch) was callable the last time a lane was created. Only a
+    /// positive answer is kept: lane creation is rare, and the probe rides on
+    /// the lane-lock round trip.
+    lane_provisioner_present: AtomicBool,
+    /// Set once a provisioner failure has been logged.
+    lane_provisioner_warned: AtomicBool,
     prune_lock_timeout: Duration,
 }
 
@@ -2499,6 +2506,8 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
+            lane_provisioner_present: AtomicBool::new(false),
+            lane_provisioner_warned: AtomicBool::new(false),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
     }
@@ -3458,9 +3467,10 @@ impl QueueStorage {
             .await
     }
 
-    /// Provision every priority and shard of a queue before deploying a runtime
-    /// role without schema CREATE. Run as the schema owner/migrator. This does
-    /// not change enqueue routing or the configured shard count.
+    /// Provision every priority and shard of a queue ahead of its first
+    /// enqueue. Once the `definer_lane_provisioning` schema patch is applied,
+    /// any runtime role may run it: the lanes are created as the schema owner.
+    /// This does not change enqueue routing or the configured shard count.
     pub async fn prepare_queue(
         &self,
         pool: &PgPool,
@@ -3499,11 +3509,35 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         let schema = self.schema();
         let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(lane_lock_key)
-            .execute(tx.as_mut())
+        let provisioner_callable = if self.lane_provisioner_present.load(Ordering::Relaxed) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&lane_lock_key)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            true
+        } else {
+            sqlx::query_scalar(
+                r#"
+                SELECT COALESCE(has_function_privilege(to_regprocedure($2), 'EXECUTE'), false)
+                FROM (SELECT pg_advisory_xact_lock(hashtextextended($1, 0))) AS lane_lock
+                "#,
+            )
+            .bind(&lane_lock_key)
+            .bind(format!("{schema}.provision_lane(text,smallint,smallint)"))
+            .fetch_one(tx.as_mut())
             .await
-            .map_err(map_sqlx_error)?;
+            .map_err(map_sqlx_error)?
+        };
+
+        if provisioner_callable
+            && self
+                .provision_lane(tx, queue, priority, enqueue_shard)
+                .await?
+        {
+            self.mark_lane_ensured(queue, priority, enqueue_shard);
+            return Ok(());
+        }
 
         sqlx::query(&format!(
             r#"
@@ -3572,6 +3606,61 @@ impl QueueStorage {
 
         self.mark_lane_ensured(queue, priority, enqueue_shard);
         Ok(())
+    }
+
+    /// Create the lane through `{schema}.provision_lane`, which runs as the
+    /// schema owner, inside a savepoint. Returns false, with the transaction
+    /// as it was, when the function has gone (`42883`) or the schema owner
+    /// may not write the lane (`42501`); the caller then writes the rows
+    /// itself, which is what a binary that predates the function does.
+    async fn provision_lane<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+    ) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        sqlx::query("SAVEPOINT awa_provision_lane")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let provisioned = sqlx::query(&format!("SELECT {schema}.provision_lane($1, $2, $3)"))
+            .bind(queue)
+            .bind(priority)
+            .bind(enqueue_shard)
+            .execute(tx.as_mut())
+            .await;
+        match provisioned {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT awa_provision_lane")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                self.lane_provisioner_present.store(true, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(sqlx::Error::Database(db_err))
+                if matches!(db_err.code().as_deref(), Some("42883" | "42501")) =>
+            {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_provision_lane")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                self.lane_provisioner_present
+                    .store(false, Ordering::Relaxed);
+                if !self.lane_provisioner_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        schema,
+                        code = db_err.code().as_deref().unwrap_or_default(),
+                        error = %db_err.message(),
+                        "Lane provisioning function failed; creating lane rows as the connected role"
+                    );
+                }
+                Ok(false)
+            }
+            Err(err) => Err(map_sqlx_error(err)),
+        }
     }
 
     /// Pick the enqueue shard for a row on `queue`.

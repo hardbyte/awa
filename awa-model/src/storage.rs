@@ -379,3 +379,86 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
         history: None,
     })
 }
+
+/// A lane sequence that is not owned by its schema's owner or lacks a grant
+/// that the head table it backs implies. Statements are returned ready to run:
+/// `missing_grants` as the sequence owner, `reassign_sql` as a role that can
+/// `SET ROLE` to both `owner` and `expected_owner`.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct LaneSequenceProblem {
+    pub sequence_name: String,
+    pub owner: String,
+    pub expected_owner: String,
+    pub missing_grants: Vec<String>,
+    pub reassign_sql: Option<String>,
+}
+
+/// What [`repair_lane_sequences`] did to one lane sequence that had a problem.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct LaneSequenceRepair {
+    pub sequence_name: String,
+    /// Owner after the repair.
+    pub owner: String,
+    pub expected_owner: String,
+    /// `repaired`; `owner_unchanged` when the grants are complete but the
+    /// connected role could not reassign the sequence; or `unrepaired` when
+    /// grants are still missing too.
+    pub outcome: String,
+    pub missing_grants: Vec<String>,
+    pub reassign_sql: Option<String>,
+}
+
+/// Lane sequences in `schema` that need repair. Read-only; any role may run it.
+pub async fn lane_sequence_problems<'e, E>(
+    executor: E,
+    schema: &str,
+) -> Result<Vec<LaneSequenceProblem>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    Ok(sqlx::query_as(
+        "SELECT sequence_name, owner, expected_owner, missing_grants, reassign_sql \
+         FROM awa.lane_sequence_problems($1)",
+    )
+    .bind(schema)
+    .fetch_all(executor)
+    .await?)
+}
+
+/// Give each lane sequence in `schema` to the schema owner and add its missing
+/// grants, as far as the connected role is allowed to. A sequence the role
+/// cannot reassign is returned with the statements still to run, never an
+/// error.
+pub async fn repair_lane_sequences(
+    pool: &PgPool,
+    schema: &str,
+) -> Result<Vec<LaneSequenceRepair>, AwaError> {
+    Ok(sqlx::query_as(
+        "SELECT sequence_name, owner, expected_owner, outcome, missing_grants, reassign_sql \
+         FROM awa.repair_lane_sequences($1)",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// How many lane sequences need repair in each queue-storage schema that has
+/// any. Read-only.
+pub async fn lane_sequence_problem_counts(pool: &PgPool) -> Result<Vec<(String, i64)>, AwaError> {
+    Ok(sqlx::query_as(
+        "SELECT n.nspname::text, count(*) \
+         FROM pg_namespace AS n \
+         CROSS JOIN LATERAL awa.lane_sequence_problems(n.nspname) AS problem \
+         WHERE has_schema_privilege(current_user, n.oid, 'USAGE') \
+           AND EXISTS ( \
+               SELECT 1 FROM pg_proc AS p \
+               WHERE p.pronamespace = n.oid \
+                 AND p.proname = 'claim_ready_runtime' \
+                 AND oidvectortypes(p.proargtypes) \
+                     = 'text, bigint, double precision, double precision') \
+         GROUP BY n.nspname \
+         ORDER BY n.nspname",
+    )
+    .fetch_all(pool)
+    .await?)
+}
