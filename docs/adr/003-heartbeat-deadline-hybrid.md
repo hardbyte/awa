@@ -34,6 +34,7 @@ Awa uses both heartbeat and deadline crash recovery, running as independent main
     AND jobs.state = 'running'
   ```
 - Batches are chunked at 500 in-flight attempts to avoid oversized queries.
+- Ticks run on a fixed grid, and a pass that outlasts the interval is followed by a full interval of rest and logs a warning.
 - The maintenance leader scans every 30 seconds for running jobs with `heartbeat_at < now() - 90s` and transitions them to `retryable`.
 - **Catches:** Process crash, OOM kill, network partition, pod eviction -- any failure where the worker process stops entirely.
 

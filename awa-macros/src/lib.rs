@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Ident, LitStr};
+use syn::{parse_macro_input, DeriveInput, Ident, LitStr, Type};
 
 /// Derive macro for job argument types.
 ///
@@ -30,28 +30,43 @@ use syn::{parse_macro_input, DeriveInput, Ident, LitStr};
 ///     pub data: String,
 /// }
 /// // kind() returns "custom_kind"
+///
+/// // `#[awa(output = T)]` declares the type the handler records as its
+/// // output (ADR-048), and implements `JobOutput` with `Output = T`.
+/// #[derive(Debug, Serialize, Deserialize, JobArgs)]
+/// #[awa(output = SyncSummary)]
+/// struct SyncInventory {
+///     pub feed: String,
+/// }
 /// ```
 #[proc_macro_derive(JobArgs, attributes(awa))]
 pub fn derive_job_args(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
 
-    // Check for #[awa(kind = "custom")] attribute
-    let custom_kind = input.attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("awa") {
-            return None;
-        }
-        let mut kind_value = None;
-        let _ = attr.parse_nested_meta(|meta| {
+    // #[awa(kind = "custom")] and #[awa(output = Type)]
+    let mut custom_kind = None;
+    let mut output_type: Option<Type> = None;
+    for attr in input
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("awa"))
+    {
+        let parsed = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("kind") {
-                let value = meta.value()?;
-                let s: LitStr = value.parse()?;
-                kind_value = Some(s.value());
+                let s: LitStr = meta.value()?.parse()?;
+                custom_kind = Some(s.value());
+            } else if meta.path.is_ident("output") {
+                output_type = Some(meta.value()?.parse()?);
+            } else {
+                return Err(meta.error("expected `kind` or `output`"));
             }
             Ok(())
         });
-        kind_value
-    });
+        if let Err(err) = parsed {
+            return err.to_compile_error().into();
+        }
+    }
 
     let kind_str = custom_kind.unwrap_or_else(|| camel_to_snake(&name.to_string()));
 
@@ -78,15 +93,53 @@ pub fn derive_job_args(input: TokenStream) -> TokenStream {
         quote!(::awa_model)
     };
 
-    let expanded = quote! {
-        impl #model_path::JobArgs for #name {
-            fn kind() -> &'static str {
-                #kind_str
+    let expanded = match output_type {
+        None => quote! {
+            impl #model_path::JobArgs for #name {
+                fn kind() -> &'static str {
+                    #kind_str
+                }
+            }
+        },
+        Some(output_type) => {
+            let output_name = type_display_name(&output_type);
+            quote! {
+                impl #model_path::JobArgs for #name {
+                    fn kind() -> &'static str {
+                        #kind_str
+                    }
+
+                    fn output_type() -> ::core::option::Option<&'static str> {
+                        ::core::option::Option::Some(#output_name)
+                    }
+                }
+
+                impl #model_path::JobOutput for #name {
+                    type Output = #output_type;
+                }
             }
         }
     };
 
     TokenStream::from(expanded)
+}
+
+/// The name operators see for an output type: the last path segment with its
+/// generic arguments, so `crate::sync::Summary<u32>` shows as `Summary<u32>`.
+fn type_display_name(ty: &Type) -> String {
+    let text = match ty {
+        Type::Path(path) if path.qself.is_none() => path
+            .path
+            .segments
+            .last()
+            .map(|segment| quote!(#segment).to_string())
+            .unwrap_or_else(|| quote!(#ty).to_string()),
+        _ => quote!(#ty).to_string(),
+    };
+    text.replace(" < ", "<")
+        .replace(" >", ">")
+        .replace("< ", "<")
+        .replace(" ,", ",")
 }
 
 /// Convert CamelCase to snake_case.
@@ -154,5 +207,19 @@ mod tests {
         assert_eq!(camel_to_snake("MyJob"), "my_job");
         assert_eq!(camel_to_snake("A"), "a");
         assert_eq!(camel_to_snake("AB"), "ab");
+    }
+
+    #[test]
+    fn output_type_names_drop_the_path() {
+        for (input, expected) in [
+            ("Summary", "Summary"),
+            ("crate::sync::Summary", "Summary"),
+            ("Vec<u32>", "Vec<u32>"),
+            ("report::Page<String, u64>", "Page<String, u64>"),
+            ("(u32, String)", "(u32, String)"),
+        ] {
+            let ty: Type = syn::parse_str(input).unwrap();
+            assert_eq!(type_display_name(&ty), expected, "{input}");
+        }
     }
 }

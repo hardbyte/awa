@@ -1,6 +1,9 @@
+use crate::enqueue_specs::EnqueueRequest;
+use crate::follow_ups::{FollowUps, StageError};
+use crate::output::{OutputError, OutputSlot, TypedOutputSlot};
 pub use crate::runtime::ProgressState;
 use crate::storage::RuntimeStorage;
-use awa_model::{AwaError, CallbackConfig, JobRow, QueueStorage};
+use awa_model::{AwaError, CallbackConfig, JobArgs, JobOutput, JobRow, QueueStorage};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -55,6 +58,10 @@ pub struct JobContext {
     storage: RuntimeStorage,
     /// Shared progress buffer — written by handler, read by heartbeat service.
     progress: Arc<std::sync::Mutex<ProgressState>>,
+    /// Follow-ups staged for this attempt's completion (ADR-046).
+    follow_ups: FollowUps,
+    /// The output this attempt records (ADR-048).
+    output: OutputSlot,
 }
 
 impl JobContext {
@@ -73,6 +80,8 @@ impl JobContext {
             pool,
             storage,
             progress,
+            follow_ups: FollowUps::new(),
+            output: OutputSlot::new(),
         }
     }
 
@@ -111,6 +120,90 @@ impl JobContext {
     /// context would make it a sibling.
     pub fn traceparent(&self) -> Option<&str> {
         awa_model::trace::traceparent_from_metadata(&self.job.metadata)
+    }
+
+    /// A cloneable handle for staging follow-up jobs on this attempt.
+    ///
+    /// Use it where the context cannot be borrowed, such as the `'static`
+    /// future returned by a `ClientBuilder::register` closure:
+    ///
+    /// ```ignore
+    /// .register::<StageA, _, _>(|args, ctx| {
+    ///     let follow_ups = ctx.follow_ups();
+    ///     async move {
+    ///         let item_id = resolve_item(&args).await?;
+    ///         follow_ups.enqueue_on_completion(
+    ///             EnqueueRequest::new(StageB { item_id }).unique(UniqueOpts::default()),
+    ///         )?;
+    ///         Ok(JobResult::Completed)
+    ///     }
+    /// })
+    /// ```
+    pub fn follow_ups(&self) -> FollowUps {
+        self.follow_ups.clone()
+    }
+
+    /// Stage a follow-up job that is enqueued in the same transaction as
+    /// this attempt's completion, and discarded if the attempt ends any other
+    /// way (ADR-046). Shorthand for `self.follow_ups().enqueue_on_completion(..)`.
+    ///
+    /// The args are serialized and the unique key computed now. A follow-up
+    /// with unique options whose key already exists is skipped when the
+    /// completion commits. A failed call poisons the attempt: returning
+    /// `JobResult::Completed` afterwards fails it terminally.
+    pub fn enqueue_on_completion<F: JobArgs>(
+        &self,
+        request: impl Into<EnqueueRequest<F>>,
+    ) -> Result<(), StageError> {
+        self.follow_ups.enqueue_on_completion(request)
+    }
+
+    /// Record this attempt's output (ADR-048), replacing any earlier one.
+    ///
+    /// The output is a JSON value of at most
+    /// [`MAX_OUTPUT_BYTES`](crate::MAX_OUTPUT_BYTES), kept for people and
+    /// tools to inspect: as the job's output if the attempt completes, or in
+    /// its error entry if it fails. Nothing in Awa reads it, and another job
+    /// must not either; pass values a follow-up needs in its args.
+    ///
+    /// The value is serialized and checked now. Recording JSON null clears
+    /// the output, and so does a failed call. A failure does not fail the
+    /// attempt: [`OutputError`] deliberately does not convert into a job
+    /// error, so the handler decides whether a missing output matters.
+    pub fn set_output<T: serde::Serialize + ?Sized>(&self, output: &T) -> Result<(), OutputError> {
+        self.output.set(output)
+    }
+
+    /// Remove the recorded output, so the attempt publishes none.
+    pub fn clear_output(&self) {
+        self.output.clear();
+    }
+
+    /// The output recorded so far by this attempt.
+    pub fn output(&self) -> Option<serde_json::Value> {
+        self.output.get()
+    }
+
+    /// A cloneable handle to this attempt's output, for futures that cannot
+    /// borrow the context, such as the `'static` future a
+    /// `ClientBuilder::register` closure returns.
+    pub fn output_slot(&self) -> OutputSlot {
+        self.output.clone()
+    }
+
+    /// This attempt's output slot, typed by the output `T` declares with
+    /// `#[awa(output = ...)]`. On a job that is not of kind `T`, every
+    /// `set` on the slot fails with [`OutputError::Invalid`].
+    pub fn typed_output<T: JobOutput>(&self) -> TypedOutputSlot<T::Output> {
+        let mismatch = (self.job.kind != T::kind()).then(|| {
+            format!(
+                "job {} is of kind {}, not {}",
+                self.job.id,
+                self.job.kind,
+                T::kind()
+            )
+        });
+        TypedOutputSlot::new(self.output.clone(), mismatch)
     }
 
     /// Clone the shared cancellation flag for language bridges.

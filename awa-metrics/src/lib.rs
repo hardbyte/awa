@@ -34,6 +34,11 @@ pub mod names {
     pub const JOB_RETRIED: &str = "awa.job.retried";
     pub const COMPLETION_DEADLOCK_RETRY: &str = "awa.completion.deadlock_retry";
     pub const COMPLETION_RECONNECT_RETRY: &str = "awa.completion.reconnect_retry";
+    pub const STAGED_FOLLOW_UPS_DISCARDED: &str = "awa.job.staged_follow_ups_discarded";
+    pub const JOB_OUTPUT_RECORDED: &str = "awa.job.output_recorded";
+    pub const JOB_OUTPUT_SIZE: &str = "awa.job.output_size";
+    pub const JOB_OUTPUT_DROPPED: &str = "awa.job.output_dropped";
+    pub const STAGED_FOLLOW_UPS_COMMITTED: &str = "awa.job.staged_follow_ups_committed";
     pub const JOB_CANCELLED: &str = "awa.job.cancelled";
     pub const JOB_CLAIMED: &str = "awa.job.claimed";
     pub const JOB_DURATION: &str = "awa.job.duration";
@@ -72,6 +77,8 @@ pub mod names {
     pub const MAINTENANCE_PRUNE_ATTEMPTS: &str = "awa.maintenance.prune.attempts";
     pub const MAINTENANCE_PRUNE_SKIPPED_ROWS: &str = "awa.maintenance.prune.skipped_rows";
     pub const MAINTENANCE_PRUNE_DURATION: &str = "awa.maintenance.prune.duration";
+    pub const MAINTENANCE_ANALYZE_ATTEMPTS: &str = "awa.maintenance.analyze.attempts";
+    pub const MAINTENANCE_ANALYZE_DURATION: &str = "awa.maintenance.analyze.duration";
     pub const STORAGE_TRANSITION_READY: &str = "awa.storage.transition_ready";
     pub const STORAGE_CANONICAL_LIVE_BACKLOG: &str = "awa.storage.canonical_live_backlog";
     pub const STORAGE_LIVE_RUNTIME_CAPABILITY: &str = "awa.storage.live_runtime_capability";
@@ -82,6 +89,24 @@ pub mod names {
 
 const WAIT_DURATION_BUCKETS_SECONDS: [f64; 14] = [
     0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Latency histograms for sub-millisecond-to-seconds operations (claim,
+/// wake-to-claim, completion flush, promote), 0.5 ms to 30 s.
+const LATENCY_BUCKETS_SECONDS: [f64; 15] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
+    30.0,
+];
+
+/// Job execution time, 1 ms to 1 hour.
+const JOB_DURATION_BUCKETS_SECONDS: [f64; 16] = [
+    0.001, 0.005, 0.010, 0.050, 0.100, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0,
+    1800.0, 3600.0,
+];
+
+/// Batch sizes, capacities and row counts, powers of two up to 8192.
+const COUNT_BUCKETS: [f64; 15] = [
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
 ];
 
 /// Awa worker metrics backed by OpenTelemetry.
@@ -119,6 +144,20 @@ pub struct AwaMetrics {
     /// including connection failures, pool timeouts, and read-only failover.
     /// This counts retries, not successful recoveries.
     pub completion_reconnect_retries: Counter<u64>,
+    /// Follow-ups a handler staged (ADR-046) and then discarded by returning
+    /// `WaitForCallback`, which parks the job without completing it.
+    pub staged_follow_ups_discarded: Counter<u64>,
+    /// Outputs (ADR-048) published with an attempt's transition, by outcome:
+    /// `completed` for the job's output, `failed` for an error entry.
+    pub job_output_recorded: Counter<u64>,
+    /// Size of published outputs, in bytes of JSON text.
+    pub job_output_size: Histogram<u64>,
+    /// Outputs a handler recorded that were not published, by reason.
+    pub job_output_dropped: Counter<u64>,
+    /// Staged follow-ups (ADR-046) whose completion committed, by
+    /// `awa.follow_up.result`: `inserted`, or `duplicate` when a job with
+    /// the same unique key already existed.
+    pub staged_follow_ups_committed: Counter<u64>,
     /// Total jobs cancelled.
     pub jobs_cancelled: Counter<u64>,
     /// Total jobs claimed (dequeued) for execution.
@@ -240,6 +279,13 @@ pub struct AwaMetrics {
     /// rather than one per tick. Fleets alert on this rather than
     /// scraping the matching `tracing::warn!` line. Issue #242.
     pub maintenance_branch_overrun_total: Counter<u64>,
+    /// Planner-statistics `ANALYZE` calls by scope (`heads`, `ring_parent`, `pass`)
+    /// and outcome (`ok`, `skipped_privilege`, `skipped_lock`,
+    /// `unavailable`, `failed`). One increment per relation per refresh pass.
+    pub maintenance_analyze_attempts: Counter<u64>,
+    /// Wall-clock duration of one planner-statistics `ANALYZE` call, by scope
+    /// and outcome.
+    pub maintenance_analyze_duration_seconds: Histogram<f64>,
     /// Current ring `current_slot` per ring, sampled from each rotate call.
     /// The slot number itself isn't meaningful but the rate of advance is —
     /// dashboards plot `rate(slot_changes)` to see whether rotation is
@@ -271,6 +317,7 @@ impl AwaMetrics {
                     "Direct queue-storage COPY enqueue: per-batch job count",
                 )
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             enqueue_duration_seconds: meter
                 .f64_histogram(names::ENQUEUE_DURATION)
@@ -309,6 +356,39 @@ impl AwaMetrics {
                 )
                 .with_unit("{transaction}")
                 .build(),
+            staged_follow_ups_discarded: meter
+                .u64_counter(names::STAGED_FOLLOW_UPS_DISCARDED)
+                .with_description(
+                    "Number of staged follow-ups discarded because the handler parked the job with WaitForCallback",
+                )
+                .with_unit("{follow_up}")
+                .build(),
+            job_output_recorded: meter
+                .u64_counter(names::JOB_OUTPUT_RECORDED)
+                .with_description(
+                    "Number of job outputs published with an attempt's transition (ADR-048)",
+                )
+                .with_unit("{output}")
+                .build(),
+            job_output_size: meter
+                .u64_histogram(names::JOB_OUTPUT_SIZE)
+                .with_description("Size of published job outputs in bytes of JSON text")
+                .with_unit("By")
+                .build(),
+            job_output_dropped: meter
+                .u64_counter(names::JOB_OUTPUT_DROPPED)
+                .with_description(
+                    "Number of job outputs not published: canonical storage, a schema before migration v052, an outcome that keeps none, an abandoned handler, a completion without a claim, or a recording rejected as too large or invalid",
+                )
+                .with_unit("{output}")
+                .build(),
+            staged_follow_ups_committed: meter
+                .u64_counter(names::STAGED_FOLLOW_UPS_COMMITTED)
+                .with_description(
+                    "Number of staged follow-ups whose completion committed, inserted or skipped as duplicates",
+                )
+                .with_unit("{follow_up}")
+                .build(),
             jobs_cancelled: meter
                 .u64_counter(names::JOB_CANCELLED)
                 .with_description("Number of jobs cancelled")
@@ -333,11 +413,13 @@ impl AwaMetrics {
                 .f64_histogram(names::DISPATCH_WAKE_TO_CLAIM_DURATION)
                 .with_description("Time from dispatcher wake-up to first claim attempt")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             dispatch_capacity_available: meter
                 .u64_histogram(names::DISPATCH_CAPACITY_AVAILABLE)
                 .with_description("Number of permits available when a dispatcher wake is processed")
                 .with_unit("{permit}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             dispatch_empty_claims: meter
                 .u64_counter(names::DISPATCH_EMPTY_CLAIMS)
@@ -358,16 +440,19 @@ impl AwaMetrics {
                 .u64_histogram(names::DISPATCH_CLAIM_BATCH_SIZE)
                 .with_description("Dispatcher claim batch size")
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             claim_duration_seconds: meter
                 .f64_histogram(names::DISPATCH_CLAIM_DURATION)
                 .with_description("Dispatcher claim query duration")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             job_duration_seconds: meter
                 .f64_histogram(names::JOB_DURATION)
                 .with_description("Job execution duration")
                 .with_unit("s")
+                .with_boundaries(JOB_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             completion_flushes: meter
                 .u64_counter(names::COMPLETION_FLUSHES)
@@ -378,11 +463,13 @@ impl AwaMetrics {
                 .u64_histogram(names::COMPLETION_FLUSH_BATCH_SIZE)
                 .with_description("Completion batch flush size")
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             completion_flush_duration_seconds: meter
                 .f64_histogram(names::COMPLETION_FLUSH_DURATION)
                 .with_description("Completion batch flush duration")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             promotion_batches: meter
                 .u64_counter(names::MAINTENANCE_PROMOTE_BATCHES)
@@ -393,11 +480,13 @@ impl AwaMetrics {
                 .u64_histogram(names::MAINTENANCE_PROMOTE_BATCH_SIZE)
                 .with_description("Promotion batch size")
                 .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             promotion_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_PROMOTE_DURATION)
                 .with_description("Promotion batch duration")
                 .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
             jobs_in_flight: meter
                 .i64_up_down_counter(names::JOB_IN_FLIGHT)
@@ -504,6 +593,7 @@ impl AwaMetrics {
                     "Row count for the blocker side of a SkippedBusy rotation",
                 )
                 .with_unit("{row}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             maintenance_prune_attempts: meter
                 .u64_counter(names::MAINTENANCE_PRUNE_ATTEMPTS)
@@ -514,6 +604,7 @@ impl AwaMetrics {
                 .u64_histogram(names::MAINTENANCE_PRUNE_SKIPPED_ROWS)
                 .with_description("Magnitude of the reason count on a SkippedActive prune")
                 .with_unit("{row}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             maintenance_prune_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_PRUNE_DURATION)
@@ -537,6 +628,21 @@ impl AwaMetrics {
                     "Maintenance branch overrun episodes: a branch fired after its previous run exceeded its tick interval",
                 )
                 .with_unit("{episode}")
+                .build(),
+            maintenance_analyze_attempts: meter
+                .u64_counter(names::MAINTENANCE_ANALYZE_ATTEMPTS)
+                .with_description(
+                    "Planner-statistics ANALYZE calls by scope (heads/ring_parent) and outcome",
+                )
+                .with_unit("{attempt}")
+                .build(),
+            maintenance_analyze_duration_seconds: meter
+                .f64_histogram(names::MAINTENANCE_ANALYZE_DURATION)
+                .with_description(
+                    "Duration of one planner-statistics ANALYZE call by scope and outcome",
+                )
+                .with_unit("s")
+                .with_boundaries(WAIT_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             ring_current_slot: meter
                 .i64_gauge(names::RING_CURRENT_SLOT)
@@ -597,6 +703,70 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
         ];
         self.completion_reconnect_retries.add(1, &attrs);
+    }
+
+    /// Record follow-ups discarded because the handler that staged them
+    /// returned `WaitForCallback`.
+    pub fn record_staged_follow_ups_discarded(&self, kind: &str, queue: &str, count: u64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+        ];
+        self.staged_follow_ups_discarded.add(count, &attrs);
+    }
+
+    /// Record an output published as the job's output (`completed`) or in
+    /// an error entry (`failed`).
+    pub fn record_job_output_recorded(&self, kind: &str, queue: &str, outcome: &str, bytes: u64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.job.outcome", outcome.to_string()),
+        ];
+        self.job_output_recorded.add(1, &attrs);
+        self.job_output_size.record(bytes, &attrs);
+    }
+
+    /// Count an external completion's output: stored, or dropped for
+    /// `dropped` (ADR-048).
+    pub fn record_external_output(&self, job: &awa_model::JobRow, dropped: Option<&str>) {
+        if let Some(reason) = dropped {
+            self.record_job_output_dropped(&job.kind, &job.queue, reason);
+        } else if let Some(output) = &job.output {
+            let bytes = awa_model::output::serialized_len(output).unwrap_or(0) as u64;
+            self.record_job_output_recorded(&job.kind, &job.queue, "completed", bytes);
+        }
+    }
+
+    /// Record an output that was not published, by `awa.output.reason`.
+    pub fn record_job_output_dropped(&self, kind: &str, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.output.reason", reason.to_string()),
+        ];
+        self.job_output_dropped.add(1, &attrs);
+    }
+
+    /// Record the staged follow-ups of a completion that committed. `kind`
+    /// and `queue` are the completed job's.
+    pub fn record_staged_follow_ups_committed(
+        &self,
+        kind: &str,
+        queue: &str,
+        inserted: u64,
+        duplicates: u64,
+    ) {
+        for (result, count) in [("inserted", inserted), ("duplicate", duplicates)] {
+            if count > 0 {
+                let attrs = [
+                    opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+                    opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+                    opentelemetry::KeyValue::new("awa.follow_up.result", result),
+                ];
+                self.staged_follow_ups_committed.add(count, &attrs);
+            }
+        }
     }
 
     pub fn record_job_retried(&self, kind: &str, queue: &str) {
@@ -1134,6 +1304,24 @@ impl AwaMetrics {
         self.maintenance_branch_overrun_total.add(1, &attrs);
     }
 
+    /// Record one planner-statistics `ANALYZE` call. `scope` is `"heads"`,
+    /// `"ring_parent"` or `"pass"` (a pass-level probe or failure); `outcome` is `"ok"`, `"skipped_privilege"`,
+    /// `"skipped_lock"`, `"unavailable"` or `"failed"`.
+    pub fn record_statistics_analyze(
+        &self,
+        scope: &'static str,
+        outcome: &'static str,
+        duration: Duration,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.analyze.scope", scope),
+            opentelemetry::KeyValue::new("awa.analyze.outcome", outcome),
+        ];
+        self.maintenance_analyze_attempts.add(1, &attrs);
+        self.maintenance_analyze_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
     /// Record a ring prune outcome.
     pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
         let (label, reason, count) = match outcome {
@@ -1194,7 +1382,7 @@ mod tests {
     use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// The info gauges are no-op under a default (global) meter provider —
     /// this just confirms the method signatures build and don't panic when
@@ -1295,5 +1483,170 @@ mod tests {
             BTreeSet::from(["commit".into(), "lock".into(), "truncate".into()])
         );
         assert!(saw_already_pruned);
+    }
+
+    /// A second-scale observation must not fall in the SDK's default
+    /// millisecond-scale buckets (upper bounds 5, 10, 25, ...), and every
+    /// histogram must export the intended explicit boundaries.
+    #[test]
+    fn histograms_export_explicit_boundaries() {
+        const SECONDS_SAMPLE: f64 = 0.02;
+        const COUNT_SAMPLE: u64 = 4096;
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        let seconds: [(&str, &Histogram<f64>, &[f64]); 10] = [
+            (
+                names::ENQUEUE_DURATION,
+                &metrics.enqueue_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::JOB_WAIT_DURATION,
+                &metrics.wait_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_PRUNE_DURATION,
+                &metrics.maintenance_prune_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_BRANCH_DURATION,
+                &metrics.maintenance_branch_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_ANALYZE_DURATION,
+                &metrics.maintenance_analyze_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::DISPATCH_WAKE_TO_CLAIM_DURATION,
+                &metrics.dispatch_wake_to_claim_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::DISPATCH_CLAIM_DURATION,
+                &metrics.claim_duration_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::COMPLETION_FLUSH_DURATION,
+                &metrics.completion_flush_duration_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_PROMOTE_DURATION,
+                &metrics.promotion_duration_seconds,
+                &LATENCY_BUCKETS_SECONDS,
+            ),
+            (
+                names::JOB_DURATION,
+                &metrics.job_duration_seconds,
+                &JOB_DURATION_BUCKETS_SECONDS,
+            ),
+        ];
+        let counts: [(&str, &Histogram<u64>); 7] = [
+            (names::ENQUEUE_BATCH_SIZE, &metrics.enqueue_batch_size),
+            (
+                names::DISPATCH_CAPACITY_AVAILABLE,
+                &metrics.dispatch_capacity_available,
+            ),
+            (names::DISPATCH_CLAIM_BATCH_SIZE, &metrics.claim_batch_size),
+            (
+                names::COMPLETION_FLUSH_BATCH_SIZE,
+                &metrics.completion_flush_batch_size,
+            ),
+            (
+                names::MAINTENANCE_PROMOTE_BATCH_SIZE,
+                &metrics.promotion_batch_size,
+            ),
+            (
+                names::MAINTENANCE_ROTATE_SKIPPED_ROWS,
+                &metrics.maintenance_rotate_skipped_rows,
+            ),
+            (
+                names::MAINTENANCE_PRUNE_SKIPPED_ROWS,
+                &metrics.maintenance_prune_skipped_rows,
+            ),
+        ];
+
+        for (_, histogram, _) in &seconds {
+            histogram.record(SECONDS_SAMPLE, &[]);
+        }
+        for (_, histogram) in &counts {
+            histogram.record(COUNT_SAMPLE, &[]);
+        }
+        provider.force_flush().expect("flush metrics");
+
+        let mut exported: BTreeMap<String, (Vec<f64>, Vec<u64>)> = BTreeMap::new();
+        for resource in exporter.get_finished_metrics().expect("read metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let point = match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                            histogram.data_points().next().map(|point| {
+                                (point.bounds().collect(), point.bucket_counts().collect())
+                            })
+                        }
+                        AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                            histogram.data_points().next().map(|point| {
+                                (point.bounds().collect(), point.bucket_counts().collect())
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(point) = point {
+                        exported.insert(metric.name().to_string(), point);
+                    }
+                }
+            }
+        }
+
+        let mut expected_names: Vec<&str> = seconds
+            .iter()
+            .map(|(name, _, _)| *name)
+            .chain(counts.iter().map(|(name, _)| *name))
+            .collect();
+        expected_names.sort_unstable();
+        let exported_names: Vec<&str> = exported.keys().map(String::as_str).collect();
+        assert_eq!(
+            exported_names, expected_names,
+            "every histogram must be covered by this test"
+        );
+
+        // Index of the bucket holding the single recorded sample; the last
+        // bucket is unbounded.
+        let upper_bound_of_sample = |name: &str| -> Option<f64> {
+            let (bounds, bucket_counts) = &exported[name];
+            let index = bucket_counts
+                .iter()
+                .position(|count| *count == 1)
+                .unwrap_or_else(|| panic!("{name}: sample not recorded"));
+            bounds.get(index).copied()
+        };
+
+        for (name, _, expected_bounds) in &seconds {
+            assert_eq!(&exported[*name].0, expected_bounds, "{name} boundaries");
+            let upper = upper_bound_of_sample(name)
+                .unwrap_or_else(|| panic!("{name}: sample in the overflow bucket"));
+            assert!(
+                upper < 1.0,
+                "{name}: a {SECONDS_SAMPLE}s observation landed in the le={upper} bucket"
+            );
+        }
+        for (name, _) in &counts {
+            assert_eq!(&exported[*name].0, &COUNT_BUCKETS, "{name} boundaries");
+            assert_eq!(
+                upper_bound_of_sample(name),
+                Some(COUNT_SAMPLE as f64),
+                "{name}: sample bucket"
+            );
+        }
     }
 }

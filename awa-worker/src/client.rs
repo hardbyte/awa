@@ -62,6 +62,8 @@ pub enum BuildError {
     InvalidDlqBatchSize,
     #[error("terminal_count_rollup_interval must be > 0")]
     InvalidTerminalCountRollupInterval,
+    #[error("heartbeat_interval must be > 0")]
+    InvalidHeartbeatInterval,
     #[error("invalid queue storage config: {0}")]
     InvalidQueueStorage(String),
     #[error("invalid AWA_HEALTH_ADDR '{0}': expected a socket address like 0.0.0.0:8321")]
@@ -138,6 +140,9 @@ pub struct ClientBuilder {
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
+    /// Output types declared by `#[awa(output = T)]` on registered args,
+    /// folded into the kind descriptors at build.
+    output_types: HashMap<String, &'static str>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     enqueue_specs: HashMap<
@@ -158,6 +163,7 @@ pub struct ClientBuilder {
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
+    statistics_refresh_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -203,6 +209,7 @@ impl ClientBuilder {
             queues: Vec::new(),
             queue_descriptors: HashMap::new(),
             job_kind_descriptors: HashMap::new(),
+            output_types: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
             enqueue_specs: HashMap::new(),
@@ -220,6 +227,7 @@ impl ClientBuilder {
             leader_check_interval: None,
             priority_aging_interval: None,
             terminal_count_rollup_interval: None,
+            statistics_refresh_interval: None,
             completed_retention: None,
             failed_retention: None,
             descriptor_retention: None,
@@ -292,8 +300,12 @@ impl ClientBuilder {
     }
 
     /// Attach descriptive metadata to a typed job kind. The kind string is
-    /// taken from [`JobArgs::kind`] on `T`.
-    pub fn job_kind_descriptor<T: JobArgs>(mut self, descriptor: JobKindDescriptor) -> Self {
+    /// taken from [`JobArgs::kind`] on `T`. A descriptor without an output
+    /// type takes the one `T` declares with `#[awa(output = ...)]`.
+    pub fn job_kind_descriptor<T: JobArgs>(mut self, mut descriptor: JobKindDescriptor) -> Self {
+        if descriptor.output.is_none() {
+            descriptor.output = T::output_type().map(awa_model::OutputDescriptor::new);
+        }
         self.job_kind_descriptors
             .insert(T::kind().to_string(), descriptor);
         self
@@ -314,6 +326,7 @@ impl ClientBuilder {
     ///
     /// The worker handles jobs of type `T` where `T: JobArgs + DeserializeOwned`.
     /// The handler function receives the deserialized args and job context.
+    /// An output type `T` declares is published in the kind's descriptor.
     pub fn register<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -321,6 +334,9 @@ impl ClientBuilder {
         Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + 'static,
     {
         let kind = T::kind().to_string();
+        if let Some(output_type) = T::output_type() {
+            self.output_types.insert(kind.clone(), output_type);
+        }
         let worker = TypedWorker {
             kind: T::kind(),
             handler: Arc::new(handler),
@@ -425,6 +441,13 @@ impl ClientBuilder {
     ///
     /// Multiple registrations for the same kind stack and all run in the
     /// same dispatch.
+    ///
+    /// # Deduplication
+    ///
+    /// A follow-up inserted with unique options (via
+    /// [`Self::on_completed_enqueue_with`]) that conflicts with an existing
+    /// job is skipped, not treated as an error: the trigger still commits and
+    /// the existing job stands. This applies to every `on_*_enqueue` outcome.
     pub fn on_completed_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -432,18 +455,20 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
     {
         self.on_completed_enqueue_with::<T, F, _>(move |args, job| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(args, job)))
         })
     }
 
     /// Like [`Self::on_completed_enqueue`] but lets the closure return an
     /// [`EnqueueRequest`](crate::EnqueueRequest) with explicit queue,
-    /// priority, or other [`awa_model::InsertOpts`] overrides.
+    /// priority, or other [`awa_model::InsertOpts`] overrides, or `None` to
+    /// enqueue nothing for this trigger. The trigger's transition commits
+    /// either way.
     pub fn on_completed_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -483,12 +508,19 @@ impl ClientBuilder {
             + 'static,
     {
         self.on_retried_enqueue_with::<T, F, _>(move |args, job, error, attempt, next_run_at| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt, next_run_at))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args,
+                job,
+                error,
+                attempt,
+                next_run_at,
+            )))
         })
     }
 
     /// Like [`Self::on_retried_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_retried_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -499,7 +531,7 @@ impl ClientBuilder {
                 &str,
                 i16,
                 chrono::DateTime<chrono::Utc>,
-            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            ) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -537,17 +569,20 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> F + Send + Sync + 'static,
     {
         self.on_exhausted_enqueue_with::<T, F, _>(move |args, job, error, attempt| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args, job, error, attempt,
+            )))
         })
     }
 
     /// Like [`Self::on_exhausted_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_exhausted_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -579,17 +614,20 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow, &str) -> F + Send + Sync + 'static,
     {
         self.on_cancelled_enqueue_with::<T, F, _>(move |args, job, reason| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args, job, reason,
+            )))
         })
     }
 
     /// Like [`Self::on_cancelled_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_cancelled_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow, &str) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow, &str) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -623,17 +661,18 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
     {
         self.on_waiting_for_callback_enqueue_with::<T, F, _>(move |args, job| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(args, job)))
         })
     }
 
     /// Like [`Self::on_waiting_for_callback_enqueue`] but the closure returns
-    /// an [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// an [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_waiting_for_callback_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -674,12 +713,15 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow, crate::events::RescueReason) -> F + Send + Sync + 'static,
     {
         self.on_rescued_enqueue_with::<T, F, _>(move |args, job, reason| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args, job, reason,
+            )))
         })
     }
 
     /// Like [`Self::on_rescued_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_rescued_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -688,7 +730,7 @@ impl ClientBuilder {
                 T,
                 &awa_model::JobRow,
                 crate::events::RescueReason,
-            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            ) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -737,7 +779,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the heartbeat interval (default: 30s).
+    /// Set the heartbeat interval (default: 30s). Must be greater than zero.
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
         self
@@ -862,6 +904,20 @@ impl ClientBuilder {
     /// ledger for fewer maintenance writes to the mutable counter table.
     pub fn terminal_count_rollup_interval(mut self, interval: Duration) -> Self {
         self.terminal_count_rollup_interval = Some(interval);
+        self
+    }
+
+    /// Set how often the maintenance leader refreshes planner statistics for
+    /// the queue-storage tables autovacuum never analyses (default: 5 minutes).
+    ///
+    /// Autovacuum does not analyse partitioned tables, and never reaches its
+    /// threshold on the two small head tables, so the leader runs `ANALYZE`
+    /// on both when it is elected and then every interval, through
+    /// `awa.analyze_queue_storage_relation()` (schema v053) so that a runtime
+    /// role that does not own the tables still works. `Duration::ZERO`
+    /// disables the refresh. Queue storage only.
+    pub fn statistics_refresh_interval(mut self, interval: Duration) -> Self {
+        self.statistics_refresh_interval = Some(interval);
         self
     }
 
@@ -1105,6 +1161,9 @@ impl ClientBuilder {
         {
             return Err(BuildError::InvalidTerminalCountRollupInterval);
         }
+        if self.heartbeat_interval.is_zero() {
+            return Err(BuildError::InvalidHeartbeatInterval);
+        }
 
         // Validate weighted mode constraints
         let overflow_pool = if let Some(global_max) = self.global_max_workers {
@@ -1169,11 +1228,19 @@ impl ClientBuilder {
             },
         };
 
+        let mut job_kind_descriptors = self.job_kind_descriptors;
+        for (kind, output_type) in self.output_types {
+            let descriptor = job_kind_descriptors.entry(kind).or_default();
+            if descriptor.output.is_none() {
+                descriptor.output = Some(awa_model::OutputDescriptor::new(output_type));
+            }
+        }
+
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
             queue_descriptors: self.queue_descriptors,
-            job_kind_descriptors: self.job_kind_descriptors,
+            job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             enqueue_specs: Arc::new(self.enqueue_specs),
@@ -1205,6 +1272,7 @@ impl ClientBuilder {
             leader_check_interval: self.leader_check_interval,
             priority_aging_interval: self.priority_aging_interval,
             terminal_count_rollup_interval: self.terminal_count_rollup_interval,
+            statistics_refresh_interval: self.statistics_refresh_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
             descriptor_retention: self.descriptor_retention,
@@ -1311,6 +1379,7 @@ pub struct Client {
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
+    statistics_refresh_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -1881,6 +1950,9 @@ impl Client {
         if let Some(interval) = self.terminal_count_rollup_interval {
             maintenance = maintenance.terminal_count_rollup_interval(interval);
         }
+        if let Some(interval) = self.statistics_refresh_interval {
+            maintenance = maintenance.statistics_refresh_interval(interval);
+        }
         if let Some(retention) = self.completed_retention {
             maintenance = maintenance.completed_retention(retention);
         }
@@ -2006,6 +2078,11 @@ impl Client {
                     claim_gate.clone(),
                     claimer_owner_id,
                     effective_storage.clone(),
+                )
+                .abandon_grace(
+                    2 * self
+                        .deadline_rescue_interval
+                        .unwrap_or(crate::maintenance::DEFAULT_DEADLINE_RESCUE_INTERVAL),
                 );
                 dispatcher_handles.push(tokio::spawn(async move {
                     dispatcher.run().await;
@@ -2209,6 +2286,39 @@ impl Client {
         )
         .await?;
         tx.commit().await?;
+        self.dispatch_callback_event(UntypedJobEvent::Completed {
+            job: job.clone(),
+            duration: Duration::ZERO,
+        })
+        .await;
+        Ok(job)
+    }
+
+    /// Complete a waiting job via its callback and store the output in
+    /// `opts` as the job's output (ADR-048), as
+    /// [`admin::complete_external_with`] does. Registered
+    /// `on_completed_enqueue` specs run in the same transaction, as for
+    /// [`Self::complete_external`], and receive the row without its output.
+    pub async fn complete_external_with(
+        &self,
+        callback_id: Uuid,
+        opts: awa_model::ExternalCompletion,
+    ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let mut tx = self.pool.begin().await?;
+        let (job, dropped) =
+            admin::complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
+        self.dispatch_callback_followups_in_tx(
+            &mut tx,
+            &job,
+            crate::enqueue_specs::Outcome::Completed,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        self.metrics.record_external_output(&job, dropped);
+        if let Some(reason) = dropped {
+            admin::warn_external_output_dropped(reason);
+        }
         self.dispatch_callback_event(UntypedJobEvent::Completed {
             job: job.clone(),
             duration: Duration::ZERO,
@@ -3414,6 +3524,15 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_interval_must_be_positive() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .heartbeat_interval(Duration::ZERO)
+            .build();
+        assert!(matches!(result, Err(BuildError::InvalidHeartbeatInterval)));
     }
 
     #[tokio::test]

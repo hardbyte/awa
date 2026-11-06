@@ -571,7 +571,12 @@ impl Worker for FailureModeWorker {
             serde_json::from_value(ctx.job.args.clone()).map_err(JobError::retryable)?;
 
         match args.mode.as_str() {
-            "complete" => Ok(JobResult::Completed),
+            "complete" => {
+                // Exercises the ADR-048 output metrics end to end.
+                ctx.set_output(&serde_json::json!({ "mode": "complete" }))
+                    .map_err(|err| JobError::terminal(err.to_string()))?;
+                Ok(JobResult::Completed)
+            }
             "terminal_fail" => Err(JobError::terminal("intentional telemetry test failure")),
             "retry_once" => {
                 if ctx.job.attempt == 1 {
@@ -687,6 +692,20 @@ fn build_otlp_meter_provider(endpoint: &str, service_name: &str) -> SdkMeterProv
         .with_reader(reader)
         .with_resource(resource)
         .build()
+}
+
+/// A client that keeps terminal rows for the whole test.
+///
+/// The default one-second ring rotation lets maintenance rotate the ready
+/// ring and prune completed rows while the test is still waiting to read
+/// them, so a count or lookup of completed jobs can miss them on a slow
+/// runner.
+fn client_builder(pool: &sqlx::PgPool) -> awa::ClientBuilder {
+    Client::builder(pool.clone()).queue_storage(
+        awa::QueueStorageConfig::default(),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    )
 }
 
 async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: i64) {
@@ -1245,7 +1264,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
 
     // 2. Build client with fast maintenance intervals, but keep retry/callback
     // transitions under explicit DB control to avoid CI timing flakes (#67).
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(
             queue,
             QueueConfig {
@@ -1370,6 +1389,13 @@ async fn test_failure_path_metrics_reach_prometheus() {
     let duration_count =
         wait_for_metric(&http, "awa_job_duration_seconds_count", 5.0, timeout).await;
     eprintln!("  awa_job_duration_seconds_count = {duration_count}");
+
+    let outputs_recorded =
+        wait_for_metric(&http, "awa_job_output_recorded_total", 1.0, timeout).await;
+    eprintln!("  awa_job_output_recorded_total = {outputs_recorded}");
+    let output_sizes =
+        wait_for_metric(&http, "awa_job_output_size_bytes_count", 1.0, timeout).await;
+    eprintln!("  awa_job_output_size_bytes_count = {output_sizes}");
 
     assert!(completed >= expected_completed as f64);
     assert!(failed >= expected_failed as f64);
@@ -1670,7 +1696,7 @@ async fn dashboard_panels_have_observed_data() {
     let meter_provider = build_otlp_meter_provider(&otlp_endpoint(), "awa-grafana-demo");
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(
             queue,
             QueueConfig {
@@ -2428,7 +2454,7 @@ async fn test_trace_pipeline_reaches_tempo() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let handler_attempts = attempts.clone();
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(
             queue,
             QueueConfig {

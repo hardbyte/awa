@@ -61,7 +61,22 @@ pub async fn complete_callback(
     let uuid = uuid::Uuid::parse_str(&callback_id)
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
-    let job = awa_model::admin::complete_external(&state.pool, uuid, body.payload, None).await?;
+    let job = match body.output {
+        Some(output) => {
+            let (job, dropped) = awa_model::admin::complete_external_reporting_output(
+                &state.pool,
+                uuid,
+                awa_model::ExternalCompletion::new().output(output),
+            )
+            .await?;
+            state.metrics.record_external_output(&job, dropped);
+            if let Some(reason) = dropped {
+                awa_model::admin::warn_external_output_dropped(reason);
+            }
+            job
+        }
+        None => awa_model::admin::complete_external(&state.pool, uuid, body.payload, None).await?,
+    };
     state.invalidate_dashboard_caches();
     Ok((
         StatusCode::OK,

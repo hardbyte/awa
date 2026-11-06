@@ -409,6 +409,42 @@ FailToDlqTx == <<
     Mut("Insert", "dlq_entries")
 >>
 
+\* rescue_stale_heartbeats / rescue_expired_deadlines, lease side: delete
+\* the stale lease, then hydrate_deleted_leases_tx drops its attempt state
+\* and closes its receipt. While attempts remain the attempt is parked in
+\* deferred_jobs for retry ...
+RescueToDeferredTx == <<
+    Mut("Delete", "leases"),
+    Mut("Delete", "attempt_state"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims"),
+    Mut("Insert", "deferred_jobs")
+>>
+
+\* ... once the rescued attempt was the last the job fails into done_entries
+\* instead, as an exhausted callback-timeout rescue does ...
+RescueToTerminalTx == <<
+    Mut("Delete", "leases"),
+    Mut("Delete", "attempt_state"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims"),
+    Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas")
+>>
+
+\* ... or, on a DLQ-enabled queue, straight into dlq_entries in the same
+\* transaction.
+RescueToDlqTx == <<
+    Mut("Delete", "leases"),
+    Mut("Delete", "attempt_state"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims"),
+    Mut("Insert", "dlq_entries")
+>>
+
 \* retry_after / snooze
 RetryToDeferredTx == <<
     Mut("Delete", "leases"),
@@ -636,6 +672,7 @@ Transactions == {
     CancelReceiptOnlyTx, CancelRunningTx, CancelReadyTx, DeleteReadyCompatTx,
     ReprioritizeReadyTx,
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
+    RescueToDeferredTx, RescueToTerminalTx, RescueToDlqTx,
     EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
     RetryExternalTx, MoveFailedToDlqTx, DiscardTerminalTx,
     DeleteTerminalCompatTx, DeleteCompactReceiptTerminalCompatTx,

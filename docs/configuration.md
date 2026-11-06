@@ -229,7 +229,7 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 | --- | --- | --- |
 | Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
-| Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, and extra metadata. They do not set dispatch limits or timeouts. |
+| Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, extra metadata and the declared [output type](job-output.md#typed-outputs). They do not set dispatch limits or timeouts. |
 | Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout). |
 | Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
 | Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` currently applies to the queue-storage engine rather than to one named queue. |
@@ -436,7 +436,7 @@ These knobs control **how fast a stuck or crashed handler is noticed and rescued
 
 ### Heartbeat — detecting crashed workers
 
-A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:
+A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against `max_attempts`: the job is re-enqueued while attempts remain, and otherwise fails or moves to the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)). Three knobs participate:
 
 | Knob | Default | What it does |
 | --- | --- | --- |
@@ -465,7 +465,9 @@ pool waits and database errors; a retry count does not prove recovery.
 
 ### Deadline — bounding a single attempt
 
-Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
+Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against `max_attempts` like a failed one, so a job that hangs every time ends in `failed` or the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)).
+
+A handler that ignores cancellation and is still running two `deadline_rescue_interval`s (one minute by default) past its deadline is dropped at its next `.await`, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python coroutine stops being awaited but keeps running on its event loop until it finishes.
 
 | Knob | Default | What it does |
 | --- | --- | --- |
@@ -506,6 +508,7 @@ DLQ rows are different: `dlq_entries` is a separate hold table and the maintenan
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
 | `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
 | `ClientBuilder::terminal_count_rollup_interval` (Rust) / `terminal_count_rollup_interval_ms` (Python kwarg) | `30s` | Queue storage only: how often maintenance folds pending `done_entries` terminal-count deltas for sealed queue slots into compact live counters. Exact reads include pending deltas and retained compact receipt batches, so this affects compaction/WAL pressure rather than correctness. |
+| `ClientBuilder::statistics_refresh_interval` (Rust) / `statistics_refresh_interval_ms` (Python kwarg) | `5m` | Queue storage only: how often the maintenance leader runs `ANALYZE` on the two head tables and the partitioned ring parents, which autovacuum never analyses; also run once when a runtime becomes leader. `0` disables it. See [Planner statistics](#planner-statistics). |
 
 ## Queue storage tuning
 
@@ -519,6 +522,8 @@ Direct-copy producers must use the same queue-storage routing config as the work
 
 `insert_many_copy()` is the compatibility insert API. It is still useful when a caller needs the canonical insert surface, but in queue-storage mode it routes through the compatibility function rather than being the primary producer fast path.
 
+The Rust compatibility inserts differ in how they treat a unique-key conflict. `insert_many` fails the whole batch with a unique violation (SQLSTATE `23505`). `insert_many_skip_unique_conflicts` inserts the rest of the batch and returns only the rows it inserted, in input order, so a producer that replays work does not have to insert the batch again one job at a time (each of those inserts takes the lane lock separately, which on a busy lane is slower than the batch itself). `insert_many_copy` also skips conflicting jobs, and is what Python's `insert_many_copy()` calls; Python has no separate skip function because that is already its behaviour. `insert_many_skip_unique_conflicts` needs migration v055. `insert_many_copy` probes its own connection on every call and uses `awa.insert_jobs_compat_batch` when installed, otherwise the per-row function. Generic `insert_many` always uses the per-row function in one statement, so a process can write to databases at different migration levels without assuming they share a schema.
+
 ### Terminal count rollup
 
 Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. `done_entries` terminal inserts append positive rows to `queue_terminal_count_deltas_*`; retry, discard, DLQ move, and compatibility delete of `done_entries` rows append negative rows. Compact receipt completions do not write count deltas: exact count reads add retained `receipt_completion_batches_*` counts and subtract retained `receipt_completion_tombstones_*`.
@@ -528,6 +533,16 @@ A queue slot is one partition in queue storage's rotating ready/done ring. A sea
 The maintenance leader folds pending `done_entries` deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Rollup is MVCC-horizon aware: if another backend is holding a visible snapshot open, or is idle in a transaction with an assigned transaction id, maintenance leaves pending delta rows append-only and tries again on a later tick. Exact counts remain correct because they read folded counters, pending deltas, retained compact batches, compact tombstones, and permanent rollups.
 
 Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the `done_entries` delta ledger is growing faster than maintenance drains it. Under long reader transactions, lowering the interval does not force rollup; the useful fix is to release the pinned snapshot or let queue prune reclaim the whole sealed segment. Compact receipt successes are already retained as compact batch rows, so this interval does not change their hot-path write count.
+
+### Planner statistics
+
+Autovacuum does not analyse partitioned tables, so the ring parents (`ready_entries`, `done_entries`, `leases`, and the other ten partitioned tables of the schema) have no inherited statistics. It also never reaches its analyze threshold on `queue_claim_heads` and `queue_enqueue_heads`, which hold a few rows per lane, so the planner prices joins against them at its defaults. Admin and metrics queries that join retained ready rows to the heads tables then pick plans for a few hundred rows while reading hundreds of thousands.
+
+The maintenance leader runs `ANALYZE` on both when it is elected and every `statistics_refresh_interval` (default `5m`). One pass takes well under a second on a small ring and a few seconds on a ring with millions of retained rows. It has no measurable effect on claim or completion throughput.
+
+- **Locks.** Each relation is analysed in its own transaction with a 2 s `lock_timeout` and a 120 s `statement_timeout`. `SKIP_LOCKED` skips a child that ring prune holds during the per-child analysis, but sampling for the parent's statistics waits for it up to the `lock_timeout`; a call that times out is recorded as `skipped_lock` and retried on the next interval. Prune never waits for the refresh: its own 10 ms lock timeout applies, so an attempt that lands while `ANALYZE` samples the oldest slot's tables returns `blocked` and retries on its usual backoff. `ANALYZE` of a partitioned table samples every child, so that window cannot be avoided.
+- **Privileges.** The refresh calls `awa.analyze_queue_storage_relation(schema, relation)`, a `SECURITY DEFINER` function installed by migration v054. The runtime needs EXECUTE on the helper, and the login role needs INSERT, UPDATE and DELETE on the target schema's `queue_claim_heads`; the migration grants EXECUTE to existing runtime grantees. A missing helper or caller privilege skips the pass before making calls and logs one warning. Run `awa migrate` for a missing helper; restore the grants as the schema owner for `skipped_privilege`. If the helper owner may not analyse the tables, transfer the function to the table owner or grant its owner `MAINTAIN` on PostgreSQL 17+. See the [database roles guide](security/database-roles.md) for the ownership command.
+- **Metrics.** `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`, by `awa.analyze.scope` (`heads`, `ring_parent`, `pass`) and `awa.analyze.outcome` (`ok`, `skipped_privilege`, `skipped_lock`, `unavailable`, `failed`). A sustained `skipped_lock` rate means something else holds the tables; any `skipped_privilege` or `unavailable` means the refresh is not running.
 
 ### Rust
 
@@ -768,7 +783,12 @@ Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 | `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Idle connection timeout (seconds) |
 | `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Max connection lifetime (seconds) |
 | `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Connection acquire timeout (seconds) |
+| `--statement-timeout` | `AWA_STATEMENT_TIMEOUT` | `60` | Longest any one UI statement may run (seconds); `0` leaves the server's setting |
 | `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Dashboard query cache TTL (seconds) |
+
+### Abandoned requests
+
+When a browser closes a tab or a proxy times out, the server drops the request, but Postgres keeps running its query and the pool keeps that query's connection until it ends. The statement timeout ends it, and the pool then reuses the connection. On Postgres 14 and later the pool also sets `client_connection_check_interval`, so a query stops within 5 s when its connection closes, for example when `awa serve` restarts. Raise `--statement-timeout` if a bulk action from the UI, such as purging a very large DLQ, needs longer.
 
 ### Dashboard cache
 

@@ -254,21 +254,26 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
         INSERT INTO {schema}.queue_claim_heads(queue, priority, enqueue_shard) VALUES ('prepared_queue', 2, 0) ON CONFLICT DO NOTHING;
         SELECT {schema}.reserve_enqueue_seq('prepared_queue', 2::smallint, 0::smallint, 3);
     "#)))).await?;
-    let error = pool
-        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
-            "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint)"
-        ))))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.as_database_error().unwrap().code().as_deref(),
-        Some("42501")
-    );
-    assert!(error
-        .as_database_error()
-        .unwrap()
-        .message()
-        .contains("has not been provisioned"));
+    // An unprepared lane is created through the schema owner's provisioning
+    // function, so the runtime still issues no DDL of its own.
+    pool.execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+        "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint); \
+         SELECT {schema}.provision_lane('unprepared_queue', 2::smallint, 0::smallint);"
+    ))))
+    .await?;
+    let foreign_owned: i64 = sqlx::query_scalar(awa_model::audited_sql(format!(
+        "SELECT count(*) FROM pg_class \
+         WHERE relnamespace = '{schema}'::regnamespace AND relkind = 'S' \
+           AND relowner <> (SELECT nspowner FROM pg_namespace WHERE nspname = '{schema}')"
+    )))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(foreign_owned, 0);
+    sqlx::query_scalar::<_, i64>(awa_model::audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq('unprepared_queue', 2::smallint, 0::smallint, 1)"
+    )))
+    .fetch_one(pool)
+    .await?;
     let error = pool
         .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
             "CREATE TABLE {schema}.must_not_create(id integer)"
@@ -284,8 +289,8 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
 
 /// The one-call enqueue needs EXECUTE on enqueue_ready_rows and on
 /// ring_cursor. Without either the store keeps the multi-statement path; a
-/// grant revoked after the store has used the function costs one failed
-/// enqueue, then the store probes again and falls back.
+/// grant revoked after the store has used the function falls back within
+/// the same call, after rolling back the store-owned transaction.
 async fn assert_enqueue_function_privileges_fall_back(
     owner_pool: &PgPool,
     runtime_pool: &PgPool,
@@ -338,12 +343,12 @@ async fn assert_enqueue_function_privileges_fall_back(
             "REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {runtime}"
         ))))
         .await?;
-    assert!(
+    assert_eq!(
         store
             .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
-            .await
-            .is_err(),
-        "the call that finds EXECUTE gone fails"
+            .await?,
+        1,
+        "the same call falls back after EXECUTE is revoked"
     );
     assert_eq!(
         store
@@ -357,5 +362,112 @@ async fn assert_enqueue_function_privileges_fall_back(
             "GRANT EXECUTE ON FUNCTION {signature} TO {runtime}"
         ))))
         .await?;
+    Ok(())
+}
+
+async fn run_sql(pool: &PgPool, sql: impl AsRef<str>) -> Result<(), sqlx::Error> {
+    pool.execute(sqlx::raw_sql(awa_model::audited_sql(
+        sql.as_ref().to_string(),
+    )))
+    .await?;
+    Ok(())
+}
+
+/// A runtime with schema CREATE (a working 0.6 deployment) creates lane
+/// sequences it owns. Provisioning that queue as the owner, the first step of
+/// revoking runtime CREATE, must not touch those sequences or their cursors.
+#[tokio::test]
+async fn owner_provisions_a_lane_whose_sequences_the_runtime_created() -> TestResult {
+    let url = std::env::var("DATABASE_URL")?;
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("lazy_owner_{suffix}");
+    let runtime = format!("lazy_runtime_{suffix}");
+    let database = format!("lazy_lane_db_{suffix}");
+    run_sql(
+        &admin,
+        format!(
+            "CREATE ROLE {owner} LOGIN PASSWORD 'lane_test'; \
+             CREATE ROLE {runtime} LOGIN PASSWORD 'lane_test';"
+        ),
+    )
+    .await?;
+    run_sql(&admin, format!("CREATE DATABASE {database} OWNER {owner}")).await?;
+    let options = PgConnectOptions::from_str(&url)?
+        .database(&database)
+        .password("lane_test");
+    let result = exercise_lazy_lane(options, &owner, &runtime).await;
+    run_sql(&admin, format!("DROP DATABASE {database} WITH (FORCE)")).await?;
+    run_sql(&admin, format!("DROP ROLE {runtime}; DROP ROLE {owner};")).await?;
+    admin.close().await;
+    result
+}
+
+async fn exercise_lazy_lane(options: PgConnectOptions, owner: &str, runtime: &str) -> TestResult {
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.clone().username(owner))
+        .await?;
+    migrations::run(&owner_pool).await?;
+    run_sql(
+        &owner_pool,
+        format!(
+            "GRANT USAGE, CREATE ON SCHEMA awa TO {runtime}; \
+             GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO {runtime}; \
+             GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {runtime}; \
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime}; \
+             REVOKE EXECUTE ON FUNCTION awa.provision_lane_sequences(text, smallint, smallint) \
+               FROM PUBLIC, {runtime};"
+        ),
+    )
+    .await?;
+    // Without the provisioning function the runtime creates the lane's
+    // sequences itself and owns them, as a 0.6 runtime with CREATE did.
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.username(runtime))
+        .await?;
+    run_sql(
+        &runtime_pool,
+        r#"
+        INSERT INTO awa.queue_lanes(queue, priority) VALUES ('lazy_queue', 2) ON CONFLICT DO NOTHING;
+        INSERT INTO awa.queue_enqueue_heads(queue, priority, enqueue_shard) VALUES ('lazy_queue', 2, 0) ON CONFLICT DO NOTHING;
+        INSERT INTO awa.queue_claim_heads(queue, priority, enqueue_shard) VALUES ('lazy_queue', 2, 0) ON CONFLICT DO NOTHING;
+        SELECT awa.reserve_enqueue_seq('lazy_queue', 2::smallint, 0::smallint, 5);
+        "#,
+    )
+    .await?;
+    let lane_owners: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT pg_get_userbyid(c.relowner)::text FROM awa.queue_enqueue_heads AS h \
+         JOIN pg_class AS c ON c.relname = h.seq_name \
+         WHERE h.queue = 'lazy_queue'",
+    )
+    .fetch_all(&owner_pool)
+    .await?;
+    assert_eq!(lane_owners, vec![runtime.to_string()]);
+    let cursor_sql = "SELECT awa.sequence_next_value(seq_name) FROM awa.queue_enqueue_heads \
+                      WHERE queue = 'lazy_queue' AND priority = 2 AND enqueue_shard = 0";
+    let before: i64 = sqlx::query_scalar(cursor_sql)
+        .fetch_one(&runtime_pool)
+        .await?;
+
+    QueueStorage::new(QueueStorageConfig::default())?
+        .prepare_queue(&owner_pool, "lazy_queue", 1)
+        .await?;
+
+    let after: i64 = sqlx::query_scalar(cursor_sql)
+        .fetch_one(&runtime_pool)
+        .await?;
+    assert_eq!(before, after);
+    let provisioned: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.queue_claim_heads WHERE queue = 'lazy_queue'")
+            .fetch_one(&owner_pool)
+            .await?;
+    assert_eq!(provisioned, 4, "every priority is provisioned");
+    runtime_pool.close().await;
+    owner_pool.close().await;
     Ok(())
 }

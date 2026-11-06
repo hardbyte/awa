@@ -1,4 +1,4 @@
--- v052: Fewer round trips and sequence writes per queue-storage enqueue.
+-- v056: Fewer round trips and sequence writes per queue-storage enqueue.
 -- Tracking: https://github.com/hardbyte/awa/issues/522
 -- reserve_enqueue_seq keeps its signature, lock key and return value. It
 -- provisions lane sequences only for a lane row without a sequence name and
@@ -30,5 +30,5 @@ END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (52, 'Fewer round trips and sequence writes per queue-storage enqueue')
+VALUES (56, 'Fewer round trips and sequence writes per queue-storage enqueue')
 ON CONFLICT (version) DO NOTHING;

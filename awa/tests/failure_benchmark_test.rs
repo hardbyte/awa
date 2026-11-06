@@ -1,5 +1,8 @@
 //! Failure-mode benchmark tests for Awa.
 //!
+//! Each benchmark owns a disposable database; `DATABASE_URL` selects the
+//! PostgreSQL server and its role must have `CREATEDB`.
+//!
 //! These benchmarks measure throughput, drain time, and recovery behaviour
 //! when a configurable percentage of jobs fail, retry, hang, or trigger
 //! callback timeouts.
@@ -16,32 +19,16 @@
 mod bench_output;
 
 use async_trait::async_trait;
-use awa::model::migrations;
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa_testing::setup::TestDatabase;
 use bench_output::{BenchMetrics, BenchRescue, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-async fn setup(max_conns: u32) -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database");
-    migrations::run(&pool).await.expect("Failed to migrate");
-    pool
-}
 
 async fn reset_runtime_state(pool: &sqlx::PgPool) {
     sqlx::query(
@@ -466,7 +453,8 @@ const WORKERS: u32 = 64;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_terminal_1pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("terminal_1pct", TOTAL, 1, "terminal", WORKERS),
@@ -477,7 +465,8 @@ async fn test_failure_bench_terminal_1pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_terminal_10pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("terminal_10pct", TOTAL, 10, "terminal", WORKERS),
@@ -488,7 +477,8 @@ async fn test_failure_bench_terminal_10pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_terminal_50pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("terminal_50pct", TOTAL, 50, "terminal", WORKERS),
@@ -499,7 +489,8 @@ async fn test_failure_bench_terminal_50pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_retryable_1pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("retryable_1pct", TOTAL, 1, "retryable", WORKERS),
@@ -510,7 +501,8 @@ async fn test_failure_bench_retryable_1pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_retryable_10pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("retryable_10pct", TOTAL, 10, "retryable", WORKERS),
@@ -521,7 +513,8 @@ async fn test_failure_bench_retryable_10pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_retryable_50pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("retryable_50pct", TOTAL, 50, "retryable", WORKERS),
@@ -532,7 +525,8 @@ async fn test_failure_bench_retryable_50pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_callback_timeout_10pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario(
@@ -549,7 +543,8 @@ async fn test_failure_bench_callback_timeout_10pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_deadline_hang_10pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("deadline_hang_10pct", TOTAL, 10, "deadline_hang", WORKERS),
@@ -560,7 +555,8 @@ async fn test_failure_bench_deadline_hang_10pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_snooze_once_10pct() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(
         &pool,
         &scenario("snooze_once_10pct", TOTAL, 10, "snooze_once", WORKERS),
@@ -571,7 +567,8 @@ async fn test_failure_bench_snooze_once_10pct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_mixed() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     run_scenario(&pool, &mixed_scenario("mixed_all_modes", TOTAL, WORKERS)).await;
 }
 
@@ -580,7 +577,8 @@ async fn test_failure_bench_mixed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_full_matrix() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
 
     let scenarios = vec![
         scenario("terminal_1pct", TOTAL, 1, "terminal", WORKERS),
@@ -637,7 +635,8 @@ impl Worker for RescueBenchWorker {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_failure_bench_stale_heartbeat_rescue() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     let queue = "bench_stale_rescue";
     reset_runtime_state(&pool).await;
 
