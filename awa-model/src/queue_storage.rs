@@ -11783,6 +11783,47 @@ impl QueueStorage {
         Ok(())
     }
 
+    /// Take the closers' attempt locks without waiting, returning the attempts
+    /// locked. A heartbeat must not queue behind a closer: an attempt whose lock
+    /// is held is being finalized or rescued right now, and rescue skips it for
+    /// as long as the lock is held. Taking the locks in a statement of their own
+    /// means the statement that then decides what is still open starts after
+    /// every closer that held a lock first has committed (#614), so a heartbeat
+    /// cannot recreate state for an attempt that has just been closed.
+    async fn try_lock_receipt_attempt_keys_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        jobs: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            WITH attempts AS MATERIALIZED (
+                SELECT DISTINCT
+                    input.job_id,
+                    input.run_lease,
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', input.job_id, input.run_lease),
+                        0
+                    ) AS lock_key
+                FROM unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
+            )
+            SELECT job_id, run_lease
+            FROM attempts
+            WHERE pg_catalog.pg_try_advisory_xact_lock(lock_key)
+            "#,
+        )
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     async fn ensure_running_leases_from_receipts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -12086,7 +12127,6 @@ impl QueueStorage {
                       WHERE dlq.job_id = items.job_id
                         AND dlq.run_lease = items.run_lease
                   )
-                FOR UPDATE OF claim_batches
             ),
             claim_refs AS (
                 SELECT * FROM row_claim_refs
@@ -12135,6 +12175,19 @@ impl QueueStorage {
             .iter()
             .map(|(job_id, run_lease, _)| (*job_id, *run_lease))
             .collect();
+        let locked: HashSet<_> = self
+            .try_lock_receipt_attempt_keys_tx(tx, &receipt_jobs)
+            .await?
+            .into_iter()
+            .collect();
+        let jobs: Vec<_> = jobs
+            .iter()
+            .filter(|(job_id, run_lease, _)| locked.contains(&(*job_id, *run_lease)))
+            .collect();
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+        let receipt_jobs: Vec<_> = jobs.iter().map(|(id, lease, _)| (*id, *lease)).collect();
         self.lock_receipt_attempts_tx(tx, &receipt_jobs).await?;
 
         let schema = self.schema();
@@ -12203,7 +12256,6 @@ impl QueueStorage {
                       WHERE dlq.job_id = items.job_id
                         AND dlq.run_lease = items.run_lease
                   )
-                FOR UPDATE OF claim_batches
             ),
             claim_refs AS (
                 SELECT * FROM row_claim_refs
@@ -15628,7 +15680,8 @@ impl QueueStorage {
     /// Heartbeat compact receipt claims by their batch identity. Each claim
     /// batch is addressed by primary key and the attempt by item index, with
     /// index-only closure probes and no batch row lock, so the cost is
-    /// O(in-flight attempts) rather than O(open claim batches).
+    /// O(in-flight attempts) rather than O(open claim batches). Attempts that
+    /// a closer holds right now are skipped rather than waited for.
     pub async fn heartbeat_claims_batch(
         &self,
         pool: &PgPool,
@@ -15643,7 +15696,19 @@ impl QueueStorage {
             .iter()
             .map(|claim| (claim.job_id, claim.run_lease))
             .collect();
-        self.lock_receipt_attempt_keys_tx(&mut tx, &pairs).await?;
+        let locked: HashSet<(i64, i64)> = self
+            .try_lock_receipt_attempt_keys_tx(&mut tx, &pairs)
+            .await?
+            .into_iter()
+            .collect();
+        let claims: Vec<&ClaimHeartbeatRef> = claims
+            .iter()
+            .filter(|claim| locked.contains(&(claim.job_id, claim.run_lease)))
+            .collect();
+        if claims.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(0);
+        }
         let job_ids: Vec<i64> = claims.iter().map(|claim| claim.job_id).collect();
         let run_leases: Vec<i64> = claims.iter().map(|claim| claim.run_lease).collect();
         let claim_slots: Vec<i32> = claims.iter().map(|claim| claim.claim_slot).collect();
@@ -15715,6 +15780,38 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
+    /// Lock legacy lease rows without waiting behind a finalizer. Keep this
+    /// separate from the updating statement: the latter must use a fresh
+    /// snapshot and must not mix partition pruning with row locking (PG18).
+    async fn lock_live_leases_for_heartbeat_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        jobs: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        sqlx::query_as::<_, (i64, i64)>(audited_sql(format!(
+            r#"
+            SELECT lease.job_id, lease.run_lease
+            FROM {table} AS lease
+            JOIN unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
+              ON lease.job_id = input.job_id AND lease.run_lease = input.run_lease
+            WHERE lease.state = 'running'
+            ORDER BY lease.job_id, lease.run_lease
+            FOR UPDATE OF lease SKIP LOCKED
+            "#,
+            table = self.leases_table(),
+        )))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     pub async fn heartbeat_batch(
         &self,
         pool: &PgPool,
@@ -15735,14 +15832,18 @@ impl QueueStorage {
             // dead entries per write under sustained churn). Compat
             // reads in `LeaseJobRow` SELECTs and the `awa.jobs` view
             // COALESCE attempt_state.heartbeat_at first.
+            let locked = self.try_lock_receipt_attempt_keys_tx(&mut tx, jobs).await?;
             updated += self
-                .upsert_attempt_state_from_receipts_tx(&mut tx, jobs)
+                .upsert_attempt_state_from_receipts_tx(&mut tx, &locked)
                 .await?;
         } else {
             // Legacy non-receipts mode (custom schemas with
             // `lease_claim_receipts=FALSE`): the `leases.heartbeat_at`
             // write is still the heartbeat home, since there is no
             // upsert_attempt_state path firing.
+            let jobs = self
+                .lock_live_leases_for_heartbeat_tx(&mut tx, jobs)
+                .await?;
             let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
             let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
             let result = sqlx::query(audited_sql(format!(
@@ -15793,9 +15894,19 @@ impl QueueStorage {
             self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
                 .await?
         } else {
-            // Legacy non-receipts mode keeps the old CTE shape that
-            // updates leases.heartbeat_at + leases.progress
-            // (via attempt_state upsert) in a single round-trip.
+            // Prelock independently so a finalizer cannot stall the entire
+            // heartbeat pass. Skipped progress snapshots remain unacknowledged
+            // in the worker and are retried on the next pass.
+            let keys: Vec<_> = jobs.iter().map(|(id, lease, _)| (*id, *lease)).collect();
+            let locked: HashSet<_> = self
+                .lock_live_leases_for_heartbeat_tx(&mut tx, &keys)
+                .await?
+                .into_iter()
+                .collect();
+            let jobs: Vec<_> = jobs
+                .iter()
+                .filter(|(id, lease, _)| locked.contains(&(*id, *lease)))
+                .collect();
             let schema = self.schema();
             let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _, _)| *job_id).collect();
             let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
