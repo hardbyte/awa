@@ -17457,6 +17457,12 @@ impl QueueStorage {
     /// outside the lanes in `skip`, and promote each lane's share in its own
     /// transaction.
     ///
+    /// The selection skips rows another transaction has locked, such as a
+    /// lane promotion still waiting for its lane, so they cannot fill every
+    /// batch of a tick. It runs as its own statement, so its row locks end
+    /// with it; `deferred_jobs` is not partitioned, so no run-time pruning
+    /// meets those locks.
+    ///
     /// Re-enqueueing a row takes its lane's enqueue reservation lock, which
     /// producers hold until they commit, so a lane under heavy enqueue load
     /// can keep its promotion waiting. A transaction per lane confines that
@@ -17494,6 +17500,7 @@ impl QueueStorage {
               )
             ORDER BY run_at ASC, priority ASC, job_id ASC
             LIMIT $2
+            FOR UPDATE OF deferred SKIP LOCKED
             "#
         )))
         .bind(state)
