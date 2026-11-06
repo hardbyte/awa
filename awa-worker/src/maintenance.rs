@@ -2800,6 +2800,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
             debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("queue");
             return;
         }
 
@@ -2840,6 +2841,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("queue");
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
         }
@@ -2874,6 +2876,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_LEASE) {
             debug!(branch = PRUNE_BRANCH_LEASE, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("lease");
             return;
         }
 
@@ -2904,6 +2907,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("lease");
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
         }
@@ -2943,6 +2947,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_CLAIM) {
             debug!(branch = PRUNE_BRANCH_CLAIM, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("claim");
             return;
         }
 
@@ -2973,6 +2978,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("claim");
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }

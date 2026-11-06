@@ -4,6 +4,26 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **The queue-storage prune `lock_timeout` is configurable, and prune
+  attempts are counted by outcome for every ring.** Prune (queue, lease and
+  claim rings) and terminal-delta rollup take their exclusive locks under a
+  10 ms `lock_timeout` that could only be changed through the hidden
+  `QueueStorage::with_prune_lock_timeout`. When short readers of the ring
+  partitions held a conflicting lock at that instant, prune reported
+  `blocked` every tick and the rings stopped recycling. Set it with
+  `ClientBuilder::prune_lock_timeout` (Rust) or
+  `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
+  default stays 10 ms and zero is rejected. `with_prune_lock_timeout` is now
+  public, with `set_prune_lock_timeout` and `prune_lock_timeout()`.
+  `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
+  gains `backed_off` (prune skipped by the backoff that follows consecutive
+  `skipped_active` or `blocked` results) and
+  `error` (prune failed with a database error) alongside the existing
+  `pruned`, `noop`, `blocked` and `skipped_active`. See
+  [Configuration](docs/configuration.md#what-the-knobs-mean).
+
 ### Fixed
 
 - **Callback completion, `get_job`, lifecycle events and the admin reads

@@ -33,6 +33,19 @@ impl QueueStorageRuntime {
         self.claim_rotate_interval = claim_rotate_interval;
         self
     }
+
+    /// Set the prune `lock_timeout` on the store. Only valid before the store
+    /// is shared, which holds for a runtime still owned by the builder.
+    pub fn set_prune_lock_timeout(&mut self, timeout: Duration) -> Result<(), awa_model::AwaError> {
+        Arc::get_mut(&mut self.store)
+            .ok_or_else(|| {
+                awa_model::AwaError::Validation(
+                    "queue storage is already shared; set the prune lock timeout before build"
+                        .into(),
+                )
+            })?
+            .set_prune_lock_timeout(timeout)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
