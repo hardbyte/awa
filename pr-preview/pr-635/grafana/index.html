@@ -2006,6 +2006,8 @@
       
         
       
+        
+      
     
     
     
@@ -2187,6 +2189,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -3159,6 +3189,18 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Histogram (s)</td>
 <td>ring, phase</td>
 <td>Successful destructive prune time split into <code>lock</code>, <code>truncate</code>, and <code>commit</code></td>
+</tr>
+<tr>
+<td><code>awa.maintenance.analyze.attempts</code></td>
+<td>Counter</td>
+<td>scope (<code>heads</code>, <code>ring_parent</code>, <code>pass</code>), outcome</td>
+<td>Planner-statistics <code>ANALYZE</code> calls on the head tables and ring parents (<code>ok</code>, <code>skipped_privilege</code>, <code>skipped_lock</code>, <code>unavailable</code>, <code>failed</code>)</td>
+</tr>
+<tr>
+<td><code>awa.maintenance.analyze.duration</code></td>
+<td>Histogram (s)</td>
+<td>scope, outcome</td>
+<td>Duration of one planner-statistics <code>ANALYZE</code> call</td>
 </tr>
 </tbody>
 </table>

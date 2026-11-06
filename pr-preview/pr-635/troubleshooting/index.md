@@ -188,7 +188,7 @@ Reading them together separates the two usual failure modes:
 
 **1. Producer is going through the compatibility insert path.**
 
-`insert_many_copy_from_pool` / `client.insert_many_copy` routes every row through `awa.insert_job_compat()` once per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row function call dominates — measured at ~100–150 ms per row through a Cloud SQL Auth Proxy in staging, which caps a single producer at ~7 rows/sec regardless of batch or chunk size.
+Before migration v055, `insert_many_copy_from_pool` / `client.insert_many_copy` calls `awa.insert_job_compat()` per staged row. With unique jobs, per-row savepoints add database round trips that can dominate behind a proxy or on managed PostgreSQL. After migration, COPY probes its own connection and uses the batch function. Generic `insert_many` retains its per-row statement on every supported schema.
 
 Switch the producer to the direct queue-storage COPY entry point:
 
@@ -447,12 +447,12 @@ Symptoms:
 Cause:
 
 - on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until it commits, so concurrent producers for one lane run one at a time; a lane's ceiling is a batch's rows divided by the time the lock is held
-- from migration v053, `insert_many` and `insert_many_copy` hold the lock across the lane write only, a few milliseconds for a 185-row batch; before it, the lock was held while every row of the batch was processed
+- from migration v055, `insert_many_copy` and `insert_many_skip_unique_conflicts` prepare the batch before taking lane locks; generic `insert_many` continues to hold the lane while subsequent rows are processed
 - maintenance promotion moves due scheduled and retryable jobs into the lane under the same lock; a promotion batch is one transaction across every queue it touches, and the leader runs its branches one at a time, so a batch parked behind a hot lane delays the due jobs of other queues in that batch and the leader's other branches. Rescue itself does not take the lane lock; it writes retryable rows that promotion moves later
 
 Fix:
 
-- run `awa migrate`: producers on the per-row path (a schema before v053) hold the lane for the whole batch, and switch to the batch function as soon as it exists
+- run `awa migrate` and use `insert_many_copy` or `insert_many_skip_unique_conflicts` for the batch function; generic `insert_many` stays on its compatible per-row path
 - when `insert_many` fails on a unique conflict, retry with `insert_many_skip_unique_conflicts` rather than inserting the batch again row by row: each single-row insert queues for the lane separately
 - raise `awa.queue_meta.enqueue_shards` for a queue whose producers still saturate one lane, accepting partitioned rather than strict FIFO ([ADR-025](../adr/025-sharded-enqueue-heads/index.md))
 
@@ -461,7 +461,7 @@ Fix:
 Cause:
 
 - on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until the transaction commits; the `DETAIL` names two 64-bit advisory keys, and two transactions that took lanes in opposite orders hold one each and wait on the other's
-- `insert_many`, `insert_many_copy` and the `QueueStorage` batch enqueues take their lane locks in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so batches never deadlock with each other
+- `insert_many`, `insert_many_copy` and the `QueueStorage` batch enqueues take their lane locks in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, avoiding deadlocks caused by opposing lane-lock order; uniqueness and other application locks can still form cycles
 - a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a batch or another such transaction that touches the same lanes in a different order
 
 Fix:

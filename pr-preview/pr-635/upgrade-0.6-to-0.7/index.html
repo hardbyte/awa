@@ -1509,6 +1509,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lane-ownership-and-v053" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lane ownership and v053
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-schema-discovery-during-migration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1581,10 +1592,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#v053-batch-producer-insert" class="md-nav__link">
+  <a href="#v054-planner-statistics-helper" class="md-nav__link">
     <span class="md-ellipsis">
       
-        v053: batch producer insert
+        v054: planner statistics helper
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v055-batch-producer-insert" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v055: batch producer insert
       
     </span>
   </a>
@@ -2041,6 +2063,8 @@
       
         
       
+        
+      
     
     
     
@@ -2235,6 +2259,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2414,6 +2466,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lane-ownership-and-v053" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lane ownership and v053
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-schema-discovery-during-migration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2486,10 +2549,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#v053-batch-producer-insert" class="md-nav__link">
+  <a href="#v054-planner-statistics-helper" class="md-nav__link">
     <span class="md-ellipsis">
       
-        v053: batch producer insert
+        v054: planner statistics helper
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v055-batch-producer-insert" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v055: batch producer insert
       
     </span>
   </a>
@@ -2701,14 +2775,40 @@ lazy creation. The migration adds no runtime version gate or authority flip.</p>
 <p>A <a href="https://github.com/hardbyte/awa/pull/501#compatibility-evidence">migrate-first rehearsal with released <code>awa-pg==0.6.7</code></a>
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.</p>
-<p>For a runtime without DDL privileges, apply v049 as the migrator, run
-<code>awa storage prepare-queue --queue &lt;name&gt;</code> for every physical queue, and grant
-sequence <code>USAGE, SELECT, UPDATE</code> before starting producers or workers. Match
-shard and stripe counts and provision extra lanes before increasing them.
-External migration runners must apply the complete generated
+<p>External migration runners must apply the complete generated
 <code>awa migrate --sql --from 48 --to 49</code> bundle: it refreshes the installer
-definition before replacing lane helpers in the installed schemas.
-See <a href="../security/database-roles/#provision-queues-before-starting-restricted-runtimes">Database roles</a>.</p>
+definition before replacing lane helpers in the installed schemas. From v053,
+runtimes without DDL privileges create lanes themselves through the schema
+owner's provisioning functions, so <code>awa storage prepare-queue</code> is optional.</p>
+<h2 id="lane-ownership-and-v053">Lane ownership and v053<a class="headerlink" href="#lane-ownership-and-v053" title="Permanent link">&para;</a></h2>
+<p>Before v053 a lane's sequences belonged to the role that first enqueued into,
+claimed from or promoted into it. With several runtime roles, only roles whose
+default privileges covered that role could use the lane; any other role failed
+with <code>permission denied for sequence</code>. v053 installs <code>SECURITY DEFINER</code>
+<code>provision_lane</code> and <code>provision_lane_sequences</code> functions, owned by the schema
+owner, in each queue-storage schema. The lane helpers create sequences through
+them, with grants that mirror the lane's head table. Once v053 commits,
+<code>awa migrate</code> gives every existing lane sequence to the schema owner and adds
+its missing grants, as far as it is allowed to, one sequence per short
+transaction with a bounded lock wait.</p>
+<p>0.6 and earlier 0.7 binaries call the same helpers, so lanes they create after
+v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
+detects that <code>provision_lane</code> is missing and creates lanes as before.</p>
+<p>To adopt it:</p>
+<ol>
+<li>Check the current state: <code>awa storage lane-sequences</code> (read-only, exits 2
+   while lanes need repair).</li>
+<li>Run <code>awa migrate</code> with the schema owner as the effective role, as described
+   in <a href="../security/database-roles/">Database roles</a>.</li>
+<li>Read the migrate output. Any lane sequence it could not repair is listed in
+   a warning. A busy one needs another run of
+   <code>awa storage lane-sequences --repair</code> as the migration role (without
+   <code>PGOPTIONS</code>); the others name the roles that can repair them. See
+   <a href="../security/database-roles/#check-and-repair-lane-ownership">Check and repair lane ownership</a>.</li>
+</ol>
+<p>External migration runners apply the generated <code>awa migrate --sql --from 52
+--to 53</code> bundle, which does not repair existing lane sequences, then run
+<code>awa storage lane-sequences --repair</code> as the migration role itself.</p>
 <h2 id="custom-schema-discovery-during-migration">Custom-schema discovery during migration<a class="headerlink" href="#custom-schema-discovery-during-migration" title="Permanent link">&para;</a></h2>
 <p>Migration bundles discover custom substrates using catalog metadata without
 evaluating their views or functions. Schemas, relations, routines and types
@@ -2920,24 +3020,32 @@ reads them, and it drops completion outputs (counted as
 workers report not ready until the migration runs, as for any version bump.</p>
 <p>External migration runners apply the complete <code>awa migrate --sql --from 51
 --to 52</code> bundle, which defines the helper before the tail calls it.</p>
-<h2 id="v053-batch-producer-insert">v053: batch producer insert<a class="headerlink" href="#v053-batch-producer-insert" title="Permanent link">&para;</a></h2>
-<p>v053 adds <code>awa.insert_jobs_compat_batch</code>, the function <code>insert_many</code> and
-<code>insert_many_copy</code> call. It is one <code>CREATE OR REPLACE FUNCTION</code>: no table DDL,
+<h2 id="v054-planner-statistics-helper">v054: planner statistics helper<a class="headerlink" href="#v054-planner-statistics-helper" title="Permanent link">&para;</a></h2>
+<p>v054 adds <code>awa.analyze_queue_storage_relation(schema, relation)</code>, a
+<code>SECURITY DEFINER</code> function owned by the migration role that lets the
+maintenance leader refresh planner statistics for the head tables and ring
+parents when the runtime role does not own them (see
+<a href="../configuration/#planner-statistics">Planner statistics</a>). It creates one
+function, revokes <code>EXECUTE</code> from <code>PUBLIC</code> and grants it to the roles that
+already hold INSERT, UPDATE and DELETE on the <code>awa</code> head tables (the runtime
+grantees); it takes no table lock and completes in milliseconds. Roles created
+later need <code>GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa</code>. Run the migration as the schema owner so the
+function's owner owns the tables.</p>
+<p>Binaries before v054 never call it. A 0.7 binary running before the migration
+logs once that the function is missing and skips the refresh; the
+<code>awa.maintenance.analyze.attempts</code> counter reports <code>unavailable</code>. External
+migration runners apply the <code>awa migrate --sql --from 53 --to 54</code> bundle.</p>
+<h2 id="v055-batch-producer-insert">v055: batch producer insert<a class="headerlink" href="#v055-batch-producer-insert" title="Permanent link">&para;</a></h2>
+<p>v055 adds <code>awa.insert_jobs_compat_batch</code>, the function <code>insert_many_copy</code> and
+<code>insert_many_skip_unique_conflicts</code> call. It is one <code>CREATE OR REPLACE FUNCTION</code>: no table DDL,
 no scan, no lock beyond the catalog, so it applies instantly under live load.
-<code>awa.insert_job_compat</code> is unchanged, and binaries before v053 keep calling it;
+<code>awa.insert_job_compat</code> is unchanged, and binaries before v055 keep calling it;
 both paths take the same per-lane reservation lock, so producers on either
 version serialise on a lane as before.</p>
 <p>The runtime role needs <code>EXECUTE</code> on the new function; the
 <a href="../security/database-roles/#runtime-grants">default privileges</a> cover functions
 the migrator creates.</p>
-<p>A 0.7 binary running before the migration keeps inserting: <code>insert_many</code> and
-<code>insert_many_copy</code> look for the function in the catalog, use the per-row
-function until it exists, and switch to the batch function without a restart
-once it does. <code>insert_many_skip_unique_conflicts</code> needs the function and returns
-a validation error before the migration. The per-row and batch paths take the
-same lane lock, so a fleet that mixes them keeps each batch contiguous and in
-order. External migration runners apply the <code>awa migrate --sql --from 52 --to
-53</code> bundle.</p>
+<p>A 0.7 binary running before the migration keeps inserting. <code>insert_many_copy</code> probes its own connection on every call, uses the per-row function until the batch function exists, and switches without a restart. Generic <code>insert_many</code> always uses the per-row function in one statement, so one process can write to databases at different migration levels without aborting a caller transaction on an unavailable function. <code>insert_many_skip_unique_conflicts</code> needs the function and returns a validation error before the migration. The per-row and batch paths take the same lane lock, so a fleet that mixes them keeps each batch contiguous and in order. External migration runners apply the <code>awa migrate --sql --from 54 --to 55</code> bundle.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>

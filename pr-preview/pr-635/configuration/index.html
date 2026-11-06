@@ -1610,6 +1610,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#planner-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Planner statistics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#rust_2" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2350,6 +2361,8 @@
       
         
       
+        
+      
     
     
     
@@ -2531,6 +2544,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -3022,6 +3063,17 @@
     <span class="md-ellipsis">
       
         Terminal count rollup
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#planner-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Planner statistics
       
     </span>
   </a>
@@ -3898,6 +3950,11 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 <td><code>30s</code></td>
 <td>Queue storage only: how often maintenance folds pending <code>done_entries</code> terminal-count deltas for sealed queue slots into compact live counters. Exact reads include pending deltas and retained compact receipt batches, so this affects compaction/WAL pressure rather than correctness.</td>
 </tr>
+<tr>
+<td><code>ClientBuilder::statistics_refresh_interval</code> (Rust) / <code>statistics_refresh_interval_ms</code> (Python kwarg)</td>
+<td><code>5m</code></td>
+<td>Queue storage only: how often the maintenance leader runs <code>ANALYZE</code> on the two head tables and the partitioned ring parents, which autovacuum never analyses; also run once when a runtime becomes leader. <code>0</code> disables it. See <a href="#planner-statistics">Planner statistics</a>.</td>
+</tr>
 </tbody>
 </table>
 <h2 id="queue-storage-tuning">Queue storage tuning<a class="headerlink" href="#queue-storage-tuning" title="Permanent link">&para;</a></h2>
@@ -3906,12 +3963,20 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 <p>For bulk producers on queue storage, prefer direct queue-storage COPY: Python <code>enqueue_many_copy()</code> or Rust <code>QueueStorage::enqueue_params_copy()</code>. Those paths write straight into <code>ready_entries</code> / <code>deferred_jobs</code> and use the queue-storage enqueue heads directly. In 0.7, each ready or deferred write group uses array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff; the API and transactional enqueue semantics are unchanged.</p>
 <p>Direct-copy producers must use the same queue-storage routing config as the worker fleet. This matters most for <code>queue_stripe_count</code> / <code>queue_storage_queue_stripe_count</code>: a producer using the default unstriped config can write to <code>queue</code> while striped workers claim from <code>queue#0</code>, <code>queue#1</code>, etc. Rust producers should construct <code>QueueStorage</code> with the same <code>QueueStorageConfig</code> used by workers. Python producers should pass the same <code>queue_storage_queue_stripe_count</code> to <code>enqueue_many_copy()</code> when the fleet uses non-default striping.</p>
 <p><code>insert_many_copy()</code> is the compatibility insert API. It is still useful when a caller needs the canonical insert surface, but in queue-storage mode it routes through the compatibility function rather than being the primary producer fast path.</p>
-<p>The Rust compatibility inserts differ in how they treat a unique-key conflict. <code>insert_many</code> fails the whole batch with a unique violation (SQLSTATE <code>23505</code>). <code>insert_many_skip_unique_conflicts</code> inserts the rest of the batch and returns only the rows it inserted, in input order, so a producer that replays work does not have to insert the batch again one job at a time (each of those inserts takes the lane lock separately, which on a busy lane is slower than the batch itself). <code>insert_many_copy</code> also skips conflicting jobs, and is what Python's <code>insert_many_copy()</code> calls; Python has no separate skip function because that is already its behaviour. <code>insert_many_skip_unique_conflicts</code> needs migration v053; the other two use <code>awa.insert_jobs_compat_batch</code> when the schema has it and the per-row function when it does not.</p>
+<p>The Rust compatibility inserts differ in how they treat a unique-key conflict. <code>insert_many</code> fails the whole batch with a unique violation (SQLSTATE <code>23505</code>). <code>insert_many_skip_unique_conflicts</code> inserts the rest of the batch and returns only the rows it inserted, in input order, so a producer that replays work does not have to insert the batch again one job at a time (each of those inserts takes the lane lock separately, which on a busy lane is slower than the batch itself). <code>insert_many_copy</code> also skips conflicting jobs, and is what Python's <code>insert_many_copy()</code> calls; Python has no separate skip function because that is already its behaviour. <code>insert_many_skip_unique_conflicts</code> needs migration v055. <code>insert_many_copy</code> probes its own connection on every call and uses <code>awa.insert_jobs_compat_batch</code> when installed, otherwise the per-row function. Generic <code>insert_many</code> always uses the per-row function in one statement, so a process can write to databases at different migration levels without assuming they share a schema.</p>
 <h3 id="terminal-count-rollup">Terminal count rollup<a class="headerlink" href="#terminal-count-rollup" title="Permanent link">&para;</a></h3>
 <p>Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. <code>done_entries</code> terminal inserts append positive rows to <code>queue_terminal_count_deltas_*</code>; retry, discard, DLQ move, and compatibility delete of <code>done_entries</code> rows append negative rows. Compact receipt completions do not write count deltas: exact count reads add retained <code>receipt_completion_batches_*</code> counts and subtract retained <code>receipt_completion_tombstones_*</code>.</p>
 <p>A queue slot is one partition in queue storage's rotating ready/done ring. A sealed slot is no longer the current write slot, so maintenance can fold its terminal-count deltas without touching the active completion segment.</p>
 <p>The maintenance leader folds pending <code>done_entries</code> deltas from sealed queue slots every <code>terminal_count_rollup_interval</code> (default <code>30s</code>) and processes at most four slots per tick. Rollup is MVCC-horizon aware: if another backend is holding a visible snapshot open, or is idle in a transaction with an assigned transaction id, maintenance leaves pending delta rows append-only and tries again on a later tick. Exact counts remain correct because they read folded counters, pending deltas, retained compact batches, compact tombstones, and permanent rollups.</p>
 <p>Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the <code>done_entries</code> delta ledger is growing faster than maintenance drains it. Under long reader transactions, lowering the interval does not force rollup; the useful fix is to release the pinned snapshot or let queue prune reclaim the whole sealed segment. Compact receipt successes are already retained as compact batch rows, so this interval does not change their hot-path write count.</p>
+<h3 id="planner-statistics">Planner statistics<a class="headerlink" href="#planner-statistics" title="Permanent link">&para;</a></h3>
+<p>Autovacuum does not analyse partitioned tables, so the ring parents (<code>ready_entries</code>, <code>done_entries</code>, <code>leases</code>, and the other ten partitioned tables of the schema) have no inherited statistics. It also never reaches its analyze threshold on <code>queue_claim_heads</code> and <code>queue_enqueue_heads</code>, which hold a few rows per lane, so the planner prices joins against them at its defaults. Admin and metrics queries that join retained ready rows to the heads tables then pick plans for a few hundred rows while reading hundreds of thousands.</p>
+<p>The maintenance leader runs <code>ANALYZE</code> on both when it is elected and every <code>statistics_refresh_interval</code> (default <code>5m</code>). One pass takes well under a second on a small ring and a few seconds on a ring with millions of retained rows. It has no measurable effect on claim or completion throughput.</p>
+<ul>
+<li><strong>Locks.</strong> Each relation is analysed in its own transaction with a 2 s <code>lock_timeout</code> and a 120 s <code>statement_timeout</code>. <code>SKIP_LOCKED</code> skips a child that ring prune holds during the per-child analysis, but sampling for the parent's statistics waits for it up to the <code>lock_timeout</code>; a call that times out is recorded as <code>skipped_lock</code> and retried on the next interval. Prune never waits for the refresh: its own 10 ms lock timeout applies, so an attempt that lands while <code>ANALYZE</code> samples the oldest slot's tables returns <code>blocked</code> and retries on its usual backoff. <code>ANALYZE</code> of a partitioned table samples every child, so that window cannot be avoided.</li>
+<li><strong>Privileges.</strong> The refresh calls <code>awa.analyze_queue_storage_relation(schema, relation)</code>, a <code>SECURITY DEFINER</code> function installed by migration v054. The runtime needs EXECUTE on the helper, and the login role needs INSERT, UPDATE and DELETE on the target schema's <code>queue_claim_heads</code>; the migration grants EXECUTE to existing runtime grantees. A missing helper or caller privilege skips the pass before making calls and logs one warning. Run <code>awa migrate</code> for a missing helper; restore the grants as the schema owner for <code>skipped_privilege</code>. If the helper owner may not analyse the tables, transfer the function to the table owner or grant its owner <code>MAINTAIN</code> on PostgreSQL 17+. See the <a href="../security/database-roles/">database roles guide</a> for the ownership command.</li>
+<li><strong>Metrics.</strong> <code>awa.maintenance.analyze.attempts</code> and <code>awa.maintenance.analyze.duration</code>, by <code>awa.analyze.scope</code> (<code>heads</code>, <code>ring_parent</code>, <code>pass</code>) and <code>awa.analyze.outcome</code> (<code>ok</code>, <code>skipped_privilege</code>, <code>skipped_lock</code>, <code>unavailable</code>, <code>failed</code>). A sustained <code>skipped_lock</code> rate means something else holds the tables; any <code>skipped_privilege</code> or <code>unavailable</code> means the refresh is not running.</li>
+</ul>
 <h3 id="rust_2">Rust<a class="headerlink" href="#rust_2" title="Permanent link">&para;</a></h3>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">client</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Client</span><span class="p">::</span><span class="n">builder</span><span class="p">(</span><span class="n">pool</span><span class="p">.</span><span class="n">clone</span><span class="p">())</span>
 </span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="w">    </span><span class="p">.</span><span class="n">queue</span><span class="p">(</span><span class="s">"email"</span><span class="p">,</span><span class="w"> </span><span class="n">QueueConfig</span><span class="p">::</span><span class="n">default</span><span class="p">())</span>
