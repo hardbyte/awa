@@ -163,6 +163,7 @@ pub struct ClientBuilder {
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
+    statistics_refresh_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -226,6 +227,7 @@ impl ClientBuilder {
             leader_check_interval: None,
             priority_aging_interval: None,
             terminal_count_rollup_interval: None,
+            statistics_refresh_interval: None,
             completed_retention: None,
             failed_retention: None,
             descriptor_retention: None,
@@ -905,6 +907,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how often the maintenance leader refreshes planner statistics for
+    /// the queue-storage tables autovacuum never analyses (default: 5 minutes).
+    ///
+    /// Autovacuum does not analyse partitioned tables, and never reaches its
+    /// threshold on the two small head tables, so the leader runs `ANALYZE`
+    /// on both when it is elected and then every interval, through
+    /// `awa.analyze_queue_storage_relation()` (schema v053) so that a runtime
+    /// role that does not own the tables still works. `Duration::ZERO`
+    /// disables the refresh. Queue storage only.
+    pub fn statistics_refresh_interval(mut self, interval: Duration) -> Self {
+        self.statistics_refresh_interval = Some(interval);
+        self
+    }
+
     /// Set how often queue depth/lag metrics are published (default: 30s).
     pub fn queue_stats_interval(mut self, interval: Duration) -> Self {
         self.queue_stats_interval = Some(interval);
@@ -1256,6 +1272,7 @@ impl ClientBuilder {
             leader_check_interval: self.leader_check_interval,
             priority_aging_interval: self.priority_aging_interval,
             terminal_count_rollup_interval: self.terminal_count_rollup_interval,
+            statistics_refresh_interval: self.statistics_refresh_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
             descriptor_retention: self.descriptor_retention,
@@ -1362,6 +1379,7 @@ pub struct Client {
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
+    statistics_refresh_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -1931,6 +1949,9 @@ impl Client {
         }
         if let Some(interval) = self.terminal_count_rollup_interval {
             maintenance = maintenance.terminal_count_rollup_interval(interval);
+        }
+        if let Some(interval) = self.statistics_refresh_interval {
+            maintenance = maintenance.statistics_refresh_interval(interval);
         }
         if let Some(retention) = self.completed_retention {
             maintenance = maintenance.completed_retention(retention);

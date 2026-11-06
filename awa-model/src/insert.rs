@@ -13,7 +13,7 @@ use sqlx::{PgExecutor, PgPool};
 // enclosing transaction ends, so two transactions that enqueue into the same
 // lanes in opposite orders can deadlock. `insert_many_copy` and
 // `insert_many_skip_unique_conflicts` use `awa.insert_jobs_compat_batch`
-// (migration v053), which does the
+// (migration v055), which does the
 // lane-independent work first and then reserves its lanes in one canonical
 // order: `(queue, priority, shard)` ascending, queues compared bytewise
 // (`COLLATE "C"`, the order of Rust's `str`). `QueueStorage` batch enqueues
@@ -556,7 +556,7 @@ where
 /// replays work wants, and it takes each lane lock once for the batch rather
 /// than once per job as a row-by-row retry does.
 ///
-/// Requires migration v053 (`awa migrate`); on an older schema it returns
+/// Requires migration v055 (`awa migrate`); on an older schema it returns
 /// [`AwaError::Validation`]. [`insert_many_copy`] skips unique conflicts on
 /// every schema, through a connection, and is the Python
 /// `insert_many_copy`.
@@ -589,14 +589,14 @@ where
     {
         Ok(results) => Ok(results),
         Err(err) if is_missing_batch_function(&err) => Err(AwaError::Validation(
-            "insert_many_skip_unique_conflicts needs migration v053; run `awa migrate`".to_string(),
+            "insert_many_skip_unique_conflicts needs migration v055; run `awa migrate`".to_string(),
         )),
         Err(err) => Err(err.into()),
     }
 }
 
 /// `undefined_function` naming the batch function: the schema predates
-/// migration v053 or the function was dropped.
+/// migration v055 or the function was dropped.
 fn is_missing_batch_function(err: &sqlx::Error) -> bool {
     matches!(
         err,
@@ -693,7 +693,7 @@ fn bind_row_function_columns<'q>(
 ///
 /// Uses a temp staging table with no constraints for fast COPY ingestion,
 /// then inserts them through `awa.insert_jobs_compat_batch`, or, on a schema
-/// without migration v053, through `awa.insert_job_compat` row by row. Jobs
+/// without migration v055, through `awa.insert_job_compat` row by row. Jobs
 /// whose unique key is already claimed are skipped. Accepts
 /// `&mut PgConnection` so callers can use pool connections or transactions
 /// (Transaction derefs to PgConnection). For high-volume queue-storage

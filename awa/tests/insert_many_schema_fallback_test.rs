@@ -1,7 +1,7 @@
 //! `insert_many` and `insert_many_copy` against a schema without
 //! `awa.insert_jobs_compat_batch`.
 //!
-//! A binary may run ahead of migration v053. Generic `insert_many` keeps using
+//! A binary may run ahead of migration v055. Generic `insert_many` keeps using
 //! the per-row function; COPY probes its own connection and uses the batch
 //! function when installed. Different databases in one process can have
 //! different schema versions without aborting their caller's transactions.
@@ -22,8 +22,8 @@ use uuid::Uuid;
 const DROP_BATCH_FUNCTION: &str = "DROP FUNCTION awa.insert_jobs_compat_batch(text[], text[], \
      jsonb[], text[], smallint[], smallint[], timestamptz[], jsonb[], jsonb[], bytea[], text[], \
      text[], boolean)";
-const MIGRATION_V053: &str =
-    include_str!("../../awa-model/migrations/v053_insert_jobs_batch_compat.sql");
+const MIGRATION_V055: &str =
+    include_str!("../../awa-model/migrations/v055_insert_jobs_batch_compat.sql");
 
 fn database_url_for(database: &str) -> String {
     let url = setup::database_url();
@@ -95,7 +95,7 @@ async fn binary_ahead_of_the_migration_falls_back_and_recovers() {
     migrations::run(&pool).await.expect("migrate");
     setup::activate_queue_storage(&pool).await;
 
-    // A schema from before v053.
+    // A schema from before v055.
     sqlx::query(DROP_BATCH_FUNCTION)
         .execute(&pool)
         .await
@@ -132,21 +132,21 @@ async fn binary_ahead_of_the_migration_falls_back_and_recovers() {
         .expect("insert_many_copy without the batch function");
     assert_eq!(seqs(&copied), vec![2, 3], "duplicate skipped");
 
-    // The skip API is new with v053 and says so.
+    // The skip API is new with v055 and says so.
     let skipped = insert_many_skip_unique_conflicts(&pool, &jobs("fallback_u", 0..1, true))
         .await
         .expect_err("needs the migration");
     assert!(
-        matches!(&skipped, AwaError::Validation(message) if message.contains("v053")),
+        matches!(&skipped, AwaError::Validation(message) if message.contains("v055")),
         "{skipped:?}"
     );
 
     // Generic insert_many stays on the per-row path when the migration runs;
     // COPY chooses the batch function on its next call.
-    sqlx::raw_sql(MIGRATION_V053)
+    sqlx::raw_sql(MIGRATION_V055)
         .execute(&pool)
         .await
-        .expect("apply v053");
+        .expect("apply v055");
     insert_many(&pool, &jobs("fallback_b", 0..3, false))
         .await
         .expect("generic insert after migration");

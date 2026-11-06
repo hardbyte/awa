@@ -425,7 +425,7 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
     assert_eq!(ready_lane_seqs(&pool, &queue).await.len(), 51);
 }
 
-/// Producers on the per-row function, as binaries before v053 are, and
+/// Producers on the per-row function, as binaries before v055 are, and
 /// producers on the batch function share one lane at the same time. Each batch
 /// still occupies a contiguous run of `lane_seq`, in input order, and the lane
 /// has no duplicate or missing positions.
@@ -504,7 +504,7 @@ async fn old_and_new_producers_share_a_lane_without_reordering() {
     }
 }
 
-/// What a binary from before v053 sends: one `insert_job_compat` call per row.
+/// What a binary from before v055 sends: one `insert_job_compat` call per row.
 async fn insert_through_row_function(pool: &PgPool, jobs: &[InsertParams]) {
     sqlx::query(
         r#"

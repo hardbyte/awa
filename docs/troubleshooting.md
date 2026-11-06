@@ -186,7 +186,7 @@ Reading them together separates the two usual failure modes:
 
 **1. Producer is going through the compatibility insert path.**
 
-Before migration v053, `insert_many_copy_from_pool` / `client.insert_many_copy` calls `awa.insert_job_compat()` per staged row. With unique jobs, per-row savepoints add database round trips that can dominate behind a proxy or on managed PostgreSQL. After migration, COPY probes its own connection and uses the batch function. Generic `insert_many` retains its per-row statement on every supported schema.
+Before migration v055, `insert_many_copy_from_pool` / `client.insert_many_copy` calls `awa.insert_job_compat()` per staged row. With unique jobs, per-row savepoints add database round trips that can dominate behind a proxy or on managed PostgreSQL. After migration, COPY probes its own connection and uses the batch function. Generic `insert_many` retains its per-row statement on every supported schema.
 
 Switch the producer to the direct queue-storage COPY entry point:
 
@@ -445,7 +445,7 @@ Symptoms:
 Cause:
 
 - on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until it commits, so concurrent producers for one lane run one at a time; a lane's ceiling is a batch's rows divided by the time the lock is held
-- from migration v053, `insert_many_copy` and `insert_many_skip_unique_conflicts` prepare the batch before taking lane locks; generic `insert_many` continues to hold the lane while subsequent rows are processed
+- from migration v055, `insert_many_copy` and `insert_many_skip_unique_conflicts` prepare the batch before taking lane locks; generic `insert_many` continues to hold the lane while subsequent rows are processed
 - maintenance promotion moves due scheduled and retryable jobs into the lane under the same lock; a promotion batch is one transaction across every queue it touches, and the leader runs its branches one at a time, so a batch parked behind a hot lane delays the due jobs of other queues in that batch and the leader's other branches. Rescue itself does not take the lane lock; it writes retryable rows that promotion moves later
 
 Fix:

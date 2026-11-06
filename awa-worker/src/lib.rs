@@ -17,6 +17,7 @@ pub mod metrics;
 mod notify_hub;
 mod output;
 mod runtime;
+mod statistics;
 mod storage;
 
 // Re-exports

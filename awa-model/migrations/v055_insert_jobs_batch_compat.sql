@@ -1,4 +1,4 @@
--- v053: Batch producer insert that holds each enqueue lane lock only for the
+-- v055: Batch producer insert that holds each enqueue lane lock only for the
 -- lane write.
 -- Tracking: https://github.com/hardbyte/awa/pull/635
 --
@@ -576,5 +576,5 @@ $$ LANGUAGE plpgsql VOLATILE
 SET search_path = pg_catalog, awa, public;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (53, 'Batch producer insert with a short enqueue lane lock window')
+VALUES (55, 'Batch producer insert with a short enqueue lane lock window')
 ON CONFLICT (version) DO NOTHING;
