@@ -3,6 +3,8 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+mod ci_timing;
+
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
     BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
@@ -2007,6 +2009,231 @@ impl Worker for MultiClientTrackingWorker {
         tokio::time::sleep(Duration::from_millis(10)).await;
         Ok(JobResult::Completed)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct GracefulRestartJob {
+    id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct GracefulRestartFollowUp {
+    id: i64,
+}
+
+/// The first execution reports its attempt and returns `Completed` once
+/// shutdown signals cancellation; later executions complete at once.
+#[derive(Clone, Default)]
+struct GracefulRestartWorker {
+    executions: Arc<AtomicU32>,
+    first_attempt: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+    entered: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Worker for GracefulRestartWorker {
+    fn kind(&self) -> &'static str {
+        "graceful_restart_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if self.executions.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(JobResult::Completed);
+        }
+        *self.first_attempt.lock().expect("first attempt") = Some((ctx.job.id, ctx.job.run_lease));
+        self.entered.notify_one();
+        while !ctx.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(JobResult::Completed)
+    }
+}
+
+/// A runtime on its own tokio runtime and pool, so stopping it after a
+/// graceful shutdown drops whatever the client left running, as a process
+/// exit does.
+struct ProcessHost {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+}
+
+impl ProcessHost {
+    async fn start(
+        options: sqlx::postgres::PgConnectOptions,
+        build: impl FnOnce(sqlx::PgPool) -> Client + Send + 'static,
+    ) -> Self {
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build process runtime");
+            let client = runtime.block_on(async move {
+                let pool = PgPoolOptions::new()
+                    .max_connections(6)
+                    .connect_with(options)
+                    .await
+                    .expect("connect process pool");
+                let client = build(pool);
+                client.start().await.expect("start process client");
+                client
+            });
+            Self {
+                runtime,
+                client: Arc::new(client),
+            }
+        })
+        .await
+        .expect("start process host")
+    }
+
+    async fn exit_gracefully(self, timeout: Duration) {
+        let client = self.client.clone();
+        self.runtime
+            .spawn(async move { client.shutdown(timeout).await })
+            .await
+            .expect("graceful shutdown");
+        tokio::task::spawn_blocking(move || self.runtime.shutdown_background())
+            .await
+            .expect("stop process runtime");
+    }
+}
+
+/// A graceful shutdown must finalize every attempt whose handler returned
+/// during the drain. Finalization used to run detached from the drain, so a
+/// process that exited after `shutdown` returned could drop it: the attempt
+/// stayed open with no heartbeat and stale-heartbeat rescue ran the completed
+/// job again. A held receipt-attempt lock keeps this attempt's finalize in
+/// flight while shutdown drains, which the detached version did not wait for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_graceful_shutdown_finalizes_returned_attempts() {
+    // Each host below opens its own pool of 6, and only one runs at a time.
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_graceful_restart";
+    let store_config = QueueStorageConfig {
+        schema: "awa_qs_graceful_restart".to_string(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &GracefulRestartJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let worker = GracefulRestartWorker::default();
+    let options = (*pool.connect_options()).clone();
+    let build = |worker: GracefulRestartWorker, store_config: QueueStorageConfig| {
+        move |pool: sqlx::PgPool| {
+            Client::builder(pool)
+                .queue(
+                    queue,
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        deadline_duration: Duration::ZERO,
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config,
+                    Duration::from_secs(60),
+                    Duration::from_millis(50),
+                )
+                .claim_rotate_interval(Duration::from_secs(60))
+                .register_worker(worker)
+                // The follow-up's queue is not served; it only routes the
+                // completion through a transaction of its own.
+                .on_completed_enqueue::<GracefulRestartJob, GracefulRestartFollowUp, _>(
+                    |args, _job| GracefulRestartFollowUp { id: args.id },
+                )
+                .heartbeat_interval(Duration::from_millis(100))
+                .heartbeat_staleness(ci_timing::scaled_staleness(Duration::from_secs(1)))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .build()
+                .expect("build graceful restart client")
+        }
+    };
+
+    let host =
+        ProcessHost::start(options.clone(), build(worker.clone(), store_config.clone())).await;
+    tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(10)),
+        worker.entered.notified(),
+    )
+    .await
+    .expect("the job should start");
+    let (attempt_job_id, run_lease) = worker
+        .first_attempt
+        .lock()
+        .expect("first attempt")
+        .expect("first attempt recorded");
+    assert_eq!(attempt_job_id, job_id);
+
+    let mut lock_holder = pool.acquire().await.expect("lock connection");
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("hold the attempt's finalize lock");
+
+    let exit =
+        tokio::spawn(host.exit_gracefully(ci_timing::scaled_timeout(Duration::from_secs(10))));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("release the attempt's finalize lock");
+    drop(lock_holder);
+    exit.await.expect("graceful exit");
+
+    let after_exit = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load job")
+        .expect("job row");
+
+    // A later runtime rescues anything the exit left open.
+    let rescuer = ProcessHost::start(options, build(worker.clone(), store_config)).await;
+    let finished = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        ci_timing::scaled_timeout(Duration::from_secs(15)),
+    )
+    .await;
+    rescuer
+        .exit_gracefully(ci_timing::scaled_timeout(Duration::from_secs(10)))
+        .await;
+
+    assert_eq!(
+        (after_exit.state, after_exit.run_lease),
+        (JobState::Completed, run_lease),
+        "graceful shutdown returned before the completed attempt was finalized"
+    );
+    assert_eq!(
+        (worker.executions.load(Ordering::SeqCst), finished.run_lease),
+        (1, run_lease),
+        "the job ran again after a graceful shutdown"
+    );
 }
 
 /// ADR-023 claim-ring control-plane smoke test. Exercises

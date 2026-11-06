@@ -6,6 +6,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A graceful shutdown no longer leaves a finished attempt for stale-heartbeat
+  rescue to run again.** Once a handler returned, its finalize (completion,
+  retry, cancel or failure, and any ADR-029 follow-up inserts) ran in a task
+  that `Client::shutdown` did not wait for. When the last handler returned
+  just as the drain ended, shutdown stopped the completion batcher before
+  that finalize reached it, and the direct fallback raced the process exit.
+  The attempt had already left the heartbeat set, so it went stale and was
+  rescued and executed again `heartbeat_staleness` later; a deploy could
+  re-run a few jobs on every rolling restart. Shutdown now waits for
+  pending finalization, within the same drain timeout, before it stops the
+  completion batcher, heartbeat and maintenance services. A finalize that
+  outlives the timeout is still left to rescue, as before.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are
