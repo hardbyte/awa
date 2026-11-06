@@ -21484,15 +21484,18 @@ async fn test_aged_materialized_lease_is_visible_to_admin_reads() {
 /// same attempt on the next lane. In a quiet queue the new lane hands out the
 /// same `lane_seq`, so a lease joined to its ready row by attempt alone matched
 /// both rows and the admin reads counted the running job twice.
-#[tokio::test]
-async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
+async fn moved_ready_row_is_joined_once_by_attempt_reads(receipts: bool) {
     let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_moved_ready_lease_reads";
-    let schema = "awa_qs_moved_ready_lease_reads";
+    let schema = if receipts {
+        "awa_qs_moved_ready_compact_reads"
+    } else {
+        "awa_qs_moved_ready_lease_reads"
+    };
     let store = create_store_with_config(
         &pool,
         QueueStorageConfig {
-            lease_claim_receipts: false,
+            lease_claim_receipts: receipts,
             ..unique_cancel_store_config(schema)
         },
     )
@@ -21541,6 +21544,19 @@ async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
         .expect("claim moved job");
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].job.id, job_id);
+    assert_eq!(claimed[0].claim.claim_batch_id.is_some(), receipts);
+
+    // This is the production CTE used by current-job projections, not only
+    // the point-read candidate list. A compact item must hydrate exactly once.
+    let projected: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
+        "{} SELECT job_id FROM current_jobs WHERE queue = $1 AND state = 'running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("project current running jobs");
+    assert_eq!(projected, vec![job_id], "hydrate only the live ready row");
 
     let running = admin::list_jobs(
         &pool,
@@ -21574,6 +21590,199 @@ async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
         .expect("moved job exists");
     assert_eq!(loaded.state, JobState::Running);
     assert_eq!(loaded.priority, 1, "reads the live destination row");
+    assert_eq!(
+        loaded.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(2)),
+        "payload comes from the aged destination, not its tombstoned source"
+    );
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(false).await;
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_compact_receipt_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(true).await;
+}
+
+/// A point read's snapshot can outlive completion. TRUNCATE is not MVCC-safe:
+/// pruning its claim/lease partition before the reader visits it would erase
+/// the old running evidence, while the new completion is outside that snapshot.
+async fn point_read_snapshot_survives_ring_prune(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = if receipts {
+        "awa_qs_snapshot_claim_prune"
+    } else {
+        "awa_qs_snapshot_lease_prune"
+    };
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.into(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 2,
+                lease_claim_receipts: receipts,
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    let queue = "snapshot_prune";
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim the snapshot probe");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].claim.claim_batch_id.is_some(), receipts);
+    assert_eq!(
+        store.load_job(&pool, job_id).await.unwrap().unwrap().state,
+        JobState::Running
+    );
+
+    // Gate the reader's second query without blocking completion's own
+    // deferred-state checks. Only this reader's application name takes the
+    // advisory lock; the view's scalar initplan runs even with no deferred rows.
+    sqlx::raw_sql(audited_sql(format!(
+        r#"CREATE FUNCTION {schema}.snapshot_read_gate() RETURNS boolean
+        LANGUAGE plpgsql VOLATILE AS $$
+        BEGIN
+            IF current_setting('application_name') = 'awa_snapshot_reader' THEN
+                PERFORM pg_advisory_xact_lock(60006, 1);
+            END IF;
+            RETURN TRUE;
+        END;
+        $$;
+        ALTER TABLE {schema}.deferred_jobs RENAME TO deferred_rows;
+        CREATE VIEW {schema}.deferred_jobs AS
+            SELECT * FROM {schema}.deferred_rows
+            WHERE (SELECT {schema}.snapshot_read_gate())"#
+    )))
+    .execute(&pool)
+    .await
+    .expect("install reader-only query gate");
+    let mut gate = pool.begin().await.expect("begin read gate");
+    sqlx::query("SELECT pg_advisory_xact_lock(60006, 1)")
+        .execute(gate.as_mut())
+        .await
+        .expect("hold the second read");
+    let reader_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .application_name("awa_snapshot_reader"),
+        )
+        .await
+        .expect("connect isolated snapshot reader");
+    let reader_store = store.clone();
+    let reader_connection = reader_pool.clone();
+    let reader =
+        tokio::spawn(async move { reader_store.load_job(&reader_connection, job_id).await });
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    loop {
+        let at_gate: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_locks
+                WHERE locktype = 'advisory'
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                  AND classid = 60006 AND objid = 1 AND NOT granted
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("observe the reader-only gate");
+        if at_gate {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "point read did not reach its second query"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let during_read =
+        tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(10)), async {
+            assert_eq!(
+                store
+                    .complete_runtime_batch(&pool, &claimed)
+                    .await
+                    .expect("complete outside the snapshot")
+                    .len(),
+                1
+            );
+            let rotation = if receipts {
+                store.rotate_claims(&pool).await
+            } else {
+                store.rotate_leases(&pool).await
+            }
+            .expect("seal the completed attempt's slot");
+            assert!(matches!(rotation, RotateOutcome::Rotated { slot: 1, .. }));
+            if receipts {
+                store.prune_oldest_claims(&pool).await
+            } else {
+                store.prune_oldest_leases(&pool).await
+            }
+            .expect("prune while the snapshot is live")
+        })
+        .await;
+
+    // Always release the gate and finish the reader before asserting the
+    // outcome, so the negative control also reports the inconsistent state.
+    gate.rollback().await.expect("release the read gate");
+    let snapshot = tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(10)), reader)
+        .await
+        .expect("point read finished")
+        .expect("join point read")
+        .expect("point read succeeds")
+        .expect("the job remains in its snapshot");
+    let during_read =
+        during_read.expect("completion/prune must not wait on the deferred read gate");
+    assert_eq!(
+        (
+            matches!(during_read, PruneOutcome::Blocked { slot: 0 }),
+            snapshot.state
+        ),
+        (true, JobState::Running),
+        "prune must retain the snapshot's running evidence: {during_read:?}"
+    );
+    assert_eq!(snapshot.run_lease, claimed[0].job.run_lease);
+    reader_pool.close().await;
+    let after_read = if receipts {
+        store.prune_oldest_claims(&pool).await
+    } else {
+        store.prune_oldest_leases(&pool).await
+    }
+    .expect("prune after the reader releases its snapshot");
+    assert!(matches!(after_read, PruneOutcome::Pruned { slot: 0, .. }));
+    assert_eq!(
+        store.load_job(&pool, job_id).await.unwrap().unwrap().state,
+        JobState::Completed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_point_read_snapshot_blocks_compact_claim_prune() {
+    point_read_snapshot_survives_ring_prune(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_point_read_snapshot_blocks_lease_prune() {
+    point_read_snapshot_survives_ring_prune(false).await;
 }
 
 /// A lane move leaves immutable source rows behind. Wrap the ring so the
