@@ -859,6 +859,7 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
+        statistics_refresh_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
@@ -907,6 +908,11 @@ class AsyncClient:
         partitions in time is counted as ``blocked`` and retried on the next
         tick; raise it when ``blocked`` outcomes persist. Must be > 0.
 
+        ``statistics_refresh_interval_ms`` controls how often the maintenance
+        leader runs ``ANALYZE`` on the queue-storage head tables and
+        partitioned ring parents, which autovacuum never analyses (default 5
+        minutes; ``0`` disables the refresh).
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -928,6 +934,7 @@ class AsyncClient:
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
+            statistics_refresh_interval_ms=statistics_refresh_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,

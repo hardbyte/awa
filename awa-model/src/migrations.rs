@@ -423,6 +423,12 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
             ")"
         ),
     },
+    SchemaPatch {
+        name: "analyze_queue_storage_relation",
+        description: "Planner statistics helper for tables autovacuum never analyses (awa 0.7 migration v053)",
+        sql: include_str!("../migrations/patches/analyze_queue_storage_relation.sql"),
+        applied_probe: "SELECT to_regprocedure('awa.analyze_queue_storage_relation(text,text)') IS NOT NULL",
+    },
 ];
 
 /// Schema patches a database still needs to reach this binary's schema shape.

@@ -23,6 +23,41 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `error` (prune failed with a database error) alongside the existing
   `pruned`, `noop`, `blocked` and `skipped_active`. See
   [Configuration](docs/configuration.md#what-the-knobs-mean).
+- **The maintenance leader keeps planner statistics fresh on the queue-storage
+  tables autovacuum never analyses.** Autovacuum does not analyse partitioned
+  tables, so the thirteen ring parents (`ready_entries`, `done_entries`,
+  `leases`, ...) had no inherited statistics, and the two small head tables
+  (`queue_claim_heads`, `queue_enqueue_heads`) never reach the autoanalyze
+  threshold, so the planner priced lane joins against them at its defaults
+  while they drove joins over hundreds of thousands of retained rows. The
+  leader now runs `ANALYZE` on them when it is elected and then every five
+  minutes. `ClientBuilder::statistics_refresh_interval` (Python
+  `statistics_refresh_interval_ms`) changes the cadence; zero disables it. It
+  analyses one relation per transaction with a 2 s `lock_timeout` (a call that
+  times out waiting for a lock is retried next interval and recorded as
+  `skipped_lock`) and never makes prune wait: a prune attempt that
+  lands while ANALYZE samples the oldest slot's tables returns `blocked` and
+  retries on its normal backoff. Results are in
+  `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`
+  (scope `heads` or `ring_parent`; outcome `ok`, `skipped_privilege`,
+  `skipped_lock`, `unavailable` or `failed`).
+- **Schema patch `analyze_queue_storage_relation` lets a runtime role that does
+  not own the tables refresh statistics.** `ANALYZE` skips a table its caller
+  may not analyse, and the documented runtime grants do not include
+  `MAINTAIN`, so the refresh runs through the `SECURITY DEFINER` function
+  `awa.analyze_queue_storage_relation(schema, relation)`, owned by the role
+  that applied the patch. It analyses only a head table or partitioned table
+  of a queue-storage schema owned by the owner of the `awa` schema, and
+  `EXECUTE` is granted to `PUBLIC` like the other runtime helpers. The 0.6
+  series cannot add a migration version, so it ships like
+  `wait_free_dirty_marks`: **run `awa migrate` as the schema owner after
+  upgrading** (it applies the patch on a v040 schema; `awa migrate --sql`
+  and `--extract-to` emit it as the repeatable script
+  `R__analyze_queue_storage_relation`). No grant changes are needed. The same
+  function is awa 0.7 migration v053, which replaces it cleanly. A binary
+  running before the patch, or against a function whose owner may not analyse
+  the tables, logs one warning naming what is missing and skips the refresh
+  without affecting job processing. Earlier binaries never call the function.
 
 ### Fixed
 
