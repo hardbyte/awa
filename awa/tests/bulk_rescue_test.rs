@@ -553,7 +553,11 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     wait_until(
         scaled_timeout(Duration::from_secs(120)),
         "the retried jobs to complete",
-        || async { recovered.lock().expect("recovered").len() as i64 >= ABANDONED - exhausted },
+        || async {
+            count(&pool, format!(
+                "SELECT count(*) FROM awa.terminal_jobs WHERE queue = '{ABANDONED_QUEUE}' AND state = 'completed'"
+            )).await == ABANDONED - exhausted
+        },
     )
     .await;
     recovery.shutdown(Duration::from_secs(10)).await;
