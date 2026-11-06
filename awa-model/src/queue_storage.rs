@@ -11866,6 +11866,20 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+        // Protect all rings prune can truncate before the first data query
+        // establishes this repeatable-read snapshot: the query can take its
+        // snapshot before acquiring its relation locks. Queue prune takes the
+        // ready child NOWAIT before terminal children, so ready also fences
+        // those. Claim-family order agrees with claim prune.
+        sqlx::query(&format!(
+            "LOCK TABLE {schema}.ready_entries, {schema}.leases, {schema}.lease_claims, \
+             {schema}.lease_claim_batches, {schema}.lease_claim_closures, \
+             {schema}.lease_claim_closure_batches IN ACCESS SHARE MODE"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11979,6 +11993,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -12039,6 +12062,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = claims.run_lease
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
@@ -12115,6 +12147,16 @@ impl QueueStorage {
              AND ready.enqueue_shard = claim_batches.enqueue_shard
              AND ready.lane_seq = items.lane_seq
              AND ready.job_id = items.job_id
+             AND ready.run_lease + 1 = items.run_lease
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
@@ -12567,6 +12609,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -12766,6 +12817,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease

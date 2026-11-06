@@ -30,6 +30,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Lock the ready ring before point reads establish their snapshot, so
+  concurrent queue pruning cannot hide a failed job carried to a live slot.
+- Exclude tombstoned source rows when hydrating moved running jobs, including compact receipts, and preserve point-read snapshots against concurrent claim/lease partition pruning.
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
