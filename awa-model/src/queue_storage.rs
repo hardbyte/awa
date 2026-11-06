@@ -362,6 +362,29 @@ enum TerminalDeltaSlotRollup {
     Blocked,
 }
 
+/// A `(queue, priority)` enqueue lane as promotion addresses it. Promotion
+/// picks the shard when it re-enqueues a row, so the shard is not part of it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PromotionLane {
+    pub queue: String,
+    pub priority: i16,
+}
+
+/// Outcome of [`QueueStorage::promote_due_lanes`] and
+/// [`QueueStorage::promote_due_lane`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromoteOutcome {
+    /// Rows moved into the ready ring.
+    pub promoted: usize,
+    /// Due rows the batch selected, including those left deferred on a
+    /// contended lane. A batch that selected its full size may have left
+    /// further due rows behind.
+    pub selected: usize,
+    /// Lanes whose promotion transaction hit `lock_timeout` and rolled back.
+    /// Their rows stay deferred.
+    pub contended: Vec<PromotionLane>,
+}
+
 /// Discriminator for [`PruneOutcome::SkippedActive`].
 ///
 /// Multiple gates can fire `SkippedActive` for the same ring (e.g. queue
@@ -420,7 +443,7 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
-async fn set_prune_lock_timeout_tx(
+async fn set_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     timeout: Duration,
 ) -> Result<(), AwaError> {
@@ -2122,6 +2145,15 @@ struct ExistingReadyRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+/// Which of a lane's due rows one promotion transaction takes.
+#[derive(Debug, Clone, Copy)]
+enum DueLaneRows<'a> {
+    /// These rows, picked by a batch across lanes, where still due.
+    Selected(&'a [i64]),
+    /// The oldest due rows, up to this many.
+    Oldest(i64),
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -14551,32 +14583,212 @@ impl QueueStorage {
         Ok(rescued)
     }
 
+    /// Promote up to `batch_size` due `state` rows into the ready ring.
+    /// Equivalent to [`Self::promote_due_lanes`] with no lock timeout and no
+    /// skipped lanes, returning the number of rows promoted.
     pub async fn promote_due(
         &self,
         pool: &PgPool,
         state: JobState,
         batch_size: i64,
     ) -> Result<usize, AwaError> {
+        Ok(self
+            .promote_due_lanes(pool, state, batch_size, None, &[])
+            .await?
+            .promoted)
+    }
+
+    /// Select up to `batch_size` due `state` rows, oldest `run_at` first,
+    /// outside the lanes in `skip`, and promote each lane's share in its own
+    /// transaction.
+    ///
+    /// The selection skips rows another transaction has locked, such as a
+    /// lane promotion still waiting for its lane, so they cannot fill every
+    /// batch of a tick. It runs as its own statement, so its row locks end
+    /// with it; `deferred_jobs` is not partitioned, so no run-time pruning
+    /// meets those locks.
+    ///
+    /// Re-enqueueing a row takes its lane's enqueue reservation lock, which
+    /// producers hold until they commit, so a lane under heavy enqueue load
+    /// can keep its promotion waiting. A transaction per lane confines that
+    /// wait to the lane's own rows. With `lane_lock_timeout`, each lane's
+    /// transaction runs under that `lock_timeout`; a lane that hits it rolls
+    /// back, keeps its rows deferred and is reported in
+    /// [`PromoteOutcome::contended`], and the remaining lanes go ahead.
+    pub async fn promote_due_lanes(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        skip: &[PromotionLane],
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(0);
+            return Ok(PromoteOutcome::default());
         }
 
         let schema = self.schema();
+        let due: Vec<(i64, String, i16)> = sqlx::query_as(&format!(
+            r#"
+            SELECT job_id, queue, priority
+            FROM {schema}.deferred_jobs AS deferred
+            WHERE state = $1
+              AND run_at <= clock_timestamp()
+              AND NOT EXISTS (
+                  SELECT 1 FROM awa.queue_meta
+                  WHERE queue = deferred.queue AND paused = TRUE
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unnest($3::text[], $4::smallint[]) AS skip (queue, priority)
+                  WHERE skip.queue = deferred.queue AND skip.priority = deferred.priority
+              )
+            ORDER BY run_at ASC, priority ASC, job_id ASC
+            LIMIT $2
+            FOR UPDATE OF deferred SKIP LOCKED
+            "#
+        ))
+        .bind(state)
+        .bind(batch_size)
+        .bind(
+            skip.iter()
+                .map(|lane| lane.queue.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(skip.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut outcome = PromoteOutcome {
+            selected: due.len(),
+            ..PromoteOutcome::default()
+        };
+        let mut lanes: BTreeMap<PromotionLane, Vec<i64>> = BTreeMap::new();
+        for (job_id, queue, priority) in due {
+            lanes
+                .entry(PromotionLane { queue, priority })
+                .or_default()
+                .push(job_id);
+        }
+        for (lane, job_ids) in lanes {
+            match self
+                .promote_lane(
+                    pool,
+                    state,
+                    &lane,
+                    DueLaneRows::Selected(&job_ids),
+                    lane_lock_timeout,
+                )
+                .await?
+            {
+                Some(promoted) => outcome.promoted += promoted,
+                None => outcome.contended.push(lane),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Promote up to `batch_size` due `state` rows of one lane, oldest
+    /// `run_at` first, in one transaction. With `lane_lock_timeout`, a
+    /// transaction that hits it rolls back and the lane is returned in
+    /// [`PromoteOutcome::contended`] with nothing selected.
+    pub async fn promote_due_lane(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+    ) -> Result<PromoteOutcome, AwaError> {
+        if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
+            return Ok(PromoteOutcome::default());
+        }
+        Ok(
+            match self
+                .promote_lane(
+                    pool,
+                    state,
+                    lane,
+                    DueLaneRows::Oldest(batch_size),
+                    lane_lock_timeout,
+                )
+                .await?
+            {
+                Some(promoted) => PromoteOutcome {
+                    promoted,
+                    selected: promoted,
+                    contended: Vec::new(),
+                },
+                None => PromoteOutcome {
+                    contended: vec![lane.clone()],
+                    ..PromoteOutcome::default()
+                },
+            },
+        )
+    }
+
+    /// One lane's promotion transaction. `None` when it hit `lock_timeout`
+    /// and rolled back.
+    async fn promote_lane(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        rows: DueLaneRows<'_>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<Option<usize>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Vec<DeferredJobRow> = sqlx::query_as(&format!(
+        match self
+            .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
+            .await
+        {
+            Ok(promoted) => match tx.commit().await {
+                Ok(()) => Ok(Some(promoted)),
+                Err(err) if is_lock_contention_error(&err) => Ok(None),
+                Err(err) => Err(map_sqlx_error(err)),
+            },
+            Err(AwaError::Database(err)) if is_lock_contention_error(&err) => {
+                tx.rollback().await.map_err(map_sqlx_error)?;
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn promote_lane_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        state: JobState,
+        lane: &PromotionLane,
+        rows: DueLaneRows<'_>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<usize, AwaError> {
+        if let Some(timeout) = lock_timeout {
+            set_lock_timeout_tx(tx, timeout).await?;
+        }
+
+        let schema = self.schema();
+        let (row_filter, limit) = match rows {
+            DueLaneRows::Selected(_) => ("AND job_id = ANY($4)", ""),
+            DueLaneRows::Oldest(_) => ("", "ORDER BY run_at ASC, job_id ASC LIMIT $4"),
+        };
+        let sql = format!(
             r#"
             DELETE FROM {schema}.deferred_jobs
             WHERE job_id IN (
                 SELECT job_id
-                FROM {schema}.deferred_jobs
+                FROM {schema}.deferred_jobs AS deferred
                 WHERE state = $1
+                  AND queue = $2
+                  AND priority = $3
+                  {row_filter}
                   AND run_at <= clock_timestamp()
                   AND NOT EXISTS (
                       SELECT 1 FROM awa.queue_meta
-                      WHERE queue = {schema}.deferred_jobs.queue AND paused = TRUE
+                      WHERE queue = deferred.queue AND paused = TRUE
                   )
-                ORDER BY run_at ASC, priority ASC, job_id ASC
-                LIMIT $2
+                {limit}
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING
@@ -14597,21 +14809,26 @@ impl QueueStorage {
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
-        ))
-        .bind(state)
-        .bind(batch_size)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
+        );
+        let query = sqlx::query_as::<_, DeferredJobRow>(&sql)
+            .bind(state)
+            .bind(&lane.queue)
+            .bind(lane.priority);
+        let query = match rows {
+            DueLaneRows::Selected(job_ids) => query.bind(job_ids),
+            DueLaneRows::Oldest(batch_size) => query.bind(batch_size),
+        };
+        let mut moved: Vec<DeferredJobRow> =
+            query.fetch_all(tx.as_mut()).await.map_err(map_sqlx_error)?;
         if moved.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(0);
         }
+        // DELETE ... RETURNING has no order; lane sequence follows due order.
+        moved.sort_unstable_by_key(|row| (row.run_at, row.job_id));
 
+        let promoted = moved.len();
         let ready_rows: Vec<ExistingReadyRow> = moved
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|row| ExistingReadyRow {
                 job_id: row.job_id,
                 kind: row.kind,
@@ -14629,15 +14846,10 @@ impl QueueStorage {
                 payload: row.payload,
             })
             .collect();
-        let queues = ready_rows
-            .iter()
-            .map(|row| row.queue.clone())
-            .collect::<Vec<_>>();
-        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(state))
+        self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(moved.len())
+        self.notify_queues_tx(tx, vec![lane.queue.clone()]).await?;
+        Ok(promoted)
     }
 
     async fn relation_has_rows_tx(
@@ -15231,7 +15443,7 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_delta = sqlx::query(&format!(
             "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
@@ -15529,7 +15741,7 @@ impl QueueStorage {
             });
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
@@ -15914,7 +16126,7 @@ impl QueueStorage {
             return Ok(PruneOutcome::Noop);
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_table = sqlx::query(&format!(
             "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
@@ -16219,7 +16431,7 @@ impl QueueStorage {
             });
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
