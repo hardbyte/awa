@@ -14293,16 +14293,18 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         begin_guard.begin_pending = false;
-        // TRUNCATE is not MVCC-safe: a claim or lease partition that prune
-        // empties after the snapshot reads as empty, while the completion that
-        // let prune run is newer than the snapshot, so the job would read as
-        // available. Lock those rings before the first query takes the
-        // snapshot; prune then waits for this read or times out to `Blocked`.
-        // The order matches claim prune's, so the two cannot deadlock. The
-        // ready, done and receipt-completion partitions need no lock here:
-        // queue prune locks the ready child, which the first query holds.
+        // TRUNCATE is not MVCC-safe: a partition that prune empties after the
+        // snapshot reads as empty, while the completion that let prune run is
+        // newer than the snapshot, so the job could read as available or
+        // missing. A query takes its snapshot before it locks the relations it
+        // reads, so lock every ring prune can truncate first; LOCK TABLE takes
+        // no snapshot. Queue prune takes the ready child with NOWAIT before its
+        // done and receipt-completion children, so holding `ready_entries`
+        // covers them and that prune reports `Blocked`. Lease and claim prune
+        // wait or time out to `Blocked`; the claim tables are listed in claim
+        // prune's order, so the two cannot deadlock.
         sqlx::query(audited_sql(format!(
-            "LOCK TABLE {schema}.leases, {schema}.lease_claims, \
+            "LOCK TABLE {schema}.ready_entries, {schema}.leases, {schema}.lease_claims, \
              {schema}.lease_claim_batches, {schema}.lease_claim_closures, \
              {schema}.lease_claim_closure_batches IN ACCESS SHARE MODE"
         )))

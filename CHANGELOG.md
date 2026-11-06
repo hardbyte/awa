@@ -30,7 +30,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   statements, so a job promoted, claimed or completed between two of them
   could read as missing; the weekly mixed-version rehearsal hit this on
   2026-11-01. It now reads all of them from one read-only snapshot, after
-  locking the lease and claim rings so prune cannot truncate a partition the
+  locking the ready, lease and claim rings so prune cannot truncate a partition the
   snapshot still needs.
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
