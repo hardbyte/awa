@@ -496,7 +496,8 @@ jobs:
     name: Python 3.12 wheel shutdown
     needs: [changes]
     if: (needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true') && !fromJSON(needs.changes.outputs.passed)['python-shutdown']
-    runs-on: ubuntu-latest
+    # setup-python publishes the pinned 3.12.3 only for images up to 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -561,7 +562,8 @@ jobs:
     name: Frontend E2E tests
     needs: [changes]
     if: needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['frontend-e2e']
-    runs-on: ubuntu-latest
+    # Playwright's Chromium build doesn't support Ubuntu 26.04 yet.
+    runs-on: ubuntu-24.04
     # 20m has been hitting the wall on slow GH-hosted runners — the
     # full Playwright suite (8 specs) plus per-test PG seeding is on
     # the edge at 17–19m. Give it real headroom.

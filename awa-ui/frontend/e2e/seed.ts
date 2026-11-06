@@ -99,7 +99,7 @@ export default async function globalSetup() {
 
     INSERT INTO awa.job_kind_descriptors (
       kind, display_name, description, owner, docs_url, tags, extra,
-      descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at
+      descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at, output
     )
     VALUES (
       'e2e_job',
@@ -113,7 +113,8 @@ export default async function globalSetup() {
       10000,
       now(),
       now(),
-      now()
+      now(),
+      '{"type":"E2eSummary","schema":{"type":"object","properties":{"rows":{"type":"integer"}}}}'::jsonb
     );
 
     INSERT INTO ${queueStorageSchema}.queue_lanes (queue, priority, next_seq, claim_seq)
@@ -143,6 +144,15 @@ export default async function globalSetup() {
       ('e2e_test', 1, 1),
       ('legacy_queue', 2, 1),
       ('e2e_dlq', 2, 1);
+
+    INSERT INTO ${queueStorageSchema}.ready_segments (
+      ready_slot, ready_generation, queue, priority, enqueue_shard,
+      first_lane_seq, next_lane_seq, first_run_at
+    )
+    VALUES
+      (0, 0, 'e2e_test', 2, 0, 1, 6, now() - interval '5 minutes'),
+      (0, 0, 'e2e_test', 1, 0, 1, 2, now() - interval '4 minutes'),
+      (0, 0, 'legacy_queue', 2, 0, 1, 2, now() - interval '2 minutes');
 
     INSERT INTO ${queueStorageSchema}.ready_entries (
       ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt,
@@ -188,23 +198,26 @@ export default async function globalSetup() {
 
     INSERT INTO ${queueStorageSchema}.done_entries (
       ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt,
-      run_lease, max_attempts, lane_seq, run_at, attempted_at, finalized_at, created_at, payload
+      run_lease, max_attempts, lane_seq, run_at, attempted_at, finalized_at, created_at, payload, output
     )
     VALUES
       (
         0, 0, 800003, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 'failed', 2, 3,
         3, 3, 3, now() - interval '3 minutes', now() - interval '2 minutes', now() - interval '1 minute', now() - interval '10 minutes',
-        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[{"error":"connection refused","attempt":1,"at":"2026-01-01T00:00:00Z"},{"error":"timeout","attempt":2,"at":"2026-01-01T00:01:00Z"},{"error":"max retries exceeded","attempt":3,"at":"2026-01-01T00:02:00Z"}],"progress":null}'::jsonb
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[{"error":"connection refused","attempt":1,"at":"2026-01-01T00:00:00Z"},{"error":"timeout","attempt":2,"at":"2026-01-01T00:01:00Z"},{"error":"max retries exceeded","attempt":3,"at":"2026-01-01T00:02:00Z","output":{"rows":7,"stage":"partial"}}],"progress":null}'::jsonb,
+        NULL
       ),
       (
         0, 0, 800002, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 'completed', 2, 1,
         1, 5, 4, now() - interval '4 minutes', now() - interval '3 minutes', now() - interval '2 minutes', now() - interval '12 minutes',
-        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb,
+        '{"rows": 42, "note": "seeded output"}'::json
       ),
       (
         0, 0, 800001, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 'cancelled', 2, 1,
         1, 5, 5, now() - interval '2 minutes', NULL, now() - interval '90 seconds', now() - interval '8 minutes',
-        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb,
+        NULL
       );
 
     INSERT INTO ${queueStorageSchema}.dlq_entries (
@@ -214,7 +227,7 @@ export default async function globalSetup() {
     VALUES (
       600001, 'dlq_job', 'e2e_dlq', '{"test": true}'::jsonb, 'failed', 2, 2, 2, 5,
       now() - interval '6 minutes', now() - interval '5 minutes', now() - interval '4 minutes', now() - interval '15 minutes',
-      '{"metadata":{"source":"playwright"},"tags":["dlq"],"errors":[{"error":"dead lettered","attempt":2,"at":"2026-01-01T00:03:00Z","terminal":true}],"progress":null}'::jsonb,
+      '{"metadata":{"source":"playwright"},"tags":["dlq"],"errors":[{"error":"dead lettered","attempt":2,"at":"2026-01-01T00:03:00Z","terminal":true,"output":{"rows":3,"stage":"dead-lettered"}}],"progress":null}'::jsonb,
       'manual_test', now() - interval '3 minutes', 2
     );
   `;

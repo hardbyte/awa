@@ -29,6 +29,18 @@ let app = awa_ui::callback_router(
 .await?;
 ```
 
+Give the UI its own pool built with `awa_ui::admin_pool_options` and `awa_ui::admin_connect_options`, as `awa serve` does. They set a statement timeout and a release hook. Without them, a request the client abandons leaves its query running and holds its connection, and over TLS sqlx can lose that connection for good (see [configuration](configuration.md#abandoned-requests)):
+
+```rust
+let pool = awa_ui::admin_pool_options(PgPoolOptions::new())
+    .max_connections(10)
+    .connect_with(awa_ui::admin_connect_options(
+        database_url.parse()?,
+        Some(Duration::from_secs(60)),
+    ))
+    .await?;
+```
+
 The frontend is a React 19 SPA built with Vite and embedded into the binary via `rust-embed`. The axum handler serves `index.html` for all non-API routes (SPA fallback), and JSON REST endpoints under `/api/`.
 
 ### Frontend Stack
@@ -44,8 +56,8 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 GET  /api/stats                         Dashboard summary (state counts)
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
-GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=
-GET  /api/jobs/:id
+GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=   (rows omit output)
+GET  /api/jobs/:id                      Includes the job's output (ADR-048)
 POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
 POST /api/jobs/bulk-retry               { ids: [...] }
@@ -85,7 +97,7 @@ POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
 
-POST /api/callbacks/:callback_id/complete
+POST /api/callbacks/:callback_id/complete   { payload?, output? }
 POST /api/callbacks/:callback_id/fail
 POST /api/callbacks/:callback_id/heartbeat
 

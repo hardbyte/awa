@@ -19,6 +19,7 @@ import {
   DescriptionDetails,
 } from "@/components/ui/description-list";
 import { JsonView } from "@/components/JsonView";
+import { OutputCard } from "@/components/OutputCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { timeAgo } from "@/lib/time";
 import { POLL } from "@/lib/constants";
@@ -166,6 +167,9 @@ export function DlqDetailPage() {
           <JsonView data={row.args} />
         </CardContent>
       </Card>
+
+      {/* The dead-lettered attempt's output, if a failed attempt recorded one (ADR-048) */}
+      <OutputCard output={row.output} errors={row.errors} />
 
       {row.errors && row.errors.length > 0 && (
         <Card>

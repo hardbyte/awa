@@ -98,11 +98,19 @@ pub fn verify(secret: &[u8; 32], callback_id: &str, signature: &str) -> bool {
     blake3::Hash::from_hex(signature).is_ok_and(|h| expected == h)
 }
 
-/// Body of `POST /api/callbacks/{id}/complete`.
+/// Body of `POST /api/callbacks/{id}/complete`. Build one from
+/// `CompletePayload::default()`, so later fields do not break senders.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct CompletePayload {
+    /// Discarded on completion; kept for compatibility.
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
+    /// Stored as the job's output (ADR-048). Validated like a handler's
+    /// output; an invalid one is rejected and completes nothing. Callback
+    /// servers older than ADR-048 ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
 }
 
 /// Body of `POST /api/callbacks/{id}/fail`.
