@@ -1666,7 +1666,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, terminal_count_rollup_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_stripe_count=1, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=1000, queue_storage_claim_rotate_interval_ms=None, storage_transition_role=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, terminal_count_rollup_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_stripe_count=1, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=1000, queue_storage_claim_rotate_interval_ms=None, queue_storage_prune_lock_timeout_ms=None, storage_transition_role=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -1694,6 +1694,7 @@ impl PyClient {
         queue_storage_queue_rotate_interval_ms: u64,
         queue_storage_lease_rotate_interval_ms: u64,
         queue_storage_claim_rotate_interval_ms: Option<u64>,
+        queue_storage_prune_lock_timeout_ms: Option<u64>,
         storage_transition_role: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let entries: Vec<_> = self
@@ -1849,6 +1850,12 @@ impl PyClient {
             }
         }
 
+        if queue_storage_prune_lock_timeout_ms == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_prune_lock_timeout_ms must be > 0",
+            ));
+        }
+
         builder = builder.queue_storage(
             QueueStorageConfig {
                 schema: queue_storage_schema
@@ -1869,6 +1876,9 @@ impl PyClient {
         // ignores it.
         if let Some(ms) = queue_storage_claim_rotate_interval_ms {
             builder = builder.claim_rotate_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = queue_storage_prune_lock_timeout_ms {
+            builder = builder.prune_lock_timeout(Duration::from_millis(ms));
         }
         builder = builder.transition_role(parse_transition_worker_role(
             storage_transition_role.as_deref(),
