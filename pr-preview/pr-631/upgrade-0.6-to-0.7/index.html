@@ -2926,8 +2926,10 @@ workers report not ready until the migration runs, as for any version bump.</p>
 maintenance leader refresh planner statistics for the head tables and ring
 parents when the runtime role does not own them (see
 <a href="../configuration/#planner-statistics">Planner statistics</a>). It creates one
-function and grants <code>EXECUTE</code> to <code>PUBLIC</code>; it takes no lock on any table and
-completes in milliseconds. Run the migration as the schema owner so the
+function, revokes <code>EXECUTE</code> from <code>PUBLIC</code> and grants it to the roles that
+already hold INSERT, UPDATE and DELETE on the <code>awa</code> head tables (the runtime
+grantees); it takes no table lock and completes in milliseconds. Roles created
+later need <code>GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa</code>. Run the migration as the schema owner so the
 function's owner owns the tables.</p>
 <p>Binaries before v053 never call it. A 0.7 binary running before the migration
 logs once that the function is missing and skips the refresh; the
