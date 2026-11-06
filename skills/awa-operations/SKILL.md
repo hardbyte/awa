@@ -151,8 +151,12 @@ until rescue closes them. Rescue drains such a backlog in passes of 500-attempt
 batches, bounded by `rescue_pass_budget` (1s) and `rescue_pass_max_rows`
 (5000), with the next pass a second later while a backlog remains.
 Stale-heartbeat rescue runs extra batches and early passes only after runtime
-snapshots support a full settled staleness window. The ordinary first batch
-keeps its configured interval. This evidence needs `heartbeat_rescue_interval`
+snapshots support a full settled staleness window. Steady evidence may predate a
+stall; it is a sampled heuristic, not proof that an owner has exited. An
+unconfirmed phase requires `3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness`;
+5-second snapshots with 12-second staleness skip that phase and can accelerate
+rescue of stale live claims. See [rescue backlog](../../docs/configuration.md#rescue-backlog)
+for cutoff and sampling limits. The ordinary first batch keeps its configured interval. This evidence needs `heartbeat_rescue_interval`
 below half of `heartbeat_staleness`; at the defaults acceleration usually
 starts 3–3.5 minutes after a runtime's last snapshot. Leadership changes reset
 the evidence window. Zero for either rescue pass control keeps one batch per
