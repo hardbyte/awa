@@ -6,6 +6,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Keep confirmed-owner bulk heartbeat rescue's first cursor window small so
+  short passes can reach follow-up batches. Unconfirmed owners and
+  configurations that disable acceleration retain the wider initial scan.
+
 - Queue-storage rescue drains large abandoned-claim backlogs in bounded
   transactions, controlled by `rescue_pass_budget` and a soft
   `rescue_pass_max_rows` cap. Cursor sweeps continue past closed or freshly
