@@ -20,12 +20,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
   could not be completed by callback with an expected kind, failed the
   mixed-transition callback routing check, and read back from `get_job` in
   the wrong state. Admin job lists, kind counts and cancellation by unique
-  key also missed those running jobs. They now match the attempt (`job_id` and `run_lease`).
+  key also missed those running jobs. They now match the attempt (`job_id` and `run_lease`),
+  skipping the tombstoned source row a lane move leaves behind.
 - **`get_job` no longer misses a job that moves while it reads.** It read
   ready, deferred, leased, claimed, completed and DLQ rows in separate
   statements, so a job promoted, claimed or completed between two of them
   could read as missing; the weekly mixed-version rehearsal hit this on
-  2026-11-01. It now reads all of them from one read-only snapshot.
+  2026-11-01. It now reads all of them from one read-only snapshot, after
+  locking the lease and claim rings so prune cannot truncate a partition the
+  snapshot still needs.
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
@@ -38,9 +41,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   rows. When one of those waited out the timeout, for example behind
   autovacuum truncating a relation or a hosted Postgres's own background
   workers, prune failed with a `lock_not_available` (`55P03`) database error,
-  was logged as an error and skipped the prune backoff. A lock timeout
-  anywhere in a queue, lease or claim prune, or in a terminal-count rollup
-  slot, now rolls the whole transaction back and reports `Blocked`
+  was logged as an error and skipped the prune backoff. A lock timeout in any
+  statement after a queue, lease or claim prune, or a terminal-count rollup
+  slot, sets its `lock_timeout` now rolls the whole transaction back and
+  reports `Blocked`
   (`blocked_slots` for rollup), so maintenance backs off and retries; nothing
   the attempt wrote survives the rollback. A rollup pass stops at its first
   blocked slot rather than waiting out the timeout again on each remaining

@@ -21480,6 +21480,102 @@ async fn test_aged_materialized_lease_is_visible_to_admin_reads() {
     assert_eq!(cancelled.id, job_id);
 }
 
+/// Aging moves a waiting job by tombstoning its ready row and re-inserting the
+/// same attempt on the next lane. In a quiet queue the new lane hands out the
+/// same `lane_seq`, so a lease joined to its ready row by attempt alone matched
+/// both rows and the admin reads counted the running job twice.
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_moved_ready_lease_reads";
+    let schema = "awa_qs_moved_ready_lease_reads";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: false,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved"),
+        InsertOpts {
+            priority: 2,
+            ..unique_cancel_opts(queue, None)
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let aged = store
+        .age_waiting_priorities(&pool, Duration::from_secs(60), 10)
+        .await
+        .expect("age waiting priorities");
+    assert_eq!(aged, vec![job_id]);
+
+    let same_position: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(DISTINCT priority)::bigint
+         FROM {schema}.ready_entries
+         WHERE job_id = $1
+         GROUP BY ready_slot, ready_generation, enqueue_shard, lane_seq"
+    )))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ready rows for the moved job");
+    assert_eq!(
+        same_position, 2,
+        "the source and destination rows must share a position for this test to mean anything"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id],
+        "the moved running job is listed once"
+    );
+
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .expect("job kind overviews");
+    let kind = overview
+        .iter()
+        .find(|row| row.kind == UniqueCancelJob::kind())
+        .expect("the moved job's kind is listed");
+    assert_eq!(kind.job_count, 1, "the moved running job is counted once");
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load moved job")
+        .expect("moved job exists");
+    assert_eq!(loaded.state, JobState::Running);
+    assert_eq!(loaded.priority, 1, "reads the live destination row");
+}
+
 /// A lane move leaves immutable source rows behind. Wrap the ring so the
 /// destination is in an earlier partition: point reads must use live evidence,
 /// rather than depending on which equal-timestamp ready row the plan emits last.

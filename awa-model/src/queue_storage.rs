@@ -14287,6 +14287,22 @@ impl QueueStorage {
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .await
             .map_err(map_sqlx_error)?;
+        // TRUNCATE is not MVCC-safe: a claim or lease partition that prune
+        // empties after the snapshot reads as empty, while the completion that
+        // let prune run is newer than the snapshot, so the job would read as
+        // available. Lock those rings before the first query takes the
+        // snapshot; prune then waits for this read or times out to `Blocked`.
+        // The order matches claim prune's, so the two cannot deadlock. The
+        // ready, done and receipt-completion partitions need no lock here:
+        // queue prune locks the ready child, which the first query holds.
+        sqlx::query(audited_sql(format!(
+            "LOCK TABLE {schema}.leases, {schema}.lease_claims, \
+             {schema}.lease_claim_batches, {schema}.lease_claim_closures, \
+             {schema}.lease_claim_closure_batches IN ACCESS SHARE MODE"
+        )))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -14401,6 +14417,17 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -14461,6 +14488,17 @@ impl QueueStorage {
              AND ready.run_lease + 1 = claims.run_lease
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
@@ -14989,6 +15027,17 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -15188,6 +15237,17 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease

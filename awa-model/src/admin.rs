@@ -381,6 +381,17 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
              AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             UNION ALL
             -- Receipt claims that have not materialised into `leases` are
             -- running too (#246 / #416). They live on legacy row-local
@@ -406,9 +417,22 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
               ON ready.ready_slot = claims.ready_slot
              AND ready.ready_generation = claims.ready_generation
              AND ready.queue = claims.queue
-             AND ready.priority = claims.priority
+             -- Claims keep the aged effective priority; match the ready attempt.
+             AND ready.job_id = claims.job_id
+             AND ready.run_lease + 1 = claims.run_lease
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             WHERE claims.closed_at IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM {schema}.lease_claim_closures AS cx
@@ -571,6 +595,17 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
              AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             WHERE ready.created_at >= {since}
             UNION ALL
             -- A queue or priority move copies the row with its times, so
@@ -694,6 +729,17 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
              AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             GROUP BY ready.kind, leases.queue
         ),
         deferred_by_kind AS MATERIALIZED (
@@ -942,6 +988,17 @@ fn queue_storage_job_id_candidates_sql(
                  AND ready.run_lease + 1 = leases.run_lease
                  AND ready.enqueue_shard = leases.enqueue_shard
                  AND ready.lane_seq = leases.lane_seq
+                 -- Moving a ready row tombstones the old one and re-inserts the same
+                 -- attempt, which can reuse the old lane_seq on the new lane.
+                 AND NOT EXISTS (
+                     SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                     WHERE tomb.ready_slot = ready.ready_slot
+                       AND tomb.ready_generation = ready.ready_generation
+                       AND tomb.queue = ready.queue
+                       AND tomb.priority = ready.priority
+                       AND tomb.enqueue_shard = ready.enqueue_shard
+                       AND tomb.lane_seq = ready.lane_seq
+                 )
                 WHERE TRUE{predicates}
                 ORDER BY leases.job_id DESC
                 LIMIT {limit}
@@ -1421,6 +1478,17 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
                   AND ready.run_lease + 1 = leases.run_lease
                   AND ready.enqueue_shard = leases.enqueue_shard
                   AND ready.lane_seq = leases.lane_seq
+                  -- Moving a ready row tombstones the old one and re-inserts the same
+                  -- attempt, which can reuse the old lane_seq on the new lane.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
                   AND ready.unique_key = $1
                 OFFSET 0
             ) AS ready ON TRUE
