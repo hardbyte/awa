@@ -30,6 +30,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Ordinary rescue ticks retain their cadence under scheduler jitter, while
+  backlog re-arms keep the heartbeat owner-evidence gate.
+
 - Keep confirmed-owner bulk heartbeat rescue's first cursor window small so
   short passes can reach follow-up batches. Unconfirmed owners and
   configurations that disable acceleration retain the wider initial scan.
