@@ -176,20 +176,25 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
         ),
     )
     .await?;
-    let error = run_sql(
+    // An unprepared lane is created through the schema owner's provisioning
+    // function, so the runtime still issues no DDL of its own.
+    run_sql(
         pool,
         format!(
-            "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint)"
+            "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint); \
+             SELECT {schema}.provision_lane('unprepared_queue', 2::smallint, 0::smallint); \
+             SELECT {schema}.reserve_enqueue_seq('unprepared_queue', 2::smallint, 0::smallint, 1);"
         ),
     )
-    .await
-    .unwrap_err();
-    assert_eq!(database_error_code(&error).as_deref(), Some("42501"));
-    assert!(error
-        .as_database_error()
-        .unwrap()
-        .message()
-        .contains("has not been provisioned"));
+    .await?;
+    let foreign_owned: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM pg_class \
+         WHERE relnamespace = '{schema}'::regnamespace AND relkind = 'S' \
+           AND relowner <> (SELECT nspowner FROM pg_namespace WHERE nspname = '{schema}')"
+    ))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(foreign_owned, 0);
     let error = run_sql(
         pool,
         format!("CREATE TABLE {schema}.must_not_create(id integer)"),
@@ -354,10 +359,12 @@ async fn exercise_stale_custom_schema(options: PgConnectOptions, migrator: &str)
             .replace("__schema__", "custom_lanes"),
     )
     .await?;
+    // The old helper also predates lane provisioning, so both patches that
+    // refresh the helpers name the schema.
     let pending = migrations::pending_schema_patches(&pool).await?;
     assert_eq!(
         pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-        vec!["prepared_lane_sequences"]
+        vec!["prepared_lane_sequences", "definer_lane_provisioning"]
     );
     let status = lane_patch_status(&pool).await?;
     assert!(!status.applied);
@@ -478,10 +485,14 @@ async fn exercise_lazy_lane(options: PgConnectOptions, owner: &str, runtime: &st
             "GRANT USAGE, CREATE ON SCHEMA awa TO {runtime}; \
              GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO {runtime}; \
              GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {runtime}; \
-             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime};"
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime}; \
+             REVOKE EXECUTE ON FUNCTION awa.provision_lane_sequences(text, smallint, smallint) \
+               FROM PUBLIC, {runtime};"
         ),
     )
     .await?;
+    // Without the provisioning function the runtime creates the lane's
+    // sequences itself and owns them, as a 0.6.9 runtime with CREATE did.
     let runtime_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(options.username(runtime))

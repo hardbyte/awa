@@ -6,6 +6,35 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first.** A lane's enqueue and claim sequences belonged to the role that
+  first enqueued into, claimed from or promoted into it, so with several
+  runtime roles sharing a group role, any role other than the creator whose
+  default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. The new schema patch
+  `definer_lane_provisioning` creates lanes through two `SECURITY DEFINER`
+  functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. Once the patch commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence
+  per transaction with a 300 ms lock wait, and only where it is allowed to,
+  trying the effective role and then the login role. A sequence an open
+  transaction holds is skipped and reported as busy; one it may not change is
+  reported with the roles that can repair it. Neither fails the run. The new read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the
+  statements to run and the roles to run them as, and exits 2 while any
+  remain; `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per
+  sequence) repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running before the patch detects that `provision_lane` is missing and
+  creates lanes as before, and older binaries create correctly owned lanes once
+  the patch has refreshed the helpers they call. `awa migrate` applies the
+  patch on any v040 database; external runners apply the exported
+  `R__definer_lane_provisioning.sql` after `V40`. See
+  [`docs/upgrade-0.6.13-to-0.6.14.md`](docs/upgrade-0.6.13-to-0.6.14.md).
 - **A graceful shutdown no longer leaves a finished attempt for stale-heartbeat
   rescue to run again.** Once a handler returned, its finalize (completion,
   retry, cancel or failure, and any ADR-029 follow-up inserts) ran in a task
