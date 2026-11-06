@@ -6,8 +6,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- Reduce running-count query work for partially closed compact receipt batches
-  by keeping closure membership lookups correlated.
+- Reduce running-count query work by keeping compact closure membership
+  correlated and limiting row-local closure lookups to their claim partition.
 
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
