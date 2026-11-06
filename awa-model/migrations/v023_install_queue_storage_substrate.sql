@@ -272,8 +272,8 @@ BEGIN
             v_seq_name TEXT;
             v_grant TEXT;
         BEGIN
-            IF p_queue IS NULL OR p_queue = ''
-               OR p_priority IS NULL OR p_priority NOT BETWEEN 1 AND 4
+            IF p_queue IS NULL
+               OR p_priority IS NULL
                OR p_enqueue_shard IS NULL OR p_enqueue_shard NOT BETWEEN 0 AND 63 THEN
                 RAISE EXCEPTION 'invalid queue lane: queue %%, priority %%, enqueue shard %%',
                     quote_nullable(p_queue), p_priority, p_enqueue_shard
