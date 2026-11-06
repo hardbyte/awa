@@ -623,42 +623,76 @@ fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, Aw
     Ok(index)
 }
 
+enum ReceiptEvidence {
+    Closed,
+    Open,
+}
+
 fn receipt_closed_evidence_sql(
     schema: &str,
     closure_rel: &str,
     closure_batch_rel: &str,
     claims_alias: &str,
 ) -> String {
-    // `receipt_id` is allocated from a global sequence, so it identifies a
-    // claim without a `claim_slot` predicate. Compact closure batches retain
-    // the raw receipt array for audit/debugging, but hot membership checks use
-    // the per-child GiST index on the derived multirange.
+    receipt_evidence_sql(
+        schema,
+        closure_rel,
+        closure_batch_rel,
+        claims_alias,
+        ReceiptEvidence::Closed,
+    )
+}
+
+fn receipt_evidence_sql(
+    schema: &str,
+    closure_rel: &str,
+    closure_batch_rel: &str,
+    claims_alias: &str,
+    evidence: ReceiptEvidence,
+) -> String {
+    let (null_test, join, exists, range_fence) = match evidence {
+        ReceiptEvidence::Closed => ("NOT NULL", "OR", "EXISTS", ""),
+        ReceiptEvidence::Open => (
+            "NULL",
+            "AND",
+            "NOT EXISTS",
+            "
+                -- Keep receipt membership correlated while the other closure
+                -- exclusions can use full-identity anti joins.
+                OFFSET 0",
+        ),
+    };
+    // `receipt_id` is allocated from a global sequence and identifies a claim.
+    // Closures retain that claim's slot; match it to prune unrelated partitions.
+    // Compact closure batches retain the raw receipt array for audit/debugging,
+    // but hot membership checks use the per-child GiST index on the multirange.
     format!(
         r#"
         (
-            {claims_alias}.closed_at IS NOT NULL
-            OR EXISTS (
+            {claims_alias}.closed_at IS {null_test}
+            {join} {exists} (
                 SELECT 1 FROM {closure_rel} AS closures
                 WHERE closures.claim_slot = {claims_alias}.claim_slot
                   AND closures.job_id = {claims_alias}.job_id
                   AND closures.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1
                 FROM {closure_batch_rel} AS closure_batches
-                WHERE closure_batches.receipt_ranges @> {claims_alias}.receipt_id
+                WHERE closure_batches.claim_slot = {claims_alias}.claim_slot
+                  AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id{range_fence}
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.done_entries AS done
                 WHERE done.job_id = {claims_alias}.job_id
                   AND done.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.deferred_jobs AS deferred
                 WHERE deferred.job_id = {claims_alias}.job_id
                   AND deferred.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.dlq_entries AS dlq
                 WHERE dlq.job_id = {claims_alias}.job_id
                   AND dlq.run_lease = {claims_alias}.run_lease
@@ -670,12 +704,11 @@ fn receipt_closed_evidence_sql(
 
 /// A subquery that yields the identity `(job_id, run_lease, queue)` of every
 /// receipt claim currently open (i.e. `running`) but not yet materialised
-/// into `leases`. Since #246 receipt claims — zero-deadline and
-/// deadline-backed alike — are written as compact `lease_claim_batches` rows
-/// rather than one `lease_claims` row per job, so the "open receipt claims"
-/// set is the union of legacy row-local `lease_claims` and the unnested
-/// members of `lease_claim_batches`, each anti-joined against every durable
-/// closure/terminal/materialised-lease evidence shape.
+/// into `leases`. Zero-deadline receipts use compact `lease_claim_batches`;
+/// deadline-backed receipts retain row-local `lease_claims` for indexed
+/// deadline rescue. The open set unions those row-local claims with the
+/// unnested compact members, excluding every durable closure, terminal, and
+/// materialised-lease evidence shape.
 ///
 /// This is the canonical open-receipt-claim shape (mirrors `queue_counts`'s
 /// `live_running` derivation). Compose it wherever a running enumeration must
@@ -701,8 +734,13 @@ pub(crate) fn open_receipt_running_claims_sql(schema: &str) -> String {
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
     let closure_rel = format!("{schema}.lease_claim_closures");
     let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-    let row_closed =
-        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    let row_open = receipt_evidence_sql(
+        schema,
+        &closure_rel,
+        &closure_batch_rel,
+        "claims",
+        ReceiptEvidence::Open,
+    );
     let (row_filter, batch_filter) = match job_ids {
         Some(ids) => (
             format!("claims.job_id = ANY({ids}) AND "),
@@ -714,7 +752,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
         FROM {schema}.lease_claims AS claims
-        WHERE {row_filter}NOT {row_closed}
+        WHERE {row_filter}{row_open}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
               WHERE lease.job_id = claims.job_id
@@ -749,6 +787,9 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
                   SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
+                  -- Keep the range lookup correlated: joining on claim_slot can
+                  -- multiply receipt members by retained closure batches.
+                  OFFSET 0
               )
           AND NOT EXISTS (
                   SELECT 1 FROM {schema}.leases AS lease
@@ -10476,10 +10517,21 @@ impl QueueStorage {
         let job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
 
+        // Resolve moved ready bodies without opening the whole tombstone ring.
+        // Empty input returned above; every remaining slot is validated here.
+        let tombstone_sources = ready_slots
+            .iter()
+            .map(|&slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .map(|slot| format!("SELECT * FROM {}", ready_tombstone_child_name(schema, slot)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+
         let ready_rows: Vec<ReadySnapshotRow> = sqlx::query_as(&format!(
             r#"
-            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id) AS (
-                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[])
+            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id, run_lease) AS (
+                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[], $7::bigint[])
             )
             SELECT
                 ready.ready_slot,
@@ -10504,6 +10556,17 @@ impl QueueStorage {
              AND ready.enqueue_shard = refs.enqueue_shard
              AND ready.lane_seq = refs.lane_seq
              AND ready.job_id = refs.job_id
+             AND ready.run_lease + 1 = refs.run_lease
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ({tombstone_sources}) AS tomb
+                WHERE tomb.ready_slot = ready.ready_slot
+                  AND tomb.ready_generation = ready.ready_generation
+                  AND tomb.queue = ready.queue
+                  AND tomb.priority = ready.priority
+                  AND tomb.enqueue_shard = ready.enqueue_shard
+                  AND tomb.lane_seq = ready.lane_seq
+                  AND tomb.job_id = ready.job_id
+            )
             "#
         ))
         .bind(&ready_slots)
@@ -10512,6 +10575,7 @@ impl QueueStorage {
         .bind(&enqueue_shards)
         .bind(&lane_seqs)
         .bind(&job_ids)
+        .bind(&run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -11991,6 +12055,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -12051,6 +12124,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = claims.run_lease
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
@@ -12127,6 +12209,16 @@ impl QueueStorage {
              AND ready.enqueue_shard = claim_batches.enqueue_shard
              AND ready.lane_seq = items.lane_seq
              AND ready.job_id = items.job_id
+             AND ready.run_lease + 1 = items.run_lease
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
@@ -12580,6 +12672,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -12779,6 +12880,15 @@ impl QueueStorage {
              AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease

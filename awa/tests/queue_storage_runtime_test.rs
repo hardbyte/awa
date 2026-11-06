@@ -8840,6 +8840,109 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+#[tokio::test]
+async fn test_row_local_receipt_admin_counts_follow_durable_dispositions() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_row_receipt_dispositions";
+    let schema = "awa_qs_row_receipt_dispositions";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    async fn counts(pool: &sqlx::PgPool, queue: &str) -> (i64, i64, i64) {
+        let overview = admin::queue_overview(pool, queue)
+            .await
+            .expect("read receipt disposition counts")
+            .expect("receipt queue exists");
+        (
+            overview.running,
+            overview.retryable,
+            overview.completed_last_hour,
+        )
+    }
+
+    store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+        .await
+        .expect("claim three deadline-backed receipts");
+    assert_eq!(claimed.len(), 3);
+    assert_eq!(lease_claim_count(&pool, &store).await, 3);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(counts(&pool, queue).await, (3, 0, 0));
+
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        completed,
+        vec![(claimed[0].job.id, claimed[0].job.run_lease)]
+    );
+    let null_fences: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2 AND closed_at IS NULL"))
+        .bind(claimed[0].job.id)
+        .bind(claimed[0].job.run_lease)
+        .fetch_one(&pool)
+        .await
+        .expect("completed row-local claim remains behind compact closure evidence");
+    assert_eq!(null_fences, 1);
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+    assert_eq!(counts(&pool, queue).await, (2, 0, 1));
+
+    let retried = store
+        .fail_retryable(
+            &pool,
+            claimed[1].job.id,
+            claimed[1].job.run_lease,
+            "retry",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("second attempt moves to retryable");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(counts(&pool, queue).await, (1, 1, 1));
+
+    let callback = store
+        .register_callback(
+            &pool,
+            claimed[2].job.id,
+            claimed[2].job.run_lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease_count(&pool, &store).await, 1);
+    assert_eq!(
+        counts(&pool, queue).await,
+        (1, 1, 1),
+        "materialization counts the attempt once"
+    );
+    let finished = store
+        .complete_external(&pool, callback, None, Some(claimed[2].job.run_lease), false)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, JobState::Completed);
+    assert_eq!(counts(&pool, queue).await, (0, 1, 2));
+    for (claim, expected) in claimed.iter().zip([
+        JobState::Completed,
+        JobState::Retryable,
+        JobState::Completed,
+    ]) {
+        let job = store.load_job(&pool, claim.job.id).await.unwrap().unwrap();
+        assert_eq!(
+            job.state, expected,
+            "point reads and aggregate counts agree"
+        );
+    }
+}
+
 /// With lease-claim receipts on, a running job is an open receipt claim and
 /// `leases` stays empty, so every running count must read the claims too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -14618,6 +14721,17 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     assert_eq!(overview.total_queued, 2);
     assert_eq!(overview.running, 0);
 
+    let kind = admin::job_kind_overview(&pool, "complete_job")
+        .await
+        .expect("read kind overview after reusing the retained lane")
+        .expect("the completed and newly enqueued jobs have a kind");
+    assert_eq!(
+        kind.job_count,
+        (completed.len() + waiting.len() - 1) as i64,
+        "retained completions and later jobs in the same lane count once"
+    );
+    assert_eq!(kind.completed_last_hour, (completed.len() - 1) as i64);
+
     // The dashboard's other two reads, over the same jobs.
     let counts = admin::state_counts(&pool)
         .await
@@ -16849,6 +16963,432 @@ async fn test_point_read_uses_live_ready_queue_after_ring_wrap() {
     );
 }
 
+/// Aging moves a waiting job by tombstoning its ready row and re-inserting the
+/// same attempt on the next lane. In a quiet queue the new lane hands out the
+/// same `lane_seq`, so a lease joined to its ready row by attempt alone matched
+/// both rows and the admin reads counted the running job twice.
+async fn moved_ready_row_is_joined_once_by_attempt_reads(receipts: bool, row_local: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_moved_ready_lease_reads";
+    let schema = if row_local {
+        "awa_qs_moved_ready_row_claim_reads"
+    } else if receipts {
+        "awa_qs_moved_ready_compact_reads"
+    } else {
+        "awa_qs_moved_ready_lease_reads"
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: receipts,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved"),
+        InsertOpts {
+            priority: 2,
+            ..unique_cancel_opts(queue, None)
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let aged = store
+        .age_waiting_priorities(&pool, Duration::from_secs(60), 10)
+        .await
+        .expect("age waiting priorities");
+    assert_eq!(aged, vec![job_id]);
+
+    let same_position: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(DISTINCT priority)::bigint
+         FROM {schema}.ready_entries
+         WHERE job_id = $1
+         GROUP BY ready_slot, ready_generation, enqueue_shard, lane_seq"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ready rows for the moved job");
+    assert_eq!(
+        same_position, 2,
+        "the source and destination rows must share a position for this test to mean anything"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(
+            &pool,
+            queue,
+            1,
+            if receipts && !row_local {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(30)
+            },
+        )
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert_eq!(claimed[0].claim.lease_claim_receipt, receipts);
+    assert_eq!(
+        claimed[0].claim.claim_batch_id.is_some(),
+        receipts && !row_local
+    );
+    let legacy_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claims WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify the claim representation");
+    assert_eq!(legacy_rows, i64::from(row_local));
+
+    // This is the production CTE used by current-job projections, not only
+    // the point-read candidate list. Every attempt must hydrate exactly once.
+    let projected: Vec<i64> = sqlx::query_scalar(&format!(
+        "{} SELECT job_id FROM current_jobs WHERE queue = $1 AND state = 'running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("project current running jobs");
+    assert_eq!(projected, vec![job_id], "hydrate only the live ready row");
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id],
+        "the moved running job is listed once"
+    );
+
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .expect("job kind overviews");
+    let kind = overview
+        .iter()
+        .find(|row| row.kind == UniqueCancelJob::kind())
+        .expect("the moved job's kind is listed");
+    assert_eq!(kind.job_count, 1, "the moved running job is counted once");
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load moved job")
+        .expect("moved job exists");
+    assert_eq!(loaded.state, JobState::Running);
+    assert_eq!(loaded.priority, 1, "reads the live destination row");
+    assert_eq!(
+        loaded.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(2)),
+        "payload comes from the aged destination, not its tombstoned source"
+    );
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(false, false).await;
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_compact_receipt_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(true, false).await;
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_row_local_receipt_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(true, true).await;
+}
+
+async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -> Vec<i64> {
+    admin::list_jobs(pool, &filter)
+        .await
+        .expect("list receipt-held jobs")
+        .into_iter()
+        .map(|job| job.id)
+        .collect()
+}
+
+async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool, row_local: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = match (receipts, row_local) {
+        (false, _) => "awa_qs_admin_scope_leases",
+        (true, false) => "awa_qs_admin_scope_compact",
+        (true, true) => "awa_qs_admin_scope_row_claims",
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: receipts,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let queue = "receipt_admin_scope";
+    let other_queue = "receipt_admin_other";
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let other_kind = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 3 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let other = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4 },
+        InsertOpts {
+            queue: other_queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let deadline = if receipts && !row_local {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(30)
+    };
+    let mut claims = store
+        .claim_runtime_batch(&pool, queue, 3, deadline)
+        .await
+        .unwrap();
+    claims.extend(
+        store
+            .claim_runtime_batch(&pool, other_queue, 1, deadline)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(claims.len(), 4);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.lease_claim_receipt == receipts));
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.claim_batch_id.is_some() == (receipts && !row_local)));
+    let row_claims: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_claims, if row_local { 4 } else { 0 });
+
+    let scoped = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        kind: Some(CompleteJob::kind().into()),
+        queue: Some(queue.into()),
+        tag: Some("selected".into()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(receipt_admin_ids(&pool, scoped.clone()).await, vec![second]);
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                before_id: Some(second),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![first]
+    );
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: Some(first),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            tag: Some("absent".into()),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            state: Some(JobState::WaitingExternal),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                state: None,
+                limit: Some(10),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![second, first]
+    );
+
+    let projected: Vec<i64> = sqlx::query_scalar(&format!(
+        "{} SELECT job_id FROM current_jobs WHERE state='running' ORDER BY job_id DESC",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projected, vec![other, other_kind, second, first]);
+    let kinds = admin::job_kind_overviews(&pool).await.unwrap();
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!((complete.job_count, complete.queue_count), (3, 2));
+    let alternate = kinds
+        .iter()
+        .find(|kind| kind.kind == DlqJob::kind())
+        .unwrap();
+    assert_eq!((alternate.job_count, alternate.queue_count), (1, 1));
+
+    // Materialization keeps the same attempt running. The receipt leg must
+    // yield to the lease leg rather than report both representations.
+    let first_claim = claims.iter().find(|claim| claim.job.id == first).unwrap();
+    store
+        .register_callback(
+            &pool,
+            first,
+            first_claim.job.run_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("materialize one running attempt");
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                limit: Some(10),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![second, first]
+    );
+    let running: i64 = sqlx::query_scalar(&format!(
+        "{} SELECT count(*) FROM current_jobs WHERE state='running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 4, "materialization does not duplicate the claim");
+
+    let closed = claims
+        .iter()
+        .find(|claim| claim.job.id == second)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &[closed])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                limit: Some(10),
+                ..scoped
+            }
+        )
+        .await,
+        vec![first],
+        "closed receipts leave running enumeration"
+    );
+    let running: i64 = sqlx::query_scalar(&format!(
+        "{} SELECT count(*) FROM current_jobs WHERE state='running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 3);
+    let kinds = admin::job_kind_overviews(&pool).await.unwrap();
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!(
+        (complete.job_count, complete.queue_count),
+        (3, 2),
+        "the completed job is counted once, not as both running and terminal"
+    );
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_compact() {
+    receipt_admin_reads_preserve_scope_and_disposition(true, false).await;
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_row_local() {
+    receipt_admin_reads_preserve_scope_and_disposition(true, true).await;
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_materialized_control() {
+    receipt_admin_reads_preserve_scope_and_disposition(false, false).await;
+}
+
 async fn claim_aged_rescue_body_job(
     schema: &str,
     receipts: bool,
@@ -17152,4 +17692,169 @@ async fn test_aged_rescued_failure_dlq_keeps_effective_priority() {
 #[tokio::test]
 async fn test_aged_rescued_failure_retryable_keeps_effective_priority() {
     aged_rescue_keeps_effective_policy_priority(false).await;
+}
+
+async fn moved_rescued_failure_keeps_live_lane(
+    initial_priority: i16,
+    runtime_aging: Duration,
+    consumer: AgedFailedConsumer,
+) {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_moved_rescue_identity";
+    let queue = "qs_moved_rescue_identity";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9028 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: initial_priority,
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    assert_eq!(
+        store
+            .age_waiting_priorities(&pool, Duration::from_secs(60), 1)
+            .await
+            .expect("move queued job"),
+        vec![job_id]
+    );
+    let claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, runtime_aging)
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    let physical_priority = initial_priority - 1;
+    assert_eq!(claimed[0].claim.priority, physical_priority);
+    assert_eq!(claimed[0].job.priority, 1);
+    // A physical reorder of the disposable fixture preserves all logical
+    // tuples while exposing both legal fetch orders of the retained body.
+    sqlx::raw_sql(&format!(
+        "CLUSTER {schema}.ready_entries_0 USING idx_{schema}_ready_0_lane_shard"
+    ))
+    .execute(&pool)
+    .await
+    .expect("order retained fixture rows by physical lane");
+    let physical_order: Vec<i16> = sqlx::query_scalar(&format!(
+        "SELECT priority FROM {schema}.ready_entries_0 WHERE job_id = $1 ORDER BY ctid"
+    ))
+    .bind(job_id)
+    .fetch_all(&pool)
+    .await
+    .expect("verify fixture row order");
+    assert_eq!(physical_order, vec![physical_priority, initial_priority]);
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("rescue moved job");
+    assert_eq!(rescued.len(), 1);
+    if matches!(consumer, AgedFailedConsumer::Carry) {
+        // Queued aging leaves its tombstoned source lane's cursor behind.
+        // A real empty claim consumes it before that queue slot can prune.
+        let remaining = store
+            .claim_runtime_batch(&pool, queue, 10, Duration::ZERO)
+            .await
+            .expect("advance tombstoned source lane");
+        assert!(
+            remaining.is_empty(),
+            "closed moved attempt must not run again"
+        );
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry moved failure")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                other => panic!("unexpected moved-failure prune outcome: {other:?}"),
+            }
+        }
+        let body = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(body.0, Some(claimed[0].job.args.clone()));
+        assert_eq!(body.1, Some(1));
+    }
+    let terminal: (i16, serde_json::Value, i16) = sqlx::query_as(&format!(
+        "SELECT priority,args,max_attempts FROM {schema}.terminal_jobs WHERE job_id=$1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read moved terminal view");
+    if matches!(consumer, AgedFailedConsumer::View) {
+        assert_eq!(
+            terminal.0, physical_priority,
+            "terminal view must retain the live lane"
+        );
+        assert_eq!(terminal.1, claimed[0].job.args);
+        assert_eq!(terminal.2, 1);
+    }
+    let retried = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry moved failure")
+        .expect("failed job retries");
+    assert_eq!(
+        retried.priority, claimed[0].claim.priority,
+        "retry must not select the tombstoned source lane"
+    );
+    assert_eq!(retried.args, claimed[0].job.args);
+    assert_eq!(retried.max_attempts, 1);
+    assert_eq!(terminal.0, physical_priority);
+    assert_eq!(terminal.1, claimed[0].job.args);
+    assert_eq!(
+        retried.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(initial_priority))
+    );
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_retry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(2, Duration::ZERO, AgedFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_retry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::Retry)
+        .await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_carry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::Carry)
+        .await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_view_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::View)
+        .await;
 }
