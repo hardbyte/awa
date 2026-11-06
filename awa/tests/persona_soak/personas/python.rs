@@ -504,26 +504,26 @@ async fn migrate_probe(shared: &Arc<Shared>, python: &PathBuf, ledger_path: &Pat
     };
     let mut evidence = Evidence::default();
     let deadline = Instant::now() + crate::ci_timing::scaled_timeout(Duration::from_secs(45));
-    loop {
+    let exit_success = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
                     evidence.incomplete(format!("Python migrate probe exited with {status}"));
                 }
-                break;
+                break status.success();
             }
             Err(error) => {
                 evidence.incomplete(format!(
                     "Python migrate probe exit could not be read: {error}"
                 ));
                 let _ = child.kill().await;
-                break;
+                break false;
             }
             Ok(None) if Instant::now() >= deadline => {
                 evidence
                     .incomplete("Python migrate-then-query probe did not exit within its deadline");
                 let _ = child.kill().await;
-                break;
+                break false;
             }
             Ok(None) => {}
         }
@@ -535,18 +535,12 @@ async fn migrate_probe(shared: &Arc<Shared>, python: &PathBuf, ledger_path: &Pat
             python_probe::sessions(&pool, &application_name).await,
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    let deadline = Instant::now() + crate::ci_timing::scaled_timeout(Duration::from_secs(2));
-    loop {
-        let result = python_probe::sessions(&pool, &application_name).await;
-        let stopped = result.as_ref().is_ok_and(|(count, _)| *count == 0);
-        let failed = result.is_err();
-        evidence.after_exit(result);
-        if stopped || failed || Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    evidence
+        .finish_exit(&phase, exit_success, || {
+            python_probe::sessions(&pool, &application_name)
+        })
+        .await;
     stats.add("python_migrate_probes", 1);
     stats.set_max("python_probe_peak_sessions", evidence.peak_sessions);
     stats.set_max(
