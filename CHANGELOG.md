@@ -18,9 +18,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `lock_timeout`. A lane that times out keeps its rows deferred and is
   handed to a dedicated task that waits up to 30 s for the lock, queued
   behind the producers already waiting, so the lane is still promoted in
-  turn however busy it stays; the leader skips it meanwhile. At most four
-  lanes wait this way at once, and a further contended lane is retried on
-  the next tick. `awa.maintenance.promote.lane_contention`
+  turn however busy it stays; the leader skips it meanwhile. Each waiter
+  holds a pool connection, so the leader runs one per eight pool
+  connections, at least one and at most four; a further contended lane is
+  retried on the next tick. Batch selection skips rows another transaction
+  has locked, so locked due rows cannot fill every batch of a tick. `awa.maintenance.promote.lane_contention`
   (`awa_maintenance_promote_lane_contention_total{awa_job_state,awa_job_queue,awa_promote_outcome}`)
   counts `handed_off`, `waiter_limit` and `waiter_timed_out`. Promoted rows
   now take lane sequence numbers in due order within their lane.

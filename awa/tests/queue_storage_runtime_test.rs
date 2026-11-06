@@ -8276,6 +8276,126 @@ async fn test_queue_storage_runtime_busy_lane_holds_back_neither_promotion_nor_r
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+/// Rows another transaction holds locked, as a lane promotion still waiting
+/// under a former leader does, must not fill every batch of a promotion tick.
+/// With more of the oldest due rows locked than one batch selects, a due job
+/// on another queue must still be promoted and run promptly, and the locked
+/// rows must be promoted once released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_locked_due_rows_do_not_starve_promotion() {
+    const LOCKED: usize = 4_096 + 64;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let locked_queue = "qs_locked_due_rows";
+    let other = "qs_locked_due_other";
+    let schema = "awa_qs_locked_due_rows";
+    let store = create_store(&pool, schema).await;
+
+    let oldest = Utc::now() - chrono::Duration::seconds(120);
+    let params: Vec<_> = (0..LOCKED)
+        .map(|n| {
+            insert::params_with(
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: locked_queue.to_string(),
+                    run_at: Some(oldest),
+                    ..Default::default()
+                },
+            )
+            .expect("build locked-row params")
+        })
+        .collect();
+    for chunk in params.chunks(2_000) {
+        store
+            .enqueue_params_batch(&pool, chunk)
+            .await
+            .expect("enqueue rows to lock");
+    }
+    let mut holder = pool.begin().await.expect("begin row holder");
+    let locked: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {schema}.deferred_jobs WHERE queue = $1 FOR UPDATE"
+    ))
+    .bind(locked_queue)
+    .fetch_all(holder.as_mut())
+    .await
+    .expect("lock the oldest due rows");
+    assert_eq!(locked.len(), LOCKED);
+
+    let other_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: -1 },
+        InsertOpts {
+            queue: other.to_string(),
+            run_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            other,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("Failed to build locked-rows client");
+    client
+        .start()
+        .await
+        .expect("Failed to start locked-rows client");
+
+    wait_for_job_state(
+        &store,
+        &pool,
+        other_job,
+        &[JobState::Completed],
+        scaled_timeout(Duration::from_secs(2)),
+    )
+    .await;
+
+    holder.rollback().await.expect("release the locked rows");
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(10));
+    loop {
+        let remaining: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.deferred_jobs WHERE queue = $1"
+        ))
+        .bind(locked_queue)
+        .fetch_one(&pool)
+        .await
+        .expect("count deferred rows");
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{remaining} released rows were never promoted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
     let (_db_guard, pool) = setup_pool(10).await;

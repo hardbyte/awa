@@ -729,8 +729,13 @@ const PROMOTE_LANE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 /// ahead of it, however busy the lane stays.
 const PROMOTE_LANE_WAITER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most lanes with a dedicated waiter at once. A waiter holds a pool
-/// connection while it waits.
+/// connection while it waits, so smaller pools get fewer: one per eight
+/// connections, and always one so a busy lane is still promoted.
 const PROMOTE_MAX_LANE_WAITERS: usize = 4;
+
+fn lane_waiter_limit(pool_max_connections: u32) -> usize {
+    (pool_max_connections as usize / 8).clamp(1, PROMOTE_MAX_LANE_WAITERS)
+}
 
 /// Queue-storage promotion of due scheduled and retryable rows, as the
 /// maintenance leader runs it for one store.
@@ -748,11 +753,14 @@ pub struct QueueStoragePromoter {
     metrics: AwaMetrics,
     waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
     waiters: std::sync::Mutex<JoinSet<()>>,
+    max_waiters: usize,
 }
 
 impl QueueStoragePromoter {
     pub fn new(pool: PgPool, store: Arc<QueueStorage>, metrics: AwaMetrics) -> Self {
+        let max_waiters = lane_waiter_limit(pool.options().get_max_connections());
         Self {
+            max_waiters,
             pool,
             store,
             metrics,
@@ -825,7 +833,7 @@ impl QueueStoragePromoter {
         let key = (state, lane);
         {
             let mut waiting = self.waiting.lock().expect("waiting lanes poisoned");
-            if waiting.len() >= PROMOTE_MAX_LANE_WAITERS {
+            if waiting.len() >= self.max_waiters {
                 self.metrics.record_promotion_lane_contention(
                     state.as_str(),
                     &key.1.queue,
@@ -3675,6 +3683,15 @@ mod tests {
             paused_at: None,
             paused_by: None,
         }
+    }
+
+    #[test]
+    fn lane_waiters_scale_with_the_pool_and_never_drop_to_zero() {
+        assert_eq!(lane_waiter_limit(1), 1);
+        assert_eq!(lane_waiter_limit(10), 1);
+        assert_eq!(lane_waiter_limit(16), 2);
+        assert_eq!(lane_waiter_limit(32), 4);
+        assert_eq!(lane_waiter_limit(200), 4);
     }
 
     #[test]
