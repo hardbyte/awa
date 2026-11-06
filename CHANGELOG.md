@@ -4,6 +4,30 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **The queue-storage prune `lock_timeout` is configurable, and prune
+  attempts are counted by outcome for every ring.** Prune (queue, lease and
+  claim rings) and terminal-delta rollup take their exclusive locks under a
+  10 ms `lock_timeout` that could only be changed through the hidden
+  `QueueStorage::with_prune_lock_timeout`. When short readers of the ring
+  partitions held a conflicting lock at that instant, prune reported
+  `blocked` every tick and the rings stopped recycling. Set it with
+  `ClientBuilder::prune_lock_timeout` (Rust) or
+  `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
+  timeout applies separately to each lock acquisition, not to the whole prune;
+  queue prune can wait on up to eight partition locks. The default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
+  maximum is rejected. Start logs a warning when the value is at or above the
+  connection's `deadlock_timeout` (prune waiting that long can make deadlock
+  detection cancel a claim instead) or `statement_timeout`. `with_prune_lock_timeout` is now
+  public, with `set_prune_lock_timeout` and `prune_lock_timeout()`.
+  `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
+  gains `backed_off` (prune skipped by the backoff that follows consecutive
+  `skipped_active` or `blocked` results) and
+  `error` (prune failed with a database error) alongside the existing
+  `pruned`, `noop`, `blocked` and `skipped_active`. See
+  [Configuration](docs/configuration.md#what-the-knobs-mean).
+
 ### Fixed
 
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
@@ -24,6 +48,85 @@ Notable changes between releases. Detailed migration notes for storage transitio
   so maintenance backs off and retries; nothing the attempt wrote survives
   the rollback. A rollup pass stops at its first blocked slot rather than
   waiting out the timeout again on each remaining one.
+- **On queue storage, a queue whose enqueue lane is busy no longer holds
+  back promotion of other queues, nor the maintenance leader's rescue,
+  rotation and prune.** Promotion re-enqueues due scheduled and retryable
+  rows into their lane, which takes the lane's reservation lock that
+  producers hold until they commit. A promotion batch was one transaction
+  across every queue it touched, and the leader runs its branches one after
+  another, so a lane kept busy by producers delayed due jobs of unrelated
+  queues in the same batch, and rescue started seconds late. Promotion now
+  gives each `(queue, priority)` lane its own transaction under a 50 ms
+  `lock_timeout`. A lane that times out keeps its rows deferred and is
+  handed to a dedicated task that waits up to 30 s for the lock, queued
+  behind the producers already waiting, so the lane is still promoted in
+  turn however busy it stays; the leader skips it meanwhile. Each waiter
+  holds a pool connection, so the leader runs one per eight pool
+  connections, at least one and at most four; a further contended lane is
+  retried on the next tick. Batch selection skips rows another transaction
+  has locked, so locked due rows cannot fill every batch of a tick. `awa.maintenance.promote.lane_contention`
+  (`awa_maintenance_promote_lane_contention_total{awa_job_state,awa_job_queue,awa_promote_outcome}`)
+  counts `handed_off`, `waiter_limit` and `waiter_timed_out`. Promoted rows
+  now take lane sequence numbers in due order within their lane.
+  `QueueStorage::promote_due` keeps its signature and promotes lane by lane
+  without a lock timeout; `promote_due_lanes` and `promote_due_lane` expose
+  the per-lane form.
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first.** A lane's enqueue and claim sequences belonged to the role that
+  first enqueued into, claimed from or promoted into it, so with several
+  runtime roles sharing a group role, any role other than the creator whose
+  default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. The new schema patch
+  `definer_lane_provisioning` creates lanes through two `SECURITY DEFINER`
+  functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. Once the patch commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence
+  per transaction with a 300 ms lock wait, and only where it is allowed to,
+  trying the effective role and then the login role. A sequence an open
+  transaction holds is skipped and reported as busy; one it may not change is
+  reported with the roles that can repair it. Neither fails the run. The new read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the
+  statements to run and the roles to run them as, and exits 2 while any
+  remain; `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per
+  sequence) repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running before the patch detects that `provision_lane` is missing and
+  creates lanes as before, and older binaries create correctly owned lanes once
+  the patch has refreshed the helpers they call. `awa migrate` applies the
+  patch on any v040 database; external runners apply the exported
+  `R__definer_lane_provisioning.sql` after `V40`. See
+  [`docs/upgrade-0.6.13-to-0.6.14.md`](docs/upgrade-0.6.13-to-0.6.14.md).
+- **A graceful shutdown no longer leaves a finished attempt for stale-heartbeat
+  rescue to run again.** Once a handler returned, its finalize (completion,
+  retry, cancel or failure, and any ADR-029 follow-up inserts) ran in a task
+  that `Client::shutdown` did not wait for. When the last handler returned
+  just as the drain ended, shutdown stopped the completion batcher before
+  that finalize reached it, and the direct fallback raced the process exit.
+  The attempt had already left the heartbeat set, so it went stale and was
+  rescued and executed again `heartbeat_staleness` later; a deploy could
+  re-run a few jobs on every rolling restart. Shutdown now waits for
+  pending finalization, within the same drain timeout, before it stops the
+  completion batcher, heartbeat and maintenance services. A finalize that
+  outlives the timeout is still left to rescue, as before.
+- **Callback completion, `get_job`, lifecycle events and the admin reads
+  find running jobs that priority aging promoted on queue storage** (backport
+  of #600). Claims and leases record a job's aged effective priority while its
+  ready row keeps the lane priority, and eight reads joined the two on
+  priority. With aging on (the default, every 60 s), a job that waited past a
+  minute before it was claimed could not be completed by callback with an
+  expected kind, failed the mixed-transition callback routing check, read back
+  from `get_job` in the wrong state, was missing from the job list, the kinds
+  page and the dashboard's recent-jobs counts, and was not found by
+  `cancel_by_unique_key`. They now match the attempt (`job_id` and `run_lease`). No
+  migration.
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing. It now reads all of them from one read-only snapshot.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are
