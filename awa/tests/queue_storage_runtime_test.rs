@@ -15663,6 +15663,181 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
     );
 }
 
+/// The prune `lock_timeout` covers every statement after it is set, not
+/// only the `LOCK TABLE` on the slot's children. A statement that waits on
+/// another table's lock — here the failed-row carry, its count deltas, the
+/// rollup delta append and the live-counter cleanup — must roll the whole prune back
+/// and report `Blocked`, leaving the slot to the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_lock_timeout_after_child_locks_reports_blocked() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_late_lock_timeout";
+    let schema = "awa_qs_prune_late_lock_timeout";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue completed job");
+    let claimed = store
+        .claim_batch(&pool, queue, 1)
+        .await
+        .expect("claim completed job");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete job");
+
+    let failed_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim failing job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    store
+        .fail_terminal(&pool, failed_job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail job")
+        .expect("running job should fail");
+
+    let rotated = store.rotate(&pool).await.expect("rotate");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let retention = Duration::from_secs(3600);
+    for held in [
+        format!("{schema}.done_entries_1"),
+        format!("{schema}.queue_terminal_count_deltas_1"),
+        format!("{schema}.queue_terminal_rollup_deltas"),
+        format!("{schema}.queue_terminal_live_counts"),
+    ] {
+        let mut holder = pool.begin().await.expect("begin lock holder");
+        sqlx::query(audited_sql(format!("LOCK TABLE {held} IN SHARE MODE")))
+            .execute(holder.as_mut())
+            .await
+            .expect("hold share lock");
+
+        let outcome = store.prune_oldest(&pool, retention).await;
+        assert!(
+            matches!(outcome, Ok(PruneOutcome::Blocked { slot: 0 })),
+            "prune waiting on {held} should report Blocked, got {outcome:?}"
+        );
+
+        holder.rollback().await.expect("release share lock");
+
+        assert_eq!(
+            done_entries_count(&pool, schema, queue).await,
+            2,
+            "blocked prune on {held} must not truncate or carry rows"
+        );
+        let rollup_rows: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*)::bigint FROM {schema}.queue_terminal_rollup_deltas"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("count rollups");
+        assert_eq!(
+            rollup_rows, 0,
+            "blocked prune on {held} must not fold rollups"
+        );
+        assert_invariant_holds(
+            &pool,
+            schema,
+            queue,
+            &format!("after prune blocked on {held}"),
+        )
+        .await;
+    }
+
+    let pruned = store
+        .prune_oldest(&pool, retention)
+        .await
+        .expect("prune after locks released");
+    assert!(
+        matches!(
+            pruned,
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 1,
+                ..
+            }
+        ),
+        "unexpected prune outcome after locks released: {pruned:?}"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after prune").await;
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.terminal, 2, "rollup (1) + carried live row (1)");
+}
+
+/// Terminal-delta rollup shares prune's lock timeout. A timeout on the
+/// live-counter fold, after the delta child is locked, must report a blocked
+/// slot rather than fail the rollup pass, and the pass stops there instead of
+/// waiting out the same timeout on every remaining slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_reports_blocked() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_late_lock";
+    let schema = "awa_qs_terminal_delta_rollup_late_lock";
+    let store = create_store(&pool, schema).await;
+
+    for _ in 0..2 {
+        store
+            .enqueue_batch(&pool, queue, 1, 3)
+            .await
+            .expect("enqueue");
+        let claimed = store.claim_batch(&pool, queue, 3).await.expect("claim");
+        store
+            .complete_batch(&pool, &claimed)
+            .await
+            .expect("complete");
+        match store.rotate(&pool).await.expect("rotate") {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("expected Rotated, got {other:?}"),
+        }
+    }
+
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.queue_terminal_live_counts IN SHARE MODE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold share lock");
+
+    let outcome = store.rollup_terminal_count_deltas(&pool, 4).await;
+    holder.rollback().await.expect("release share lock");
+    let outcome = outcome.expect("rollup waiting on live counts should not error");
+    assert_eq!(outcome.rolled_slots, 0);
+    assert_eq!(
+        outcome.blocked_slots, 1,
+        "the pass stops at the first blocked slot"
+    );
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup after lock released");
+    assert_eq!(outcome.rolled_slots, 2);
+    assert_eq!(outcome.blocked_slots, 0);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let (_db_guard, pool) = setup_pool(8).await;
