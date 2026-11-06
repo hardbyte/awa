@@ -243,7 +243,7 @@ Since these triggers run with the caller's privileges, the runtime role needs wr
 
 The maintenance leader also calls `awa.refresh_admin_metadata()` as a full reconciliation safety net. It runs with invoker privileges and needs DML on the admin metadata tables. `TRUNCATE` in the grant is for queue-storage segment pruning, which truncates retired partitions.
 
-Schema patches (`awa migrate --sql` prints them after the versioned migrations) replace function bodies and create tables under the migrator role, like migrations do; they never change grants. Privileges managed with `GRANT ... ON ALL TABLES` plus the default privileges above cover patched tables without further action.
+Schema patches (`awa migrate --sql` prints them after the versioned migrations) replace functions and may create tables or change function ownership and grants. The `definer_lane_provisioning` patch installs provisioning functions owned by the schema owner and grants them `PUBLIC EXECUTE`. After the patch commits, `awa migrate` attempts to repair existing lane-sequence ownership and grants; review its warnings for sequences that still need repair. The default privileges above cover new tables created by the migration role.
 
 The runtime also directly upserts into the descriptor catalogs on startup and on each runtime snapshot tick:
 

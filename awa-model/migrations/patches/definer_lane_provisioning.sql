@@ -65,7 +65,7 @@ BEGIN
         IF v_count > 0 THEN
             RAISE NOTICE '% lane sequence(s) in schema % are not owned by the schema owner or lack runtime grants', v_count, v_schema
                 USING HINT = format(
-                    'awa migrate repairs them after this commits. Otherwise run awa storage lane-sequences --schema %s --repair as the migration role itself, without SET ROLE.',
+                    'awa migrate attempts repair after this commits; review its warnings for any sequences left unrepaired. To retry, run awa storage lane-sequences --schema %s --repair as the migration role itself, without SET ROLE.',
                     v_schema
                 );
         END IF;
