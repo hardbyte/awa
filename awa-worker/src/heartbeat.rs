@@ -1,5 +1,6 @@
 use crate::runtime::{InFlightMap, RunLease};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::queue_storage::ClaimHeartbeatRef;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -140,7 +141,7 @@ impl HeartbeatService {
                     .iter()
                     .filter(|(key, _)| !progress_keys.contains(key))
                     .partition(|(_, claim)| claim.is_some());
-                let claimed: Vec<awa_model::queue_storage::ClaimHeartbeatRef> =
+                let claimed: Vec<ClaimHeartbeatRef> =
                     claimed.into_iter().filter_map(|(_, claim)| claim).collect();
                 let plain: Vec<(i64, RunLease)> = plain.into_iter().map(|(key, _)| key).collect();
                 self.heartbeat_once_queue_storage(runtime, &claimed, &plain, &pending_progress)
@@ -170,7 +171,7 @@ impl HeartbeatService {
                      AND jobs.run_lease = inflight.run_lease
                     WHERE jobs.state = 'running'
                     ORDER BY jobs.id
-                    FOR UPDATE OF jobs
+                    FOR UPDATE OF jobs SKIP LOCKED
                 )
                 UPDATE awa.jobs_hot AS jobs
                 SET heartbeat_at = now()
@@ -217,7 +218,7 @@ impl HeartbeatService {
                          AND jobs.run_lease = inflight.run_lease
                         WHERE jobs.state = 'running'
                         ORDER BY jobs.id
-                        FOR UPDATE OF jobs
+                        FOR UPDATE OF jobs SKIP LOCKED
                     )
                     UPDATE awa.jobs_hot AS jobs
                     SET heartbeat_at = now(),
@@ -243,7 +244,13 @@ impl HeartbeatService {
                             .iter()
                             .map(|(id, lease, gen, _)| (*id, *lease, *gen))
                             .collect();
-                        self.in_flight.ack_progress(&acked);
+                        if result.rows_affected() as usize == chunk.len() {
+                            self.in_flight.ack_progress(&acked);
+                        } else {
+                            // Re-send successful snapshots too: replay is safe,
+                            // whereas acknowledging a skipped write loses progress.
+                            self.in_flight.clear_in_flight_progress(&acked);
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "Failed to send heartbeat+progress batch");
@@ -261,7 +268,7 @@ impl HeartbeatService {
     async fn heartbeat_once_queue_storage(
         &self,
         runtime: &QueueStorageRuntime,
-        claimed: &[awa_model::queue_storage::ClaimHeartbeatRef],
+        claimed: &[ClaimHeartbeatRef],
         heartbeat_only: &[(i64, RunLease)],
         pending_progress: &[(i64, i64, u64, serde_json::Value)],
     ) {
@@ -314,7 +321,11 @@ impl HeartbeatService {
                             .iter()
                             .map(|(id, lease, gen, _)| (*id, *lease, *gen))
                             .collect();
-                        self.in_flight.ack_progress(&acked);
+                        if updated == chunk.len() {
+                            self.in_flight.ack_progress(&acked);
+                        } else {
+                            self.in_flight.clear_in_flight_progress(&acked);
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "Failed to send heartbeat+progress batch");

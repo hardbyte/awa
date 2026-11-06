@@ -1,0 +1,908 @@
+//! A runtime holding tens of thousands of receipt claims dies without a
+//! graceful shutdown. Maintenance must rescue the whole backlog in bounded
+//! time, the claim ring must resume rotating, a runtime that stays alive
+//! must never have a claim rescued, and every rescued attempt must count
+//! (#627).
+
+#[path = "ci_timing.rs"]
+mod ci_timing;
+
+use awa::audited_sql;
+use awa::model::{QueueStorage, QueueStorageConfig, RingRotationCadence};
+use awa::{Client, InsertOpts, JobArgs, JobEvent, JobResult, QueueConfig};
+use awa_testing::setup::TestDatabase;
+use ci_timing::{scaled_staleness, scaled_timeout};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const ABANDONED: i64 = 50_000;
+const ABANDONED_CHUNK: i64 = 10_000;
+/// Every tenth abandoned job has one attempt, so its rescue exhausts it.
+const EXHAUSTED_EVERY: i64 = 10;
+const ABANDONED_QUEUE: &str = "bulk_rescue_abandoned";
+const LIVE_QUEUE: &str = "bulk_rescue_live";
+
+/// What each run of a job saw, by job id.
+type RunsByJob<T> = HashMap<i64, Vec<T>>;
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct AbandonedJob {
+    n: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct LiveJob {
+    n: i64,
+    hold_ms: u64,
+}
+
+fn queue_storage_builder(
+    pool: &PgPool,
+    staleness: Duration,
+    heartbeat_interval: Duration,
+) -> awa::ClientBuilder {
+    Client::builder(pool.clone())
+        .queue_storage(
+            QueueStorageConfig::default(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        // Rotate the claim ring every tick so the abandoned claims spread
+        // across slots and the ring wraps onto the oldest of them.
+        .claim_rotate_interval(Duration::from_millis(200))
+        .ring_rotation_cadence(RingRotationCadence::EAGER)
+        .heartbeat_interval(heartbeat_interval)
+        .heartbeat_staleness(staleness)
+        .runtime_snapshot_interval(Duration::from_millis(250))
+        .leader_check_interval(Duration::from_millis(200))
+        .promote_interval(Duration::from_millis(100))
+        .dlq_enabled_by_default(true)
+}
+
+async fn count(pool: &PgPool, sql: String) -> i64 {
+    sqlx::query_scalar(audited_sql(sql.clone()))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"))
+}
+
+/// Retry promotion transfers a row between these states in one transaction.
+/// Read both counts from one statement so a commit between reads cannot count
+/// the same job once in deferred storage and again in ready storage.
+async fn waiting_retry_counts(pool: &PgPool, queue: &str) -> (i64, i64) {
+    let overview = awa::model::admin::queue_overview(pool, queue)
+        .await
+        .expect("retry accounting overview")
+        .expect("retry accounting queue");
+    (overview.retryable, overview.available)
+}
+
+#[tokio::test]
+async fn retry_accounting_uses_one_snapshot_during_promotion() {
+    let db = TestDatabase::queue_storage().await;
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let queue = "bulk_rescue_retry_snapshot";
+    let params = awa::model::insert::params_with(
+        &AbandonedJob { n: 0 },
+        InsertOpts {
+            queue: queue.into(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .expect("retry accounting job");
+    store
+        .enqueue_params_batch(db.pool(), &[params])
+        .await
+        .expect("enqueue retry accounting job");
+    let claims = store
+        .claim_runtime_batch(db.pool(), queue, 1, Duration::ZERO)
+        .await
+        .expect("claim retry accounting job");
+    assert_eq!(claims.len(), 1);
+    store
+        .retry_after(
+            db.pool(),
+            claims[0].job.id,
+            claims[0].job.run_lease,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .expect("retry accounting job")
+        .expect("claimed job becomes retryable");
+    assert_eq!(waiting_retry_counts(db.pool(), queue).await, (1, 0));
+
+    // Hold the observer's only connection after its first statement. A real
+    // promotion commits before any second observer statement can start. The
+    // old split read therefore counts this one job twice; the overview's two
+    // counts always describe the same statement snapshot.
+    let armed = Arc::new(AtomicBool::new(false));
+    let read_finished = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let observer = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(scaled_timeout(Duration::from_secs(10)))
+        .after_release({
+            let armed = armed.clone();
+            let read_finished = read_finished.clone();
+            let release = release.clone();
+            move |_, _| {
+                let gate = armed.swap(false, Ordering::SeqCst);
+                let read_finished = read_finished.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if gate {
+                        read_finished.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(true)
+                })
+            }
+        })
+        .connect(&db.url())
+        .await
+        .expect("retry accounting observer pool");
+    let primed = observer.acquire().await.expect("prime observer connection");
+    drop(primed);
+    tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), async {
+        while observer.num_idle() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observer's initial connection is idle before arming");
+    armed.store(true, Ordering::SeqCst);
+    let promote = async {
+        let observed = tokio::time::timeout(
+            scaled_timeout(Duration::from_secs(10)),
+            read_finished.notified(),
+        )
+        .await;
+        if observed.is_err() {
+            release.notify_one();
+            panic!("retry accounting observer did not finish its first statement");
+        }
+        let promoted = store
+            .promote_due(db.pool(), awa::JobState::Retryable, 1)
+            .await;
+        release.notify_one();
+        assert_eq!(promoted.expect("promote between accounting reads"), 1);
+    };
+    let (counts, ()) = tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), async {
+        tokio::join!(waiting_retry_counts(&observer, queue), promote)
+    })
+    .await
+    .expect("bounded retry accounting interleaving");
+    observer.close().await;
+    assert_eq!(counts.0 + counts.1, 1, "one job is waiting to retry");
+    assert_eq!(waiting_retry_counts(db.pool(), queue).await, (0, 1));
+}
+
+async fn running(pool: &PgPool, store: &QueueStorage, queue: &str) -> i64 {
+    store
+        .queue_counts(pool, queue)
+        .await
+        .expect("queue counts")
+        .running
+}
+
+async fn claim_ring_generation(pool: &PgPool) -> i64 {
+    count(
+        pool,
+        "SELECT generation FROM awa.claim_ring_rotations ORDER BY generation DESC LIMIT 1".into(),
+    )
+    .await
+}
+
+async fn abandoned_claim_slots(pool: &PgPool) -> i64 {
+    count(
+        pool,
+        format!(
+            "SELECT count(DISTINCT claim_slot) FROM (
+                 SELECT claim_slot FROM awa.lease_claim_batches WHERE queue = '{ABANDONED_QUEUE}'
+                 UNION ALL
+                 SELECT claim_slot FROM awa.lease_claims WHERE queue = '{ABANDONED_QUEUE}'
+             ) AS claims"
+        ),
+    )
+    .await
+}
+
+/// Rescued and dead-lettered rows for a queue: what a false rescue would leave.
+async fn rescued_rows(pool: &PgPool, queue: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM awa.deferred_jobs WHERE queue = $1 AND state = 'retryable')
+              + (SELECT count(*) FROM awa.dlq_entries WHERE queue = $1)",
+    )
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count rescued rows")
+}
+
+/// Failure-only evidence: never delay a passing test or replace its assertion.
+/// Row caps bound output; statement and outer deadlines also bound the scans.
+async fn live_rescue_diagnostic(
+    pool: &PgPool,
+    staleness: Duration,
+    heartbeat_interval: Duration,
+) -> serde_json::Value {
+    let capture = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '250ms'")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .execute(tx.as_mut())
+            .await?;
+        let result = sqlx::query_scalar::<_, serde_json::Value>(
+            r#"
+            WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at),
+            rescued AS MATERIALIZED (
+                SELECT * FROM (
+                    SELECT 'retryable' AS plane, job_id, run_lease, attempt,
+                           attempted_at, finalized_at, NULL::text AS dlq_reason,
+                           NULL::bigint AS original_run_lease, payload
+                    FROM awa.deferred_jobs WHERE queue = $1 AND state = 'retryable'
+                    UNION ALL
+                    SELECT 'dlq', job_id, run_lease, attempt,
+                           attempted_at, finalized_at, dlq_reason, original_run_lease, payload
+                    FROM awa.dlq_entries WHERE queue = $1
+                ) retained ORDER BY job_id LIMIT 16
+            ),
+            claims AS (
+                SELECT batch.claim_slot, batch.batch_id, batch.ready_slot,
+                       batch.ready_generation, batch.claimed_at, item.job_id,
+                       item.run_lease, item.receipt_id, attempt.heartbeat_at,
+                       extract(epoch FROM stamp.at - COALESCE(attempt.heartbeat_at, batch.claimed_at)) AS age_s
+                FROM awa.lease_claim_batches batch
+                CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases, batch.receipt_ids)
+                    AS item(job_id, run_lease, receipt_id)
+                CROSS JOIN stamp
+                LEFT JOIN awa.attempt_state attempt
+                  ON attempt.job_id = item.job_id AND attempt.run_lease = item.run_lease
+                WHERE batch.queue = $1 AND item.job_id IN (SELECT job_id FROM rescued)
+                LIMIT 16
+            ),
+            runtimes AS (
+                SELECT instance_id, last_seen_at, heartbeat_alive, snapshot_interval_ms,
+                       extract(epoch FROM stamp.at - last_seen_at) AS age_s
+                FROM awa.runtime_instances CROSS JOIN stamp LIMIT 8
+            ),
+            activity AS (
+                SELECT pid, state, wait_event_type, wait_event,
+                       extract(epoch FROM stamp.at - query_start) AS query_age_s,
+                       pg_blocking_pids(pid) AS blocking_pids, left(query, 256) AS query
+                FROM pg_stat_activity CROSS JOIN stamp
+                WHERE datname = current_database() AND pid <> pg_backend_pid() AND state <> 'idle'
+                ORDER BY query_start LIMIT 24
+            ),
+            waiting AS (
+                SELECT locks.pid, locks.locktype, locks.mode, relation.relname
+                FROM pg_locks locks LEFT JOIN pg_class relation ON relation.oid = locks.relation
+                WHERE NOT locks.granted
+                  AND (locks.database IS NULL OR locks.database = (SELECT oid FROM pg_database WHERE datname = current_database()))
+                LIMIT 32
+            )
+            SELECT jsonb_build_object(
+                'at', (SELECT at FROM stamp), 'database', current_database(),
+                'rescued', (SELECT COALESCE(jsonb_agg(rescued), '[]') FROM rescued),
+                'claims', (SELECT COALESCE(jsonb_agg(claims), '[]') FROM claims),
+                'runtimes', (SELECT COALESCE(jsonb_agg(runtimes), '[]') FROM runtimes),
+                'claim_slots', (SELECT COALESCE(jsonb_agg(ring_slot), '[]') FROM (SELECT * FROM awa.claim_ring_slots ORDER BY slot LIMIT 8) ring_slot),
+                'activity', (SELECT COALESCE(jsonb_agg(activity), '[]') FROM activity),
+                'waiting_locks', (SELECT COALESCE(jsonb_agg(waiting), '[]') FROM waiting),
+                'wal', (SELECT to_jsonb(wal) FROM pg_stat_wal wal))
+            "#,
+        ).bind(ABANDONED_QUEUE).fetch_one(tx.as_mut()).await;
+        tx.rollback().await?;
+        result
+    };
+    let evidence = match tokio::time::timeout(Duration::from_secs(3), capture).await {
+        Ok(Ok(data)) => serde_json::json!({"status": "captured", "data": data}),
+        Ok(Err(error)) => serde_json::json!({"status": "incomplete", "error": error.to_string()}),
+        Err(_) => serde_json::json!({"status": "incomplete", "error": "3s diagnostic deadline"}),
+    };
+    serde_json::json!({
+        "staleness_ms": staleness.as_millis(),
+        "heartbeat_interval_ms": heartbeat_interval.as_millis(),
+        "CI": std::env::var("CI").ok(),
+        "multiplier_override": std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER").ok(),
+        "evidence": evidence,
+        "caveat": "current bounded snapshot, not historical heartbeat proof; missing attempt_state may follow rescue"
+    })
+}
+
+#[tokio::test]
+async fn live_rescue_diagnostic_captures_bounded_compact_evidence() {
+    let db = TestDatabase::queue_storage().await;
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let params: Vec<_> = (0..20)
+        .map(|n| {
+            awa::model::insert::params_with(
+                &AbandonedJob { n },
+                InsertOpts {
+                    queue: ABANDONED_QUEUE.into(),
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            )
+            .expect("diagnostic job")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(db.pool(), &params)
+        .await
+        .expect("enqueue");
+    let claims = store
+        .claim_runtime_batch(db.pool(), ABANDONED_QUEUE, 20, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claims.len(), 20);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.claim_batch_id.is_some()));
+    let rescued = store
+        .rescue_stale_heartbeats_with_dlq(db.pool(), Duration::ZERO, &|_| true)
+        .await
+        .expect("force diagnostic evidence");
+    assert_eq!(rescued.len(), 20);
+    let report = live_rescue_diagnostic(
+        db.pool(),
+        Duration::from_secs(18),
+        Duration::from_millis(2250),
+    )
+    .await;
+    assert_eq!(report["evidence"]["status"], "captured", "{report}");
+    let data = &report["evidence"]["data"];
+    assert_eq!(data["rescued"].as_array().unwrap().len(), 16);
+    assert_eq!(data["rescued"][0]["dlq_reason"], "heartbeat_stale");
+    assert_eq!(data["claims"].as_array().unwrap().len(), 16);
+    assert!(data["claim_slots"][0]["generation"].is_number());
+    for item in data["claims"].as_array().unwrap() {
+        assert!(claims.iter().any(
+            |claim| item["job_id"] == claim.job.id && item["run_lease"] == claim.job.run_lease
+        ));
+    }
+    assert_eq!(
+        rescued_rows(db.pool(), ABANDONED_QUEUE).await,
+        20,
+        "diagnostic is read-only"
+    );
+}
+
+#[tokio::test]
+async fn live_rescue_diagnostic_query_error_is_incomplete() {
+    let db = TestDatabase::queue_storage().await;
+    let mut gate = db.pool().begin().await.expect("begin diagnostic lock gate");
+    sqlx::query("LOCK TABLE awa.lease_claim_batches IN ACCESS EXCLUSIVE MODE")
+        .execute(gate.as_mut())
+        .await
+        .expect("hold the diagnostic claim relation");
+    let report = live_rescue_diagnostic(
+        db.pool(),
+        Duration::from_secs(18),
+        Duration::from_millis(2250),
+    )
+    .await;
+    gate.rollback().await.expect("release diagnostic lock gate");
+    assert_eq!(report["evidence"]["status"], "incomplete");
+    assert!(report["evidence"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("lock timeout"));
+}
+
+async fn wait_until<F, Fut>(timeout: Duration, what: &str, mut done: F) -> Duration
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let started = Instant::now();
+    loop {
+        if done().await {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn largest_heartbeat_rescue_pass(exporter: &InMemoryMetricExporter) -> u64 {
+    let mut largest = 0;
+    for resource in exporter.get_finished_metrics().expect("read metrics") {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "awa.maintenance.rescue.pass_size" {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Histogram(histogram)) = metric.data() {
+                    for point in histogram.data_points() {
+                        let heartbeat = point.attributes().any(|attribute| {
+                            attribute.key.as_str() == "awa.rescue.kind"
+                                && attribute.value.as_str() == "heartbeat"
+                        });
+                        if heartbeat {
+                            largest = largest.max(point.max().unwrap_or(0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    largest
+}
+
+/// A client on its own Tokio runtime, so it can be killed the way SIGKILL
+/// would: every task is dropped mid-flight, no shutdown runs, and its
+/// connections close with their transactions rolled back.
+struct DoomedClient {
+    kill: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DoomedClient {
+    fn start(url: String, staleness: Duration, heartbeat_interval: Duration) -> Self {
+        let (kill, killed) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("doomed client runtime");
+            let client = runtime.block_on(async {
+                let pool = PgPoolOptions::new()
+                    .max_connections(20)
+                    .connect(&url)
+                    .await
+                    .expect("doomed client pool");
+                let client = queue_storage_builder(&pool, staleness, heartbeat_interval)
+                    .queue(
+                        ABANDONED_QUEUE,
+                        QueueConfig {
+                            max_workers: ABANDONED as u32 + 1_000,
+                            poll_interval: Duration::from_millis(10),
+                            deadline_duration: Duration::ZERO,
+                            claimers: 4,
+                            claim_batch_size: 1_000,
+                            ..QueueConfig::default()
+                        },
+                    )
+                    .register::<AbandonedJob, _, _>(|_, _| async {
+                        std::future::pending::<Result<JobResult, awa::JobError>>().await
+                    })
+                    .build()
+                    .expect("doomed client");
+                client.start().await.expect("start doomed client");
+                client
+            });
+            started_tx.send(()).expect("report doomed client start");
+            runtime.block_on(async {
+                let _ = killed.await;
+            });
+            runtime.shutdown_background();
+            drop(client);
+        });
+        started_rx.recv().expect("doomed client started");
+        Self {
+            kill: Some(kill),
+            thread: Some(thread),
+        }
+    }
+
+    fn kill(mut self) {
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("doomed client thread");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let claim_slots = store.claim_slot_count() as i64;
+
+    // Once the doomed runtime has claimed its backlog, live jobs run for
+    // three staleness windows, so a rescue that ignored their heartbeats
+    // would take them. Until then they finish at once, so their claims do
+    // not hold up the claim ring while the doomed runtime fills it.
+    let staleness = scaled_staleness(Duration::from_secs(6));
+    let heartbeat_interval = staleness / 8;
+    let live_job_duration = staleness * 3;
+
+    let live_pool = PgPoolOptions::new()
+        .max_connections(30)
+        .connect(&db.url())
+        .await
+        .expect("live pool");
+    let live_runs: Arc<Mutex<RunsByJob<i16>>> = Arc::default();
+    // The live runtime leads maintenance, so it sees every rescue.
+    let rescues: Arc<Mutex<RunsByJob<(&'static str, i16)>>> = Arc::default();
+    let live = {
+        let live_runs = live_runs.clone();
+        let live_rescues = rescues.clone();
+        let abandoned_rescues = rescues.clone();
+        queue_storage_builder(&live_pool, staleness, heartbeat_interval)
+            // Under half the staleness, so the leader samples runtime
+            // snapshots often enough to confirm the dead owner.
+            .heartbeat_rescue_interval(Duration::from_secs(2))
+            .deadline_rescue_interval(Duration::from_secs(2))
+            .leader_election_interval(Duration::from_millis(100))
+            .queue(
+                LIVE_QUEUE,
+                QueueConfig {
+                    max_workers: 1_000,
+                    poll_interval: Duration::from_millis(25),
+                    deadline_duration: Duration::ZERO,
+                    ..QueueConfig::default()
+                },
+            )
+            .on_event::<LiveJob, _, _>(move |event| {
+                if let JobEvent::Rescued { job, .. } = event {
+                    live_rescues
+                        .lock()
+                        .expect("rescues")
+                        .entry(job.id)
+                        .or_default()
+                        .push((LIVE_QUEUE, job.attempt));
+                }
+                async {}
+            })
+            .on_event::<AbandonedJob, _, _>(move |event| {
+                if let JobEvent::Rescued { job, .. } = event {
+                    abandoned_rescues
+                        .lock()
+                        .expect("rescues")
+                        .entry(job.id)
+                        .or_default()
+                        .push((ABANDONED_QUEUE, job.attempt));
+                }
+                async {}
+            })
+            .register::<LiveJob, _, _>(move |job, ctx| {
+                live_runs
+                    .lock()
+                    .expect("live runs")
+                    .entry(ctx.job.id)
+                    .or_default()
+                    .push(ctx.job.attempt);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(job.hold_ms)).await;
+                    Ok(JobResult::Completed)
+                }
+            })
+            .build()
+            .expect("live client")
+    };
+    live.start().await.expect("start live client");
+    wait_until(
+        scaled_timeout(Duration::from_secs(10)),
+        "live leader",
+        || async { live.health_check().await.leader },
+    )
+    .await;
+
+    // The live runtime keeps claiming new work for the whole test.
+    let producing = Arc::new(AtomicBool::new(true));
+    let live_hold_ms = Arc::new(AtomicU64::new(0));
+    let producer = {
+        let pool = pool.clone();
+        let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+        let producing = producing.clone();
+        let live_hold_ms = live_hold_ms.clone();
+        tokio::spawn(async move {
+            let mut n = 0;
+            let mut produced = 0usize;
+            while producing.load(Ordering::SeqCst) {
+                let params: Vec<_> = (0..5)
+                    .map(|i| {
+                        awa::model::insert::params_with(
+                            &LiveJob {
+                                n: n + i,
+                                hold_ms: live_hold_ms.load(Ordering::SeqCst),
+                            },
+                            InsertOpts {
+                                queue: LIVE_QUEUE.into(),
+                                ..Default::default()
+                            },
+                        )
+                        .expect("live params")
+                    })
+                    .collect();
+                store
+                    .enqueue_params_batch(&pool, &params)
+                    .await
+                    .expect("enqueue live jobs");
+                n += 5;
+                produced += params.len();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            produced
+        })
+    };
+
+    // The doomed runtime claims the backlog in chunks, each after the claim
+    // ring has rotated, so the abandoned claims span several slots.
+    let generation_before = claim_ring_generation(&pool).await;
+    let doomed = DoomedClient::start(db.url(), staleness, heartbeat_interval);
+    let claim_started = Instant::now();
+    for chunk_start in (0..ABANDONED).step_by(ABANDONED_CHUNK as usize) {
+        let chunk_end = (chunk_start + ABANDONED_CHUNK).min(ABANDONED);
+        let params: Vec<_> = (chunk_start..chunk_end)
+            .map(|n| {
+                awa::model::insert::params_with(
+                    &AbandonedJob { n },
+                    InsertOpts {
+                        queue: ABANDONED_QUEUE.into(),
+                        max_attempts: if n % EXHAUSTED_EVERY == 0 { 1 } else { 3 },
+                        ..Default::default()
+                    },
+                )
+                .expect("abandoned params")
+            })
+            .collect();
+        let generation = claim_ring_generation(&pool).await;
+        for batch in params.chunks(5_000) {
+            store
+                .enqueue_params_batch(&pool, batch)
+                .await
+                .expect("enqueue abandoned jobs");
+        }
+        wait_until(
+            scaled_timeout(Duration::from_secs(60)),
+            "the doomed runtime to claim the chunk",
+            || async { running(&pool, &store, ABANDONED_QUEUE).await >= chunk_end },
+        )
+        .await;
+        // Give the ring a chance to move on before the next chunk; once it
+        // wraps onto a slot of abandoned claims it stays there.
+        let rotate_deadline = Instant::now() + scaled_timeout(Duration::from_secs(3));
+        while claim_ring_generation(&pool).await <= generation && Instant::now() < rotate_deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let claimed_in = claim_started.elapsed();
+    let rescued_while_alive = rescued_rows(&pool, ABANDONED_QUEUE).await;
+    if rescued_while_alive != 0 {
+        eprintln!(
+            "live-rescue diagnostic: {}",
+            live_rescue_diagnostic(&pool, staleness, heartbeat_interval).await
+        );
+    }
+    assert_eq!(
+        rescued_while_alive, 0,
+        "rescue took a claim while its runtime was alive and heartbeating"
+    );
+    let generation_at_kill = claim_ring_generation(&pool).await;
+    live_hold_ms.store(live_job_duration.as_millis() as u64, Ordering::SeqCst);
+    doomed.kill();
+    let slots = abandoned_claim_slots(&pool).await;
+    assert!(
+        slots >= 2,
+        "the abandoned claims should span several claim slots: {slots} \
+         (ring generation {generation_before} -> {generation_at_kill})"
+    );
+
+    // Before the drain: the claims become stale one staleness after the
+    // kill, and the owner evidence needs one more staleness window. After
+    // that the backlog must drain at the multi-batch rate, not 500 claims
+    // per heartbeat-rescue interval.
+    let drained_in = wait_until(
+        staleness * 2 + scaled_timeout(Duration::from_secs(90)),
+        "rescue to drain the abandoned claims",
+        || async { running(&pool, &store, ABANDONED_QUEUE).await == 0 },
+    )
+    .await;
+    let generation_drained = claim_ring_generation(&pool).await;
+    eprintln!(
+        "claimed {ABANDONED} in {claimed_in:?}; drained {drained_in:?} after the kill \
+         (claims stale after {staleness:?})"
+    );
+
+    wait_until(
+        scaled_timeout(Duration::from_secs(10)),
+        "a rescue event for every abandoned job",
+        || async { rescues.lock().expect("rescues").len() as i64 >= ABANDONED },
+    )
+    .await;
+    type Rescued = (&'static str, i16);
+    let rescued_twice = |rescues: &RunsByJob<Rescued>| -> Vec<(i64, Vec<Rescued>)> {
+        rescues
+            .iter()
+            .filter(|(_, rescued)| rescued.as_slice() != [(ABANDONED_QUEUE, 1)])
+            .take(5)
+            .map(|(id, rescued)| (*id, rescued.clone()))
+            .collect()
+    };
+    {
+        let rescues = rescues.lock().expect("rescues");
+        assert_eq!(rescues.len() as i64, ABANDONED);
+        let unexpected = rescued_twice(&rescues);
+        assert!(
+            unexpected.is_empty(),
+            "each abandoned job is rescued once and nothing else is: {unexpected:?}"
+        );
+    }
+
+    let exhausted = ABANDONED / EXHAUSTED_EVERY;
+    assert_eq!(
+        count(
+            &pool,
+            format!(
+                "SELECT count(*) FROM awa.dlq_entries
+                 WHERE queue = '{ABANDONED_QUEUE}' AND dlq_reason = 'heartbeat_stale' AND attempt = 1"
+            ),
+        )
+        .await,
+        exhausted,
+        "every one-attempt job is dead-lettered by its rescue"
+    );
+    let (retryable, promoted) = waiting_retry_counts(&pool, ABANDONED_QUEUE).await;
+    assert_eq!(
+        retryable + promoted,
+        ABANDONED - exhausted,
+        "every other abandoned job is waiting to retry"
+    );
+    meter_provider.force_flush().expect("flush metrics");
+    let largest_pass = largest_heartbeat_rescue_pass(&exporter);
+    assert!(
+        largest_pass > 500,
+        "a stale-heartbeat pass should take more than one 500-claim batch once the \
+         owner is confirmed gone; the largest took {largest_pass}"
+    );
+
+    // Live claims can hold a slot for a whole live job.
+    let rotated_in = wait_until(
+        live_job_duration * 2 + scaled_timeout(Duration::from_secs(30)),
+        "the claim ring to rotate through every slot after the drain",
+        || async { claim_ring_generation(&pool).await >= generation_drained + claim_slots },
+    )
+    .await;
+    eprintln!("claim ring rotated a full revolution {rotated_in:?} after the drain");
+
+    // A fresh runtime runs every retried job exactly once, on its second attempt.
+    let recovered: Arc<Mutex<RunsByJob<(i16, bool)>>> = Arc::default();
+    let recovery_pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&db.url())
+        .await
+        .expect("recovery pool");
+    let recovery = {
+        let recovered = recovered.clone();
+        queue_storage_builder(&recovery_pool, staleness, heartbeat_interval)
+            .queue(
+                ABANDONED_QUEUE,
+                // Small claims, so finished attempts never wait on a long
+                // completion backlog while the recovery runtime is under test.
+                QueueConfig {
+                    max_workers: 100,
+                    poll_interval: Duration::from_millis(10),
+                    deadline_duration: Duration::ZERO,
+                    claim_batch_size: 100,
+                    ..QueueConfig::default()
+                },
+            )
+            .register::<AbandonedJob, _, _>(move |_, ctx| {
+                let rescue_recorded = ctx
+                    .job
+                    .errors
+                    .as_ref()
+                    .and_then(|errors| errors.last())
+                    .and_then(|error| error.get("error"))
+                    .and_then(|error| error.as_str())
+                    .is_some_and(|error| error.contains("presumed dead"));
+                recovered
+                    .lock()
+                    .expect("recovered")
+                    .entry(ctx.job.id)
+                    .or_default()
+                    .push((ctx.job.attempt, rescue_recorded));
+                async { Ok(JobResult::Completed) }
+            })
+            .build()
+            .expect("recovery client")
+    };
+    recovery.start().await.expect("start recovery client");
+    wait_until(
+        scaled_timeout(Duration::from_secs(120)),
+        "the retried jobs to complete",
+        || async {
+            count(&pool, format!(
+                "SELECT count(*) FROM awa.terminal_jobs WHERE queue = '{ABANDONED_QUEUE}' AND state = 'completed'"
+            )).await == ABANDONED - exhausted
+        },
+    )
+    .await;
+    recovery.shutdown(Duration::from_secs(10)).await;
+    {
+        let recovered = recovered.lock().expect("recovered");
+        assert_eq!(recovered.len() as i64, ABANDONED - exhausted);
+        let unexpected: Vec<_> = recovered
+            .iter()
+            .filter(|(_, runs)| runs.as_slice() != [(2, true)])
+            .take(5)
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "each retried job runs once, on attempt 2, with the rescue recorded: {unexpected:?}"
+        );
+    }
+
+    producing.store(false, Ordering::SeqCst);
+    let produced = producer.await.expect("producer");
+    wait_until(
+        live_job_duration + scaled_timeout(Duration::from_secs(30)),
+        "the live jobs to finish",
+        || async {
+            running(&pool, &store, LIVE_QUEUE).await == 0
+                && store
+                    .queue_counts(&pool, LIVE_QUEUE)
+                    .await
+                    .expect("live counts")
+                    .available
+                    == 0
+        },
+    )
+    .await;
+    live.shutdown(Duration::from_secs(10)).await;
+
+    assert_eq!(
+        rescued_rows(&pool, LIVE_QUEUE).await,
+        0,
+        "rescue took a claim from the live runtime"
+    );
+    {
+        let rescues = rescues.lock().expect("rescues");
+        let unexpected = rescued_twice(&rescues);
+        assert!(
+            rescues.len() as i64 == ABANDONED && unexpected.is_empty(),
+            "no claim of a live runtime was rescued: {} rescued jobs, e.g. {unexpected:?}",
+            rescues.len()
+        );
+    }
+    let live_runs = live_runs.lock().expect("live runs");
+    assert_eq!(live_runs.len(), produced, "every live job ran");
+    let rerun: Vec<_> = live_runs
+        .iter()
+        .filter(|(_, attempts)| attempts.as_slice() != [1])
+        .take(5)
+        .collect();
+    assert!(
+        rerun.is_empty(),
+        "a live job ran more than once or on a later attempt: {rerun:?}"
+    );
+    eprintln!(
+        "live runtime ran {} jobs of {live_job_duration:?} each with no rescue",
+        live_runs.len()
+    );
+}

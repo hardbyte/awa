@@ -156,6 +156,8 @@ pub struct ClientBuilder {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Vec<PeriodicJob>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     global_max_workers: Option<u32>,
@@ -219,6 +221,8 @@ impl ClientBuilder {
             heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
+            rescue_pass_budget: None,
+            rescue_pass_max_rows: None,
             periodic_jobs: Vec::new(),
             periodic_reconciliation: None,
             global_max_workers: None,
@@ -815,6 +819,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches of
+    /// 500 attempts, each in its own transaction (default: 1s, capped at half
+    /// the rescue interval). While a backlog remains the next pass runs
+    /// a second later. `Duration::ZERO` keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = Some(budget);
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). With a pass a second while a backlog remains,
+    /// this bounds the number rescued per second per kind, allowing one
+    /// final batch beyond the cap. Zero disables follow-up batches and early
+    /// re-arms. Retried attempts retain their normal backoff; their due times
+    /// can cluster, so this does not cap the promotion rate.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = Some(max_rows);
+        self
+    }
+
     /// Set the leader election retry interval (default: 10s).
     ///
     /// Controls how often a non-leader instance retries acquiring the maintenance
@@ -1235,6 +1259,8 @@ impl ClientBuilder {
             heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
+            rescue_pass_budget: self.rescue_pass_budget,
+            rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
             periodic_reconciliation: self.periodic_reconciliation,
             periodic_manifest,
@@ -1335,6 +1361,8 @@ pub struct Client {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     periodic_manifest: Option<Arc<awa_model::cron_reconciliation::PeriodicManifest>>,
@@ -1919,6 +1947,12 @@ impl Client {
         }
         if let Some(interval) = self.callback_rescue_interval {
             maintenance = maintenance.callback_rescue_interval(interval);
+        }
+        if let Some(budget) = self.rescue_pass_budget {
+            maintenance = maintenance.rescue_pass_budget(budget);
+        }
+        if let Some(max_rows) = self.rescue_pass_max_rows {
+            maintenance = maintenance.rescue_pass_max_rows(max_rows);
         }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);

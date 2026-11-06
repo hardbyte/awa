@@ -6,6 +6,29 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Ordinary rescue ticks retain their cadence under scheduler jitter, while
+  backlog re-arms keep the heartbeat owner-evidence gate.
+
+- Keep confirmed-owner bulk heartbeat rescue's first cursor window small so
+  short passes can reach follow-up batches. Unconfirmed owners and
+  configurations that disable acceleration retain the wider initial scan.
+
+- Queue-storage rescue drains large abandoned-claim backlogs in bounded
+  transactions, controlled by `rescue_pass_budget` and a soft
+  `rescue_pass_max_rows` cap. Cursor sweeps continue past closed or freshly
+  heartbeated history and stop after a full traversal. Accelerated heartbeat
+  rescue requires settled runtime evidence; ordinary first batches keep their
+  configured cadence. Retries retain their backoffs, and due times can cluster:
+  the row cap bounds rescue writes, not promotion throughput. Zero for either
+  pass control keeps one batch per ordinary interval. See the
+  [backlog-drain configuration](docs/configuration.md#rescue-backlog).
+
+- Finished attempts keep heartbeating until their durable finalization finishes,
+  including while completion writes are stalled. Compact receipt heartbeats
+  address claims by batch identity and skip attempts a closer already holds,
+  so one stalled completion cannot block the rest of a heartbeat pass. Late
+  heartbeats cannot recreate state for a completed attempt.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane

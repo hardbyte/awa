@@ -921,6 +921,8 @@ class AsyncClient:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        rescue_pass_budget_ms: int | None = None,
+        rescue_pass_max_rows: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
@@ -967,6 +969,11 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``rescue_pass_budget_ms`` (default 1000) and ``rescue_pass_max_rows``
+        (default 5000) bound how long one queue-storage rescue pass keeps
+        taking 500-attempt batches and how many attempts it rescues; see the
+        configuration guide's "Draining a backlog of abandoned claims".
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -987,6 +994,8 @@ class AsyncClient:
             heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
+            rescue_pass_budget_ms=rescue_pass_budget_ms,
+            rescue_pass_max_rows=rescue_pass_max_rows,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
