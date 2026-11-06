@@ -473,6 +473,26 @@ If you suspend a handler with `wait_for_callback()` and the external system neve
 | --- | --- | --- |
 | `ClientBuilder::callback_rescue_interval` | `30s` | How often the maintenance leader scans for `callback_timeout_at < now()`. The per-callback timeout itself is set when registering the callback in the handler. |
 
+### Draining a backlog of abandoned claims { #rescue-backlog }
+
+A runtime that is killed (OOM, `SIGKILL`, a lost node) leaves every attempt it had claimed open. On queue storage those open claims also stop the claim ring from rotating back into their slot, so a large backlog has to be rescued quickly, not 500 attempts per rescue interval.
+
+Each stale-heartbeat, deadline or callback-timeout rescue therefore runs as a pass of batches. A batch rescues up to 500 attempts per source (lease rows and receipt claims) in its own short transaction. The pass keeps starting batches while the previous one came back full, until its time budget is spent or it has rescued `rescue_pass_max_rows`. While a backlog remains, the next pass of that kind runs one second later instead of after its interval, so a drain proceeds at up to about `rescue_pass_max_rows` attempts per second per rescue kind.
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `ClientBuilder::rescue_pass_budget` (Rust) / `rescue_pass_budget_ms` (Python kwarg) | `1s` | How long one pass keeps starting batches. Capped at half the rescue interval. `Duration::ZERO` / `0` keeps every pass to one batch. |
+| `ClientBuilder::rescue_pass_max_rows` (Rust) / `rescue_pass_max_rows` (Python kwarg) | `5000` | How many attempts one pass rescues before it stops. Bounds the write burst (closures, retry rows, WAL, replica and CDC traffic) per pass and so per second. |
+
+How a pass chooses and paces its work:
+
+- **Oldest claims first.** Batches visit claim slots from the oldest to the current one, because the ring cannot rotate back into the oldest slot until its claims are closed. Every fourth batch visits the other slots first, so a long drain of one slot does not starve the rest. A slot a batch found nothing in is skipped for the rest of the pass.
+- **Stale heartbeats need evidence that the owner is gone.** A stale heartbeat cannot tell a dead runtime from a stalled one (a database stall, a long GC pause, a network partition). A stale-heartbeat pass takes more than one batch only when the runtime snapshots in `awa.runtime_instances` show every runtime either fresh with its heartbeat loop alive, or silent for at least `heartbeat_staleness`, and that has held at every pass for a whole `heartbeat_staleness` window. A live runtime coming out of a stall has had that window to refresh its heartbeats, so its claims are not stale by the time a drain can reach them. The extra batches also take only claims last heartbeated before the most recent of those gone runtimes stopped reporting, so a live runtime whose heartbeat pass merely lags behind `heartbeat_staleness` (one holding many claims under load, say) is not drained in bulk; its claims stay at one batch per pass, as before. The leader samples the snapshots once per pass, so this evidence needs `heartbeat_rescue_interval` below half of `heartbeat_staleness` (the defaults, `30s` and `90s`, qualify); otherwise stale-heartbeat rescue stays at one batch per pass. The per-attempt staleness rule itself is unchanged. Deadline and callback-timeout rescues act on a deadline that has passed, so they drain without this evidence.
+- **Retries are spread out.** A rescued attempt that goes back to `retryable` keeps its backoff, and rescued retries across all kinds become due no faster than `rescue_pass_max_rows` per second, so promotion moves a large drain into the ready lanes over time instead of all at once.
+- **Exhausted attempts are dead-lettered in the same batches.** On a DLQ-enabled queue an attempt rescued on its last try goes to the DLQ in its batch's transaction (reason `heartbeat_stale`, `deadline_exceeded` or `callback_timeout`), so a drain can move many jobs to the DLQ at once. `awa.job.dlq_moved` counts them by reason.
+
+A pass holds the maintenance leader's loop for up to its budget plus one batch, so promotion and the other maintenance branches can wait about that long while a backlog drains. Watch a drain with `awa.maintenance.rescue.pass_size` (attempts per pass, by `awa.rescue.kind` and `awa.rescue.pass_end`: `drained`, `time_budget`, `row_limit`, `owners_unconfirmed` or `error`) and `awa.maintenance.rescue.oldest_attempt_age` (the age of the oldest attempt the latest pass rescued, `0` when it rescued nothing). An `oldest_attempt_age` far above `heartbeat_staleness` or the queue's deadline means rescue is behind.
+
 ### Retention and cleanup
 
 Retention depends on the storage path.

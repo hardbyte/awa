@@ -142,6 +142,8 @@ pub struct ClientBuilder {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
@@ -200,6 +202,8 @@ impl ClientBuilder {
             heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
+            rescue_pass_budget: None,
+            rescue_pass_max_rows: None,
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
@@ -758,6 +762,24 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches of
+    /// 500 attempts, each in its own transaction (default: 1s, capped at half
+    /// the rescue interval). While a backlog remains the next pass runs
+    /// a second later. `Duration::ZERO` keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = Some(budget);
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). With a pass a second while a backlog remains,
+    /// this caps a drain at about this many attempts per second per rescue
+    /// kind, and rescued retries become due no faster than this per second.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = Some(max_rows);
+        self
+    }
+
     /// Set the leader election retry interval (default: 10s).
     ///
     /// Controls how often a non-leader instance retries acquiring the maintenance
@@ -1079,6 +1101,8 @@ impl ClientBuilder {
             heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
+            rescue_pass_budget: self.rescue_pass_budget,
+            rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
@@ -1174,6 +1198,8 @@ pub struct Client {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
@@ -1637,6 +1663,12 @@ impl Client {
         }
         if let Some(interval) = self.callback_rescue_interval {
             maintenance = maintenance.callback_rescue_interval(interval);
+        }
+        if let Some(budget) = self.rescue_pass_budget {
+            maintenance = maintenance.rescue_pass_budget(budget);
+        }
+        if let Some(max_rows) = self.rescue_pass_max_rows {
+            maintenance = maintenance.rescue_pass_max_rows(max_rows);
         }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
