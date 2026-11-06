@@ -749,6 +749,9 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
                   SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
+                  -- Keep the range lookup correlated: joining on claim_slot can
+                  -- multiply receipt members by retained closure batches.
+                  OFFSET 0
               )
           AND NOT EXISTS (
                   SELECT 1 FROM {schema}.leases AS lease
