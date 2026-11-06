@@ -11861,10 +11861,16 @@ impl QueueStorage {
         // A job moves between these relations as it is promoted, claimed,
         // completed or dead-lettered. Read them all from one snapshot so a
         // move between two reads cannot hide the job or surface a stale row.
-        let mut tx = pool
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
             .await
             .map_err(map_sqlx_error)?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        begin_guard.begin_pending = false;
 
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(&format!(
             r#"
@@ -12236,6 +12242,7 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
+        drop(begin_guard);
         Ok(candidates.into_iter().max_by_key(|job| {
             (
                 job.run_lease,
