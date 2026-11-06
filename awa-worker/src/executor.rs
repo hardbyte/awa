@@ -365,6 +365,14 @@ impl JobExecutor {
             let in_flight_state = InFlightState {
                 cancel: cancel.clone(),
                 progress: progress_state.clone(),
+                claim: queue_storage_claim.as_ref().and_then(|claim| {
+                    awa_model::queue_storage::ClaimHeartbeatRef::from_claim(
+                        job_id,
+                        job_run_lease,
+                        claim,
+                    )
+                }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             if let Some(counter) = queue_in_flight.get(&job_queue) {
@@ -443,12 +451,17 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
-            // Leaving `in_flight` ends the attempt's heartbeat, so only a
-            // bounded number of finished attempts may wait for finalization.
-            // While that queue is full the attempt keeps its worker slot and
-            // its heartbeat, and the dispatcher stops claiming: a completion
-            // backlog cannot outgrow `heartbeat_staleness` and get finished
-            // attempts rescued and run again.
+            // The attempt stays in `in_flight`, and so keeps its heartbeat,
+            // until its finalize is over: a finalize that waits behind a
+            // completion backlog must not look like a dead worker to rescue.
+            // Only a bounded number of finished attempts may wait for
+            // finalization; while that queue is full the attempt also keeps
+            // its worker slot, so the dispatcher stops claiming.
+            in_flight.mark_finalizing((job_id, job_run_lease));
+            let heartbeat = HeartbeatUntilFinalized {
+                in_flight: in_flight.clone(),
+                key: (job_id, job_run_lease),
+            };
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
                     permit = finalize_capacity.acquire_owned() => {
@@ -458,7 +471,6 @@ impl JobExecutor {
                 },
                 None => None,
             };
-            in_flight.remove((job_id, job_run_lease));
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
@@ -511,6 +523,7 @@ impl JobExecutor {
                         outcome => break outcome,
                     }
                 };
+                drop(heartbeat);
                 drop(finalize_permit);
 
                 match &outcome {
@@ -591,6 +604,19 @@ impl JobExecutor {
             });
         }
         .instrument(span)
+    }
+}
+
+/// Keeps a finished attempt in the heartbeat set until its finalize is over,
+/// and takes it out however the finalizer ends.
+struct HeartbeatUntilFinalized {
+    in_flight: InFlightMap,
+    key: (i64, i64),
+}
+
+impl Drop for HeartbeatUntilFinalized {
+    fn drop(&mut self) {
+        self.in_flight.remove(self.key);
     }
 }
 
