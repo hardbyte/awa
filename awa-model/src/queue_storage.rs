@@ -2506,15 +2506,21 @@ impl QueueStorage {
     /// Set the PostgreSQL `lock_timeout` applied to the exclusive-lock steps of
     /// ring prune (queue, lease and claim rings) and terminal-delta rollup.
     ///
-    /// A prune that cannot take its locks within the timeout rolls back and
-    /// reports [`PruneOutcome::Blocked`]; the maintenance loop retries on its
-    /// next tick. The default is 10 ms, which keeps prune from queueing behind
-    /// readers and so from stalling claims and enqueues behind its pending
+    /// Each lock acquisition gets its own timeout; this does not bound the
+    /// whole prune. Queue prune locks up to eight partitions, so its
+    /// partition-lock
+    /// waits alone can approach eight times this value. A lock timeout rolls
+    /// back
+    /// the prune and reports [`PruneOutcome::Blocked`]; the maintenance loop
+    /// retries on a later tick. The default is 10 ms, which keeps prune from
+    /// queueing behind readers and so from stalling claims and enqueues behind
+    /// its pending
     /// `ACCESS EXCLUSIVE` request. Raise it when prune is persistently
     /// `Blocked` by short-lived readers of the ring partitions. Keep it well
     /// below `deadlock_timeout` (default 1 s) and any `statement_timeout`: a
     /// prune that waits as long as `deadlock_timeout` triggers deadlock
-    /// detection, which may cancel a concurrent claim instead of the prune. The
+    /// detection, which may cancel a concurrent claim instead of the prune.
+    /// The
     /// timeout is applied at millisecond granularity.
     ///
     /// Returns a validation error for a zero timeout or one above PostgreSQL's
