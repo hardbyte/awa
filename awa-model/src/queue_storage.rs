@@ -11866,11 +11866,13 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-        // Protect running evidence from non-MVCC-safe TRUNCATE before
-        // the first data query establishes this repeatable-read snapshot.
-        // Claim-family order agrees with claim prune.
+        // Protect all rings prune can truncate before the first data query
+        // establishes this repeatable-read snapshot: the query can take its
+        // snapshot before acquiring its relation locks. Queue prune takes the
+        // ready child NOWAIT before terminal children, so ready also fences
+        // those. Claim-family order agrees with claim prune.
         sqlx::query(&format!(
-            "LOCK TABLE {schema}.leases, {schema}.lease_claims, \
+            "LOCK TABLE {schema}.ready_entries, {schema}.leases, {schema}.lease_claims, \
              {schema}.lease_claim_batches, {schema}.lease_claim_closures, \
              {schema}.lease_claim_closure_batches IN ACCESS SHARE MODE"
         ))
