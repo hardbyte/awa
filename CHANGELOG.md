@@ -30,6 +30,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Admin job lists and kind counts include running receipt claims before
+  they materialize into leases, including compact and legacy row-local claims.
+- Exclude tombstoned source rows when hydrating moved running jobs, including compact receipts, and preserve point-read snapshots against concurrent claim/lease partition pruning.
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but

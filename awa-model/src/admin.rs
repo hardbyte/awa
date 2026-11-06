@@ -381,6 +381,156 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
              AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
+            UNION ALL
+            -- Receipt claims that have not materialised into `leases` are
+            -- running too (#246 / #416). They live on legacy row-local
+            -- `lease_claims` or, by default, compact `lease_claim_batches`.
+            -- Report both as `running`, anti-joined against every durable
+            -- closure/terminal/materialised-lease shape. This mirrors
+            -- QueueStorage::load_job (the batch-aware single-job admin read)
+            -- and the canonical open-receipt shape in
+            -- queue_storage::open_receipt_running_claims_sql; it is spelled
+            -- out here because this view projects the full job row
+            -- (kind/created_at/run_at from `ready_entries`), not just claim
+            -- identity.
+            SELECT
+                claims.job_id,
+                ready.kind,
+                claims.queue,
+                'running'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.lease_claims AS claims
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = claims.ready_slot
+             AND ready.ready_generation = claims.ready_generation
+             AND ready.queue = claims.queue
+             -- Claims keep the aged effective priority; match the ready attempt.
+             AND ready.job_id = claims.job_id
+             AND ready.run_lease + 1 = claims.run_lease
+             AND ready.enqueue_shard = claims.enqueue_shard
+             AND ready.lane_seq = claims.lane_seq
+             -- Moving a ready row tombstones the old one and re-inserts the same
+             -- attempt, which can reuse the old lane_seq on the new lane.
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
+            WHERE claims.closed_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS cx
+                  WHERE cx.claim_slot = claims.claim_slot
+                    AND cx.job_id = claims.job_id
+                    AND cx.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb
+                  WHERE cb.receipt_ranges @> claims.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = claims.job_id
+                    AND lease.run_lease = claims.run_lease
+              )
+              -- Terminal supersession counts as closed evidence even
+              -- without an explicit closure row (mirrors the compact
+              -- branch below and open_receipt_running_claims_sql);
+              -- without these a legacy row-local claim would be listed
+              -- as running AND terminal at once.
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = claims.job_id
+                    AND done.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = claims.job_id
+                    AND deferred.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = claims.job_id
+                    AND dlq.run_lease = claims.run_lease
+              )
+            UNION ALL
+            SELECT
+                items.job_id,
+                ready.kind,
+                batches.queue,
+                'running'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.lease_claim_batches AS batches
+            CROSS JOIN LATERAL unnest(
+                batches.job_ids,
+                batches.run_leases,
+                batches.receipt_ids,
+                batches.lane_seqs
+            ) AS items(job_id, run_lease, receipt_id, lane_seq)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = batches.ready_slot
+             AND ready.ready_generation = batches.ready_generation
+             AND ready.queue = batches.queue
+             AND ready.enqueue_shard = batches.enqueue_shard
+             AND ready.lane_seq = items.lane_seq
+             AND ready.job_id = items.job_id
+             AND ready.run_lease + 1 = items.run_lease
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
+            WHERE NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS cx
+                  WHERE cx.claim_slot = batches.claim_slot
+                    AND cx.job_id = items.job_id
+                    AND cx.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb
+                  WHERE cb.claim_slot = batches.claim_slot
+                    AND cb.receipt_ranges @> items.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
             UNION ALL
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
             FROM {schema}.terminal_jobs
@@ -734,6 +884,15 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
              AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             WHERE ready.created_at >= {since}
             UNION ALL
             -- A queue or priority move copies the row with its times, so
@@ -820,6 +979,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
 /// probes the ready primary key.
 fn queue_storage_kind_counts_cte(schema: &str) -> String {
     let available = queue_storage_available_lane_rows_sql(schema, "heads", "ready.kind", "TRUE");
+    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     format!(
         r#"
         heads AS MATERIALIZED (
@@ -856,12 +1016,45 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
              AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             GROUP BY ready.kind, leases.queue
         ),
         deferred_by_kind AS MATERIALIZED (
             SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
             FROM {schema}.deferred_jobs
             GROUP BY kind, queue
+        ),
+        -- Count each open claim once using its live ready row. Materialized
+        -- leases and closed claims are excluded by open_running.
+        running_by_kind AS MATERIALIZED (
+            SELECT created.kind, open_claims.queue, count(*)::bigint AS n, 0::bigint AS n_recent
+            FROM ({open_running}) AS open_claims
+            CROSS JOIN LATERAL (
+                SELECT ready.kind
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                  AND ready.run_lease + 1 = open_claims.run_lease
+                  AND ready.queue = open_claims.queue
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
+                LIMIT 1
+            ) AS created
+            GROUP BY created.kind, open_claims.queue
         ),
         done_by_kind AS MATERIALIZED (
             SELECT
@@ -916,6 +1109,7 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
             FROM (
                 SELECT * FROM available_by_kind
                 UNION ALL SELECT * FROM leased_by_kind
+                UNION ALL SELECT * FROM running_by_kind
                 UNION ALL SELECT * FROM deferred_by_kind
                 UNION ALL SELECT * FROM done_by_kind
                 UNION ALL SELECT * FROM receipts_by_kind
@@ -1090,8 +1284,52 @@ fn queue_storage_job_id_candidates_sql(
                  AND ready.run_lease + 1 = leases.run_lease
                  AND ready.enqueue_shard = leases.enqueue_shard
                  AND ready.lane_seq = leases.lane_seq
+                 AND NOT EXISTS (
+                     SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                     WHERE tomb.ready_slot = ready.ready_slot
+                       AND tomb.ready_generation = ready.ready_generation
+                       AND tomb.queue = ready.queue
+                       AND tomb.priority = ready.priority
+                       AND tomb.enqueue_shard = ready.enqueue_shard
+                       AND tomb.lane_seq = ready.lane_seq
+                 )
                 WHERE TRUE{predicates}
                 ORDER BY leases.job_id DESC
+                LIMIT {limit}
+            )"#
+        ));
+    }
+    if holds(&[JobState::Running]) {
+        let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
+        let predicates = predicates(
+            None,
+            Some("created.kind"),
+            "open_claims.queue",
+            "open_claims.job_id",
+        );
+        legs.push(format!(
+            r#"(
+                SELECT open_claims.job_id
+                FROM ({open_running}) AS open_claims
+                CROSS JOIN LATERAL (
+                    SELECT ready.kind
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.job_id = open_claims.job_id
+                      AND ready.run_lease + 1 = open_claims.run_lease
+                      AND ready.queue = open_claims.queue
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                          WHERE tomb.ready_slot = ready.ready_slot
+                            AND tomb.ready_generation = ready.ready_generation
+                            AND tomb.queue = ready.queue
+                            AND tomb.priority = ready.priority
+                            AND tomb.enqueue_shard = ready.enqueue_shard
+                            AND tomb.lane_seq = ready.lane_seq
+                      )
+                    LIMIT 1
+                ) AS created
+                WHERE TRUE{predicates}
+                ORDER BY open_claims.job_id DESC
                 LIMIT {limit}
             )"#
         ));
@@ -1552,6 +1790,15 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
                   AND ready.run_lease + 1 = leases.run_lease
                   AND ready.enqueue_shard = leases.enqueue_shard
                   AND ready.lane_seq = leases.lane_seq
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
                   AND ready.unique_key = $1
                 OFFSET 0
             ) AS ready ON TRUE
