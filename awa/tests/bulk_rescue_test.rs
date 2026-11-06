@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const ABANDONED: i64 = 50_000;
+const ABANDONED_CHUNK: i64 = 10_000;
 /// Every tenth abandoned job has one attempt, so its rescue exhausts it.
 const EXHAUSTED_EVERY: i64 = 10;
 const ABANDONED_QUEUE: &str = "bulk_rescue_abandoned";
@@ -84,6 +85,20 @@ async fn claim_ring_generation(pool: &PgPool) -> i64 {
     count(
         pool,
         "SELECT generation FROM awa.claim_ring_rotations ORDER BY generation DESC LIMIT 1".into(),
+    )
+    .await
+}
+
+async fn abandoned_claim_slots(pool: &PgPool) -> i64 {
+    count(
+        pool,
+        format!(
+            "SELECT count(DISTINCT claim_slot) FROM (
+                 SELECT claim_slot FROM awa.lease_claim_batches WHERE queue = '{ABANDONED_QUEUE}'
+                 UNION ALL
+                 SELECT claim_slot FROM awa.lease_claims WHERE queue = '{ABANDONED_QUEUE}'
+             ) AS claims"
+        ),
     )
     .await
 }
@@ -347,8 +362,14 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         })
     };
 
-    for chunk_start in (0..ABANDONED).step_by(5_000) {
-        let params: Vec<_> = (chunk_start..(chunk_start + 5_000).min(ABANDONED))
+    // The doomed runtime claims the backlog in chunks, each after the claim
+    // ring has rotated, so the abandoned claims span several slots.
+    let generation_before = claim_ring_generation(&pool).await;
+    let doomed = DoomedClient::start(db.url(), staleness, heartbeat_interval);
+    let claim_started = Instant::now();
+    for chunk_start in (0..ABANDONED).step_by(ABANDONED_CHUNK as usize) {
+        let chunk_end = (chunk_start + ABANDONED_CHUNK).min(ABANDONED);
+        let params: Vec<_> = (chunk_start..chunk_end)
             .map(|n| {
                 awa::model::insert::params_with(
                     &AbandonedJob { n },
@@ -361,20 +382,27 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
                 .expect("abandoned params")
             })
             .collect();
-        store
-            .enqueue_params_batch(&pool, &params)
-            .await
-            .expect("enqueue abandoned jobs");
+        let generation = claim_ring_generation(&pool).await;
+        for batch in params.chunks(5_000) {
+            store
+                .enqueue_params_batch(&pool, batch)
+                .await
+                .expect("enqueue abandoned jobs");
+        }
+        wait_until(
+            scaled_timeout(Duration::from_secs(60)),
+            "the doomed runtime to claim the chunk",
+            || async { running(&pool, &store, ABANDONED_QUEUE).await >= chunk_end },
+        )
+        .await;
+        // Give the ring a chance to move on before the next chunk; once it
+        // wraps onto a slot of abandoned claims it stays there.
+        let rotate_deadline = Instant::now() + scaled_timeout(Duration::from_secs(3));
+        while claim_ring_generation(&pool).await <= generation && Instant::now() < rotate_deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
-
-    let generation_before = claim_ring_generation(&pool).await;
-    let doomed = DoomedClient::start(db.url(), staleness, heartbeat_interval);
-    let claimed_in = wait_until(
-        scaled_timeout(Duration::from_secs(120)),
-        "the doomed runtime to claim every abandoned job",
-        || async { running(&pool, &store, ABANDONED_QUEUE).await >= ABANDONED },
-    )
-    .await;
+    let claimed_in = claim_started.elapsed();
     assert_eq!(
         rescued_rows(&pool, ABANDONED_QUEUE).await,
         0,
@@ -383,9 +411,10 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     let generation_at_kill = claim_ring_generation(&pool).await;
     live_hold_ms.store(live_job_duration.as_millis() as u64, Ordering::SeqCst);
     doomed.kill();
+    let slots = abandoned_claim_slots(&pool).await;
     assert!(
-        generation_at_kill - generation_before >= 2,
-        "the abandoned claims should span several claim slots \
+        slots >= 2,
+        "the abandoned claims should span several claim slots: {slots} \
          (ring generation {generation_before} -> {generation_at_kill})"
     );
 
