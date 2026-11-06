@@ -11973,7 +11973,8 @@ async fn test_queue_storage_prune_lock_timeout_after_child_locks_reports_blocked
 
 /// Terminal-delta rollup shares prune's lock timeout. A timeout on the
 /// live-counter fold, after the delta child is locked, must report a blocked
-/// slot rather than fail the whole rollup pass.
+/// slot rather than fail the rollup pass, and the pass stops there instead of
+/// waiting out the same timeout on every remaining slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_reports_blocked() {
     let (_db_guard, pool) = setup_pool(10).await;
@@ -11981,18 +11982,20 @@ async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_re
     let schema = "awa_qs_terminal_delta_rollup_late_lock";
     let store = create_store(&pool, schema).await;
 
-    store
-        .enqueue_batch(&pool, queue, 1, 3)
-        .await
-        .expect("enqueue");
-    let claimed = store.claim_batch(&pool, queue, 3).await.expect("claim");
-    store
-        .complete_batch(&pool, &claimed)
-        .await
-        .expect("complete");
-    match store.rotate(&pool).await.expect("rotate") {
-        RotateOutcome::Rotated { .. } => {}
-        other => panic!("expected Rotated, got {other:?}"),
+    for _ in 0..2 {
+        store
+            .enqueue_batch(&pool, queue, 1, 3)
+            .await
+            .expect("enqueue");
+        let claimed = store.claim_batch(&pool, queue, 3).await.expect("claim");
+        store
+            .complete_batch(&pool, &claimed)
+            .await
+            .expect("complete");
+        match store.rotate(&pool).await.expect("rotate") {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("expected Rotated, got {other:?}"),
+        }
     }
 
     let mut holder = pool.begin().await.expect("begin lock holder");
@@ -12007,17 +12010,20 @@ async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_re
     holder.rollback().await.expect("release share lock");
     let outcome = outcome.expect("rollup waiting on live counts should not error");
     assert_eq!(outcome.rolled_slots, 0);
-    assert_eq!(outcome.blocked_slots, 1);
+    assert_eq!(
+        outcome.blocked_slots, 1,
+        "the pass stops at the first blocked slot"
+    );
     assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
-    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 3);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
 
     let outcome = store
         .rollup_terminal_count_deltas(&pool, 4)
         .await
         .expect("rollup after lock released");
-    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.rolled_slots, 2);
     assert_eq!(outcome.blocked_slots, 0);
-    assert_eq!(live_count_sum(&pool, schema, queue).await, 3);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
 }
 

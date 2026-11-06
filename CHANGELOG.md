@@ -22,7 +22,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   lease or claim prune, or in a terminal-count rollup slot, now rolls the
   whole transaction back and reports `Blocked` (`blocked_slots` for rollup),
   so maintenance backs off and retries; nothing the attempt wrote survives
-  the rollback.
+  the rollback. A rollup pass stops at its first blocked slot rather than
+  waiting out the timeout again on each remaining one.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are
