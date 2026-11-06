@@ -629,10 +629,10 @@ fn receipt_closed_evidence_sql(
     closure_batch_rel: &str,
     claims_alias: &str,
 ) -> String {
-    // `receipt_id` is allocated from a global sequence, so it identifies a
-    // claim without a `claim_slot` predicate. Compact closure batches retain
-    // the raw receipt array for audit/debugging, but hot membership checks use
-    // the per-child GiST index on the derived multirange.
+    // `receipt_id` is allocated from a global sequence and identifies a claim.
+    // Closures retain that claim's slot; match it to prune unrelated partitions.
+    // Compact closure batches retain the raw receipt array for audit/debugging,
+    // but hot membership checks use the per-child GiST index on the multirange.
     format!(
         r#"
         (
@@ -646,7 +646,8 @@ fn receipt_closed_evidence_sql(
             OR EXISTS (
                 SELECT 1
                 FROM {closure_batch_rel} AS closure_batches
-                WHERE closure_batches.receipt_ranges @> {claims_alias}.receipt_id
+                WHERE closure_batches.claim_slot = {claims_alias}.claim_slot
+                  AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id
             )
             OR EXISTS (
                 SELECT 1 FROM {schema}.done_entries AS done

@@ -34,6 +34,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
 - Reduce running-count query work for partially closed compact receipt batches
   by keeping closure membership lookups correlated.
+- Reduce running-count query work by keeping compact closure membership
+  correlated and limiting row-local closure lookups to their claim partition.
 
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
