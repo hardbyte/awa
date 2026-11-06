@@ -36,6 +36,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   by keeping closure membership lookups correlated.
 - Reduce running-count query work by keeping compact closure membership
   correlated and limiting row-local closure lookups to their claim partition.
+- Hydrate completed job-kind counts through each member's full ready-row key,
+  avoiding repeated scans of other retained rows in the same enqueue lane.
 
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
