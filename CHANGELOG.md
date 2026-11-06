@@ -16,7 +16,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `ClientBuilder::prune_lock_timeout` (Rust) or
   `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
   timeout applies separately to each lock acquisition, not to the whole prune;
-  queue prune waits only on `ready_segments` and uses `NOWAIT` elsewhere. The
+  queue prune takes its other initial partition locks with `NOWAIT`. Later
+  statements also run under the timeout. The
   default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
   maximum is rejected. Start logs a warning when the value is at or above the
   connection's `deadlock_timeout` (prune waiting that long can make deadlock
@@ -30,6 +31,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Prune and terminal-count rollup roll back and report `Blocked` when a
+  later statement times out on a lock.** The timeout also covers failed-row
+  carry, terminal-count updates and post-lock liveness checks. Those waits
+  previously escaped as `55P03` errors after the initial partition locks had
+  succeeded. The whole attempt now rolls back before maintenance retries;
+  rollup stops at its first blocked slot.
 - **Point reads show the live queue and priority after a lane move.** Retained
   ready rows from before a priority or queue change could win a read's tie
   after the ring wrapped, returning the old fields even though the batch

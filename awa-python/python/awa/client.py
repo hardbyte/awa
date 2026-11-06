@@ -971,9 +971,10 @@ class AsyncClient:
         ``queue_storage_prune_lock_timeout_ms`` sets the PostgreSQL
         ``lock_timeout`` the maintenance leader uses when pruning the queue,
         lease and claim rings (default 10 ms). Each lock acquisition gets its
-        own timeout; this does not bound the whole prune. Queue prune waits
-        only on ``ready_segments``; its other partition locks use ``NOWAIT``. A
-        lock timeout rolls back the prune and counts it as ``blocked``; the
+        own timeout; this does not bound the whole prune. Among queue prune's
+        initial partition locks, only ``ready_segments`` waits; the others use
+        ``NOWAIT``. Later reads and writes also run under the timeout. A lock
+        timeout rolls back the prune and counts it as ``blocked``; the
         maintenance loop retries on a later tick. Raise it when ``blocked``
         outcomes persist, keeping it well below the server's
         ``deadlock_timeout`` and ``statement_timeout`` (a warning is logged at
