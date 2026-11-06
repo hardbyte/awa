@@ -19,8 +19,6 @@ const MAX_ROWS: usize = 25;
 const RING_STALL_AFTER_MS: i64 = 6_000;
 /// Owner of attempts run by the surviving in-process runtime, which is never killed.
 pub const FINISHER: u32 = u32::MAX;
-/// Heartbeat staleness every runtime in the run uses.
-pub const STALENESS_SECS: f64 = super::personas::HEARTBEAT_STALENESS_SECS as f64;
 
 pub fn epoch_ms() -> i64 {
     SystemTime::now()
@@ -108,6 +106,8 @@ pub struct AbandonState {
     samples: Mutex<Vec<Sample>>,
     ring: Mutex<RingMonitor>,
     csv: Mutex<Option<PathBuf>>,
+    passes_csv: Mutex<Option<PathBuf>>,
+    heartbeat_last: Mutex<Option<f64>>,
 }
 
 pub struct Probe {
@@ -133,7 +133,59 @@ impl AbandonState {
                 "run_s,open_claims,expired_claims,oldest_expired_s,claim_ring_generation,probe_ms"
             );
         }
+        let passes = path.with_file_name("abandon-heartbeat-passes.csv");
+        if let Ok(mut file) = std::fs::File::create(&passes) {
+            let _ = writeln!(file, "run_s,handlers_running,claims_sampled,pass_ms");
+        }
+        *self.passes_csv.lock().expect("passes csv") = Some(passes);
         *self.csv.lock().expect("csv") = Some(path);
+    }
+
+    /// Folds in one reading of the oldest and newest heartbeat (epoch seconds) among the live
+    /// process's claims. While a pass runs the oldest heartbeat is still the previous pass's;
+    /// the reading that first shows a newer oldest heartbeat is taken just after the pass
+    /// finished, and the spread from oldest to newest is its duration (to within the last
+    /// chunk). The samples are bucketed by handler count so the report shows how pass time
+    /// grows with what a process holds.
+    pub fn note_heartbeat_sample(
+        &self,
+        shared: &Shared,
+        rows: i64,
+        oldest: f64,
+        newest: f64,
+        active: i64,
+    ) {
+        let mut last = self.heartbeat_last.lock().expect("heartbeat last");
+        let previous = last.replace(oldest);
+        let Some(previous_oldest) = previous else {
+            return;
+        };
+        // Claims leaving (a rescue) can also move the oldest heartbeat a little; a pass moves
+        // it by at least the time since the previous pass began.
+        if oldest <= previous_oldest + 0.5 || active <= 0 || newest - oldest > 300.0 {
+            return;
+        }
+        drop(last);
+        let ms = ((newest - oldest) * 1000.0).round() as i64;
+        let stats = shared.stats(Persona::ClaimAbandon);
+        stats.observe("heartbeat_pass_ms", ms);
+        let bucket = match active {
+            ..=4_999 => "under 5k",
+            5_000..=9_999 => "5k-10k",
+            10_000..=14_999 => "10k-15k",
+            15_000..=19_999 => "15k-20k",
+            _ => "20k and over",
+        };
+        stats.observe(&format!("heartbeat_pass_ms (handlers {bucket})"), ms);
+        if let Some(path) = self.passes_csv.lock().expect("passes csv").as_ref() {
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                let _ = writeln!(
+                    file,
+                    "{:.1},{active},{rows},{ms}",
+                    shared.now_ms() as f64 / 1000.0
+                );
+            }
+        }
     }
 
     pub fn register_job(&self, job_id: i64, max_attempts: i16) {
@@ -168,6 +220,7 @@ impl AbandonState {
     }
 
     pub fn set_live(&self, live: Option<(u32, i64)>) {
+        *self.heartbeat_last.lock().expect("heartbeat last") = None;
         *self.live.lock().expect("live") = live;
     }
 
@@ -280,7 +333,7 @@ impl AbandonState {
                 );
             }
         }
-        let staleness_ms = (STALENESS_SECS as i64 + 3) * 1_000;
+        let staleness_ms = shared.config.heartbeat_staleness.as_millis() as i64 + 3_000;
         let epoch = epoch_ms();
         let bound = shared.config.abandon_bound;
         let mut slow: Vec<String> = Vec::new();

@@ -30,6 +30,9 @@
 #   AWA_SOAK_RESCUE_INTERVAL_SECONDS
 #                             heartbeat and deadline rescue interval of every runtime (default: the
 #                             harness's 3 s and 2 s; the library default for heartbeat rescue is 30 s)
+#   AWA_SOAK_HEARTBEAT_SECONDS, AWA_SOAK_STALENESS_SECONDS
+#                             heartbeat interval and heartbeat staleness of every runtime (default 2 s
+#                             and 12 s, so rescues happen often; the library's are 30 s and 90 s)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)

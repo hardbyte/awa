@@ -14,9 +14,9 @@
 //! `max_attempts`.
 
 use super::super::abandon_oracle::{
-    epoch_ms, probe_backlog, Attempt, Kill, LiveCheck, Scope, FINISHER, STALENESS_SECS,
+    epoch_ms, probe_backlog, Attempt, Kill, LiveCheck, Scope, FINISHER,
 };
-use super::super::config::Persona;
+use super::super::config::{Persona, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_STALENESS_SECONDS};
 use super::super::db::{connect_pool, connect_pool_with_timeout, ClientFactory};
 use super::super::fleet::Fleet;
 use super::super::ledger::{expect, flag, JobRecord};
@@ -52,6 +52,8 @@ const ENV_GENERATION: &str = "AWA_SOAK_ABANDON_GENERATION";
 const ENV_LEDGER: &str = "AWA_SOAK_ABANDON_LEDGER";
 const ENV_WORKERS: &str = "AWA_SOAK_ABANDON_WORKERS";
 const ENV_POOL: &str = "AWA_SOAK_ABANDON_POOL";
+const ENV_HEARTBEAT: &str = "AWA_SOAK_HEARTBEAT_SECONDS";
+const ENV_STALENESS: &str = "AWA_SOAK_STALENESS_SECONDS";
 
 /// Longer than any process lives, so a job is only ever finished by the survivors.
 const HOLD: Duration = Duration::from_secs(20 * 60);
@@ -158,6 +160,14 @@ pub async fn run_child() {
     };
     // The child keeps away from maintenance leadership: the survivors do the rescuing, as
     // the other replicas of an application would.
+    let seconds = |name: &str, default: u64| {
+        Duration::from_secs(
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default),
+        )
+    };
     let client = timings(
         Client::builder(pool)
             .queue(QUEUE_PLAIN, claiming(Duration::ZERO))
@@ -168,6 +178,8 @@ pub async fn run_child() {
                 active: active.clone(),
                 peak: peak.clone(),
             }),
+        seconds(ENV_HEARTBEAT, DEFAULT_HEARTBEAT_SECONDS),
+        seconds(ENV_STALENESS, DEFAULT_STALENESS_SECONDS),
     )
     .leader_election_interval(Duration::from_secs(3600))
     .build()
@@ -278,6 +290,14 @@ fn spawn_child(
         .env(ENV_LEDGER, ledger)
         .env(ENV_WORKERS, workers_per_queue.to_string())
         .env(ENV_POOL, pool_size.to_string())
+        .env(
+            ENV_HEARTBEAT,
+            shared.config.heartbeat_interval.as_secs().to_string(),
+        )
+        .env(
+            ENV_STALENESS,
+            shared.config.heartbeat_staleness.as_secs().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -512,6 +532,33 @@ async fn canary_producer(shared: Arc<Shared>, pool: sqlx::PgPool) {
     }
 }
 
+/// Measures the live process's heartbeat passes from the timestamps its heartbeats write.
+/// A pass updates every in-flight claim with the time of its own chunk, so once a pass has
+/// finished the oldest heartbeat is newer than anything the previous pass wrote, and the
+/// spread from oldest to newest is the pass's duration (to within the last chunk). Only the
+/// deadline queue's claims are read: they are interleaved with the other queue's in the
+/// pass's job-id order, so they span the whole pass.
+async fn sample_heartbeats(shared: &Arc<Shared>, pool: &sqlx::PgPool, schema: &str) {
+    let row: Result<(i64, Option<f64>, Option<f64>), _> = sqlx::query_as(&format!(
+        "SELECT count(*)::bigint,
+                EXTRACT(EPOCH FROM min(a.heartbeat_at))::float8,
+                EXTRACT(EPOCH FROM max(a.heartbeat_at))::float8
+         FROM {schema}.lease_claims c
+         JOIN {schema}.attempt_state a ON a.job_id = c.job_id AND a.run_lease = c.run_lease
+         WHERE c.queue = $1 AND c.closed_at IS NULL"
+    ))
+    .bind(QUEUE_DEADLINE)
+    .fetch_one(pool)
+    .await;
+    let Ok((rows, Some(oldest), Some(newest))) = row else {
+        return;
+    };
+    let active = shared.abandon.child_active.load(Ordering::Relaxed);
+    shared
+        .abandon
+        .note_heartbeat_sample(shared, rows, oldest, newest, active);
+}
+
 /// Probes the backlog every few seconds and the claim ring every second, until the
 /// run is over.
 async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
@@ -535,6 +582,7 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
         );
         return;
     };
+    let staleness_secs = shared.config.heartbeat_staleness.as_secs_f64();
     let mut tick = 0u64;
     while !shared.drain_stop.sleep(Duration::from_secs(1)).await {
         tick += 1;
@@ -546,6 +594,9 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
         let Ok((slot, ring_generation, slot_count)) = ring else {
             continue;
         };
+        if shared.abandon.live().is_some() {
+            sample_heartbeats(&shared, &pool, &schema).await;
+        }
         // While the ring is still, look at the slot it has to enter next: live claims
         // there explain the stall.
         let next_slot = if shared.abandon.ring_stalled() && tick.is_multiple_of(2) {
@@ -553,7 +604,7 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
                 &pool,
                 &schema,
                 Scope::Slot((slot + 1).rem_euclid(slot_count)),
-                STALENESS_SECS,
+                staleness_secs,
                 0,
             )
             .await
@@ -578,7 +629,7 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
                 &pool,
                 &schema,
                 Scope::Queues(&queues),
-                STALENESS_SECS,
+                staleness_secs,
                 live.map_or(0, |(_, spawned)| spawned),
             )
             .await
@@ -606,6 +657,7 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
 pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     let persona = Persona::ClaimAbandon;
     let config = shared.config.clone();
+    let staleness_secs = config.heartbeat_staleness.as_secs_f64();
     let plain = shared.queues.register(QUEUE_PLAIN, persona, false);
     let deadline = shared.queues.register(QUEUE_DEADLINE, persona, false);
     let canary = shared.queues.register(QUEUE_CANARY, persona, false);
@@ -808,7 +860,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             &backlog_pool,
             &schema,
             Scope::Queues(&queues),
-            STALENESS_SECS,
+            staleness_secs,
             0,
         )
         .await

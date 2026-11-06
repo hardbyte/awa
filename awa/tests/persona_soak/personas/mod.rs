@@ -47,7 +47,11 @@ pub fn tune(builder: ClientBuilder, shared: &Shared) -> ClientBuilder {
     } else {
         builder
     };
-    let builder = timings(builder);
+    let builder = timings(
+        builder,
+        shared.config.heartbeat_interval,
+        shared.config.heartbeat_staleness,
+    );
     match shared.config.rescue_interval {
         Some(interval) => builder
             .heartbeat_rescue_interval(interval)
@@ -58,19 +62,20 @@ pub fn tune(builder: ClientBuilder, shared: &Shared) -> ClientBuilder {
 
 /// The timings of [`tune`] that do not depend on the run, for runtimes that live in a
 /// process of their own.
-pub fn timings(builder: ClientBuilder) -> ClientBuilder {
+pub fn timings(
+    builder: ClientBuilder,
+    heartbeat_interval: Duration,
+    heartbeat_staleness: Duration,
+) -> ClientBuilder {
     builder
-        .heartbeat_interval(Duration::from_secs(2))
-        .heartbeat_staleness(Duration::from_secs(HEARTBEAT_STALENESS_SECS))
+        .heartbeat_interval(heartbeat_interval)
+        .heartbeat_staleness(heartbeat_staleness)
         .heartbeat_rescue_interval(Duration::from_secs(3))
         .deadline_rescue_interval(Duration::from_secs(2))
         .promote_interval(Duration::from_millis(250))
         .runtime_snapshot_interval(Duration::from_secs(5))
         .dlq_enabled_by_default(true)
 }
-
-/// Seconds without a heartbeat after which a claim is eligible for rescue.
-pub const HEARTBEAT_STALENESS_SECS: u64 = 12;
 
 pub fn queue(max_workers: u32) -> QueueConfig {
     QueueConfig {

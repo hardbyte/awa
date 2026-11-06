@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// The harness's fast heartbeat cadence, so that rescues happen many times in a short run.
+pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 2;
+pub const DEFAULT_STALENESS_SECONDS: u64 = 12;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Persona {
     Mia,
@@ -143,6 +147,10 @@ pub struct SoakConfig {
     /// Overrides the heartbeat and deadline rescue intervals of every runtime, to run the
     /// soak with production's cadence instead of the harness's fast one.
     pub rescue_interval: Option<Duration>,
+    /// Heartbeat interval and the heartbeat staleness after which a claim may be rescued,
+    /// for every runtime. The library's own defaults are 30 s and 90 s.
+    pub heartbeat_interval: Duration,
+    pub heartbeat_staleness: Duration,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -239,6 +247,12 @@ impl SoakConfig {
             ),
             rescue_interval: env_parse::<u64>("AWA_SOAK_RESCUE_INTERVAL_SECONDS")
                 .map(Duration::from_secs),
+            heartbeat_interval: Duration::from_secs(
+                env_parse("AWA_SOAK_HEARTBEAT_SECONDS").unwrap_or(DEFAULT_HEARTBEAT_SECONDS),
+            ),
+            heartbeat_staleness: Duration::from_secs(
+                env_parse("AWA_SOAK_STALENESS_SECONDS").unwrap_or(DEFAULT_STALENESS_SECONDS),
+            ),
         })
     }
 
