@@ -1,4 +1,5 @@
 -- v053: Create queue lanes as the schema owner, whichever role touches them first.
+-- Tracking: https://github.com/hardbyte/awa/pull/637
 -- Lane sequences used to belong to the role that first enqueued into, claimed
 -- from or promoted into a lane, and only that role (plus whoever its default
 -- privileges named) could use them. refresh_lane_sequence_helpers now installs
