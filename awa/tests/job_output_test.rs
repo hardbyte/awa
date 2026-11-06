@@ -38,6 +38,20 @@ fn queue_config() -> QueueConfig {
     }
 }
 
+/// A queue-storage client that keeps terminal rows for the whole test.
+///
+/// The default one-second ring rotation lets maintenance rotate the ready
+/// ring and prune completed rows while the test runs, or inside its
+/// `shutdown` window, so a later read of a terminal job finds nothing on a
+/// slow machine.
+fn client_builder(pool: &sqlx::PgPool) -> awa::ClientBuilder {
+    Client::builder(pool.clone()).queue_storage(
+        awa::QueueStorageConfig::default(),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    )
+}
+
 async fn insert(
     pool: &sqlx::PgPool,
     args: &impl JobArgs,
@@ -84,14 +98,7 @@ async fn completion_stores_the_output_on_both_terminal_paths() {
     let queue = "output_paths";
     let events: Arc<Mutex<Vec<Option<Value>>>> = Arc::default();
     let seen = events.clone();
-    // The default one-second ring rotation lets prune truncate completed
-    // rows before the table checks below run on a slow machine.
-    let client = Client::builder(pool.clone())
-        .queue_storage(
-            awa::QueueStorageConfig::default(),
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        )
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Summarize, _, _>(|args, ctx| {
             let output = ctx.output_slot();
@@ -202,7 +209,7 @@ async fn failures_keep_only_the_latest_output_and_dispatch_strips_it() {
     let queue = "output_failures";
     let dispatch_errors: Arc<Mutex<Vec<Vec<Value>>>> = Arc::default();
     let seen = dispatch_errors.clone();
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Flaky, _, _>(move |_args, ctx| {
             let attempt = ctx.job.attempt;
@@ -289,7 +296,7 @@ async fn snooze_discards_and_a_failed_set_clears_without_failing() {
     let queue = "output_snooze";
     let errors: Arc<Mutex<Vec<OutputError>>> = Arc::default();
     let recorded = errors.clone();
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Poll, _, _>(move |_args, ctx| {
             let attempt = ctx.job.attempt;
@@ -379,7 +386,7 @@ async fn enqueue_specs_receive_the_row_without_its_output() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
     let queue = "output_specs";
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Summarize, _, _>(|args, ctx| {
             let output = ctx.output_slot();
@@ -448,14 +455,7 @@ async fn external_completion_stores_the_output_it_is_given() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
     let queue = "output_external";
-    // The completed jobs are read back after shutdown; with the default
-    // one-second ring rotation, prune can truncate them first.
-    let client = Client::builder(pool.clone())
-        .queue_storage(
-            awa::QueueStorageConfig::default(),
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        )
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register_worker(AwaitWorker)
         .build()
@@ -529,7 +529,7 @@ async fn a_schema_without_output_columns_drops_completion_outputs() {
     .unwrap();
 
     let queue = "output_pre_v052";
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Summarize, _, _>(|args, ctx| {
             let output = ctx.output_slot();
@@ -630,7 +630,7 @@ async fn panic_and_cancel_keep_the_output_in_their_error_entry() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
     let queue = "output_panic_cancel";
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Ends, _, _>(|args, ctx| {
             let output = ctx.output_slot();
@@ -693,7 +693,7 @@ async fn the_dlq_keeps_the_failed_output_and_a_retry_dispatches_without_it() {
     let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let leaked: Arc<Mutex<Vec<String>>> = Arc::default();
     let (runs_seen, leaked_seen) = (runs.clone(), leaked.clone());
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .dlq_enabled_by_default(true)
         .register::<DeadLetter, _, _>(move |_args, ctx| {
@@ -856,7 +856,7 @@ async fn typed_outputs_round_trip_and_publish_their_type() {
     let queue = "output_typed";
     let mismatches: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen = mismatches.clone();
-    let client = Client::builder(pool.clone())
+    let client = client_builder(&pool)
         .queue(queue, queue_config())
         .register::<Resize, _, _>(move |args, ctx| {
             // The wrong kind's slot fails, and clears like any failed set.

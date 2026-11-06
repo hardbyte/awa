@@ -89,6 +89,7 @@ pub async fn retry_dlq_job(
     let job = dlq::retry_from_dlq(&state.pool, job_id, &opts).await?;
     if job.is_some() {
         state.metrics.record_dlq_retried(source_queue.as_deref(), 1);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(job))
 }
@@ -178,6 +179,7 @@ async fn retry_matching_filter(
         state
             .metrics
             .record_dlq_retried(filter.queue.as_deref(), count);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }
@@ -196,6 +198,7 @@ pub async fn purge_dlq_job(
     let count = if deleted { 1 } else { 0 };
     if count > 0 {
         state.metrics.record_dlq_purged(queue.as_deref(), count);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }
@@ -225,6 +228,7 @@ async fn purge_matching_filter(
         state
             .metrics
             .record_dlq_purged(filter.queue.as_deref(), count);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }
@@ -269,6 +273,7 @@ pub async fn bulk_move_failed(
             &payload.reason,
             count,
         );
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }

@@ -1,8 +1,9 @@
 # Grafana Dashboards for Awa
 
-Two dashboards are provided:
+Three dashboards are provided:
 
-- **`awa-dashboard.json`** — Prometheus / OTel metrics dashboard. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows time-series metrics: throughput, latency, queue depth, rescues, completion flush performance.
+- **`awa-dashboard.json`** — Prometheus / OTel fleet overview. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows backlog and lag, promotion of scheduled work, throughput and failures per queue, latency, dispatcher behaviour, rescues, DLQ, maintenance leader health and ring rotation/prune.
+- **`awa-queue-detail.json`** — Prometheus / OTel drill-down for one queue: backlog, latency, per-kind outcomes, dispatcher, DLQ and how the queue compares with its neighbours. The overview links to it from every per-queue series.
 - **`awa-dashboard-postgres.json`** — SQL dashboard querying Postgres directly. No collector needed. Shows queue depth, lag, descriptor health, recent failures, cron schedules, and runtime instances. Queue depth and backlog panels read from `queue_state_counts` (cache table, eventually consistent within the ~2s dirty-key recompute window). Lag and recent-failure panels read through the `awa.jobs` compatibility view, so they follow the active queue-storage schema instead of assuming `jobs_hot` is the live worker engine. Queue-related tables LEFT JOIN `queue_descriptors` so declared display names and owners appear alongside raw queue names, and declared-but-idle queues stay visible. The **Descriptor Health** panel surfaces stale and drifted descriptors (see `docs/architecture.md#descriptors-and-runtime-liveness` for the model); an empty table = healthy fleet.
 
 Previews (live demo workload, both dashboards rendered against a local `grafana/otel-lgtm` collector + Postgres):
@@ -33,13 +34,52 @@ sum by (awa_job_queue, awa_queue_display_name) (
 
 The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job Kind Descriptor Catalog** (both instant-query tables), and **Throughput by Queue (with display names)** (a live timeseries demonstrating the join). Descriptor drift / stale detection still lives on the Postgres dashboard because deriving it from metrics alone would require emitting per-runtime hash gauges, which the Postgres catalog does more cleanly.
 
-## Prometheus / OTel Dashboard
+## Prometheus / OTel dashboards
 
-### Panels
+### Template variables
+
+Both dashboards use the same variables, so they import unmodified against any Prometheus-compatible datasource:
+
+| Variable | Purpose |
+| --- | --- |
+| `datasource` | Which Prometheus-compatible datasource to query. |
+| `queue` | Queue filter (multi-select with All on the overview, single queue on the detail dashboard). |
+| `kind` | Job kind filter (detail dashboard). |
+| `filters` | Ad hoc label filters applied to every query. Use it to scope to an environment, cluster, namespace or service, whatever label your metrics pipeline attaches to awa's series, for example `service_name = my-worker`. |
+| `awa_ui_url` | Base URL of awa-ui for drill-through links. |
+
+The dashboards never reference a deployment label directly, so no edit is needed when a fleet runs in several environments behind one datasource: pick the environment in `filters`.
+
+Queue depth, queue lag, DLQ depth and the descriptor info gauges are published by the maintenance leader (or by every runtime, for the info gauges), so the dashboards collapse them with `max by (...)` to stay correct during a leader handover and when the metrics pipeline keeps per-instance labels.
+
+### Overview panels
+
+The overview opens with fleet stats in triage order (oldest job, DLQ, error rate, throughput, in flight, deferred, rescues, runtimes; the first four carry a sparkline) followed by these rows:
+
+| Row | What it answers |
+| --- | --- |
+| **Backlog & lag** | Is work waiting, and is it waiting to be claimed (lag) or to be promoted (deferred backlog against the promotion rate, batch size and duration)? |
+| **Throughput & failures** | Which queue or kind is failing; whether one queue is crowding out others (in-flight and claims by queue). |
+| **Latency** | Wait time (creation to claim) and execution time percentiles per queue. |
+| **Dispatcher & claims** | Claim query latency and batch size, wake-ups by reason, empty claims, rate limiting, completion flush time. |
+| **Rescues, DLQ & database retries** | Rescues by kind (stale heartbeat, deadline, callback timeout), DLQ inflow and depth, deadlock and database-unavailability retries. |
+| **Maintenance leader** | Whether exactly one runtime is running maintenance, which one, and how long each branch takes. A slow branch delays promotion, rescue and rotation. |
+| **Ring rotation & prune** | Rotation and prune outcomes, what blocks them, prune phase latency. |
+| **Job outputs & follow-ups (0.7+)**, **Descriptor catalogs**, **Storage transition** | Collapsed by default. |
+
+Panels backed by metrics that a release does not emit render empty; the job output, staged follow-up, `awa_completion_reconnect_retry_total` and prune duration series arrive in 0.7.
+
+Fleets can have hundreds of queues, so the per-queue panels (queue lag, deepest queues, deferred backlog, throughput, in-flight and claim rate by queue, top kinds, and the queue detail dashboard's other-queue panels) draw the ten series with the highest value over the selected time range. The set is fixed for the whole range, and the legend is a table sorted by its maximum. Use the **Queue** variable to look at a specific queue.
+
+Event counters such as failures, retries, DLQ moves and parked jobs only exist after their first event, so those panels read "None in range" on a healthy fleet.
+
+Quantiles of the duration histograms (job duration, claim latency, wake-to-first-claim, completion flush, promotion duration) need AWA 0.6.13 or later; earlier versions export buckets that are too coarse below 5 s. Each of those panels also plots a dashed `mean` series, which is correct on every version.
+
+### Panel reference
 
 | Panel | Type | What it shows |
 | --- | --- | --- |
-| **Queue Lag** | Time series | Age of the oldest available job per queue |
+| **Queue Lag** | Time series | Age of the oldest available job per queue; on queue storage, of the oldest next-to-claim job across its lanes (the admin UI shows the oldest overall) |
 | **Queue Depth** | Stacked time series | Current jobs by queue and state (available, running, failed, scheduled, retryable, waiting external) |
 | **Job Wait Time (p50/p95/p99)** | Time series | Time from job creation to claim |
 | **Job Throughput** | Time series | Completed, failed, retried, cancelled jobs/sec |
@@ -62,6 +102,13 @@ The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job
 | **Rescues (5m)** | Stat | Recent rescue count with threshold colours |
 
 Color semantics are consistent across panels: green for healthy/fast paths, orange for warning/tail latency or retries, red for failures/high tail latency, blue for queue intake/backlog, and yellow for callback/external wait states.
+
+### What the dashboards cannot show
+
+- **Due-but-unpromoted work.** `awa_queue_depth{awa_job_state="scheduled"}` counts every deferred job, due or not, and queue lag only sees jobs already in the ready lanes. A stall in promotion shows up as the deferred backlog growing while the promotion rate is flat, not as a direct number.
+- **Maintenance leader identity.** No metric names the leader. The *Maintenance leader* row infers it from which series is running maintenance branches, so it needs a per-runtime label (`instance`, pod or similar) from your pipeline.
+- **Runtime versions.** No metric reports the awa version a runtime runs.
+- **Maintenance task failures.** Failed promotion, rescue or prune queries are logged, not counted.
 
 ## Setup
 
@@ -90,22 +137,25 @@ opentelemetry::global::set_meter_provider(provider);
 
 1. Open Grafana (default: http://localhost:3000)
 2. Go to Dashboards → Import
-3. Upload `awa-dashboard.json`
-4. Select your Prometheus datasource
+3. Upload `awa-dashboard.json`, then repeat for `awa-queue-detail.json`
+4. Choose the Prometheus datasource with the **Datasource** variable at the top of the dashboard
 
-**Option B: Provisioning** Copy `awa-dashboard.json` to your Grafana provisioning directory:
+**Option B: Provisioning** Copy `awa-dashboard.json` and `awa-queue-detail.json` to the directory a Grafana dashboard provider reads. The dashboards need no datasource substitution: the `datasource` variable defaults to your default Prometheus datasource.
 
 ```
-/etc/grafana/provisioning/dashboards/awa-dashboard.json
+/var/lib/grafana/dashboards/awa-dashboard.json
+/var/lib/grafana/dashboards/awa-queue-detail.json
 ```
 
 **Option C: API**
 
 ```bash
 # The Grafana API requires a wrapper object around the dashboard JSON
-curl -X POST "http://admin:admin@localhost:3000/api/dashboards/db" \
-  -H "Content-Type: application/json" \
-  -d "{\"dashboard\": $(cat awa-dashboard.json), \"overwrite\": true}"
+for dashboard in awa-dashboard.json awa-queue-detail.json; do
+  curl -X POST "http://admin:admin@localhost:3000/api/dashboards/db" \
+    -H "Content-Type: application/json" \
+    -d "{\"dashboard\": $(cat $dashboard), \"overwrite\": true}"
+done
 ```
 
 ### 3. Verify metrics are flowing
