@@ -144,8 +144,19 @@ impl Predicate {
 /// The DLQ rows `filter` selects, or `None` when it can select none: every
 /// DLQ row is a dead-lettered, failed job.
 pub(crate) fn dlq_predicate(filter: &JobFilter) -> Option<Predicate> {
-    if filter.dead_lettered == Some(false)
-        || (!filter.states.is_empty() && !filter.states.contains(&JobState::Failed))
+    // No `..`: this bounds a DELETE, so a new field must be handled here
+    // before it compiles.
+    let JobFilter {
+        kind,
+        queue,
+        states,
+        tags,
+        dead_lettered,
+        ids,
+        created_at_gte,
+        created_at_lt,
+    } = filter;
+    if *dead_lettered == Some(false) || (!states.is_empty() && !states.contains(&JobState::Failed))
     {
         return None;
     }
@@ -153,35 +164,42 @@ pub(crate) fn dlq_predicate(filter: &JobFilter) -> Option<Predicate> {
         conditions: Vec::new(),
         binds: Vec::new(),
     };
-    if let Some(kind) = &filter.kind {
+    if let Some(kind) = kind {
         let p = predicate.param(Bind::Text(kind.clone()));
         predicate.conditions.push(format!("kind = {p}"));
     }
-    if let Some(queue) = &filter.queue {
+    if let Some(queue) = queue {
         let p = predicate.param(Bind::Text(queue.clone()));
         predicate.conditions.push(format!("queue = {p}"));
     }
-    if !filter.tags.is_empty() {
-        let p = predicate.param(Bind::Json(serde_json::json!(filter.tags)));
-        predicate.conditions.push(format!(
-            "(payload -> 'tags') <> '[]'::jsonb AND payload -> 'tags' @> {p}::jsonb"
-        ));
+    if !tags.is_empty() {
+        let p = predicate.param(Bind::Json(serde_json::json!(tags)));
+        predicate.conditions.push(tag_condition("payload", &p));
     }
-    if let Some(ids) = &filter.ids {
+    if let Some(ids) = ids {
         let p = predicate.param(Bind::Ints(ids.clone()));
         predicate
             .conditions
             .push(format!("job_id = ANY({p}::bigint[])"));
     }
-    if let Some(gte) = filter.created_at_gte {
+    if let Some(gte) = *created_at_gte {
         let p = predicate.param(Bind::Time(gte));
         predicate.conditions.push(format!("created_at >= {p}"));
     }
-    if let Some(lt) = filter.created_at_lt {
+    if let Some(lt) = *created_at_lt {
         let p = predicate.param(Bind::Time(lt));
         predicate.conditions.push(format!("created_at < {p}"));
     }
     Some(predicate)
+}
+
+/// `payload` holds every tag in `param`. Starts with the tag index's own
+/// predicate so the planner can use that partial index.
+fn tag_condition(payload: &str, param: &str) -> String {
+    format!(
+        "{} AND {payload} -> 'tags' @> {param}::jsonb",
+        crate::tag_index::has_tags(payload)
+    )
 }
 
 fn state_names(states: &[JobState]) -> Vec<String> {
@@ -215,12 +233,25 @@ impl Branch {
         states: &[JobState],
         window: Window,
     ) -> String {
+        // No `..`, so a new field must be handled here before it compiles.
+        // `states` and `dead_lettered` arrive as `states` and through the
+        // choice of branch.
+        let JobFilter {
+            kind,
+            queue,
+            states: _,
+            tags,
+            dead_lettered: _,
+            ids,
+            created_at_gte,
+            created_at_lt,
+        } = filter;
         let mut conditions = self.conditions.clone();
-        if let Some(kind) = &filter.kind {
+        if let Some(kind) = kind {
             let p = statement.param(Bind::Text(kind.clone()));
             conditions.push(format!("{} = {p}", self.kind));
         }
-        if let Some(queue) = &filter.queue {
+        if let Some(queue) = queue {
             let p = statement.param(Bind::Text(queue.clone()));
             conditions.push(format!("{} = {p}", self.queue));
         }
@@ -236,25 +267,22 @@ impl Branch {
                 conditions.push(format!("{column} = ANY({p}::awa.job_state[])"));
             }
         }
-        if !filter.tags.is_empty() {
+        if !tags.is_empty() {
             let payload = self
                 .payload
                 .expect("branches without a tag payload are skipped for tag filters");
-            let p = statement.param(Bind::Json(serde_json::json!(filter.tags)));
-            // Repeats the partial index's predicate so the planner can use it.
-            conditions.push(format!(
-                "({payload} -> 'tags') <> '[]'::jsonb AND {payload} -> 'tags' @> {p}::jsonb"
-            ));
+            let p = statement.param(Bind::Json(serde_json::json!(tags)));
+            conditions.push(tag_condition(payload, &p));
         }
-        if let Some(ids) = &filter.ids {
+        if let Some(ids) = ids {
             let p = statement.param(Bind::Ints(ids.clone()));
             conditions.push(format!("{} = ANY({p}::bigint[])", self.id));
         }
-        if let Some(gte) = filter.created_at_gte {
+        if let Some(gte) = *created_at_gte {
             let p = statement.param(Bind::Time(gte));
             conditions.push(format!("{} >= {p}", self.created_at));
         }
-        if let Some(lt) = filter.created_at_lt {
+        if let Some(lt) = *created_at_lt {
             let p = statement.param(Bind::Time(lt));
             conditions.push(format!("{} < {p}", self.created_at));
         }
@@ -262,7 +290,7 @@ impl Branch {
         // `job_id` index: otherwise the planner walks that index backwards,
         // expecting the tag to match soon, and tests every row for a rare
         // one instead of asking the tag index.
-        let order = if filter.tags.is_empty() {
+        let order = if tags.is_empty() {
             self.id.to_string()
         } else {
             format!("({} + 0)", self.id)
@@ -817,18 +845,18 @@ pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// One interactive read's share of [`READ_TIMEOUT`]. Every candidate pass and
 /// load takes the time that is left as its statement timeout, so repeated
 /// passes cannot each spend the whole allowance.
-struct ReadBudget {
+pub(crate) struct ReadBudget {
     deadline: tokio::time::Instant,
 }
 
 impl ReadBudget {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         Self {
             deadline: tokio::time::Instant::now() + READ_TIMEOUT,
         }
     }
 
-    fn remaining(&self) -> Result<std::time::Duration, AwaError> {
+    pub(crate) fn remaining(&self) -> Result<std::time::Duration, AwaError> {
         let left = self
             .deadline
             .saturating_duration_since(tokio::time::Instant::now());
@@ -840,7 +868,7 @@ impl ReadBudget {
 
     /// Run `read` within the budget. Statement timeouts end the SQL; this
     /// also bounds the time spent waiting for a pool connection.
-    async fn run<T>(
+    pub(crate) async fn run<T>(
         &self,
         read: impl std::future::Future<Output = Result<T, AwaError>>,
     ) -> Result<T, AwaError> {
@@ -914,8 +942,11 @@ async fn find_within(
     let fetch = (limit * 2).clamp(limit, limit + 200);
     let mut cursor = window;
     let mut jobs = Vec::new();
-    // Bounded so a pathological stream of stale candidates cannot loop.
-    for _ in 0..32 {
+    // Each round moves the cursor past the ids it read, and the read budget
+    // ends a long run of stale candidates with an error. A fixed round limit
+    // would instead return a short page while matches remain, which a caller
+    // paging until a short page would take for the end.
+    loop {
         let cursor_window = match cursor {
             Window::NewestFirst { before_id, .. } => Window::NewestFirst {
                 before_id,
@@ -963,7 +994,6 @@ async fn find_within(
             Window::Unbounded { .. } => unreachable!("rejected above"),
         };
     }
-    Ok(jobs)
 }
 
 /// How many jobs `filter` selects among `eligible` states, counted in SQL

@@ -1,6 +1,13 @@
 export class HttpError extends Error {
   constructor(message: string, public readonly status: number, public readonly retryAfterMs = 0) { super(message); }
 }
+/** API compatibility name with the same HTTP identity used by observation policy. */
+export class ApiError extends HttpError {
+  constructor(status: number, message: string, retryAfterMs = 0) {
+    super(message, status, retryAfterMs);
+    this.name = "ApiError";
+  }
+}
 export class ReadProtocolError extends Error {}
 export class ReadTimeoutError extends Error {}
 
@@ -25,7 +32,7 @@ export function onHttpFailure(listener?: (error: unknown) => void) { failure = l
 
 export async function checkedJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const error = new HttpError(`Admin request failed (${response.status})`, response.status,
+    const error = new ApiError(response.status, response.statusText || `Admin request failed (${response.status})`,
       [429, 503].includes(response.status) ? retryAfter(response.headers.get("retry-after")) : 0);
     failure?.(error); // Apply backend cooldown before waiting on an error body.
     if (response.headers.get("content-type")?.split(";")[0]?.trim() === "application/json") {

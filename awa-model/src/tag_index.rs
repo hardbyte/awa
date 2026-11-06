@@ -20,17 +20,24 @@ use crate::error::{map_sqlx_error, AwaError};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, PgConnection, PgPool};
 
+/// The partial index's predicate. A query must repeat it, over the same
+/// payload column, for the planner to use the index.
+pub(crate) fn has_tags(payload: &str) -> String {
+    format!("({payload} -> 'tags') <> '[]'::jsonb")
+}
+
 /// The index definition, shared by every partition and table.
 fn index_ddl(schema: &str, table: &str, concurrently: bool) -> String {
     format!(
         "CREATE INDEX {}IF NOT EXISTS {} ON {}.{} \
          USING gin ((payload -> 'tags') jsonb_path_ops) \
          WITH (fastupdate = off) \
-         WHERE (payload -> 'tags') <> '[]'::jsonb",
+         WHERE {}",
         if concurrently { "CONCURRENTLY " } else { "" },
         quote_ident(&index_name(table)),
         quote_ident(schema),
         quote_ident(table),
+        has_tags("payload"),
     )
 }
 
@@ -261,8 +268,8 @@ pub struct TagIndexBuild {
     pub built: usize,
     pub repaired: usize,
     pub already_valid: usize,
-    /// Left for a later pass: populated ring partitions, and tables that
-    /// were busy past the lock timeout or lost a deadlock.
+    /// Left for a later pass: populated ring partitions, and tables another
+    /// session was indexing or whose build lost a deadlock.
     pub waiting: Vec<TagIndexTarget>,
 }
 
@@ -272,19 +279,19 @@ impl TagIndexBuild {
     }
 }
 
-/// Run `ddl` outside a transaction with a short lock timeout:
-/// `CONCURRENTLY` refuses to run in a transaction.
+/// Run `ddl` outside a transaction: `CONCURRENTLY` refuses to run in one.
+///
+/// No lock timeout. A concurrent build waits for every transaction older
+/// than it, through the same lock machinery, so a timeout would abort it
+/// whenever one long read was running, leaving an invalid index that every
+/// write still maintains. Its own table lock doesn't block writers, so
+/// waiting costs nothing but time.
 async fn run_concurrently(conn: &mut PgConnection, ddl: String) -> Result<(), AwaError> {
-    sqlx::query("SET lock_timeout = '5s'")
+    sqlx::query(audited_sql(ddl))
         .execute(&mut *conn)
         .await
         .map_err(map_sqlx_error)?;
-    let result = sqlx::query(audited_sql(ddl))
-        .execute(&mut *conn)
-        .await
-        .map_err(map_sqlx_error);
-    let _ = sqlx::query("RESET lock_timeout").execute(&mut *conn).await;
-    result.map(|_| ())
+    Ok(())
 }
 
 /// Whether `target`'s index exists and is valid.
@@ -303,8 +310,9 @@ async fn index_valid(conn: &mut PgConnection, target: &TagIndexTarget) -> Result
     Ok(valid == Some(true))
 }
 
-/// Drop the `_ccnew` copies a failed `REINDEX CONCURRENTLY` leaves behind:
-/// they are invalid, so no query uses them, but every write maintains them.
+/// Drop the `_ccnew` and `_ccold` copies a failed `REINDEX CONCURRENTLY`
+/// leaves behind: they are invalid, so no query uses them, but every write
+/// maintains them.
 async fn drop_abandoned_copies(conn: &mut PgConnection) -> Result<(), AwaError> {
     let abandoned: Vec<(String, String)> = sqlx::query_as(
         r#"
@@ -313,7 +321,8 @@ async fn drop_abandoned_copies(conn: &mut PgConnection) -> Result<(), AwaError> 
         JOIN pg_class ic ON ic.oid = idx.indexrelid
         JOIN pg_namespace n ON n.oid = ic.relnamespace
         WHERE NOT idx.indisvalid
-          AND ic.relname LIKE '%\_tags\_idx\_ccnew%'
+          AND (ic.relname LIKE '%\_tags\_idx\_ccnew%'
+               OR ic.relname LIKE '%\_tags\_idx\_ccold%')
           AND n.nspname IN (SELECT s FROM awa.queue_storage_schemas() AS q(s))
         "#,
     )
@@ -341,11 +350,24 @@ async fn drop_abandoned_copies(conn: &mut PgConnection) -> Result<(), AwaError> 
 /// One pass of the migrator's online build. Builds one index at a time,
 /// repairs indexes an interrupted build left invalid, and reports what is
 /// left for a later pass: ring partitions waiting for pruning to empty them,
-/// and tables that stayed busy past the lock timeout. Safe to repeat.
+/// and tables another session was indexing. Safe to repeat.
 pub async fn build_tag_indexes(pool: &PgPool, mode: BuildMode) -> Result<TagIndexBuild, AwaError> {
     let mut outcome = TagIndexBuild::default();
-    // One connection throughout, so a pool of one is enough.
-    let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
+    // Its own connection rather than a pooled one: a concurrent build can
+    // run for a long time, and if this future is dropped the connection
+    // closes, which cancels the build instead of returning a busy
+    // connection to the pool.
+    let mut conn = PgConnection::connect_with(&pool.connect_options())
+        .await
+        .map_err(map_sqlx_error)?;
+    // A role or `PGOPTIONS` timeout would abort a long build part-way, as
+    // `run_concurrently` explains; this connection closes when the pass ends.
+    for setting in ["SET lock_timeout = 0", "SET statement_timeout = 0"] {
+        sqlx::query(setting)
+            .execute(&mut conn)
+            .await
+            .map_err(map_sqlx_error)?;
+    }
     let statuses = tag_index_status_on(&mut conn).await?;
     if !statuses.is_empty() {
         drop_abandoned_copies(&mut conn).await?;

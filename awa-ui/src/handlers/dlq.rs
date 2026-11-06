@@ -88,8 +88,8 @@ pub async fn retry_dlq_job(
         .map(|row| row.job.queue);
     let job = dlq::retry_from_dlq(&state.pool, job_id, &opts).await?;
     if job.is_some() {
-        state.invalidate_dashboard_caches();
         state.metrics.record_dlq_retried(source_queue.as_deref(), 1);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(job))
 }
@@ -126,7 +126,7 @@ impl BulkFilterPayload {
 /// 0.6 ones: a 0.6 server ignores fields it doesn't know, so any body it can
 /// reach is read as its flat fields, and `all: true` beside a filter it
 /// ignored would act on the whole DLQ. A 0.6 server answers these paths with
-/// 404 instead.
+/// 405 instead: it routes `/api/dlq/{id}` for GET and DELETE only.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatchingPayload {
@@ -176,10 +176,10 @@ async fn retry_matching_filter(
     state.require_writable()?;
     let count = dlq::bulk_retry_from_dlq_matching(&state.pool, filter, all).await?;
     if count > 0 {
-        state.invalidate_dashboard_caches();
         state
             .metrics
             .record_dlq_retried(filter.queue.as_deref(), count);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }
@@ -197,8 +197,8 @@ pub async fn purge_dlq_job(
     let deleted = dlq::purge_dlq_job(&state.pool, job_id).await?;
     let count = if deleted { 1 } else { 0 };
     if count > 0 {
-        state.invalidate_dashboard_caches();
         state.metrics.record_dlq_purged(queue.as_deref(), count);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }
@@ -225,10 +225,10 @@ async fn purge_matching_filter(
     state.require_writable()?;
     let count = dlq::purge_dlq_matching(&state.pool, filter, all).await?;
     if count > 0 {
-        state.invalidate_dashboard_caches();
         state
             .metrics
             .record_dlq_purged(filter.queue.as_deref(), count);
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }
@@ -267,13 +267,13 @@ pub async fn bulk_move_failed(
     )
     .await?;
     if count > 0 {
-        state.invalidate_dashboard_caches();
         state.metrics.record_dlq_moved_bulk(
             payload.kind.as_deref(),
             payload.queue.as_deref(),
             &payload.reason,
             count,
         );
+        state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
 }

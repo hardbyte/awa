@@ -59,6 +59,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   queue, tag, ids or a created bound) unless `allow_all` is set; `state:
   failed` and `dead_lettered: true` alone are refused, since every DLQ row
   matches them.
+- **A batch operation needs the same:** a kind, queue, tag, ids or created
+  bound, unless `allow_all` is set. In 0.6 a state alone was enough, so
+  `{"state": "available"}` changed every available job; it is now refused.
+  Stored operations are unaffected. An empty `ids` list is refused in any
+  filter, since it would match nothing; omit `ids` to match any id.
+- **`awa storage status` prints one JSON document,** now with a
+  `tag_indexes: {valid, total}` field; the build hint goes to stderr.
 - **Deprecated:** `admin::list_jobs` and `ListJobsFilter` (use `find_jobs`
   with `JobFilter` and `JobPage`), and `dlq::list_dlq`, `purge_dlq`,
   `bulk_retry_from_dlq` and `ListDlqFilter` (use `find_dlq`,
@@ -96,6 +103,250 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `($n IS NULL OR …)` and degraded to minutes once Postgres switched it to a
   generic plan; at 50,000 retained jobs a rare-tag lookup now takes tens of
   milliseconds instead of more than two minutes.
+
+### Fixed
+
+- **Reading one job by id no longer misses a job that moved mid-read.** The
+  loader behind `get_job` and filtered listings reads every table from one
+  snapshot (`REPEATABLE READ READ ONLY`); a promotion or retry committing
+  between two of its statements could hide the job.
+- **A batch operation the runner can't read is marked failed** instead of
+  being claimed on every tick, which blocked every later operation. The same
+  goes for one whose stored filter no longer suits its operation.
+- **`awa storage build-tag-index --now` waits out long transactions** rather
+  than aborting after 5 s and leaving an invalid index that every write still
+  maintained. It runs on its own connection with no lock or statement
+  timeout, and also drops the `_ccold` copies a failed rebuild leaves.
+- **Job filters are bounded while they're parsed.** Tag de-duplication is
+  linear, and the query-string parser stops at 20 tags or 1,000 ids, so an
+  oversized request costs no more than the limit.
+- **The DLQ listing has the same 30-second read budget** as job listing.
+- **Admin UI:** the DLQ page shows the server's error instead of "DLQ is
+  empty" and disables bulk actions while its list is failing or loading; a
+  4xx response is not retried; the jobs page shows the server's message. A
+  batch operation needs a preview of the form's current filter and a
+  confirmation stating its scope and count, and the jobs page offers the
+  batch link only for a search that narrows the population.
+
+- **Batch enqueues take their lane locks in one order, so they no longer
+  deadlock with each other.** On queue storage every enqueue holds a
+  transaction-scoped advisory lock on its `(queue, priority, shard)` lane
+  until commit. `insert_many` and `insert_many_copy` took those locks in input
+  order, while `QueueStorage` batch enqueues took them in sorted order, so a
+  batch spanning several queues listed differently from another batch or from
+  a `QueueStorage` enqueue could deadlock with it (`40P01`). The two insert
+  paths now sort rows by `(queue, priority, shard)`, queues compared bytewise,
+  before they reach `awa.insert_job_compat`, the order `QueueStorage` already
+  used, and still return rows in input order. Job ids within a batch that
+  spans several lanes are now allocated lane by lane rather than in input
+  order, and when an `insert_many_copy` batch carries the same unique key in
+  more than one lane, the row in the lowest lane is the one inserted. A
+  transaction that enqueues with separate statements still takes locks in
+  statement order; see "`deadlock detected` while enqueueing" in the
+  troubleshooting guide.
+- **Scheduled, snoozed and retry-after jobs are no longer held back while
+  the maintenance leader is overloaded.** The leader backs a maintenance
+  branch off for a cooldown after its body repeatedly runs longer than its
+  interval, and promotion, which makes every scheduled, snoozed and
+  retry-after job runnable, was backed off like the rest, so those jobs
+  waited out the cooldown. The cooldown also counted ticks, and under CPU
+  starvation the leader loop services a branch's tick only once many other
+  branches have run, so a cooldown of a few seconds could last several times
+  that. Promotion is no longer backed off; other branches (rescues, cleanup)
+  back off for a wall-clock duration of twice the overrunning body, capped
+  at five seconds. The leader's interval timers also delay rather than burst
+  after a stall, so a stall no longer queues back-to-back catch-up ticks.
+- **`admin::drain_queue` on queue storage cancels a backlog in bulk and
+  drains every stripe of a striped queue.** It found the queue's jobs through
+  a lookup that read every retained ready row, then cancelled them one at a
+  time, several statements each, inside one transaction, so draining a large
+  backlog took minutes and held its row locks throughout. Scheduled,
+  retryable and available jobs are now cancelled 1,000 at a time, each chunk
+  one short transaction, with available rows read from each lane's claim
+  cursor; waiting jobs are still cancelled one by one and running jobs are
+  left alone. Jobs enqueued after the drain starts are left for a later
+  call, so draining a queue that keeps receiving work still returns, and
+  the drain moves each lane's claim cursor past the rows it cancelled, so
+  workers reach the jobs behind them on their next poll. It also matched
+  only the logical queue name, so draining a striped queue cancelled
+  nothing; it now covers every stripe. `awa queue drain` and the Python
+  `drain_queue` use this path.
+- **Cancelling, moving or reprioritising an available job on queue storage
+  no longer acts on a job a worker has already claimed.** A claim moves its
+  lane's claim cursor past the rows it took only after it commits, so
+  briefly, or until the next claim if that advance failed, a claimed row
+  still looked available. A cancel in that window wrote a cancelled terminal
+  row while the attempt kept running, and a move re-enqueued a job that was
+  already executing. A claim still in progress was missed the same way.
+  These paths now wait for any claim in progress on the job's lane and skip
+  rows a claim has recorded, the same evidence claims use to skip them, so a
+  cancel reaches the running attempt instead.
+- **Queue storage no longer drives PostgreSQL 18 into a backend crash when a
+  rescue, cancel or claim close locks a row-local claim that was just
+  rewritten.** A statement that locks a row another transaction updated after
+  the statement's snapshot rechecks the row (EvalPlanQual). In PostgreSQL 18
+  (reproduced on 18.6) that recheck rebuilds the statement's run-time
+  partition pruning state in memory that is freed when the lock runs out of
+  rows, so a later pruning pass in the same statement reads freed memory and
+  the backend segfaults
+  ([pgsql-bugs report](https://www.postgresql.org/message-id/CAP2G_gGpV%3DrKMLuET4RW-qO41GvBvi6Czsjsj16eT9hAwHxG6w%40mail.gmail.com)).
+  0.6 runtimes write a row-local claim for every deadline-bearing job, and
+  their deadline rescue crashed the server when a heartbeat rewrote an
+  expired claim mid-rescue; this branch writes compact claims, so it meets
+  row-local claims only while 0.6 runtimes are still in flight. The rescues
+  now update the slot's own claim partition, the completion, heartbeat,
+  progress, callback and close paths lock their attempts' row-local claims
+  in a statement that prunes nothing before the statements that lock them
+  again, and cancel locks row and batch receipts in separate statements.
+- **`insert_many` no longer fails above 5,461 jobs in one call.** It built one
+  multi-row `VALUES` statement with twelve bind parameters per job, so a call
+  with more than 5,461 jobs exceeded PostgreSQL's 65,535-parameter limit and
+  failed client-side with `too many arguments for query` before reaching the
+  server. It now sends one array per column through a single fixed-text
+  statement over `unnest(...)`, so the bind count no longer depends on the
+  batch size and the call keeps its single-statement, caller-transaction
+  semantics, on both the canonical and queue-storage engines.
+- **Duration and size histograms now export explicit bucket boundaries, so
+  latency quantiles are accurate.** `awa.job.duration`,
+  `awa.dispatch.claim_duration`, `awa.dispatch.wake_to_claim_duration`,
+  `awa.completion.flush_duration` and `awa.maintenance.promote_duration`
+  record seconds but were exported with the OpenTelemetry SDK's default
+  millisecond-scale buckets (0, 5, 10, 25, ... 10000), so almost every
+  observation landed in the first bucket and `histogram_quantile` p50/p95/p99
+  were flat lines near 2.5 s, 4.75 s and 4.95 s whatever the real latency.
+  Latency histograms now use 0.5 ms to 30 s buckets and job duration uses
+  1 ms to 1 h buckets. The batch-size, capacity and skipped-row histograms
+  (`awa.enqueue.batch_size`, `awa.dispatch.capacity_available`,
+  `awa.dispatch.claim_batch_size`, `awa.completion.flush_batch_size`,
+  `awa.maintenance.promote_batch_size`,
+  `awa.maintenance.rotate.skipped_rows`,
+  `awa.maintenance.prune.skipped_rows`) now use power-of-two buckets from 0 to
+  8192. Quantile panels become accurate after upgrading. The `le` labels of
+  these histograms change, so a quantile computed over a range that spans the
+  upgrade mixes old and new buckets until the old series age out.
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
+  tokio runtime but with the client's pool, so connections the pool opened
+  during the migration went back into it tied to a runtime that no longer
+  existed. A later query that picked one up could wait 30 s and fail with
+  `pool timed out while waiting for an open connection`. The migrations now
+  run on the bindings' shared runtime. This was the intermittent fixture
+  timeout in the Python test suite (#420).
+- **`awa storage prepare-queue` provisions lanes a 0.6 runtime created.** A
+  runtime role with schema `CREATE` owns the lane sequences it creates.
+  Provisioning such a lane as the owner, the first step of revoking runtime
+  `CREATE`, failed with `permission denied for sequence`: the head tables'
+  `BEFORE INSERT` triggers run even for a row `ON CONFLICT DO NOTHING` then
+  skips, and they read and set the lane's sequence. Lane inserts now skip
+  rows that exist. Found by the 0.6.10 upgrade rehearsal.
+- **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
+  storage find running jobs and no longer read retained history**
+  ([#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
+  built every available ready row before filtering by key, reading every
+  retained ready row, completed jobs included. A missing key cost as much
+  as a full scan, and the transaction variant held the caller's
+  transaction while it ran. Given a queue, it now starts from that queue's
+  ready rows holding the key and checks only those jobs for being available,
+  leased or on an open receipt claim; with no such row, only the
+  `deferred_jobs` key index is read. Its cost follows that queue's own rows,
+  not other queues' backlogs or the claim ring, which a long-running job can
+  keep from pruning. Without a queue, available rows are walked lane by lane
+  from the claim cursor and open receipt claims are read in full. It also
+  finds jobs running on receipt claims not yet materialised into `leases`,
+  which it missed, so they couldn't be cancelled by key.
+- **The admin UI's runtime page no longer shows the storage transition card
+  once the transition is finalized.** It stayed up on every cluster running
+  queue storage; it now appears only while an engine is prepared or a mixed
+  transition is in flight.
+- **The admin dashboard's reads no longer grow with retained history on
+  queue storage, and a test keeps them that way.** `awa-ui`'s
+  `admin_read_cost_test` serves every endpoint the UI polls against ten
+  times more retained history and fails if a read does more work. It found
+  four more reads that grew with history:
+  - Available counts read every retained ready row. They now walk each
+    lane's segments from its claim cursor.
+  - Running counts expanded every retained claim batch. A batch whose
+    receipts have all closed is now skipped before it is expanded.
+  - The timeseries read its window's completions through `terminal_jobs`,
+    which joined them to every retained ready row.
+  - Completions in the last hour, less deletions, checked each recent
+    deletion against its lane's completion batches. One production-sized
+    fixture took 5.4 s for that check alone. Each affected batch is now read
+    once.
+  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and job lists that
+  can include completed jobs still read retained history; the test lists
+  those it exercises and fails once one stops, so the list can only shrink.
+- **Queue lag in the admin UI is the age of the oldest available job
+  again.** On queue storage it had become the age of each lane's next job,
+  which hides an older job a queue move or priority aging appended behind
+  newer ones: an hour's wait could show as a second. The workers' queue-lag
+  gauge keeps the cheaper next-job reading.
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts.** They didn't invalidate the dashboard caches, so failed
+  counts lagged a DLQ action by up to the cache TTL. From #579.
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, such as a statement timeout, sqlx 0.9 tried
+  to close the connection, and closing a TLS connection mid-stream hangs, so
+  the pool lost that slot permanently; a slow dashboard read polled often
+  enough could exhaust the pool. `awa serve` now sets a 60-second statement
+  timeout (`--statement-timeout`, `AWA_STATEMENT_TIMEOUT`), recovers such
+  connections when they are released, and on Postgres 14+ sets
+  `client_connection_check_interval` so a query stops when its connection
+  closes. Applications embedding `awa_ui::router` can build their pool with
+  the new `awa_ui::admin_pool_options` and `admin_connect_options`.
+- **Queue overviews on queue storage no longer read retained history.**
+  `admin::queue_overviews`, behind the admin UI's queues and dashboard pages
+  and `awa queue stats`, counted every current job through `terminal_jobs`,
+  which expands each completion batch and joins it back to `ready_entries`.
+  It now reads the live-work tables, as the workers' queue gauges do, and
+  counts completions in the last hour from batch sizes. With 100,000
+  retained completions and 100,000 queued jobs it drops from 7.7 s to
+  0.27 s. JIT is off for the read; compiling it cost more than running it.
+- **The dashboard's state counts and timeseries no longer read retained
+  history on queue storage.** `admin::state_counts` counts completions from
+  batch sizes and available jobs per lane from its claim cursor (6.5 s to
+  0.24 s on the same data). `admin::state_timeseries` reads only rows
+  finalised within its window, since a job finishes after it is created. It
+  previously expanded every retained completion and sorted the result:
+  against that data it ran for over 10 minutes and filled the disk with
+  temporary files. It now takes 0.6 s, with all 100,000 completions inside
+  the window.
+- **`admin::job_kind_overviews` on queue storage no longer depends on the
+  planner's row estimates.** Behind the admin UI's kinds page, it counted
+  every job through the `current_jobs` view. Two nodes of that view are
+  estimated at one row whatever the statistics say: the join from completion
+  batches to `ready_entries`, and the `UNION ALL` over every place a job can
+  live. Postgres therefore chose nested loops that visit each retained row,
+  and the join on `queue_claim_heads` was only as good as that table's
+  estimate, which autovacuum never refreshes. It now aggregates each place to
+  `(kind, queue)` on its own and combines the results: available jobs are
+  found per lane from the claim cursor, and a completion batch's members are
+  unnested and probed along the ready primary key. The rows are identical,
+  and a test compares them with the former definition across every job
+  state. With 2.6 million retained ready rows (1.8 million of them available)
+  and 860,000 retained completions it takes about 6 to 8 s instead of 20 s on
+  PostgreSQL 17 and 18. It still reads each available job and each retained
+  completion's ready row, because a job's kind lives there. JIT is off for
+  the read.
+- **`admin::list_jobs` on queue storage reads only the places that can hold
+  the requested state.** It selected candidate ids from the `current_jobs`
+  view, so every listing, whatever its filter, planned around the same
+  single-row estimates and joined each retained completion to a scan of the
+  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
+  timeout. Each place a job can live is now read and limited on its own,
+  only those that can hold the state asked for, with a predicate for each
+  filter that is set rather than `$n IS NULL OR` terms, which a prepared
+  statement's generic plan can't drop. Completion batches are ordered by job
+  id before their ready rows are probed, so a page probes only as many as it
+  returns. The ids are identical, and a test compares them with the former
+  definition for every state, kind, queue, limit and page. On the dataset
+  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
+  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
+  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
+  from more than four minutes). Available jobs and completions are still read
+  in full when the state allows them. JIT is off for the read.
 
 ## [0.7.0-alpha.1] — 2026-10-29
 

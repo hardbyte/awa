@@ -133,8 +133,13 @@ def test_sync_batch_operation_move_queue_and_validation(sync_client):
     assert operation["spec"]["queue"] == "pybatch_dest"
     assert operation["spec"]["priority"] == 2
 
-    with pytest.raises(awa.ValidationError, match="requires a filter"):
+    with pytest.raises(awa.ValidationError, match="needs a kind, queue"):
         sync_client.set_priority(1)
+    # A state alone still names every job in it.
+    with pytest.raises(awa.ValidationError, match="needs a kind, queue"):
+        sync_client.submit_batch_operation(
+            "set_priority", spec={"priority": 1}, filter={"state": "available"}
+        )
 
 
 @pytest.mark.asyncio

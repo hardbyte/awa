@@ -145,6 +145,15 @@ export default async function globalSetup() {
       ('legacy_queue', 2, 1),
       ('e2e_dlq', 2, 1);
 
+    INSERT INTO ${queueStorageSchema}.ready_segments (
+      ready_slot, ready_generation, queue, priority, enqueue_shard,
+      first_lane_seq, next_lane_seq, first_run_at
+    )
+    VALUES
+      (0, 0, 'e2e_test', 2, 0, 1, 6, now() - interval '5 minutes'),
+      (0, 0, 'e2e_test', 1, 0, 1, 2, now() - interval '4 minutes'),
+      (0, 0, 'legacy_queue', 2, 0, 1, 2, now() - interval '2 minutes');
+
     INSERT INTO ${queueStorageSchema}.ready_entries (
       ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt,
       run_lease, max_attempts, lane_seq, run_at, attempted_at, created_at, payload

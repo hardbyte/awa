@@ -261,25 +261,98 @@ async fn the_canonical_engine_is_refused_rather_than_searched() {
 async fn a_batch_needs_a_field_that_narrows_it() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
-    let submit = |filter: JobFilter| {
+    let submit = |filter: JobFilter, allow_all: bool| {
         batch_operations::submit_batch_operation(
             &pool,
             SubmitBatchOperation {
                 spec: BatchOperationSpec::SetPriority { priority: 1 },
                 filter,
                 submitted_by: None,
-                allow_all: false,
+                allow_all,
             },
         )
     };
-    // Every job a batch operation can reach is not dead-lettered.
-    let err = submit(JobFilter::new().dead_lettered(false))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("requires a filter"), "{err}");
-    submit(JobFilter::new().queue(QUEUE).dead_lettered(false))
+    // Every job a batch operation can reach is not dead-lettered, and a state
+    // alone still names every job in it.
+    for unscoped in [
+        JobFilter::new().dead_lettered(false),
+        JobFilter::new().state(JobState::Available),
+        JobFilter::new().states([JobState::Available, JobState::Scheduled]),
+    ] {
+        let err = submit(unscoped.clone(), false).await.unwrap_err();
+        assert!(err.to_string().contains("needs a kind, queue"), "{err}");
+        submit(unscoped, true).await.unwrap();
+    }
+    submit(JobFilter::new().queue(QUEUE).dead_lettered(false), false)
         .await
         .unwrap();
+    // An empty id list would match nothing, unlike every other empty field.
+    let err = submit(JobFilter::new().ids([]), true).await.unwrap_err();
+    assert!(err.to_string().contains("at least one id"), "{err}");
+}
+
+/// The runner claims the oldest open operation first, so one it cannot read
+/// must fail rather than be claimed again on every tick.
+#[tokio::test]
+async fn an_unreadable_batch_operation_fails_instead_of_blocking_the_runner() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    sqlx::query("DELETE FROM awa.batch_operations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let unreadable = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO awa.batch_operations (id, op_kind, filter, spec, state, submitted_at) \
+         VALUES ($1, 'set_priority', $2, $3, 'pending', now() - interval '1 minute')",
+    )
+    .bind(unreadable)
+    .bind(json!({ "queue": QUEUE, "from_a_newer_version": true }))
+    .bind(serde_json::to_value(BatchOperationSpec::SetPriority { priority: 1 }).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let readable = batch_operations::submit_batch_operation(
+        &pool,
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::SetPriority { priority: 1 },
+            filter: JobFilter::new().queue(QUEUE),
+            submitted_by: None,
+            allow_all: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let runner = uuid::Uuid::new_v4();
+    let first = batch_operations::run_one_batch_operation_chunk(&pool, runner, 100)
+        .await
+        .unwrap();
+    assert!(first.claimed && first.finalized);
+    let (state, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT state, last_error FROM awa.batch_operations WHERE id = $1")
+            .bind(unreadable)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert!(
+        last_error.unwrap_or_default().contains("could not be read"),
+        "the failure says why"
+    );
+
+    for _ in 0..5 {
+        batch_operations::run_one_batch_operation_chunk(&pool, runner, 100)
+            .await
+            .unwrap();
+    }
+    let readable = batch_operations::get_batch_operation(&pool, readable.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        readable.state,
+        batch_operations::BatchOperationState::Completed
+    );
 }
 
 #[tokio::test]
@@ -560,9 +633,25 @@ async fn the_build_repairs_invalid_indexes_and_waits_for_populated_ring_partitio
             .collect::<Vec<_>>(),
         vec![populated.as_str()]
     );
-    let pass = tag_index::build_tag_indexes(&pool, BuildMode::Now)
+    // A concurrent build waits for every older transaction. A long read
+    // must delay it, not abort it and leave an invalid index behind.
+    let mut long_read = pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(long_read.as_mut())
         .await
         .unwrap();
+    sqlx::query("SELECT txid_current()")
+        .execute(long_read.as_mut())
+        .await
+        .unwrap();
+    let build = tokio::spawn({
+        let pool = pool.clone();
+        async move { tag_index::build_tag_indexes(&pool, BuildMode::Now).await }
+    });
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(!build.is_finished(), "the build waits for the older read");
+    long_read.commit().await.unwrap();
+    let pass = build.await.unwrap().unwrap();
     assert_eq!(pass.built, 1);
     assert!(pass.complete());
     assert!(tag_index::tag_index_status(&pool)

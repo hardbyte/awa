@@ -281,7 +281,8 @@ export interface BatchOperation {
 }
 
 export interface BatchOperationPreview {
-  total_matched: number;
+  /** A plain number is exact. */
+  total_matched: number | JobCount;
   sample: JobRow[];
 }
 
@@ -388,6 +389,8 @@ function jobFilterQuery(params: ListJobsParams): URLSearchParams {
   }
   return qs;
 }
+
+export { ApiError } from "./observation/read-control.ts";
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {

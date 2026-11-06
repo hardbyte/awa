@@ -140,6 +140,7 @@ nav:
       - Python API: reference/python.md
       - Stability policy: stability.md
       - Architecture decisions: adr/README.md
+      - Incident reports: incidents/README.md
   - Contributing:
       - Contributing index: contributing/index.md
       - Development: development.md

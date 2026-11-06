@@ -68,9 +68,15 @@ export function useManagedQuery<T>(options: Options<T>) {
     // The captured function remains bound to this exact backend/scope/filter/page.
   }, [client, id, options.enabled]);
   useEffect(() => { attachment.current?.setPaused(options.paused ?? false); }, [id, options.paused]);
-  return { ...query, data: options.enabled === false ? undefined : query.data, error: admissionError ?? query.error,
+  const error = admissionError ?? query.error;
+  const result = { ...query, data: options.enabled === false ? undefined : query.data,
     isLoading: options.enabled !== false && query.data === undefined && !query.error && !admissionError,
     isRetainedNotFound: query.data !== undefined && query.error instanceof HttpError && query.error.status === 404,
-    isError: !!admissionError || (query.isError && query.data === undefined), isObservationStale: stale || query.isPlaceholderData,
+    isObservationStale: stale || query.isPlaceholderData,
     refetch: () => { attempt.current?.(); refreshScheduler.mark(id, true); return Promise.resolve(query); } };
+  // Preserve the error discriminator for callers while retaining stale data.
+  if (error && (admissionError || (query.isError && query.data === undefined))) {
+    return { ...result, error, isError: true as const };
+  }
+  return { ...result, error, isError: false as const };
 }
