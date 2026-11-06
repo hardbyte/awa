@@ -254,6 +254,7 @@ In Prometheus they appear under the OpenTelemetry [OTLP-to-Prometheus translatio
 | `awa.maintenance.promote_batches` | Counter | state | Promotion batches |
 | `awa.maintenance.promote_batch_size` | Histogram | state | Jobs promoted |
 | `awa.maintenance.promote_duration` | Histogram (s) | state | Promotion time |
+| `awa.maintenance.promote.lane_contention` | Counter | state, queue, outcome | Promotion lanes whose lock was busy: `handed_off` to a dedicated waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out` when a waiter's 30 s wait ran out |
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
 | `awa.maintenance.prune.attempts` | Counter | ring, outcome, reason | Ring prune outcomes, including destructive `pruned` and no-DDL `already_pruned` |
 | `awa.maintenance.prune.duration` | Histogram (s) | ring, phase | Successful destructive prune time split into `lock`, `truncate`, and `commit` |

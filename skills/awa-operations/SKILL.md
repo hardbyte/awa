@@ -137,7 +137,11 @@ tick). The leader alone runs cluster-wide scans: deferred→ready promotion, the
 three rescue paths (stale-heartbeat, hard-deadline, callback-timeout), ring
 rotation and prune, DLQ and descriptor cleanup, and cron evaluation. During an
 unfinalized transition it promotes both planes' deferred backlogs, so drain and
-post-flip execution do not depend on which runtime holds leadership. Every
+post-flip execution do not depend on which runtime holds leadership.
+Promotion gives each queue lane its own short transaction and hands a lane
+whose enqueue lock stays busy to a dedicated waiter, so a hot queue delays
+neither other queues' promotion nor rescue
+(`awa_maintenance_promote_lane_contention_total` counts the hand-offs). Every
 worker dispatches and heartbeats its own attempts. There is no `pg_cron` or
 external scheduler.
 
