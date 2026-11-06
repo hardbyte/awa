@@ -15514,3 +15514,77 @@ async fn test_queue_storage_receipt_claims_are_locked_before_the_heartbeat_state
         .expect("join heartbeat")
         .expect("heartbeat after the rewrite");
 }
+
+/// Metadata completions validate the exact compact item and do not lock the
+/// immutable batch shared with other attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_metadata_completion_validates_and_does_not_lock_compact_batch() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_metadata_completion_identity".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "metadata_completion_identity";
+    for id in 0..2 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.into(),
+                tags: vec!["retained".into()],
+                metadata: serde_json::json!({"source": "recovery"}),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let jobs = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+        .await
+        .expect("claim compact jobs with metadata");
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].claim.claim_batch_id, jobs[1].claim.claim_batch_id);
+    let mut invalid = jobs[0].clone();
+    invalid.claim.claim_batch_index = jobs[1].claim.claim_batch_index;
+    assert!(store
+        .complete_runtime_batch(&pool, &[invalid])
+        .await
+        .expect("reject a different batch item")
+        .is_empty());
+
+    let mut holder = pool.begin().await.expect("begin batch holder");
+    sqlx::query(&format!(
+        "SELECT batch_id FROM {}.lease_claim_batches \
+         WHERE claim_slot = $1 AND batch_id = $2 FOR UPDATE",
+        store.schema()
+    ))
+    .bind(jobs[0].claim.claim_slot)
+    .bind(jobs[0].claim.claim_batch_id.expect("compact batch"))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold the immutable batch row");
+    let completed = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(2)),
+        store.complete_runtime_batch(&pool, &jobs),
+    )
+    .await
+    .expect("completion must not wait on an unrelated batch-row lock")
+    .expect("complete metadata jobs");
+    assert_eq!(completed.len(), 2);
+    holder.rollback().await.expect("release batch row");
+    for job in jobs {
+        let durable = store
+            .load_job(&pool, job.job.id)
+            .await
+            .expect("read completed job")
+            .expect("completed job");
+        assert_eq!(durable.state, JobState::Completed);
+        assert_eq!(durable.tags, vec!["retained".to_string()]);
+        assert_eq!(durable.metadata, serde_json::json!({"source": "recovery"}));
+    }
+}
