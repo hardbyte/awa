@@ -116,6 +116,13 @@ impl PassSummary {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HelperAccess {
+    Available,
+    Missing,
+    Denied,
+}
+
 /// Refreshes planner statistics for one queue-storage schema.
 pub(crate) struct StatisticsRefresher {
     pool: PgPool,
@@ -205,9 +212,9 @@ impl StatisticsRefresher {
             }
         }
 
-        match self.helper_installed().await {
-            Ok(true) => {}
-            Ok(false) => {
+        match self.helper_access().await {
+            Ok(HelperAccess::Available) => {}
+            Ok(HelperAccess::Missing) => {
                 self.warn_unavailable_once();
                 self.record(
                     RelationScope::Pass,
@@ -217,8 +224,23 @@ impl StatisticsRefresher {
                 summary.record(AnalyzeOutcome::Unavailable);
                 return summary;
             }
+            Ok(HelperAccess::Denied) => {
+                self.warn_privilege_once(
+                    "queue_claim_heads",
+                    "the runtime role needs EXECUTE on awa.analyze_queue_storage_relation(text, text), \
+                     and the login role needs INSERT, UPDATE and DELETE on this schema's queue_claim_heads; \
+                     restore those grants as the schema owner",
+                );
+                self.record(
+                    RelationScope::Pass,
+                    AnalyzeOutcome::SkippedPrivilege,
+                    started.elapsed(),
+                );
+                summary.record(AnalyzeOutcome::SkippedPrivilege);
+                return summary;
+            }
             Err(err) => {
-                warn!(error = %err, schema = %self.schema, "Could not probe for the statistics helper");
+                warn!(error = %err, schema = %self.schema, "Could not probe access to the statistics helper");
                 self.record(
                     RelationScope::Pass,
                     AnalyzeOutcome::Failed,
@@ -277,16 +299,33 @@ impl StatisticsRefresher {
             .record_statistics_analyze(scope.as_str(), outcome.as_str(), elapsed);
     }
 
-    /// One catalog lookup per pass. A missing helper (a binary running ahead
-    /// of the schema) then costs this query instead of a failing call, and a
-    /// server-side ERROR line, per relation; the pass interval is the
-    /// re-probe interval.
-    async fn helper_installed(&self) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT to_regprocedure('awa.analyze_queue_storage_relation(text,text)') IS NOT NULL",
+    /// Check the helper and its caller privileges once per pass, so a missing
+    /// migration or grant does not produce a failing call for every relation.
+    async fn helper_access(&self) -> Result<HelperAccess, sqlx::Error> {
+        let (installed, allowed): (bool, bool) = sqlx::query_as(
+            r#"
+            SELECT helper IS NOT NULL,
+                   COALESCE(
+                       has_function_privilege(helper, 'EXECUTE')
+                       AND has_table_privilege(session_user, heads, 'INSERT')
+                       AND has_table_privilege(session_user, heads, 'UPDATE')
+                       AND has_table_privilege(session_user, heads, 'DELETE'),
+                       false
+                   )
+            FROM (
+                SELECT to_regprocedure('awa.analyze_queue_storage_relation(text,text)') AS helper,
+                       to_regclass(format('%I.queue_claim_heads', $1::text)) AS heads
+            ) AS objects
+            "#,
         )
+        .bind(&self.schema)
         .fetch_one(&self.pool)
-        .await
+        .await?;
+        Ok(match (installed, allowed) {
+            (false, _) => HelperAccess::Missing,
+            (true, false) => HelperAccess::Denied,
+            (true, true) => HelperAccess::Available,
+        })
     }
 
     async fn ring_parents(&self) -> Result<Vec<String>, sqlx::Error> {
@@ -314,8 +353,8 @@ impl StatisticsRefresher {
                     self.warn_privilege_once(
                         relation,
                         "the owner of awa.analyze_queue_storage_relation() may not ANALYZE this table; \
-                         run migrations as the role that owns the queue-storage tables, or grant the \
-                         function owner MAINTAIN on them (PostgreSQL 17+)",
+                         change the function's owner to the table owner with ALTER FUNCTION, \
+                         or grant the function owner MAINTAIN on them (PostgreSQL 17+)",
                     );
                     AnalyzeOutcome::SkippedPrivilege
                 }
@@ -502,5 +541,94 @@ mod tests {
             .execute(&admin)
             .await
             .expect("drop database");
+    }
+
+    /// Missing EXECUTE or login-role DML is a single skipped pass, rather
+    /// than fifteen server-side permission errors.
+    #[tokio::test]
+    async fn missing_helper_privileges_skip_the_pass_without_calling_it() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string());
+        let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("connect admin");
+        let database = format!("awa_stats_access_unit_{}", std::process::id());
+        let role = format!("awa_stats_access_{}", std::process::id());
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .expect("drop leftover database");
+        sqlx::raw_sql(&format!("DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'statistics_access_test'"))
+            .execute(&admin)
+            .await
+            .expect("create test role");
+        sqlx::raw_sql(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await
+            .expect("create database");
+        let owner = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone().database(&database))
+            .await
+            .expect("connect owner");
+        awa_model::migrations::run(&owner).await.expect("migrate");
+        sqlx::raw_sql(&format!(
+            "GRANT USAGE ON SCHEMA awa TO {role}; \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA awa TO {role}; \
+             REVOKE EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) FROM {role}"
+        ))
+        .execute(&owner)
+        .await
+        .expect("grant head-table privileges only");
+        let runtime = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                options
+                    .database(&database)
+                    .username(&role)
+                    .password("statistics_access_test"),
+            )
+            .await
+            .expect("connect runtime");
+        let refresher = StatisticsRefresher::new(
+            runtime.clone(),
+            "awa".to_string(),
+            AwaMetrics::from_global(),
+            false,
+        );
+        let denied = PassSummary {
+            skipped_privilege: 1,
+            ..PassSummary::default()
+        };
+        assert_eq!(refresher.run_pass().await, denied);
+        sqlx::raw_sql(&format!(
+            "GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) TO {role}"
+        ))
+        .execute(&owner)
+        .await
+        .expect("grant helper EXECUTE");
+        assert_eq!(refresher.run_pass().await.ok, 15);
+        sqlx::raw_sql(&format!(
+            "REVOKE INSERT ON awa.queue_claim_heads FROM {role}"
+        ))
+        .execute(&owner)
+        .await
+        .expect("revoke login-role head privilege");
+        assert_eq!(refresher.run_pass().await, denied);
+
+        runtime.close().await;
+        owner.close().await;
+        sqlx::raw_sql(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .expect("drop database");
+        sqlx::raw_sql(&format!("DROP ROLE {role}"))
+            .execute(&admin)
+            .await
+            .expect("drop test role");
+        admin.close().await;
     }
 }

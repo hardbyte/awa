@@ -42,10 +42,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   upgrading** (it applies the patch on a v040 schema; `awa migrate --sql`
   and `--extract-to` emit it as the repeatable script
   `R__analyze_queue_storage_relation`). The same
-  function is awa 0.7 migration v053, which replaces it cleanly. A binary
+  function is awa 0.7 migration v054, which replaces it cleanly. A binary
   running before the patch, or against a function whose owner may not analyse
   the tables, logs one warning naming what is missing and skips the refresh
   without affecting job processing. Earlier binaries never call the function.
+  The patch also repairs an older helper definition, PUBLIC EXECUTE or missing
+  grants for existing runtime roles; a missing runtime privilege skips a pass
+  before calling the helper.
 
 ### Fixed
 

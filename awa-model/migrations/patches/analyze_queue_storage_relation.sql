@@ -1,6 +1,6 @@
 -- Schema patch analyze_queue_storage_relation: planner statistics helper for
 -- the queue-storage tables autovacuum never analyses (#631).
--- Counterpart of awa 0.7 migration v053, minus the schema_version row; v053
+-- Counterpart of awa 0.7 migration v054, minus the schema_version row; v054
 -- replaces this body with one that checks the schema through
 -- awa.queue_storage_schemas(), which 0.6 does not have.
 --
@@ -78,6 +78,7 @@ DECLARE
     v_relowner    OID;
     v_may_analyze BOOLEAN;
 BEGIN
+    -- awa_statistics_helper_v1: bump when the definition or grants change.
     IF to_regprocedure(format(
         '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
         p_schema

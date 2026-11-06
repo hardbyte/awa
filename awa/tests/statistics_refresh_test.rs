@@ -811,3 +811,99 @@ async fn statistics_refresh_does_not_stop_prune_reclaiming_slots() {
     ));
     database.drop().await;
 }
+
+/// The versionless patch must repair an existing older helper, its public
+/// grant, and missing runtime grants without changing the schema version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_repairs_a_stale_statistics_helper_and_missing_runtime_grants() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("stats_owner_{suffix}");
+    let runtime = format!("stats_runtime_{suffix}");
+    let database = TestDatabase::create(Some(&owner), &[&runtime]).await;
+    let runtime_pool = database.runtime_pool(&runtime).await;
+    let owner_pool = &database.owner_pool;
+    run_sql(
+        owner_pool,
+        format!(
+            "CREATE OR REPLACE FUNCTION awa.analyze_queue_storage_relation(p_schema text, p_relation text) \
+         RETURNS text LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RETURN 'stale'; END $$; \
+         GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) TO PUBLIC; \
+         REVOKE EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) FROM {runtime}"
+        ),
+    )
+    .await
+    .expect("install an older helper with PUBLIC EXECUTE");
+    assert!(migrations::pending_schema_patches(owner_pool)
+        .await
+        .expect("pending patches")
+        .iter()
+        .any(|patch| patch.name == "analyze_queue_storage_relation"));
+    migrations::run(owner_pool)
+        .await
+        .expect("repair the helper");
+    assert_eq!(
+        call_helper(&runtime_pool, "awa", "queue_claim_heads")
+            .await
+            .expect("runtime helper"),
+        "analyzed"
+    );
+    let public_execute: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc AS helper, \
+         LATERAL aclexplode(COALESCE(helper.proacl, acldefault('f', helper.proowner))) AS privilege \
+         WHERE helper.oid = 'awa.analyze_queue_storage_relation(text,text)'::regprocedure \
+           AND privilege.grantee = 0 AND privilege.privilege_type = 'EXECUTE')"
+    ).fetch_one(owner_pool).await.expect("read PUBLIC grant");
+    assert!(!public_execute, "the patch revokes PUBLIC EXECUTE");
+    assert!(!migrations::pending_schema_patches(owner_pool)
+        .await
+        .expect("pending after repair")
+        .iter()
+        .any(|patch| patch.name == "analyze_queue_storage_relation"));
+
+    run_sql(
+        owner_pool,
+        "GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) TO PUBLIC"
+            .to_string(),
+    )
+    .await
+    .expect("restore the obsolete PUBLIC grant");
+    assert!(migrations::pending_schema_patches(owner_pool)
+        .await
+        .expect("pending PUBLIC grant")
+        .iter()
+        .any(|patch| patch.name == "analyze_queue_storage_relation"));
+    migrations::run(owner_pool)
+        .await
+        .expect("remove obsolete PUBLIC grant");
+
+    run_sql(
+        owner_pool,
+        format!(
+        "REVOKE EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) FROM {runtime}"
+    ),
+    )
+    .await
+    .expect("remove the runtime grant");
+    assert!(migrations::pending_schema_patches(owner_pool)
+        .await
+        .expect("pending missing grant")
+        .iter()
+        .any(|patch| patch.name == "analyze_queue_storage_relation"));
+    migrations::run(owner_pool)
+        .await
+        .expect("repair missing runtime grant");
+    assert_eq!(
+        call_helper(&runtime_pool, "awa", "queue_claim_heads")
+            .await
+            .expect("restored runtime helper"),
+        "analyzed"
+    );
+    assert_eq!(
+        migrations::current_version(owner_pool)
+            .await
+            .expect("schema version"),
+        migrations::CURRENT_VERSION
+    );
+    runtime_pool.close().await;
+    database.drop().await;
+}
