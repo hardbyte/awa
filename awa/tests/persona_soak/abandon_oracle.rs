@@ -47,6 +47,8 @@ pub struct Kill {
     pub started_by_process: i64,
     /// Open claims on the persona's queues right after the kill.
     pub open_after_kill: i64,
+    /// Claims of the process that were rescued before it was killed.
+    pub rescued_while_alive: i64,
     pub expired_peak: i64,
     pub oldest_expired_peak_s: f64,
     pub cleared_after_s: Option<f64>,
@@ -94,6 +96,10 @@ pub struct AbandonState {
     /// Handlers running in the child process at its last report.
     pub child_active: AtomicI64,
     started_by_process: Mutex<HashMap<u32, i64>>,
+    /// The running child process and the epoch milliseconds at which it was started.
+    live: Mutex<Option<(u32, i64)>>,
+    /// Most claims of a process seen rescued while it was alive, per process.
+    live_lost: Mutex<HashMap<u32, i64>>,
     attempts: Mutex<HashMap<i64, Vec<Attempt>>>,
     max_attempts: Mutex<HashMap<i64, i16>>,
     /// Epoch milliseconds at which each process generation was killed.
@@ -108,6 +114,15 @@ pub struct Probe {
     pub open: i64,
     pub expired: i64,
     pub oldest_expired_s: f64,
+    /// Open claims taken at or after the `since` the probe was given.
+    pub open_since: i64,
+}
+
+/// The process that is alive, and how many handlers it had started before the probe.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveCheck {
+    pub generation: u32,
+    pub started: i64,
 }
 
 impl AbandonState {
@@ -152,6 +167,23 @@ impl AbandonState {
             .insert(generation, at_epoch_ms);
     }
 
+    pub fn set_live(&self, live: Option<(u32, i64)>) {
+        *self.live.lock().expect("live") = live;
+    }
+
+    pub fn live(&self) -> Option<(u32, i64)> {
+        *self.live.lock().expect("live")
+    }
+
+    pub fn live_lost(&self, generation: u32) -> i64 {
+        self.live_lost
+            .lock()
+            .expect("live lost")
+            .get(&generation)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn record_kill(&self, kill: Kill) {
         self.kills.lock().expect("kills").push(kill);
     }
@@ -182,7 +214,14 @@ impl AbandonState {
     }
 
     /// Records one probe and advances the per-kill clocks.
-    pub fn observe(&self, shared: &Shared, probe: &Probe, ring_generation: i64, probe_ms: i64) {
+    pub fn observe(
+        &self,
+        shared: &Shared,
+        probe: &Probe,
+        live: Option<LiveCheck>,
+        ring_generation: i64,
+        probe_ms: i64,
+    ) {
         let now = shared.now_ms();
         self.open_claims.store(probe.open, Ordering::Relaxed);
         let sample = Sample {
@@ -217,6 +256,30 @@ impl AbandonState {
         );
         stats.observe("probe_ms", probe_ms);
 
+        // Every claim a live process started stays open until the process dies, so any
+        // missing from the store were rescued from under it.
+        if let Some(live) = live {
+            let lost = (live.started - probe.open_since).max(0);
+            let mut peaks = self.live_lost.lock().expect("live lost");
+            let peak = peaks.entry(live.generation).or_insert(0);
+            let first = lost > 0 && *peak == 0;
+            *peak = (*peak).max(lost);
+            drop(peaks);
+            stats.set_max("live_claims_rescued_peak", lost);
+            if first {
+                shared.violation(
+                    "live_owner_rescued",
+                    format!(
+                        "claims of process {} were rescued while it was alive: it had started {} handler(s) and only {} of its claims were still open ({} claim(s) were eligible for rescue)",
+                        live.generation, live.started, probe.open_since, probe.expired
+                    ),
+                    vec![format!(
+                        "{{\"process\":{},\"started\":{},\"claims_still_open\":{},\"eligible_for_rescue\":{}}}",
+                        live.generation, live.started, probe.open_since, probe.expired
+                    )],
+                );
+            }
+        }
         let staleness_ms = (STALENESS_SECS as i64 + 3) * 1_000;
         let epoch = epoch_ms();
         let bound = shared.config.abandon_bound;
@@ -395,14 +458,15 @@ impl AbandonState {
         let samples = self.samples.lock().expect("samples");
         let mut out = String::new();
         out.push_str("### Kills\n\n");
-        out.push_str("| kill | held by the process | open claims after kill | peak expired | oldest expired (s) | time to clear (s) | ring stalled (s) | ring resumed after (s) |\n");
-        out.push_str("| -- | -- | -- | -- | -- | -- | -- | -- |\n");
+        out.push_str("| kill | held by the process | rescued while alive | open claims after kill | peak expired | oldest expired (s) | time to clear (s) | ring stalled (s) | ring resumed after (s) |\n");
+        out.push_str("| -- | -- | -- | -- | -- | -- | -- | -- | -- |\n");
         for (kill, (stalled, resumed)) in kills.iter().zip(ring) {
             out.push_str(&format!(
-                "| {}{} | {} | {} | {} | {:.0} | {} | {:.0} | {} |\n",
+                "| {}{} | {} | {} | {} | {} | {:.0} | {} | {:.0} | {} |\n",
                 kill.number,
                 if kill.load_ended { " (load end)" } else { "" },
                 kill.started_by_process,
+                kill.rescued_while_alive,
                 kill.open_after_kill,
                 kill.expired_peak,
                 kill.oldest_expired_peak_s,
@@ -621,11 +685,14 @@ pub enum Scope<'a> {
 /// Open claims in `scope`, and the ones the rescue is already entitled to take: claims
 /// whose last heartbeat (or claim time, when there never was one) is older than
 /// `staleness_secs`, or whose deadline has passed.
+///
+/// `since_epoch_ms` splits out the open claims taken at or after that time.
 pub async fn probe_backlog(
     pool: &PgPool,
     schema: &str,
     scope: Scope<'_>,
     staleness_secs: f64,
+    since_epoch_ms: i64,
 ) -> Result<Probe, sqlx::Error> {
     let (batch_filter, row_filter, lease_leg) = match &scope {
         Scope::Queues(_) => (
@@ -633,13 +700,14 @@ pub async fn probe_backlog(
             "c.queue = ANY($1)",
             format!(
                 "UNION ALL
-            SELECT COALESCE(a.heartbeat_at, l.heartbeat_at, l.attempted_at), l.deadline_at
+            SELECT COALESCE(a.heartbeat_at, l.heartbeat_at, l.attempted_at), l.deadline_at,
+                   COALESCE(l.attempted_at, l.heartbeat_at)
             FROM {schema}.leases l
             LEFT JOIN {schema}.attempt_state a ON a.job_id = l.job_id AND a.run_lease = l.run_lease
             WHERE l.queue = ANY($1) AND l.state = 'running'"
             ),
         ),
-        Scope::Slot(_) => ("b.claim_slot = $3", "c.claim_slot = $3", String::new()),
+        Scope::Slot(_) => ("b.claim_slot = $4", "c.claim_slot = $4", String::new()),
     };
     let sql = format!(
         r#"
@@ -670,7 +738,7 @@ pub async fn probe_backlog(
               AND NOT EXISTS (SELECT 1 FROM {schema}.dlq_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
         ),
         holders AS (
-            SELECT COALESCE(a.heartbeat_at, x.claimed_at) AS beat_at, x.deadline_at
+            SELECT COALESCE(a.heartbeat_at, x.claimed_at) AS beat_at, x.deadline_at, x.claimed_at
             FROM open_receipts x
             LEFT JOIN {schema}.attempt_state a ON a.job_id = x.job_id AND a.run_lease = x.run_lease
             {lease_leg}
@@ -679,27 +747,35 @@ pub async fn probe_backlog(
             SELECT LEAST(
                        CASE WHEN beat_at < stale_before THEN beat_at + make_interval(secs => $2) END,
                        CASE WHEN deadline_at < now_ts THEN deadline_at END
-                   ) AS eligible_at
+                   ) AS eligible_at,
+                   claimed_at >= to_timestamp($3::float8 / 1000.0) AS since_start
             FROM holders, bounds
         )
         SELECT count(*)::bigint,
                count(eligible_at)::bigint,
-               COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - min(eligible_at))), 0)::float8
+               COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - min(eligible_at))), 0)::float8,
+               count(*) FILTER (WHERE since_start)::bigint
         FROM eligible
         "#
     );
-    let query = sqlx::query_as::<_, (i64, i64, f64)>(&sql);
+    let query = sqlx::query_as::<_, (i64, i64, f64, i64)>(&sql);
     let query = match scope {
-        Scope::Queues(queues) => query.bind(queues.to_vec()).bind(staleness_secs).bind(0_i32),
+        Scope::Queues(queues) => query
+            .bind(queues.to_vec())
+            .bind(staleness_secs)
+            .bind(since_epoch_ms as f64)
+            .bind(0_i32),
         Scope::Slot(slot) => query
             .bind(Vec::<String>::new())
             .bind(staleness_secs)
+            .bind(since_epoch_ms as f64)
             .bind(slot),
     };
-    let (open, expired, oldest) = query.fetch_one(pool).await?;
+    let (open, expired, oldest, open_since) = query.fetch_one(pool).await?;
     Ok(Probe {
         open,
         expired,
         oldest_expired_s: oldest.max(0.0),
+        open_since,
     })
 }

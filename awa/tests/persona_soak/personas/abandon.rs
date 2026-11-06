@@ -14,7 +14,7 @@
 //! `max_attempts`.
 
 use super::super::abandon_oracle::{
-    epoch_ms, probe_backlog, Attempt, Kill, Scope, FINISHER, STALENESS_SECS,
+    epoch_ms, probe_backlog, Attempt, Kill, LiveCheck, Scope, FINISHER, STALENESS_SECS,
 };
 use super::super::config::Persona;
 use super::super::db::{connect_pool, connect_pool_with_timeout, ClientFactory};
@@ -554,6 +554,7 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
                 &schema,
                 Scope::Slot((slot + 1).rem_euclid(slot_count)),
                 STALENESS_SECS,
+                0,
             )
             .await
             .ok()
@@ -565,11 +566,27 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
             .abandon
             .observe_ring(&shared, slot, ring_generation, next_slot);
         if tick.is_multiple_of(3) {
+            // Read what the live process has started before the probe, so a claim started
+            // meanwhile cannot make a claim look missing.
+            let live = shared.abandon.live();
+            let live_check = live.map(|(generation, _)| LiveCheck {
+                generation,
+                started: shared.abandon.started_by(generation),
+            });
             let started = Instant::now();
-            match probe_backlog(&pool, &schema, Scope::Queues(&queues), STALENESS_SECS).await {
+            match probe_backlog(
+                &pool,
+                &schema,
+                Scope::Queues(&queues),
+                STALENESS_SECS,
+                live.map_or(0, |(_, spawned)| spawned),
+            )
+            .await
+            {
                 Ok(probe) => shared.abandon.observe(
                     &shared,
                     &probe,
+                    live_check,
                     ring_generation,
                     started.elapsed().as_millis() as i64,
                 ),
@@ -726,6 +743,9 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         )?;
         shared.abandon.child_alive.store(true, Ordering::Relaxed);
         shared.abandon.child_active.store(0, Ordering::Relaxed);
+        shared
+            .abandon
+            .set_live(Some((generation, epoch_ms() - 1_000)));
         let spawned = Instant::now();
         let mut ramped = false;
         shared.note(
@@ -780,6 +800,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         shared
             .abandon
             .note_generation_killed(generation, signalled_epoch_ms);
+        shared.abandon.set_live(None);
         shared.abandon.child_alive.store(false, Ordering::Relaxed);
         shared.abandon.child_active.store(0, Ordering::Relaxed);
         importer.import(&shared);
@@ -788,6 +809,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             &schema,
             Scope::Queues(&queues),
             STALENESS_SECS,
+            0,
         )
         .await
         .map_or(-1, |probe| probe.open);
@@ -798,6 +820,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             at_run_ms: signalled_run_ms,
             signalled_epoch_ms,
             started_by_process: started,
+            rescued_while_alive: shared.abandon.live_lost(generation),
             open_after_kill,
             expired_peak: 0,
             oldest_expired_peak_s: 0.0,
