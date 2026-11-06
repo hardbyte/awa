@@ -105,9 +105,19 @@ fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
 #[derive(Clone)]
 pub(crate) struct CompletionBatcherHandle {
     shards: Vec<mpsc::Sender<CompletionRequest>>,
+    pipeline_capacity: usize,
 }
 
 impl CompletionBatcherHandle {
+    /// How many finished attempts may wait for finalization at once: enough
+    /// to keep every shard's in-flight and next batch full, and at least one
+    /// per worker.
+    pub fn finalizer_capacity(&self, runtime_worker_capacity: u32) -> usize {
+        self.pipeline_capacity
+            .max(runtime_worker_capacity.max(1) as usize)
+            .min(tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
     pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
         self.complete_inner(job_id, run_lease, None, None).await
     }
@@ -185,7 +195,14 @@ impl CompletionBatcher {
             });
         }
 
-        (Self { workers }, CompletionBatcherHandle { shards })
+        (
+            Self { workers },
+            CompletionBatcherHandle {
+                shards,
+                // Each shard needs an in-flight batch and a queued batch.
+                pipeline_capacity: batch_size.saturating_mul(shard_count).saturating_mul(2),
+            },
+        )
     }
 
     pub fn spawn(self) -> Vec<tokio::task::JoinHandle<()>> {

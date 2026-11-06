@@ -3,6 +3,8 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+mod ci_timing;
+
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
     BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
@@ -2007,6 +2009,151 @@ impl Worker for MultiClientTrackingWorker {
         tokio::time::sleep(Duration::from_millis(10)).await;
         Ok(JobResult::Completed)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct FinalizeBacklogJob {
+    n: i64,
+}
+
+/// A runtime's finished attempts stop heartbeating once they are handed to
+/// finalization, so it must stop claiming when finalization falls behind.
+/// Otherwise the backlog of finished, unheartbeated attempts grows with the
+/// claim rate, outlives `heartbeat_staleness`, and rescue runs those jobs
+/// again. Holding the first jobs' receipt-completion locks stalls the
+/// completion batcher, standing in for a batcher that cannot keep up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_stops_claiming_while_finalization_is_stalled() {
+    // The default completion pipeline: one shard of 512-job batches, one
+    // batch in flight and one queued.
+    const FINALIZER_CAPACITY: usize = 1_024;
+    const WORKERS: u32 = 64;
+    const JOBS: i64 = 1_600;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_finalize_backlog";
+    let store_config = QueueStorageConfig {
+        schema: "awa_qs_finalize_backlog".to_string(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    for first in (0..JOBS).step_by(500) {
+        let params: Vec<_> = (first..(first + 500).min(JOBS))
+            .map(|n| {
+                insert::params_with(
+                    &FinalizeBacklogJob { n },
+                    InsertOpts {
+                        queue: queue.to_string(),
+                        ..Default::default()
+                    },
+                )
+                .expect("params")
+            })
+            .collect();
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("enqueue backlog");
+    }
+
+    let first_jobs: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT $2",
+        store.schema()
+    ))
+    .bind(queue)
+    .bind(i64::from(WORKERS) * 2)
+    .fetch_all(&pool)
+    .await
+    .expect("first jobs");
+    let mut lock_holder = pool.acquire().await.expect("lock connection");
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', job_id, 1), 0))
+         FROM unnest($1::bigint[]) AS job_id",
+    )
+    .bind(&first_jobs)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("stall the first jobs' finalization");
+
+    let runs: Arc<std::sync::Mutex<HashMap<i64, u32>>> = Arc::default();
+    let recorded = runs.clone();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: WORKERS,
+                poll_interval: Duration::from_millis(10),
+                deadline_duration: Duration::ZERO,
+                claim_batch_size: WORKERS as usize,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register::<FinalizeBacklogJob, _, _>(move |_, ctx| {
+            *recorded
+                .lock()
+                .expect("runs")
+                .entry(ctx.job.id)
+                .or_insert(0) += 1;
+            async { Ok(JobResult::Completed) }
+        })
+        .heartbeat_staleness(Duration::from_secs(300))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("build finalize backlog client");
+    client.start().await.expect("start finalize backlog client");
+
+    // Wait for claiming to stop, or to run past the bound. A fixed runtime
+    // can never pass it, so a pause in claiming only weakens the check.
+    let limit = FINALIZER_CAPACITY + WORKERS as usize;
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    let mut last = (0, Instant::now());
+    let started_while_stalled = loop {
+        let started = runs.lock().expect("runs").len();
+        if started > limit {
+            break started;
+        }
+        if started != last.0 {
+            last = (started, Instant::now());
+        } else if started > 0 && last.1.elapsed() >= Duration::from_secs(5) {
+            break started;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "claiming neither stopped nor passed {limit}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    sqlx::query("SELECT pg_catalog.pg_advisory_unlock_all()")
+        .execute(&mut *lock_holder)
+        .await
+        .expect("release the stalled finalization");
+    drop(lock_holder);
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(60));
+    while completed_terminal_count(&pool, &store, queue).await < JOBS {
+        assert!(Instant::now() < deadline, "the backlog did not drain");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client.shutdown(Duration::from_secs(10)).await;
+
+    assert!(
+        started_while_stalled <= limit,
+        "{started_while_stalled} jobs started while finalization was stalled; \
+         at most {limit} may wait without a heartbeat or hold a worker"
+    );
+    let runs = runs.lock().expect("runs");
+    assert_eq!(runs.len() as i64, JOBS);
+    assert!(
+        runs.values().all(|count| *count == 1),
+        "a job ran more than once"
+    );
 }
 
 /// ADR-023 claim-ring control-plane smoke test. Exercises

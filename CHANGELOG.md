@@ -6,6 +6,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A completion backlog no longer gets finished jobs rescued and run
+  again.** An attempt stops heartbeating when its handler returns, and its
+  finalize then waits for the completion batcher. The runtime released the
+  worker slot at the same moment and kept claiming, so when finalization was
+  slower than claiming (for example, retried jobs, whose completions take
+  the slower per-row path) the queue of finished, unheartbeated attempts grew
+  without bound. Attempts that waited longer than `heartbeat_staleness` were
+  rescued and executed again, some of them twice. At most `2 × batch size ×
+  completion shards` attempts (1,024 by default), and at least one per
+  worker, now wait for finalization. Past that, a finished attempt keeps its
+  worker slot and its heartbeat until there is room, so the dispatcher stops
+  claiming until finalization catches up.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are

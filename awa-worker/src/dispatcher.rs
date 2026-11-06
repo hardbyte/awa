@@ -851,6 +851,8 @@ mod tests {
             completion,
             storage.clone(),
             crate::executor::DlqPolicy::default(),
+            CancellationToken::new(),
+            1,
         ));
         let config = QueueConfig {
             max_workers: 1,
