@@ -4,7 +4,7 @@
 //!
 //! The maintenance leader runs one pass on election and one every interval.
 //! Each relation is analysed through `awa.analyze_queue_storage_relation`
-//! (migration v053, `SECURITY DEFINER`) in its own short transaction with a
+//! (migration v054, `SECURITY DEFINER`) in its own short transaction with a
 //! bounded `lock_timeout` and `statement_timeout`, so the refresh never holds
 //! locks across relations and cannot wait on ring prune for long.
 
@@ -78,7 +78,7 @@ pub(crate) enum AnalyzeOutcome {
     /// `lock_timeout` expired waiting on a conflicting lock.
     SkippedLock,
     /// `awa.analyze_queue_storage_relation` is not installed (schema older
-    /// than v053).
+    /// than v054).
     Unavailable,
     Failed,
 }
@@ -431,7 +431,7 @@ impl StatisticsRefresher {
         warn!(
             schema = %self.schema,
             "Planner statistics refresh is disabled: awa.analyze_queue_storage_relation() \
-             is missing. Run `awa migrate` (schema v053 or later) to install it"
+             is missing. Run `awa migrate` (schema v054 or later) to install it"
         );
     }
 

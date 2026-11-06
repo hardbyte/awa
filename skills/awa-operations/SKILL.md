@@ -91,11 +91,14 @@ Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
 ## Restricted Database Roles
 
-When deploying a runtime without schema CREATE, apply v049 and provision every
-queue with `awa storage prepare-queue` as the migrator before starting producers
-or workers. Match shard/stripe counts; provision additional lanes before changing
-routing. Use the sequence grants and owner defaults in
-[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+From v053 any runtime role creates lanes through the schema owner's
+`SECURITY DEFINER` provisioning functions, so runtimes need neither schema
+CREATE nor sequence default privileges, and `awa storage prepare-queue` is
+optional. Run migrations with the schema owner as the effective role. Check
+lane ownership with `awa storage lane-sequences` (exits 2 while lanes need
+repair) and fix it with `--repair`, connected as the migration role itself
+rather than as the schema owner, or with the statements it prints; see
+[Database roles](../../docs/security/database-roles.md#check-and-repair-lane-ownership).
 
 ## Rolling Upgrades
 
@@ -319,7 +322,7 @@ On queue storage the leader runs `ANALYZE` on `queue_claim_heads`,
 `statistics_refresh_interval` (default 5 minutes; Python
 `statistics_refresh_interval_ms`; zero disables), because autovacuum never
 analyses them. It goes through the `SECURITY DEFINER` function
-`awa.analyze_queue_storage_relation` from migration v053, so a non-owner runtime
+`awa.analyze_queue_storage_relation` from migration v054, so a non-owner runtime
 role needs no `MAINTAIN` grant. Watch `awa.maintenance.analyze.attempts`: any
 `unavailable` means the helper is missing: run `awa migrate` as the schema
 owner. For `skipped_privilege`, restore helper EXECUTE and the login role's

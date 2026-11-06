@@ -1,4 +1,4 @@
--- v053: Planner statistics for the queue-storage tables autovacuum never analyses (#631)
+-- v054: Planner statistics for the queue-storage tables autovacuum never analyses (#631)
 --
 -- Autovacuum does not analyse partitioned tables, so the ring parents
 -- (ready_entries, done_entries, leases, ...) have no inherited statistics. It
@@ -176,5 +176,5 @@ END
 $grant$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (53, 'Planner statistics refresh for queue-storage tables autovacuum never analyses')
+VALUES (54, 'Planner statistics refresh for queue-storage tables autovacuum never analyses')
 ON CONFLICT (version) DO NOTHING;

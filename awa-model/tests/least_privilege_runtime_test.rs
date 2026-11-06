@@ -250,21 +250,26 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
         INSERT INTO {schema}.queue_claim_heads(queue, priority, enqueue_shard) VALUES ('prepared_queue', 2, 0) ON CONFLICT DO NOTHING;
         SELECT {schema}.reserve_enqueue_seq('prepared_queue', 2::smallint, 0::smallint, 3);
     "#)))).await?;
-    let error = pool
-        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
-            "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint)"
-        ))))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.as_database_error().unwrap().code().as_deref(),
-        Some("42501")
-    );
-    assert!(error
-        .as_database_error()
-        .unwrap()
-        .message()
-        .contains("has not been provisioned"));
+    // An unprepared lane is created through the schema owner's provisioning
+    // function, so the runtime still issues no DDL of its own.
+    pool.execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+        "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint); \
+         SELECT {schema}.provision_lane('unprepared_queue', 2::smallint, 0::smallint);"
+    ))))
+    .await?;
+    let foreign_owned: i64 = sqlx::query_scalar(awa_model::audited_sql(format!(
+        "SELECT count(*) FROM pg_class \
+         WHERE relnamespace = '{schema}'::regnamespace AND relkind = 'S' \
+           AND relowner <> (SELECT nspowner FROM pg_namespace WHERE nspname = '{schema}')"
+    )))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(foreign_owned, 0);
+    sqlx::query_scalar::<_, i64>(awa_model::audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq('unprepared_queue', 2::smallint, 0::smallint, 1)"
+    )))
+    .fetch_one(pool)
+    .await?;
     let error = pool
         .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
             "CREATE TABLE {schema}.must_not_create(id integer)"
@@ -331,10 +336,14 @@ async fn exercise_lazy_lane(options: PgConnectOptions, owner: &str, runtime: &st
             "GRANT USAGE, CREATE ON SCHEMA awa TO {runtime}; \
              GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO {runtime}; \
              GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {runtime}; \
-             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime};"
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime}; \
+             REVOKE EXECUTE ON FUNCTION awa.provision_lane_sequences(text, smallint, smallint) \
+               FROM PUBLIC, {runtime};"
         ),
     )
     .await?;
+    // Without the provisioning function the runtime creates the lane's
+    // sequences itself and owns them, as a 0.6 runtime with CREATE did.
     let runtime_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(options.username(runtime))

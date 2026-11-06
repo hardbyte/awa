@@ -25,7 +25,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`
   (scope `heads`, `ring_parent` or `pass`; outcome `ok`, `skipped_privilege`,
   `skipped_lock`, `unavailable` or `failed`).
-- **Migration v053 adds `awa.analyze_queue_storage_relation(schema, relation)`,
+- **Migration v054 adds `awa.analyze_queue_storage_relation(schema, relation)`,
   so a runtime role that does not own the tables can refresh statistics.**
   `ANALYZE` skips a table its caller may not analyse, and the documented
   runtime grants do not include `MAINTAIN`, so the refresh runs through this
@@ -48,6 +48,33 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first (migration v053).** A lane's enqueue and claim sequences belonged to
+  the role that first enqueued into, claimed from or promoted into it, so with
+  several runtime roles sharing a group role, any role other than the creator
+  whose default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. Lanes are now created through two
+  `SECURITY DEFINER` functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. After v053 commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence per
+  transaction with a 300 ms lock wait, and only where it is allowed to, trying
+  the effective role and then the login role. A sequence an open transaction
+  holds is skipped and reported as busy; one it may not change is reported
+  with the roles that can repair it. Neither fails the migration. The new
+  read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the statements
+  to run and the roles to run them as, and exits 2 while any remain;
+  `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per sequence)
+  repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running ahead of v053 detects that `provision_lane` is missing and creates
+  lanes as before, and older binaries create correctly owned lanes once v053
+  has refreshed the helpers they call. See "Lane ownership and v053" in the
+  0.6 to 0.7 upgrade guide.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
@@ -193,9 +220,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
     deletion against its lane's completion batches. One production-sized
     fixture took 5.4 s for that check alone. Each affected batch is now read
     once.
-  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and the job list
-  still read retained history; the test lists them and fails once one
-  stops, so the list can only shrink.
+  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and job lists that
+  can include completed jobs still read retained history; the test lists
+  those it exercises and fails once one stops, so the list can only shrink.
 - **Queue lag in the admin UI is the age of the oldest available job
   again.** On queue storage it had become the age of each lane's next job,
   which hides an older job a queue move or priority aging appended behind
@@ -233,6 +260,40 @@ Notable changes between releases. Detailed migration notes for storage transitio
   against that data it ran for over 10 minutes and filled the disk with
   temporary files. It now takes 0.6 s, with all 100,000 completions inside
   the window.
+- **`admin::job_kind_overviews` on queue storage no longer depends on the
+  planner's row estimates.** Behind the admin UI's kinds page, it counted
+  every job through the `current_jobs` view. Two nodes of that view are
+  estimated at one row whatever the statistics say: the join from completion
+  batches to `ready_entries`, and the `UNION ALL` over every place a job can
+  live. Postgres therefore chose nested loops that visit each retained row,
+  and the join on `queue_claim_heads` was only as good as that table's
+  estimate, which autovacuum never refreshes. It now aggregates each place to
+  `(kind, queue)` on its own and combines the results: available jobs are
+  found per lane from the claim cursor, and a completion batch's members are
+  unnested and probed along the ready primary key. The rows are identical,
+  and a test compares them with the former definition across every job
+  state. With 2.6 million retained ready rows (1.8 million of them available)
+  and 860,000 retained completions it takes about 6 to 8 s instead of 20 s on
+  PostgreSQL 17 and 18. It still reads each available job and each retained
+  completion's ready row, because a job's kind lives there. JIT is off for
+  the read.
+- **`admin::list_jobs` on queue storage reads only the places that can hold
+  the requested state.** It selected candidate ids from the `current_jobs`
+  view, so every listing, whatever its filter, planned around the same
+  single-row estimates and joined each retained completion to a scan of the
+  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
+  timeout. Each place a job can live is now read and limited on its own,
+  only those that can hold the state asked for, with a predicate for each
+  filter that is set rather than `$n IS NULL OR` terms, which a prepared
+  statement's generic plan can't drop. Completion batches are ordered by job
+  id before their ready rows are probed, so a page probes only as many as it
+  returns. The ids are identical, and a test compares them with the former
+  definition for every state, kind, queue, limit and page. On the dataset
+  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
+  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
+  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
+  from more than four minutes). Available jobs and completions are still read
+  in full when the state allows them. JIT is off for the read.
 
 ## [0.7.0-alpha.1] — 2026-10-29
 
