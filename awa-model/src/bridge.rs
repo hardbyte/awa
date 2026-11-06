@@ -169,6 +169,7 @@ pub mod tokio_pg {
                 callback_on_fail: col(row, "callback_on_fail")?,
                 callback_transform: col(row, "callback_transform")?,
                 progress: col(row, "progress")?,
+                output: None,
             })
         }
     }

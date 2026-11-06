@@ -4,12 +4,242 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Batch enqueues take their lane locks in one order, so they no longer
+  deadlock with each other.** On queue storage every enqueue holds a
+  transaction-scoped advisory lock on its `(queue, priority, shard)` lane
+  until commit. `insert_many` and `insert_many_copy` took those locks in input
+  order, while `QueueStorage` batch enqueues took them in sorted order, so a
+  batch spanning several queues listed differently from another batch or from
+  a `QueueStorage` enqueue could deadlock with it (`40P01`). The two insert
+  paths now sort rows by `(queue, priority, shard)`, queues compared bytewise,
+  before they reach `awa.insert_job_compat`, the order `QueueStorage` already
+  used, and still return rows in input order. Job ids within a batch that
+  spans several lanes are now allocated lane by lane rather than in input
+  order, and when an `insert_many_copy` batch carries the same unique key in
+  more than one lane, the row in the lowest lane is the one inserted. A
+  transaction that enqueues with separate statements still takes locks in
+  statement order; see "`deadlock detected` while enqueueing" in the
+  troubleshooting guide.
+- **Scheduled, snoozed and retry-after jobs are no longer held back while
+  the maintenance leader is overloaded.** The leader backs a maintenance
+  branch off for a cooldown after its body repeatedly runs longer than its
+  interval, and promotion, which makes every scheduled, snoozed and
+  retry-after job runnable, was backed off like the rest, so those jobs
+  waited out the cooldown. The cooldown also counted ticks, and under CPU
+  starvation the leader loop services a branch's tick only once many other
+  branches have run, so a cooldown of a few seconds could last several times
+  that. Promotion is no longer backed off; other branches (rescues, cleanup)
+  back off for a wall-clock duration of twice the overrunning body, capped
+  at five seconds. The leader's interval timers also delay rather than burst
+  after a stall, so a stall no longer queues back-to-back catch-up ticks.
+- **`admin::drain_queue` on queue storage cancels a backlog in bulk and
+  drains every stripe of a striped queue.** It found the queue's jobs through
+  a lookup that read every retained ready row, then cancelled them one at a
+  time, several statements each, inside one transaction, so draining a large
+  backlog took minutes and held its row locks throughout. Scheduled,
+  retryable and available jobs are now cancelled 1,000 at a time, each chunk
+  one short transaction, with available rows read from each lane's claim
+  cursor; waiting jobs are still cancelled one by one and running jobs are
+  left alone. Jobs enqueued after the drain starts are left for a later
+  call, so draining a queue that keeps receiving work still returns, and
+  the drain moves each lane's claim cursor past the rows it cancelled, so
+  workers reach the jobs behind them on their next poll. It also matched
+  only the logical queue name, so draining a striped queue cancelled
+  nothing; it now covers every stripe. `awa queue drain` and the Python
+  `drain_queue` use this path.
+- **Cancelling, moving or reprioritising an available job on queue storage
+  no longer acts on a job a worker has already claimed.** A claim moves its
+  lane's claim cursor past the rows it took only after it commits, so
+  briefly, or until the next claim if that advance failed, a claimed row
+  still looked available. A cancel in that window wrote a cancelled terminal
+  row while the attempt kept running, and a move re-enqueued a job that was
+  already executing. A claim still in progress was missed the same way.
+  These paths now wait for any claim in progress on the job's lane and skip
+  rows a claim has recorded, the same evidence claims use to skip them, so a
+  cancel reaches the running attempt instead.
+- **Queue storage no longer drives PostgreSQL 18 into a backend crash when a
+  rescue, cancel or claim close locks a row-local claim that was just
+  rewritten.** A statement that locks a row another transaction updated after
+  the statement's snapshot rechecks the row (EvalPlanQual). In PostgreSQL 18
+  (reproduced on 18.6) that recheck rebuilds the statement's run-time
+  partition pruning state in memory that is freed when the lock runs out of
+  rows, so a later pruning pass in the same statement reads freed memory and
+  the backend segfaults
+  ([pgsql-bugs report](https://www.postgresql.org/message-id/CAP2G_gGpV%3DrKMLuET4RW-qO41GvBvi6Czsjsj16eT9hAwHxG6w%40mail.gmail.com)).
+  0.6 runtimes write a row-local claim for every deadline-bearing job, and
+  their deadline rescue crashed the server when a heartbeat rewrote an
+  expired claim mid-rescue; this branch writes compact claims, so it meets
+  row-local claims only while 0.6 runtimes are still in flight. The rescues
+  now update the slot's own claim partition, the completion, heartbeat,
+  progress, callback and close paths lock their attempts' row-local claims
+  in a statement that prunes nothing before the statements that lock them
+  again, and cancel locks row and batch receipts in separate statements.
+- **`insert_many` no longer fails above 5,461 jobs in one call.** It built one
+  multi-row `VALUES` statement with twelve bind parameters per job, so a call
+  with more than 5,461 jobs exceeded PostgreSQL's 65,535-parameter limit and
+  failed client-side with `too many arguments for query` before reaching the
+  server. It now sends one array per column through a single fixed-text
+  statement over `unnest(...)`, so the bind count no longer depends on the
+  batch size and the call keeps its single-statement, caller-transaction
+  semantics, on both the canonical and queue-storage engines.
+- **Duration and size histograms now export explicit bucket boundaries, so
+  latency quantiles are accurate.** `awa.job.duration`,
+  `awa.dispatch.claim_duration`, `awa.dispatch.wake_to_claim_duration`,
+  `awa.completion.flush_duration` and `awa.maintenance.promote_duration`
+  record seconds but were exported with the OpenTelemetry SDK's default
+  millisecond-scale buckets (0, 5, 10, 25, ... 10000), so almost every
+  observation landed in the first bucket and `histogram_quantile` p50/p95/p99
+  were flat lines near 2.5 s, 4.75 s and 4.95 s whatever the real latency.
+  Latency histograms now use 0.5 ms to 30 s buckets and job duration uses
+  1 ms to 1 h buckets. The batch-size, capacity and skipped-row histograms
+  (`awa.enqueue.batch_size`, `awa.dispatch.capacity_available`,
+  `awa.dispatch.claim_batch_size`, `awa.completion.flush_batch_size`,
+  `awa.maintenance.promote_batch_size`,
+  `awa.maintenance.rotate.skipped_rows`,
+  `awa.maintenance.prune.skipped_rows`) now use power-of-two buckets from 0 to
+  8192. Quantile panels become accurate after upgrading. The `le` labels of
+  these histograms change, so a quantile computed over a range that spans the
+  upgrade mixes old and new buckets until the old series age out.
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` ran the migrations on a throwaway
+  tokio runtime but with the client's pool, so connections the pool opened
+  during the migration went back into it tied to a runtime that no longer
+  existed. A later query that picked one up could wait 30 s and fail with
+  `pool timed out while waiting for an open connection`. The migrations now
+  run on the bindings' shared runtime. This was the intermittent fixture
+  timeout in the Python test suite (#420).
+- **`awa storage prepare-queue` provisions lanes a 0.6 runtime created.** A
+  runtime role with schema `CREATE` owns the lane sequences it creates.
+  Provisioning such a lane as the owner, the first step of revoking runtime
+  `CREATE`, failed with `permission denied for sequence`: the head tables'
+  `BEFORE INSERT` triggers run even for a row `ON CONFLICT DO NOTHING` then
+  skips, and they read and set the lane's sequence. Lane inserts now skip
+  rows that exist. Found by the 0.6.10 upgrade rehearsal.
+- **`admin::cancel_by_unique_key` and `cancel_by_unique_key_tx` on queue
+  storage find running jobs and no longer read retained history**
+  ([#585](https://github.com/hardbyte/awa/issues/585)). The candidate lookup
+  built every available ready row before filtering by key, reading every
+  retained ready row, completed jobs included. A missing key cost as much
+  as a full scan, and the transaction variant held the caller's
+  transaction while it ran. Given a queue, it now starts from that queue's
+  ready rows holding the key and checks only those jobs for being available,
+  leased or on an open receipt claim; with no such row, only the
+  `deferred_jobs` key index is read. Its cost follows that queue's own rows,
+  not other queues' backlogs or the claim ring, which a long-running job can
+  keep from pruning. Without a queue, available rows are walked lane by lane
+  from the claim cursor and open receipt claims are read in full. It also
+  finds jobs running on receipt claims not yet materialised into `leases`,
+  which it missed, so they couldn't be cancelled by key.
+- **The admin UI's runtime page no longer shows the storage transition card
+  once the transition is finalized.** It stayed up on every cluster running
+  queue storage; it now appears only while an engine is prepared or a mixed
+  transition is in flight.
+- **The admin dashboard's reads no longer grow with retained history on
+  queue storage, and a test keeps them that way.** `awa-ui`'s
+  `admin_read_cost_test` serves every endpoint the UI polls against ten
+  times more retained history and fails if a read does more work. It found
+  four more reads that grew with history:
+  - Available counts read every retained ready row. They now walk each
+    lane's segments from its claim cursor.
+  - Running counts expanded every retained claim batch. A batch whose
+    receipts have all closed is now skipped before it is expanded.
+  - The timeseries read its window's completions through `terminal_jobs`,
+    which joined them to every retained ready row.
+  - Completions in the last hour, less deletions, checked each recent
+    deletion against its lane's completion batches. One production-sized
+    fixture took 5.4 s for that check alone. Each affected batch is now read
+    once.
+  `/api/kinds`, `/api/stats/kinds`, `/api/stats/queues` and job lists that
+  can include completed jobs still read retained history; the test lists
+  those it exercises and fails once one stops, so the list can only shrink.
+- **Queue lag in the admin UI is the age of the oldest available job
+  again.** On queue storage it had become the age of each lane's next job,
+  which hides an older job a queue move or priority aging appended behind
+  newer ones: an hour's wait could show as a second. The workers' queue-lag
+  gauge keeps the cheaper next-job reading.
+- **DLQ retries, purges and moves refresh the admin UI's cached stats and
+  queue counts.** They didn't invalidate the dashboard caches, so failed
+  counts lagged a DLQ action by up to the cache TTL. From #579.
+- **A request the admin UI's client abandons no longer holds a database
+  connection for good.** When a browser closes a tab or a proxy times out,
+  the server drops the request but Postgres keeps running its query. If that
+  query then ended in an error, such as a statement timeout, sqlx 0.9 tried
+  to close the connection, and closing a TLS connection mid-stream hangs, so
+  the pool lost that slot permanently; a slow dashboard read polled often
+  enough could exhaust the pool. `awa serve` now sets a 60-second statement
+  timeout (`--statement-timeout`, `AWA_STATEMENT_TIMEOUT`), recovers such
+  connections when they are released, and on Postgres 14+ sets
+  `client_connection_check_interval` so a query stops when its connection
+  closes. Applications embedding `awa_ui::router` can build their pool with
+  the new `awa_ui::admin_pool_options` and `admin_connect_options`.
+- **Queue overviews on queue storage no longer read retained history.**
+  `admin::queue_overviews`, behind the admin UI's queues and dashboard pages
+  and `awa queue stats`, counted every current job through `terminal_jobs`,
+  which expands each completion batch and joins it back to `ready_entries`.
+  It now reads the live-work tables, as the workers' queue gauges do, and
+  counts completions in the last hour from batch sizes. With 100,000
+  retained completions and 100,000 queued jobs it drops from 7.7 s to
+  0.27 s. JIT is off for the read; compiling it cost more than running it.
+- **The dashboard's state counts and timeseries no longer read retained
+  history on queue storage.** `admin::state_counts` counts completions from
+  batch sizes and available jobs per lane from its claim cursor (6.5 s to
+  0.24 s on the same data). `admin::state_timeseries` reads only rows
+  finalised within its window, since a job finishes after it is created. It
+  previously expanded every retained completion and sorted the result:
+  against that data it ran for over 10 minutes and filled the disk with
+  temporary files. It now takes 0.6 s, with all 100,000 completions inside
+  the window.
+- **`admin::job_kind_overviews` on queue storage no longer depends on the
+  planner's row estimates.** Behind the admin UI's kinds page, it counted
+  every job through the `current_jobs` view. Two nodes of that view are
+  estimated at one row whatever the statistics say: the join from completion
+  batches to `ready_entries`, and the `UNION ALL` over every place a job can
+  live. Postgres therefore chose nested loops that visit each retained row,
+  and the join on `queue_claim_heads` was only as good as that table's
+  estimate, which autovacuum never refreshes. It now aggregates each place to
+  `(kind, queue)` on its own and combines the results: available jobs are
+  found per lane from the claim cursor, and a completion batch's members are
+  unnested and probed along the ready primary key. The rows are identical,
+  and a test compares them with the former definition across every job
+  state. With 2.6 million retained ready rows (1.8 million of them available)
+  and 860,000 retained completions it takes about 6 to 8 s instead of 20 s on
+  PostgreSQL 17 and 18. It still reads each available job and each retained
+  completion's ready row, because a job's kind lives there. JIT is off for
+  the read.
+- **`admin::list_jobs` on queue storage reads only the places that can hold
+  the requested state.** It selected candidate ids from the `current_jobs`
+  view, so every listing, whatever its filter, planned around the same
+  single-row estimates and joined each retained completion to a scan of the
+  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
+  timeout. Each place a job can live is now read and limited on its own,
+  only those that can hold the state asked for, with a predicate for each
+  filter that is set rather than `$n IS NULL OR` terms, which a prepared
+  statement's generic plan can't drop. Completion batches are ordered by job
+  id before their ready rows are probed, so a page probes only as many as it
+  returns. The ids are identical, and a test compares them with the former
+  definition for every state, kind, queue, limit and page. On the dataset
+  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
+  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
+  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
+  from more than four minutes). Available jobs and completions are still read
+  in full when the state allows them. JIT is off for the read.
+
+## [0.7.0-alpha.1] — 2026-10-29
+
 ### Upgrading
 
-This release adds migrations v044 to v051. Run `awa migrate` as the migrator
+This release adds migrations v041 to v052. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
+- **0.6.2 is a mandatory stepping-stone.** The ring-cursor authority work
+  (migration v043) needs it: roll every 0.6.0/0.6.1 runtime to 0.6.2 or a
+  later 0.6.x *before* applying 0.7 migrations, then upgrade in either order
+  (binaries first or migrate first). The mixed 0.6.2/0.7 fleet is supported
+  and rehearsed nightly against released artifacts; the ring-rotation ledger
+  entry below has the staged expand, flip and contract steps.
 - **Rollout order.** Health-gated workers report ready only once the schema
   reaches their version, so migrate before rolling them out. Producers and
   workers without a readiness gate can roll before v050. On PostgreSQL 17 and
@@ -38,11 +268,142 @@ for each step.
   `&'static str`, so wrap SQL you build at run time in `awa::audited_sql`, and
   only after validating anything interpolated into it.
   `storage::flip_ring_authority` now takes a `&PgPool`.
+- **Rust library users: `JobRow` is `#[non_exhaustive]`.** This is a source
+  break: code outside awa can no longer build a `JobRow` with a struct literal
+  or functional update, or match it without `..`. Build test rows by
+  deserializing JSON instead. Reading fields and `FromRow` are unchanged.
+  Fields added later carry `#[sqlx(default)]`, so neither struct literals nor
+  `query_as::<_, JobRow>` over an explicit column list break when one lands.
 - **Run `awa storage rebuild-terminal-counters` from an upgraded binary.** An
   older binary can deadlock with an upgraded runtime's rotation tick.
+- **v052 adds job output columns** (ADR-048). It adds two nullable columns per
+  queue-storage schema, a `NOT VALID` check and a final `output` column on
+  `terminal_jobs`, without replaying the installer or scanning rows. It takes
+  brief `ACCESS EXCLUSIVE` locks on the terminal tables, held until the
+  migration transaction commits, and waits at most 2 s for each when no
+  `lock_timeout` is set. A released 0.6.9 worker keeps completing, reading,
+  listing and retrying jobs on the migrated schema alongside a 0.7 worker
+  (rehearsed migrate-first in `test_migrate_first_mixed_fleet_job_output`).
+  A binary that has ADR-048 but runs against a schema without the columns
+  drops completion outputs and counts them as `schema_missing`; this is tested
+  against a schema with the columns renamed away
+  (`a_schema_without_output_columns_drops_completion_outputs`), not with a
+  released binary.
+- **Queue-storage failure transitions take `impl Into<AttemptError>`.** The
+  `error` argument of `fail_retryable*`, `fail_terminal*` and `fail_to_dlq*`,
+  and the `reason` of `cancel_running*`, accept `&str` and `String` as before.
+  Code that passes a function pointer or names the type may need a cast.
+- **`callback_contract::CompletePayload` is `#[non_exhaustive]`** and gains
+  `output`. Senders that built it with a struct literal start from
+  `CompletePayload::default()` and set fields.
+- **`JobKindDescriptor` gains a public `output` field.** Code that builds it
+  with a struct literal adds `output: None` or starts from
+  `JobKindDescriptor::new()`.
+- **`#[derive(JobArgs)]` rejects unknown `#[awa(...)]` keys.** It accepts
+  `kind` and `output`; any other key, or a malformed value, is now a compile
+  error rather than silently ignored.
+- **`awa-testing`'s `WorkResult::Completed` holds the row read back after
+  completion** (state `Completed`, `finalized_at` and `output` set), not the
+  claimed row.
+- **Rust library users: `on_*_enqueue_with` closures return
+  `Option<EnqueueRequest<F>>`.** Wrap an existing closure's result in
+  `Some(...)`; the turbofish (`::<T, F, _>`) is unchanged. Returning `None`
+  enqueues nothing for that trigger ([ADR-029 amendment](docs/adr/029-transactional-followup-jobs.md#amendment-conditional-registered-follow-ups)).
+- **Ring maintenance outcome fields.** `RotateOutcome::SkippedIdle` gains
+  `generation`; `PruneOutcome::Pruned` gains `generation` and `durations:
+  PruneDurations`. Exhaustive matches and direct construction of these public
+  Rust enum variants must bind or ignore the new fields.
+- **0.7 migrate gate ([#370](https://github.com/hardbyte/awa/issues/370),
+  [ADR-037](docs/adr/037-canonical-engine-deprecation.md)).** `awa migrate`
+  (and `awa_model::migrations::run`) now refuses to apply pending migrations
+  unless the storage transition is finalized (`state = active`) or the install
+  is fresh (no jobs, no recently-live runtimes — the same conditions as
+  worker-startup auto-finalize). Nothing is applied on refusal; the error names
+  the finalize steps. Complete the staged transition on 0.6 binaries first: see
+  [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
+- **Canonical engine deprecated.** Runtimes whose effective storage resolves to
+  the canonical engine log a startup deprecation warning; canonical
+  claim/execution/trigger paths will be removed in 0.8.
+- **Ring-rotation ledger — staged rolling upgrade
+  ([#371](https://github.com/hardbyte/awa/issues/371),
+  [ADR-040](docs/adr/040-append-only-ring-rotation-ledger.md), migration
+  v043).** The queue/lease/claim ring cursors move out of the mutable
+  `{ring}_ring_state` singletons into append-only `{ring}_ring_rotations`
+  ledgers (dead-tuple-free rotation under a pinned MVCC horizon). The supported
+  upgrade path is a mixed 0.6.2/0.7 fleet after the mandatory 0.6.2
+  stepping-stone (the first 0.6 build that fails closed on unknown newer
+  schemas and recognizes v043 only in compat authority; 0.6.0/0.6.1 must not
+  migrate a v043 database). **Expand:** migration v043 is *additive* — it
+  creates and seeds the ledgers and the rollup-delta table and **keeps** the
+  compat `current_slot` / `generation` columns; a new per-schema
+  `ring_cursor_authority` row selects the authoritative representation
+  (`columns` on upgrade, `ledger` on fresh install). In compat mode a 0.7
+  rotator serializes with any live 0.6.2 rotator on the same
+  `{ring}_ring_state` row lock, CASes the columns, and shadows the ledger.
+  **Flip:** once the whole fleet is on 0.7, promote to ledger authority one-way
+  with `awa storage flip-ring-authority` (or the maintenance leader's auto-flip
+  once every fresh runtime reports a 0.7+ `binary_version`, an additive
+  `awa.runtime_instances` column, continuously for a stable period). Under the
+  cursor locks the flip reconciles and verifies every ledger, poisons the stale
+  cursor/prune metadata, and database-enforces rejection of old-style cursor
+  advances; roll binaries back only *before* the flip. **Contract:** dropping
+  the compat columns is deferred to 0.8. After the 0.6.2 patch step, upgrade
+  0.7 in either order (roll binaries then migrate, or migrate then roll). See
+  [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
 
 ### Added
 
+- **Job output ([ADR-048](docs/adr/048-retained-job-output.md), [guide](docs/job-output.md)).**
+  A handler can record a JSON output of up to 4 KiB with `ctx.set_output`
+  (`ctx.output_slot()` for `register` closures) or `job.set_output` in Python.
+  It is published by the attempt's own transition: as `JobRow.output` when the
+  job completes, or under `output` in the error entry of a failure, where only
+  the latest entry to record one keeps it. It rides the compact completion
+  batch, is shown on the admin UI's job detail and in `terminal_jobs.output`,
+  and is never read by the engine; enqueue specs and the dispatch row do not
+  see it. A failed recording (`OutputError`, Python `awa.OutputError`) clears
+  the output without failing the attempt. External completions store one only
+  when given: `Client::complete_external_with` with `ExternalCompletion`,
+  Python `complete_external(..., output=...)`, or the HTTP callback body's
+  `output` field. Canonical storage discards outputs. New metrics:
+  `awa.job.output_recorded`, `awa.job.output_size` and
+  `awa.job.output_dropped`, whose `too_large` and `invalid` reasons count
+  rejected recordings a handler ignored. The Grafana dashboard gains output
+  panels, and the alert rules an `awa_job_output_schema_missing` warning for a
+  binary running ahead of migration v052.
+- **Typed job outputs.** `#[awa(output = T)]` declares the output type of a
+  kind. It implements the new `JobOutput` trait, and with it
+  `ctx.typed_output::<K>()`, `JobRow::output_as` / `error_output_as` and
+  `ExternalCompletion::output_for` give typed access to the JSON output.
+  Python's `@client.task(..., output=T)` checks `set_output` values, and
+  `Job.output_as` / `error_output_as` decode them. The type name, with a JSON
+  Schema when the runtime has one, is published in the new
+  `awa.job_kind_descriptors.output` column and shown on the admin UI's kinds
+  and job detail pages.
+- **Conditional registered follow-ups.** An `on_*_enqueue_with` closure can
+  return `None` to enqueue nothing for a trigger while its transition still
+  commits. This covers completions with no handler, such as
+  `complete_external` and `resolve_callback`, where a handler-staged follow-up
+  cannot be used.
+- **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
+  A handler can stage follow-up jobs built from values it computed:
+  `ctx.enqueue_on_completion(request)`, `ctx.follow_ups()` for `register`
+  closures, and `job.enqueue_on_completion(args, **insert_opts)` in Python.
+  They are inserted in the same transaction as the attempt's completion,
+  deduplicated by their own unique keys, and discarded on every other outcome.
+  A failed stage (`StageError`, Python `awa.StagingError`) fails an attempt
+  that still returns `Completed`. Limits are 16 follow-ups and 64 KiB per
+  attempt. Staging is a new reason for an otherwise batchable job to leave
+  the batched completion path; jobs with registered `Completed` specs already
+  complete in their own transaction. New
+  `EnqueueRequest::unique` and `::metadata` set one option without replacing
+  the rest, `awa_model::insert_prepared` inserts a prepared row, and the
+  `awa.job.staged_follow_ups_discarded` counter records follow-ups dropped by
+  `WaitForCallback`. `awa.job.staged_follow_ups_committed` counts the
+  follow-ups of committed completions, `inserted` or `duplicate`, and the
+  Grafana dashboard and alert rules gain a panel and an info alert for them.
+  The Rust and Python test harnesses insert staged
+  follow-ups like the runtime.
 - **Owner-scoped periodic schedules (opt-in, v045,
   [#481](https://github.com/hardbyte/awa/issues/481)).** A client can declare
   the complete set of periodic schedules it owns. awa then adds, updates and
@@ -78,6 +439,113 @@ for each step.
   take a per-queue predicate and dead-letter exhausted attempts in the rescue
   transaction. The existing methods keep their behaviour and fail exhausted
   attempts into `done_entries`.
+- **Release gate: the mixed-version rehearsal now gates publishing
+  ([#427](https://github.com/hardbyte/awa/issues/427),
+  [#383](https://github.com/hardbyte/awa/issues/383)).** A reusable
+  `release-gate.yml` workflow runs the released-N-1 rolling-upgrade rehearsal
+  and the pinned-artifact compat matrix: dispatch it manually against a
+  candidate ref as the required pre-tag check, and `release.yml` now also
+  invokes it on the tagged commit with every publishing job (crates.io, PyPI,
+  Docker, GitHub Release) gated behind it — a tag created without the pre-check
+  cannot ship artifacts. Each rehearsal cell emits a machine-readable JSON
+  report (phase transitions with elapsed-ms watermarks, census counts, flip
+  status, exact reconciliation) uploaded as a 90-day workflow artifact on
+  success and failure; the nightly rehearsal delegates to the same workflow so
+  the two cannot drift.
+- **UI instance identity
+  ([#437](https://github.com/hardbyte/awa/issues/437)).** The UI stays
+  single-backend by design (one `awa serve` per database — the 0.7 roadmap
+  non-goal stands), but it can now say *which* backend it is: `awa serve
+  --instance-name` / `AWA_INSTANCE_NAME` (plus optional `--instance-color` /
+  `AWA_INSTANCE_COLOR` and repeatable `--peer NAME=URL` links) surface via
+  `/api/capabilities` and render as a header badge, the browser tab title, and
+  a tinted favicon, with peers as plain links — a zero-data-plane "switcher"
+  between per-database instances. No multiple pools, no backend switcher, no
+  per-request backend selection.
+- **CLI named contexts ([#437](https://github.com/hardbyte/awa/issues/437)).**
+  `~/.config/awa/config.toml` defines kubectl-style contexts (`url` or
+  `url_env` indirection, `production = true`), resolved as `--database-url` >
+  `--context`/`AWA_CONTEXT` > `DATABASE_URL` env > `default_context` —
+  deliberately with **no sticky current-context for mutations**: once more than
+  one context is defined, mutating commands (migrate apply, storage
+  transitions/flips, dlq retry/purge/move, queue drain/pause, batch-ops submit,
+  cron remove, and every other write) require an explicit `--context` or
+  `--database-url`, while read-only commands may still fall back. Every command
+  echoes its password-stripped target to stderr before acting; `production =
+  true` gates mutations behind an interactive y/N (`--yes` for automation); a
+  plaintext-password `url` in a group/other-readable config file warns. New
+  `awa context list|show` inspect the config. With no config file, behaviour is
+  unchanged.
+- **End-to-end distributed tracing
+  ([#110](https://github.com/hardbyte/awa/issues/110),
+  [ADR-039](docs/adr/039-trace-propagation.md)).** Enqueues inside an
+  OpenTelemetry span capture the W3C `traceparent` into the reserved
+  `awa:traceparent` metadata key (no migration; both engines; SQL and Python
+  producers participate by setting the key). The worker's `job.execute` span
+  continues that trace: first attempts join it as a remote child, retries start
+  a fresh root trace with a span **link** back to the enqueue site (OTel
+  messaging guidance for deferred processing). Producer and consumer spans
+  carry messaging semantic conventions (`messaging.system = "awa"`,
+  producer/consumer kinds, `send {queue}` naming). Default-on — measured at
+  ~0.2µs per enqueue (E8 gate) — with `AWA_TRACE_CAPTURE=off` as a kill switch;
+  handlers forward the context via `ctx.traceparent()` (Rust) /
+  `job.traceparent` (Python). Metadata keys prefixed `awa:` are now a
+  documented reserved namespace in the stability policy.
+- **Python automatic tracing
+  ([#110](https://github.com/hardbyte/awa/issues/110) follow-up,
+  [ADR-039](docs/adr/039-trace-propagation.md)).** When `opentelemetry-api` is
+  importable (optional — `awa-pg[otel]` is a convenience alias), Python
+  producers capture the current span into `awa:traceparent` automatically
+  (client insert methods and `awa.bridge`; an explicit key wins;
+  `AWA_TRACE_CAPTURE=off` disables) and workers attach the job's trace context
+  as the ambient OpenTelemetry context around handler invocation, so
+  instrumented libraries (httpx, requests, SQLAlchemy, …) nest into the job's
+  trace with no user code. `awa.init_telemetry(...)` now also installs an OTLP
+  **trace** pipeline for the Rust runtime's spans (`traces=False` opts out),
+  letting Python handler spans nest under `job.execute`. Without
+  `opentelemetry` installed, everything degrades to a cached no-op.
+- **Public-surface stability policy accepted
+  ([#369](https://github.com/hardbyte/awa/issues/369),
+  [ADR-036](docs/adr/036-public-surface-stability-policy.md)).**
+  [`docs/stability.md`](docs/stability.md) is now normative: the
+  surface-by-surface compatibility map, pre-1.0 release-type rules, deprecation
+  schedule, and the binary/schema skew statement (asserted nightly by the
+  compat matrix). The HTTP-admin-API row promises documented response types
+  rather than an `awa-api` crate — the split is deferred to 0.8
+  ([#143](https://github.com/hardbyte/awa/issues/143)) where the MCP server
+  proposal is the first real second consumer; the 0.7 hygiene half (no
+  `FromRow` types in handler returns) is
+  [#403](https://github.com/hardbyte/awa/issues/403).
+- **Hot-reloadable per-queue runtime overrides
+  ([#385](https://github.com/hardbyte/awa/issues/385)/[#396](https://github.com/hardbyte/awa/issues/396),
+  [ADR-038](docs/adr/038-queue-runtime-overrides.md)).** `awa queue overrides
+  set|clear|show` (and the matching `awa_model::admin` functions) change
+  `poll_interval`, `claim_batch_size`, `rate_limit`, and `deadline_duration` on
+  a running fleet: dispatchers refresh nullable override columns on
+  `queue_meta` (migration **v041** — the first 0.7-line migration, so the
+  ADR-037 migrate gate is now live for unfinalized clusters) on a slow cadence
+  and apply them without restarts; NULL reverts to the builder value. Guard
+  rails: rate-limit overrides only retune an existing limiter, and deadline
+  overrides cannot cross the zero boundary (claim mode is fixed at startup).
+  Live concurrency and correctness-coupled cadences are Tier 2
+  ([#397](https://github.com/hardbyte/awa/issues/397)).
+- **Worker health & readiness endpoints
+  ([#368](https://github.com/hardbyte/awa/issues/368)).** Opt-in HTTP listener
+  in the worker runtime (`AWA_HEALTH_ADDR` or `ClientBuilder::health_addr`):
+  `GET /healthz` (process liveness, stays `200` through graceful drain) and
+  `GET /readyz` (`503` + JSON reasons when Postgres is unreachable, the schema
+  is older than the binary, a claim loop stalls, heartbeat/maintenance die, or
+  shutdown starts). No new dependencies in `awa-worker`. Kubernetes probe
+  examples in `docs/deployment.md`.
+- **`awa health` CLI probe.** Cluster-level readiness from the database alone
+  (reachable, schema migrated for this binary, storage state, fleet heartbeat
+  counts) with `--json` output and exit codes for probe-less environments.
+- **Migrate progress output.** `awa migrate` now prints a plan line before
+  applying (`Applying pending migrations v41..v43 (3 migrations)`) and a
+  per-migration completion line with elapsed (`Migration v42 applied in
+  7752ms`), emitted as `tracing` `info!` events. Some migrations reinstall the
+  queue-storage substrate and take several seconds each with no intermediate
+  output; the timing lines distinguish steady progress from a hang.
 
 ### Changed
 
@@ -155,9 +623,73 @@ for each step.
 - **Jobs in one claim batch no longer contend when they fail, retry, snooze
   or move to the DLQ.** Each validates its own receipt under its own attempt
   lock instead of locking the shared batch row.
+- **Compact deadline receipt claims
+  ([#246](https://github.com/hardbyte/awa/issues/246),
+  [ADR-023](docs/adr/023-receipt-plane-ring-partitioning.md),
+  [#410](https://github.com/hardbyte/awa/pull/410)).** Deadline-backed receipt
+  claims (the default when a queue sets `deadline_duration > 0`) now write the
+  same compact `lease_claim_batches` row as zero-deadline claims — every job
+  claimed in one `claim_ready_runtime` call shares one `claimed_at`, hence one
+  `deadline_at` — instead of one row-local `lease_claims` row per job. At
+  256-worker saturation this removes ~83k steady-state live `lease_claims` rows
+  and the associated end-to-end p99 regression. Migration **v042** refreshes
+  every installed queue-storage schema with the compact claim function, a
+  per-slot batch deadline-rescue cursor on `claim_ring_slots`, and a partial
+  `(deadline_at, batch_id) WHERE deadline_at IS NOT NULL` sweep index per
+  `lease_claim_batches` child. Additive only: row-local `lease_claims` and its
+  deadline cursor are retained for claims that materialize into mutable leases
+  and for legacy in-flight claims written before the upgrade.
+- **Idle rings stop rotating
+  ([#371](https://github.com/hardbyte/awa/issues/371),
+  [#409](https://github.com/hardbyte/awa/pull/409)).** Ring rotation was purely
+  timer-driven: every maintenance tick UPDATEd the `queue_ring_state` /
+  `lease_ring_state` / `claim_ring_state` singleton (and a `queue_ring_slots`
+  row) even when the ring had received no writes, so under a pinned MVCC
+  horizon each tick left an unreclaimable dead tuple (~14.4k/hour on
+  `lease_ring_state` at the historical 250ms cadence). Rotation now probes
+  whether the current slot's child tables are empty (a cheap indexed `EXISTS`,
+  no stronger locks than the existing busy check) and, if so, returns a new
+  `SkippedIdle` outcome without touching any row. A quiet queue therefore
+  freezes `current_slot`/`generation` entirely instead of churning bookkeeping
+  rows; the first write un-idles the ring and rotation resumes on the next
+  tick. The skip is benign under concurrency — an enqueue that lands just after
+  the probe is sealed one tick later, never lost. Observability: the
+  maintenance rotate counter gains a `skipped_idle` outcome so dashboards can
+  distinguish a healthy quiet ring (flat generation + `skipped_idle`) from a
+  pinned ring (`skipped_busy` with rows accumulating). This is PR A of the #371
+  work; the structural ledger rework is a later PR.
+- **Ring cursors move to append-only rotation ledgers
+  ([#371](https://github.com/hardbyte/awa/issues/371),
+  [ADR-040](docs/adr/040-append-only-ring-rotation-ledger.md), migration v043,
+  [#415](https://github.com/hardbyte/awa/pull/415) — see Upgrading).**
+  PR B completes the #371 work: where PR A stopped the *idle* rotation write,
+  this removes the *busy*-path write too. Each ring cursor is now the
+  max-generation row of an append-only `{ring}_ring_rotations` ledger (backward
+  primary-key scan, O(1)); rotation **appends** a row (a compare-and-swap on
+  the generation PK) instead of UPDATEing the ring-state singleton, so a busy
+  ring under a pinned MVCC horizon no longer strands a dead bookkeeping tuple
+  per tick. In ledger authority, rotate/prune/delta-rollup serialize on a
+  per-ring `pg_advisory_xact_lock` (try-locked; a periodic rotate skips under
+  contention rather than queueing behind a prune); in compat authority they
+  serialize on the `{ring}_ring_state` singleton `FOR UPDATE` (see the ring-rotation ledger entry under Upgrading). Either way the ring-state singleton `FOR
+  UPDATE` is taken first as the universal gate against the flip. Queue prune
+  stops upserting `queue_terminal_rollups` inside the prune transaction — it
+  appends to a new `queue_terminal_rollup_deltas` landing table folded by
+  horizon-gated maintenance on the existing 30s tick (which also trims each
+  ledger to one wrap); exact count readers add the unfolded delta sums, so
+  counts stay exact regardless of fold timing. A new receipt-plane regression
+  assertion pins the whole `{ring}_ring_state` family write-free (zero
+  UPDATE/DELETE, zero dead tuples) under load **in ledger authority** — the
+  steady state after the flip; compat authority retains the pre-#371 singleton
+  churn until the fleet flips (see Upgrading).
 
 ### Fixed
 
+- **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
+  numbers in plain decimal, and serde_json's default parser could round a long
+  one to the neighbouring `f64`, so a value like `5.130112436774387e-96` in job
+  args read back one unit in the last place off. serde_json's
+  `float_roundtrip` feature is now enabled.
 - **A duplicate follow-up no longer fails its trigger.** A follow-up enqueued
   with unique options that conflicted with an existing job aborted the
   trigger's transaction: the trigger's completion (or other outcome) rolled
@@ -285,6 +817,107 @@ for each step.
   not a retry.
 - Rust cadence and claim-rotation interval overrides survive later
   `queue_storage` builder calls, whatever the call order.
+- **Admin views undercounted running jobs behind compact deadline claims
+  ([#416](https://github.com/hardbyte/awa/issues/416), part of
+  [#410](https://github.com/hardbyte/awa/pull/410)).** Job listings and queue
+  overviews only knew about materialized `lease_claims` rows; a compact
+  deadline-backed claim batch has none until its members individually
+  materialize, so those jobs briefly vanished from admin views while genuinely
+  running. Both surfaces now fold in un-materialized receipt claims from
+  `lease_claim_batches`, so a job shows as running from the moment it's claimed
+  regardless of which claim representation carries it.
+- **Migration cancellation could strand a session-scoped advisory lock
+  ([#408](https://github.com/hardbyte/awa/pull/408)).** `migrations::run`
+  guarded the version check, migrate gate, and migration steps with a
+  session-scoped `pg_advisory_lock` on a pooled connection, released manually.
+  sqlx does not `DISCARD ALL` a connection on return to the pool, so a `run`
+  future cancelled mid-migration (a Rust embedder wrapping it in
+  `tokio::time::timeout`, for example) handed the connection back with the lock
+  still held — every later `migrate` anywhere then blocked until that
+  connection happened to close. Python callers were unaffected (`block_on`
+  always runs to completion). Fixed by moving to a transaction-scoped
+  `pg_advisory_xact_lock` wrapping the whole upgrade in one transaction:
+  cancelling the future rolls back and frees the lock immediately, and a failed
+  or cancelled run leaves no half-applied step (every migration is
+  transaction-safe). New coverage races concurrent `run()`s to convergence and
+  reproduces cancellation non-stranding against the old lock (fails) and the
+  fix (passes).
+- **Migration's admin-metadata warmup could leak a pool connection and deadlock
+  the client ([#408](https://github.com/hardbyte/awa/pull/408) follow-up).**
+  The best-effort `warm_admin_metadata_cache` step at the end of
+  `migrations::run` used a pooled connection; the Python bridge drives
+  migration on a throwaway `current_thread` runtime that's dropped the instant
+  `block_on` returns, so the warmup connection's return-to-pool could race —
+  and lose to — that runtime teardown, stranding the connection and leaking its
+  pool semaphore permit. With a small `max_connections`, one leaked permit
+  eventually deadlocked every later `acquire`: `migrate()` reported success but
+  the first subsequent `transaction()` or worker `start()` hung until the 30s
+  `acquire_timeout` fired. Fixed by running the warmup on a detached connection
+  (`pool.acquire().detach()`) with an explicit `close().await`, so there is no
+  return-to-pool step to race and nothing to strand.
+- **`migrate` fails safe on a schema newer than the binary
+  ([#392](https://github.com/hardbyte/awa/issues/392)).**
+  `awa_model::migrations::current_version`'s legacy-numbering heuristic
+  previously matched a schema *newer* than the running binary — the supported
+  rolling-deploy skew — and **destructively rewrote `awa.schema_version`**
+  (deleted the version history, re-applied old migrations onto the newer
+  physical layout, then crashed mid-way, leaving split-brain metadata). The
+  migrate path (`awa migrate`, the CLI `--pending` probe, and the library
+  `run`/`run_with_options` used by embedded/Python startup) now refuses a
+  schema whose recorded `MAX(version)` exceeds this binary's `CURRENT_VERSION`
+  with a clear `SchemaNewerThanBinary` error (*"schema is at vN but this binary
+  supports up to vM — upgrade the awa binaries …; refusing to modify a newer
+  schema"*) and writes nothing; the legacy heuristic is bounded so it never
+  normalizes a version above `CURRENT_VERSION`. This protects forward skews (a
+  0.7 binary against a future 0.8 schema); it cannot retroactively fix binaries
+  built before this release.
+- **Migration compatibility pre-flights.** Additive migrations can declare a
+  minimum runtime version; v043 requires 0.6.2, the patch that understands its
+  compat-authority schema. `awa migrate` refuses while a fresh-heartbeat
+  runtime reports an older or unparseable version, and names the incompatible
+  instances. `--allow-live-runtimes` (`MigrateOptions::allow_live_runtimes`)
+  remains the explicit override. The stricter `EXCLUSIVE_WINDOW_MIGRATIONS`
+  mechanism remains available only for migrations with no rolling-compatible
+  shape; v043 no longer uses it.
+- **Worker startup on a pre-migration schema names the real fix.** A runtime
+  started against a schema that predates its own migrations — the binary-first
+  rolling-upgrade window — refuses to start (it completes no work), but
+  previously did so with the misleading 0.5-era message *"run schema
+  preparation before starting 0.6 runtimes"*. The readiness refusal now
+  distinguishes an outdated schema version from missing queue-storage
+  preparation and directs the operator to `awa migrate`. Under a rolling
+  deployment the refused replicas crash-loop harmlessly and come up unaided
+  once the migration commits; the nightly rolling-upgrade rehearsal pins the
+  refusal message, the roll that recovers from it, and an overlapped roll
+  racing a live migration.
+- **Maintenance branch cooldown is paced by the branch's own duration.** The
+  per-branch overrun governor armed a fixed 120-tick cooldown and re-armed it
+  on every subsequent overrun, so a maintenance branch whose body consistently
+  exceeded 1.5× its configured interval collapsed to a 1/120 duty cycle —
+  indefinitely, with a single warning at the first flip. With
+  `deadline_rescue_interval = 100ms` and a ~250ms sweep (realistic
+  containerized-Postgres latency), deadline rescue ran once per 12 seconds and
+  deadline-based cancellation starved: a hanging handler polling
+  `ctx.is_cancelled()` never heard back inside its window. At the default 30s
+  interval, a >45s sweep would have silenced rescue for an hour at a stretch.
+  The cooldown is now `2 × ceil(body_duration / interval)` ticks, capped at the
+  previous 120: a merely-slow branch settles at roughly one-third duty cycle
+  instead of going near-silent, and pathological bodies stay bounded.
+- **`JobResult::RetryAfter` now respects `max_attempts`.** RetryAfter is
+  documented as "this attempt failed; try again after delay X", but the
+  completion path never checked exhaustion — a handler that always returned
+  `RetryAfter` looped forever (observed at attempt 653 with `max_attempts =
+  2`), invisible to the DLQ and appending nothing to `errors`. A retry
+  requested on the final attempt (`attempt >= max_attempts`) now exhausts the
+  job exactly like a retryable error: `failed` state, `dlq_reason =
+  max_attempts_exhausted` when the DLQ is enabled, an `Exhausted` event, and
+  `on_exhausted_enqueue` follow-ups. A job gets exactly `max_attempts`
+  executions regardless of which failure primitive reports them. The canonical
+  `RetryAfter` reschedule also now clears `heartbeat_at`/`deadline_at`,
+  matching the retryable-error path. **If your `RetryAfter` loop meant "not
+  yet" rather than "failed", return `Snooze`** — it reschedules without
+  consuming the attempt budget. `TestClient` (Rust and Python) mirrors the
+  bound.
 
 ### Security
 
@@ -321,79 +954,82 @@ for each step.
   [#434](https://github.com/hardbyte/awa/issues/434)), and the Python suite no
   longer exhausts the server's connection slots
   ([#420](https://github.com/hardbyte/awa/issues/420)).
-
-## [0.7.0-alpha.1] — 2026-07-17
-
-> **Upgrade path:** the ring-cursor authority work (migration v043) makes **0.6.2 a mandatory
-> stepping-stone**: roll every 0.6.0/0.6.1 runtime to 0.6.2 (or a later 0.6.x) *before*
-> applying 0.7 migrations, then upgrade in either order (binaries first or migrate first) —
-> the mixed 0.6.2/0.7 fleet is supported and rehearsed nightly against released artifacts.
-> See [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md) and Breaking changes below.
-
-### Added
-
-- **Release gate: the mixed-version rehearsal now gates publishing ([#427](https://github.com/hardbyte/awa/issues/427), [#383](https://github.com/hardbyte/awa/issues/383)).** A reusable `release-gate.yml` workflow runs the released-N-1 rolling-upgrade rehearsal and the pinned-artifact compat matrix: dispatch it manually against a candidate ref as the required pre-tag check, and `release.yml` now also invokes it on the tagged commit with every publishing job (crates.io, PyPI, Docker, GitHub Release) gated behind it — a tag created without the pre-check cannot ship artifacts. Each rehearsal cell emits a machine-readable JSON report (phase transitions with elapsed-ms watermarks, census counts, flip status, exact reconciliation) uploaded as a 90-day workflow artifact on success and failure; the nightly rehearsal delegates to the same workflow so the two cannot drift.
-- **UI instance identity ([#437](https://github.com/hardbyte/awa/issues/437)).** The UI stays single-backend by design (one `awa serve` per database — the 0.7 roadmap non-goal stands), but it can now say *which* backend it is: `awa serve --instance-name` / `AWA_INSTANCE_NAME` (plus optional `--instance-color` / `AWA_INSTANCE_COLOR` and repeatable `--peer NAME=URL` links) surface via `/api/capabilities` and render as a header badge, the browser tab title, and a tinted favicon, with peers as plain links — a zero-data-plane "switcher" between per-database instances. No multiple pools, no backend switcher, no per-request backend selection.
-- **CLI named contexts ([#437](https://github.com/hardbyte/awa/issues/437)).** `~/.config/awa/config.toml` defines kubectl-style contexts (`url` or `url_env` indirection, `production = true`), resolved as `--database-url` > `--context`/`AWA_CONTEXT` > `DATABASE_URL` env > `default_context` — deliberately with **no sticky current-context for mutations**: once more than one context is defined, mutating commands (migrate apply, storage transitions/flips, dlq retry/purge/move, queue drain/pause, batch-ops submit, cron remove, and every other write) require an explicit `--context` or `--database-url`, while read-only commands may still fall back. Every command echoes its password-stripped target to stderr before acting; `production = true` gates mutations behind an interactive y/N (`--yes` for automation); a plaintext-password `url` in a group/other-readable config file warns. New `awa context list|show` inspect the config. With no config file, behaviour is unchanged.
-
-### Breaking changes
-
-- **Ring maintenance outcome fields.** `RotateOutcome::SkippedIdle` gains `generation`; `PruneOutcome::Pruned` gains `generation` and `durations: PruneDurations`. Exhaustive matches and direct construction of these public Rust enum variants must bind or ignore the new fields.
-- **0.7 migrate gate ([#370](https://github.com/hardbyte/awa/issues/370), [ADR-037](docs/adr/037-canonical-engine-deprecation.md)).** `awa migrate` (and `awa_model::migrations::run`) now refuses to apply pending migrations unless the storage transition is finalized (`state = active`) or the install is fresh (no jobs, no recently-live runtimes — the same conditions as worker-startup auto-finalize). Nothing is applied on refusal; the error names the finalize steps. Complete the staged transition on 0.6 binaries first: see [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
-- **Canonical engine deprecated.** Runtimes whose effective storage resolves to the canonical engine log a startup deprecation warning; canonical claim/execution/trigger paths will be removed in 0.8.
-- **Ring-rotation ledger — staged rolling upgrade ([#371](https://github.com/hardbyte/awa/issues/371), [ADR-040](docs/adr/040-append-only-ring-rotation-ledger.md), migration v043).** The queue/lease/claim ring cursors move out of the mutable `{ring}_ring_state` singletons into append-only `{ring}_ring_rotations` ledgers (dead-tuple-free rotation under a pinned MVCC horizon). The supported upgrade path is a mixed 0.6.2/0.7 fleet after the mandatory 0.6.2 stepping-stone (the first 0.6 build that fails closed on unknown newer schemas and recognizes v043 only in compat authority; 0.6.0/0.6.1 must not migrate a v043 database). **Expand:** migration v043 is *additive* — it creates and seeds the ledgers and the rollup-delta table and **keeps** the compat `current_slot` / `generation` columns; a new per-schema `ring_cursor_authority` row selects the authoritative representation (`columns` on upgrade, `ledger` on fresh install). In compat mode a 0.7 rotator serializes with any live 0.6.2 rotator on the same `{ring}_ring_state` row lock, CASes the columns, and shadows the ledger. **Flip:** once the whole fleet is on 0.7, promote to ledger authority one-way with `awa storage flip-ring-authority` (or the maintenance leader's auto-flip once every fresh runtime reports a 0.7+ `binary_version`, an additive `awa.runtime_instances` column, continuously for a stable period). Under the cursor locks the flip reconciles and verifies every ledger, poisons the stale cursor/prune metadata, and database-enforces rejection of old-style cursor advances; roll binaries back only *before* the flip. **Contract:** dropping the compat columns is deferred to 0.8. After the 0.6.2 patch step, upgrade 0.7 in either order (roll binaries then migrate, or migrate then roll). See [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
-
-### Performance
-
-- **Compact deadline receipt claims ([#246](https://github.com/hardbyte/awa/issues/246), [ADR-023](docs/adr/023-receipt-plane-ring-partitioning.md), [#410](https://github.com/hardbyte/awa/pull/410)).** Deadline-backed receipt claims (the default when a queue sets `deadline_duration > 0`) now write the same compact `lease_claim_batches` row as zero-deadline claims — every job claimed in one `claim_ready_runtime` call shares one `claimed_at`, hence one `deadline_at` — instead of one row-local `lease_claims` row per job. At 256-worker saturation this removes ~83k steady-state live `lease_claims` rows and the associated end-to-end p99 regression. Migration **v042** refreshes every installed queue-storage schema with the compact claim function, a per-slot batch deadline-rescue cursor on `claim_ring_slots`, and a partial `(deadline_at, batch_id) WHERE deadline_at IS NOT NULL` sweep index per `lease_claim_batches` child. Additive only: row-local `lease_claims` and its deadline cursor are retained for claims that materialize into mutable leases and for legacy in-flight claims written before the upgrade.
-
-- **Idle rings stop rotating ([#371](https://github.com/hardbyte/awa/issues/371), [#409](https://github.com/hardbyte/awa/pull/409)).** Ring rotation was purely timer-driven: every maintenance tick UPDATEd the `queue_ring_state` / `lease_ring_state` / `claim_ring_state` singleton (and a `queue_ring_slots` row) even when the ring had received no writes, so under a pinned MVCC horizon each tick left an unreclaimable dead tuple (~14.4k/hour on `lease_ring_state` at the historical 250ms cadence). Rotation now probes whether the current slot's child tables are empty (a cheap indexed `EXISTS`, no stronger locks than the existing busy check) and, if so, returns a new `SkippedIdle` outcome without touching any row. A quiet queue therefore freezes `current_slot`/`generation` entirely instead of churning bookkeeping rows; the first write un-idles the ring and rotation resumes on the next tick. The skip is benign under concurrency — an enqueue that lands just after the probe is sealed one tick later, never lost. Observability: the maintenance rotate counter gains a `skipped_idle` outcome so dashboards can distinguish a healthy quiet ring (flat generation + `skipped_idle`) from a pinned ring (`skipped_busy` with rows accumulating). This is PR A of the #371 work; the structural ledger rework is a later PR.
-
-- **Ring cursors move to append-only rotation ledgers ([#371](https://github.com/hardbyte/awa/issues/371), [ADR-040](docs/adr/040-append-only-ring-rotation-ledger.md), migration v043, [#415](https://github.com/hardbyte/awa/pull/415) — see Breaking changes).** PR B completes the #371 work: where PR A stopped the *idle* rotation write, this removes the *busy*-path write too. Each ring cursor is now the max-generation row of an append-only `{ring}_ring_rotations` ledger (backward primary-key scan, O(1)); rotation **appends** a row (a compare-and-swap on the generation PK) instead of UPDATEing the ring-state singleton, so a busy ring under a pinned MVCC horizon no longer strands a dead bookkeeping tuple per tick. In ledger authority, rotate/prune/delta-rollup serialize on a per-ring `pg_advisory_xact_lock` (try-locked; a periodic rotate skips under contention rather than queueing behind a prune); in compat authority they serialize on the `{ring}_ring_state` singleton `FOR UPDATE` (see Breaking changes for the staged upgrade). Either way the ring-state singleton `FOR UPDATE` is taken first as the universal gate against the flip. Queue prune stops upserting `queue_terminal_rollups` inside the prune transaction — it appends to a new `queue_terminal_rollup_deltas` landing table folded by horizon-gated maintenance on the existing 30s tick (which also trims each ledger to one wrap); exact count readers add the unfolded delta sums, so counts stay exact regardless of fold timing. A new receipt-plane regression assertion pins the whole `{ring}_ring_state` family write-free (zero UPDATE/DELETE, zero dead tuples) under load **in ledger authority** — the steady state after the flip; compat authority retains the pre-#371 singleton churn until the fleet flips (see Breaking changes).
-
-### Fixed
-
-- **Admin views undercounted running jobs behind compact deadline claims ([#416](https://github.com/hardbyte/awa/issues/416), part of [#410](https://github.com/hardbyte/awa/pull/410)).** Job listings and queue overviews only knew about materialized `lease_claims` rows; a compact deadline-backed claim batch has none until its members individually materialize, so those jobs briefly vanished from admin views while genuinely running. Both surfaces now fold in un-materialized receipt claims from `lease_claim_batches`, so a job shows as running from the moment it's claimed regardless of which claim representation carries it.
-
-- **Migration cancellation could strand a session-scoped advisory lock ([#408](https://github.com/hardbyte/awa/pull/408)).** `migrations::run` guarded the version check, migrate gate, and migration steps with a session-scoped `pg_advisory_lock` on a pooled connection, released manually. sqlx does not `DISCARD ALL` a connection on return to the pool, so a `run` future cancelled mid-migration (a Rust embedder wrapping it in `tokio::time::timeout`, for example) handed the connection back with the lock still held — every later `migrate` anywhere then blocked until that connection happened to close. Python callers were unaffected (`block_on` always runs to completion). Fixed by moving to a transaction-scoped `pg_advisory_xact_lock` wrapping the whole upgrade in one transaction: cancelling the future rolls back and frees the lock immediately, and a failed or cancelled run leaves no half-applied step (every migration is transaction-safe). New coverage races concurrent `run()`s to convergence and reproduces cancellation non-stranding against the old lock (fails) and the fix (passes).
-
-- **Migration's admin-metadata warmup could leak a pool connection and deadlock the client ([#408](https://github.com/hardbyte/awa/pull/408) follow-up).** The best-effort `warm_admin_metadata_cache` step at the end of `migrations::run` used a pooled connection; the Python bridge drives migration on a throwaway `current_thread` runtime that's dropped the instant `block_on` returns, so the warmup connection's return-to-pool could race — and lose to — that runtime teardown, stranding the connection and leaking its pool semaphore permit. With a small `max_connections`, one leaked permit eventually deadlocked every later `acquire`: `migrate()` reported success but the first subsequent `transaction()` or worker `start()` hung until the 30s `acquire_timeout` fired. Fixed by running the warmup on a detached connection (`pool.acquire().detach()`) with an explicit `close().await`, so there is no return-to-pool step to race and nothing to strand.
-
-### Correctness
-
-- **`migrate` fails safe on a schema newer than the binary ([#392](https://github.com/hardbyte/awa/issues/392)).** `awa_model::migrations::current_version`'s legacy-numbering heuristic previously matched a schema *newer* than the running binary — the supported rolling-deploy skew — and **destructively rewrote `awa.schema_version`** (deleted the version history, re-applied old migrations onto the newer physical layout, then crashed mid-way, leaving split-brain metadata). The migrate path (`awa migrate`, the CLI `--pending` probe, and the library `run`/`run_with_options` used by embedded/Python startup) now refuses a schema whose recorded `MAX(version)` exceeds this binary's `CURRENT_VERSION` with a clear `SchemaNewerThanBinary` error (*"schema is at vN but this binary supports up to vM — upgrade the awa binaries …; refusing to modify a newer schema"*) and writes nothing; the legacy heuristic is bounded so it never normalizes a version above `CURRENT_VERSION`. This protects forward skews (a 0.7 binary against a future 0.8 schema); it cannot retroactively fix binaries built before this release.
-- **Migration compatibility pre-flights.** Additive migrations can declare a minimum runtime version; v043 requires 0.6.2, the patch that understands its compat-authority schema. `awa migrate` refuses while a fresh-heartbeat runtime reports an older or unparseable version, and names the incompatible instances. `--allow-live-runtimes` (`MigrateOptions::allow_live_runtimes`) remains the explicit override. The stricter `EXCLUSIVE_WINDOW_MIGRATIONS` mechanism remains available only for migrations with no rolling-compatible shape; v043 no longer uses it.
-- **Worker startup on a pre-migration schema names the real fix.** A runtime started against a schema that predates its own migrations — the binary-first rolling-upgrade window — refuses to start (it completes no work), but previously did so with the misleading 0.5-era message *"run schema preparation before starting 0.6 runtimes"*. The readiness refusal now distinguishes an outdated schema version from missing queue-storage preparation and directs the operator to `awa migrate`. Under a rolling deployment the refused replicas crash-loop harmlessly and come up unaided once the migration commits; the nightly rolling-upgrade rehearsal pins the refusal message, the roll that recovers from it, and an overlapped roll racing a live migration.
-- **Maintenance branch cooldown is paced by the branch's own duration.** The per-branch overrun governor armed a fixed 120-tick cooldown and re-armed it on every subsequent overrun, so a maintenance branch whose body consistently exceeded 1.5× its configured interval collapsed to a 1/120 duty cycle — indefinitely, with a single warning at the first flip. With `deadline_rescue_interval = 100ms` and a ~250ms sweep (realistic containerized-Postgres latency), deadline rescue ran once per 12 seconds and deadline-based cancellation starved: a hanging handler polling `ctx.is_cancelled()` never heard back inside its window. At the default 30s interval, a >45s sweep would have silenced rescue for an hour at a stretch. The cooldown is now `2 × ceil(body_duration / interval)` ticks, capped at the previous 120: a merely-slow branch settles at roughly one-third duty cycle instead of going near-silent, and pathological bodies stay bounded.
-- **`JobResult::RetryAfter` now respects `max_attempts`.** RetryAfter is documented as "this attempt failed; try again after delay X", but the completion path never checked exhaustion — a handler that always returned `RetryAfter` looped forever (observed at attempt 653 with `max_attempts = 2`), invisible to the DLQ and appending nothing to `errors`. A retry requested on the final attempt (`attempt >= max_attempts`) now exhausts the job exactly like a retryable error: `failed` state, `dlq_reason = max_attempts_exhausted` when the DLQ is enabled, an `Exhausted` event, and `on_exhausted_enqueue` follow-ups. A job gets exactly `max_attempts` executions regardless of which failure primitive reports them. The canonical `RetryAfter` reschedule also now clears `heartbeat_at`/`deadline_at`, matching the retryable-error path. **If your `RetryAfter` loop meant "not yet" rather than "failed", return `Snooze`** — it reschedules without consuming the attempt budget. `TestClient` (Rust and Python) mirrors the bound.
-- `AwaStorageLockOrder.tla` and `AwaDeadTupleContract.tla` are updated for the ring-rotation ledger ([#371](https://github.com/hardbyte/awa/issues/371)): the per-ring rotation advisory lock is the ledger-mode serializer, a new `RollupTerminalDeltasPlan` models the terminal-delta rollup transaction, and the rotation ledgers plus the `queue_terminal_rollup_deltas` landing table are modeled as cold `RowVacuum` relations with horizon-gated fold transactions (`RingLedgerFoldTx`, `TerminalRollupDeltaFoldTx`). The **staged rolling upgrade** is also modeled: the compat-authority plans take the ring-state singleton `FOR UPDATE` (the pre-#415 discipline, restored so a 0.7 compat rotator serializes with live 0.6 rotators), a one-way `FlipAuthority` action promotes the authority under all three singletons, and a new `MixedFleet` invariant forbids advancing any ring under both disciplines at once. TLC caught a real authority-read TOCTOU (a rotator reading `columns`, the flip committing, then the rotator advancing under the stale mode); the fix is to take the singleton before reading the authority, in both the spec and the `acquire_ring_serializer_tx` implementation. The compat singleton churn is a documented, bounded transition-mode exemption in `AwaDeadTupleContract.tla`. The full TLC suite passes (`AwaStorageLockOrder` 480,721 distinct states, depth 39; `AwaDeadTupleContract` contract check — all "No error found"), plus the existing expected-counterexample witnesses (the deadlock-detector and old-striped-claim `NoDeadlock` witnesses still fire).
-
-- `AwaStorageTransition.tla` models the 0.7 migrate gate (`Migrate07OnlyOnQuiescedCanonical`), with an expected-counterexample config (`AwaStorageTransitionMigrate07Ungated.cfg`) witnessing why the gate is required; the transition model family runs in nightly CI via the TLC suite runner (`correctness/run-tlc-suite.sh`).
-- Compact deadline claims ([#246](https://github.com/hardbyte/awa/issues/246)) preserve the `AwaSegmentedStorage.tla` receipt-plane invariants (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty`): the lifecycle model already abstracts row-local and compact claims as `claimOpen`/`claimClosed`, so a deadline-backed claim force-closed by batch deadline rescue is covered by the existing `RescueStaleReceipt` / `RescueToReady` transitions. The full TLC suite re-passed (`AwaSegmentedStorage`: 790,881 states, depth 24); `MAPPING.md` and the spec's claim-family comment record that both deadline modes are now compact.
-
-### Features
-
-- **End-to-end distributed tracing ([#110](https://github.com/hardbyte/awa/issues/110), [ADR-039](docs/adr/039-trace-propagation.md)).** Enqueues inside an OpenTelemetry span capture the W3C `traceparent` into the reserved `awa:traceparent` metadata key (no migration; both engines; SQL and Python producers participate by setting the key). The worker's `job.execute` span continues that trace: first attempts join it as a remote child, retries start a fresh root trace with a span **link** back to the enqueue site (OTel messaging guidance for deferred processing). Producer and consumer spans carry messaging semantic conventions (`messaging.system = "awa"`, producer/consumer kinds, `send {queue}` naming). Default-on — measured at ~0.2µs per enqueue (E8 gate) — with `AWA_TRACE_CAPTURE=off` as a kill switch; handlers forward the context via `ctx.traceparent()` (Rust) / `job.traceparent` (Python). Metadata keys prefixed `awa:` are now a documented reserved namespace in the stability policy.
-
-- **Python automatic tracing ([#110](https://github.com/hardbyte/awa/issues/110) follow-up, [ADR-039](docs/adr/039-trace-propagation.md)).** When `opentelemetry-api` is importable (optional — `awa-pg[otel]` is a convenience alias), Python producers capture the current span into `awa:traceparent` automatically (client insert methods and `awa.bridge`; an explicit key wins; `AWA_TRACE_CAPTURE=off` disables) and workers attach the job's trace context as the ambient OpenTelemetry context around handler invocation, so instrumented libraries (httpx, requests, SQLAlchemy, …) nest into the job's trace with no user code. `awa.init_telemetry(...)` now also installs an OTLP **trace** pipeline for the Rust runtime's spans (`traces=False` opts out), letting Python handler spans nest under `job.execute`. Without `opentelemetry` installed, everything degrades to a cached no-op.
-
-- **Public-surface stability policy accepted ([#369](https://github.com/hardbyte/awa/issues/369), [ADR-036](docs/adr/036-public-surface-stability-policy.md)).** [`docs/stability.md`](docs/stability.md) is now normative: the surface-by-surface compatibility map, pre-1.0 release-type rules, deprecation schedule, and the binary/schema skew statement (asserted nightly by the compat matrix). The HTTP-admin-API row promises documented response types rather than an `awa-api` crate — the split is deferred to 0.8 ([#143](https://github.com/hardbyte/awa/issues/143)) where the MCP server proposal is the first real second consumer; the 0.7 hygiene half (no `FromRow` types in handler returns) is [#403](https://github.com/hardbyte/awa/issues/403).
-
-- **Hot-reloadable per-queue runtime overrides ([#385](https://github.com/hardbyte/awa/issues/385)/[#396](https://github.com/hardbyte/awa/issues/396), [ADR-038](docs/adr/038-queue-runtime-overrides.md)).** `awa queue overrides set|clear|show` (and the matching `awa_model::admin` functions) change `poll_interval`, `claim_batch_size`, `rate_limit`, and `deadline_duration` on a running fleet: dispatchers refresh nullable override columns on `queue_meta` (migration **v041** — the first 0.7-line migration, so the ADR-037 migrate gate is now live for unfinalized clusters) on a slow cadence and apply them without restarts; NULL reverts to the builder value. Guard rails: rate-limit overrides only retune an existing limiter, and deadline overrides cannot cross the zero boundary (claim mode is fixed at startup). Live concurrency and correctness-coupled cadences are Tier 2 ([#397](https://github.com/hardbyte/awa/issues/397)).
-
-- **Worker health & readiness endpoints ([#368](https://github.com/hardbyte/awa/issues/368)).** Opt-in HTTP listener in the worker runtime (`AWA_HEALTH_ADDR` or `ClientBuilder::health_addr`): `GET /healthz` (process liveness, stays `200` through graceful drain) and `GET /readyz` (`503` + JSON reasons when Postgres is unreachable, the schema is older than the binary, a claim loop stalls, heartbeat/maintenance die, or shutdown starts). No new dependencies in `awa-worker`. Kubernetes probe examples in `docs/deployment.md`.
-- **`awa health` CLI probe.** Cluster-level readiness from the database alone (reachable, schema migrated for this binary, storage state, fleet heartbeat counts) with `--json` output and exit codes for probe-less environments.
-
-- **Migrate progress output.** `awa migrate` now prints a plan line before applying (`Applying pending migrations v41..v43 (3 migrations)`) and a per-migration completion line with elapsed (`Migration v42 applied in 7752ms`), emitted as `tracing` `info!` events. Some migrations reinstall the queue-storage substrate and take several seconds each with no intermediate output; the timing lines distinguish steady progress from a hang.
-
-### Internal
-
-- **Trace pipeline validated end-to-end in CI.** The telemetry-validation job (grafana/otel-lgtm) now asserts spans, not just metrics: `test_trace_pipeline_reaches_tempo` exports over OTLP and verifies the ADR-039 topology in Tempo (producer → `send {queue}` → `job.execute` with consumer kind and messaging attributes; retries as fresh roots carrying a span link, found via TraceQL); `scripts/trace-e2e-python.py` proves the cross-language chain (Python producer span → Rust execution span → Python handler span as one trace); `scripts/validate-grafana.sh` guards the published Grafana assets against drift (every referenced `awa_*` identifier must exist in live Prometheus or `awa-metrics` source, both dashboards must import through the Grafana API, all Postgres-dashboard SQL must `EXPLAIN` against a migrated schema, and traces must be readable through Grafana's Tempo datasource). `scripts/telemetry-e2e-local.sh` runs the identical checks locally.
-
-- **Nightly binary/schema compat matrix ([#367](https://github.com/hardbyte/awa/issues/367)).** Pinned release artifacts (`awa-pg` 0.6.0 and 0.5.7 wheels from PyPI) run against the newest schema every night: the 0.6.0 leg asserts the full job lifecycle on a finalized cluster; the 0.5.7 leg asserts the documented asymmetry (producers route through the compat layer to the active engine, workers are inert); the backward-guard leg asserts the newest `awa migrate` refuses an old unfinalized schema with the exact finalize-steps message and a non-zero exit. The support statement lives in `docs/stability.md`.
-
-- **CI: the Rust tests job is sharded ([#335](https://github.com/hardbyte/awa/issues/335)).** One `cargo test --workspace` run took ~31 minutes, ~22 of them the migration replay binary alone. The job is now a six-way matrix: the migration suite partitioned per-test across four shards with `cargo-nextest` (safe because those tests already serialize through a Postgres advisory lock), the other slow binaries in a `heavy` shard, and everything else — including any new test file, automatically — in `rest`. Shard membership lives in `scripts/ci-test-shard.sh`; the lint job validates it so renames can't drop coverage, and the nextest profile flags any test slower than 60s as the standing worklist for shrinking real-time fixture windows.
-- **rustc 1.97 compatibility ([#411](https://github.com/hardbyte/awa/pull/411), [#414](https://github.com/hardbyte/awa/pull/414)).** GitHub's stable runners rolled 1.96.1 → 1.97.0; the awa-python async bridge needed a Send-inference-satisfying restructure around `spawn_blocking`, and awa-cli dropped redundant references in `println!` args to clear the new clippy lint. No behavior change.
+- `AwaStorageLockOrder.tla` and `AwaDeadTupleContract.tla` are updated for the
+  ring-rotation ledger ([#371](https://github.com/hardbyte/awa/issues/371)):
+  the per-ring rotation advisory lock is the ledger-mode serializer, a new
+  `RollupTerminalDeltasPlan` models the terminal-delta rollup transaction, and
+  the rotation ledgers plus the `queue_terminal_rollup_deltas` landing table
+  are modeled as cold `RowVacuum` relations with horizon-gated fold
+  transactions (`RingLedgerFoldTx`, `TerminalRollupDeltaFoldTx`). The **staged
+  rolling upgrade** is also modeled: the compat-authority plans take the
+  ring-state singleton `FOR UPDATE` (the pre-#415 discipline, restored so a 0.7
+  compat rotator serializes with live 0.6 rotators), a one-way `FlipAuthority`
+  action promotes the authority under all three singletons, and a new
+  `MixedFleet` invariant forbids advancing any ring under both disciplines at
+  once. TLC caught a real authority-read TOCTOU (a rotator reading `columns`,
+  the flip committing, then the rotator advancing under the stale mode); the
+  fix is to take the singleton before reading the authority, in both the spec
+  and the `acquire_ring_serializer_tx` implementation. The compat singleton
+  churn is a documented, bounded transition-mode exemption in
+  `AwaDeadTupleContract.tla`. The full TLC suite passes (`AwaStorageLockOrder`
+  480,721 distinct states, depth 39; `AwaDeadTupleContract` contract check —
+  all "No error found"), plus the existing expected-counterexample witnesses
+  (the deadlock-detector and old-striped-claim `NoDeadlock` witnesses still
+  fire).
+- `AwaStorageTransition.tla` models the 0.7 migrate gate
+  (`Migrate07OnlyOnQuiescedCanonical`), with an expected-counterexample config
+  (`AwaStorageTransitionMigrate07Ungated.cfg`) witnessing why the gate is
+  required; the transition model family runs in nightly CI via the TLC suite
+  runner (`correctness/run-tlc-suite.sh`).
+- Compact deadline claims ([#246](https://github.com/hardbyte/awa/issues/246))
+  preserve the `AwaSegmentedStorage.tla` receipt-plane invariants
+  (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty`): the lifecycle model already
+  abstracts row-local and compact claims as `claimOpen`/`claimClosed`, so a
+  deadline-backed claim force-closed by batch deadline rescue is covered by the
+  existing `RescueStaleReceipt` / `RescueToReady` transitions. The full TLC
+  suite re-passed (`AwaSegmentedStorage`: 790,881 states, depth 24);
+  `MAPPING.md` and the spec's claim-family comment record that both deadline
+  modes are now compact.
+- **Trace pipeline validated end-to-end in CI.** The telemetry-validation job
+  (grafana/otel-lgtm) now asserts spans, not just metrics:
+  `test_trace_pipeline_reaches_tempo` exports over OTLP and verifies the
+  ADR-039 topology in Tempo (producer → `send {queue}` → `job.execute` with
+  consumer kind and messaging attributes; retries as fresh roots carrying a
+  span link, found via TraceQL); `scripts/trace-e2e-python.py` proves the
+  cross-language chain (Python producer span → Rust execution span → Python
+  handler span as one trace); `scripts/validate-grafana.sh` guards the
+  published Grafana assets against drift (every referenced `awa_*` identifier
+  must exist in live Prometheus or `awa-metrics` source, both dashboards must
+  import through the Grafana API, all Postgres-dashboard SQL must `EXPLAIN`
+  against a migrated schema, and traces must be readable through Grafana's
+  Tempo datasource). `scripts/telemetry-e2e-local.sh` runs the identical checks
+  locally.
+- **Nightly binary/schema compat matrix
+  ([#367](https://github.com/hardbyte/awa/issues/367)).** Pinned release
+  artifacts (`awa-pg` 0.6.0 and 0.5.7 wheels from PyPI) run against the newest
+  schema every night: the 0.6.0 leg asserts the full job lifecycle on a
+  finalized cluster; the 0.5.7 leg asserts the documented asymmetry (producers
+  route through the compat layer to the active engine, workers are inert); the
+  backward-guard leg asserts the newest `awa migrate` refuses an old
+  unfinalized schema with the exact finalize-steps message and a non-zero exit.
+  The support statement lives in `docs/stability.md`.
+- **CI: the Rust tests job is sharded
+  ([#335](https://github.com/hardbyte/awa/issues/335)).** One `cargo test
+  --workspace` run took ~31 minutes, ~22 of them the migration replay binary
+  alone. The job is now a six-way matrix: the migration suite partitioned
+  per-test across four shards with `cargo-nextest` (safe because those tests
+  already serialize through a Postgres advisory lock), the other slow binaries
+  in a `heavy` shard, and everything else — including any new test file,
+  automatically — in `rest`. Shard membership lives in
+  `scripts/ci-test-shard.sh`; the lint job validates it so renames can't drop
+  coverage, and the nextest profile flags any test slower than 60s as the
+  standing worklist for shrinking real-time fixture windows.
+- **rustc 1.97 compatibility ([#411](https://github.com/hardbyte/awa/pull/411),
+  [#414](https://github.com/hardbyte/awa/pull/414)).** GitHub's stable runners
+  rolled 1.96.1 → 1.97.0; the awa-python async bridge needed a
+  Send-inference-satisfying restructure around `spawn_blocking`, and awa-cli
+  dropped redundant references in `println!` args to clear the new clippy lint.
+  No behavior change.
 
 ## [0.6.3] — 2026-07-15
 

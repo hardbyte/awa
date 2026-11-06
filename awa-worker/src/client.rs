@@ -140,6 +140,9 @@ pub struct ClientBuilder {
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
+    /// Output types declared by `#[awa(output = T)]` on registered args,
+    /// folded into the kind descriptors at build.
+    output_types: HashMap<String, &'static str>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     enqueue_specs: HashMap<
@@ -205,6 +208,7 @@ impl ClientBuilder {
             queues: Vec::new(),
             queue_descriptors: HashMap::new(),
             job_kind_descriptors: HashMap::new(),
+            output_types: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
             enqueue_specs: HashMap::new(),
@@ -294,8 +298,12 @@ impl ClientBuilder {
     }
 
     /// Attach descriptive metadata to a typed job kind. The kind string is
-    /// taken from [`JobArgs::kind`] on `T`.
-    pub fn job_kind_descriptor<T: JobArgs>(mut self, descriptor: JobKindDescriptor) -> Self {
+    /// taken from [`JobArgs::kind`] on `T`. A descriptor without an output
+    /// type takes the one `T` declares with `#[awa(output = ...)]`.
+    pub fn job_kind_descriptor<T: JobArgs>(mut self, mut descriptor: JobKindDescriptor) -> Self {
+        if descriptor.output.is_none() {
+            descriptor.output = T::output_type().map(awa_model::OutputDescriptor::new);
+        }
         self.job_kind_descriptors
             .insert(T::kind().to_string(), descriptor);
         self
@@ -316,6 +324,7 @@ impl ClientBuilder {
     ///
     /// The worker handles jobs of type `T` where `T: JobArgs + DeserializeOwned`.
     /// The handler function receives the deserialized args and job context.
+    /// An output type `T` declares is published in the kind's descriptor.
     pub fn register<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -323,6 +332,9 @@ impl ClientBuilder {
         Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + 'static,
     {
         let kind = T::kind().to_string();
+        if let Some(output_type) = T::output_type() {
+            self.output_types.insert(kind.clone(), output_type);
+        }
         let worker = TypedWorker {
             kind: T::kind(),
             handler: Arc::new(handler),
@@ -441,18 +453,20 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
     {
         self.on_completed_enqueue_with::<T, F, _>(move |args, job| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(args, job)))
         })
     }
 
     /// Like [`Self::on_completed_enqueue`] but lets the closure return an
     /// [`EnqueueRequest`](crate::EnqueueRequest) with explicit queue,
-    /// priority, or other [`awa_model::InsertOpts`] overrides.
+    /// priority, or other [`awa_model::InsertOpts`] overrides, or `None` to
+    /// enqueue nothing for this trigger. The trigger's transition commits
+    /// either way.
     pub fn on_completed_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -492,12 +506,19 @@ impl ClientBuilder {
             + 'static,
     {
         self.on_retried_enqueue_with::<T, F, _>(move |args, job, error, attempt, next_run_at| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt, next_run_at))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args,
+                job,
+                error,
+                attempt,
+                next_run_at,
+            )))
         })
     }
 
     /// Like [`Self::on_retried_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_retried_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -508,7 +529,7 @@ impl ClientBuilder {
                 &str,
                 i16,
                 chrono::DateTime<chrono::Utc>,
-            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            ) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -546,17 +567,20 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> F + Send + Sync + 'static,
     {
         self.on_exhausted_enqueue_with::<T, F, _>(move |args, job, error, attempt| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args, job, error, attempt,
+            )))
         })
     }
 
     /// Like [`Self::on_exhausted_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_exhausted_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -588,17 +612,20 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow, &str) -> F + Send + Sync + 'static,
     {
         self.on_cancelled_enqueue_with::<T, F, _>(move |args, job, reason| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args, job, reason,
+            )))
         })
     }
 
     /// Like [`Self::on_cancelled_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_cancelled_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow, &str) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow, &str) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -632,17 +659,18 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
     {
         self.on_waiting_for_callback_enqueue_with::<T, F, _>(move |args, job| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(args, job)))
         })
     }
 
     /// Like [`Self::on_waiting_for_callback_enqueue`] but the closure returns
-    /// an [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// an [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_waiting_for_callback_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
-        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+        MakeFn: Fn(T, &awa_model::JobRow) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -683,12 +711,15 @@ impl ClientBuilder {
         MakeFn: Fn(T, &awa_model::JobRow, crate::events::RescueReason) -> F + Send + Sync + 'static,
     {
         self.on_rescued_enqueue_with::<T, F, _>(move |args, job, reason| {
-            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+            Some(crate::enqueue_specs::EnqueueRequest::new(make(
+                args, job, reason,
+            )))
         })
     }
 
     /// Like [`Self::on_rescued_enqueue`] but the closure returns an
-    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides,
+    /// or `None` to enqueue nothing for this trigger.
     pub fn on_rescued_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -697,7 +728,7 @@ impl ClientBuilder {
                 T,
                 &awa_model::JobRow,
                 crate::events::RescueReason,
-            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            ) -> Option<crate::enqueue_specs::EnqueueRequest<F>>
             + Send
             + Sync
             + 'static,
@@ -1181,11 +1212,19 @@ impl ClientBuilder {
             },
         };
 
+        let mut job_kind_descriptors = self.job_kind_descriptors;
+        for (kind, output_type) in self.output_types {
+            let descriptor = job_kind_descriptors.entry(kind).or_default();
+            if descriptor.output.is_none() {
+                descriptor.output = Some(awa_model::OutputDescriptor::new(output_type));
+            }
+        }
+
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
             queue_descriptors: self.queue_descriptors,
-            job_kind_descriptors: self.job_kind_descriptors,
+            job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             enqueue_specs: Arc::new(self.enqueue_specs),
@@ -2226,6 +2265,39 @@ impl Client {
         )
         .await?;
         tx.commit().await?;
+        self.dispatch_callback_event(UntypedJobEvent::Completed {
+            job: job.clone(),
+            duration: Duration::ZERO,
+        })
+        .await;
+        Ok(job)
+    }
+
+    /// Complete a waiting job via its callback and store the output in
+    /// `opts` as the job's output (ADR-048), as
+    /// [`admin::complete_external_with`] does. Registered
+    /// `on_completed_enqueue` specs run in the same transaction, as for
+    /// [`Self::complete_external`], and receive the row without its output.
+    pub async fn complete_external_with(
+        &self,
+        callback_id: Uuid,
+        opts: awa_model::ExternalCompletion,
+    ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let mut tx = self.pool.begin().await?;
+        let (job, dropped) =
+            admin::complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
+        self.dispatch_callback_followups_in_tx(
+            &mut tx,
+            &job,
+            crate::enqueue_specs::Outcome::Completed,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        self.metrics.record_external_output(&job, dropped);
+        if let Some(reason) = dropped {
+            admin::warn_external_output_dropped(reason);
+        }
         self.dispatch_callback_event(UntypedJobEvent::Completed {
             job: job.clone(),
             duration: Duration::ZERO,

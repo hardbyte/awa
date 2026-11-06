@@ -372,6 +372,16 @@ connection. Set `--callback-hmac-secret` to verify callback signatures; for
 externally reachable callbacks with a private admin surface, run
 `awa callbacks serve` instead, whose router has no admin routes.
 
+`awa serve` caps every admin query at 60 seconds (`--statement-timeout` /
+`AWA_STATEMENT_TIMEOUT`, in seconds; `0` keeps the server's setting). Postgres
+keeps running a query after its HTTP request is abandoned, so this cap is what
+stops repeated dashboard polls from piling up slow queries. When embedding
+`awa_ui::router` in another service, build its pool with
+`awa_ui::admin_pool_options(PgPoolOptions::new())` and
+`connect_with(awa_ui::admin_connect_options(url.parse()?, Some(timeout)))`.
+The release hook recovers connections whose request was dropped mid-query;
+without it, a cancelled query can leak the pool slot over TLS.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.

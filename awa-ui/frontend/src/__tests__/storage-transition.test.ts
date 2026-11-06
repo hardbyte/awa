@@ -164,7 +164,19 @@ describe("shouldShowStorageTransitionCard", () => {
     ).toBe(true);
   });
 
-  it("shows the card when the cluster has finalized onto queue_storage", () => {
+  it("shows the card during a mixed transition", () => {
+    expect(
+      shouldShowStorageTransitionCard(
+        makeReport({
+          state: "mixed_transition",
+          active_engine: "canonical",
+          prepared_engine: "queue_storage",
+        })
+      )
+    ).toBe(true);
+  });
+
+  it("hides the card once the cluster has finalized onto queue_storage", () => {
     expect(
       shouldShowStorageTransitionCard(
         makeReport({
@@ -173,6 +185,6 @@ describe("shouldShowStorageTransitionCard", () => {
           prepared_engine: null,
         })
       )
-    ).toBe(true);
+    ).toBe(false);
   });
 });
