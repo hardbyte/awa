@@ -400,6 +400,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

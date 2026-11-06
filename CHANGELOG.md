@@ -6,6 +6,27 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **On queue storage, a queue whose enqueue lane is busy no longer holds
+  back promotion of other queues, nor the maintenance leader's rescue,
+  rotation and prune.** Promotion re-enqueues due scheduled and retryable
+  rows into their lane, which takes the lane's reservation lock that
+  producers hold until they commit. A promotion batch was one transaction
+  across every queue it touched, and the leader runs its branches one after
+  another, so a lane kept busy by producers delayed due jobs of unrelated
+  queues in the same batch, and rescue started seconds late. Promotion now
+  gives each `(queue, priority)` lane its own transaction under a 50 ms
+  `lock_timeout`. A lane that times out keeps its rows deferred and is
+  handed to a dedicated task that waits up to 30 s for the lock, queued
+  behind the producers already waiting, so the lane is still promoted in
+  turn however busy it stays; the leader skips it meanwhile. At most four
+  lanes wait this way at once, and a further contended lane is retried on
+  the next tick. `awa.maintenance.promote.lane_contention`
+  (`awa_maintenance_promote_lane_contention_total{awa_job_state,awa_job_queue,awa_promote_outcome}`)
+  counts `handed_off`, `waiter_limit` and `waiter_timed_out`. Promoted rows
+  now take lane sequence numbers in due order within their lane.
+  `QueueStorage::promote_due` keeps its signature and promotes lane by lane
+  without a lock timeout; `promote_due_lanes` and `promote_due_lane` expose
+  the per-lane form.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are
