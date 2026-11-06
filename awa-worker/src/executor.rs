@@ -409,6 +409,7 @@ impl JobExecutor {
                         claim,
                     )
                 }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             if let Some(counter) = queue_in_flight.get(&job_queue) {
@@ -514,7 +515,12 @@ impl JobExecutor {
                 }
             }
 
-            // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
+            // Keep heartbeating through the finalization queue and its durable write.
+            in_flight.mark_finalizing((job_id, job_run_lease));
+            let heartbeat = HeartbeatUntilFinalized {
+                in_flight: in_flight.clone(),
+                key: (job_id, job_run_lease),
+            };
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
                     permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
@@ -523,7 +529,6 @@ impl JobExecutor {
                 None => None,
             };
 
-            in_flight.remove((job_id, job_run_lease));
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
@@ -543,6 +548,7 @@ impl JobExecutor {
             job.output = sealed_output;
             finalizers.spawn(
                 async move {
+                    let _heartbeat = heartbeat;
                     let event_kind = job_kind.clone();
                     let abandon_output = had_output.then(|| (metrics.clone(), job_queue.clone()));
                     let finalize = async move {
@@ -3367,6 +3373,18 @@ async fn retry_backoff_canonical_with_followups(
 
     tx.commit().await?;
     Ok(Some(updated_job))
+}
+
+/// Keep finalizing attempts live until their durable write or abandonment.
+struct HeartbeatUntilFinalized {
+    in_flight: InFlightMap,
+    key: (i64, i64),
+}
+
+impl Drop for HeartbeatUntilFinalized {
+    fn drop(&mut self) {
+        self.in_flight.remove(self.key);
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Finished attempts keep heartbeating until their durable finalization finishes,
+  including while completion writes are stalled. Compact receipt heartbeats
+  address claims by batch identity and skip attempts a closer already holds,
+  so one stalled completion cannot block the rest of a heartbeat pass. Late
+  heartbeats cannot recreate state for a completed attempt.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
