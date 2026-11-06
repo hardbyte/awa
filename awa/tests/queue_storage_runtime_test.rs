@@ -3,6 +3,7 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+mod ci_timing;
 #[path = "../../awa-model/src/storage_footprint_sql.rs"]
 mod storage_footprint_sql;
 
@@ -13503,13 +13504,43 @@ async fn test_queue_storage_prune_past_floor_folds_failed_into_rollup() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    // Duration::ZERO disables the floor: every failed row is treated as
-    // past-floor and pruned for good — no carry.
-    match store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("prune_oldest")
-    {
+    let mut reader = pool.begin().await.expect("begin transient terminal reader");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_0 IN ACCESS SHARE MODE"
+    )))
+    .execute(reader.as_mut())
+    .await
+    .expect("hold terminal partition reader");
+
+    // A valid transient Blocked must leave both the rows and rollup untouched.
+    // This test checks retention accounting, not immediate exclusive-lock access.
+    assert!(matches!(
+        store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("blocked prune"),
+        PruneOutcome::Blocked { slot: 0 }
+    ));
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 3);
+    assert_eq!(pruned_rollup_sums(&pool, schema, queue).await, (0, 0));
+    reader.rollback().await.expect("release terminal reader");
+
+    // Duration::ZERO disables the floor. A background reader may still briefly
+    // hold a partition, so require the fold to finish within an assertion bound.
+    // Only Blocked may defer it; every error or other outcome still fails below.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    let outcome = loop {
+        let outcome = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("prune_oldest");
+        if matches!(outcome, PruneOutcome::Blocked { slot: 0 }) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        } else {
+            break outcome;
+        }
+    };
+    match outcome {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 0,
