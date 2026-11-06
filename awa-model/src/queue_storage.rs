@@ -18192,7 +18192,10 @@ impl QueueStorage {
                     break;
                 }
                 TerminalDeltaSlotRollup::Blocked => {
+                    // The next slot would most likely wait out the same lock
+                    // timeout, and the leader loop is blocked while it does.
                     outcome.blocked_slots += 1;
+                    break;
                 }
             }
         }

@@ -22,7 +22,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   anywhere in a queue, lease or claim prune, or in a terminal-count rollup
   slot, now rolls the whole transaction back and reports `Blocked`
   (`blocked_slots` for rollup), so maintenance backs off and retries; nothing
-  the attempt wrote survives the rollback.
+  the attempt wrote survives the rollback. A rollup pass stops at its first
+  blocked slot rather than waiting out the timeout again on each remaining
+  one.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
