@@ -2006,6 +2006,8 @@
       
         
       
+        
+      
     
     
     
@@ -2187,6 +2189,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -3158,7 +3188,7 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td><code>awa.maintenance.rescue.oldest_attempt_age</code></td>
 <td>Gauge (s)</td>
 <td>rescue_kind</td>
-<td>Age of the oldest attempt the latest queue-storage rescue pass rescued; <code>0</code> when it rescued none</td>
+<td>Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; <code>0</code> when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader</td>
 </tr>
 <tr>
 <td><code>awa.maintenance.prune.attempts</code></td>
