@@ -30,9 +30,10 @@ default privileges covered that role could use the lane; any other role failed
 with `permission denied for sequence`. v053 installs `SECURITY DEFINER`
 `provision_lane` and `provision_lane_sequences` functions, owned by the schema
 owner, in each queue-storage schema. The lane helpers create sequences through
-them, with grants that mirror the lane's head table. v053 then gives every
-existing lane sequence to the schema owner and adds its missing grants, as far
-as the migrating role is allowed to.
+them, with grants that mirror the lane's head table. Once v053 commits,
+`awa migrate` gives every existing lane sequence to the schema owner and adds
+its missing grants, as far as it is allowed to, one sequence per short
+transaction with a bounded lock wait.
 
 0.6 and earlier 0.7 binaries call the same helpers, so lanes they create after
 v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
@@ -44,13 +45,15 @@ To adopt it:
    while lanes need repair).
 2. Run `awa migrate` with the schema owner as the effective role, as described
    in [Database roles](../security/database-roles/index.md).
-3. Read the migrate output. Any lane sequence it could not reassign is listed;
-   `awa storage lane-sequences` gives the statements to run and the role to run
-   them as. See
+3. Read the migrate output. Any lane sequence it could not repair is listed in
+   a warning. A busy one needs another run of
+   `awa storage lane-sequences --repair` as the migration role (without
+   `PGOPTIONS`); the others name the roles that can repair them. See
    [Check and repair lane ownership](../security/database-roles/index.md#check-and-repair-lane-ownership).
 
 External migration runners apply the generated `awa migrate --sql --from 52
---to 53` bundle, then run `awa storage lane-sequences` to check for leftovers.
+--to 53` bundle, which does not repair existing lane sequences, then run
+`awa storage lane-sequences --repair` as the migration role itself.
 
 ## Custom-schema discovery during migration
 

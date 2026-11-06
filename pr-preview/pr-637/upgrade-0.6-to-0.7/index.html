@@ -2713,9 +2713,10 @@ default privileges covered that role could use the lane; any other role failed
 with <code>permission denied for sequence</code>. v053 installs <code>SECURITY DEFINER</code>
 <code>provision_lane</code> and <code>provision_lane_sequences</code> functions, owned by the schema
 owner, in each queue-storage schema. The lane helpers create sequences through
-them, with grants that mirror the lane's head table. v053 then gives every
-existing lane sequence to the schema owner and adds its missing grants, as far
-as the migrating role is allowed to.</p>
+them, with grants that mirror the lane's head table. Once v053 commits,
+<code>awa migrate</code> gives every existing lane sequence to the schema owner and adds
+its missing grants, as far as it is allowed to, one sequence per short
+transaction with a bounded lock wait.</p>
 <p>0.6 and earlier 0.7 binaries call the same helpers, so lanes they create after
 v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
 detects that <code>provision_lane</code> is missing and creates lanes as before.</p>
@@ -2725,13 +2726,15 @@ detects that <code>provision_lane</code> is missing and creates lanes as before.
    while lanes need repair).</li>
 <li>Run <code>awa migrate</code> with the schema owner as the effective role, as described
    in <a href="../security/database-roles/">Database roles</a>.</li>
-<li>Read the migrate output. Any lane sequence it could not reassign is listed;
-   <code>awa storage lane-sequences</code> gives the statements to run and the role to run
-   them as. See
+<li>Read the migrate output. Any lane sequence it could not repair is listed in
+   a warning. A busy one needs another run of
+   <code>awa storage lane-sequences --repair</code> as the migration role (without
+   <code>PGOPTIONS</code>); the others name the roles that can repair them. See
    <a href="../security/database-roles/#check-and-repair-lane-ownership">Check and repair lane ownership</a>.</li>
 </ol>
 <p>External migration runners apply the generated <code>awa migrate --sql --from 52
---to 53</code> bundle, then run <code>awa storage lane-sequences</code> to check for leftovers.</p>
+--to 53</code> bundle, which does not repair existing lane sequences, then run
+<code>awa storage lane-sequences --repair</code> as the migration role itself.</p>
 <h2 id="custom-schema-discovery-during-migration">Custom-schema discovery during migration<a class="headerlink" href="#custom-schema-discovery-during-migration" title="Permanent link">&para;</a></h2>
 <p>Migration bundles discover custom substrates using catalog metadata without
 evaluating their views or functions. Schemas, relations, routines and types
