@@ -63,36 +63,44 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
 
 If an existing installation created objects as `awa_migrator` without first setting the owner role, transfer every existing schema object to `awa_owner` before relying on owner-scoped defaults. New migrations should use the effective-role command above.
 
-## Provision queues before starting restricted runtimes
+## Lane sequences
 
-From schema v049, runtime calls use existing lane sequences without issuing
-`CREATE SEQUENCE`. Run provisioning as the migrator for every queue before
-starting its producers or workers:
+Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. From schema v053 they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after validating the queue, priority (1–4) and shard (0–63). A runtime therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard.
+
+A new lane sequence gets the privileges of the head table it backs. A role that may `INSERT` or `UPDATE` `queue_enqueue_heads` gets `USAGE, SELECT, UPDATE` on the enqueue sequences, and one that may only `SELECT` it gets `SELECT`; `queue_claim_heads` does the same for the claim sequences. Granting the runtime the table privileges above is enough, and no sequence default privileges are needed for lanes.
+
+Run migrations with the schema owner as the effective role, as above, so the provisioning functions belong to it. A migrator that cannot `SET ROLE` to the owner leaves them owned by itself and the migration warns.
+
+`awa storage prepare-queue` still creates every priority and shard of a queue in one transaction, and any runtime role may run it. Use it to create lanes before a deploy rather than on first use.
+
+### Check and repair lane ownership
+
+Lanes created before v053 belong to whichever role touched them first, and only that role, or the roles its default privileges named, can use them. A different runtime role then fails with `permission denied for sequence` on that lane. List lane sequences that are not owned by the schema owner or lack a runtime grant (read-only, any role):
+
+```bash
+awa --database-url "$AWA_DATABASE_URL" storage lane-sequences --schema awa
+```
+
+```sql
+SELECT * FROM awa.lane_sequence_problems('awa');
+```
+
+The command exits 2 while any remain. Migration v053 runs the repair as the migrating role: for each sequence it changes the owner to the schema owner and adds the missing grants, wherever that role is allowed to. A sequence it is not allowed to change does not fail the migration. It is reported in a warning, and `awa migrate` prints a summary. Run the repair again at any time; it is idempotent:
 
 ```bash
 PGOPTIONS='-c role=awa_owner' \
-  awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
-  --queue email --enqueue-shards 1
+  awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage lane-sequences --repair
 ```
 
-The command provisions all four priorities in one transaction and is safe to
-repeat on a live queue: existing sequence cursors keep their positions. It does
-not change routing or the queue's configured shard count. Prepare additional
-shards before increasing `enqueue_shards`; match `--queue-stripe-count` to the
-runtime's queue-storage configuration. With `PartitionedQueue`, provision each
-physical queue. Use `--schema` for a custom storage schema.
+Changing a sequence's owner requires a role that can `SET ROLE` to both the current owner and the schema owner. A migrator usually can for sequences it or the owner created, but not for one an unrelated application role created, and managed PostgreSQL offers no superuser. For each sequence that remains, the output gives the statements to run:
 
-Apply the sequence grants above after provisioning, or set the owner's default
-privileges first. Lane cursors need `UPDATE` for `setval`, in addition to `USAGE`
-and `SELECT`. `CREATE SEQUENCE IF NOT EXISTS` requires schema CREATE even when
-the sequence already exists, so provisioning alone does not repair pre-v049
-helpers: apply the migration first. Schema owners retain lazy creation for
-single-role installations; a restricted runtime encountering an unprepared
-lane fails with a provisioning hint.
+- `missing_grants`: run them as the current owner, or as a role that can `SET ROLE` to it. Every runtime role can then use the lane, although the owner stays unchanged.
+- `reassign_sql`: run it as a role that is a member of both roles, for example after `GRANT app_role TO awa_migrator` from a role with `ADMIN` on `app_role`. Revoke that membership afterwards.
 
 ## Custom queue-storage schemas
+## Custom queue-storage schemas
 
-Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and `TRUNCATE`, but never DDL. See [Queue storage](../queue-storage-substrate.md).
+Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and `TRUNCATE`, but never DDL. Check lanes in a custom schema with `awa storage lane-sequences --schema <name>`. See [Queue storage](../queue-storage-substrate.md).
 
 ## Why the grants are broad
 

@@ -91,11 +91,13 @@ Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
 ## Restricted Database Roles
 
-When deploying a runtime without schema CREATE, apply v049 and provision every
-queue with `awa storage prepare-queue` as the migrator before starting producers
-or workers. Match shard/stripe counts; provision additional lanes before changing
-routing. Use the sequence grants and owner defaults in
-[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+From v053 any runtime role creates lanes through the schema owner's
+`SECURITY DEFINER` provisioning functions, so runtimes need neither schema
+CREATE nor sequence default privileges, and `awa storage prepare-queue` is
+optional. Run migrations with the schema owner as the effective role. Check
+lane ownership with `awa storage lane-sequences` (exits 2 while lanes need
+repair) and fix it with `--repair` or the statements it prints; see
+[Database roles](../../docs/security/database-roles.md#check-and-repair-lane-ownership).
 
 ## Rolling Upgrades
 

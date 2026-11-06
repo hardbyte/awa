@@ -328,11 +328,13 @@ fn access_for(command: &Commands) -> context::Access {
         },
         Commands::Storage { command } => match command {
             StorageCommands::Status => ReadOnly,
+            StorageCommands::LaneSequences { repair: false, .. } => ReadOnly,
             StorageCommands::Finalize { check: true, .. } => ReadOnly,
             StorageCommands::FlipRingAuthority { check: true, .. } => ReadOnly,
             StorageCommands::Prepare { .. }
             | StorageCommands::PrepareQueueStorageSchema { .. }
             | StorageCommands::PrepareQueue { .. }
+            | StorageCommands::LaneSequences { .. }
             | StorageCommands::Abort
             | StorageCommands::EnterMixedTransition { .. }
             | StorageCommands::Finalize { .. }
@@ -811,7 +813,7 @@ enum StorageCommands {
         #[arg(long)]
         reset: bool,
     },
-    /// Provision lane sequences as the migrator, before starting a runtime without DDL
+    /// Provision every priority and shard of a queue ahead of its first enqueue
     PrepareQueue {
         /// Queue-storage schema to provision
         #[arg(long, default_value = "awa")]
@@ -825,6 +827,16 @@ enum StorageCommands {
         /// Match the runtime's queue-storage stripe count
         #[arg(long, default_value_t = 1)]
         queue_stripe_count: usize,
+    },
+    /// List lane sequences not owned by the schema owner or missing runtime
+    /// grants, with the statements that fix them. Exits 2 while any remain.
+    LaneSequences {
+        /// Queue-storage schema to check
+        #[arg(long, default_value = "awa")]
+        schema: String,
+        /// Reassign and grant what the connected role is allowed to first
+        #[arg(long)]
+        repair: bool,
     },
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
@@ -1182,6 +1194,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 awa_model::migrations::run_with_options(&pool, options).await?;
                 println!("Migrations applied successfully.");
+                for (schema, count) in
+                    awa_model::storage::lane_sequence_problem_counts(&pool).await?
+                {
+                    eprintln!(
+                        "warning: {count} lane sequence(s) in schema {schema} are not owned by \
+                         the schema owner or lack runtime grants, and the migrating role could \
+                         not repair them. Run `awa storage lane-sequences --schema {schema}` for \
+                         the statements to run and the roles to run them as."
+                    );
+                }
             }
         }
 
@@ -1932,6 +1954,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "queue_stripe_count": queue_stripe_count, "routing_changed": false,
                             }))?
                         );
+                    }
+                    StorageCommands::LaneSequences { schema, repair } => {
+                        let remaining = if repair {
+                            let results =
+                                awa_model::storage::repair_lane_sequences(&pool, &schema).await?;
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "schema": schema, "results": results,
+                                }))?
+                            );
+                            results
+                                .iter()
+                                .filter(|result| result.outcome != "repaired")
+                                .count()
+                        } else {
+                            let problems =
+                                awa_model::storage::lane_sequence_problems(&pool, &schema).await?;
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "schema": schema, "problems": problems,
+                                }))?
+                            );
+                            problems.len()
+                        };
+                        if remaining > 0 {
+                            eprintln!(
+                                "{remaining} lane sequence(s) in schema {schema} need repair. Run \
+                                 each missing_grants statement as the sequence owner (or a role \
+                                 that can SET ROLE to it), and each reassign_sql statement as a \
+                                 role that can SET ROLE to both the owner and expected_owner."
+                            );
+                            std::process::exit(2);
+                        }
                     }
                     StorageCommands::Abort => {
                         awa_model::storage::abort(&pool).await?;
