@@ -48,6 +48,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Statistics-refresh permission warnings distinguish caller grants from
+  helper/table ownership and ANALYZE privileges.
 - **A queue lane is usable by every runtime role, whichever role creates it
   first (migration v053).** A lane's enqueue and claim sequences belonged to
   the role that first enqueued into, claimed from or promoted into it, so with

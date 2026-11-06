@@ -366,16 +366,29 @@ async fn non_owner_runtime_role_refreshes_statistics() {
     seed_ready_rows(&store, &database.owner_pool, 200).await;
     let runtime_pool = database.runtime_pool(&runtime).await;
 
-    let is_superuser_or_owner: bool = sqlx::query_scalar(
+    let server_version_num: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&runtime_pool)
+            .await
+            .expect("read PostgreSQL version");
+    // pg_maintain and the MAINTAIN privilege were introduced in PostgreSQL 17.
+    // Older supported servers must never evaluate either privilege check.
+    let privilege_query = if server_version_num >= 170000 {
         "SELECT rolsuper OR pg_has_role(current_user, 'pg_maintain', 'USAGE')
               OR has_table_privilege('awa.queue_claim_heads', 'MAINTAIN')
               OR (SELECT relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)
                   FROM pg_class WHERE oid = 'awa.queue_claim_heads'::regclass)
-         FROM pg_roles WHERE rolname = current_user",
-    )
-    .fetch_one(&runtime_pool)
-    .await
-    .expect("check runtime role privileges");
+         FROM pg_roles WHERE rolname = current_user"
+    } else {
+        "SELECT rolsuper
+              OR (SELECT relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                  FROM pg_class WHERE oid = 'awa.queue_claim_heads'::regclass)
+         FROM pg_roles WHERE rolname = current_user"
+    };
+    let is_superuser_or_owner: bool = sqlx::query_scalar(privilege_query)
+        .fetch_one(&runtime_pool)
+        .await
+        .expect("check runtime role privileges");
     assert!(
         !is_superuser_or_owner,
         "the runtime role must not be able to analyse the tables itself"

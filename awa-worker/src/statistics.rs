@@ -132,7 +132,8 @@ pub(crate) struct StatisticsRefresher {
     /// runtime is only a standby: a pass runs only once routing has flipped to
     /// `schema`.
     require_active_schema: bool,
-    warned_privilege: AtomicBool,
+    warned_caller_privilege: AtomicBool,
+    warned_analyze_privilege: AtomicBool,
     warned_unavailable: AtomicBool,
 }
 
@@ -148,7 +149,8 @@ impl StatisticsRefresher {
             schema,
             metrics,
             require_active_schema,
-            warned_privilege: AtomicBool::new(false),
+            warned_caller_privilege: AtomicBool::new(false),
+            warned_analyze_privilege: AtomicBool::new(false),
             warned_unavailable: AtomicBool::new(false),
         }
     }
@@ -226,6 +228,7 @@ impl StatisticsRefresher {
             }
             Ok(HelperAccess::Denied) => {
                 self.warn_privilege_once(
+                    &self.warned_caller_privilege,
                     "queue_claim_heads",
                     "the runtime role needs EXECUTE on awa.analyze_queue_storage_relation(text, text), \
                      and the login role needs INSERT, UPDATE and DELETE on this schema's queue_claim_heads; \
@@ -351,6 +354,7 @@ impl StatisticsRefresher {
                 "analyzed" => AnalyzeOutcome::Ok,
                 "skipped_privilege" => {
                     self.warn_privilege_once(
+                        &self.warned_analyze_privilege,
                         relation,
                         "the owner of awa.analyze_queue_storage_relation() may not ANALYZE this table; \
                          change the function's owner to the table owner with ALTER FUNCTION, \
@@ -410,10 +414,11 @@ impl StatisticsRefresher {
             }
             Some(SQLSTATE_INSUFFICIENT_PRIVILEGE) => {
                 self.warn_privilege_once(
+                    &self.warned_analyze_privilege,
                     relation,
-                    "the runtime role may not execute awa.analyze_queue_storage_relation(), or lacks \
-                     INSERT, UPDATE and DELETE on the queue head tables; \
-                     GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) to it",
+                    "the statistics helper was denied access; check the helper's owner, table ownership \
+                     and ANALYZE privileges; also recheck runtime helper EXECUTE and login-role \
+                     head-table INSERT, UPDATE and DELETE grants if they changed after this pass's privilege probe",
                 );
                 AnalyzeOutcome::SkippedPrivilege
             }
@@ -435,8 +440,8 @@ impl StatisticsRefresher {
         );
     }
 
-    fn warn_privilege_once(&self, relation: &str, missing: &str) {
-        if self.warned_privilege.swap(true, Ordering::Relaxed) {
+    fn warn_privilege_once(&self, warned: &AtomicBool, relation: &str, missing: &str) {
+        if warned.swap(true, Ordering::Relaxed) {
             return;
         }
         warn!(
