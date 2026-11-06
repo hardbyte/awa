@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
@@ -267,6 +268,7 @@ pub struct JobExecutor {
     completion_batcher: CompletionBatcherHandle,
     storage: RuntimeStorage,
     dlq_policy: DlqPolicy,
+    finalizers: TaskTracker,
 }
 
 impl JobExecutor {
@@ -288,6 +290,7 @@ impl JobExecutor {
         completion_batcher: CompletionBatcherHandle,
         storage: RuntimeStorage,
         dlq_policy: DlqPolicy,
+        finalizers: TaskTracker,
     ) -> Self {
         Self {
             pool,
@@ -301,6 +304,7 @@ impl JobExecutor {
             completion_batcher,
             storage,
             dlq_policy,
+            finalizers,
         }
     }
 
@@ -327,6 +331,7 @@ impl JobExecutor {
         let completion_batcher = self.completion_batcher.clone();
         let storage = self.storage.clone();
         let dlq_policy = self.dlq_policy.clone();
+        let finalizers = self.finalizers.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -444,7 +449,10 @@ impl JobExecutor {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            tokio::spawn(async move {
+            // Graceful shutdown waits for this before it stops the completion
+            // batcher: the attempt has already left `in_flight`, so nothing
+            // heartbeats it, and a finalize lost at exit leaves it to rescue.
+            finalizers.spawn(async move {
                 // Every finalize path is one lease-guarded transaction, and a
                 // deadlock abort rolls the whole transaction back, so running
                 // it again is safe. Without the retry the job would sit
