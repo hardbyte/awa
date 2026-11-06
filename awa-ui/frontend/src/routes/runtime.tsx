@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
   effectiveEngine,
@@ -28,7 +28,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 import {
   formatDateTime,
   formatSnapshotInterval,
@@ -77,7 +76,6 @@ function EngineCaption({
 }
 
 export function RuntimePage() {
-  const poll = usePollInterval();
   const navigate = useNavigate();
   const search = useSearch({ strict: false }) as { lifecycle?: string };
   const lifecycle: LifecycleFilter =
@@ -92,32 +90,28 @@ export function RuntimePage() {
       replace: true,
     });
   };
-  const runtimeQuery = useQuery<RuntimeOverview>({
+  const runtimeQuery = useManagedQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
-  const queueRuntimeQuery = useQuery<QueueRuntimeSummary[]>({
+  const queueRuntimeQuery = useManagedQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   // Optional: backends before 0.5.5-alpha return 404 for /storage, in which
   // case fetchStorage resolves to null and the card simply doesn't render.
   // Once we've seen a null response the endpoint is known-absent for this
   // session — stop polling so we don't hammer it with 404s every interval.
-  const storageQuery = useQuery<StorageStatusReport | null>({
+  const storageQuery = useManagedQuery<StorageStatusReport | null>({
     queryKey: ["storage", "with-history"],
     // The card accumulates per-epoch backlog history client-side (Option
     // A from issue #297). The `?history=true` query param is still set
     // so the server-side contract is engaged — it makes future server
     // ring-buffer rollouts a no-op for clients that already opted in.
     queryFn: () => fetchStorage({ history: true }),
-    refetchInterval: (query) =>
-      query.state.data === null ? false : poll.interval,
-    staleTime: poll.staleTime,
+
     retry: false,
   });
 

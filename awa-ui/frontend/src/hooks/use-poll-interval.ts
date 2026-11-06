@@ -21,6 +21,7 @@ export function usePollInterval(): PollConfig {
   const { data } = useQuery({
     queryKey: ["capabilities"],
     queryFn: fetchCapabilities,
+    enabled: false, refetchOnWindowFocus: false, refetchOnReconnect: false, retry: false,
     staleTime: 60_000,
   });
 

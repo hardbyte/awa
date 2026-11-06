@@ -4,6 +4,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Changed
+
+- **Dashboard refreshes share one bounded polling scheduler.** Managed views
+  coalesce mutation/focus/manual demand, reconcile independently, pause in hidden
+  tabs and retain stale data on failures. Selected jobs and manually refreshed
+  counts keep their refresh exceptions. Aggregate caches fence obsolete fills
+  after local mutations and return source-observation/cache-age headers. See
+  [admin observation](docs/admin-observation.md) for scope and validation limits.
+
 ### Upgrading
 
 - **Build the tag indexes after upgrading** (ADR-049). As the migrator, run

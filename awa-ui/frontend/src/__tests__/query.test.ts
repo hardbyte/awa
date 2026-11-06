@@ -1,8 +1,14 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { shouldRetry } from "@/lib/query";
 import { ApiError, fetchJobs } from "@/lib/api";
+import { HttpError } from "@/lib/observation/read-control";
 
 describe("shouldRetry", () => {
+  it("recognizes the HTTP errors emitted by observation reads", () => {
+    expect(shouldRetry(0, new HttpError("narrow the filter", 400))).toBe(false);
+    expect(shouldRetry(0, new HttpError("not found", 404))).toBe(false);
+    expect(shouldRetry(0, new HttpError("unavailable", 503))).toBe(true);
+  });
   it("does not retry a 4xx", () => {
     expect(shouldRetry(0, new ApiError(400, "narrow the filter"))).toBe(false);
     expect(shouldRetry(0, new ApiError(404, "not found"))).toBe(false);
@@ -35,6 +41,7 @@ describe("ApiError", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).status).toBe(400);
     expect((error as ApiError).message).toBe("narrow the filter");
+    expect(shouldRetry(0, error)).toBe(false);
   });
 
   it("falls back to the status text without a JSON body", async () => {

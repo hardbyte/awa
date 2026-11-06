@@ -1,5 +1,5 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -42,7 +42,6 @@ import {
   RETRYABLE_STATES,
   TERMINAL_STATES,
 } from "@/lib/constants";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 
 const STATES = [
   "all",
@@ -129,14 +128,13 @@ export function JobsPage() {
     filters.state !== "all" || Object.keys(parseSearch(filters.search)).length > 0;
 
   const hasSel = selected.size > 0;
-  const poll = usePollInterval();
   const searchError = termError(filters.search);
 
-  const jobsQuery = useQuery<JobRow[]>({
+  const jobsQuery = useManagedQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
     enabled: !searchError,
-    refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
+    paused: hasSel,
   });
 
   // A batch operation acts on available and scheduled jobs, so the jobs
@@ -161,17 +159,16 @@ export function JobsPage() {
 
   // Counted when the filter changes, not on every poll: a count reads the
   // whole matching population.
-  const countQuery = useQuery<JobCount>({
+  const countQuery = useManagedQuery<JobCount>({
     queryKey: ["jobs-count", filterParams],
     queryFn: () => fetchJobCount(filterParams),
     enabled: hasFilter && !searchError,
     staleTime: 30_000,
   });
 
-  const statsQuery = useQuery<StateCounts>({
+  const statsQuery = useManagedQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
   const readOnly = useReadOnly();
 
@@ -209,7 +206,7 @@ export function JobsPage() {
 
   // Queue context: when filtering by a single queue, show queue actions
   const activeQueue = searchFilters.queue;
-  const queuesQuery = useQuery<QueueStats[]>({
+  const queuesQuery = useManagedQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
     enabled: !!activeQueue,
@@ -310,6 +307,7 @@ export function JobsPage() {
 
   return (
     <div className="space-y-4">
+      {jobsQuery.isPlaceholderData && <p role="status">Previous filter results are shown while the new read finishes.</p>}
       <div className="flex flex-wrap items-center gap-4">
         <Heading level={2}>
           {activeQueue ? `Queue: ${activeQueueLabel}` : "Jobs"}
@@ -425,7 +423,7 @@ export function JobsPage() {
               {countQuery.data.kind === "at_least"
                 ? `${countQuery.data.value.toLocaleString()}+`
                 : countQuery.data.value.toLocaleString()}{" "}
-              matching
+              matching{countQuery.isObservationStale ? " (stale)" : ""}
             </span>
           )}
           {countQuery.isError && (
@@ -500,6 +498,7 @@ export function JobsPage() {
             <div className="flex items-start gap-3">
               <input
                 type="checkbox"
+                disabled={jobsQuery.isPlaceholderData}
                 checked={selected.has(job.id)}
                 onChange={() => {
                   setSelected((prev) => {
@@ -569,9 +568,10 @@ export function JobsPage() {
       {/* Desktop table */}
       <Table
         aria-label="Jobs"
-        selectionMode="multiple"
+        selectionMode={jobsQuery.isPlaceholderData ? "none" : "multiple"}
         selectedKeys={selected}
         onSelectionChange={(keys) => {
+          if (jobsQuery.isPlaceholderData) return;
           if (keys === "all") {
             setSelected(new Set(jobs.map((j) => j.id)));
           } else {

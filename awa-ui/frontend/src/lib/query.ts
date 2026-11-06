@@ -1,5 +1,5 @@
 import { QueryClient } from "@tanstack/react-query";
-import { ApiError } from "@/lib/api";
+import { HttpError } from "@/lib/observation/read-control";
 
 /** Retries after a failure. */
 const MAX_RETRIES = 2;
@@ -11,7 +11,7 @@ const MAX_RETRIES = 2;
  * 5xx responses may pass.
  */
 export function shouldRetry(failureCount: number, error: unknown): boolean {
-  if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+  if (error instanceof HttpError && error.status >= 400 && error.status < 500) {
     return false;
   }
   return failureCount < MAX_RETRIES;
@@ -20,8 +20,8 @@ export function shouldRetry(failureCount: number, error: unknown): boolean {
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      // Polling interval and staleTime are set per-query via
-      // usePollInterval() so the server can control the rate.
+      // Managed views use the tab observation scheduler. Catalog views
+      // retain their existing per-query polling and focus behavior.
       refetchInterval: false,
       refetchIntervalInBackground: false,
       refetchOnWindowFocus: "always",

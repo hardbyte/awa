@@ -1,6 +1,6 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useState } from "react";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -29,7 +29,6 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
 import {
   dlqPolicyIntent,
@@ -39,18 +38,15 @@ import {
 export function QueuesPage() {
   const queryClient = useQueryClient();
   const [drainTarget, setDrainTarget] = useState<string | null>(null);
-  const poll = usePollInterval();
 
-  const queuesQuery = useQuery<QueueStats[]>({
+  const queuesQuery = useManagedQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
-  const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
+  const runtimeQuery = useManagedQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
   const readOnly = useReadOnly();
 

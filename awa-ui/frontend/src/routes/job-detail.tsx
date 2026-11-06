@@ -1,6 +1,6 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useEffect } from "react";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -25,7 +25,6 @@ import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
 import { OutputCard } from "@/components/OutputCard";
-import { POLL } from "@/lib/constants";
 
 function hasMetadata(job: JobRow): boolean {
   return (
@@ -60,11 +59,10 @@ export function JobDetailPage() {
   const readOnly = useReadOnly();
   const navigate = useNavigate();
 
-  const jobQuery = useQuery<JobRow>({
+  const jobQuery = useManagedQuery<JobRow>({
     queryKey: ["job", jobId],
     queryFn: () => fetchJob(jobId),
     enabled: !isNaN(jobId),
-    refetchInterval: POLL.FAST,
   });
 
   // If this job has been moved to the DLQ, /jobs/:id retry/cancel routes will
@@ -107,7 +105,7 @@ export function JobDetailPage() {
   if (jobQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading...</p>;
   }
-  if (jobQuery.error) {
+  if (jobQuery.error && jobQuery.data === undefined) {
     return (
       <p className="text-sm text-danger">Error: {String(jobQuery.error)}</p>
     );
@@ -124,6 +122,7 @@ export function JobDetailPage() {
 
   return (
     <div className="space-y-6">
+      {jobQuery.isRetainedNotFound && <p role="status">Last observed job shown. The latest read reports that this job was not found.</p>}
       {/* Back link */}
       <Link
         to="/jobs"
