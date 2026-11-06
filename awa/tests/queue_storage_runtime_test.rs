@@ -6,6 +6,8 @@
 #[path = "../../awa-model/src/storage_footprint_sql.rs"]
 mod storage_footprint_sql;
 
+mod ci_timing;
+
 use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
@@ -447,6 +449,32 @@ async fn create_store_with_config(pool: &sqlx::PgPool, config: QueueStorageConfi
     store.reset(pool).await.expect("Failed to reset store");
     activate_queue_storage_transition(pool, store.schema()).await;
     store
+}
+
+/// Prune's success/accounting assertions allow a transient competing lock.
+/// Retry only the expected slot's Blocked result; errors and other outcomes
+/// still reach the caller's original assertions without being retried.
+async fn prune_until_not_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+    slot: i32,
+) -> PruneOutcome {
+    tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(5)), async {
+        loop {
+            let outcome = store
+                .prune_oldest(pool, retention)
+                .await
+                .expect("prune_oldest");
+            if matches!(outcome, PruneOutcome::Blocked { slot: blocked } if blocked == slot) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("prune remained Blocked past the assertion deadline")
 }
 
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
@@ -13332,11 +13360,7 @@ async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 0).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 2,
@@ -13614,11 +13638,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 0).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
@@ -13662,11 +13682,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
 
     // Second prune: current slot is 0, so the oldest sealed non-current
     // slot is slot 1 (the carried row). It is carried again into slot 0.
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest re-carry")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 1).await {
         PruneOutcome::Pruned {
             slot: 1,
             carried_failed_rows: 1,
@@ -15622,10 +15638,7 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         .await
         .expect("Failed to release reader lock");
 
-    let pruned = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune after reader lock release");
+    let pruned = prune_until_not_blocked(&store, &pool, Duration::ZERO, 0).await;
     assert!(
         matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
