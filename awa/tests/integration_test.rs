@@ -547,6 +547,101 @@ async fn test_insert_many() {
     assert!(jobs.iter().all(|j| j.queue == queue));
 }
 
+/// One `insert_many` call must not depend on the number of jobs: a per-row
+/// bind layout fails client-side above 65,535 / params-per-row rows.
+#[tokio::test]
+async fn test_insert_many_exceeding_bind_parameter_limit() {
+    const JOB_COUNT: usize = 6_000;
+    // A concurrent test that activates queue storage would route part of the
+    // batch away from the canonical tables this test reads back.
+    let _guard = test_lock().lock().await;
+    let client = setup_with_connections(4).await;
+    let queue = "integ_insert_many_bind_limit";
+    clean_queue(client.pool(), queue).await;
+
+    let jobs_params: Vec<InsertParams> = (0..JOB_COUNT)
+        .map(|seq| InsertParams {
+            kind: "integ_insert_many_bind_limit_kind".to_string(),
+            args: serde_json::json!({ "seq": seq }),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                priority: (seq % 4) as i16 + 1,
+                max_attempts: (seq % 7) as i16 + 1,
+                metadata: serde_json::json!({ "seq": seq }),
+                tags: vec![format!("tag-{}", seq % 3)],
+                ..Default::default()
+            },
+        })
+        .collect();
+
+    let jobs = insert_many(client.pool(), &jobs_params)
+        .await
+        .expect("a batch above the 65,535 bind-parameter limit should insert");
+
+    assert_eq!(jobs.len(), JOB_COUNT);
+    for (seq, job) in jobs.iter().enumerate() {
+        assert_eq!(job.kind, "integ_insert_many_bind_limit_kind");
+        assert_eq!(job.queue, queue);
+        assert_eq!(job.args, serde_json::json!({ "seq": seq }));
+        assert_eq!(job.metadata["seq"], serde_json::json!(seq));
+        assert_eq!(job.priority, (seq % 4) as i16 + 1);
+        assert_eq!(job.max_attempts, (seq % 7) as i16 + 1);
+        assert_eq!(job.tags, vec![format!("tag-{}", seq % 3)]);
+        assert_eq!(job.state, JobState::Available);
+    }
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, JOB_COUNT as i64);
+}
+
+#[tokio::test]
+async fn test_insert_many_enforces_unique_keys() {
+    let client = setup().await;
+    let queue = "integ_insert_many_unique";
+    clean_queue(client.pool(), queue).await;
+
+    let unique_job = |seq: i64| InsertParams {
+        kind: "integ_insert_many_unique_kind".to_string(),
+        args: serde_json::json!({ "seq": seq }),
+        opts: InsertOpts {
+            queue: queue.to_string(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    };
+    let plain_job = InsertParams {
+        kind: "integ_insert_many_unique_kind".to_string(),
+        args: serde_json::json!({ "seq": "plain" }),
+        opts: InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    };
+
+    let inserted = insert_many(client.pool(), &[unique_job(1), plain_job, unique_job(2)])
+        .await
+        .unwrap();
+    assert_eq!(inserted.len(), 3);
+    assert!(inserted[0].unique_key.is_some());
+    assert!(inserted[1].unique_key.is_none());
+    assert!(inserted[2].unique_key.is_some());
+    assert_ne!(inserted[0].unique_key, inserted[2].unique_key);
+
+    let duplicate = insert_many(client.pool(), &[unique_job(1)]).await;
+    assert!(
+        duplicate.is_err(),
+        "a duplicate unique job must be rejected: {duplicate:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_insert_many_updates_admin_metadata_for_direct_paths() {
     let _guard = test_lock().lock().await;

@@ -1,4 +1,4 @@
--- v053: keep aged running jobs visible through awa.jobs.
+-- v057: keep aged running jobs visible through awa.jobs.
 -- Issue: https://github.com/hardbyte/awa/issues/569.
 --
 -- Claims and leases store effective priority after aging; ready entries keep
@@ -560,5 +560,5 @@ END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (53, 'Keep aged running jobs visible in jobs_compat()')
+VALUES (57, 'Keep aged running jobs visible in jobs_compat()')
 ON CONFLICT (version) DO NOTHING;

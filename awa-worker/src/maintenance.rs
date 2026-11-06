@@ -1,5 +1,6 @@
 use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
+use crate::statistics::{RefreshGuard, StatisticsRefresher};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::audited_sql;
 use awa_model::cron::{
@@ -272,13 +273,12 @@ struct MaintenanceBranchState {
     /// delayed -> on-time recovery with the same K-consecutive
     /// requirement.
     consecutive_ontime: u32,
-    /// Tick counter that suppresses the branch body while the branch
-    /// is unhealthy. Decremented every tick; while non-zero the
-    /// caller's body is skipped. Re-armed on every flip-to-delayed
-    /// AND every overrun observation while already delayed, so a
-    /// branch that keeps failing keeps quietly waiting instead of
-    /// hammering the database.
-    cooldown_ticks_remaining: u32,
+    /// Wall-clock deadline that suppresses the branch body while the
+    /// branch is unhealthy: ticks arriving before it are skipped. Armed on
+    /// flip-to-delayed AND on every overrun observation while already
+    /// delayed, so a branch that keeps failing keeps quietly waiting
+    /// instead of hammering the database.
+    cooldown_until: Option<Instant>,
 }
 
 /// How many consecutive observations the branch tracker requires before
@@ -309,19 +309,33 @@ const OVERRUN_UPPER_DEN: u32 = 2;
 const OVERRUN_LOWER_NUM: u32 = 7;
 const OVERRUN_LOWER_DEN: u32 = 10;
 
-/// Upper bound on the ticks a delayed branch's body is suppressed.
-///
-/// The actual cooldown is paced by the branch's own duration —
-/// `2 × ceil(last_duration / tick_interval)` ticks, capped here — so a
-/// branch that merely runs slower than its configured interval settles at
-/// roughly one-third duty cycle instead of going near-silent. A fixed
-/// 120-tick penalty re-armed on every overrun let a rescue sweep whose
-/// body consistently exceeded 1.5× a short interval run at 1/120 duty:
-/// with `deadline_rescue_interval = 100ms` and a ~250ms sweep, expired
-/// deadline claims waited 12s+ between rescue passes, starving
-/// deadline-based cancellation entirely. The cap still bounds pathological
-/// bodies (minutes-long) to this many quiet ticks.
-const BRANCH_COOLDOWN_TICKS: u32 = 120;
+/// Cooldown armed after an overrun, as a multiple of the offending body's
+/// duration. A branch that merely runs slower than its interval settles at
+/// roughly a one-third duty cycle (`D / (D + 2D)`) instead of going
+/// near-silent.
+const BRANCH_COOLDOWN_BODY_MULTIPLE: u32 = 2;
+
+/// Upper bound on a single cooldown. The cooldown is a wall-clock duration
+/// because the leader loop's ticks are not evenly serviced: under CPU
+/// starvation a branch's tick is consumed only once many loop iterations
+/// have passed, so a tick-count cooldown stretches to many times its nominal
+/// length. Five seconds bounds how long a pathologically slow body (minutes
+/// long) can silence a branch, and is shorter than the default interval of
+/// every rescue and cleanup branch, so at default settings the cooldown has
+/// expired by the next tick.
+const BRANCH_COOLDOWN_MAX: Duration = Duration::from_secs(5);
+
+/// Interval for one branch of the leader loop. A tick that is serviced late
+/// (the loop was busy with another branch, or the runtime was starved)
+/// restarts the period from that moment, so a branch never gets back-to-back
+/// catch-up ticks that would crowd out the others. `Skip` would realign to
+/// the original grid and could fire again almost immediately after a late
+/// tick; `Delay` guarantees a full period between consecutive bodies.
+fn leader_loop_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 /// Records the start of one branch body and emits observability when the
 /// body returns. Constructed by [`MaintenanceBranchTracker::try_begin`], which
@@ -377,12 +391,11 @@ impl MaintenanceBranchTracker {
     ///
     /// Two gating phases:
     ///
-    /// 1. **Cooldown.** If `cooldown_ticks_remaining > 0`, decrement
-    ///    and return `None`. While cooldown is non-zero the branch is
-    ///    quiet; this is set on flip-to-delayed and re-armed on
-    ///    every subsequent overrun observation, so an unhealthy
-    ///    branch backs off instead of beating on the database every
-    ///    tick.
+    /// 1. **Cooldown.** If `cooldown_until` is in the future, return
+    ///    `None`. The deadline is wall-clock, set on flip-to-delayed and
+    ///    re-armed on every subsequent overrun observation, so an
+    ///    unhealthy branch backs off instead of beating on the database
+    ///    every tick.
     /// 2. **Duration-margin hysteresis.** Compare `last_duration` to
     ///    `tick_interval * UPPER/LOWER`. Outside the deadband, advance
     ///    the matching K-counter; inside, leave both alone. Crossing
@@ -394,24 +407,28 @@ impl MaintenanceBranchTracker {
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
     ) -> Option<BranchTimer<'a>> {
-        self.try_begin_with_cooldown(branch, tick_interval, metrics, BRANCH_COOLDOWN_TICKS)
+        self.try_begin_at(branch, tick_interval, metrics, true, Instant::now())
     }
 
+    /// Like [`Self::try_begin`] for latency-critical, cheap, idempotent
+    /// branches that must run on every tick: overruns are still tracked,
+    /// warned about and counted, but never suppress the body.
     fn try_begin_without_cooldown<'a>(
         &'a self,
         branch: &'static str,
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
     ) -> Option<BranchTimer<'a>> {
-        self.try_begin_with_cooldown(branch, tick_interval, metrics, 0)
+        self.try_begin_at(branch, tick_interval, metrics, false, Instant::now())
     }
 
-    fn try_begin_with_cooldown<'a>(
+    fn try_begin_at<'a>(
         &'a self,
         branch: &'static str,
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
-        cooldown_ticks: u32,
+        arm_cooldown: bool,
+        now: Instant,
     ) -> Option<BranchTimer<'a>> {
         let mut branches = self
             .branches
@@ -419,11 +436,12 @@ impl MaintenanceBranchTracker {
             .expect("maintenance branch tracker mutex");
         let state = branches.entry(branch).or_default();
 
-        // Phase 1: cooldown gate. Counts down regardless of any
-        // other signal; the branch stays quiet while non-zero.
-        if state.cooldown_ticks_remaining > 0 {
-            state.cooldown_ticks_remaining -= 1;
-            return None;
+        // Phase 1: cooldown gate. Purely wall-clock; the branch stays
+        // quiet until the deadline passes, however many ticks that takes.
+        match state.cooldown_until {
+            Some(until) if now < until => return None,
+            Some(_) => state.cooldown_until = None,
+            None => {}
         }
 
         // Phase 2: duration-margin + K-consecutive hysteresis.
@@ -437,15 +455,9 @@ impl MaintenanceBranchTracker {
         // on PR #318.
         //
         // Cooldowns are paced by the offending body's own duration so a
-        // consistently slow branch keeps a bounded duty cycle (~1/3)
-        // rather than collapsing to 1/BRANCH_COOLDOWN_TICKS.
-        let paced_cooldown = |last_duration: Duration| -> u32 {
-            if cooldown_ticks == 0 {
-                return 0;
-            }
-            let interval_ms = tick_interval.as_millis().max(1);
-            let ticks = (2 * last_duration.as_millis()).div_ceil(interval_ms);
-            ticks.clamp(1, cooldown_ticks as u128) as u32
+        // consistently slow branch keeps a bounded duty cycle (~1/3).
+        let cooldown_for = |last_duration: Duration| -> Duration {
+            (last_duration * BRANCH_COOLDOWN_BODY_MULTIPLE).min(BRANCH_COOLDOWN_MAX)
         };
         if let Some(last_duration) = state.last_duration.take() {
             // Integer-ratio thresholds — avoid f64 in the hot path.
@@ -458,25 +470,26 @@ impl MaintenanceBranchTracker {
                 let cross_threshold = state.consecutive_overrun >= OVERRUN_HYSTERESIS_K;
                 if cross_threshold && !state.is_delayed {
                     state.is_delayed = true;
-                    state.cooldown_ticks_remaining = paced_cooldown(last_duration);
+                    let cooldown = arm_cooldown.then(|| cooldown_for(last_duration));
+                    state.cooldown_until = cooldown.map(|cooldown| now + cooldown);
                     warn!(
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
                         upper_threshold_ms = upper_threshold.as_millis() as u64,
                         consecutive_overrun = state.consecutive_overrun,
-                        cooldown_ticks = state.cooldown_ticks_remaining,
+                        cooldown_ms = cooldown.map_or(0, |cooldown| cooldown.as_millis() as u64),
                         "maintenance branch overran tick interval",
                     );
                     metrics.record_maintenance_branch_overrun(branch);
-                    if state.cooldown_ticks_remaining > 0 {
+                    if cooldown.is_some() {
                         return None;
                     }
-                } else if cross_threshold && state.is_delayed && cooldown_ticks > 0 {
+                } else if cross_threshold && state.is_delayed && arm_cooldown {
                     // Already delayed and another overrun arrived —
                     // re-arm a duration-paced cooldown but stay quiet
                     // about it.
-                    state.cooldown_ticks_remaining = paced_cooldown(last_duration);
+                    state.cooldown_until = Some(now + cooldown_for(last_duration));
                     return None;
                 }
             } else if last_duration < lower_threshold {
@@ -532,17 +545,17 @@ impl MaintenanceBranchTracker {
             .map(|state| (state.last_duration, state.is_delayed))
     }
 
-    /// Test-only — read the per-branch cooldown counter and consecutive
+    /// Test-only — read the per-branch cooldown deadline and consecutive
     /// counters so tests can assert on the full state machine.
     #[cfg(test)]
-    fn cooldown_snapshot(&self, branch: &'static str) -> Option<(u32, u32, u32)> {
+    fn cooldown_snapshot(&self, branch: &'static str) -> Option<(Option<Instant>, u32, u32)> {
         let branches = self
             .branches
             .lock()
             .expect("maintenance branch tracker mutex");
         branches.get(branch).map(|state| {
             (
-                state.cooldown_ticks_remaining,
+                state.cooldown_until,
                 state.consecutive_overrun,
                 state.consecutive_ontime,
             )
@@ -726,6 +739,9 @@ pub struct MaintenanceService {
     priority_aging_interval: Duration,
     batch_operations_interval: Duration,
     terminal_count_rollup_interval: Duration,
+    /// How often the leader refreshes planner statistics for the queue-storage
+    /// tables autovacuum never analyses. Zero disables the refresh.
+    statistics_refresh_interval: Duration,
     /// How long a descriptor catalog row can sit without being refreshed
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
@@ -745,6 +761,8 @@ pub struct MaintenanceService {
     ring_authority_flip_aware_since: std::sync::Mutex<Option<Instant>>,
 }
 
+/// Default cadence of the planner-statistics refresh on the maintenance leader.
+pub(crate) const DEFAULT_STATISTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
 const CRON_CATCH_UP_LIMIT: usize = 1_000;
@@ -805,6 +823,7 @@ impl MaintenanceService {
             priority_aging_interval: Duration::from_secs(60),
             batch_operations_interval: Duration::from_secs(1),
             terminal_count_rollup_interval: Duration::from_secs(30),
+            statistics_refresh_interval: DEFAULT_STATISTICS_REFRESH_INTERVAL,
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
             ring_authority_auto_flip: true,
             ring_authority_auto_flip_stable_period: Duration::from_secs(600), // 10min
@@ -858,6 +877,14 @@ impl MaintenanceService {
     /// counter table for sealed queue segments (default: 30s).
     pub fn terminal_count_rollup_interval(mut self, interval: Duration) -> Self {
         self.terminal_count_rollup_interval = interval;
+        self
+    }
+
+    /// Set how often the leader runs `ANALYZE` on the queue-storage tables
+    /// autovacuum never analyses (default: 5 minutes). `Duration::ZERO`
+    /// disables the refresh.
+    pub fn statistics_refresh_interval(mut self, interval: Duration) -> Self {
+        self.statistics_refresh_interval = interval;
         self
     }
 
@@ -1023,33 +1050,33 @@ impl MaintenanceService {
             }
 
             // Run maintenance tasks as leader
-            let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
-            let mut deadline_rescue_timer = tokio::time::interval(self.deadline_rescue_interval);
-            let mut callback_rescue_timer = tokio::time::interval(self.callback_rescue_interval);
-            let mut promote_timer = tokio::time::interval(self.promote_interval);
-            let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
-            let mut cron_sync_timer = tokio::time::interval(self.cron_sync_interval);
-            let mut leader_check_timer = tokio::time::interval(self.leader_check_interval);
-            let mut queue_stats_timer = tokio::time::interval(self.queue_stats_interval);
-            let mut dirty_key_timer = tokio::time::interval(self.dirty_key_recompute_interval);
+            let mut heartbeat_rescue_timer = leader_loop_interval(self.heartbeat_rescue_interval);
+            let mut deadline_rescue_timer = leader_loop_interval(self.deadline_rescue_interval);
+            let mut callback_rescue_timer = leader_loop_interval(self.callback_rescue_interval);
+            let mut promote_timer = leader_loop_interval(self.promote_interval);
+            let mut cleanup_timer = leader_loop_interval(self.cleanup_interval);
+            let mut cron_sync_timer = leader_loop_interval(self.cron_sync_interval);
+            let mut leader_check_timer = leader_loop_interval(self.leader_check_interval);
+            let mut queue_stats_timer = leader_loop_interval(self.queue_stats_interval);
+            let mut dirty_key_timer = leader_loop_interval(self.dirty_key_recompute_interval);
             let mut metadata_reconciliation_timer =
-                tokio::time::interval(self.metadata_reconciliation_interval);
-            let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
-            let mut batch_operations_timer = tokio::time::interval(self.batch_operations_interval);
+                leader_loop_interval(self.metadata_reconciliation_interval);
+            let mut priority_aging_timer = leader_loop_interval(self.priority_aging_interval);
+            let mut batch_operations_timer = leader_loop_interval(self.batch_operations_interval);
             let mut terminal_count_rollup_timer =
-                tokio::time::interval(self.terminal_count_rollup_interval);
+                leader_loop_interval(self.terminal_count_rollup_interval);
             let mut vacuum_queue_timer = self
                 .storage
                 .queue_storage()
-                .map(|runtime| tokio::time::interval(runtime.queue_rotate_interval));
+                .map(|runtime| leader_loop_interval(runtime.queue_rotate_interval));
             let mut vacuum_lease_timer = self
                 .storage
                 .queue_storage()
-                .map(|runtime| tokio::time::interval(runtime.lease_rotate_interval));
+                .map(|runtime| leader_loop_interval(runtime.lease_rotate_interval));
             let mut vacuum_claim_timer = self
                 .storage
                 .queue_storage()
-                .map(|runtime| tokio::time::interval(runtime.claim_rotate_interval));
+                .map(|runtime| leader_loop_interval(runtime.claim_rotate_interval));
             // Cache rotate intervals alongside the timers so the per-branch
             // observability calls can recover the configured period. Both
             // derive from the same `queue_storage()` source so they are
@@ -1109,6 +1136,7 @@ impl MaintenanceService {
                 cron_eval_cancel.clone(),
                 self.cron_eval_interval,
             ));
+            let _statistics_refresh = self.spawn_statistics_refresh();
 
             loop {
                 tokio::select! {
@@ -1140,7 +1168,7 @@ impl MaintenanceService {
                         }
                     }
                     _ = promote_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("promote_scheduled", self.promote_interval, &self.metrics) {
+                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
                             self.promote_scheduled().await;
                             timer.finish();
                         }
@@ -1300,6 +1328,28 @@ impl MaintenanceService {
                 }
             }
         }
+    }
+
+    /// Start the planner-statistics refresh for this leadership term. The
+    /// returned guard stops it when dropped.
+    fn spawn_statistics_refresh(&self) -> Option<RefreshGuard> {
+        if self.statistics_refresh_interval.is_zero() {
+            return None;
+        }
+        let (runtime, standby) = match self.storage.queue_storage() {
+            Some(runtime) => (runtime, false),
+            None => (self.standby_queue_storage.as_ref()?, true),
+        };
+        Some(RefreshGuard::spawn(
+            StatisticsRefresher::new(
+                self.pool.clone(),
+                runtime.store.schema().to_string(),
+                self.metrics.clone(),
+                standby,
+            ),
+            self.statistics_refresh_interval,
+            &self.cancel,
+        ))
     }
 
     fn stop_cron_evaluator(cancel: &CancellationToken, task: &JoinHandle<()>) {
@@ -4080,8 +4130,9 @@ mod tests {
         );
     }
 
-    /// Drive `n` consecutive `try_begin` ticks. When the body would
-    /// have run (try_begin returns Some), call `record_finish` with
+    /// Drive `n` consecutive ticks on a virtual clock that advances by
+    /// `tick_interval` before each one. When the body would have run
+    /// (`try_begin_at` returns Some), call `record_finish` with
     /// `body_duration` to simulate the body completing in that time.
     /// When the body is skipped (cooldown returns None), `last_duration`
     /// is intentionally NOT updated — matching production where a
@@ -4093,6 +4144,7 @@ mod tests {
     /// observation) must call `seed_last_duration` first.
     fn replay_ticks(
         tracker: &MaintenanceBranchTracker,
+        clock: &mut Instant,
         branch: &'static str,
         body_duration: Duration,
         tick_interval: Duration,
@@ -4101,8 +4153,10 @@ mod tests {
         let metrics = metrics_for_test();
         let mut ran = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let timer_opt = tracker.try_begin(branch, tick_interval, &metrics);
-            let did_run = timer_opt.is_some();
+            *clock += tick_interval;
+            let did_run = tracker
+                .try_begin_at(branch, tick_interval, &metrics, true, *clock)
+                .is_some();
             ran.push(did_run);
             if did_run {
                 tracker.record_finish(branch, body_duration);
@@ -4124,17 +4178,41 @@ mod tests {
             .last_duration = Some(dur);
     }
 
+    const TICK_100MS: Duration = Duration::from_millis(100);
+
+    /// Tracker for "cleanup" driven through the K-th overrun, so the next
+    /// tick falls inside the armed cooldown. Returns the tracker, the
+    /// virtual clock at the flip, and the cooldown deadline it armed.
+    fn tracker_flipped_by_250ms_bodies() -> (MaintenanceBranchTracker, Instant, Instant) {
+        let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
+        replay_ticks(
+            &tracker,
+            &mut clock,
+            "cleanup",
+            Duration::from_millis(250),
+            TICK_100MS,
+            OVERRUN_HYSTERESIS_K,
+        );
+        let (deadline, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        let deadline = deadline.expect("flip arms a cooldown");
+        (tracker, clock, deadline)
+    }
+
     #[test]
     fn branch_tracker_single_overrun_does_not_flip() {
         // A single overrun sample (clearly above the upper threshold)
         // shouldn't flip is_delayed — K-consecutive is required.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(200));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(200), // upper threshold for 100ms tick is 150
-            Duration::from_millis(100),
+            TICK_100MS,
             1,
         );
         assert!(
@@ -4150,16 +4228,22 @@ mod tests {
         // is the fix the bench post-mortem prescribed: 49ms-vs-51ms
         // flap at the boundary no longer accumulates toward a flip.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(101));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(101),
-            Duration::from_millis(100),
+            TICK_100MS,
             5,
         );
-        let (cooldown, overrun, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, 0, "deadband samples should not arm cooldown");
+        let (cooldown_until, overrun, ontime) =
+            tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(
+            cooldown_until.is_none(),
+            "deadband samples should not arm cooldown"
+        );
         assert_eq!(overrun, 0, "deadband sample 101ms must not advance overrun");
         assert_eq!(ontime, 0, "deadband sample 101ms must not advance ontime");
     }
@@ -4172,48 +4256,47 @@ mod tests {
         // flip-tick skips the body so we don't immediately do more
         // expensive work).
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(250),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
         assert_eq!(ran, vec![true, true, false], "flip-tick skips body");
-        let (cooldown, overrun, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        let (cooldown_until, overrun, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
         assert!(tracker.snapshot("cleanup").unwrap().1, "flipped to delayed");
         assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
-        // Cooldown is paced by the offending duration: 2 × ceil(250/100)
-        // ticks — a slow branch backs off proportionally, it does not go
-        // near-silent for BRANCH_COOLDOWN_TICKS.
-        assert_eq!(cooldown, 5, "cooldown paced to 2×duration/interval");
+        // The cooldown is a wall-clock duration paced by the offending
+        // body: 2 × 250ms from the flip tick.
+        assert_eq!(
+            cooldown_until,
+            Some(clock + Duration::from_millis(500)),
+            "cooldown is 2× the overrunning body, from the flip"
+        );
     }
 
     /// A branch whose body always overruns keeps a bounded duty cycle:
     /// each post-cooldown run re-arms a duration-paced cooldown, so the
-    /// body still executes roughly every `2×duration` — never once per
-    /// `BRANCH_COOLDOWN_TICKS`. This is the regression shape behind the
-    /// starved deadline-rescue sweep: a ~250ms sweep on a 100ms interval
-    /// must keep rescuing, not fall to a 12s cadence.
+    /// body still executes roughly every `3×duration` of wall time —
+    /// never once per many seconds. This is the regression shape behind
+    /// the starved deadline-rescue sweep: a ~250ms sweep on a 100ms
+    /// interval must keep rescuing.
     #[test]
     fn branch_tracker_persistent_overrun_keeps_bounded_duty_cycle() {
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
+        let (tracker, mut clock, _) = tracker_flipped_by_250ms_bodies();
 
-        // 40 further ticks with every executed body still overrunning.
+        // 40 further 100ms ticks (4s) with every executed body still
+        // overrunning.
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(250),
-            Duration::from_millis(100),
+            TICK_100MS,
             40,
         );
         let executed = ran.iter().filter(|&&r| r).count();
@@ -4223,55 +4306,61 @@ mod tests {
         );
     }
 
-    /// Pathologically long bodies still clamp at BRANCH_COOLDOWN_TICKS.
+    /// Pathologically long bodies clamp at BRANCH_COOLDOWN_MAX.
     #[test]
-    fn branch_tracker_paced_cooldown_clamps_at_cap() {
+    fn branch_tracker_cooldown_clamps_at_cap() {
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_secs(60));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_secs(60),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
-        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS, "cap bounds the cooldown");
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            cooldown_until,
+            Some(clock + BRANCH_COOLDOWN_MAX),
+            "cap bounds the cooldown"
+        );
     }
 
     #[test]
     fn branch_tracker_without_cooldown_tracks_overrun_but_keeps_running() {
         let tracker = MaintenanceBranchTracker::new();
         let metrics = metrics_for_test();
+        let mut clock = Instant::now();
         seed_last_duration(
             &tracker,
             "terminal_count_rollup",
             Duration::from_millis(250),
         );
 
-        let mut ran = Vec::new();
-        for _ in 0..OVERRUN_HYSTERESIS_K {
-            let timer = tracker.try_begin_without_cooldown(
-                "terminal_count_rollup",
-                Duration::from_millis(100),
-                &metrics,
+        // Well past the point where a cooling-down branch would have been
+        // skipped several times over.
+        let ticks = OVERRUN_HYSTERESIS_K * 10;
+        for _ in 0..ticks {
+            clock += TICK_100MS;
+            let timer =
+                tracker.try_begin_at("terminal_count_rollup", TICK_100MS, &metrics, false, clock);
+            assert!(
+                timer.is_some(),
+                "no-cooldown branches should keep running on overrun"
             );
-            ran.push(timer.is_some());
-            if timer.is_some() {
-                tracker.record_finish("terminal_count_rollup", Duration::from_millis(250));
-            }
+            tracker.record_finish("terminal_count_rollup", Duration::from_millis(250));
         }
 
-        assert_eq!(
-            ran,
-            vec![true, true, true],
-            "no-cooldown branches should keep running on overrun"
-        );
-        let (cooldown, overrun, _) = tracker
+        let (cooldown_until, overrun, _) = tracker
             .cooldown_snapshot("terminal_count_rollup")
             .expect("snapshot");
-        assert_eq!(cooldown, 0, "no-cooldown branch must not arm cooldown");
-        assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
+        assert!(
+            cooldown_until.is_none(),
+            "no-cooldown branch must not arm cooldown"
+        );
+        assert!(overrun >= OVERRUN_HYSTERESIS_K);
         assert!(
             tracker.snapshot("terminal_count_rollup").unwrap().1,
             "overrun state should still be observable"
@@ -4279,76 +4368,100 @@ mod tests {
     }
 
     #[test]
-    fn branch_tracker_cooldown_skips_body() {
-        // Drive past the flip, then assert subsequent ticks return
-        // None until cooldown decrements to zero. After the flip,
-        // `last_duration` was consumed by `take()`, so the cooldown
-        // gate is the only thing returning None here — exactly the
-        // production shape we want.
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        // Subsequent ticks return None until the paced cooldown
-        // (2 × ceil(250/100) = 5 ticks) drains. We pass 50ms as the
-        // body_duration but it's unused — `record_finish` is only
-        // called when a body actually runs.
+    fn branch_tracker_cooldown_skips_body_until_deadline() {
+        // Drive past the flip, then assert every tick before the
+        // deadline returns None. After the flip, `last_duration` was
+        // consumed by `take()`, so the cooldown gate is the only thing
+        // returning None here — exactly the production shape we want.
+        let (tracker, mut clock, deadline) = tracker_flipped_by_250ms_bodies();
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
-            5,
+            TICK_100MS,
+            4,
         );
+        assert!(clock < deadline, "test must stay inside the cooldown");
         assert!(
             ran.iter().all(|&r| !r),
             "every tick during cooldown must skip body"
         );
-        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, 0, "cooldown decrements to zero");
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            cooldown_until,
+            Some(deadline),
+            "skips do not move the deadline"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_cooldown_is_wall_clock_not_tick_count() {
+        // A tick-count cooldown only drains as ticks are serviced, and
+        // under CPU starvation a branch is serviced rarely. The cooldown
+        // here must end on time no matter how few ticks arrive, and must
+        // not end early no matter how many do.
+        let (tracker, clock, deadline) = tracker_flipped_by_250ms_bodies();
+        let metrics = metrics_for_test();
+
+        // A burst of ticks all inside the cooldown does not shorten it.
+        for _ in 0..1_000 {
+            assert!(
+                tracker
+                    .try_begin_at("cleanup", TICK_100MS, &metrics, true, clock)
+                    .is_none(),
+                "ticks inside the cooldown are skipped however many arrive"
+            );
+        }
+        assert!(
+            tracker
+                .try_begin_at(
+                    "cleanup",
+                    TICK_100MS,
+                    &metrics,
+                    true,
+                    deadline - Duration::from_millis(1)
+                )
+                .is_none(),
+            "still cooling down 1ms before the deadline"
+        );
+
+        // A single tick after the deadline runs, though only one tick
+        // was serviced since the flip.
+        assert!(
+            tracker
+                .try_begin_at("cleanup", TICK_100MS, &metrics, true, deadline)
+                .is_some(),
+            "first tick at the deadline runs the body"
+        );
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(cooldown_until.is_none(), "expired cooldown is cleared");
     }
 
     #[test]
     fn branch_tracker_cooldown_expires_then_body_runs() {
-        // After cooldown drains, the first post-cooldown try_begin
+        // After cooldown expires, the first post-cooldown try_begin
         // sees `last_duration = None` (consumed at the flip, no body
         // ran during cooldown), so no hysteresis check fires; the
         // body simply runs. The counters do NOT advance on this
         // first post-cooldown tick — the sample this body produces
         // is evaluated on the *next* try_begin.
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            5,
-        );
+        let (tracker, _, deadline) = tracker_flipped_by_250ms_bodies();
+        let mut clock = deadline;
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
+            TICK_100MS,
             1,
         );
         assert_eq!(ran, vec![true], "post-cooldown body runs");
-        let (cooldown, overrun, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(
-            cooldown, 0,
-            "cooldown stays at zero after a single fast body"
+        let (cooldown_until, overrun, ontime) =
+            tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(
+            cooldown_until.is_none(),
+            "cooldown stays cleared after a single fast body"
         );
         assert_eq!(
             overrun, OVERRUN_HYSTERESIS_K,
@@ -4362,36 +4475,23 @@ mod tests {
 
     #[test]
     fn branch_tracker_cooldown_rearms_on_continued_overrun() {
-        // After cooldown drains, the first post-cooldown body runs
+        // After cooldown expires, the first post-cooldown body runs
         // and is slow. That slow body's sample is evaluated on the
         // *second* post-cooldown try_begin, where it re-arms cooldown
         // because consecutive_overrun is already at K (preserved
         // across the cooldown).
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            5,
-        );
+        let (tracker, _, deadline) = tracker_flipped_by_250ms_bodies();
+        let mut clock = deadline;
 
         // Tick 1 post-cooldown: take None, no eval, body runs slow.
         // Tick 2: take Some(250), consecutive_overrun saturates past
         // K, is_delayed && cross → re-arm cooldown.
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(250),
-            Duration::from_millis(100),
+            TICK_100MS,
             2,
         );
         assert_eq!(
@@ -4399,8 +4499,12 @@ mod tests {
             vec![true, false],
             "first tick runs body; second tick re-arms cooldown"
         );
-        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, 5, "cooldown re-armed, paced by the slow body");
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            cooldown_until,
+            Some(clock + Duration::from_millis(500)),
+            "cooldown re-armed, paced by the slow body"
+        );
         assert!(
             tracker.snapshot("cleanup").unwrap().1,
             "still delayed across re-arm"
@@ -4413,6 +4517,7 @@ mod tests {
         // clearly-on-time samples. Non-consecutive overruns never
         // accumulate K=3 because each on-time tick resets the counter.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(200));
         for over in [true, false, true, false, true] {
             let dur = if over {
@@ -4420,7 +4525,7 @@ mod tests {
             } else {
                 Duration::from_millis(50)
             };
-            replay_ticks(&tracker, "cleanup", dur, Duration::from_millis(100), 1);
+            replay_ticks(&tracker, &mut clock, "cleanup", dur, TICK_100MS, 1);
         }
         assert!(
             !tracker.snapshot("cleanup").unwrap().1,
@@ -4430,35 +4535,22 @@ mod tests {
 
     #[test]
     fn branch_tracker_recovers_only_after_k_ontime_ticks_post_cooldown() {
-        // After cooldown drains, K consecutive on-time samples must be
+        // After cooldown expires, K consecutive on-time samples must be
         // *evaluated* before is_delayed clears. The very first
         // post-cooldown body has no sample to evaluate (last_duration
         // was consumed at the flip), so K evaluable samples require
         // K+1 post-cooldown ticks: one to seed, K to advance ontime.
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            5,
-        );
+        let (tracker, _, deadline) = tracker_flipped_by_250ms_bodies();
+        let mut clock = deadline;
 
         // K post-cooldown ticks: tick 1 seeds, ticks 2..K evaluate K-1
         // on-time samples. Still delayed.
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
         assert!(
@@ -4469,9 +4561,10 @@ mod tests {
         // (K+1)-th tick evaluates the K-th on-time sample → recovery.
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
+            TICK_100MS,
             1,
         );
         assert!(
@@ -4486,17 +4579,20 @@ mod tests {
         // "promote_scheduled" stays on-time the whole time. Branches
         // must not share state.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(500));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(500),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
         seed_last_duration(&tracker, "promote_scheduled", Duration::from_millis(10));
         replay_ticks(
             &tracker,
+            &mut clock,
             "promote_scheduled",
             Duration::from_millis(10),
             Duration::from_millis(250),
@@ -4504,6 +4600,25 @@ mod tests {
         );
         assert!(tracker.snapshot("cleanup").unwrap().1);
         assert!(!tracker.snapshot("promote_scheduled").unwrap().1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_loop_interval_does_not_burst_after_a_stall() {
+        let period = Duration::from_millis(100);
+        let mut interval = leader_loop_interval(period);
+        interval.tick().await;
+
+        // The loop is stalled for ten periods; a `Burst` interval would
+        // now hand back ten immediate catch-up ticks.
+        tokio::time::sleep(period * 10).await;
+        interval.tick().await;
+
+        let before_next = tokio::time::Instant::now();
+        interval.tick().await;
+        assert!(
+            before_next.elapsed() >= period,
+            "the tick after a late one waits a full period instead of catching up"
+        );
     }
 
     // ── PruneBackoffTracker (#169) ────────────────────────────────────
