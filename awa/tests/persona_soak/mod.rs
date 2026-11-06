@@ -10,6 +10,7 @@ pub mod ledger;
 pub mod oracle;
 pub mod personas;
 pub mod pgserver;
+pub mod python_probe;
 pub mod registry;
 pub mod report;
 pub mod rng;

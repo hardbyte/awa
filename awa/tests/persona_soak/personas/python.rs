@@ -10,6 +10,7 @@
 use super::super::config::Persona;
 use super::super::fleet::Fleet;
 use super::super::ledger::{expect, flag, JobRecord};
+use super::super::python_probe::{self, Evidence, Phase};
 use super::super::shared::Shared;
 use super::{attach_events, queue, tune};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, Worker};
@@ -19,6 +20,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -92,6 +94,17 @@ fn spawn(
     ledger_path: &PathBuf,
     role: &str,
 ) -> Result<Child, String> {
+    spawn_process(shared, python, ledger_path, role, "soak_python", None)
+}
+
+fn spawn_process(
+    shared: &Arc<Shared>,
+    python: &PathBuf,
+    ledger_path: &PathBuf,
+    role: &str,
+    application_name: &str,
+    probe_phase: Option<Arc<AtomicU8>>,
+) -> Result<Child, String> {
     let mut child = Command::new(python)
         .arg(SCRIPT)
         .env(
@@ -104,11 +117,7 @@ fn spawn(
                 } else {
                     '?'
                 },
-                if role == "full" {
-                    "soak_python"
-                } else {
-                    "soak_python_probe"
-                }
+                application_name
             ),
         )
         .env("SOAK_LEDGER", ledger_path)
@@ -143,9 +152,19 @@ fn spawn(
     .flatten()
     {
         let shared = shared.clone();
+        let probe_phase = probe_phase.clone();
+        let application_name = application_name.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stream).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if let (Some(phase), Some(marker)) = (&probe_phase, Phase::marker(&line)) {
+                    // A close marker alone does not prove migrate-and-query
+                    // reached readiness. IDLE also follows that completed call.
+                    if marker != Phase::Closed || phase.load(Ordering::Acquire) > 0 {
+                        phase.fetch_max(marker as u8, Ordering::Release);
+                    }
+                    shared.note("python", format!("{application_name}: {line}"));
+                }
                 absorb_output(&shared, &line);
             }
         });
@@ -374,62 +393,106 @@ impl Importer {
 /// left stranded while it idles, and must be gone once it exits.
 async fn migrate_probe(shared: &Arc<Shared>, python: &PathBuf, ledger_path: &PathBuf) {
     let stats = shared.stats(Persona::Python);
-    let Ok(mut child) = spawn(shared, python, ledger_path, "migrate_probe") else {
-        return;
+    let application_name = format!("soak_python_probe_{}", uuid::Uuid::new_v4().simple());
+    let phase = Arc::new(AtomicU8::new(Phase::Migrating as u8));
+    let mut child = match spawn_process(
+        shared,
+        python,
+        ledger_path,
+        "migrate_probe",
+        &application_name,
+        Some(phase.clone()),
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            shared.incomplete(
+                format!("Python migrate probe could not start: {error}"),
+                vec![],
+            );
+            return;
+        }
     };
-    let Ok(pool) =
-        super::super::db::connect_pool(&shared.config.database_url, "soak_python_probe_watch", 1)
-            .await
-    else {
-        return;
+    let pool = match super::super::db::connect_pool(
+        &shared.config.database_url,
+        "soak_python_probe_watch",
+        1,
+    )
+    .await
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            shared.incomplete(
+                format!("Python probe observer could not connect: {error}"),
+                vec![],
+            );
+            let _ = child.kill().await;
+            return;
+        }
     };
-    let sessions = || async {
-        sqlx::query_as::<_, (i64, i64)>(
-            "SELECT count(*)::bigint, count(*) FILTER (WHERE state = 'idle in transaction')::bigint
-             FROM pg_stat_activity WHERE application_name = 'soak_python_probe' AND pid <> pg_backend_pid()
-               AND backend_start > now() - interval '30 seconds'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap_or((0, 0))
-    };
-    let mut peak = (0, 0);
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut evidence = Evidence::default();
+    let deadline = Instant::now() + crate::ci_timing::scaled_timeout(Duration::from_secs(45));
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
+            Ok(Some(status)) => {
+                if !status.success() {
+                    evidence.incomplete(format!("Python migrate probe exited with {status}"));
+                }
+                break;
+            }
+            Err(error) => {
+                evidence.incomplete(format!(
+                    "Python migrate probe exit could not be read: {error}"
+                ));
+                let _ = child.kill().await;
+                break;
+            }
             Ok(None) if Instant::now() >= deadline => {
-                shared.finding(
-                    "python_migrate_probe_hang",
-                    "the Python migrate-then-query probe did not exit within 45s",
-                    vec![],
-                );
+                evidence
+                    .incomplete("Python migrate-then-query probe did not exit within its deadline");
                 let _ = child.kill().await;
                 break;
             }
             Ok(None) => {}
         }
-        let now = sessions().await;
-        peak = (peak.0.max(now.0), peak.1.max(now.1));
+        // Capture readiness before starting the query: a MIGRATED marker that
+        // arrives during it must not relabel an earlier migration snapshot.
+        let before_query = Phase::from_byte(phase.load(Ordering::Acquire));
+        evidence.observe(
+            before_query,
+            python_probe::sessions(&pool, &application_name).await,
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let deadline = Instant::now() + crate::ci_timing::scaled_timeout(Duration::from_secs(2));
+    loop {
+        let result = python_probe::sessions(&pool, &application_name).await;
+        let stopped = result.as_ref().is_ok_and(|(count, _)| *count == 0);
+        let failed = result.is_err();
+        evidence.after_exit(result);
+        if stopped || failed || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     stats.add("python_migrate_probes", 1);
-    stats.set_max("python_probe_peak_sessions", peak.0);
-    // The probe's pool is capped at 4 connections; more than that, or any session left in a
-    // transaction, means connections were stranded.
-    if peak.0 > 4 || peak.1 > 0 {
-        shared.violation(
-            "python_connections_stranded",
-            format!("the Python migrate probe held {} session(s) ({} idle in transaction) against a pool of 4", peak.0, peak.1),
+    stats.set_max("python_probe_peak_sessions", evidence.peak_sessions);
+    stats.set_max(
+        "python_probe_migrating_idle_transactions",
+        evidence.migrating_idle_transactions,
+    );
+    stats.add("python_probe_ready_samples", evidence.ready_samples as i64);
+    if !evidence.complete() {
+        shared.incomplete(
+            format!(
+                "Python migrate probe {application_name} has incomplete evidence: {evidence:?}"
+            ),
             vec![],
         );
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let (left, _) = sessions().await;
-    if left > 0 {
+    if evidence.violation() {
         shared.violation(
             "python_connections_stranded",
-            format!("{left} Python session(s) remain after the migrate probe process exited"),
+            format!("Python migrate probe {application_name}: peak={} against pool4, idle-in-transaction after ready={}, sessions after exit={:?}", evidence.peak_sessions, evidence.ready_idle_transactions, evidence.remaining),
             vec![],
         );
     }
