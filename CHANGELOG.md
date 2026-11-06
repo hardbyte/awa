@@ -88,6 +88,26 @@ Notable changes between releases. Detailed migration notes for storage transitio
   lanes as before, and older binaries create correctly owned lanes once v053
   has refreshed the helpers they call. See "Lane ownership and v053" in the
   0.6 to 0.7 upgrade guide.
+
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only those `LOCK TABLE` statements and the final `TRUNCATE` turned a
+  timeout into `PruneOutcome::Blocked`. The timeout covers every later
+  statement in the transaction too: the post-lock liveness checks read the
+  lease and claim partitions, the failed-row carry inserts into the current
+  slot's `done_entries` and terminal-count deltas, and the fold appends
+  `queue_terminal_rollup_deltas` and deletes `queue_terminal_live_counts`
+  rows. When one of those waited out the timeout, for example behind
+  autovacuum truncating a relation or a hosted Postgres's own background
+  workers, prune failed with a `lock_not_available` (`55P03`) database error,
+  was logged as an error and skipped the prune backoff. A lock timeout
+  anywhere in a queue, lease or claim prune, or in a terminal-count rollup
+  slot, now rolls the whole transaction back and reports `Blocked`
+  (`blocked_slots` for rollup), so maintenance backs off and retries; nothing
+  the attempt wrote survives the rollback. A rollup pass stops at its first
+  blocked slot rather than waiting out the timeout again on each remaining
+  one.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
