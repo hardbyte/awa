@@ -194,17 +194,32 @@ awa --database-url "$AWA_DATABASE_URL" storage lane-sequences --schema awa
 SELECT * FROM awa.lane_sequence_problems('awa');
 ```
 
-The command exits 2 while any remain. Applying the patch runs the repair as the applying role: for each sequence it changes the owner to the schema owner and adds the missing grants, wherever that role is allowed to. A sequence it is not allowed to change does not fail the patch. It is reported in a warning, and `awa migrate` prints a summary. Run the repair again at any time; it is idempotent:
+The command exits 2 while any remain.
+
+`awa migrate` repairs them once the patch commits, one sequence per short transaction: it gives each sequence to the schema owner and adds its missing grants, wherever it is allowed to. Reassigning takes the sequence's `ACCESS EXCLUSIVE` lock, so the repair waits at most 300 ms for it. A sequence that an open enqueue or claim holds for longer is skipped, left unchanged and reported as busy. A sequence the repair is not allowed to change is reported with the roles that can finish it. Neither fails the patch or `awa migrate`. Run the repair again at any time; it is idempotent:
 
 ```bash
-PGOPTIONS='-c role=awa_owner' \
-  awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage lane-sequences --repair
+awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage lane-sequences --repair
 ```
 
-Changing a sequence's owner requires a role that can `SET ROLE` to both the current owner and the schema owner. A migrator usually can for sequences it or the owner created, but not for one an unrelated application role created, and managed PostgreSQL offers no superuser. For each sequence that remains, the output gives the statements to run:
+Which role can repair a sequence:
 
-- `missing_grants`: run them as the current owner, or as a role that can `SET ROLE` to it. Every runtime role can then use the lane, although the owner stays unchanged.
-- `reassign_sql`: run it as a role that is a member of both roles, for example after `GRANT app_role TO awa_migrator` from a role with `ADMIN` on `app_role`. Revoke that membership afterwards.
+- Reassigning it needs a role that holds the current owner's privileges (a member of the owner, with inheritance) and can `SET ROLE` to the schema owner.
+- Adding its grants needs the current owner's privileges.
+
+The schema owner holds neither the migration role's nor an application role's privileges, so a repair running as `awa_owner` cannot reassign sequences those roles created. That includes the migration role connected with `PGOPTIONS='-c role=awa_owner'`. Run the repair as the migration role itself, without `PGOPTIONS`, as above. `awa migrate` and `--repair` retry each sequence the effective role could not repair as the login role, so `awa migrate` run with `PGOPTIONS='-c role=awa_owner'`, as documented, still repairs the migration role's sequences.
+
+For each sequence that remains, the output lists `repair_roles`, the login roles other than superusers that can repair it, and the statements to run. A busy sequence only needs another `--repair`. When `repair_roles` is empty, which is usual for a sequence an application role created on managed PostgreSQL, either:
+
+- run `missing_grants` as the current owner. Every runtime role can then use the lane, although the owner stays unchanged; or
+- give the migration role the owner's privileges, for example `GRANT app_role TO awa_migrator` from a role with `ADMIN` on `app_role`, rerun `--repair` as the migration role, then revoke the membership.
+
+Without the CLI, repair one sequence per transaction from `psql` in autocommit mode, connected as the migration role:
+
+```sql
+SELECT format('SELECT * FROM awa.repair_lane_sequence(%L, %L)', 'awa', sequence_name)
+FROM awa.lane_sequence_problems('awa') \gexec
+```
 
 ### 5. Configure your processes
 

@@ -2,7 +2,7 @@ use crate::admin;
 use crate::error::AwaError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgExecutor, PgPool};
+use sqlx::{Connection, FromRow, PgConnection, PgExecutor, PgPool};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq)]
@@ -382,30 +382,65 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
 
 /// A lane sequence that is not owned by its schema's owner or lacks a grant
 /// that the head table it backs implies. Statements are returned ready to run:
-/// `missing_grants` as the sequence owner, `reassign_sql` as a role that can
-/// `SET ROLE` to both `owner` and `expected_owner`.
+/// `missing_grants` as the sequence owner, `reassign_sql` as a role that holds
+/// the owner's privileges and can `SET ROLE` to `expected_owner`.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct LaneSequenceProblem {
+    pub schema: String,
     pub sequence_name: String,
     pub owner: String,
     pub expected_owner: String,
     pub missing_grants: Vec<String>,
     pub reassign_sql: Option<String>,
+    /// Login roles, superusers aside, that can run every statement above.
+    /// Empty when no such role exists yet.
+    pub repair_roles: Vec<String>,
 }
 
-/// What [`repair_lane_sequences`] did to one lane sequence that had a problem.
+/// What a repair did to one lane sequence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneSequenceOutcome {
+    /// Owned by the schema owner with every runtime grant.
+    Repaired,
+    /// Grants complete, but the role could not reassign the sequence.
+    OwnerUnchanged,
+    /// The role could neither reassign the sequence nor add its grants.
+    Unrepaired,
+    /// An open transaction held the sequence's lock past the repair's lock
+    /// timeout, so nothing changed. Rerun the repair.
+    Busy,
+}
+
+impl TryFrom<String> for LaneSequenceOutcome {
+    type Error = String;
+
+    fn try_from(outcome: String) -> Result<Self, Self::Error> {
+        match outcome.as_str() {
+            "repaired" => Ok(Self::Repaired),
+            "owner_unchanged" => Ok(Self::OwnerUnchanged),
+            "unrepaired" => Ok(Self::Unrepaired),
+            "busy" => Ok(Self::Busy),
+            _ => Err(format!("unknown lane sequence repair outcome {outcome:?}")),
+        }
+    }
+}
+
+/// What [`repair_lane_sequences`] did to one lane sequence that had a problem,
+/// with what is still wrong afterwards.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct LaneSequenceRepair {
+    pub schema: String,
     pub sequence_name: String,
     /// Owner after the repair.
     pub owner: String,
     pub expected_owner: String,
-    /// `repaired`; `owner_unchanged` when the grants are complete but the
-    /// connected role could not reassign the sequence; or `unrepaired` when
-    /// grants are still missing too.
-    pub outcome: String,
+    #[sqlx(try_from = "String")]
+    pub outcome: LaneSequenceOutcome,
     pub missing_grants: Vec<String>,
     pub reassign_sql: Option<String>,
+    /// Login roles, superusers aside, that can finish the repair.
+    pub repair_roles: Vec<String>,
 }
 
 /// Lane sequences in `schema` that need repair. Read-only; any role may run it.
@@ -417,7 +452,8 @@ where
     E: PgExecutor<'e>,
 {
     Ok(sqlx::query_as(
-        "SELECT sequence_name, owner, expected_owner, missing_grants, reassign_sql \
+        "SELECT $1::text AS schema, sequence_name, owner, expected_owner, missing_grants, \
+                reassign_sql, repair_roles \
          FROM awa.lane_sequence_problems($1)",
     )
     .bind(schema)
@@ -426,25 +462,182 @@ where
 }
 
 /// Give each lane sequence in `schema` to the schema owner and add its missing
-/// grants, as far as the connected role is allowed to. A sequence the role
-/// cannot reassign is returned with the statements still to run, never an
-/// error.
+/// grants, as far as the connection's roles are allowed to. A sequence that
+/// cannot be repaired is returned with the statements still to run and the
+/// roles that can run them, never an error.
+///
+/// Each sequence is repaired by its own statement, outside any transaction
+/// the caller holds, so a reassignment's ACCESS EXCLUSIVE lock is released
+/// before the next sequence and waits at most the repair function's lock
+/// timeout. A sequence locked for longer by an open enqueue or claim comes
+/// back [`LaneSequenceOutcome::Busy`].
+///
+/// Reassigning needs the current owner's privileges. A migration role that
+/// connects as itself and sets its role to the schema owner (`role` in the
+/// connection options) loses its own privileges while acting as the owner,
+/// so a sequence the current role cannot repair is retried once as the login
+/// role.
 pub async fn repair_lane_sequences(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     schema: &str,
 ) -> Result<Vec<LaneSequenceRepair>, AwaError> {
-    Ok(sqlx::query_as(
-        "SELECT sequence_name, owner, expected_owner, outcome, missing_grants, reassign_sql \
-         FROM awa.repair_lane_sequences($1)",
-    )
-    .bind(schema)
-    .fetch_all(pool)
-    .await?)
+    let (current_role, login_role): (String, String) =
+        sqlx::query_as("SELECT current_user::text, session_user::text")
+            .fetch_one(&mut *conn)
+            .await?;
+    let problems = lane_sequence_problems(&mut *conn, schema).await?;
+    let mut repairs = Vec::with_capacity(problems.len());
+    for problem in problems {
+        let mut repair: Option<LaneSequenceRepair> = sqlx::query_as(REPAIR_LANE_SEQUENCE_SQL)
+            .bind(schema)
+            .bind(&problem.sequence_name)
+            .fetch_optional(&mut *conn)
+            .await?;
+        let role_was_the_obstacle = matches!(
+            repair.as_ref().map(|repair| repair.outcome),
+            Some(LaneSequenceOutcome::OwnerUnchanged | LaneSequenceOutcome::Unrepaired)
+        );
+        if role_was_the_obstacle && login_role != current_role {
+            if let Some(retried) =
+                repair_lane_sequence_as_login_role(conn, schema, &problem.sequence_name).await?
+            {
+                repair = retried;
+            }
+        }
+        repairs.extend(repair);
+    }
+    Ok(repairs)
+}
+
+const REPAIR_LANE_SEQUENCE_SQL: &str =
+    "SELECT $1::text AS schema, sequence_name, owner, expected_owner, outcome, missing_grants, \
+            reassign_sql, repair_roles \
+     FROM awa.repair_lane_sequence($1, $2)";
+
+/// Repair one sequence with the login role as the current role, for this
+/// transaction only. `None` when the login role may not run the repair.
+async fn repair_lane_sequence_as_login_role(
+    conn: &mut PgConnection,
+    schema: &str,
+    sequence_name: &str,
+) -> Result<Option<Option<LaneSequenceRepair>>, AwaError> {
+    let mut transaction = conn.begin().await?;
+    sqlx::query("SET LOCAL ROLE NONE")
+        .execute(&mut *transaction)
+        .await?;
+    let repair = sqlx::query_as(REPAIR_LANE_SEQUENCE_SQL)
+        .bind(schema)
+        .bind(sequence_name)
+        .fetch_optional(&mut *transaction)
+        .await;
+    match repair {
+        Ok(repair) => {
+            transaction.commit().await?;
+            Ok(Some(repair))
+        }
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => {
+            transaction.rollback().await?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// [`repair_lane_sequences`] for every queue-storage schema with a lane
+/// sequence that needs repair.
+pub async fn repair_lane_sequences_in_every_schema(
+    conn: &mut PgConnection,
+) -> Result<Vec<LaneSequenceRepair>, AwaError> {
+    let mut repairs = Vec::new();
+    for (schema, _) in lane_sequence_problem_counts(&mut *conn).await? {
+        repairs.extend(repair_lane_sequences(conn, &schema).await?);
+    }
+    Ok(repairs)
+}
+
+/// One line per group of lane sequences that still need repair, saying what
+/// to do next. `busy` marks sequences a repair found locked.
+pub fn lane_sequence_next_steps<'a>(
+    leftovers: impl IntoIterator<Item = (&'a LaneSequenceProblem, bool)>,
+) -> Vec<String> {
+    let mut groups: BTreeMap<(String, bool, String, String, Vec<String>), usize> = BTreeMap::new();
+    for (problem, busy) in leftovers {
+        *groups
+            .entry((
+                problem.schema.clone(),
+                busy,
+                problem.owner.clone(),
+                problem.expected_owner.clone(),
+                problem.repair_roles.clone(),
+            ))
+            .or_default() += 1;
+    }
+    groups
+        .into_iter()
+        .map(
+            |((schema, busy, owner, expected_owner, repair_roles), count)| {
+                let rerun = format!("awa storage lane-sequences --schema {schema} --repair");
+                if busy {
+                    format!(
+                    "{count} lane sequence(s) in schema {schema} owned by {owner} are busy: an \
+                     open transaction held the lock, so nothing changed. Rerun `{rerun}`."
+                )
+                } else if repair_roles.is_empty() {
+                    format!(
+                        "{count} lane sequence(s) in schema {schema} owned by {owner} still need \
+                     repair, and no login role can both act as {owner} and SET ROLE to \
+                     {expected_owner}. Grant {owner} to the migration role, then rerun `{rerun}` \
+                     connected as the migration role, or run the statements from \
+                     `awa storage lane-sequences --schema {schema}` as {owner}."
+                    )
+                } else {
+                    format!(
+                        "{count} lane sequence(s) in schema {schema} owned by {owner} still need \
+                     repair. Rerun `{rerun}` connected as one of: {}.",
+                        repair_roles.join(", ")
+                    )
+                }
+            },
+        )
+        .collect()
+}
+
+impl LaneSequenceRepair {
+    /// The problem left after this repair, or `None` when it was repaired.
+    pub fn remaining_problem(&self) -> Option<LaneSequenceProblem> {
+        (self.outcome != LaneSequenceOutcome::Repaired).then(|| LaneSequenceProblem {
+            schema: self.schema.clone(),
+            sequence_name: self.sequence_name.clone(),
+            owner: self.owner.clone(),
+            expected_owner: self.expected_owner.clone(),
+            missing_grants: self.missing_grants.clone(),
+            reassign_sql: self.reassign_sql.clone(),
+            repair_roles: self.repair_roles.clone(),
+        })
+    }
+}
+
+/// [`lane_sequence_next_steps`] for the sequences a repair left behind.
+pub fn lane_sequence_repair_next_steps(repairs: &[LaneSequenceRepair]) -> Vec<String> {
+    let leftovers: Vec<(LaneSequenceProblem, bool)> = repairs
+        .iter()
+        .filter_map(|repair| {
+            repair
+                .remaining_problem()
+                .map(|problem| (problem, repair.outcome == LaneSequenceOutcome::Busy))
+        })
+        .collect();
+    lane_sequence_next_steps(leftovers.iter().map(|(problem, busy)| (problem, *busy)))
 }
 
 /// How many lane sequences need repair in each queue-storage schema that has
 /// any. Read-only.
-pub async fn lane_sequence_problem_counts(pool: &PgPool) -> Result<Vec<(String, i64)>, AwaError> {
+pub async fn lane_sequence_problem_counts<'e, E>(
+    executor: E,
+) -> Result<Vec<(String, i64)>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     Ok(sqlx::query_as(
         "SELECT n.nspname::text, count(*) \
          FROM pg_namespace AS n \
@@ -459,6 +652,6 @@ pub async fn lane_sequence_problem_counts(pool: &PgPool) -> Result<Vec<(String, 
          GROUP BY n.nspname \
          ORDER BY n.nspname",
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?)
 }

@@ -306,8 +306,8 @@ macro_rules! definer_lane_provisioning_pending_sql {
         "SELECT 'awa.lane_sequence_problems'::text AS target \
          WHERE to_regprocedure('awa.lane_sequence_problems(text,text)') IS NULL \
          UNION ALL \
-         SELECT 'awa.repair_lane_sequences' \
-         WHERE to_regprocedure('awa.repair_lane_sequences(text)') IS NULL \
+         SELECT 'awa.repair_lane_sequence' \
+         WHERE to_regprocedure('awa.repair_lane_sequence(text,text)') IS NULL \
          UNION ALL \
          SELECT 'awa.refresh_lane_sequence_helpers' \
          WHERE EXISTS ( \
@@ -578,6 +578,11 @@ pub struct MigrationReport {
     /// change routing; both are `None` before the storage tables exist.
     pub storage_routing_before: Option<StorageRouting>,
     pub storage_routing_after: Option<StorageRouting>,
+    /// What the run did to each lane sequence that needed repair, when it
+    /// applied `definer_lane_provisioning`. Each sequence is repaired in its
+    /// own short transaction after the patch commits; a sequence left behind
+    /// does not make the run incomplete.
+    pub lane_sequences: Vec<crate::storage::LaneSequenceRepair>,
 }
 
 impl MigrationReport {
@@ -736,6 +741,28 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
         }));
     }
 
+    // ALTER SEQUENCE ... OWNER takes the sequence's ACCESS EXCLUSIVE lock
+    // until its transaction ends, so the patch only installs the definitions
+    // and each lane sequence is repaired here, in its own transaction with a
+    // bounded lock wait, once the patch has committed.
+    let mut lane_sequences = Vec::new();
+    if patches.iter().any(|patch| {
+        patch.name == "definer_lane_provisioning" && patch.outcome == PatchOutcome::Applied
+    }) {
+        match crate::storage::repair_lane_sequences_in_every_schema(conn).await {
+            Ok(repairs) => {
+                for next_step in crate::storage::lane_sequence_repair_next_steps(&repairs) {
+                    tracing::warn!("{next_step}");
+                }
+                lane_sequences = repairs;
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "Could not repair lane sequences; run `awa storage lane-sequences --repair`"
+            ),
+        }
+    }
+
     // Ensure the admin metadata cache is warm. Since v006 removed the
     // synchronous triggers on jobs_hot, the cache is only updated by the
     // maintenance leader. Refreshing here guarantees queue_stats() and
@@ -770,6 +797,7 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
         patches,
         storage_routing_before,
         storage_routing_after: storage_routing_conn(conn).await?,
+        lane_sequences,
     })
 }
 

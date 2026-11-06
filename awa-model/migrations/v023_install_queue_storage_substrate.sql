@@ -418,15 +418,18 @@ REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 -- USAGE, SELECT and UPDATE on it, and whoever may read it gets SELECT:
 -- queue_enqueue_seq_* mirror queue_enqueue_heads, queue_claim_seq_* mirror
 -- queue_claim_heads. missing_grants holds the statements to run as the
--- sequence owner; reassign_sql, when the owner is wrong, needs a role that can
--- SET ROLE to both the current owner and the schema owner. Read-only.
+-- sequence owner; reassign_sql, when the owner is wrong, needs a role that
+-- holds the current owner's privileges and can SET ROLE to the schema owner.
+-- repair_roles lists the login roles, superusers aside, that can run both.
+-- Read-only.
 CREATE OR REPLACE FUNCTION awa.lane_sequence_problems(p_schema TEXT, p_sequence TEXT DEFAULT NULL)
 RETURNS TABLE (
     sequence_name TEXT,
     owner TEXT,
     expected_owner TEXT,
     missing_grants TEXT[],
-    reassign_sql TEXT
+    reassign_sql TEXT,
+    repair_roles TEXT[]
 )
 LANGUAGE sql
 STABLE
@@ -500,55 +503,76 @@ AS $problems$
            CASE WHEN lane_sequence.relowner <> lane_sequence.nspowner THEN format(
                'ALTER SEQUENCE %I.%I OWNER TO %I',
                p_schema, lane_sequence.relname, pg_get_userbyid(lane_sequence.nspowner)
-           ) END
+           ) END,
+           ARRAY(
+               SELECT candidate.rolname::text
+               FROM pg_roles AS candidate
+               WHERE candidate.rolcanlogin
+                 AND NOT candidate.rolsuper
+                 AND pg_has_role(candidate.oid, lane_sequence.relowner, 'USAGE')
+                 AND (lane_sequence.relowner = lane_sequence.nspowner
+                      OR (pg_has_role(candidate.oid, lane_sequence.nspowner, 'USAGE')
+                          AND pg_has_role(
+                              candidate.oid,
+                              lane_sequence.nspowner,
+                              CASE WHEN current_setting('server_version_num')::int >= 160000
+                                   THEN 'SET' ELSE 'MEMBER' END
+                          )))
+               ORDER BY candidate.rolname
+           )
     FROM lane_sequence
     WHERE lane_sequence.relowner <> lane_sequence.nspowner
        OR EXISTS (SELECT 1 FROM missing WHERE missing.oid = lane_sequence.oid)
     ORDER BY lane_sequence.relname
 $problems$;
 
--- Give every lane sequence in p_schema to the schema owner and add its missing
--- runtime grants, one sequence at a time, doing only what the calling role is
--- allowed to: a sequence it cannot reassign keeps its owner and still gets
--- the grants when the caller can act as that owner. Never raises for a
--- sequence it cannot repair. Returns one row per sequence that had a problem:
--- outcome is 'repaired', 'owner_unchanged' (grants complete, owner still
--- wrong) or 'unrepaired', with the statements still to run.
-CREATE OR REPLACE FUNCTION awa.repair_lane_sequences(p_schema TEXT)
+-- Give one lane sequence to the schema owner and add its missing runtime
+-- grants, doing only what the calling role is allowed to: a sequence it
+-- cannot reassign keeps its owner and still gets the grants when the caller
+-- holds that owner's privileges. Never raises for a sequence it cannot
+-- repair. Reassigning takes the sequence's ACCESS EXCLUSIVE lock, which an
+-- open enqueue or claim on the lane conflicts with, so the lock wait is
+-- bounded: on timeout nothing changes and the outcome is 'busy'. The lock is
+-- held until the caller's transaction ends, so callers repair one sequence
+-- per transaction. Returns no row when the sequence needs nothing, otherwise
+-- one row: outcome is 'repaired', 'owner_unchanged' (grants complete, owner
+-- still wrong), 'unrepaired' or 'busy', with the statements still to run.
+CREATE OR REPLACE FUNCTION awa.repair_lane_sequence(p_schema TEXT, p_sequence TEXT)
 RETURNS TABLE (
     sequence_name TEXT,
     owner TEXT,
     expected_owner TEXT,
     outcome TEXT,
     missing_grants TEXT[],
-    reassign_sql TEXT
+    reassign_sql TEXT,
+    repair_roles TEXT[]
 )
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, pg_temp
+SET lock_timeout = '300ms'
 AS $repair$
 DECLARE
     v_problem RECORD;
     v_remaining RECORD;
-    v_has_remaining BOOLEAN;
-    v_owner OID;
+    v_busy BOOLEAN := false;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
                             THEN 'SET' ELSE 'MEMBER' END;
     v_statement TEXT;
 BEGIN
-    FOR v_problem IN
-        SELECT * FROM awa.lane_sequence_problems(p_schema) AS problem
-    LOOP
-        SELECT sequence.relowner INTO v_owner
-        FROM pg_class AS sequence
-        WHERE sequence.oid = to_regclass(format('%I.%I', p_schema, v_problem.sequence_name));
+    SELECT * INTO v_problem
+    FROM awa.lane_sequence_problems(p_schema, p_sequence) AS problem;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
 
+    BEGIN
         -- ALTER ... OWNER TO needs the current owner's privileges, SET ROLE to
         -- the new owner, and the new owner's CREATE on the schema (which a
         -- schema owner has). Check first so an unrelated owner is skipped
-        -- rather than raising.
+        -- without waiting for the lock.
         IF v_problem.reassign_sql IS NOT NULL
-           AND pg_has_role(current_user, v_owner, 'USAGE')
+           AND pg_has_role(current_user, to_regrole(quote_ident(v_problem.owner)), 'USAGE')
            AND pg_has_role(current_user, to_regrole(quote_ident(v_problem.expected_owner)), v_set_mode) THEN
             BEGIN
                 EXECUTE v_problem.reassign_sql;
@@ -558,10 +582,8 @@ BEGIN
         END IF;
 
         SELECT * INTO v_remaining
-        FROM awa.lane_sequence_problems(p_schema, v_problem.sequence_name) AS problem;
-        v_has_remaining := FOUND;
-
-        IF v_has_remaining
+        FROM awa.lane_sequence_problems(p_schema, p_sequence) AS problem;
+        IF FOUND
            AND cardinality(v_remaining.missing_grants) > 0
            AND pg_has_role(current_user, to_regrole(quote_ident(v_remaining.owner)), 'USAGE') THEN
             FOREACH v_statement IN ARRAY v_remaining.missing_grants LOOP
@@ -571,31 +593,35 @@ BEGIN
                     NULL;
                 END;
             END LOOP;
-            SELECT * INTO v_remaining
-            FROM awa.lane_sequence_problems(p_schema, v_problem.sequence_name) AS problem;
-            v_has_remaining := FOUND;
         END IF;
+    EXCEPTION WHEN lock_not_available THEN
+        v_busy := true;
+    END;
 
-        sequence_name := v_problem.sequence_name;
-        expected_owner := v_problem.expected_owner;
-        IF v_has_remaining THEN
-            owner := v_remaining.owner;
-            missing_grants := v_remaining.missing_grants;
-            reassign_sql := v_remaining.reassign_sql;
-            outcome := CASE WHEN cardinality(v_remaining.missing_grants) = 0
-                            THEN 'owner_unchanged' ELSE 'unrepaired' END;
-        ELSE
-            owner := v_problem.expected_owner;
-            missing_grants := ARRAY[]::TEXT[];
-            reassign_sql := NULL;
-            outcome := 'repaired';
-        END IF;
-        RETURN NEXT;
-    END LOOP;
+    SELECT * INTO v_remaining
+    FROM awa.lane_sequence_problems(p_schema, p_sequence) AS problem;
+    sequence_name := v_problem.sequence_name;
+    expected_owner := v_problem.expected_owner;
+    IF FOUND THEN
+        owner := v_remaining.owner;
+        missing_grants := v_remaining.missing_grants;
+        reassign_sql := v_remaining.reassign_sql;
+        repair_roles := v_remaining.repair_roles;
+        outcome := CASE WHEN v_busy THEN 'busy'
+                        WHEN cardinality(v_remaining.missing_grants) = 0 THEN 'owner_unchanged'
+                        ELSE 'unrepaired' END;
+    ELSE
+        owner := v_problem.expected_owner;
+        missing_grants := ARRAY[]::TEXT[];
+        reassign_sql := NULL;
+        repair_roles := ARRAY[]::TEXT[];
+        outcome := 'repaired';
+    END IF;
+    RETURN NEXT;
 END
 $repair$;
 
-REVOKE EXECUTE ON FUNCTION awa.repair_lane_sequences(TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION awa.repair_lane_sequence(TEXT, TEXT) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,

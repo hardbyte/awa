@@ -18,18 +18,18 @@
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
    ```
 
-4. Read the output. The `definer_lane_provisioning` patch reports `applied`. If it could not reassign some lane sequences, `awa migrate` prints a warning; run `awa storage lane-sequences` for the statements to run and the role to run them as (see [Check and repair lane ownership](security.md#check-and-repair-lane-ownership)). The migration exit status does not depend on them.
+4. Read the output. The `definer_lane_provisioning` patch reports `applied`, followed by how many lane sequences were repaired. Any left over are listed in warnings: a busy one needs another run of `awa storage lane-sequences --repair` as the migration role (without `PGOPTIONS`), and the others name the roles that can repair them (see [Check and repair lane ownership](security.md#check-and-repair-lane-ownership)). The migration exit status does not depend on them.
 5. Roll workers, producers and admin processes to 0.6.14, in any order.
 
 ## What `awa migrate` changes
 
-The schema stays at v40. The `definer_lane_provisioning` patch installs `provision_lane` and `provision_lane_sequences`, two `SECURITY DEFINER` functions owned by the schema owner, in `awa` and every other queue-storage schema. It changes the three lane helpers to create a missing sequence through them, and adds the read-only `awa.lane_sequence_problems(schema)` and `awa.repair_lane_sequences(schema)`. Every new lane sequence then belongs to the schema owner and carries the privileges of the head table it backs, whichever role creates the lane: a producer enqueueing to a new queue, priority or shard, the maintenance leader promoting into a shard after `enqueue_shards` was raised, or `awa storage prepare-queue` run as any role.
+The schema stays at v40. The `definer_lane_provisioning` patch installs `provision_lane` and `provision_lane_sequences`, two `SECURITY DEFINER` functions owned by the schema owner, in `awa` and every other queue-storage schema. It changes the three lane helpers to create a missing sequence through them, and adds the read-only `awa.lane_sequence_problems(schema)` and `awa.repair_lane_sequence(schema, sequence)`. Every new lane sequence then belongs to the schema owner and carries the privileges of the head table it backs, whichever role creates the lane: a producer enqueueing to a new queue, priority or shard, the maintenance leader promoting into a shard after `enqueue_shards` was raised, or `awa storage prepare-queue` run as any role.
 
-The patch then repairs existing lane sequences. Each one not owned by the schema owner is reassigned if the applying role can `SET ROLE` to both its current owner and the schema owner. Missing grants are added if the applying role can act as the owner. A sequence it cannot change is reported and left as it was. The patch never fails because of one.
+Once the patch commits, `awa migrate` repairs existing lane sequences, each in its own short transaction. A sequence not owned by the schema owner is reassigned if the role holds its current owner's privileges and can `SET ROLE` to the schema owner. Missing grants are added if the role holds the owner's privileges. Each sequence is tried as the effective role and then as the login role. Reassigning waits at most 300 ms for the sequence's lock, which an open enqueue or claim on that lane holds, and holds it only for that sequence's transaction. A sequence that is busy, or that neither role may change, is reported and left as it was.
 
 The patch:
 
-- replaces functions and changes only the lane sequences that need it. `ALTER SEQUENCE ... OWNER` holds that sequence's lock until the patch commits, so enqueues and claims on those lanes wait for the commit. Correctly owned lanes are not touched;
+- only replaces functions; it takes no sequence or table locks;
 - keeps every lane's sequence position;
 - leaves storage routing unchanged;
 - applies as one transaction, so an interrupted run leaves nothing applied; run it again.
@@ -38,7 +38,7 @@ The patch:
 
 ### External migration runners
 
-`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database; with `--extract-to`, apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the schema owner, then run `awa storage lane-sequences` to check for leftovers.
+`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database; with `--extract-to`, apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the schema owner. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
 
 ## Roll back
 

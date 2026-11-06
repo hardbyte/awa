@@ -4,6 +4,7 @@
 //! so a lane sequence is usable by every runtime role only if it is created as
 //! the owner or granted explicitly, whichever role touches the lane first.
 
+use awa::model::storage::LaneSequenceOutcome;
 use awa::model::{migrations, storage, AwaError, InsertOpts, InsertParams, QueueStorage};
 use awa::model::{JobState, QueueStorageConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -25,6 +26,7 @@ struct Cluster {
     owner_name: String,
     migrator_name: String,
     runtime_name: String,
+    connect_options: PgConnectOptions,
     owner: PgPool,
     migrator: PgPool,
     app_a: PgPool,
@@ -154,7 +156,7 @@ impl Cluster {
                     DROP FUNCTION awa.v0613_refresh_lane_sequence_helpers(text);
                     DROP FUNCTION awa.provision_lane(text, smallint, smallint);
                     DROP FUNCTION awa.provision_lane_sequences(text, smallint, smallint);
-                    DROP FUNCTION awa.repair_lane_sequences(text);
+                    DROP FUNCTION awa.repair_lane_sequence(text, text);
                     DROP FUNCTION awa.lane_sequence_problems(text, text);
                     "#,
                 ))
@@ -179,6 +181,7 @@ impl Cluster {
             owner_name,
             migrator_name,
             runtime_name,
+            connect_options: options,
             owner,
             migrator,
             app_a,
@@ -210,6 +213,31 @@ impl Cluster {
         }
         self.admin.close().await;
         Ok(())
+    }
+
+    /// The migration role acting as the schema owner, as `awa migrate` runs
+    /// under the database-roles guide.
+    async fn migrator_as_owner(&self) -> Result<PgPool, sqlx::Error> {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                self.connect_options
+                    .clone()
+                    .username(&self.migrator_name)
+                    .options([("role", self.owner_name.as_str())]),
+            )
+            .await
+    }
+
+    /// The `queue_enqueue_seq_*` sequence of `queue`'s first lane.
+    async fn enqueue_sequence(&self, queue: &str) -> Result<String, sqlx::Error> {
+        Ok(self
+            .lane_sequence_owners(queue)
+            .await?
+            .into_iter()
+            .map(|(sequence, _)| sequence)
+            .find(|sequence| sequence.starts_with("queue_enqueue_seq_"))
+            .expect("lane has an enqueue sequence"))
     }
 
     /// `(sequence, owner)` for every lane sequence of `queue`.
@@ -593,37 +621,44 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
             ))))
             .await?;
     }
-    let failed = drain(&cluster.app_b, "owner_lane").await.unwrap_err();
-    assert!(
-        failed
-            .to_string()
-            .contains("permission denied for sequence"),
-        "{failed}"
-    );
-    let failed = drain(&cluster.app_b, "app_lane").await.unwrap_err();
-    assert!(
-        failed
-            .to_string()
-            .contains("permission denied for sequence"),
-        "{failed}"
-    );
-    assert_eq!(
-        migrations::pending_schema_patches(&cluster.owner)
-            .await?
-            .iter()
-            .map(|patch| patch.name)
-            .collect::<Vec<_>>(),
-        vec!["definer_lane_provisioning"]
-    );
+    for lane in ["owner_lane", "app_lane"] {
+        let failed = drain(&cluster.app_b, lane).await.unwrap_err();
+        assert!(
+            failed
+                .to_string()
+                .contains("permission denied for sequence"),
+            "{failed}"
+        );
+    }
 
-    // `awa migrate` runs as the migration role itself. It is a member of the
-    // owner, so it may reassign its own and the owner's sequences, but not
-    // the app role's. The leftovers do not keep the patch pending.
-    let report = migrations::run_with_report(&cluster.migrator).await?;
+    // `awa migrate` connects as the migration role and acts as the owner. As
+    // the owner it adds the grants the owner's sequences lack; the migration
+    // role's own sequences need the migration role's privileges, so they are
+    // reassigned as the login role. Neither can act as the app role.
+    let migrate_pool = cluster.migrator_as_owner().await?;
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        migrations::run_with_report(&migrate_pool),
+    )
+    .await??;
     assert!(report.complete(), "{:?}", report.patches);
     assert!(migrations::pending_schema_patches(&cluster.owner)
         .await?
         .is_empty());
+    let outcomes: Vec<LaneSequenceOutcome> = report
+        .lane_sequences
+        .iter()
+        .map(|repair| repair.outcome)
+        .collect();
+    assert_eq!(outcomes.len(), 6, "{:?}", report.lane_sequences);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == LaneSequenceOutcome::Repaired)
+            .count(),
+        4
+    );
+    migrate_pool.close().await;
     cluster
         .assert_lanes_owned_by_owner("migrator_lane", 1)
         .await?;
@@ -631,10 +666,10 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
     assert_eq!(drain(&cluster.app_b, "migrator_lane").await?, 1);
     assert_eq!(drain(&cluster.app_b, "owner_lane").await?, 1);
 
-    let problems = storage::lane_sequence_problems(&cluster.app_c, "awa").await?;
-    assert_eq!(problems.len(), 2, "{problems:?}");
     let app_a = cluster.roles[3].clone();
     let app_a = &app_a;
+    let problems = storage::lane_sequence_problems(&cluster.app_c, "awa").await?;
+    assert_eq!(problems.len(), 2, "{problems:?}");
     for problem in &problems {
         assert_eq!(&problem.owner, app_a);
         assert_eq!(problem.expected_owner, cluster.owner_name);
@@ -655,21 +690,31 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
                 .as_str()
             )
         );
+        assert!(problem.repair_roles.is_empty(), "{problem:?}");
     }
+    let next_steps =
+        storage::lane_sequence_next_steps(problems.iter().map(|problem| (problem, false)));
+    assert_eq!(next_steps.len(), 1, "{next_steps:?}");
+    assert!(
+        next_steps[0].contains(&format!("no login role can both act as {app_a}")),
+        "{next_steps:?}"
+    );
 
     // Re-running the repair as the migration role changes nothing and fails
-    // nothing. The migration role created the repair function, so it grants
-    // its use.
+    // nothing.
     cluster
-        .migrator
+        .owner
         .execute(sqlx::raw_sql(&sql(format!(
-            "GRANT EXECUTE ON FUNCTION awa.repair_lane_sequences(text) TO {}",
+            "GRANT EXECUTE ON FUNCTION awa.repair_lane_sequence(text, text) TO {}",
             cluster.runtime_name
         ))))
         .await?;
-    let rerun = storage::repair_lane_sequences(&cluster.migrator, "awa").await?;
+    let rerun =
+        storage::repair_lane_sequences(&mut *cluster.migrator.acquire().await?, "awa").await?;
     assert_eq!(rerun.len(), 2);
-    assert!(rerun.iter().all(|result| result.outcome == "unrepaired"));
+    assert!(rerun
+        .iter()
+        .all(|result| result.outcome == LaneSequenceOutcome::Unrepaired));
 
     // A role that can act as the app role but cannot become the owner adds
     // the grants and leaves the owner for someone who can.
@@ -684,20 +729,14 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
         .await?;
     let delegate_pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect_with(
-            PgConnectOptions::from_str(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://postgres:test@localhost:15432/awa_test".to_string()
-            }))?
-            .database(&cluster.database)
-            .username(&delegate)
-            .password("lane_test"),
-        )
+        .connect_with(cluster.connect_options.clone().username(&delegate))
         .await?;
-    let delegated = storage::repair_lane_sequences(&delegate_pool, "awa").await?;
+    let delegated =
+        storage::repair_lane_sequences(&mut *delegate_pool.acquire().await?, "awa").await?;
     delegate_pool.close().await;
     assert_eq!(delegated.len(), 2);
     for result in &delegated {
-        assert_eq!(result.outcome, "owner_unchanged");
+        assert_eq!(result.outcome, LaneSequenceOutcome::OwnerUnchanged);
         assert_eq!(&result.owner, app_a);
         assert!(result.missing_grants.is_empty());
         assert!(result.reassign_sql.is_some());
@@ -705,7 +744,8 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
     assert_eq!(drain(&cluster.app_b, "app_lane").await?, 1);
     enqueue(&cluster.app_c, "app_lane", 1, 1).await?;
 
-    // A role that is a member of both the app role and the owner reassigns.
+    // Once the migration role is a member of the app role too, the check names
+    // it, and a repair connected as it reassigns.
     cluster
         .admin
         .execute(sqlx::raw_sql(&sql(format!(
@@ -713,21 +753,105 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
             migrator = cluster.migrator_name
         ))))
         .await?;
-    let repaired = storage::repair_lane_sequences(&cluster.migrator, "awa").await?;
+    let problems = storage::lane_sequence_problems(&cluster.app_c, "awa").await?;
+    assert!(problems
+        .iter()
+        .all(|problem| problem.repair_roles == vec![cluster.migrator_name.clone()]));
+    let repaired =
+        storage::repair_lane_sequences(&mut *cluster.migrator.acquire().await?, "awa").await?;
     assert_eq!(repaired.len(), 2);
     assert!(
-        repaired.iter().all(|result| result.outcome == "repaired"),
+        repaired
+            .iter()
+            .all(|result| result.outcome == LaneSequenceOutcome::Repaired),
         "{repaired:?}"
     );
     assert!(storage::lane_sequence_problems(&cluster.app_c, "awa")
-        .await?
-        .is_empty());
-    assert!(storage::repair_lane_sequences(&cluster.migrator, "awa")
         .await?
         .is_empty());
     cluster.assert_lanes_owned_by_owner("app_lane", 1).await?;
     assert_eq!(drain(&cluster.app_b, "app_lane").await?, 1);
 
     cluster.roles.push(delegate);
+    cluster.teardown().await
+}
+
+/// Reassigning a lane sequence waits on any open enqueue or claim on the lane,
+/// so the repair bounds that wait and holds each sequence's lock only for its
+/// own short transaction. A held sequence is skipped and reported; the rest
+/// are repaired, and a later repair finishes it.
+#[tokio::test]
+async fn migration_skips_a_lane_sequence_an_open_transaction_holds() -> TestResult {
+    let cluster = Cluster::new(Schema::BeforeProvisioning, true).await?;
+    enqueue(&cluster.migrator, "held_lane", 1, 1).await?;
+    enqueue(&cluster.migrator, "free_lane", 1, 1).await?;
+    let held_sequence = cluster.enqueue_sequence("held_lane").await?;
+
+    // An enqueue in flight on held_lane holds its sequence's lock.
+    let mut holder = cluster.app_b.begin().await?;
+    sqlx::query("SELECT nextval($1::regclass)")
+        .bind(format!("awa.{held_sequence}"))
+        .execute(&mut *holder)
+        .await?;
+
+    let migrate_pool = cluster.migrator_as_owner().await?;
+    // The patch completes while the lock is held, and its report names the
+    // held sequence.
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        migrations::run_with_report(&migrate_pool),
+    )
+    .await??;
+    assert!(report.complete(), "{:?}", report.patches);
+    assert_eq!(
+        report.lane_sequences.len(),
+        4,
+        "{:?}",
+        report.lane_sequences
+    );
+    for repair in &report.lane_sequences {
+        let expected = if repair.sequence_name == held_sequence {
+            LaneSequenceOutcome::Busy
+        } else {
+            LaneSequenceOutcome::Repaired
+        };
+        assert_eq!(repair.outcome, expected, "{repair:?}");
+    }
+    for (sequence, owner) in cluster.lane_sequence_owners("held_lane").await? {
+        let expected = if sequence == held_sequence {
+            &cluster.migrator_name
+        } else {
+            &cluster.owner_name
+        };
+        assert_eq!(&owner, expected, "{sequence}");
+    }
+    cluster.assert_lanes_owned_by_owner("free_lane", 1).await?;
+
+    // A repair while the transaction is still open reports the sequence busy.
+    let mut conn = migrate_pool.acquire().await?;
+    let busy = storage::repair_lane_sequences(&mut conn, "awa").await?;
+    assert_eq!(busy.len(), 1, "{busy:?}");
+    assert_eq!(busy[0].sequence_name, held_sequence);
+    assert_eq!(busy[0].outcome, LaneSequenceOutcome::Busy);
+    assert_eq!(busy[0].owner, cluster.migrator_name);
+    let next_steps = storage::lane_sequence_repair_next_steps(&busy);
+    assert_eq!(next_steps.len(), 1);
+    assert!(next_steps[0].contains("busy"), "{next_steps:?}");
+    assert!(
+        next_steps[0].contains("awa storage lane-sequences --schema awa --repair"),
+        "{next_steps:?}"
+    );
+
+    holder.rollback().await?;
+    let repaired = storage::repair_lane_sequences(&mut conn, "awa").await?;
+    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    assert_eq!(repaired[0].outcome, LaneSequenceOutcome::Repaired);
+    drop(conn);
+    migrate_pool.close().await;
+    cluster.assert_lanes_owned_by_owner("held_lane", 1).await?;
+    assert!(storage::lane_sequence_problems(&cluster.app_c, "awa")
+        .await?
+        .is_empty());
+    assert_eq!(drain(&cluster.app_b, "held_lane").await?, 1);
     cluster.teardown().await
 }
