@@ -29,6 +29,18 @@ let app = awa_ui::callback_router(
 .await?;
 ```
 
+Give the UI its own pool built with `awa_ui::admin_pool_options` and `awa_ui::admin_connect_options`, as `awa serve` does. They set a statement timeout and a release hook. Without them, a request the client abandons leaves its query running and holds its connection, and over TLS sqlx can lose that connection for good (see [configuration](configuration.md#abandoned-requests)):
+
+```rust
+let pool = awa_ui::admin_pool_options(PgPoolOptions::new())
+    .max_connections(10)
+    .connect_with(awa_ui::admin_connect_options(
+        database_url.parse()?,
+        Some(Duration::from_secs(60)),
+    ))
+    .await?;
+```
+
 The frontend is a React 19 SPA built with Vite and embedded into the binary via `rust-embed`. The axum handler serves `index.html` for all non-API routes (SPA fallback), and JSON REST endpoints under `/api/`.
 
 ### Frontend Stack
@@ -46,8 +58,8 @@ GET  /api/stats/timeseries?minutes=60   Retained jobs by creation minute and cur
 GET  /api/stats/queue-history?minutes=60 Per-minute queue and fleet history (see below)
 GET  /api/health/queues?fail_on=        Whether each queue is keeping up, worst first
 
-GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=
-GET  /api/jobs/:id
+GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=   (rows omit output)
+GET  /api/jobs/:id                      Includes the job's output (ADR-048)
 POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
 POST /api/jobs/bulk-retry               { ids: [...] }
@@ -87,7 +99,7 @@ POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
 
-POST /api/callbacks/:callback_id/complete
+POST /api/callbacks/:callback_id/complete   { payload?, output? }
 POST /api/callbacks/:callback_id/fail
 POST /api/callbacks/:callback_id/heartbeat
 
@@ -115,7 +127,7 @@ For queues needing attention, **Limited by** says what holds the work back: the 
 
 #### Queue history
 
-Job tables record current state, not how a backlog moved, so the maintenance leader records it once a minute in `awa.queue_history` and `awa.fleet_history` (v051), keeping 48 hours by default. Runtimes publish cumulative per-queue counters (claimed, completed, failed, retried, rate-limited polls, claim wait) in their snapshots and the leader differences them into per-minute counts. `/api/stats/queue-history` returns one-minute buckets with `null` where nothing was recorded or a count was unknown, plus fleet events (version changes, leader changes, lost instances). See [configuration](configuration.md#queue-history) for what makes a minute unknown and what sampling costs.
+Job tables record current state, not how a backlog moved, so the maintenance leader records it once a minute in `awa.queue_history` and `awa.fleet_history` (v058), keeping 48 hours by default. Runtimes publish cumulative per-queue counters (claimed, completed, failed, retried, rate-limited polls, claim wait) in their snapshots and the leader differences them into per-minute counts. `/api/stats/queue-history` returns one-minute buckets with `null` where nothing was recorded or a count was unknown, plus fleet events (version changes, leader changes, lost instances). See [configuration](configuration.md#queue-history) for what makes a minute unknown and what sampling costs.
 
 ### Jobs (`/jobs`)
 

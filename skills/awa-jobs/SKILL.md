@@ -124,12 +124,15 @@ low-priority work cannot starve indefinitely.
 
 **Unique jobs** deduplicate on a BLAKE3 key over kind + optionally queue + args +
 a time-period bucket. Defaults: dedup by args, not by queue. Conflict handling
-depends on the API: a single-row `insert` / `insert_with` and the row-by-row
-`insert_many` **raise `AwaError::UniqueConflict`** (Python raises the
-corresponding error) on a duplicate — you must handle it, do not assume a silent
-no-op. Only the COPY bulk path (`insert_many_copy`) silently skips duplicates.
+depends on the API: a single-row `insert` / `insert_with` raises `AwaError::UniqueConflict` (Python raises the corresponding error), and `insert_many` fails the whole batch with SQLSTATE `23505`. `insert_many_copy` skips duplicates on every supported schema; Rust's `insert_many_skip_unique_conflicts` also skips them but requires migration v055. Both return only inserted rows, in input order. Generic `insert_many` always uses one per-row SQL statement; COPY probes its own connection and uses the batch function when installed.
 Cancel without storing the id via `cancel_by_unique_key(kind, queue=, args=,
-period_bucket=)` — the components must match those used at insert.
+period_bucket=)` — the components must match those used at insert. It cancels
+the oldest live job holding the key. On queue storage, a `by_queue` key is
+looked up through that queue's ready rows, so a job moved to another queue
+can't be cancelled by key while it is available there. A moved running or
+waiting job can't be cancelled by key once its original ready row is pruned;
+cancel it by id. Scheduled and retryable jobs are found by key wherever they
+are.
 Args-based uniqueness relies on canonical (sorted-key) JSON, pinned by
 cross-language golden tests; the default state set includes `completed`, so a
 still-retained completed job suppresses a re-insert with the same args. Scope
@@ -154,6 +157,12 @@ An uncaught error is retryable by default. Make it terminal with
 
 **The key gotcha:** use `Snooze` — not `RetryAfter` — for "not ready yet" polling
 or rate-limit waits, so `max_attempts` bounds genuine failures only.
+
+Every way an attempt can end spends an attempt: a Rust panic (recorded as
+`handler panicked: …`), a crashed or killed worker (stale heartbeat), and an
+attempt past the queue's `deadline_duration`. A crash also ends every other
+attempt in that process, so keep `max_attempts` above one for work that must
+survive a node loss.
 
 ## Cron / Periodic Jobs
 
@@ -254,7 +263,8 @@ Rust exposes two hook families on the client builder:
   - Worker-driven outcomes (a handler returning `Ok`/`Err`) and callback
     resolution on the `Client` (`complete_external`, `resolve_callback`, …) commit
     the follow-up in the **same transaction** as the transition — exactly-once per
-    committed outcome.
+    committed outcome, unless the follow-up has unique options and its key
+    already exists, in which case the insert is skipped (see below).
   - **`on_rescued_enqueue` is the exception: it is best-effort, not atomic.**
     Maintenance rescue (stale-heartbeat / deadline / expired-callback) commits the
     rescue first, then dispatches the follow-up in a separate transaction; a
@@ -264,6 +274,39 @@ Rust exposes two hook families on the client builder:
 
   Every follow-up, once enqueued, is delivered at-least-once, so its handler must
   be safe to re-run.
+
+  To collapse duplicates (several triggers producing the same downstream work),
+  give the follow-up unique options via `on_*_enqueue_with`. A conflicting
+  follow-up is skipped and the trigger still commits. With `UniqueOpts::default()`
+  the key covers the follow-up's kind and args, so keep only the deduplication
+  key in its args; `by_args: false` leaves args out of the key entirely.
+
+  A `_with` closure returns `Option<EnqueueRequest<F>>`: return `None` to
+  enqueue nothing for that trigger (the transition still commits). This is the
+  way to make a follow-up conditional on paths with no handler, such as
+  `complete_external`. Closures written for 0.6 wrap their result in `Some(...)`.
+
+  When the follow-up needs a value the handler computes, stage it from the
+  handler instead (ADR-046): `ctx.enqueue_on_completion(request)` in a `Worker`,
+  `ctx.follow_ups()` for a `register` closure's `'static` future, or
+  `job.enqueue_on_completion(args, **insert_opts)` in Python. Staged follow-ups
+  commit only with the attempt's own `Completed` finalization, deduplicate the
+  same way, and are discarded on every other outcome. A staging error
+  (`StageError` / `awa.StagingError`) fails the attempt if the handler still
+  returns `Completed`; at most 16 follow-ups and 64 KiB per attempt. Deploy the
+  follow-up kind's workers before the code that stages it.
+
+To keep what a job produced for people to inspect, record an **output**
+(ADR-048): `ctx.set_output(&value)` (or `ctx.output_slot()` in a `register`
+closure) and `job.set_output(value)` in Python, at most 4 KiB of JSON. A
+completed job's output is `JobRow.output` / `job.output` from `get_job`; a
+failed attempt's is under `output` in its entry in `errors`, and only the
+latest entry keeps one. Outputs are queue-storage only, are pruned with the job,
+and are never read by Awa. Never have one job read another's output: pass
+values a follow-up needs in its args. A failed `set_output` clears the output
+and does not fail the attempt in Rust (`OutputError` has no `?` conversion);
+in Python the uncaught `awa.OutputError` is terminal, so record before side
+effects or catch it.
 
 Enqueues capture the current trace span into reserved metadata
 (`awa:traceparent`) automatically; disable with `AWA_TRACE_CAPTURE=off`. To

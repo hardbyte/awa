@@ -126,6 +126,11 @@ enum Commands {
         /// Seconds to wait when acquiring a connection
         #[arg(long, default_value = "10", env = "AWA_POOL_ACQUIRE_TIMEOUT")]
         pool_acquire_timeout: u64,
+        /// Seconds any one database statement from the UI may run; 0 leaves
+        /// the server's setting. Bounds queries a closed or timed-out request
+        /// leaves running, and the pool connections they hold.
+        #[arg(long, default_value = "60", env = "AWA_STATEMENT_TIMEOUT")]
+        statement_timeout: u64,
         /// Cache TTL for dashboard queries in seconds
         #[arg(long, default_value = "5", env = "AWA_CACHE_TTL")]
         cache_ttl: u64,
@@ -268,6 +273,23 @@ fn sanitize_filename(description: &str) -> String {
 /// mutating commands require an explicit `--context` or `--database-url`
 /// once more than one context is defined, and are confirmation-gated on
 /// contexts marked `production = true`.
+/// After a migration, say which lane sequences still need repair and how to
+/// finish it. Read-only.
+async fn print_lane_sequence_leftovers(
+    pool: &sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut problems = Vec::new();
+    for (schema, _) in awa_model::storage::lane_sequence_problem_counts(pool).await? {
+        problems.extend(awa_model::storage::lane_sequence_problems(pool, &schema).await?);
+    }
+    for next_step in awa_model::storage::lane_sequence_next_steps(
+        problems.iter().map(|problem| (problem, false)),
+    ) {
+        eprintln!("warning: {next_step}");
+    }
+    Ok(())
+}
+
 fn access_for(command: &Commands) -> context::Access {
     use context::Access::{Mutating, ReadOnly};
     match command {
@@ -323,11 +345,13 @@ fn access_for(command: &Commands) -> context::Access {
         },
         Commands::Storage { command } => match command {
             StorageCommands::Status => ReadOnly,
+            StorageCommands::LaneSequences { repair: false, .. } => ReadOnly,
             StorageCommands::Finalize { check: true, .. } => ReadOnly,
             StorageCommands::FlipRingAuthority { check: true, .. } => ReadOnly,
             StorageCommands::Prepare { .. }
             | StorageCommands::PrepareQueueStorageSchema { .. }
             | StorageCommands::PrepareQueue { .. }
+            | StorageCommands::LaneSequences { .. }
             | StorageCommands::Abort
             | StorageCommands::EnterMixedTransition { .. }
             | StorageCommands::Finalize { .. }
@@ -806,7 +830,7 @@ enum StorageCommands {
         #[arg(long)]
         reset: bool,
     },
-    /// Provision lane sequences as the migrator, before starting a runtime without DDL
+    /// Provision every priority and shard of a queue ahead of its first enqueue
     PrepareQueue {
         /// Queue-storage schema to provision
         #[arg(long, default_value = "awa")]
@@ -820,6 +844,17 @@ enum StorageCommands {
         /// Match the runtime's queue-storage stripe count
         #[arg(long, default_value_t = 1)]
         queue_stripe_count: usize,
+    },
+    /// List lane sequences not owned by the schema owner or missing runtime
+    /// grants, with the statements that fix them. Exits 2 while any remain.
+    LaneSequences {
+        /// Queue-storage schema to check
+        #[arg(long, default_value = "awa")]
+        schema: String,
+        /// Reassign and grant first, as far as the connected role (or, failing
+        /// that, its login role) is allowed to
+        #[arg(long)]
+        repair: bool,
     },
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
@@ -1177,6 +1212,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 awa_model::migrations::run_with_options(&pool, options).await?;
                 println!("Migrations applied successfully.");
+                print_lane_sequence_leftovers(&pool).await?;
             }
         }
 
@@ -1189,6 +1225,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pool_idle_timeout,
             pool_max_lifetime,
             pool_acquire_timeout,
+            statement_timeout,
             cache_ttl,
             callback_hmac_secret,
             read_only,
@@ -1212,13 +1249,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Result<Vec<_>, _>>()?,
             };
             let db_url = resolve_db()?;
-            let pool = PgPoolOptions::new()
+            let connect_options = awa_ui::admin_connect_options(
+                db_url.parse()?,
+                Some(Duration::from_secs(statement_timeout)),
+            );
+            let pool = awa_ui::admin_pool_options(PgPoolOptions::new())
                 .max_connections(pool_max)
                 .min_connections(pool_min)
                 .idle_timeout(Duration::from_secs(pool_idle_timeout))
                 .max_lifetime(Duration::from_secs(pool_max_lifetime))
                 .acquire_timeout(Duration::from_secs(pool_acquire_timeout))
-                .connect(&db_url)
+                .connect_with(connect_options)
                 .await?;
 
             let cache_duration = Duration::from_secs(cache_ttl);
@@ -1922,6 +1963,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "queue_stripe_count": queue_stripe_count, "routing_changed": false,
                             }))?
                         );
+                    }
+                    StorageCommands::LaneSequences { schema, repair } => {
+                        let next_steps = if repair {
+                            let mut conn = pool.acquire().await?;
+                            let repairs =
+                                awa_model::storage::repair_lane_sequences(&mut conn, &schema)
+                                    .await?;
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "schema": schema, "results": repairs,
+                                }))?
+                            );
+                            awa_model::storage::lane_sequence_repair_next_steps(&repairs)
+                        } else {
+                            let problems =
+                                awa_model::storage::lane_sequence_problems(&pool, &schema).await?;
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "schema": schema, "problems": problems,
+                                }))?
+                            );
+                            awa_model::storage::lane_sequence_next_steps(
+                                problems.iter().map(|problem| (problem, false)),
+                            )
+                        };
+                        if !next_steps.is_empty() {
+                            for next_step in next_steps {
+                                eprintln!("{next_step}");
+                            }
+                            std::process::exit(2);
+                        }
                     }
                     StorageCommands::Abort => {
                         awa_model::storage::abort(&pool).await?;

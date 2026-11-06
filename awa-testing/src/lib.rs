@@ -113,18 +113,39 @@ impl TestClient {
             None => return Ok(WorkResult::NoJob),
         };
 
-        let (result, progress_snapshot) = self.run_handler(&job, worker).await;
+        // Canonical keeps no outputs (ADR-048), so the sealed one is dropped.
+        let (result, progress_snapshot, staged, _output) = self.run_handler(&job, worker).await;
 
         // Update job state based on result
         match &result {
-            Ok(JobResult::Completed) => {
+            Ok(JobResult::Completed) if staged.is_empty() => {
                 sqlx::query(
                     "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL WHERE id = $1",
                 )
                 .bind(job.id)
                 .execute(&self.pool)
                 .await?;
-                Ok(WorkResult::Completed(job))
+                Ok(WorkResult::Completed(self.get_job(job.id).await?))
+            }
+            Ok(JobResult::Completed) => {
+                // As in the runtime, staged follow-ups commit only with a
+                // completion that still holds this attempt's lease.
+                let mut tx = self.pool.begin().await?;
+                let completed = sqlx::query(
+                    "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL \
+                     WHERE id = $1 AND state = 'running' AND run_lease = $2",
+                )
+                .bind(job.id)
+                .bind(job.run_lease)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if completed == 0 {
+                    return Err(stale_completion(&job));
+                }
+                awa_worker::insert_staged_follow_ups_in_tx(&mut tx, &job, &staged).await?;
+                tx.commit().await?;
+                Ok(WorkResult::Completed(self.get_job(job.id).await?))
             }
             Ok(JobResult::Cancel(reason)) => {
                 sqlx::query(
@@ -224,15 +245,26 @@ impl TestClient {
         &self,
         job: &JobRow,
         worker: &W,
-    ) -> (Result<JobResult, JobError>, Option<serde_json::Value>) {
+    ) -> (
+        Result<JobResult, JobError>,
+        Option<serde_json::Value>,
+        Vec<awa_model::PreparedJobInsert>,
+        Option<serde_json::Value>,
+    ) {
         let cancel = Arc::new(AtomicBool::new(false));
         let state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>> =
             Arc::new(HashMap::new());
         let progress = Arc::new(std::sync::Mutex::new(ProgressState::new(
             job.progress.clone(),
         )));
+        // As in the runtime, the dispatch row carries no failed outputs
+        // (ADR-048).
+        let mut dispatch_row = job.clone();
+        if let Some(errors) = dispatch_row.errors.as_mut() {
+            awa_model::output::strip_error_outputs(errors);
+        }
         let ctx = JobContext::new_for_testing(
-            job.clone(),
+            dispatch_row,
             cancel,
             state,
             self.pool.clone(),
@@ -243,7 +275,26 @@ impl TestClient {
             let guard = progress.lock().expect("progress lock poisoned");
             guard.clone_latest()
         };
-        (result, snapshot)
+        // ADR-046, as in the runtime: staged follow-ups ride only on
+        // `Completed`, and a `Completed` attempt that failed to stage fails
+        // terminally instead.
+        let (result, staged) = match (result, ctx.follow_ups().seal_for_testing()) {
+            (Ok(JobResult::Completed), Ok(staged)) => (Ok(JobResult::Completed), staged),
+            (Ok(JobResult::Completed), Err(err)) => (
+                Err(JobError::Terminal(format!(
+                    "a follow-up failed to stage: {err}"
+                ))),
+                Vec::new(),
+            ),
+            (result, _) => (result, Vec::new()),
+        };
+        // ADR-048: the output closes with the staging buffer; `Snooze` keeps
+        // none.
+        let output = ctx
+            .output_slot()
+            .seal_for_testing()
+            .filter(|_| !matches!(result, Ok(JobResult::Snooze(_))));
+        (result, snapshot, staged, output)
     }
 
     /// Queue-storage variant of [`Self::work_one_in_queue`]: claim, run the
@@ -285,18 +336,45 @@ impl TestClient {
         };
         let job = claimed.job.clone();
 
-        let (result, progress_snapshot) = self.run_handler(&job, worker).await;
+        let (result, progress_snapshot, staged, output) = self.run_handler(&job, worker).await;
+        // As in the runtime, a completion's output is kept only once the
+        // schema has the output columns; a failure's rides its error entry.
+        let mut claimed = claimed;
+        claimed.job.output = match &output {
+            Some(_) if store.supports_job_output(&self.pool).await? => output.clone(),
+            _ => None,
+        };
+        let failure =
+            |message: &str| awa_model::AttemptError::new(message).with_output(output.clone());
 
         match &result {
-            Ok(JobResult::Completed) => {
+            Ok(JobResult::Completed) if staged.is_empty() => {
                 store
                     .complete_runtime_batch(&self.pool, std::slice::from_ref(&claimed))
                     .await?;
-                Ok(WorkResult::Completed(job))
+                Ok(WorkResult::Completed(self.get_job(job.id).await?))
+            }
+            Ok(JobResult::Completed) => {
+                let mut tx = self.pool.begin().await?;
+                let completed = store
+                    .complete_runtime_batch_slow_in_tx(&mut tx, std::slice::from_ref(&claimed))
+                    .await?;
+                if completed.is_empty() {
+                    return Err(stale_completion(&job));
+                }
+                awa_worker::insert_staged_follow_ups_in_tx(&mut tx, &job, &staged).await?;
+                tx.commit().await?;
+                Ok(WorkResult::Completed(self.get_job(job.id).await?))
             }
             Ok(JobResult::Cancel(reason)) => {
                 store
-                    .cancel_running(&self.pool, job.id, job.run_lease, reason, progress_snapshot)
+                    .cancel_running(
+                        &self.pool,
+                        job.id,
+                        job.run_lease,
+                        failure(reason),
+                        progress_snapshot,
+                    )
                     .await?;
                 Ok(WorkResult::Cancelled(job, reason.clone()))
             }
@@ -309,7 +387,7 @@ impl TestClient {
                             &self.pool,
                             job.id,
                             job.run_lease,
-                            "max_attempts exhausted",
+                            failure("max_attempts exhausted"),
                             progress_snapshot,
                         )
                         .await?;
@@ -319,11 +397,20 @@ impl TestClient {
                     ));
                 }
                 store
-                    .retry_after(&self.pool, job.id, job.run_lease, *delay, progress_snapshot)
+                    .retry_after_with_output(
+                        &self.pool,
+                        job.id,
+                        job.run_lease,
+                        *delay,
+                        progress_snapshot,
+                        Some(&claimed.claim),
+                        output.clone(),
+                    )
                     .await?;
                 Ok(WorkResult::Retryable(job))
             }
-            Err(JobError::Retryable(_)) => {
+            Err(JobError::Retryable(err)) => {
+                let message = err.to_string();
                 // The final attempt exhausts the job, mirroring the real
                 // executor.
                 if job.attempt >= job.max_attempts {
@@ -332,7 +419,7 @@ impl TestClient {
                             &self.pool,
                             job.id,
                             job.run_lease,
-                            "max_attempts exhausted",
+                            failure("max_attempts exhausted"),
                             progress_snapshot,
                         )
                         .await?;
@@ -347,12 +434,14 @@ impl TestClient {
                 // one rather than a near-immediate reschedule that would let the
                 // same job be re-claimed within a test or accumulate across runs.
                 store
-                    .retry_after(
+                    .fail_retryable_after_with_claim(
                         &self.pool,
                         job.id,
                         job.run_lease,
                         Duration::from_secs(3600),
+                        failure(&message),
                         progress_snapshot,
+                        Some(&claimed.claim),
                     )
                     .await?;
                 Ok(WorkResult::Retryable(job))
@@ -386,7 +475,7 @@ impl TestClient {
                                 &self.pool,
                                 job.id,
                                 job.run_lease,
-                                msg,
+                                failure(msg),
                                 progress_snapshot,
                             )
                             .await?;
@@ -396,7 +485,13 @@ impl TestClient {
             }
             Err(JobError::Terminal(msg)) => {
                 store
-                    .fail_terminal(&self.pool, job.id, job.run_lease, msg, progress_snapshot)
+                    .fail_terminal(
+                        &self.pool,
+                        job.id,
+                        job.run_lease,
+                        failure(msg),
+                        progress_snapshot,
+                    )
                     .await?;
                 Ok(WorkResult::Failed(job, msg.clone()))
             }
@@ -407,6 +502,16 @@ impl TestClient {
     pub async fn get_job(&self, job_id: i64) -> Result<JobRow, AwaError> {
         awa_model::admin::get_job(&self.pool, job_id).await
     }
+}
+
+/// The attempt lost its lease while the handler ran (rescued, cancelled or
+/// completed elsewhere), so its completion and staged follow-ups were rolled
+/// back.
+fn stale_completion(job: &JobRow) -> AwaError {
+    AwaError::Validation(format!(
+        "job {} is no longer running under attempt {}'s lease; its completion and staged follow-ups were not applied",
+        job.id, job.attempt
+    ))
 }
 
 /// Result of `work_one`.

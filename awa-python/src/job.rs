@@ -1,5 +1,6 @@
-use awa_model::{JobRow, JobState, QueueStorage};
+use awa_model::{InsertOpts, JobRow, JobState, QueueStorage};
 use awa_worker::context::ProgressState;
+use awa_worker::{FollowUps, OutputSlot};
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use sqlx::PgPool;
@@ -103,6 +104,15 @@ pub struct PyJob {
     queue_storage: Option<Arc<QueueStorage>>,
     /// Shared progress buffer for in-flight reporting (only set during dispatch).
     progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
+    /// The attempt's follow-up staging buffer (ADR-046; only set during dispatch).
+    follow_ups: Option<FollowUps>,
+    /// The attempt's output slot (ADR-048; only set during dispatch).
+    output_slot: Option<OutputSlot>,
+    /// The output type given to `task(..., output=...)`, which `set_output`
+    /// checks values against (only set during dispatch).
+    output_type: Option<Py<PyAny>>,
+    /// The completed attempt's output from the job row (for queried jobs).
+    output_json: Option<serde_json::Value>,
     /// Progress JSON from the job row (for queried jobs).
     progress_json: Option<serde_json::Value>,
     /// Error history from the job row (array of {error, attempt, at} objects).
@@ -132,6 +142,10 @@ impl Clone for PyJob {
             pool: self.pool.clone(),
             queue_storage: self.queue_storage.clone(),
             progress_buffer: self.progress_buffer.clone(),
+            follow_ups: self.follow_ups.clone(),
+            output_slot: self.output_slot.clone(),
+            output_type: self.output_type.as_ref().map(|tp| tp.clone_ref(py)),
+            output_json: self.output_json.clone(),
             progress_json: self.progress_json.clone(),
             errors_json: self.errors_json.clone(),
             run_at: self.run_at,
@@ -184,6 +198,178 @@ impl PyJob {
     #[getter]
     fn finalized_at(&self) -> Option<String> {
         self.finalized_at.map(|d| d.to_rfc3339())
+    }
+
+    /// Stage a follow-up job that is enqueued in the same transaction as this
+    /// attempt's completion, and discarded if the attempt ends any other way
+    /// (ADR-046). Takes the same keyword arguments as `Transaction.insert`.
+    ///
+    /// The args are converted to JSON now. A request that cannot be staged
+    /// raises `StagingError` and poisons the attempt: if the handler still
+    /// returns normally, the attempt fails terminally.
+    // Options are taken untyped and extracted below, so a value of the wrong
+    // type or range poisons the attempt instead of raising before staging.
+    #[pyo3(signature = (args, *, kind=None, queue=None, priority=None, max_attempts=None, tags=None, metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_on_completion(
+        &self,
+        py: Python<'_>,
+        args: Py<PyAny>,
+        kind: Option<Py<PyAny>>,
+        queue: Option<Py<PyAny>>,
+        priority: Option<Py<PyAny>>,
+        max_attempts: Option<Py<PyAny>>,
+        tags: Option<Py<PyAny>>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let Some(follow_ups) = &self.follow_ups else {
+            return Err(crate::StagingError::new_err(
+                "follow-ups can only be staged on the job passed to a running handler",
+            ));
+        };
+        // Convert everything first; a conversion failure poisons the attempt
+        // like any other staging failure, so a handler that swallows it
+        // cannot complete without the follow-up it asked for.
+        let prepared = (|| -> PyResult<(String, serde_json::Value, InsertOpts)> {
+            let args_bound = args.bind(py);
+            let kind = match kind {
+                Some(kind) => kind.extract::<String>(py)?,
+                None => crate::args::derive_kind(&crate::args::get_type_class_name(
+                    args_bound.get_type().as_any(),
+                )?),
+            };
+            let opts = InsertOpts {
+                queue: queue
+                    .map(|value| value.extract::<String>(py))
+                    .transpose()?
+                    .unwrap_or_else(|| "default".to_string()),
+                priority: priority
+                    .map(|value| value.extract::<i16>(py))
+                    .transpose()?
+                    .unwrap_or(2),
+                max_attempts: max_attempts
+                    .map(|value| value.extract::<i16>(py))
+                    .transpose()?
+                    .unwrap_or(25),
+                tags: tags
+                    .map(|value| value.extract::<Vec<String>>(py))
+                    .transpose()?
+                    .unwrap_or_default(),
+                run_at: run_at
+                    .as_ref()
+                    .map(|value| crate::transaction::parse_run_at(py, value.bind(py)))
+                    .transpose()?,
+                metadata: metadata
+                    .as_ref()
+                    .map(|value| py_to_json(py, value.bind(py)))
+                    .transpose()?
+                    .unwrap_or(serde_json::json!({})),
+                unique: unique_opts
+                    .as_ref()
+                    .map(|value| crate::transaction::parse_unique_opts(py, value.bind(py)))
+                    .transpose()?,
+                ordering_key: ordering_key
+                    .as_ref()
+                    .map(|value| crate::transaction::parse_ordering_key(py, value.bind(py)))
+                    .transpose()?,
+                ..InsertOpts::default()
+            };
+            Ok((kind, crate::args::serialize_args(py, args_bound)?, opts))
+        })();
+        match prepared {
+            Ok((kind, args_json, opts)) => follow_ups
+                .enqueue_raw_on_completion(kind, args_json, opts)
+                .map_err(|err| crate::StagingError::new_err(err.to_string())),
+            Err(cause) => {
+                let err = follow_ups.poison(awa_worker::StageError::Invalid(cause.to_string()));
+                let staging = crate::StagingError::new_err(err.to_string());
+                staging.set_cause(py, Some(cause));
+                Err(staging)
+            }
+        }
+    }
+
+    /// Record this attempt's output (ADR-048), replacing any earlier one.
+    ///
+    /// The value is converted to JSON now: pydantic models are dumped in JSON
+    /// mode, dataclasses and tuples are converted, and sets, non-finite
+    /// floats, non-string keys and integers outside 64 bits are rejected.
+    /// At most `MAX_OUTPUT_BYTES` of JSON text. `None` clears the output.
+    /// A value that cannot be recorded raises `OutputError` and clears the
+    /// output; it does not poison the attempt. When the task declared an
+    /// output class, a value of another class is one that cannot be recorded.
+    fn set_output(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        let Some(slot) = &self.output_slot else {
+            return Err(crate::OutputError::new_err(
+                "an output can only be recorded on the job passed to a running handler",
+            ));
+        };
+        let value = value.bind(py);
+        let converted = check_output_type(self.output_type.as_ref().map(|tp| tp.bind(py)), value)
+            .and_then(|()| output_to_json(py, value, 0));
+        match converted {
+            Ok(json) => slot
+                .set_json(json)
+                .map_err(|err| crate::OutputError::new_err(err.to_string())),
+            Err(cause) => {
+                let err = slot.fail(awa_worker::OutputError::Invalid(cause.to_string()));
+                let output_error = crate::OutputError::new_err(err.to_string());
+                output_error.set_cause(py, Some(cause));
+                Err(output_error)
+            }
+        }
+    }
+
+    /// Remove the recorded output, so the attempt publishes none.
+    fn clear_output(&self) {
+        if let Some(slot) = &self.output_slot {
+            slot.clear();
+        }
+    }
+
+    /// During dispatch, the output recorded so far; on a job read from the
+    /// database, the completed attempt's output (ADR-048), or None.
+    #[getter]
+    fn output(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = match &self.output_slot {
+            Some(slot) => slot.get(),
+            None => self.output_json.clone(),
+        };
+        match value {
+            Some(value) => json_to_py(py, &value),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// The output, as `output` reads it, decoded as `tp`: pydantic models
+    /// with `model_validate`, dataclasses from their fields, and other
+    /// classes checked with `isinstance`. None when there is no output.
+    fn output_as(&self, py: Python<'_>, tp: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let value = match &self.output_slot {
+            Some(slot) => slot.get(),
+            None => self.output_json.clone(),
+        };
+        match value {
+            Some(value) => decode_output(py, tp.bind(py), &value),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// The output of the latest failed attempt that recorded one, decoded as
+    /// `tp` like `output_as`. None when no failed attempt recorded one.
+    fn error_output_as(&self, py: Python<'_>, tp: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let latest = self.errors_json.iter().flatten().rev().find_map(|entry| {
+            entry
+                .get(awa_model::output::ERROR_ENTRY_OUTPUT_KEY)
+                .filter(|output| !output.is_null())
+        });
+        match latest {
+            Some(value) => decode_output(py, tp.bind(py), value),
+            None => Ok(py.None()),
+        }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -585,6 +771,7 @@ impl From<JobRow> for PyJob {
     fn from(row: JobRow) -> Self {
         let progress_json = row.progress.clone();
         let errors_json = row.errors.clone();
+        let output_json = row.output.clone();
         PyJob {
             id: row.id,
             kind: row.kind,
@@ -602,6 +789,10 @@ impl From<JobRow> for PyJob {
             pool: None,
             queue_storage: None,
             progress_buffer: None,
+            follow_ups: None,
+            output_slot: None,
+            output_type: None,
+            output_json,
             progress_json,
             errors_json,
             run_at: row.run_at,
@@ -613,6 +804,7 @@ impl From<JobRow> for PyJob {
 }
 
 impl PyJob {
+    #[allow(clippy::too_many_arguments)]
     pub fn for_dispatch(
         row: JobRow,
         args_override: Py<PyAny>,
@@ -620,6 +812,9 @@ impl PyJob {
         pool: PgPool,
         queue_storage: Option<Arc<QueueStorage>>,
         progress_buffer: Arc<std::sync::Mutex<ProgressState>>,
+        follow_ups: FollowUps,
+        output_slot: OutputSlot,
+        output_type: Option<Py<PyAny>>,
     ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
@@ -627,8 +822,222 @@ impl PyJob {
         job.pool = Some(pool);
         job.queue_storage = queue_storage;
         job.progress_buffer = Some(progress_buffer);
+        job.follow_ups = Some(follow_ups);
+        job.output_slot = Some(output_slot);
+        job.output_type = output_type;
         job
     }
+}
+
+/// Refuse a value that is not an instance of the declared output class.
+/// `None` clears the output and always passes; so does a declared type that
+/// `isinstance` cannot check, such as `list[int]` or a `TypedDict`.
+fn check_output_type(
+    output_type: Option<&Bound<'_, PyAny>>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let Some(output_type) = output_type else {
+        return Ok(());
+    };
+    if value.is_none() || !output_type.is_instance_of::<pyo3::types::PyType>() {
+        return Ok(());
+    }
+    match value.is_instance(output_type) {
+        Ok(false) => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "the task's output is {}, not {}",
+            type_name(output_type),
+            type_name(&value.get_type().into_any()),
+        ))),
+        Ok(true) | Err(_) => Ok(()),
+    }
+}
+
+fn type_name(tp: &Bound<'_, PyAny>) -> String {
+    tp.getattr("__qualname__")
+        .and_then(|name| name.extract())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Decode a stored output as `tp`, the way dispatch builds args.
+fn decode_output(
+    py: Python<'_>,
+    tp: &Bound<'_, PyAny>,
+    value: &serde_json::Value,
+) -> PyResult<Py<PyAny>> {
+    let obj = json_to_py(py, value)?;
+    if tp.hasattr("model_validate")? {
+        return Ok(tp.call_method1("model_validate", (obj,))?.unbind());
+    }
+    if tp.hasattr("__dataclass_fields__")? {
+        let kwargs = obj.bind(py).cast::<pyo3::types::PyDict>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "output is not an object, so it cannot be a {}",
+                type_name(tp)
+            ))
+        })?;
+        return Ok(tp.call((), Some(kwargs))?.unbind());
+    }
+    if tp.is_instance_of::<pyo3::types::PyType>() {
+        let bound = obj.bind(py);
+        if let Ok(false) = bound.is_instance(tp) {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "output is a {}, not {}",
+                type_name(&bound.get_type().into_any()),
+                type_name(tp)
+            )));
+        }
+    }
+    Ok(obj)
+}
+
+/// Convert a Python value to an output (ADR-048): pydantic models in JSON
+/// mode, dataclasses at any depth, tuples as lists. Sets, non-finite floats,
+/// non-string keys, integers outside 64 bits and other objects are rejected
+/// rather than coerced.
+fn output_to_json(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    depth: usize,
+) -> PyResult<serde_json::Value> {
+    use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+    let type_error = |message: String| pyo3::exceptions::PyTypeError::new_err(message);
+    if depth > MAX_JSON_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "output nesting too deep (max 64 levels)",
+        ));
+    }
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(serde_json::Value::Bool(b.is_true()));
+    }
+    if obj.cast::<PyInt>().is_ok() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(serde_json::json!(i));
+        }
+        if let Ok(u) = obj.extract::<u64>() {
+            return Ok(serde_json::json!(u));
+        }
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "output integers must fit in 64 bits",
+        ));
+    }
+    if let Ok(f) = obj.cast::<PyFloat>() {
+        let value = f.value();
+        return serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("output floats must be finite")
+            });
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        return Ok(serde_json::Value::String(s.to_str()?.to_owned()));
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        return list
+            .iter()
+            .map(|item| output_to_json(py, &item, depth + 1))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(tuple) = obj.cast::<PyTuple>() {
+        return tuple
+            .iter()
+            .map(|item| output_to_json(py, &item, depth + 1))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (key, value) in dict.iter() {
+            let Ok(key) = key.cast::<PyString>() else {
+                return Err(type_error(format!(
+                    "output keys must be str, not {}",
+                    key.get_type().qualname()?
+                )));
+            };
+            map.insert(
+                key.to_str()?.to_owned(),
+                output_to_json(py, &value, depth + 1)?,
+            );
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    // A pydantic model (v2): dump in JSON mode so dates and the like become
+    // strings, as pydantic would send them.
+    if !obj.is_instance_of::<pyo3::types::PyType>() {
+        if let Ok(model_dump) = obj.getattr("model_dump") {
+            if model_dump.is_callable() {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("mode", "json")?;
+                let dumped = model_dump.call((), Some(&kwargs))?;
+                return output_to_json(py, &dumped, depth + 1);
+            }
+        }
+        let dataclasses = py.import("dataclasses")?;
+        if dataclasses
+            .call_method1("is_dataclass", (obj,))?
+            .is_truthy()?
+        {
+            let as_dict = dataclasses.call_method1("asdict", (obj,))?;
+            return output_to_json(py, &as_dict, depth + 1);
+        }
+    }
+    Err(type_error(format!(
+        "{} is not JSON-serializable as an output",
+        obj.get_type().qualname()?
+    )))
+}
+
+/// Validate and normalize a value as `Job.set_output` would, returning the
+/// JSON it would store. Used by the `awa.testing.HandlerJob` stand-in so its
+/// rules cannot drift from the runtime's.
+#[pyfunction]
+#[pyo3(name = "_validate_output", signature = (value, output_type=None))]
+pub fn validate_output(
+    py: Python<'_>,
+    value: Py<PyAny>,
+    output_type: Option<Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    if let Err(cause) =
+        check_output_type(output_type.as_ref().map(|tp| tp.bind(py)), value.bind(py))
+    {
+        let err = crate::OutputError::new_err(format!("output is not storable JSON: {cause}"));
+        err.set_cause(py, Some(cause));
+        return Err(err);
+    }
+    match output_json(py, value.bind(py))? {
+        Some(json) => json_to_py(py, &json),
+        None => Ok(py.None()),
+    }
+}
+
+/// Decode a JSON-compatible output as `tp`, as `Job.output_as` does. Used by
+/// `awa.testing.HandlerJob`.
+#[pyfunction]
+#[pyo3(name = "_decode_output")]
+pub fn decode_output_py(py: Python<'_>, tp: Py<PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    if value.bind(py).is_none() {
+        return Ok(py.None());
+    }
+    let json = py_to_json(py, value.bind(py))?;
+    decode_output(py, tp.bind(py), &json)
+}
+
+/// Convert and validate a value as an output, raising `OutputError`. `None`
+/// (or JSON null) means no output.
+pub(crate) fn output_json(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Option<serde_json::Value>> {
+    let json = output_to_json(py, value, 0).map_err(|cause| {
+        let err = crate::OutputError::new_err(format!("output is not storable JSON: {cause}"));
+        err.set_cause(py, Some(cause));
+        err
+    })?;
+    awa_model::output::validate_output(json)
+        .map_err(|err| crate::OutputError::new_err(err.to_string()))
 }
 
 /// Convert serde_json::Value to a Python object.
@@ -644,6 +1053,11 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i.into_pyobject(py)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                    .into_any()
+                    .unbind())
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.into_pyobject(py)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
                     .into_any()
                     .unbind())

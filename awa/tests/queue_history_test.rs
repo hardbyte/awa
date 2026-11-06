@@ -356,3 +356,113 @@ async fn test_maintenance_leader_writes_queue_and_fleet_history() {
     runtime.shutdown(Duration::from_secs(2)).await;
     admin::resume_queue(&pool, queue).await.unwrap();
 }
+
+/// Existing v057 databases must receive history without replaying or replacing
+/// the already-applied claim, output, lane, statistics, enqueue and jobs-view
+/// migrations. Current ungated workers keep running before this additive step.
+#[sqlx::test(migrations = false)]
+async fn test_history_upgrade_preserves_existing_jobs_and_replays_export_safely(
+    pool: sqlx::PgPool,
+) {
+    use awa::model::migrations;
+
+    let mut tx = pool.begin().await.unwrap();
+    for (_, _, sql) in migrations::migration_sql_range(0, 57) {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(tx.as_mut())
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(migrations::current_version(&pool).await.unwrap(), 57);
+    assert!(!queue_history::history_installed(&pool).await.unwrap());
+
+    let store = QueueStorage::new(QueueStorageConfig::default()).unwrap();
+    store.install(&pool).await.unwrap();
+    let relation_before: i64 =
+        sqlx::query_scalar("SELECT 'awa.ready_entries'::regclass::oid::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let queue = "qh_upgrade";
+    let runtime = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .register_worker(HistoryProbeWorker)
+        .build()
+        .unwrap();
+    runtime.start().await.unwrap();
+    let job = insert_with(
+        &pool,
+        &HistoryProbe { n: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if store
+            .load_job(&pool, job.id)
+            .await
+            .unwrap()
+            .is_some_and(|job| job.state == JobState::Completed)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "binary-first worker did not complete on v057"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    runtime.shutdown(Duration::from_secs(2)).await;
+    assert!(!queue_history::history_installed(&pool).await.unwrap());
+
+    let exported = migrations::migration_sql_range(57, 58);
+    assert_eq!(exported.len(), 1);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(exported[0].2.as_str()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(migrations::current_version(&pool).await.unwrap(), 58);
+    assert!(queue_history::history_installed(&pool).await.unwrap());
+    let queues = admin::queue_overviews(&pool).await.unwrap();
+    let bucket = Utc::now().duration_trunc(TimeDelta::minutes(1)).unwrap();
+    let (rows, fleet) = queue_history::build_sample(
+        bucket,
+        &queues,
+        &Default::default(),
+        &Default::default(),
+        &[],
+    );
+    queue_history::record_sample(&pool, &rows, &fleet)
+        .await
+        .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(exported[0].2.as_str()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    migrations::run(&pool).await.unwrap();
+    let relation_after: i64 =
+        sqlx::query_scalar("SELECT 'awa.ready_entries'::regclass::oid::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(relation_after, relation_before);
+    assert_eq!(
+        store.load_job(&pool, job.id).await.unwrap().unwrap().state,
+        JobState::Completed
+    );
+    let history = queue_history::queue_history_since(&pool, bucket - TimeDelta::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(history.get(queue).unwrap().len(), 1);
+}

@@ -14,14 +14,74 @@ A [migrate-first rehearsal with released `awa-pg==0.6.7`](https://github.com/har
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.
 
-For a runtime without DDL privileges, apply v049 as the migrator, run
-`awa storage prepare-queue --queue <name>` for every physical queue, and grant
-sequence `USAGE, SELECT, UPDATE` before starting producers or workers. Match
-shard and stripe counts and provision extra lanes before increasing them.
 External migration runners must apply the complete generated
 `awa migrate --sql --from 48 --to 49` bundle: it refreshes the installer
-definition before replacing lane helpers in the installed schemas.
-See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+definition before replacing lane helpers in the installed schemas. From v053,
+runtimes without DDL privileges create lanes themselves through the schema
+owner's provisioning functions, so `awa storage prepare-queue` is optional.
+
+## Lane ownership and v053
+
+Before v053 a lane's sequences belonged to the role that first enqueued into,
+claimed from or promoted into it. With several runtime roles, only roles whose
+default privileges covered that role could use the lane; any other role failed
+with `permission denied for sequence`. v053 installs `SECURITY DEFINER`
+`provision_lane` and `provision_lane_sequences` functions, owned by the schema
+owner, in each queue-storage schema. The lane helpers create sequences through
+them, with grants that mirror the lane's head table. Once v053 commits,
+`awa migrate` gives every existing lane sequence to the schema owner and adds
+its missing grants, as far as it is allowed to, one sequence per short
+transaction with a bounded lock wait.
+
+0.6 and earlier 0.7 binaries call the same helpers, so lanes they create after
+v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
+detects that `provision_lane` is missing and creates lanes as before.
+
+To adopt it:
+
+1. Check the current state: `awa storage lane-sequences` (read-only, exits 2
+   while lanes need repair).
+2. Run `awa migrate` with the schema owner as the effective role, as described
+   in [Database roles](security/database-roles.md).
+3. Read the migrate output. Any lane sequence it could not repair is listed in
+   a warning. A busy one needs another run of
+   `awa storage lane-sequences --repair` as the migration role (without
+   `PGOPTIONS`); the others name the roles that can repair them. See
+   [Check and repair lane ownership](security/database-roles.md#check-and-repair-lane-ownership).
+
+External migration runners apply the generated `awa migrate --sql --from 52
+--to 53` bundle, which does not repair existing lane sequences, then run
+`awa storage lane-sequences --repair` as the migration role itself.
+
+## v056: enqueue round trips
+
+v056 replaces functions only. `reserve_enqueue_seq` keeps its signature, lane
+lock and return value, so earlier 0.7 binaries and SQL producers
+(`insert_job_compat`) run unchanged on the migrated schema. A new
+`{schema}.enqueue_ready_rows` lets current runtimes enqueue a ready batch in
+one statement. Runtimes use it when they have `EXECUTE` on it and on
+`{schema}.ring_cursor`, which it calls and which is revoked from `PUBLIC`; the
+default privileges in [Database roles](security/database-roles.md#runtime-grants)
+grant both. Otherwise they keep the multi-statement path. A store that finds
+the function missing probes again after a minute, so it picks the function up
+without a restart once the migration commits. If the function disappears or
+loses `EXECUTE` after a store has used it, the same call retries once through
+the multi-statement path. Any transaction that call owns is rolled back before
+replaying the original input, including its uniqueness claims. Other errors
+propagate; a healthy cached fast path adds no probe or savepoint.
+
+Deploy order: the fallback keeps enqueue, claim and completion working when a
+current binary runs against a pre-v056 schema, but worker readiness does not
+follow it. `/readyz` reports a worker ready only once the schema is at the
+binary's version, so health-gated workers started before the migration stay
+unready until it commits. Migrate first for health-gated workers; binary-first
+is safe for producers and for workers without a readiness gate.
+
+Apply the complete pending range through v056, including v053 lane ownership,
+v054 statistics and v055 batch inserts. The runner applies only versions above
+the highest one recorded; do not stamp v056 before its predecessors.
+External runners must apply the complete generated `awa migrate --sql` bundle,
+which redefines the installer before refreshing the installed schemas.
 
 ## Custom-schema discovery during migration
 
@@ -131,18 +191,18 @@ For example, extract with `awa migrate --pending --extract-to ./pending-migratio
 into a new directory. Execute complete generated bundles; individual discovery
 tail files in the repository do not include their bootstrap prerequisites.
 
-## v051: queue and fleet history
+## v058: queue and fleet history
 
-v051 creates two new tables, `awa.queue_history` and `awa.fleet_history`, that
+v058 creates two new tables, `awa.queue_history` and `awa.fleet_history`, that
 the maintenance leader fills once a minute for the admin overview. No existing
 table is touched and the migration takes effect instantly; nothing needs to
-stop. Older binaries ignore the tables, so they keep working against a v051
+stop. Older binaries ignore the tables, so they keep working against a v058
 schema; history simply does not appear until a current binary holds
 leadership, and claim/completion rates stay blank for queues still served by
 older runtimes. The runtime role writes and prunes these tables: the default
 privileges in [Database roles](security/database-roles.md) cover them, but a
 role granted table by table needs `SELECT, INSERT, DELETE` on both. External
-runners apply `v051_queue_history.sql` from a regenerated pending bundle like
+runners apply `v058_queue_history.sql` from a regenerated pending bundle like
 any other migration.
 
 ## v050: one lane index per ready partition
@@ -208,6 +268,97 @@ into job-id buckets, so this release keeps that shape in its own folds and
 rebuilds until the flip fences them. Exact terminal counts stay exact through a
 mixed-version rollout and through a rollback before the flip; no operator action
 is needed.
+
+## v051: per-slot claim functions
+
+v051 moves the claim query out of `claim_ready_runtime` into one
+`claim_ready_slot_<N>` function per queue-ring slot in the default and every
+discovered custom queue-storage schema. Each function addresses that slot's
+ready, tombstone and attempt-batch children directly, so PostgreSQL keeps a
+cached plan for it across ring rotations. `claim_ready_runtime` keeps its
+signature and result and dispatches to the slot function, and the claim
+evidence it writes is unchanged, so binaries before v051 claim unchanged on the
+migrated schema and the migration adds no runtime version gate.
+
+This is an installer replay, not a function-only change. Reinstalling each
+substrate drops and recreates ring-state and queue-head triggers and takes
+ACCESS EXCLUSIVE table locks that are held until the whole pending range
+commits, so enqueue and claim in those schemas wait for the migration. Use a
+quiet window and a bounded `lock_timeout` (for example
+`PGOPTIONS='-c lock_timeout=5s' awa migrate`); on timeout nothing is applied,
+so retry the complete migration. Apply it with credentials that own every
+installed substrate.
+
+The runtime role needs `EXECUTE` on the new functions. The
+[default privileges](security/database-roles.md#runtime-grants) granted to `awa_runtime`
+cover functions the migrator creates; if you granted `EXECUTE ON ALL FUNCTIONS`
+once instead, run that grant again after migrating. External migration runners
+apply the complete generated `awa migrate --sql --from 50 --to 51` bundle, which
+refreshes the installer definition before the tail reinstalls the custom
+substrates.
+
+## v052: job output columns
+
+v052 adds the storage for [job output](job-output.md) (ADR-048) to the default
+and every discovered custom queue-storage schema:
+- a nullable `output json` column on `done_entries`;
+- a nullable `outputs json[]` array on `receipt_completion_batches`, with a
+  `NOT VALID` check on its length;
+- a final `output` column on `terminal_jobs`.
+
+It is not an installer replay. It redefines the installer, so new schemas
+get the columns, then runs a targeted helper for each schema. Nothing is
+rewritten or scanned. Adding the columns and replacing the view still take
+`ACCESS EXCLUSIVE` locks on the terminal tables and view, held until the
+whole pending range commits, so completions and terminal reads wait while it
+runs. It locks `terminal_jobs` before its tables, the order terminal reads
+use. When no `lock_timeout` is set, each lock acquisition waits at most 2 s.
+On a timeout or a deadlock nothing is applied; retry the complete migration.
+
+Binaries before v052 run unchanged on the migrated schema: they name terminal
+columns explicitly. While both versions run, a 0.6 worker that claims the
+retry of an attempt a 0.7 worker failed sees that attempt's output in
+`job.errors`; 0.7 workers remove it from the row they dispatch. A 0.7 binary running before the migration checks its
+schema's catalog for the columns. Until they exist, it neither writes nor
+reads them, and it drops completion outputs (counted as
+`awa.job.output_dropped{awa.output.reason="schema_missing"}`). Health-gated
+workers report not ready until the migration runs, as for any version bump.
+
+External migration runners apply the complete `awa migrate --sql --from 51
+--to 52` bundle, which defines the helper before the tail calls it.
+
+## v054: planner statistics helper
+
+v054 adds `awa.analyze_queue_storage_relation(schema, relation)`, a
+`SECURITY DEFINER` function owned by the migration role that lets the
+maintenance leader refresh planner statistics for the head tables and ring
+parents when the runtime role does not own them (see
+[Planner statistics](configuration.md#planner-statistics)). It creates one
+function, revokes `EXECUTE` from `PUBLIC` and grants it to the roles that
+already hold INSERT, UPDATE and DELETE on the `awa` head tables (the runtime
+grantees); it takes no table lock and completes in milliseconds. Roles created
+later need `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa`. Run the migration as the schema owner so the
+function's owner owns the tables.
+
+Binaries before v054 never call it. A 0.7 binary running before the migration
+logs once that the function is missing and skips the refresh; the
+`awa.maintenance.analyze.attempts` counter reports `unavailable`. External
+migration runners apply the `awa migrate --sql --from 53 --to 54` bundle.
+
+## v055: batch producer insert
+
+v055 adds `awa.insert_jobs_compat_batch`, the function `insert_many_copy` and
+`insert_many_skip_unique_conflicts` call. It is one `CREATE OR REPLACE FUNCTION`: no table DDL,
+no scan, no lock beyond the catalog, so it applies instantly under live load.
+`awa.insert_job_compat` is unchanged, and binaries before v055 keep calling it;
+both paths take the same per-lane reservation lock, so producers on either
+version serialise on a lane as before.
+
+The runtime role needs `EXECUTE` on the new function; the
+[default privileges](security/database-roles.md#runtime-grants) cover functions
+the migrator creates.
+
+A 0.7 binary running before the migration keeps inserting. `insert_many_copy` probes its own connection on every call, uses the per-row function until the batch function exists, and switches without a restart. Generic `insert_many` always uses the per-row function in one statement, so one process can write to databases at different migration levels without aborting a caller transaction on an unavailable function. `insert_many_skip_unique_conflicts` needs the function and returns a validation error before the migration. The per-row and batch paths take the same lane lock, so a fleet that mixes them keeps each batch contiguous and in order. External migration runners apply the `awa migrate --sql --from 54 --to 55` bundle.
 
 ## The one gate
 

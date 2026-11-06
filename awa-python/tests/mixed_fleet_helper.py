@@ -44,7 +44,10 @@ async def main() -> None:
     mode = os.environ["MIXED_MODE"]
 
     client = awa.AsyncClient(database_url)
-    await client.migrate()
+    # A released artifact refuses to migrate a schema newer than it knows;
+    # the rehearsal sets this once the current migrations have run.
+    if not os.environ.get("MIXED_SKIP_MIGRATE"):
+        await client.migrate()
 
     if mode == "worker_chaos_probe":
         worker_count = int(os.environ.get("MIXED_QUEUE_WORKERS", "1"))
@@ -137,6 +140,27 @@ async def main() -> None:
         for idx in range(count):
             await client.insert(ChaosProbe(marker=f"{prefix}-{idx}"), queue=queue)
         print(f"INSERTED mode={mode} prefix={prefix} count={count}", flush=True)
+        return
+
+    if mode == "admin_read_and_retry":
+        # Reads rows a newer runtime wrote, then retries some of them, so a
+        # released admin surface is exercised against columns and error
+        # entries it predates.
+        read_ids = [int(i) for i in os.environ.get("MIXED_READ_IDS", "").split(",") if i]
+        retry_ids = [int(i) for i in os.environ.get("MIXED_RETRY_IDS", "").split(",") if i]
+        for job_id in read_ids:
+            job = await client.get_job(job_id)
+            await client.dump_job(job_id)
+            print(
+                f"READ mode={mode} job_id={job.id} state={job.state} errors={len(job.errors or [])}",
+                flush=True,
+            )
+        listed = await client.list_jobs(queue=queue, limit=1000)
+        print(f"LISTED mode={mode} count={len(listed)}", flush=True)
+        for job_id in retry_ids:
+            retried = await client.retry(job_id)
+            assert retried is not None, f"retry({job_id}) returned None"
+            print(f"RETRIED mode={mode} job_id={job_id}", flush=True)
         return
 
     raise SystemExit(f"unknown MIXED_MODE={mode}")

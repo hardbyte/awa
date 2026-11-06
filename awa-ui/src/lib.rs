@@ -3,10 +3,14 @@ pub mod cache;
 pub mod callback_router;
 pub mod error;
 pub mod handlers;
+pub mod pool;
 pub mod state;
 
 pub use callback_router::{
     callback_router, CallbackAuth, CallbackReceiverConfig, CallbackRouterBuildError,
+};
+pub use pool::{
+    admin_connect_options, admin_pool_options, configure_admin_connection, recover_admin_connection,
 };
 
 use std::time::Duration;

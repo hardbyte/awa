@@ -344,7 +344,10 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
             "COMMENT ON FUNCTION {OWNED_SCHEMA}.{CLAIM_SIGNATURE} IS 'stale'"
         ))))
         .await?;
-    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+    for (_, _, statement) in migrations::migration_sql_range(47, 48)
+        .into_iter()
+        .chain(migrations::migration_sql_range(50, 51))
+    {
         migrator_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
             .await?;
@@ -405,7 +408,10 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         vec!["awa".to_string(), OWNED_SCHEMA.to_string()],
         "role membership alone must not authorize refreshing foreign schemas"
     );
-    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+    for (_, _, statement) in migrations::migration_sql_range(47, 48)
+        .into_iter()
+        .chain(migrations::migration_sql_range(50, 51))
+    {
         superuser_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
             .await?;
@@ -473,7 +479,10 @@ async fn assert_foreign_when_clause_is_rejected(
         ))))
         .await?;
     let mut replay_failed_closed = false;
-    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+    for (_, _, statement) in migrations::migration_sql_range(47, 48)
+        .into_iter()
+        .chain(migrations::migration_sql_range(50, 51))
+    {
         if let Err(error) = migrator_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
             .await
@@ -547,8 +556,15 @@ async fn assert_configured_substrates_fail_closed(
     )
     .fetch_one(migrator_pool)
     .await?;
-    sqlx::query("DELETE FROM awa.schema_version WHERE version = $1")
-        .bind(migrations::CURRENT_VERSION)
+    // The newest migration that runs the discovery preflight. Later ones
+    // that touch no custom substrate carry no preflight to refuse.
+    let (preflight_version, _, pending_sql) = migrations::migration_sql()
+        .into_iter()
+        .rev()
+        .find(|(_, _, sql)| sql.contains("unsafe configured queue-storage schema"))
+        .expect("a migration that runs the discovery preflight");
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= $1")
+        .bind(preflight_version)
         .execute(migrator_pool)
         .await?;
     let previous_version: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
@@ -593,7 +609,6 @@ async fn assert_configured_substrates_fail_closed(
             "CREATE SCHEMA awa_exp AUTHORIZATION {outsider}"
         ))))
         .await?;
-    let (_, _, pending_sql) = migrations::migration_sql().pop().unwrap();
     for (details, expected_schema) in [
         (
             serde_json::json!({"schema": "injected_custom"}),

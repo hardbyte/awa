@@ -85,6 +85,25 @@ DlqRetryTrace == <<
     [action |-> "FastComplete", worker |-> "w1", job |-> "j1"]
 >>
 
+\* Exhausted rescue trace (#546): a worker that dies on the job's last
+\* attempt is rescued straight into the DLQ instead of the ready lane, and
+\* the old lease's receipt is closed.
+RescueToDlqTrace == <<
+    [action |-> "EnqueueReady",  job |-> "j1"],
+    [action |-> "Claim",         worker |-> "w1", job |-> "j1"],
+    [action |-> "LoseHeartbeat", job |-> "j1"],
+    [action |-> "RescueToDlq",   job |-> "j1"]
+>>
+
+\* The same exhausted rescue on a queue without a DLQ: the job fails into
+\* the terminal family instead.
+RescueToTerminalTrace == <<
+    [action |-> "EnqueueReady",     job |-> "j1"],
+    [action |-> "Claim",            worker |-> "w1", job |-> "j1"],
+    [action |-> "LoseHeartbeat",    job |-> "j1"],
+    [action |-> "RescueToTerminal", job |-> "j1"]
+>>
+
 \* Receipt-only cancel trace. Models `awa::admin::cancel` racing with a
 \* freshly-opened receipt: the claim cursor has advanced and an open
 \* receipt exists, but the lease row hasn't materialized yet. Admin
@@ -111,6 +130,16 @@ CallbackWaitTrace == <<
     [action |-> "ParkToWaiting",           worker |-> "w1", job |-> "j1"],
     [action |-> "ResumeWaitingToRunning",  job |-> "j1"],
     [action |-> "StatefulComplete",        worker |-> "w1", job |-> "j1"]
+>>
+
+\* Exhausted callback timeout on a queue without a DLQ: the waiting entry
+\* fails into the terminal family instead of the DLQ.
+CallbackTimeoutToTerminalTrace == <<
+    [action |-> "EnqueueReady",             job |-> "j1"],
+    [action |-> "Claim",                    worker |-> "w1", job |-> "j1"],
+    [action |-> "MaterializeAttemptState",  job |-> "j1"],
+    [action |-> "ParkToWaiting",            worker |-> "w1", job |-> "j1"],
+    [action |-> "TimeoutWaitingToTerminal", job |-> "j1"]
 >>
 
 \* DLQ purge trace: an executor terminal failure moves the row into
@@ -237,8 +266,11 @@ TraceStep(trace, n) ==
        \/ (ev.action = "ResumeWaitingToRunning" /\ ResumeWaitingToRunning(ev.job))
        \/ (ev.action = "TimeoutWaitingToReady" /\ TimeoutWaitingToReady(ev.job))
        \/ (ev.action = "TimeoutWaitingToDlq" /\ TimeoutWaitingToDlq(ev.job))
+       \/ (ev.action = "TimeoutWaitingToTerminal" /\ TimeoutWaitingToTerminal(ev.job))
        \/ (ev.action = "FailToDlq" /\ FailToDlq(ev.worker, ev.job))
        \/ (ev.action = "RescueToReady" /\ RescueToReady(ev.job))
+       \/ (ev.action = "RescueToDlq" /\ RescueToDlq(ev.job))
+       \/ (ev.action = "RescueToTerminal" /\ RescueToTerminal(ev.job))
        \/ (ev.action = "RescueStaleReceipt" /\ RescueStaleReceipt(ev.job, ev.run_lease))
        \/ (ev.action = "CancelWaitingToTerminal" /\ CancelWaitingToTerminal(ev.job))
        \/ (ev.action = "CancelRunningToTerminal" /\ CancelRunningToTerminal(ev.job))
@@ -268,7 +300,10 @@ SpecRunningCancel == TraceInit /\ [][TraceNextFor(RunningCancelTrace)]_<<vars, t
 SpecDlqRetry == TraceInit /\ [][TraceNextFor(DlqRetryTrace)]_<<vars, traceIdx>>
 SpecReceiptOnlyCancel == TraceInit /\ [][TraceNextFor(ReceiptOnlyCancelTrace)]_<<vars, traceIdx>>
 SpecCallbackWait == TraceInit /\ [][TraceNextFor(CallbackWaitTrace)]_<<vars, traceIdx>>
+SpecCallbackTimeoutToTerminal == TraceInit /\ [][TraceNextFor(CallbackTimeoutToTerminalTrace)]_<<vars, traceIdx>>
 SpecDlqPurge == TraceInit /\ [][TraceNextFor(DlqPurgeTrace)]_<<vars, traceIdx>>
+SpecRescueToDlq == TraceInit /\ [][TraceNextFor(RescueToDlqTrace)]_<<vars, traceIdx>>
+SpecRescueToTerminal == TraceInit /\ [][TraceNextFor(RescueToTerminalTrace)]_<<vars, traceIdx>>
 SpecBroken == TraceInit /\ [][TraceNextFor(BrokenTrace)]_<<vars, traceIdx>>
 
 \* Positive witness invariants: negated so "violation" means acceptance.
@@ -284,7 +319,10 @@ RunningCancelTraceIncomplete == traceIdx < Len(RunningCancelTrace)
 DlqRetryTraceIncomplete == traceIdx < Len(DlqRetryTrace)
 ReceiptOnlyCancelTraceIncomplete == traceIdx < Len(ReceiptOnlyCancelTrace)
 CallbackWaitTraceIncomplete == traceIdx < Len(CallbackWaitTrace)
+CallbackTimeoutToTerminalTraceIncomplete == traceIdx < Len(CallbackTimeoutToTerminalTrace)
 DlqPurgeTraceIncomplete == traceIdx < Len(DlqPurgeTrace)
+RescueToDlqTraceIncomplete == traceIdx < Len(RescueToDlqTrace)
+RescueToTerminalTraceIncomplete == traceIdx < Len(RescueToTerminalTrace)
 BrokenTraceIncomplete == traceIdx < Len(BrokenTrace)
 
 \* All other safety invariants (TypeOK, DlqHasNoLiveRuntime, etc.) are

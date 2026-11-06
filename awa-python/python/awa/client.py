@@ -87,6 +87,24 @@ class BatchOperation(TypedDict, total=False):
     updated_at: str
 
 
+def _output_descriptor(output: Any) -> dict[str, Any]:
+    """The kind descriptor's output entry for a declared output type: its
+    name, and its JSON Schema when pydantic can produce one."""
+    name = output.__name__ if isinstance(output, type) else repr(output)
+    descriptor: dict[str, Any] = {"type": name}
+    try:
+        if hasattr(output, "model_json_schema"):
+            descriptor["schema"] = output.model_json_schema()
+        else:
+            from pydantic import TypeAdapter
+
+            descriptor["schema"] = TypeAdapter(output).json_schema()
+    except Exception:
+        # No pydantic, or a type it cannot describe: publish the name alone.
+        pass
+    return descriptor
+
+
 class AsyncClient:
     """Async client for workers and async applications.
 
@@ -664,10 +682,19 @@ class AsyncClient:
     # ── External callbacks (async) ──────────────────────────────
 
     async def complete_external(
-        self, callback_id: str, payload: dict[str, Any] | None = None
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        output: Any = None,
     ) -> Job:
-        """Complete a waiting job via external callback."""
-        return await self._raw.complete_external(callback_id, payload)
+        """Complete a waiting job via external callback.
+
+        The payload is not stored. ``output``, when given, is stored as the
+        job's output (ADR-048); an invalid one raises ``OutputError`` and
+        completes nothing.
+        """
+        return await self._raw.complete_external(callback_id, payload, output=output)
 
     async def fail_external(self, callback_id: str, error: str) -> Job:
         """Fail a waiting job via external callback."""
@@ -716,16 +743,32 @@ class AsyncClient:
         *,
         kind: str | None = None,
         queue: str = "default",
+        output: Any = None,
     ) -> Callable[[Callable[[Job[T]], Awaitable[Any]]], Callable[[Job[T]], Awaitable[Any]]]:
         """Register a task handler (decorator).
 
+        ``output`` declares the type the handler records with
+        ``job.set_output`` (ADR-048). ``set_output`` then refuses an instance
+        of another class, and the kind's descriptor publishes the type's name,
+        with its JSON Schema when it is a pydantic model or pydantic is
+        installed. Read it back with ``job.output_as(output)``.
+
         Example::
 
-            @client.task(SendEmail, queue="email")
+            @client.task(SendEmail, queue="email", output=Delivery)
             async def handle(job):
-                send_email(job.args.to, job.args.subject)
+                receipt = send_email(job.args.to, job.args.subject)
+                job.set_output(Delivery(message_id=receipt.id))
         """
-        return self._raw.worker(args_type, kind=kind, queue=queue)
+        if output is None:
+            return self._raw.worker(args_type, kind=kind, queue=queue)
+        return self._raw.worker(
+            args_type,
+            kind=kind,
+            queue=queue,
+            output=output,
+            output_descriptor=_output_descriptor(output),
+        )
 
     def worker(
         self,
@@ -880,6 +923,7 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
+        statistics_refresh_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
@@ -929,6 +973,11 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``statistics_refresh_interval_ms`` controls how often the maintenance
+        leader runs ``ANALYZE`` on the queue-storage head tables and
+        partitioned ring parents, which autovacuum never analyses (default 5
+        minutes; ``0`` disables the refresh).
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -951,6 +1000,7 @@ class AsyncClient:
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
+            statistics_refresh_interval_ms=statistics_refresh_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,
@@ -1366,10 +1416,19 @@ class Client:
     # ── External callbacks (sync) ───────────────────────────────
 
     def complete_external(
-        self, callback_id: str, payload: dict[str, Any] | None = None
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        output: Any = None,
     ) -> Job:
-        """Complete a waiting job via external callback."""
-        return self._raw.complete_external_sync(callback_id, payload)
+        """Complete a waiting job via external callback.
+
+        The payload is not stored. ``output``, when given, is stored as the
+        job's output (ADR-048); an invalid one raises ``OutputError`` and
+        completes nothing.
+        """
+        return self._raw.complete_external_sync(callback_id, payload, output=output)
 
     def fail_external(self, callback_id: str, error: str) -> Job:
         """Fail a waiting job via external callback."""

@@ -329,9 +329,23 @@ async def test_maintenance_interval_kwargs_accepted(client):
         deadline_rescue_interval_ms=1_000,
         callback_rescue_interval_ms=1_000,
         terminal_count_rollup_interval_ms=1_000,
+        statistics_refresh_interval_ms=1_000,
         leader_election_interval_ms=200,
         promote_interval_ms=500,
     )
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_statistics_refresh_can_be_disabled(client):
+    """statistics_refresh_interval_ms=0 disables the refresh; start() accepts it."""
+    queue = "cfg_statistics_refresh_off"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    await client.start([(queue, 1)], statistics_refresh_interval_ms=0)
     await client.shutdown()
 
 
@@ -758,6 +772,13 @@ async def test_queue_storage_claim_ring_knobs_validate(client):
             [(queue, 1)],
             poll_interval_ms=25,
             queue_storage_claim_rotate_interval_ms=0,
+        )
+
+    with pytest.raises(ValueError, match="heartbeat_interval_ms must be > 0"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            heartbeat_interval_ms=0,
         )
 
     with pytest.raises(ValueError, match="terminal_count_rollup_interval_ms must be > 0"):

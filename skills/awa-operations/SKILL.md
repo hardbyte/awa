@@ -91,11 +91,19 @@ Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
 ## Restricted Database Roles
 
-When deploying a runtime without schema CREATE, apply v049 and provision every
-queue with `awa storage prepare-queue` as the migrator before starting producers
-or workers. Match shard/stripe counts; provision additional lanes before changing
-routing. Use the sequence grants and owner defaults in
-[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+From v053 any runtime role creates lanes through the schema owner's
+`SECURITY DEFINER` provisioning functions, so runtimes need neither schema
+CREATE nor sequence default privileges, and `awa storage prepare-queue` is
+optional. Run migrations with the schema owner as the effective role. Check
+lane ownership with `awa storage lane-sequences` (exits 2 while lanes need
+repair) and fix it with `--repair`, connected as the migration role itself
+rather than as the schema owner, or with the statements it prints; see
+[Database roles](../../docs/security/database-roles.md#check-and-repair-lane-ownership).
+
+Queue-storage batch enqueue acceleration (v056) keeps the older multi-statement
+path available. A missing function or revoked EXECUTE retries once within the
+same call after rolling back its owned transaction. Apply complete migration
+bundles through v056, retaining the v053/v054/v055 predecessors.
 
 ## Rolling Upgrades
 
@@ -135,7 +143,8 @@ processes. Exactly one worker per database is the elected maintenance leader
 (session-scoped advisory lock — if it dies, another is elected on the next
 tick). The leader alone runs cluster-wide scans: deferred→ready promotion, the
 three rescue paths (stale-heartbeat, hard-deadline, callback-timeout), ring
-rotation and prune, DLQ and descriptor cleanup, and cron evaluation. During an
+rotation and prune, planner-statistics refresh, DLQ and descriptor cleanup, and
+cron evaluation. During an
 unfinalized transition it promotes both planes' deferred backlogs, so drain and
 post-flip execution do not depend on which runtime holds leadership. Every
 worker dispatches and heartbeats its own attempts. There is no `pg_cron` or
@@ -180,7 +189,13 @@ timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.
 The DLQ is a separate physical table, not a job state; a DLQ'd job cannot be
 claimed until retried out. It is per-queue opt-in (`dlq_enabled`) with a
 default 30-day retention pruned by the maintenance leader. `dlq_reason` is
-`max_attempts`, `manual`, or `deadline_expired`.
+`max_attempts_exhausted`, `terminal_error`, `heartbeat_stale`,
+`deadline_exceeded`, `callback_timeout`, or the reason passed to `awa dlq move`.
+
+A poison job (one that crashes, hangs or panics on every attempt) stops after
+`max_attempts`: crash and deadline rescues spend attempts like handler errors.
+To contain one, `awa job cancel <id>` it or `awa queue pause` its queue, ship
+the fix, then `awa dlq retry-bulk --queue <q> --kind <kind>`.
 
 ```bash
 awa dlq depth --queue emails
@@ -307,6 +322,19 @@ storage limit. Queue prune lock contention retries on the next decision tick;
 active-data gates retain exponential backoff. Persistent contention can still
 stall reclamation. See `docs/configuration.md` for the scheduling contract.
 
+On queue storage the leader runs `ANALYZE` on `queue_claim_heads`,
+`queue_enqueue_heads` and the partitioned ring parents when elected and every
+`statistics_refresh_interval` (default 5 minutes; Python
+`statistics_refresh_interval_ms`; zero disables), because autovacuum never
+analyses them. It goes through the `SECURITY DEFINER` function
+`awa.analyze_queue_storage_relation` from migration v054, so a non-owner runtime
+role needs no `MAINTAIN` grant. Watch `awa.maintenance.analyze.attempts`: any
+`unavailable` means the helper is missing: run `awa migrate` as the schema
+owner. For `skipped_privilege`, restore helper EXECUTE and the login role's
+head-table DML, or correct the helper owner; migration reruns preserve an
+existing function's owner. See `docs/configuration.md#planner-statistics` and
+`docs/security/database-roles.md`.
+
 ## Managed Postgres
 
 Prefer PostgreSQL 18 where available; PG17 on some managed platforms caps
@@ -368,9 +396,9 @@ externally reachable callbacks with a private admin surface, run
 
 The overview's "keeping up" verdict comes from per-minute history the
 maintenance leader writes (`awa.queue_history`, `awa.fleet_history`, schema
-v051; `queue_history_retention`, default 48h). `GET /api/health/queues` returns
+v058; `queue_history_retention`, default 48h). `GET /api/health/queues` returns
 the same verdicts; `?fail_on=critical` answers 503 for a plain HTTP alert. With
-no history (pre-v051 schema, or no current leader yet) only stalls and long
+no history (pre-v058 schema, or no current leader yet) only stalls and long
 waits are detected. A queue flagged "Not being worked" has claimable jobs
 waiting over a minute with no live worker serving it, or nothing running or
 claimed; read its **Limited by** (no workers, rate limit, worker capacity,
@@ -380,6 +408,15 @@ Missing counter coverage is a gap, including a worker disappearing without a
 final snapshot or callbacks completing without worker runtimes. Do not read a
 gap as zero throughput; the overview uses its hourly fallback when current
 completion rates are unknown.
+`awa serve` caps every admin query at 60 seconds (`--statement-timeout` /
+`AWA_STATEMENT_TIMEOUT`, in seconds; `0` keeps the server's setting). Postgres
+keeps running a query after its HTTP request is abandoned, so this cap is what
+stops repeated dashboard polls from piling up slow queries. When embedding
+`awa_ui::router` in another service, build its pool with
+`awa_ui::admin_pool_options(PgPoolOptions::new())` and
+`connect_with(awa_ui::admin_connect_options(url.parse()?, Some(timeout)))`.
+The release hook recovers connections whose request was dropped mid-query;
+without it, a cancelled query can leak the pool slot over TLS.
 
 ## Before You Finish A Change
 
