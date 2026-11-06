@@ -189,16 +189,16 @@ def test_queue_management_sync(client):
     assert count == 3
 
 
-# -- Test 18: list_jobs_sync with filters --
+# -- Test 18: list_jobs_sync needs queue storage --
 
 
-def test_list_jobs_sync(client):
+def test_list_jobs_sync_needs_queue_storage(client):
+    # Listing jobs by filter is refused on the canonical engine (ADR-049).
     client.insert(
         SyncEmail(to="list@example.com", subject="List"), queue="sync_list"
     )
-    jobs = client.list_jobs(queue="sync_list", state="available")
-    assert len(jobs) == 1
-    assert jobs[0].queue == "sync_list"
+    with pytest.raises(awa.ValidationError, match="queue_storage"):
+        client.list_jobs(queue="sync_list", state="available")
 
 
 # -- Test 19: queue_stats_sync --

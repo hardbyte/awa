@@ -439,8 +439,29 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
     // migration transaction: it must not extend the lock hold, and a slow or
     // timed-out refresh must not roll back the committed schema.
     warm_admin_metadata_cache(pool).await;
+    index_empty_tag_partitions(pool).await;
 
     Ok(())
+}
+
+/// Best-effort: give every empty, owned queue-storage partition its tag
+/// index (ADR-049), which is instant on an empty table. Populated ones are
+/// left to `awa storage build-tag-index`. Runs on a detached connection for
+/// the same reason as [`warm_admin_metadata_cache`].
+async fn index_empty_tag_partitions(pool: &PgPool) {
+    let Ok(conn) = pool.acquire().await else {
+        return;
+    };
+    let mut conn = conn.detach();
+    match crate::tag_index::index_empty_partitions(&mut conn).await {
+        Ok(0) => {}
+        Ok(built) => info!(
+            built,
+            "Created tag indexes on empty queue-storage partitions"
+        ),
+        Err(error) => warn!(%error, "Skipped creating tag indexes after migration"),
+    }
+    let _ = conn.close().await;
 }
 
 async fn run_migration_transaction(

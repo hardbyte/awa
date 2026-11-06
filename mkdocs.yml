@@ -113,6 +113,7 @@ nav:
       - Bridge adapters: bridge-adapters.md
       - Lifecycle hooks: lifecycle-hooks.md
       - Job output: job-output.md
+      - Finding jobs: finding-jobs.md
       - HTTP callbacks: http-callbacks.md
       - Callback receivers: callback-receivers.md
       - Dead-letter queue: dead-letter-queue.md

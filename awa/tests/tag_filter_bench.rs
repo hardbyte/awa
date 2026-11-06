@@ -1,0 +1,242 @@
+//! ADR-049 cost check for finding jobs on queue storage.
+//!
+//! Inserts and completes a batch of jobs, two thirds of them tagged (one tag
+//! shared by one job in fifty, one unique per job), and leaves as many again
+//! unclaimed in a queue with no worker. It then times `find_jobs` and
+//! `count_jobs` for a rare tag in each population, a common tag and a kind
+//! with no tag. It also reports the lifecycle WAL per job and the tag
+//! indexes' size.
+//! Ignored by default; run with:
+//!
+//! ```sh
+//! DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+//!   cargo test -p awa --test tag_filter_bench -- --ignored --nocapture
+//! ```
+//!
+//! `TAG_BENCH_JOBS` overrides the batch size (default 50000).
+//! `TAG_BENCH_KEEP=1` stops after loading and keeps the database, printing
+//! its name, for running `EXPLAIN` by hand.
+
+use awa::model::admin;
+use awa::{Client, JobArgs, JobFilter, JobPage, JobResult, QueueConfig};
+use awa_testing::setup::TestDatabase;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct TagBench {
+    n: i64,
+}
+
+const TENANTS: i64 = 50;
+/// A regression bound for a warm rare-tag lookup at the default scale.
+/// ADR-049 aims for 100 ms; about half of today's ~150 ms is loading the one
+/// job, which reads every compact completion batch through `terminal_jobs`.
+const RARE_TAG_TARGET: Duration = Duration::from_millis(250);
+
+async fn wal_lsn(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The first run, then the median of the next nine: the pool's connections
+/// plan a statement afresh for its first five runs, then reuse a generic
+/// plan, as a long-running admin server would.
+async fn cold_and_warm<F, Fut>(mut f: F) -> (Duration, Duration, usize)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
+    let mut runs = Vec::new();
+    let mut found = 0;
+    for _ in 0..10 {
+        let started = Instant::now();
+        found = f().await;
+        runs.push(started.elapsed());
+    }
+    let cold = runs[0];
+    let mut warm = runs.split_off(1);
+    warm.sort();
+    (cold, warm[warm.len() / 2], found)
+}
+
+#[tokio::test]
+#[ignore]
+async fn tag_filter_cost() {
+    let jobs: i64 = std::env::var("TAG_BENCH_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let queue = "tag_bench";
+    let backlog_queue = "tag_bench_backlog";
+
+    let returned = Arc::new(AtomicI64::new(0));
+    let handler_returned = returned.clone();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 64,
+                poll_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .register::<TagBench, _, _>(move |_args, _ctx| {
+            let returned = handler_returned.clone();
+            async move {
+                returned.fetch_add(1, Ordering::Relaxed);
+                Ok(JobResult::Completed)
+            }
+        })
+        .build()
+        .unwrap();
+
+    // Every third job is untagged: it keeps the compact completion path and
+    // must add nothing to the tag indexes.
+    let params: Vec<awa::InsertParams> = (0..jobs)
+        .map(|n| awa::InsertParams {
+            kind: TagBench::kind().into(),
+            args: json!({ "n": n }),
+            opts: awa::InsertOpts {
+                queue: queue.into(),
+                tags: if n % 3 == 2 {
+                    Vec::new()
+                } else {
+                    vec![format!("tenant:{}", n % TENANTS), format!("order:{n}")]
+                },
+                ..Default::default()
+            },
+        })
+        .collect();
+    let wal_start = wal_lsn(&pool).await;
+    for chunk in params.chunks(500) {
+        awa::insert_many(&pool, chunk).await.unwrap();
+    }
+    let started = Instant::now();
+    client.start().await.unwrap();
+    while returned.load(Ordering::Relaxed) < jobs {
+        assert!(
+            started.elapsed() < Duration::from_secs(900),
+            "drain stalled"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    client.shutdown(Duration::from_secs(30)).await;
+    let lifecycle_wal = (wal_lsn(&pool).await - wal_start) as f64 / jobs as f64;
+    let index_bytes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(pg_relation_size(c.oid)), 0)::bigint FROM pg_class c \
+         WHERE c.relkind = 'i' AND c.relname LIKE '%\\_tags\\_idx'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // An unclaimed backlog: available jobs are read per lane from its claim
+    // cursor, a different path from completed ones.
+    let backlog: Vec<awa::InsertParams> = (0..jobs)
+        .map(|n| awa::InsertParams {
+            kind: TagBench::kind().into(),
+            args: json!({ "n": n }),
+            opts: awa::InsertOpts {
+                queue: backlog_queue.into(),
+                tags: vec![format!("tenant:{}", n % TENANTS), format!("backlog:{n}")],
+                ..Default::default()
+            },
+        })
+        .collect();
+    for chunk in backlog.chunks(500) {
+        awa::insert_many(&pool, chunk).await.unwrap();
+    }
+
+    println!(
+        "\n{jobs} completed jobs, two thirds tagged; lifecycle WAL {lifecycle_wal:.0} B/job, \
+         tag indexes {:.0} B/job; then {jobs} tagged jobs left available",
+        index_bytes as f64 / jobs as f64
+    );
+    if std::env::var("TAG_BENCH_KEEP").is_ok() {
+        println!("kept database {}", db.name());
+        std::mem::forget(db);
+        return;
+    }
+    println!(
+        "{:<44} {:>10} {:>10} {:>8}",
+        "lookup", "cold", "warm", "rows"
+    );
+    let rare = format!("order:{}", jobs / 2 - (jobs / 2) % 3);
+    let mut rare_median = Duration::ZERO;
+    for (label, filter, limit) in [
+        ("find_jobs, no filter, limit 100", JobFilter::new(), 100),
+        (
+            "find_jobs, available only, limit 100",
+            JobFilter::new().state(awa::JobState::Available),
+            100,
+        ),
+        (
+            "find_jobs, kind, limit 100",
+            JobFilter::new().kind(TagBench::kind()),
+            100,
+        ),
+        (
+            "find_jobs, common tag, limit 100",
+            JobFilter::new().tag("tenant:7"),
+            100,
+        ),
+        (
+            "find_jobs, rare tag",
+            JobFilter::new().tag(rare.clone()),
+            20,
+        ),
+        (
+            "find_jobs, rare tag in available backlog",
+            JobFilter::new().tag(format!("backlog:{}", jobs / 2)),
+            20,
+        ),
+    ] {
+        let (cold, elapsed, rows) = cold_and_warm(|| {
+            let pool = pool.clone();
+            let filter = filter.clone();
+            async move {
+                admin::find_jobs(&pool, &filter, JobPage::first(limit))
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        })
+        .await;
+        println!(
+            "{label:<44} {:>8.1}ms {:>8.1}ms {rows:>8}",
+            cold.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e3
+        );
+        if label.contains("rare") {
+            assert_eq!(rows, 1, "{label}");
+            rare_median = rare_median.max(elapsed);
+        }
+    }
+    let (cold, elapsed, _) = cold_and_warm(|| {
+        let pool = pool.clone();
+        async move {
+            admin::count_jobs(&pool, &JobFilter::new().tag("tenant:7"))
+                .await
+                .unwrap()
+                .value() as usize
+        }
+    })
+    .await;
+    println!(
+        "{:<44} {:>8.1}ms {:>8.1}ms",
+        "count_jobs, common tag",
+        cold.as_secs_f64() * 1e3,
+        elapsed.as_secs_f64() * 1e3
+    );
+    assert!(
+        rare_median < RARE_TAG_TARGET,
+        "the slower warm rare-tag lookup took {rare_median:?}, over the {RARE_TAG_TARGET:?} target"
+    );
+}

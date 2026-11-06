@@ -4563,13 +4563,10 @@ async fn test_compact_batch_claims_are_visible_as_open() {
         "queue_overviews (list/UI surface, #416) must count compact-batch claims as running"
     );
 
-    let listed = admin::list_jobs(
+    let listed = admin::find_jobs(
         &pool,
-        &admin::ListJobsFilter {
-            state: Some(JobState::Running),
-            queue: Some(queue.to_string()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().state(JobState::Running).queue(queue),
+        awa::JobPage::default(),
     )
     .await
     .expect("admin::list_jobs under queue storage");
@@ -4645,13 +4642,10 @@ async fn test_compact_batch_claims_are_visible_as_open() {
          the running count (terminal supersession is closed evidence)"
     );
 
-    let relisted = admin::list_jobs(
+    let relisted = admin::find_jobs(
         &pool,
-        &admin::ListJobsFilter {
-            state: Some(JobState::Running),
-            queue: Some(queue.to_string()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().state(JobState::Running).queue(queue),
+        awa::JobPage::default(),
     )
     .await
     .expect("admin::list_jobs after seeding superseded row-local claim");
@@ -11447,26 +11441,20 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     assert_eq!(failed_kind.job_count, 1);
     assert_eq!(failed_kind.queue_count, 1);
 
-    let running_jobs = admin::list_jobs(
+    let running_jobs = admin::find_jobs(
         &pool,
-        &admin::ListJobsFilter {
-            state: Some(JobState::Running),
-            queue: Some(queue.to_string()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().state(JobState::Running).queue(queue),
+        awa::JobPage::default(),
     )
     .await
     .expect("Failed to list running queue_storage jobs");
     assert_eq!(running_jobs.len(), 1);
     assert_eq!(running_jobs[0].id, running_job_id);
 
-    let failed_jobs = admin::list_jobs(
+    let failed_jobs = admin::find_jobs(
         &pool,
-        &admin::ListJobsFilter {
-            state: Some(JobState::Failed),
-            queue: Some(queue.to_string()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().state(JobState::Failed).queue(queue),
+        awa::JobPage::default(),
     )
     .await
     .expect("Failed to list failed queue_storage jobs");
@@ -15692,10 +15680,22 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(outcome, PruneOutcome::Pruned { slot: 0, .. }),
-        "{outcome:?}"
-    );
+    // COMMIT releases relation locks individually. The waiting segment lock
+    // may wake prune before the reader releases its claim/ready locks, so its
+    // NOWAIT tail can validly report Blocked. After COMMIT has returned, one
+    // fresh pass must prune the same slot.
+    if matches!(outcome, PruneOutcome::Blocked { slot: 0 }) {
+        let retried = store.prune_oldest(&pool, Duration::ZERO).await.unwrap();
+        assert!(
+            matches!(retried, PruneOutcome::Pruned { slot: 0, .. }),
+            "prune after reader commit: {retried:?}"
+        );
+    } else {
+        assert!(
+            matches!(outcome, PruneOutcome::Pruned { slot: 0, .. }),
+            "{outcome:?}"
+        );
+    }
     assert_eq!(store.queue_counts(&pool, "q").await.unwrap().terminal, 1);
 }
 
@@ -16132,12 +16132,10 @@ async fn test_queue_storage_dlq_api_round_trip() {
         "dlq rows should not advertise the live-job retry action"
     );
 
-    let dlq_list = awa::model::dlq::list_dlq(
+    let dlq_list = awa::model::dlq::find_dlq(
         &pool,
-        &awa::model::ListDlqFilter {
-            queue: Some(queue.to_string()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().queue(queue),
+        awa::DlqPage::default(),
     )
     .await
     .expect("Failed to list dlq rows");
@@ -16224,13 +16222,13 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
     wait_for_failed_done_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
     wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
 
-    let empty_filter = awa::model::ListDlqFilter::default();
-    let retry_err = awa::model::dlq::bulk_retry_from_dlq(&pool, &empty_filter, false)
+    let empty_filter = awa::JobFilter::default();
+    let retry_err = awa::model::dlq::bulk_retry_from_dlq_matching(&pool, &empty_filter, false)
         .await
         .expect_err("bulk retry without scope should be rejected");
     assert!(matches!(retry_err, AwaError::Validation(_)));
 
-    let retried = awa::model::dlq::bulk_retry_from_dlq(&pool, &empty_filter, true)
+    let retried = awa::model::dlq::bulk_retry_from_dlq_matching(&pool, &empty_filter, true)
         .await
         .expect("Failed to bulk-retry DLQ rows");
     assert_eq!(retried, 1);
@@ -16308,13 +16306,13 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
 
     client.shutdown(Duration::from_secs(5)).await;
 
-    let empty_filter = awa::model::ListDlqFilter::default();
-    let purge_err = awa::model::dlq::purge_dlq(&pool, &empty_filter, false)
+    let empty_filter = awa::JobFilter::default();
+    let purge_err = awa::model::dlq::purge_dlq_matching(&pool, &empty_filter, false)
         .await
         .expect_err("purge without scope should be rejected");
     assert!(matches!(purge_err, AwaError::Validation(_)));
 
-    let purged = awa::model::dlq::purge_dlq(&pool, &empty_filter, true)
+    let purged = awa::model::dlq::purge_dlq_matching(&pool, &empty_filter, true)
         .await
         .expect("Failed to purge filtered DLQ rows");
     assert_eq!(purged, 1);
