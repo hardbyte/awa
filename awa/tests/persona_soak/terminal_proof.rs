@@ -115,13 +115,7 @@ pub async fn observe(shared: &Shared, pool: &PgPool) {
             id,
             || JobRecord::new(Persona::Chaos, u32::MAX, now, expect::ANY_TERMINAL, 0),
             |record| {
-                record.note_terminal(run_lease);
-                record.flags |= match state.as_str() {
-                    "completed" => flag::DB_SEEN_COMPLETED,
-                    "failed" => flag::DB_SEEN_FAILED,
-                    "cancelled" => flag::DB_SEEN_CANCELLED,
-                    _ => 0,
-                };
+                record.note_observed_terminal(run_lease, &state);
             },
         );
     }

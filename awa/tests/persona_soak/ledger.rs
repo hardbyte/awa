@@ -102,10 +102,27 @@ impl JobRecord {
     }
 
     pub fn note_terminal(&mut self, run_lease: i64) {
-        self.terminal_run_lease = Some(
-            self.terminal_run_lease
-                .map_or(run_lease, |old| old.max(run_lease)),
-        );
+        if self.terminal_run_lease.is_none_or(|old| run_lease > old) {
+            // DB outcome bits belong to the newest proven attempt. A later
+            // lifecycle proof also supersedes an older observed DB state.
+            self.flags &=
+                !(flag::DB_SEEN_COMPLETED | flag::DB_SEEN_FAILED | flag::DB_SEEN_CANCELLED);
+            self.terminal_run_lease = Some(run_lease);
+        }
+    }
+
+    pub fn note_observed_terminal(&mut self, run_lease: i64, state: &str) {
+        self.note_terminal(run_lease);
+        if self.terminal_run_lease == Some(run_lease) {
+            // The query is unordered: an older row can follow a newer proof.
+            // Different states at the same lease remain visible as a conflict.
+            self.flags |= match state {
+                "completed" => flag::DB_SEEN_COMPLETED,
+                "failed" => flag::DB_SEEN_FAILED,
+                "cancelled" => flag::DB_SEEN_CANCELLED,
+                _ => 0,
+            };
+        }
     }
 
     pub fn has_durable_terminal(&self) -> bool {

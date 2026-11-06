@@ -774,13 +774,7 @@ async fn tail_terminal_rows(shared: &Arc<Shared>, pool: &sqlx::PgPool, tick: &mu
                 )
             },
             |record| {
-                record.note_terminal(run_lease);
-                match state.as_str() {
-                    "completed" => record.flags |= flag::DB_SEEN_COMPLETED,
-                    "failed" => record.flags |= flag::DB_SEEN_FAILED,
-                    "cancelled" => record.flags |= flag::DB_SEEN_CANCELLED,
-                    _ => {}
-                }
+                record.note_observed_terminal(run_lease, &state);
             },
         );
     }

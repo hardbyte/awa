@@ -1,7 +1,7 @@
 //! The invariant oracle: periodic checks while the load runs and a final
 //! reconciliation of the client ledger against the database.
 
-use super::ledger::{expect, flag, samples_terminal_proof};
+use super::ledger::{expect, flag, samples_terminal_proof, JobRecord};
 use super::pgserver::PgWatch;
 use super::shared::Shared;
 use super::stop::Stop;
@@ -708,36 +708,33 @@ impl Oracle {
             sampled += i64::from(sampled_no_events);
             if record.has_durable_terminal() {
                 confirmed += i64::from(sampled_no_events);
-                let completed = record.completed_events > 0
-                    || record.has(flag::RETURNED_COMPLETED)
-                    || record.has(flag::DB_SEEN_COMPLETED);
-                if record.has(flag::DB_SEEN_CANCELLED)
-                    && record.expect & expect::CANCELLED == 0
-                    && !record.has(flag::HANDLER_CANCELLED)
-                    && unexpected.len() < MAX_ROWS
-                {
-                    unexpected.push(format!(
-                        "{{\"job_id\":{id},\"outcome\":\"cancelled\",\"allowed\":{}}}",
-                        record.expect
-                    ));
-                }
-                if completed
-                    && record.expect & expect::COMPLETED == 0
-                    && unexpected.len() < MAX_ROWS
-                {
-                    unexpected.push(format!(
-                        "{{\"job_id\":{id},\"outcome\":\"completed\",\"allowed\":{}}}",
-                        record.expect
-                    ));
-                }
-                if (record.exhausted_events > 0 || record.has(flag::DB_SEEN_FAILED))
-                    && record.expect & expect::FAILED == 0
-                    && unexpected.len() < MAX_ROWS
-                {
-                    unexpected.push(format!(
-                        "{{\"job_id\":{id},\"outcome\":\"failed\",\"allowed\":{}}}",
-                        record.expect
-                    ));
+                for outcome in unexpected_terminal_outcomes(record) {
+                    if unexpected.len() >= MAX_ROWS {
+                        break;
+                    }
+                    let queue = self.shared.queues.by_index(record.queue);
+                    unexpected.push(serde_json::json!({
+                        "job_id": id,
+                        "outcome": outcome,
+                        "allowed": record.expect,
+                        "persona": record.persona.name(),
+                        "queue": queue.as_ref().map(|queue| queue.name.chars().take(256).collect::<String>()),
+                        "flags": record.flags,
+                        "latest_run_lease": record.latest_run_lease,
+                        "terminal_run_lease": record.terminal_run_lease,
+                        "executions": record.executions,
+                        "in_flight": record.in_flight,
+                        "max_attempt": record.max_attempt,
+                        "completed_events": record.completed_events,
+                        "exhausted_events": record.exhausted_events,
+                        "cancel_events": record.cancel_events,
+                        "enqueued_ms": record.enqueued_ms,
+                        "first_start_ms": record.first_start_ms,
+                        "last_start_ms": record.last_start_ms,
+                        "completed_event_ms": record.completed_event_ms,
+                        "operator_cancel_ms": record.operator_cancel_ms,
+                        "queue_drained_at_ms": queue.map(|queue| queue.drained_at_ms.load(std::sync::atomic::Ordering::Relaxed)),
+                    }).to_string());
                 }
             } else if record.has(flag::NO_EVENTS)
                 && record.has(flag::RETURNED_COMPLETED)
@@ -989,6 +986,36 @@ impl Oracle {
     }
 }
 
+/// The final verdict's outcome predicates, shared by deterministic lease-order controls.
+fn unexpected_terminal_outcomes(record: &JobRecord) -> Vec<&'static str> {
+    if !record.has_durable_terminal() {
+        return Vec::new();
+    }
+    let completed = record.completed_events > 0
+        || record.has(flag::RETURNED_COMPLETED)
+        || record.has(flag::DB_SEEN_COMPLETED);
+    [
+        (
+            "cancelled",
+            record.has(flag::DB_SEEN_CANCELLED)
+                && record.expect & expect::CANCELLED == 0
+                && !record.has(flag::HANDLER_CANCELLED),
+        ),
+        (
+            "completed",
+            completed && record.expect & expect::COMPLETED == 0,
+        ),
+        (
+            "failed",
+            (record.exhausted_events > 0 || record.has(flag::DB_SEEN_FAILED))
+                && record.expect & expect::FAILED == 0,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(outcome, unexpected)| unexpected.then_some(outcome))
+    .collect()
+}
+
 fn count_is_idle(count: i64) -> bool {
     count <= 0
 }
@@ -998,9 +1025,70 @@ mod tests {
     use super::*;
     use crate::persona_soak::config::{replace_database_name, Persona, SoakConfig};
     use crate::persona_soak::db::{self, Budget};
-    use crate::persona_soak::ledger::JobRecord;
     use awa::model::{ClaimedRuntimeJob, QueueStorage, QueueStorageConfig};
     use std::sync::atomic::Ordering;
+
+    fn current_terminal_record() -> JobRecord {
+        let mut record = JobRecord::new(Persona::Tom, 0, 0, expect::COMPLETED, 0);
+        record.latest_run_lease = 1;
+        record
+    }
+
+    #[test]
+    fn terminal_state_old_cancel_then_new_completion_is_completed() {
+        let mut record = current_terminal_record();
+        record.note_observed_terminal(0, "cancelled");
+        record.note_observed_terminal(1, "completed");
+        assert!(unexpected_terminal_outcomes(&record).is_empty());
+        assert_eq!(record.terminal_run_lease, Some(1));
+        assert!(!record.has(flag::DB_SEEN_CANCELLED));
+        assert!(record.has(flag::DB_SEEN_COMPLETED));
+    }
+
+    #[test]
+    fn terminal_state_new_completion_then_old_cancel_is_completed() {
+        let mut record = current_terminal_record();
+        record.note_observed_terminal(1, "completed");
+        record.note_observed_terminal(0, "cancelled");
+        assert!(unexpected_terminal_outcomes(&record).is_empty());
+        assert!(!record.has(flag::DB_SEEN_CANCELLED));
+        assert!(record.has(flag::DB_SEEN_COMPLETED));
+    }
+
+    #[test]
+    fn terminal_state_lifecycle_completion_supersedes_old_db_cancel() {
+        let mut record = current_terminal_record();
+        record.note_observed_terminal(0, "cancelled");
+        record.note_terminal(1);
+        record.completed_events += 1;
+        assert!(unexpected_terminal_outcomes(&record).is_empty());
+        assert!(!record.has(flag::DB_SEEN_CANCELLED));
+        record.note_observed_terminal(0, "cancelled");
+        assert!(!record.has(flag::DB_SEEN_CANCELLED));
+        assert!(unexpected_terminal_outcomes(&record).is_empty());
+    }
+
+    #[test]
+    fn terminal_state_new_cancel_remains_an_unexpected_outcome() {
+        let mut record = current_terminal_record();
+        record.note_observed_terminal(0, "completed");
+        record.note_observed_terminal(1, "cancelled");
+        assert!(record.has(flag::DB_SEEN_CANCELLED));
+        assert_eq!(unexpected_terminal_outcomes(&record), vec!["cancelled"]);
+    }
+
+    #[test]
+    fn terminal_state_same_lease_conflicting_states_remain_visible() {
+        for states in [["cancelled", "completed"], ["completed", "cancelled"]] {
+            let mut record = current_terminal_record();
+            for state in states {
+                record.note_observed_terminal(1, state);
+            }
+            assert!(record.has(flag::DB_SEEN_CANCELLED));
+            assert!(record.has(flag::DB_SEEN_COMPLETED));
+            assert_eq!(unexpected_terminal_outcomes(&record), vec!["cancelled"]);
+        }
+    }
 
     struct TestRun {
         shared: Arc<Shared>,
