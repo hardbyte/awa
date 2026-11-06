@@ -6,10 +6,11 @@
 //! enqueue must take its lane locks in one canonical order: `(queue, priority,
 //! shard)` ascending, with queue names compared bytewise.
 //!
-//! The deadlock is driven deterministically: a gate lock stalls the
+//! The lane-order interleaving is driven deterministically: a gate lock stalls the
 //! `QueueStorage` batch between its first and second lane, a second producer
 //! with the lanes in the opposite input order is then observed waiting on the
 //! first lane's lock through `pg_locks`, and only then is the gate released.
+//! A reversed producer parks on the gate and fails the expected first-lane wait.
 //!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test enqueue_lane_lock_order_test -- --nocapture`
@@ -103,16 +104,7 @@ async fn reservation_lock_key(pool: &PgPool, queue: &str) -> i64 {
     .expect("derive reservation lock key")
 }
 
-/// Key of the advisory lock `QueueStorage` takes while it provisions a lane.
-async fn provisioning_lock_key(pool: &PgPool, queue: &str) -> i64 {
-    sqlx::query_scalar("SELECT hashtextextended($1, 0)")
-        .bind(format!("awa:{queue}:2:0"))
-        .fetch_one(pool)
-        .await
-        .expect("derive provisioning lock key")
-}
-
-async fn wait_for_advisory_waiter(pool: &PgPool, key: i64) {
+async fn wait_for_advisory_waiter(pool: &PgPool, key: i64, pid: i32) {
     let started = Instant::now();
     loop {
         let waiting: bool = sqlx::query_scalar(
@@ -124,10 +116,12 @@ async fn wait_for_advisory_waiter(pool: &PgPool, key: i64) {
                   AND NOT granted
                   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
                   AND ((classid::bigint << 32) | objid::bigint) = $1
+                  AND pid = $2
             )
             "#,
         )
         .bind(key)
+        .bind(pid)
         .fetch_one(pool)
         .await
         .expect("poll pg_locks");
@@ -136,7 +130,7 @@ async fn wait_for_advisory_waiter(pool: &PgPool, key: i64) {
         }
         assert!(
             started.elapsed() < WAIT_DEADLINE,
-            "no backend started waiting for advisory lock {key}"
+            "backend {pid} did not start waiting for advisory lock {key}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -164,21 +158,26 @@ async fn assert_producer_does_not_deadlock_with_queue_storage_batch(producer: Pr
     provision_lanes(&pool, &config, &[&first_queue, &second_queue]).await;
 
     let first_reservation = reservation_lock_key(&pool, &first_queue).await;
-    let second_provisioning = provisioning_lock_key(&pool, &second_queue).await;
+    let second_reservation = reservation_lock_key(&pool, &second_queue).await;
 
     // The gate stalls the QueueStorage batch after it has reserved its first
     // lane and before it reaches its second.
     let mut gate = pool.begin().await.expect("begin gate transaction");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(second_provisioning)
+        .bind(second_reservation)
         .execute(&mut *gate)
         .await
         .expect("take gate lock");
 
-    // A fresh store has an empty lane cache, so it provisions each lane under
-    // the lock the gate holds.
+    // Both folded and fallback enqueues reserve these pre-provisioned lanes.
+    // The folded path skips provisioning locks when their heads already exist.
+    let storage_pool = setup::pool(1).await;
+    let storage_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&storage_pool)
+        .await
+        .expect("storage backend PID");
     let storage_batch = {
-        let pool = pool.clone();
+        let pool = storage_pool.clone();
         let config = config.clone();
         let jobs = jobs_for(Producer::InsertMany, &[&first_queue, &second_queue]);
         tokio::spawn(async move {
@@ -186,7 +185,7 @@ async fn assert_producer_does_not_deadlock_with_queue_storage_batch(producer: Pr
             store.enqueue_params_batch(&pool, &jobs).await
         })
     };
-    wait_for_advisory_waiter(&pool, second_provisioning).await;
+    wait_for_advisory_waiter(&pool, second_reservation, storage_pid).await;
 
     // The competing producer lists the lanes in the opposite order, and so
     // reaches for the first lane's reservation lock, which the batch holds.
@@ -195,11 +194,16 @@ async fn assert_producer_does_not_deadlock_with_queue_storage_batch(producer: Pr
         .iter()
         .map(|params| params.opts.queue.clone())
         .collect();
+    let competing_pool = setup::pool(1).await;
+    let competing_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&competing_pool)
+        .await
+        .expect("competing backend PID");
     let competing = {
-        let pool = pool.clone();
+        let pool = competing_pool.clone();
         tokio::spawn(async move { producer.run(&pool, &competing_jobs).await })
     };
-    wait_for_advisory_waiter(&pool, first_reservation).await;
+    wait_for_advisory_waiter(&pool, first_reservation, competing_pid).await;
 
     gate.commit().await.expect("release gate");
 
@@ -215,6 +219,8 @@ async fn assert_producer_does_not_deadlock_with_queue_storage_batch(producer: Pr
     storage_result.expect("QueueStorage batch must not be chosen as a deadlock victim");
     let inserted =
         competing_result.expect("competing producer must not be chosen as a deadlock victim");
+    storage_pool.close().await;
+    competing_pool.close().await;
 
     // Lane ordering must not leak into the result: rows come back in input order.
     let returned_queues: Vec<String> = inserted.iter().map(|row| row.queue.clone()).collect();
