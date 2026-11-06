@@ -221,11 +221,11 @@ export function RuntimeInstancePage() {
         />
         <CardContent>
           {instance.queues.length === 0 ? (
-            <div className="rounded-lg border p-6 text-center text-sm text-muted-fg sm:hidden">
+            <div className="rounded-lg border p-6 text-center text-sm text-muted-fg lg:hidden">
               No queue snapshots recorded for this worker instance.
             </div>
           ) : (
-            <div className="space-y-3 sm:hidden">
+            <div className="space-y-3 lg:hidden">
               {instance.queues.map((queue) => (
                 <div key={queue.queue} className="rounded-lg border p-4">
                     <div className="flex items-center justify-between gap-3">
@@ -264,7 +264,7 @@ export function RuntimeInstancePage() {
             </div>
           )}
 
-          <Table bleed aria-label="Runtime queue assignments" className="hidden sm:table">
+          <Table bleed aria-label="Runtime queue assignments" className="hidden lg:block">
             <TableHeader>
               <TableColumn isRowHeader>Queue</TableColumn>
               <TableColumn>Mode</TableColumn>

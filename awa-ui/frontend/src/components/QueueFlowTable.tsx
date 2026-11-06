@@ -1,0 +1,504 @@
+import type { ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
+import type {
+  QueueHealthKind,
+  QueueRuntimeSummary,
+  QueueStats,
+} from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
+import { HistorySpark } from "@/components/HistorySpark";
+import {
+  capacityLabel,
+  formatCount,
+  formatDuration,
+  formatRate,
+  healthOf,
+  LIMITED_BY_HINT,
+  LIMITED_BY_LABEL,
+  type AssessedQueue,
+} from "@/lib/operations";
+
+export const HEALTH_BADGE: Record<
+  QueueHealthKind,
+  "danger" | "warning" | "info" | "secondary" | "outline"
+> = {
+  stalled: "danger",
+  behind: "warning",
+  slow: "warning",
+  paused: "secondary",
+  draining: "info",
+  unknown: "outline",
+  steady: "outline",
+  idle: "outline",
+};
+
+/** Text tint for the backlog sparkline, so the trend reads at a glance. */
+export const SPARK_TONE: Record<QueueHealthKind, string> = {
+  stalled: "text-danger",
+  behind: "text-warning",
+  slow: "text-warning",
+  paused: "text-muted-fg",
+  draining: "text-info",
+  unknown: "text-muted-fg",
+  steady: "text-muted-fg",
+  idle: "text-muted-fg",
+};
+
+function queueName(queue: QueueStats): string {
+  return queue.display_name?.trim() || queue.queue;
+}
+
+function JobsLink({
+  queue,
+  state,
+  value,
+  className = "",
+}: {
+  queue: string;
+  state: string;
+  value: number;
+  className?: string;
+}) {
+  return (
+    <Link
+      to="/jobs"
+      search={{ state, q: `queue:${queue}` }}
+      className={`tabular-nums hover:underline ${value === 0 ? "text-muted-fg" : className}`}
+    >
+      {value.toLocaleString()}
+    </Link>
+  );
+}
+
+function Capacity({ summary }: { summary: QueueRuntimeSummary | undefined }) {
+  if (summary && summary.live_instances === 0) {
+    return <span className="text-danger-subtle-fg">No live workers</span>;
+  }
+  const title = summary
+    ? `${summary.healthy_instances}/${summary.live_instances} live instances healthy${summary.config_mismatch ? " · config differs between instances" : ""}`
+    : "No runtime has reported this queue";
+  return (
+    <span
+      title={title}
+      className={summary?.config_mismatch ? "text-warning-subtle-fg" : ""}
+    >
+      {capacityLabel(summary)}
+    </span>
+  );
+}
+
+/**
+ * Rare conditions worth seeing without opening the queue. They sit by the
+ * name rather than in a column so they survive when narrow tables drop one.
+ */
+function QueueFlags({
+  queue,
+  summary,
+}: {
+  queue: QueueStats;
+  summary: QueueRuntimeSummary | undefined;
+}) {
+  return (
+    <>
+      {summary?.config_mismatch && (
+        <Badge
+          intent="warning"
+          className="ml-2"
+          title="Live instances run this queue with different settings"
+        >
+          Config mismatch
+        </Badge>
+      )}
+      {summary?.config?.dlq_enabled === false && (
+        <Badge
+          intent="secondary"
+          className="ml-2"
+          title="Exhausted jobs stay failed instead of moving to the dead-letter queue"
+        >
+          DLQ off
+        </Badge>
+      )}
+      {queue.descriptor_stale && (
+        <Badge
+          intent="warning"
+          className="ml-2"
+          title="No runtime has re-synced this descriptor recently"
+        >
+          Descriptor stale
+        </Badge>
+      )}
+      {queue.descriptor_mismatch && (
+        <Badge
+          intent="danger"
+          className="ml-2"
+          title="Live runtimes declare different descriptors for this queue"
+        >
+          Descriptor drift
+        </Badge>
+      )}
+    </>
+  );
+}
+
+function TrendText({ row }: { row: AssessedQueue }) {
+  const trend = row.assessment?.trend;
+  if (!trend) return <span className="text-muted-fg">—</span>;
+  // Below the noise threshold the fitted slope is batching jitter; printing
+  // "-0.6/min" would invite reading meaning into it.
+  const health = healthOf(row);
+  if (health === "steady" || health === "idle" || health === "paused") {
+    return <span className="text-muted-fg">flat</span>;
+  }
+  const clear = row.assessment?.clear_seconds ?? null;
+  return (
+    <span className="tabular-nums">
+      {formatRate(trend.per_minute, true)}
+      {clear !== null && (
+        <span className="text-muted-fg"> · ~{formatDuration(clear)}</span>
+      )}
+    </span>
+  );
+}
+
+function LimitedBy({ row }: { row: AssessedQueue }) {
+  const limited = row.assessment?.limited_by;
+  if (!limited) return <span className="text-muted-fg">—</span>;
+  const tone =
+    limited === "no_workers"
+      ? "text-danger-subtle-fg"
+      : limited === "rate_limit" || limited === "worker_capacity"
+        ? "text-warning-subtle-fg"
+        : "";
+  return (
+    <span className={tone} title={LIMITED_BY_HINT[limited]}>
+      {LIMITED_BY_LABEL[limited]}
+    </span>
+  );
+}
+
+/** Measured completions per minute over the last 5 minutes, or the last
+ * hour's average when the runtimes have not reported counters. */
+function DoneRate({ row }: { row: AssessedQueue }) {
+  const measured = row.assessment?.flow.completed_per_minute;
+  if (measured !== null && measured !== undefined) {
+    return (
+      <span className="tabular-nums" title="Measured over the last 5 minutes">
+        {formatCount(Math.round(measured))}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="tabular-nums text-muted-fg"
+      title="Average over the last hour; runtimes have not reported counters"
+    >
+      {formatCount(Math.round(row.queue.completed_last_hour / 60))}
+    </span>
+  );
+}
+
+/**
+ * One line per queue, ordered by the caller. Switches to stacked cards when
+ * its own container is narrow (not the viewport: the docked sidebar takes a
+ * fixed share of a tablet screen).
+ */
+export function QueueFlowTable({
+  rows,
+  controls,
+  runtime,
+  label,
+}: {
+  rows: ReadonlyArray<AssessedQueue>;
+  controls?: (queue: QueueStats) => ReactNode;
+  /** When given, adds a capacity column from live runtime config. */
+  runtime?: ReadonlyMap<string, QueueRuntimeSummary>;
+  label: string;
+}) {
+  return (
+    <div className="@container">
+      <div className="relative hidden overflow-x-auto @4xl:block">
+        <table className="w-full text-sm" aria-label={label}>
+          <thead>
+            <tr className="border-b text-left text-xs text-muted-fg [&>th]:px-2 [&>th]:py-2 [&>th]:font-medium [&>th]:whitespace-nowrap">
+              <th scope="col" className="pl-4">
+                Queue
+              </th>
+              <th scope="col">Status</th>
+              <th
+                scope="col"
+                className="text-right"
+                title="Claimable now; scheduled, retrying and callback-blocked jobs are not counted"
+              >
+                Waiting
+              </th>
+              <th scope="col">Last hour</th>
+              <th
+                scope="col"
+                className="text-right"
+                title="Fitted change in waiting jobs over the last 5 minutes"
+              >
+                Trend
+              </th>
+              <th scope="col" className="text-right">
+                Oldest wait
+              </th>
+              <th scope="col" className="text-right">
+                Running
+              </th>
+              <th scope="col" title="What is holding waiting work back">
+                Limited by
+              </th>
+              {runtime && (
+                <th scope="col" className="hidden @7xl:table-cell">
+                  Capacity
+                </th>
+              )}
+              <th scope="col" className="text-right">
+                Done/min
+              </th>
+              <th
+                scope="col"
+                className={controls ? "text-right" : "pr-4 text-right"}
+              >
+                Retrying / failed
+              </th>
+              {controls && (
+                <th scope="col" className="sticky right-0 bg-bg pr-4">
+                  <span className="sr-only">Controls</span>
+                </th>
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const { queue, assessment } = row;
+              const health = healthOf(row);
+              return (
+                <tr
+                  key={queue.queue}
+                  className="border-b last:border-b-0 hover:bg-muted/50 [&>td]:px-2 [&>td]:py-2 [&>td]:whitespace-nowrap"
+                >
+                  <th
+                    scope="row"
+                    className="max-w-64 truncate py-2 pr-2 pl-4 text-left font-medium"
+                  >
+                    <Link
+                      to="/queues/$name"
+                      params={{ name: queue.queue }}
+                      className="text-primary hover:underline"
+                      title={queue.description ?? queue.queue}
+                    >
+                      {queueName(queue)}
+                    </Link>
+                    {queue.display_name?.trim() && (
+                      <span className="ml-2 font-mono text-xs font-normal text-muted-fg">
+                        {queue.queue}
+                      </span>
+                    )}
+                    <QueueFlags
+                      queue={queue}
+                      summary={runtime?.get(queue.queue)}
+                    />
+                  </th>
+                  <td>
+                    <Badge
+                      intent={HEALTH_BADGE[health]}
+                      title={assessment?.reason}
+                    >
+                      {assessment?.label ?? "…"}
+                    </Badge>
+                  </td>
+                  <td className="text-right">
+                    <JobsLink
+                      queue={queue.queue}
+                      state="available"
+                      value={queue.available}
+                    />
+                  </td>
+                  <td className={SPARK_TONE[health]}>
+                    <HistorySpark
+                      data={row.series?.available ?? []}
+                      width={72}
+                      height={20}
+                      label={`${queueName(queue)} waiting jobs over the last hour`}
+                    />
+                  </td>
+                  <td className="text-right">
+                    <TrendText row={row} />
+                  </td>
+                  <td className="text-right tabular-nums">
+                    {queue.available > 0 ? (
+                      formatDuration(queue.lag_seconds)
+                    ) : (
+                      <span className="text-muted-fg">—</span>
+                    )}
+                  </td>
+                  <td className="text-right">
+                    <JobsLink
+                      queue={queue.queue}
+                      state="running"
+                      value={queue.running}
+                    />
+                  </td>
+                  <td>
+                    <LimitedBy row={row} />
+                  </td>
+                  {runtime && (
+                    <td className="hidden @7xl:table-cell">
+                      <Capacity summary={runtime.get(queue.queue)} />
+                    </td>
+                  )}
+                  <td className="text-right">
+                    <DoneRate row={row} />
+                  </td>
+                  <td className={controls ? "text-right" : "pr-4 text-right"}>
+                    <JobsLink
+                      queue={queue.queue}
+                      state="retryable"
+                      value={queue.retryable}
+                      className="text-warning-subtle-fg"
+                    />
+                    <span className="text-muted-fg" aria-hidden="true">
+                      {" "}
+                      /{" "}
+                    </span>
+                    <JobsLink
+                      queue={queue.queue}
+                      state="failed"
+                      value={queue.failed}
+                      className="text-danger-subtle-fg"
+                    />
+                  </td>
+                  {controls && (
+                    <td className="sticky right-0 bg-bg pr-4 text-right">
+                      {controls(queue)}
+                    </td>
+                  )}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <ul className="divide-y @4xl:hidden" aria-label={label}>
+        {rows.map((row) => {
+          const { queue, assessment } = row;
+          const health = healthOf(row);
+          return (
+            <li key={queue.queue} className="space-y-2 px-4 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <Link
+                    to="/queues/$name"
+                    params={{ name: queue.queue }}
+                    className="block truncate font-medium text-primary hover:underline"
+                  >
+                    {queueName(queue)}
+                  </Link>
+                  <p className="text-xs text-muted-fg">{assessment?.reason}</p>
+                  {(queue.descriptor_stale || queue.descriptor_mismatch) && (
+                    <div className="mt-1 -ml-2">
+                      <QueueFlags
+                        queue={queue}
+                        summary={runtime?.get(queue.queue)}
+                      />
+                    </div>
+                  )}
+                </div>
+                <Badge intent={HEALTH_BADGE[health]} className="shrink-0">
+                  {assessment?.label ?? "…"}
+                </Badge>
+              </div>
+              <div className={`flex items-center gap-3 ${SPARK_TONE[health]}`}>
+                <HistorySpark
+                  data={row.series?.available ?? []}
+                  width={160}
+                  height={24}
+                  label={`${queueName(queue)} waiting jobs over the last hour`}
+                  className="shrink-0"
+                />
+                <span className="text-xs text-fg">
+                  <TrendText row={row} />
+                </span>
+              </div>
+              <dl className="grid grid-cols-3 gap-x-3 gap-y-1 text-xs [&_dd]:text-sm [&_dd]:tabular-nums [&_dt]:text-muted-fg">
+                <div>
+                  <dt>Waiting</dt>
+                  <dd>
+                    <JobsLink
+                      queue={queue.queue}
+                      state="available"
+                      value={queue.available}
+                    />
+                  </dd>
+                </div>
+                <div>
+                  <dt>Oldest wait</dt>
+                  <dd>
+                    {queue.available > 0
+                      ? formatDuration(queue.lag_seconds)
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Running</dt>
+                  <dd>
+                    <JobsLink
+                      queue={queue.queue}
+                      state="running"
+                      value={queue.running}
+                    />
+                  </dd>
+                </div>
+                <div>
+                  <dt>Done/min</dt>
+                  <dd>
+                    <DoneRate row={row} />
+                  </dd>
+                </div>
+                <div>
+                  <dt>Retrying</dt>
+                  <dd>
+                    <JobsLink
+                      queue={queue.queue}
+                      state="retryable"
+                      value={queue.retryable}
+                      className="text-warning-subtle-fg"
+                    />
+                  </dd>
+                </div>
+                <div>
+                  <dt>Failed</dt>
+                  <dd>
+                    <JobsLink
+                      queue={queue.queue}
+                      state="failed"
+                      value={queue.failed}
+                      className="text-danger-subtle-fg"
+                    />
+                  </dd>
+                </div>
+                <div className="col-span-3">
+                  <dt>Limited by</dt>
+                  <dd>
+                    <LimitedBy row={row} />
+                  </dd>
+                </div>
+                {runtime && (
+                  <div className="col-span-3">
+                    <dt>Capacity</dt>
+                    <dd>
+                      <Capacity summary={runtime.get(queue.queue)} />
+                    </dd>
+                  </div>
+                )}
+              </dl>
+              {controls && <div>{controls(queue)}</div>}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}

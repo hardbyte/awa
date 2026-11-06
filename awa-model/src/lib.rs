@@ -14,6 +14,7 @@ pub mod kind;
 pub mod migrations;
 pub mod output;
 pub mod partitioned_queue;
+pub mod queue_history;
 pub mod queue_storage;
 pub mod reschedule;
 pub mod storage;
@@ -45,7 +46,8 @@ pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder
 pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::{map_sqlx_error, AwaError};
 pub use insert::{
-    insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_prepared, insert_with,
+    insert, insert_many, insert_many_copy, insert_many_copy_from_pool,
+    insert_many_skip_unique_conflicts, insert_prepared, insert_with,
 };
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
 pub use output::{AttemptError, JobOutput, OutputDescriptor, OutputError, MAX_OUTPUT_BYTES};

@@ -16,7 +16,9 @@ pub mod maintenance;
 pub mod metrics;
 mod notify_hub;
 mod output;
+mod queue_counters;
 mod runtime;
+mod statistics;
 mod storage;
 
 // Re-exports

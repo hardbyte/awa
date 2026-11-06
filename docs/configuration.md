@@ -504,10 +504,12 @@ DLQ rows are different: `dlq_entries` is a separate hold table and the maintenan
 | `failed_retention` | `72h` | Both engines: a non-DLQ `failed` terminal row stays retryable for at least this long past failure. Canonical enforces it by leaving recent failed rows in place; queue storage enforces it by carry-forward at prune time. Does not apply to `cancelled` rows or to the DLQ. |
 | `dlq_retention` | `30d` | How long DLQ rows stay in `dlq_entries` before bounded cleanup deletes them. |
 | `descriptor_retention` | `30d` | How long stale queue/kind descriptor catalog rows survive. |
+| `queue_history_retention` | `48h` | How long the leader keeps per-minute queue and fleet history for the admin UI (Python: `queue_history_retention_hours`). Zero stops sampling; existing rows are left in place. |
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
 | `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
 | `ClientBuilder::terminal_count_rollup_interval` (Rust) / `terminal_count_rollup_interval_ms` (Python kwarg) | `30s` | Queue storage only: how often maintenance folds pending `done_entries` terminal-count deltas for sealed queue slots into compact live counters. Exact reads include pending deltas and retained compact receipt batches, so this affects compaction/WAL pressure rather than correctness. |
+| `ClientBuilder::statistics_refresh_interval` (Rust) / `statistics_refresh_interval_ms` (Python kwarg) | `5m` | Queue storage only: how often the maintenance leader runs `ANALYZE` on the two head tables and the partitioned ring parents, which autovacuum never analyses; also run once when a runtime becomes leader. `0` disables it. See [Planner statistics](#planner-statistics). |
 
 ## Queue storage tuning
 
@@ -521,6 +523,8 @@ Direct-copy producers must use the same queue-storage routing config as the work
 
 `insert_many_copy()` is the compatibility insert API. It is still useful when a caller needs the canonical insert surface, but in queue-storage mode it routes through the compatibility function rather than being the primary producer fast path.
 
+The Rust compatibility inserts differ in how they treat a unique-key conflict. `insert_many` fails the whole batch with a unique violation (SQLSTATE `23505`). `insert_many_skip_unique_conflicts` inserts the rest of the batch and returns only the rows it inserted, in input order, so a producer that replays work does not have to insert the batch again one job at a time (each of those inserts takes the lane lock separately, which on a busy lane is slower than the batch itself). `insert_many_copy` also skips conflicting jobs, and is what Python's `insert_many_copy()` calls; Python has no separate skip function because that is already its behaviour. `insert_many_skip_unique_conflicts` needs migration v055. `insert_many_copy` probes its own connection on every call and uses `awa.insert_jobs_compat_batch` when installed, otherwise the per-row function. Generic `insert_many` always uses the per-row function in one statement, so a process can write to databases at different migration levels without assuming they share a schema.
+
 ### Terminal count rollup
 
 Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. `done_entries` terminal inserts append positive rows to `queue_terminal_count_deltas_*`; retry, discard, DLQ move, and compatibility delete of `done_entries` rows append negative rows. Compact receipt completions do not write count deltas: exact count reads add retained `receipt_completion_batches_*` counts and subtract retained `receipt_completion_tombstones_*`.
@@ -530,6 +534,16 @@ A queue slot is one partition in queue storage's rotating ready/done ring. A sea
 The maintenance leader folds pending `done_entries` deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Rollup is MVCC-horizon aware: if another backend is holding a visible snapshot open, or is idle in a transaction with an assigned transaction id, maintenance leaves pending delta rows append-only and tries again on a later tick. Exact counts remain correct because they read folded counters, pending deltas, retained compact batches, compact tombstones, and permanent rollups.
 
 Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the `done_entries` delta ledger is growing faster than maintenance drains it. Under long reader transactions, lowering the interval does not force rollup; the useful fix is to release the pinned snapshot or let queue prune reclaim the whole sealed segment. Compact receipt successes are already retained as compact batch rows, so this interval does not change their hot-path write count.
+
+### Planner statistics
+
+Autovacuum does not analyse partitioned tables, so the ring parents (`ready_entries`, `done_entries`, `leases`, and the other ten partitioned tables of the schema) have no inherited statistics. It also never reaches its analyze threshold on `queue_claim_heads` and `queue_enqueue_heads`, which hold a few rows per lane, so the planner prices joins against them at its defaults. Admin and metrics queries that join retained ready rows to the heads tables then pick plans for a few hundred rows while reading hundreds of thousands.
+
+The maintenance leader runs `ANALYZE` on both when it is elected and every `statistics_refresh_interval` (default `5m`). One pass takes well under a second on a small ring and a few seconds on a ring with millions of retained rows. It has no measurable effect on claim or completion throughput.
+
+- **Locks.** Each relation is analysed in its own transaction with a 2 s `lock_timeout` and a 120 s `statement_timeout`. `SKIP_LOCKED` skips a child that ring prune holds during the per-child analysis, but sampling for the parent's statistics waits for it up to the `lock_timeout`; a call that times out is recorded as `skipped_lock` and retried on the next interval. Prune never waits for the refresh: its own 10 ms lock timeout applies, so an attempt that lands while `ANALYZE` samples the oldest slot's tables returns `blocked` and retries on its usual backoff. `ANALYZE` of a partitioned table samples every child, so that window cannot be avoided.
+- **Privileges.** The refresh calls `awa.analyze_queue_storage_relation(schema, relation)`, a `SECURITY DEFINER` function installed by migration v054. The runtime needs EXECUTE on the helper, and the login role needs INSERT, UPDATE and DELETE on the target schema's `queue_claim_heads`; the migration grants EXECUTE to existing runtime grantees. A missing helper or caller privilege skips the pass before making calls and logs one warning. Run `awa migrate` for a missing helper; restore the grants as the schema owner for `skipped_privilege`. If the helper owner may not analyse the tables, transfer the function to the table owner or grant its owner `MAINTAIN` on PostgreSQL 17+. See the [database roles guide](security/database-roles.md) for the ownership command.
+- **Metrics.** `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`, by `awa.analyze.scope` (`heads`, `ring_parent`, `pass`) and `awa.analyze.outcome` (`ok`, `skipped_privilege`, `skipped_lock`, `unavailable`, `failed`). A sustained `skipped_lock` rate means something else holds the tables; any `skipped_privilege` or `unavailable` means the refresh is not running.
 
 ### Rust
 
@@ -782,6 +796,39 @@ When a browser closes a tab or a proxy times out, the server drops the request, 
 The cache deduplicates repeated poll requests — multiple browser tabs or rapid refresh cycles within the TTL window hit memory rather than the database. The frontend polling interval is derived from the cache TTL (minimum 5s) and served via `/api/capabilities`, so clients automatically back off to match the server's refresh rate.
 
 If you're connecting to a read replica, increase `--cache-ttl` to reduce load. The dashboard will feel slightly less real-time but won't overwhelm the replica.
+
+### Queue history
+
+The overview judges whether each queue is keeping up from how its waiting
+(available) job count moves, which a single snapshot cannot show. The
+maintenance leader records it: once a minute it writes a row per queue to
+`awa.queue_history` and a fleet row to `awa.fleet_history` (schema v058). Each
+sample costs one queue overview read (the query behind the Queues page) and
+one insert per queue, issued by the leader only, beside the maintenance loop
+so a slow read cannot delay rescue or promotion.
+
+Claim, completion and failure rates come from per-queue counters each runtime
+publishes with its snapshot. The leader differences consecutive readings, so
+a minute's counts are unknown (shown as gaps, never as zero) after a leader
+change, for runtimes older than these counters, for a runtime it first
+sees that started earlier, and when a sample lands well off the minute (more
+than 15 seconds early or late). Completion, failure and retry counts are also
+unknown for a minute in which a callback could have resolved one of the
+queue's jobs (a job parked for a callback during it, or was already waiting
+at its start), because callbacks resolve in whichever process receives them;
+the UI then shows the hourly completion average instead. A runtime that dies
+between samples contributes its final published counters once; only its
+unpublished snapshot tail is lost. If a participating runtime disappears
+without a final reading, the affected interval is unknown, even when no
+workers remain live. The overview also keeps receiver-only callback outcome
+rates unknown and uses its documented hourly fallback.
+
+`awa serve` reads the tables, so every UI replica shows the same history and
+history survives UI restarts. On a schema before v058, or until a current
+leader has sampled, the overview says so and detects only stalls and long
+waits. `GET /api/health/queues` serves the same verdicts as JSON; add
+`?fail_on=critical` (or `warning`) to get a 503 at that level from a plain
+HTTP check.
 
 ### Read-only mode
 

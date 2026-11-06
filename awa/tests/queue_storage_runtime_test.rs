@@ -15632,6 +15632,181 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
     );
 }
 
+/// The prune `lock_timeout` covers every statement after it is set, not
+/// only the `LOCK TABLE` on the slot's children. A statement that waits on
+/// another table's lock — here the failed-row carry, its count deltas, the
+/// rollup delta append and the live-counter cleanup — must roll the whole prune back
+/// and report `Blocked`, leaving the slot to the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_lock_timeout_after_child_locks_reports_blocked() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_late_lock_timeout";
+    let schema = "awa_qs_prune_late_lock_timeout";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue completed job");
+    let claimed = store
+        .claim_batch(&pool, queue, 1)
+        .await
+        .expect("claim completed job");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete job");
+
+    let failed_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim failing job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    store
+        .fail_terminal(&pool, failed_job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail job")
+        .expect("running job should fail");
+
+    let rotated = store.rotate(&pool).await.expect("rotate");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let retention = Duration::from_secs(3600);
+    for held in [
+        format!("{schema}.done_entries_1"),
+        format!("{schema}.queue_terminal_count_deltas_1"),
+        format!("{schema}.queue_terminal_rollup_deltas"),
+        format!("{schema}.queue_terminal_live_counts"),
+    ] {
+        let mut holder = pool.begin().await.expect("begin lock holder");
+        sqlx::query(audited_sql(format!("LOCK TABLE {held} IN SHARE MODE")))
+            .execute(holder.as_mut())
+            .await
+            .expect("hold share lock");
+
+        let outcome = store.prune_oldest(&pool, retention).await;
+        assert!(
+            matches!(outcome, Ok(PruneOutcome::Blocked { slot: 0 })),
+            "prune waiting on {held} should report Blocked, got {outcome:?}"
+        );
+
+        holder.rollback().await.expect("release share lock");
+
+        assert_eq!(
+            done_entries_count(&pool, schema, queue).await,
+            2,
+            "blocked prune on {held} must not truncate or carry rows"
+        );
+        let rollup_rows: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*)::bigint FROM {schema}.queue_terminal_rollup_deltas"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("count rollups");
+        assert_eq!(
+            rollup_rows, 0,
+            "blocked prune on {held} must not fold rollups"
+        );
+        assert_invariant_holds(
+            &pool,
+            schema,
+            queue,
+            &format!("after prune blocked on {held}"),
+        )
+        .await;
+    }
+
+    let pruned = store
+        .prune_oldest(&pool, retention)
+        .await
+        .expect("prune after locks released");
+    assert!(
+        matches!(
+            pruned,
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 1,
+                ..
+            }
+        ),
+        "unexpected prune outcome after locks released: {pruned:?}"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after prune").await;
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.terminal, 2, "rollup (1) + carried live row (1)");
+}
+
+/// Terminal-delta rollup shares prune's lock timeout. A timeout on the
+/// live-counter fold, after the delta child is locked, must report a blocked
+/// slot rather than fail the rollup pass, and the pass stops there instead of
+/// waiting out the same timeout on every remaining slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_reports_blocked() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_late_lock";
+    let schema = "awa_qs_terminal_delta_rollup_late_lock";
+    let store = create_store(&pool, schema).await;
+
+    for _ in 0..2 {
+        store
+            .enqueue_batch(&pool, queue, 1, 3)
+            .await
+            .expect("enqueue");
+        let claimed = store.claim_batch(&pool, queue, 3).await.expect("claim");
+        store
+            .complete_batch(&pool, &claimed)
+            .await
+            .expect("complete");
+        match store.rotate(&pool).await.expect("rotate") {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("expected Rotated, got {other:?}"),
+        }
+    }
+
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.queue_terminal_live_counts IN SHARE MODE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold share lock");
+
+    let outcome = store.rollup_terminal_count_deltas(&pool, 4).await;
+    holder.rollback().await.expect("release share lock");
+    let outcome = outcome.expect("rollup waiting on live counts should not error");
+    assert_eq!(outcome.rolled_slots, 0);
+    assert_eq!(
+        outcome.blocked_slots, 1,
+        "the pass stops at the first blocked slot"
+    );
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup after lock released");
+    assert_eq!(outcome.rolled_slots, 2);
+    assert_eq!(outcome.blocked_slots, 0);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let (_db_guard, pool) = setup_pool(8).await;
@@ -17371,10 +17546,25 @@ async fn test_priority_aging_off_does_not_stamp_original() {
 /// helper's comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
+    check_ensure_lane_cache_recovers_after_rollback("awa_qs_ensure_lane_rollback", false).await;
+}
+
+/// The multi-statement path is the one that fills the Rust lane cache, so
+/// the recovery must also hold when the function is not used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback_without_function() {
+    check_ensure_lane_cache_recovers_after_rollback("awa_qs_ensure_lane_rollback_nf", true).await;
+}
+
+async fn check_ensure_lane_cache_recovers_after_rollback(schema: &str, without_function: bool) {
     let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_ensure_lane_rollback";
-    let schema = "awa_qs_ensure_lane_rollback";
     let store = create_store(&pool, schema).await;
+    let store = if without_function {
+        store.without_enqueue_function()
+    } else {
+        store
+    };
 
     // Simulate the rolled-back ensure_lane: run the three lane
     // inserts in a transaction that we explicitly roll back. After
@@ -18365,6 +18555,211 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_aged_receipt_claims() {
+    jobs_compat_view_reports_aged_claims(CompatClaimMode::Batch).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_aged_materialized_leases() {
+    jobs_compat_view_reports_aged_claims(CompatClaimMode::Materialized).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_aged_row_local_claims() {
+    jobs_compat_view_reports_aged_claims(CompatClaimMode::RowLocal).await;
+}
+
+enum CompatClaimMode {
+    Batch,
+    RowLocal,
+    Materialized,
+}
+
+async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_compat_aged_running";
+    let schema = "awa_qs_compat_aged_running";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: !matches!(mode, CompatClaimMode::Materialized),
+            ..Default::default()
+        },
+    )
+    .await;
+    let args = serde_json::json!({ "id": 901 });
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 901 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    // Reprioritization retains the old ready row, tombstoned, with the same
+    // job and attempt identity. It must not become another running result.
+    assert!(store.set_priority(&pool, job_id, 3).await.unwrap());
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim reprioritized job with aging");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert_eq!(claimed[0].job.priority, 1);
+    assert_eq!(claimed[0].claim.priority, 3);
+
+    if matches!(mode, CompatClaimMode::RowLocal) {
+        // Represent the real claim in the legacy row-local receipt format.
+        // Keep its identity, attempt, claim time and deadline unchanged.
+        let converted = sqlx::query(audited_sql(format!(
+            r#"
+            WITH batches AS (
+                DELETE FROM {schema}.lease_claim_batches
+                WHERE queue = $1
+                RETURNING *
+            )
+            INSERT INTO {schema}.lease_claims (
+                claim_slot, receipt_id, job_id, run_lease, ready_slot,
+                ready_generation, queue, priority, attempt, max_attempts,
+                lane_seq, enqueue_shard, claimed_at, deadline_at
+            )
+            SELECT batches.claim_slot, items.receipt_id, items.job_id,
+                   items.run_lease, batches.ready_slot, batches.ready_generation,
+                   batches.queue, batches.priority, items.attempt,
+                   items.max_attempts, items.lane_seq, batches.enqueue_shard,
+                   batches.claimed_at, batches.deadline_at
+            FROM batches
+            CROSS JOIN LATERAL unnest(
+                batches.job_ids, batches.run_leases, batches.receipt_ids,
+                batches.lane_seqs, batches.attempts, batches.max_attempts
+            ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+            "#
+        )))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("convert the claim to the row-local receipt format");
+        assert_eq!(converted.rows_affected(), 1);
+    }
+
+    type Projection = (i64, String, i64, i16, serde_json::Value, i16);
+    async fn read_projection(pool: &sqlx::PgPool, job_id: i64) -> Vec<Projection> {
+        sqlx::query_as(
+            "SELECT id, state::text, run_lease, attempt, args, priority \
+             FROM awa.jobs WHERE id = $1 ORDER BY run_lease",
+        )
+        .bind(job_id)
+        .fetch_all(pool)
+        .await
+        .expect("read aged job from SQL compatibility view")
+    }
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "running".to_string(),
+            claimed[0].job.run_lease,
+            claimed[0].job.attempt,
+            args.clone(),
+            claimed[0].job.priority,
+        )],
+        "aging must not hide a live claim or duplicate a tombstoned ready row"
+    );
+
+    let retried = store
+        .retry_after(
+            &pool,
+            job_id,
+            claimed[0].job.run_lease,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .expect("retry aged claim")
+        .expect("current attempt must be retryable");
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "retryable".to_string(),
+            claimed[0].job.run_lease,
+            claimed[0].job.attempt,
+            args.clone(),
+            retried.priority,
+        )],
+        "closed receipts must not remain visible as running"
+    );
+    assert_eq!(
+        store
+            .promote_due(&pool, JobState::Retryable, 1)
+            .await
+            .expect("promote retried job"),
+        1
+    );
+    let reclaimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim the next attempt");
+    assert_eq!(reclaimed.len(), 1);
+    assert!(reclaimed[0].job.run_lease > claimed[0].job.run_lease);
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "running".to_string(),
+            reclaimed[0].job.run_lease,
+            reclaimed[0].job.attempt,
+            args.clone(),
+            reclaimed[0].job.priority,
+        )],
+        "retained ready rows from older attempts must not duplicate the current one"
+    );
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &reclaimed)
+            .await
+            .expect("complete current attempt"),
+        vec![(job_id, reclaimed[0].job.run_lease)]
+    );
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "completed".to_string(),
+            reclaimed[0].job.run_lease,
+            reclaimed[0].job.attempt,
+            args,
+            reclaimed[0].job.priority,
+        )],
+        "completed attempts must not also remain visible as running"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
     cursor_advance_requires_claim_evidence(true).await;
 }
@@ -18681,6 +19076,66 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
         "stale completion cannot create another disposition"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// A NULL count would return a start without advancing the lane sequence,
+/// handing the same range to the next caller.
+#[tokio::test]
+async fn test_reserve_enqueue_seq_rejects_a_null_count() {
+    let (_db_guard, pool) = setup_pool(2).await;
+    let schema = "awa_qs_reserve_null_count";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let error = sqlx::query(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq('q', 1::smallint, 0::smallint, NULL::bigint)"
+    )))
+    .execute(&pool)
+    .await
+    .expect_err("a NULL count must be rejected");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("22004")
+    );
+    pool.close().await;
+}
+
+/// A store that has seen enqueue_ready_rows must not keep calling it once it
+/// is gone: the failed SQL call forgets the observation, and the same enqueue
+/// rolls back and takes the multi-statement path once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_enqueue_falls_back_after_the_enqueue_function_disappears() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_enqueue_function_vanishes";
+    let store = create_store(&pool, schema).await;
+    assert_eq!(store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(), 1);
+
+    let signature: String = sqlx::query_scalar(audited_sql(format!(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+         WHERE pronamespace = '{schema}'::regnamespace AND proname = 'enqueue_ready_rows'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!("DROP FUNCTION {signature}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(),
+        1,
+        "the same call falls back when the cached function disappears"
+    );
+    assert_eq!(
+        store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(),
+        1,
+        "the next enqueue probes again and uses the multi-statement path"
+    );
+    assert_eq!(store.queue_counts(&pool, "q").await.unwrap().available, 3);
     pool.close().await;
 }
 
@@ -21092,4 +21547,398 @@ async fn test_queue_storage_legacy_row_claims_are_locked_before_the_heartbeat_st
         .await
         .expect("join heartbeat")
         .expect("heartbeat after the rewrite");
+}
+
+fn fold_test_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    }
+}
+
+fn fold_test_jobs(
+    queue: &str,
+    ids: std::ops::RangeInclusive<i64>,
+) -> Vec<awa::model::InsertParams> {
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        ..Default::default()
+    };
+    ids.map(|id| insert::params_with(&DlqJob { id }, opts.clone()).expect("Failed to prepare job"))
+        .collect()
+}
+
+/// A runtime that enqueues through `enqueue_ready_rows` and one that uses the
+/// multi-statement path (as a binary without the function does) interleave
+/// on one lane: the lane stays gap-free and FIFO, each call writes its own
+/// segment, and a store on a schema without the function falls back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_function_and_fallback_share_one_lane() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_function_lane";
+    let schema = "awa_qs_enqueue_function_lane";
+    let store = create_store_with_config(&pool, fold_test_config(schema)).await;
+    let fallback = QueueStorage::new(fold_test_config(schema))
+        .expect("Failed to create fallback store")
+        .without_enqueue_function();
+
+    let mut next_id = 1_i64;
+    for (through_function, batch_size) in [(true, 3), (false, 1), (true, 1), (false, 4), (true, 2)]
+    {
+        let jobs = fold_test_jobs(queue, next_id..=next_id + batch_size - 1);
+        next_id += batch_size;
+        let writer = if through_function { &store } else { &fallback };
+        let inserted = writer
+            .enqueue_params_copy(&pool, &jobs)
+            .await
+            .expect("Failed to enqueue");
+        assert_eq!(inserted, batch_size as usize);
+    }
+
+    let rows: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT lane_seq, (args->>'id')::bigint FROM {schema}.ready_entries \
+         WHERE queue = $1 ORDER BY lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read ready rows");
+    assert_eq!(rows, (1..=11).map(|seq| (seq, seq)).collect::<Vec<_>>());
+
+    let segments: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT first_lane_seq, next_lane_seq FROM {schema}.ready_segments \
+         WHERE queue = $1 ORDER BY first_lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read ready segments");
+    assert_eq!(segments, vec![(1, 4), (4, 5), (5, 6), (6, 10), (10, 12)]);
+
+    let distinct_job_ids: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(DISTINCT job_id) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count job ids");
+    assert_eq!(distinct_job_ids, 11);
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 11, Duration::ZERO)
+        .await
+        .expect("Failed to claim");
+    let claimed_lane_seqs: Vec<i64> = claimed.iter().map(|job| job.claim.lane_seq).collect();
+    assert_eq!(claimed_lane_seqs, (1..=11).collect::<Vec<_>>());
+
+    sqlx::query(audited_sql(format!(
+        "DROP FUNCTION {schema}.enqueue_ready_rows(text[], smallint[], smallint[], bigint[], \
+         bigint[], text[], jsonb[], smallint[], bigint[], smallint[], timestamptz[], \
+         timestamptz[], timestamptz[], bytea[], text[], jsonb[], integer[], bigint[], bigint[], \
+         timestamptz[], text[])"
+    )))
+    .execute(&pool)
+    .await
+    .expect("Failed to drop enqueue function");
+    let older_schema_store =
+        QueueStorage::new(fold_test_config(schema)).expect("Failed to create store");
+    older_schema_store
+        .enqueue_params_copy(&pool, &fold_test_jobs(queue, 12..=13))
+        .await
+        .expect("Failed to enqueue without the function");
+    let last_lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT max(lane_seq) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read last lane sequence");
+    assert_eq!(last_lane_seq, 13);
+}
+
+/// The one-statement enqueue takes the same per-lane reservation lock as
+/// `reserve_enqueue_seq`, so it cannot publish past an open reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_function_waits_for_open_lane_reservation() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_function_waits";
+    let schema = "awa_qs_enqueue_function_waits";
+    let store = Arc::new(create_store_with_config(&pool, fold_test_config(schema)).await);
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare lane");
+
+    let mut reservation = pool.begin().await.expect("Failed to begin reservation");
+    let reserved: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+    )))
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(2_i64)
+    .fetch_one(reservation.as_mut())
+    .await
+    .expect("Failed to reserve");
+    assert_eq!(reserved, 1);
+
+    let enqueue_pool = pool.clone();
+    let enqueue_store = Arc::clone(&store);
+    let jobs = fold_test_jobs(queue, 1..=1);
+    let enqueue = tokio::spawn(async move {
+        enqueue_store
+            .enqueue_params_copy(&enqueue_pool, &jobs)
+            .await
+    });
+    wait_for_lock_wait(&pool, "advisory").await;
+    let visible: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready rows");
+    assert_eq!(visible, 0);
+
+    reservation
+        .rollback()
+        .await
+        .expect("Failed to release reservation");
+    tokio::time::timeout(Duration::from_secs(5), enqueue)
+        .await
+        .expect("Enqueue remained blocked")
+        .expect("Enqueue task panicked")
+        .expect("Enqueue failed");
+    let lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT lane_seq FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read lane sequence");
+    assert_eq!(lane_seq, 3, "the rolled-back reservation leaves a gap");
+}
+
+/// A lane row without a sequence name (written before the head trigger
+/// existed) is provisioned on its first reservation; reservations of one and
+/// of several rows stay contiguous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_reserve_names_unnamed_lane_and_stays_contiguous() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_reserve_unnamed_lane";
+    let schema = "awa_qs_reserve_unnamed_lane";
+    let store = create_store_with_config(&pool, fold_test_config(schema)).await;
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare lane");
+
+    let reserve = |count: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+            )))
+            .bind(queue)
+            .bind(2_i16)
+            .bind(0_i16)
+            .bind(count)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to reserve")
+        }
+    };
+    assert_eq!(reserve(1).await, 1);
+    assert_eq!(reserve(3).await, 2);
+
+    let ensure_calls_in_reserve = || {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.expect("Failed to begin");
+            sqlx::query("SET LOCAL track_functions = 'pl'")
+                .execute(tx.as_mut())
+                .await
+                .expect("Failed to track functions");
+            sqlx::query(audited_sql(format!(
+                "SELECT {schema}.reserve_enqueue_seq($1, 2::smallint, 0::smallint, 2)"
+            )))
+            .bind(queue)
+            .execute(tx.as_mut())
+            .await
+            .expect("Failed to reserve");
+            let calls: i64 = sqlx::query_scalar(audited_sql(format!(
+                "SELECT COALESCE(pg_stat_get_xact_function_calls(\
+                 '{schema}.ensure_lane_sequences(text, smallint, smallint)'::regprocedure), 0)"
+            )))
+            .fetch_one(tx.as_mut())
+            .await
+            .expect("Failed to read function calls");
+            tx.rollback().await.expect("Failed to roll back");
+            calls
+        }
+    };
+    assert_eq!(
+        ensure_calls_in_reserve().await,
+        0,
+        "a named lane reserves without provisioning"
+    );
+    assert_eq!(
+        reserve(1).await,
+        7,
+        "the probe's rolled-back range is a gap"
+    );
+
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to clear the sequence name");
+
+    assert_eq!(
+        ensure_calls_in_reserve().await,
+        1,
+        "an unnamed lane is provisioned on reserve"
+    );
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to clear the sequence name");
+    assert_eq!(reserve(1).await, 10);
+    assert_eq!(reserve(2).await, 11);
+    assert_eq!(reserve(0).await, 13, "a zero count reads the next value");
+    let named: bool = sqlx::query_scalar(audited_sql(format!(
+        "SELECT seq_name IS NOT NULL FROM {schema}.queue_enqueue_heads \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read the sequence name");
+    assert!(named);
+}
+
+async fn drop_enqueue_function(pool: &sqlx::PgPool, schema: &str) {
+    let signature: String = sqlx::query_scalar(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+         WHERE pronamespace = $1::regnamespace AND proname = 'enqueue_ready_rows'",
+    )
+    .bind(schema)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!("DROP FUNCTION {signature}")))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_enqueue_cached_function_falls_back_between_databases() {
+    let (_new_guard, new_pool) = setup_pool(4).await;
+    let (_old_guard, old_pool) = setup_pool(4).await;
+    let schema = "awa_qs_enqueue_two_databases";
+    let store = create_store(&new_pool, schema).await;
+    let _old_store = create_store(&old_pool, schema).await;
+    drop_enqueue_function(&old_pool, schema).await;
+    store
+        .enqueue_params_batch(&new_pool, &fold_test_jobs("q", 1..=1))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .enqueue_params_batch(&old_pool, &fold_test_jobs("q", 2..=3))
+            .await
+            .unwrap(),
+        2,
+        "a stale positive hint cannot fail an otherwise valid enqueue"
+    );
+    assert_eq!(
+        store
+            .enqueue_params_copy(&new_pool, &fold_test_jobs("q", 4..=5))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store.queue_counts(&new_pool, "q").await.unwrap().available,
+        3
+    );
+    assert_eq!(
+        store.queue_counts(&old_pool, "q").await.unwrap().available,
+        2
+    );
+    new_pool.close().await;
+    old_pool.close().await;
+}
+
+#[tokio::test]
+async fn test_enqueue_batch_lost_function_rolls_back_unique_claims_before_fallback() {
+    enqueue_lost_function_rolls_back_unique_claims(false).await;
+}
+
+#[tokio::test]
+async fn test_enqueue_copy_lost_function_rolls_back_unique_claims_before_fallback() {
+    enqueue_lost_function_rolls_back_unique_claims(true).await;
+}
+
+async fn enqueue_lost_function_rolls_back_unique_claims(copy: bool) {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_enqueue_lost_unique";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 2, 1).await.unwrap();
+    drop_enqueue_function(&pool, schema).await;
+    let jobs: Vec<_> = [None, Some(Utc::now() + chrono::Duration::hours(1))]
+        .into_iter()
+        .enumerate()
+        .map(|(id, run_at)| {
+            insert::params_with(
+                &DlqJob { id: id as i64 },
+                InsertOpts {
+                    queue: "q".into(),
+                    run_at,
+                    unique: Some(UniqueOpts {
+                        by_args: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    let inserted = if copy {
+        store.enqueue_params_copy(&pool, &jobs).await
+    } else {
+        store.enqueue_params_batch(&pool, &jobs).await
+    }
+    .expect("fallback must roll back its failed transaction before replaying");
+    assert_eq!(inserted, 2);
+    let counts = store.queue_counts(&pool, "q").await.unwrap();
+    assert_eq!(counts.available, 2);
+    let scheduled: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.deferred_jobs WHERE state = 'scheduled'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(scheduled, 1);
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.job_unique_claims")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        claims, 2,
+        "each successful unique job owns exactly one claim"
+    );
+    pool.close().await;
 }

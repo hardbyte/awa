@@ -4,8 +4,118 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **`insert_many_skip_unique_conflicts` inserts a batch and skips the jobs
+  whose unique key is already claimed.** `insert_many` fails the whole batch
+  with a unique violation, so a producer that replays work had to insert the
+  batch again one job at a time, taking the lane lock once per job. The new
+  function returns the inserted rows in input order, with skipped jobs absent.
+  It needs migration v055 and returns a validation error on an older schema;
+  `insert_many_copy` (and Python's `insert_many_copy`) skips unique conflicts on
+  every schema.
+
+- **The maintenance leader keeps planner statistics fresh on the queue-storage
+  tables autovacuum never analyses.** Autovacuum does not analyse partitioned
+  tables, so the thirteen ring parents (`ready_entries`, `done_entries`,
+  `leases`, ...) had no inherited statistics, and the two small head tables
+  (`queue_claim_heads`, `queue_enqueue_heads`) never reach the autoanalyze
+  threshold, so the planner priced lane joins against them at its defaults
+  while they drove joins over hundreds of thousands of retained rows. The
+  leader now runs `ANALYZE` on them when it is elected and then every five
+  minutes. `ClientBuilder::statistics_refresh_interval` (Python
+  `statistics_refresh_interval_ms`) changes the cadence; zero disables it. One
+  pass takes under a second on a small ring and a few seconds on a large one.
+  It analyses one relation per transaction with a 2 s `lock_timeout` (a call that
+  times out waiting for a lock is retried next interval and recorded as
+  `skipped_lock`) and never makes prune wait: a prune attempt that
+  lands while ANALYZE samples the oldest slot's tables returns `blocked` and
+  retries on its normal backoff. Results are in
+  `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`
+  (scope `heads`, `ring_parent` or `pass`; outcome `ok`, `skipped_privilege`,
+  `skipped_lock`, `unavailable` or `failed`).
+- **Migration v054 adds `awa.analyze_queue_storage_relation(schema, relation)`,
+  so a runtime role that does not own the tables can refresh statistics.**
+  `ANALYZE` skips a table its caller may not analyse, and the documented
+  runtime grants do not include `MAINTAIN`, so the refresh runs through this
+  `SECURITY DEFINER` function owned by the migration role. It analyses only a
+  head table or ring parent of a schema that `awa.queue_storage_schemas()`
+  reports as trusted. It is not executable by `PUBLIC`, because the lock it
+  takes lasts until the caller's transaction ends and would block ring prune:
+  the migration grants `EXECUTE` to the roles that already hold INSERT, UPDATE
+  and DELETE on the head tables (the runtime grantees), and the function
+  requires the calling session user to hold them. A role created later needs
+  the documented `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa`. Run
+  `awa migrate` as the schema owner (see
+  [database roles](docs/security/database-roles.md)). A binary running ahead of
+  the migration probes for the function once per pass and, like one whose
+  function's owner may not analyse the tables, logs one warning naming what is
+  missing and skips the refresh without making failing calls or affecting job
+  processing. Earlier binaries never call the function.
+  Missing EXECUTE or head-table privileges are checked before each pass,
+  avoiding a failing helper call for every relation.
+
+### Changed
+
+- **COPY and opt-in skip-conflict batch enqueues hold lane locks only for reservation, ready-row writes and commit.** Migration v055 adds `awa.insert_jobs_compat_batch`, which allocates job ids, claims unique keys in key order, registers lanes and prepares rows before reserving each lane's sequence range in lane order. `insert_many_copy` probes its own connection on every call and uses the function when installed, falling back to per-row inserts on older schemas. `insert_many_skip_unique_conflicts` requires the function. Generic `insert_many` keeps its single-statement per-row path on every supported schema, preserving caller transactions when one process writes to databases at different migration levels. All paths return rows in input order and share the same per-lane lock with older binaries.
+
 ### Fixed
 
+- **`awa.jobs` keeps running jobs visible after priority aging changes their
+  effective priority** ([#569](https://github.com/hardbyte/awa/issues/569)).
+  Migration v057 joins receipt claims and materialized leases to the exact
+  job attempt rather than comparing effective and lane priorities, and
+  excludes tombstoned and older-attempt ready rows so a job is not listed
+  twice. Receipt and materialized-lease rows report the claimed effective
+  priority. The migration only replaces the compatibility function; storage
+  and runtime write protocols are unchanged.
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first (migration v053).** A lane's enqueue and claim sequences belonged to
+  the role that first enqueued into, claimed from or promoted into it, so with
+  several runtime roles sharing a group role, any role other than the creator
+  whose default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. Lanes are now created through two
+  `SECURITY DEFINER` functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. After v053 commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence per
+  transaction with a 300 ms lock wait, and only where it is allowed to, trying
+  the effective role and then the login role. A sequence an open transaction
+  holds is skipped and reported as busy; one it may not change is reported
+  with the roles that can repair it. Neither fails the migration. The new
+  read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the statements
+  to run and the roles to run them as, and exits 2 while any remain;
+  `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per sequence)
+  repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running ahead of v053 detects that `provision_lane` is missing and creates
+  lanes as before, and older binaries create correctly owned lanes once v053
+  has refreshed the helpers they call. See "Lane ownership and v053" in the
+  0.6 to 0.7 upgrade guide.
+
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only those `LOCK TABLE` statements and the final `TRUNCATE` turned a
+  timeout into `PruneOutcome::Blocked`. The timeout covers every later
+  statement in the transaction too: the post-lock liveness checks read the
+  lease and claim partitions, the failed-row carry inserts into the current
+  slot's `done_entries` and terminal-count deltas, and the fold appends
+  `queue_terminal_rollup_deltas` and deletes `queue_terminal_live_counts`
+  rows. When one of those waited out the timeout, for example behind
+  autovacuum truncating a relation or a hosted Postgres's own background
+  workers, prune failed with a `lock_not_available` (`55P03`) database error,
+  was logged as an error and skipped the prune backoff. A lock timeout
+  anywhere in a queue, lease or claim prune, or in a terminal-count rollup
+  slot, now rolls the whole transaction back and reports `Blocked`
+  (`blocked_slots` for rollup), so maintenance backs off and retries; nothing
+  the attempt wrote survives the rollback. A rollup pass stops at its first
+  blocked slot rather than waiting out the timeout again on each remaining
+  one.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
@@ -15,10 +125,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   a `QueueStorage` enqueue could deadlock with it (`40P01`). The two insert
   paths now sort rows by `(queue, priority, shard)`, queues compared bytewise,
   before they reach `awa.insert_job_compat`, the order `QueueStorage` already
-  used, and still return rows in input order. Job ids within a batch that
-  spans several lanes are now allocated lane by lane rather than in input
-  order, and when an `insert_many_copy` batch carries the same unique key in
-  more than one lane, the row in the lowest lane is the one inserted. A
+  used, and still return rows in input order. A
   transaction that enqueues with separate statements still takes locks in
   statement order; see "`deadlock detected` while enqueueing" in the
   troubleshooting guide.
@@ -230,7 +337,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v041 to v052. Run `awa migrate` as the migrator
+This release adds migrations v041 to v058. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
@@ -242,9 +349,9 @@ for each step.
   entry below has the staged expand, flip and contract steps.
 - **Rollout order.** Health-gated workers report ready only once the schema
   reaches their version, so migrate before rolling them out. Producers and
-  workers without a readiness gate can roll before v050. On PostgreSQL 17 and
-  earlier, pre-v050 binaries scan every ready partition during maintenance
-  once v050 is applied, so replace them promptly.
+  workers without a readiness gate can roll before v050 and v056. On
+  PostgreSQL 17 and earlier, pre-v050 binaries scan every ready partition
+  during maintenance once v050 is applied, so replace them promptly.
 - **Runtime roles no longer need `CREATE` (v049).** Provision lanes with
   `awa storage prepare-queue` as the migrator before deploying, and grant the
   runtime role `USAGE, SELECT, UPDATE` on the lane sequences. Existing
@@ -434,6 +541,22 @@ for each step.
   `awa.migration_lock_key()` expose the runner's advisory lock key.
 - Python prints a diagnostic to stderr if native shutdown has stalled for five
   seconds.
+- **The admin overview answers "is it keeping up?" (v058,
+  [#543](https://github.com/hardbyte/awa/pull/543)).** The maintenance leader
+  writes one row per queue per minute to `awa.queue_history` (depth by state,
+  oldest wait, and claimed/completed/failed/retried/rate-limited counts) and
+  one fleet row to `awa.fleet_history` (live and healthy instances, leader,
+  running versions), keeping 48 hours by default. Runtimes publish the
+  per-queue outcome counters this needs in their existing snapshots. The
+  overview, Queues page and queue detail classify each queue as not being
+  worked, falling behind, waiting long, paused, draining, steady or idle,
+  say what is holding waiting work back (no workers, rate limit, worker
+  capacity), show measured completion and arrival rates and an hour of
+  history, and mark rollouts, leader changes and lost instances on the chart.
+  `GET /api/health/queues` returns the same verdicts for alerting
+  (`?fail_on=critical` or `warning` answers 503 at that level).
+  Configure retention with `ClientBuilder::queue_history_retention` or
+  Python's `queue_history_retention_hours`; zero stops sampling.
 - **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
   `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
   take a per-queue predicate and dead-letter exhausted attempts in the rescue
@@ -595,6 +718,22 @@ for each step.
   session sets no `lock_timeout`, each lock wait is capped at 2 s; on a
   timeout (`55P03`, usually behind a long `awa.jobs` read or a backup) the
   migration rolls back and can be re-run.
+- **Enqueueing a batch of ready jobs takes one round trip (v056,
+  [#522](https://github.com/hardbyte/awa/issues/522)).**
+  `QueueStorage::enqueue_params_batch`, and `enqueue_params_copy` below its
+  2,048-row COPY threshold, send a batch of ready jobs without uniqueness
+  claims as one call to the new `{schema}.enqueue_ready_rows` function instead
+  of ten round trips. Batches with uniqueness claims or scheduled jobs still
+  run in a transaction but use the function for most of the work, and
+  reserving a lane's sequence range now writes the sequence once instead of
+  twice. On an earlier revision, at 800 jobs/s in 20-job calls, producer call
+  p50 fell 19-62% and WAL per job by about 5 bytes, with throughput unchanged.
+  On a schema without the function, or without `EXECUTE` on it and on
+  `ring_cursor`, binaries keep using the multi-statement path, which is also
+  shorter now, and look for the function again after a minute. If a cached
+  function disappears or loses EXECUTE, the same call rolls back any transaction
+  it owns and retries its original input once without the function; healthy
+  cached calls keep the one-statement path.
 - **Retry-heavy workloads leave far fewer dead tuples.** After the ring
   authority flip, awa keeps one terminal-count row per lane in
   `queue_terminal_live_counts` instead of up to 256, and a batch of finished
@@ -684,6 +823,11 @@ for each step.
   churn until the fleet flips (see Upgrading).
 
 ### Fixed
+
+- Queue history retains a departing worker's final published counters once,
+  keeps missing intervals unknown, and attributes striped queue outcomes to
+  their logical dispatcher. The overview no longer treats unknown callback
+  rates as zero when no worker runtime serves the queue.
 
 - **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
   numbers in plain decimal, and serde_json's default parser could round a long

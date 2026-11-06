@@ -4,7 +4,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useState, useCallback, useMemo } from "react";
-import { useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchJobs,
   fetchStats,
@@ -39,6 +39,7 @@ import {
   RETRYABLE_STATES,
   TERMINAL_STATES,
 } from "@/lib/constants";
+import { SnapshotStatus } from "@/components/SnapshotStatus";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 
 const STATES = [
@@ -279,24 +280,30 @@ export function JobsPage() {
         )}
       </div>
 
+      {hasSel ? (
+        <p className="text-sm text-muted-fg">Job refresh paused while rows are selected.</p>
+      ) : (
+        <SnapshotStatus sources={[jobsQuery, statsQuery]} />
+      )}
+
       {/* Queue context banner — shown when filtering by a single queue */}
       {activeQueue && queueStats && (
         <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/30 p-3">
           {queueStats.paused ? (
             <Badge intent="warning">Paused</Badge>
           ) : (
-            <Badge intent="success">Active</Badge>
+            <Badge intent="success">Claims enabled</Badge>
           )}
           {queueStats.description && (
             <span className="text-sm text-muted-fg">{queueStats.description}</span>
           )}
           <span className="text-sm text-muted-fg">
-            {queueStats.available} available &middot;{" "}
-            {queueStats.running} running &middot;{" "}
+            {queueStats.available.toLocaleString()} available &middot;{" "}
+            {queueStats.running.toLocaleString()} running &middot;{" "}
             <span className={queueStats.failed > 0 ? "text-danger" : ""}>
-              {queueStats.failed} failed
+              {queueStats.failed.toLocaleString()} failed
             </span>{" "}
-            &middot; {queueStats.completed_last_hour}/hr
+            &middot; {queueStats.completed_last_hour.toLocaleString()} completed in the last hour
           </span>
           <div className="flex gap-1">
             {queueStats.paused ? (
@@ -334,12 +341,17 @@ export function JobsPage() {
       {/* Compact state filter pills + search on same row */}
       <div className="flex flex-wrap items-center gap-2">
         {STATES.map((s) => {
-          const count = s === "all" ? total : statsQuery.data?.[s];
+          const count = activeQueue
+            ? s === "all" || s === "completed" || s === "cancelled"
+              ? undefined
+              : queueStats?.[s as keyof QueueStats]
+            : s === "all" ? total : statsQuery.data?.[s];
           const isActive = filters.state === s;
           return (
             <button
               key={s}
               onClick={() => setStateFilter(s)}
+              aria-pressed={isActive}
               className={[
                 "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium transition-colors",
                 isActive
@@ -348,7 +360,7 @@ export function JobsPage() {
               ].join(" ")}
             >
               {s === "waiting_external" ? "waiting" : s}
-              {count !== undefined && count > 0 && (
+              {typeof count === "number" && count > 0 && (
                 <span
                   className={
                     isActive
@@ -364,12 +376,17 @@ export function JobsPage() {
         })}
       </div>
 
+      <p className="text-xs text-muted-fg">
+        State counts cover {activeQueue ? "this queue" : "all queues"}; search
+        filters apply to the results below.
+      </p>
+
       {/* Search bar with integrated filter chips */}
       <SearchBar value={filters.search} onChange={setSearch} />
 
       {/* Bulk action toolbar */}
       {selected.size > 0 && (
-        <div className="flex items-center gap-3 rounded-lg bg-muted p-3">
+        <div className="flex flex-wrap items-center gap-3 rounded-lg bg-muted p-3">
           <span className="text-sm font-medium">{selected.size} selected</span>
           <Badge intent="warning">Updates paused</Badge>
           <Button
@@ -393,7 +410,7 @@ export function JobsPage() {
       )}
 
       {/* Mobile card layout */}
-      <div className="space-y-2 sm:hidden">
+      <div className="space-y-2 lg:hidden">
         {jobsQuery.isLoading && (
           <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
         )}
@@ -412,32 +429,31 @@ export function JobsPage() {
             ].join(" ")}
           >
             <div className="flex items-start gap-3">
-              <input
-                type="checkbox"
-                checked={selected.has(job.id)}
-                onChange={() => {
-                  setSelected((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(job.id)) next.delete(job.id);
-                    else next.add(job.id);
-                    return next;
-                  });
-                }}
-                className="mt-1 shrink-0"
-              />
-              <div
-                className="min-w-0 flex-1 cursor-pointer"
-                onClick={() =>
-                  void navigate({
-                    to: "/jobs/$id",
-                    params: { id: String(job.id) },
-                  })
-                }
+              <label className="flex size-11 shrink-0 items-center justify-center">
+                <input
+                  type="checkbox"
+                  aria-label={`Select job ${job.id}`}
+                  checked={selected.has(job.id)}
+                  onChange={() => {
+                    setSelected((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(job.id)) next.delete(job.id);
+                      else next.add(job.id);
+                      return next;
+                    });
+                  }}
+                  className="size-5"
+                />
+              </label>
+              <Link
+                className="min-w-0 flex-1"
+                to="/jobs/$id"
+                params={{ id: String(job.id) }}
               >
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">
                     {jobKindLabel(job)}
-                    <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                    <span className="ml-1.5 whitespace-nowrap text-xs text-muted-fg/50">#{job.id}</span>
                   </span>
                   <StateBadge state={job.state} />
                   {(job.priority !== 2 || job.original_priority !== job.priority) && (
@@ -452,7 +468,7 @@ export function JobsPage() {
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-fg">
                   <span>{queueLabel(job)}</span>
                   {job.queue_descriptor?.display_name && <span>{job.queue}</span>}
-                  <span>{job.attempt}/{job.max_attempts}</span>
+                  <span>Attempt {job.attempt}/{job.max_attempts}</span>
                   <span>{contextualTime(job)}</span>
                 </div>
                 {job.kind_descriptor?.description && (
@@ -474,7 +490,7 @@ export function JobsPage() {
                     )}
                   </div>
                 )}
-              </div>
+              </Link>
             </div>
           </div>
         ))}
@@ -492,7 +508,7 @@ export function JobsPage() {
             setSelected(new Set(keys as Set<number>));
           }
         }}
-        className="hidden sm:table"
+        className="hidden lg:block"
       >
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>
@@ -625,7 +641,7 @@ export function JobsPage() {
           {jobs.length > 0 && (
             <span className="text-sm text-muted-fg">
               Showing {jobs.length} job{jobs.length !== 1 ? "s" : ""}
-              {total !== undefined && ` of ${total.toLocaleString()} total`}
+              {total !== undefined && filters.state === "all" && !filters.search && ` of ${total.toLocaleString()} total`}
             </span>
           )}
         </div>

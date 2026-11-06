@@ -9,6 +9,8 @@ import {
   drainQueue,
   fetchQueue,
   fetchQueueRuntime,
+  fetchQueueHealth,
+  fetchQueueHistory,
   pauseQueue,
   resumeQueue,
 } from "@/lib/api";
@@ -24,8 +26,17 @@ import {
   DescriptionTerm,
 } from "@/components/ui/description-list";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { LagValue } from "@/components/LagValue";
+import {
+  formatDuration,
+  formatRate,
+  LIMITED_BY_HINT,
+  LIMITED_BY_LABEL,
+} from "@/lib/operations";
+import { HEALTH_BADGE, SPARK_TONE } from "@/components/QueueFlowTable";
+import { HistorySpark } from "@/components/HistorySpark";
 import type { QueueRuntimeSummary } from "@/lib/api";
+import { usePollInterval } from "@/hooks/use-poll-interval";
+import { SnapshotStatus } from "@/components/SnapshotStatus";
 import { timeAgo } from "@/lib/time";
 import {
   dlqPolicyIntent,
@@ -40,18 +51,35 @@ export function QueueDetailPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
+  const poll = usePollInterval();
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
   const queueQuery = useQuery({
     queryKey: ["queue", queueName],
     queryFn: () => fetchQueue(queueName),
     enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
+  const historyQuery = useQuery({
+    queryKey: ["queue-history", 60],
+    queryFn: () => fetchQueueHistory(60),
+    enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
+  const healthQuery = useQuery({
+    queryKey: ["queue-health"],
+    queryFn: fetchQueueHealth,
+    enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
     enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const pauseMutation = useMutation({
@@ -59,6 +87,7 @@ export function QueueDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      void queryClient.invalidateQueries({ queryKey: ["queue-health"] });
       toast.success(`Queue "${queueName}" paused`);
     },
     onError: () => toast.error("Failed to pause queue"),
@@ -69,6 +98,7 @@ export function QueueDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      void queryClient.invalidateQueries({ queryKey: ["queue-health"] });
       toast.success(`Queue "${queueName}" resumed`);
     },
     onError: () => toast.error("Failed to resume queue"),
@@ -80,6 +110,7 @@ export function QueueDetailPage() {
       setShowDrainConfirm(false);
       void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      void queryClient.invalidateQueries({ queryKey: ["queue-health"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       toast.success(`Queue "${queueName}" drained`);
     },
@@ -106,6 +137,23 @@ export function QueueDetailPage() {
   // Treat empty display_name as missing so a declared-but-blank row
   // doesn't render an empty page title.
   const title = queue.display_name?.trim() ? queue.display_name : queue.queue;
+  const series = historyQuery.data?.queues[queue.queue];
+  const assessment = healthQuery.data?.queues.find(
+    (entry) => entry.queue === queue.queue,
+  );
+  const health = assessment?.health ?? "unknown";
+  const flow = assessment?.flow;
+  const flowFacts = [
+    flow?.completed_per_minute != null &&
+      `${formatRate(flow.completed_per_minute)} completed`,
+    flow?.arrivals_per_minute != null &&
+      `${formatRate(flow.arrivals_per_minute)} arriving`,
+    flow?.failed_per_minute != null &&
+      flow.failed_per_minute > 0 &&
+      `${formatRate(flow.failed_per_minute)} failing`,
+    flow?.mean_claim_wait_seconds != null &&
+      `mean claim wait ${formatDuration(flow.mean_claim_wait_seconds)}`,
+  ].filter(Boolean);
   const descriptorSyncLabel = queue.descriptor_last_seen_at
     ? timeAgo(queue.descriptor_last_seen_at)
     : null;
@@ -126,11 +174,7 @@ export function QueueDetailPage() {
             {queue.queue}
           </code>
         )}
-        {queue.paused ? (
-          <Badge intent="warning">Paused</Badge>
-        ) : (
-          <Badge intent="success">Active</Badge>
-        )}
+        <Badge intent={HEALTH_BADGE[health]}>{assessment?.label ?? "…"}</Badge>
         {runtime?.config && (
           <Badge intent={dlqPolicyIntent(runtime.config)}>
             {dlqPolicyLabel(runtime.config)}
@@ -138,6 +182,33 @@ export function QueueDetailPage() {
         )}
         {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
         {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
+      </div>
+
+      <SnapshotStatus sources={[queueQuery, runtimeQuery, healthQuery, historyQuery]} />
+
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg border px-4 py-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{assessment?.reason ?? "Checking…"}</p>
+          <p className="text-xs text-muted-fg">
+            {queue.available.toLocaleString()} waiting
+            {queue.available > 0 && ` · oldest ${formatDuration(queue.lag_seconds)}`}
+            {flowFacts.length
+              ? ` · ${flowFacts.join(" · ")} (last 5m)`
+              : ` · ${formatRate(queue.completed_last_hour / 60)} completed (hour average)`}
+          </p>
+          {assessment?.limited_by && (
+            <p className="text-xs" title={LIMITED_BY_HINT[assessment.limited_by]}>
+              Limited by: {LIMITED_BY_LABEL[assessment.limited_by]}
+            </p>
+          )}
+        </div>
+        <HistorySpark
+          data={series?.available ?? []}
+          width={240}
+          height={32}
+          label={`${title} waiting jobs over the last hour`}
+          className={SPARK_TONE[health]}
+        />
       </div>
 
       {queue.description && (
@@ -190,6 +261,42 @@ export function QueueDetailPage() {
           Drain
         </Button>
       </div>
+
+      <Card>
+        <CardHeader title="Queue stats" />
+        <CardContent>
+          <DescriptionList>
+            <DescriptionTerm>Total queued</DescriptionTerm>
+            <DescriptionDetails>{queue.total_queued.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Scheduled</DescriptionTerm>
+            <DescriptionDetails>{queue.scheduled.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Available</DescriptionTerm>
+            <DescriptionDetails>{queue.available.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Retryable</DescriptionTerm>
+            <DescriptionDetails>{queue.retryable.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Running</DescriptionTerm>
+            <DescriptionDetails>{queue.running.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Waiting external</DescriptionTerm>
+            <DescriptionDetails>{queue.waiting_external.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Failed</DescriptionTerm>
+            <DescriptionDetails>{queue.failed.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Completed last hour</DescriptionTerm>
+            <DescriptionDetails>{queue.completed_last_hour.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Oldest available wait</DescriptionTerm>
+            <DescriptionDetails>
+              {formatDuration(queue.lag_seconds)}
+            </DescriptionDetails>
+          </DescriptionList>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader title="Descriptor" />
@@ -252,42 +359,6 @@ export function QueueDetailPage() {
                 </DescriptionDetails>
               </>
             )}
-          </DescriptionList>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader title="Queue stats" />
-        <CardContent>
-          <DescriptionList>
-            <DescriptionTerm>Total queued</DescriptionTerm>
-            <DescriptionDetails>{queue.total_queued.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Scheduled</DescriptionTerm>
-            <DescriptionDetails>{queue.scheduled.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Available</DescriptionTerm>
-            <DescriptionDetails>{queue.available.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Retryable</DescriptionTerm>
-            <DescriptionDetails>{queue.retryable.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Running</DescriptionTerm>
-            <DescriptionDetails>{queue.running.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Waiting external</DescriptionTerm>
-            <DescriptionDetails>{queue.waiting_external.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Failed</DescriptionTerm>
-            <DescriptionDetails>{queue.failed.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Completed last hour</DescriptionTerm>
-            <DescriptionDetails>{queue.completed_last_hour.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Lag</DescriptionTerm>
-            <DescriptionDetails>
-              <LagValue seconds={queue.lag_seconds} /> s
-            </DescriptionDetails>
           </DescriptionList>
         </CardContent>
       </Card>

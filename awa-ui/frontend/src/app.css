@@ -307,3 +307,15 @@ If you want to use the typography plugin (prose), uncomment the line below.
   outline: 1px solid var(--primary);
   transform: translateZ(0);
 }
+
+/* Touch targets on phones: header controls and in-page buttons stay at
+   least 44px, and long unbroken identifiers wrap instead of widening the page. */
+@media (max-width: 767px) {
+  [data-slot=sidebar-trigger], header button, main button { min-height: 44px; min-width: 44px; }
+  [data-slot=sidebar-item] { min-height: 44px; }
+  main { overflow-wrap: anywhere; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+}
+

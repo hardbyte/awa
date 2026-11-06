@@ -913,6 +913,7 @@ class AsyncClient:
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
         descriptor_retention_days: float | None = None,
+        queue_history_retention_hours: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,
@@ -922,6 +923,7 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
+        statistics_refresh_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
@@ -946,6 +948,10 @@ class AsyncClient:
         ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
         disable retention (useful if you manage the catalog externally).
 
+        ``queue_history_retention_hours`` controls how long the maintenance
+        leader keeps the per-minute queue and fleet history behind the admin
+        UI's trends. Defaults to 48 hours; pass ``0`` to stop sampling.
+
         Workers are queue-storage-capable by default, but during a storage
         transition ``storage_transition_role`` controls how this runtime
         participates:
@@ -967,6 +973,11 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``statistics_refresh_interval_ms`` controls how often the maintenance
+        leader runs ``ANALYZE`` on the queue-storage head tables and
+        partitioned ring parents, which autovacuum never analyses (default 5
+        minutes; ``0`` disables the refresh).
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -979,6 +990,7 @@ class AsyncClient:
             completed_retention_hours=completed_retention_hours,
             failed_retention_hours=failed_retention_hours,
             descriptor_retention_days=descriptor_retention_days,
+            queue_history_retention_hours=queue_history_retention_hours,
             cleanup_batch_size=cleanup_batch_size,
             leader_election_interval_ms=leader_election_interval_ms,
             heartbeat_interval_ms=heartbeat_interval_ms,
@@ -988,6 +1000,7 @@ class AsyncClient:
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
+            statistics_refresh_interval_ms=statistics_refresh_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,

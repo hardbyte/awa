@@ -163,9 +163,11 @@ pub struct ClientBuilder {
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
+    statistics_refresh_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
+    queue_history_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
@@ -226,9 +228,11 @@ impl ClientBuilder {
             leader_check_interval: None,
             priority_aging_interval: None,
             terminal_count_rollup_interval: None,
+            statistics_refresh_interval: None,
             completed_retention: None,
             failed_retention: None,
             descriptor_retention: None,
+            queue_history_retention: None,
             cleanup_batch_size: None,
             cleanup_interval: None,
             queue_retention_overrides: HashMap::new(),
@@ -860,6 +864,14 @@ impl ClientBuilder {
         self
     }
 
+    /// How long the maintenance leader keeps per-minute queue and fleet
+    /// history for the admin UI (default: 48 hours). `Duration::ZERO` stops
+    /// sampling. See [`MaintenanceService::queue_history_retention`].
+    pub fn queue_history_retention(mut self, retention: Duration) -> Self {
+        self.queue_history_retention = Some(retention);
+        self
+    }
+
     /// Set the maximum number of jobs to delete per cleanup pass (default: 1000).
     pub fn cleanup_batch_size(mut self, batch_size: i64) -> Self {
         self.cleanup_batch_size = Some(batch_size);
@@ -902,6 +914,20 @@ impl ClientBuilder {
     /// ledger for fewer maintenance writes to the mutable counter table.
     pub fn terminal_count_rollup_interval(mut self, interval: Duration) -> Self {
         self.terminal_count_rollup_interval = Some(interval);
+        self
+    }
+
+    /// Set how often the maintenance leader refreshes planner statistics for
+    /// the queue-storage tables autovacuum never analyses (default: 5 minutes).
+    ///
+    /// Autovacuum does not analyse partitioned tables, and never reaches its
+    /// threshold on the two small head tables, so the leader runs `ANALYZE`
+    /// on both when it is elected and then every interval, through
+    /// `awa.analyze_queue_storage_relation()` (schema v053) so that a runtime
+    /// role that does not own the tables still works. `Duration::ZERO`
+    /// disables the refresh. Queue storage only.
+    pub fn statistics_refresh_interval(mut self, interval: Duration) -> Self {
+        self.statistics_refresh_interval = Some(interval);
         self
     }
 
@@ -1186,6 +1212,8 @@ impl ClientBuilder {
         }
 
         let metrics = crate::metrics::AwaMetrics::from_global();
+        let queue_counters =
+            crate::queue_counters::counter_map(self.queues.iter().map(|(name, _)| name));
         let queue_in_flight = Arc::new(
             self.queues
                 .iter()
@@ -1246,6 +1274,7 @@ impl ClientBuilder {
             finalizers: TaskTracker::new(),
             in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
+            queue_counters,
             dispatcher_alive,
             heartbeat_alive: Arc::new(AtomicBool::new(false)),
             maintenance_alive: Arc::new(AtomicBool::new(false)),
@@ -1256,9 +1285,11 @@ impl ClientBuilder {
             leader_check_interval: self.leader_check_interval,
             priority_aging_interval: self.priority_aging_interval,
             terminal_count_rollup_interval: self.terminal_count_rollup_interval,
+            statistics_refresh_interval: self.statistics_refresh_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
             descriptor_retention: self.descriptor_retention,
+            queue_history_retention: self.queue_history_retention,
             cleanup_batch_size: self.cleanup_batch_size,
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
@@ -1351,6 +1382,7 @@ pub struct Client {
     finalizers: TaskTracker,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
+    queue_counters: crate::queue_counters::QueueCounterMap,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
     maintenance_alive: Arc<AtomicBool>,
@@ -1362,9 +1394,11 @@ pub struct Client {
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
+    statistics_refresh_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
+    queue_history_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
@@ -1401,6 +1435,7 @@ struct RuntimeReporterState {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     worker_kinds: Vec<String>,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
+    queue_counters: crate::queue_counters::QueueCounterMap,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
     maintenance_alive: Arc<AtomicBool>,
@@ -1654,6 +1689,7 @@ impl Client {
             job_kind_descriptors: self.job_kind_descriptors.clone(),
             worker_kinds: self.workers.keys().cloned().collect(),
             queue_in_flight: self.queue_in_flight.clone(),
+            queue_counters: self.queue_counters.clone(),
             dispatcher_alive: self.dispatcher_alive.clone(),
             heartbeat_alive: self.heartbeat_alive.clone(),
             maintenance_alive: self.maintenance_alive.clone(),
@@ -1823,6 +1859,7 @@ impl Client {
             self.enqueue_specs.clone(),
             self.in_flight.clone(),
             self.queue_in_flight.clone(),
+            self.queue_counters.clone(),
             self.state.clone(),
             self.metrics.clone(),
             completion_handle,
@@ -1932,6 +1969,9 @@ impl Client {
         if let Some(interval) = self.terminal_count_rollup_interval {
             maintenance = maintenance.terminal_count_rollup_interval(interval);
         }
+        if let Some(interval) = self.statistics_refresh_interval {
+            maintenance = maintenance.statistics_refresh_interval(interval);
+        }
         if let Some(retention) = self.completed_retention {
             maintenance = maintenance.completed_retention(retention);
         }
@@ -1940,6 +1980,9 @@ impl Client {
         }
         if let Some(retention) = self.descriptor_retention {
             maintenance = maintenance.descriptor_retention(retention);
+        }
+        if let Some(retention) = self.queue_history_retention {
+            maintenance = maintenance.queue_history_retention(retention);
         }
         if let Some(batch_size) = self.cleanup_batch_size {
             maintenance = maintenance.cleanup_batch_size(batch_size);
@@ -2680,6 +2723,10 @@ impl RuntimeReporterState {
             queue: queue.to_string(),
             in_flight,
             overflow_held,
+            counters: self
+                .queue_counters
+                .get(queue)
+                .map(|counters| counters.snapshot()),
             config: QueueRuntimeConfigSnapshot {
                 mode,
                 max_workers,
