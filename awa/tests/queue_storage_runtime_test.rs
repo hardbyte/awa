@@ -22129,3 +22129,309 @@ async fn test_point_read_first_snapshot_follows_ready_prune_carry() {
         assert_eq!(row.finalized_at, before.finalized_at);
     }
 }
+
+async fn claim_aged_rescue_body_job(
+    schema: &str,
+    receipts: bool,
+    deadline: Duration,
+    max_attempts: i16,
+) -> (
+    TestDbGuard,
+    sqlx::PgPool,
+    QueueStorage,
+    awa::model::ClaimedRuntimeJob,
+) {
+    let (guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: receipts,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_aged_rescue_body";
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9027 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts,
+            metadata: serde_json::json!({"retained": "aged-rescue-body"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Control elapsed queue age without waiting five minutes; all claim,
+    // rescue, terminal and retry transitions below use their real APIs.
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let mut claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, deadline, Duration::from_secs(60))
+        .await
+        .expect("claim aged job");
+    assert_eq!(claimed.len(), 1);
+    let original = claimed.remove(0);
+    assert_eq!(original.job.id, job_id);
+    assert_eq!(original.claim.priority, 4, "physical ready lane");
+    assert_eq!(original.job.priority, 1, "aged effective priority");
+    (guard, pool, store, original)
+}
+
+#[derive(Clone, Copy)]
+enum AgedFailedConsumer {
+    Retry,
+    Carry,
+    View,
+}
+
+async fn aged_rescued_failure_keeps_body(
+    schema: &str,
+    receipts: bool,
+    deadline: Duration,
+    consumer: AgedFailedConsumer,
+) {
+    let (_guard, pool, store, original) =
+        claim_aged_rescue_body_job(schema, receipts, deadline, 1).await;
+    let job_id = original.job.id;
+    // Zero staleness makes this committed attempt eligible without sleeps
+    // or rewriting receipt timestamps. No worker is running in this test.
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("rescue exhausted aged attempt");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    assert_eq!(rescued[0].args, original.job.args);
+    assert_eq!(rescued[0].max_attempts, 1);
+    let raw_body = done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        raw_body.0.is_none() && raw_body.1.is_none(),
+        "ready-backed failure stays narrow"
+    );
+
+    if matches!(consumer, AgedFailedConsumer::Carry) {
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry failed row")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                    ..
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected carry prune outcome: {other:?}"),
+            }
+        }
+        let carried = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(
+            carried.0,
+            Some(original.job.args.clone()),
+            "carry must hydrate before truncating ready backing"
+        );
+        assert_eq!(carried.1, Some(original.job.max_attempts));
+        assert_eq!(carried.3, Some(original.job.created_at));
+        let ready_count: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*) FROM {schema}.ready_entries WHERE job_id = $1"
+        )))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pruned ready body");
+        assert_eq!(
+            ready_count, 0,
+            "carried body must survive without ready backing"
+        );
+    }
+
+    // This is the installed SQL view, independent of the Rust hydration helper.
+    let view = terminal_view_body_columns(&pool, &store, job_id).await;
+    if matches!(consumer, AgedFailedConsumer::View) {
+        assert_eq!(
+            view.0, original.job.args,
+            "terminal_jobs must hydrate the aged failure"
+        );
+        assert_eq!(view.1, original.job.max_attempts);
+    }
+    let retained = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load retained failure")
+        .expect("retained failure");
+    let retry = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry aged failure")
+        .expect("failed job retries");
+    assert_eq!(
+        retry.args, original.job.args,
+        "manual retry must retain original arguments"
+    );
+    assert_eq!(
+        retry.max_attempts, original.job.max_attempts,
+        "manual retry must not default to25"
+    );
+    assert_eq!(retry.created_at, original.job.created_at);
+    assert_eq!(retry.metadata["retained"], "aged-rescue-body");
+    assert_eq!(retry.state, JobState::Available);
+    assert_eq!(retry.attempt, 0);
+    assert_eq!(view.0, original.job.args);
+    assert_eq!(view.1, original.job.max_attempts);
+    assert_eq!(view.3, original.job.created_at);
+    assert_eq!(retained.args, original.job.args);
+    assert_eq!(retained.max_attempts, original.job.max_attempts);
+    let rerun = store
+        .claim_runtime_batch(&pool, &original.job.queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim manual retry");
+    assert_eq!(rerun.len(), 1);
+    assert_eq!(rerun[0].job.args, original.job.args);
+    assert_eq!(rerun[0].job.max_attempts, original.job.max_attempts);
+    assert_eq!(rerun[0].job.run_lease, original.job.run_lease + 1);
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_compact_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_compact",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_deadline_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_deadline",
+        true,
+        Duration::from_secs(300),
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_legacy_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_legacy",
+        false,
+        Duration::from_secs(300),
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_carry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_carry",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::Carry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_terminal_view_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_view",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::View,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_expired_deadline_retry_preserves_body() {
+    let (_guard, pool, store, original) = claim_aged_rescue_body_job(
+        "awa_qs_aged_rescue_expired_deadline",
+        true,
+        Duration::from_micros(1),
+        1,
+    )
+    .await;
+    // The real positive deadline has expired by the time its claim commits.
+    // This exercises deadline rescue itself, separately from heartbeat rescue.
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue expired aged attempt");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, original.job.id);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    let view = terminal_view_body_columns(&pool, &store, original.job.id).await;
+    let retry = store
+        .retry_job(&pool, original.job.id)
+        .await
+        .expect("retry expired aged failure")
+        .expect("failed job retries");
+    assert_eq!(retry.args, original.job.args);
+    assert_eq!(retry.max_attempts, original.job.max_attempts);
+    assert_eq!(retry.created_at, original.job.created_at);
+    assert_eq!(view.0, original.job.args);
+    assert_eq!(view.1, original.job.max_attempts);
+}
+
+async fn aged_rescue_keeps_effective_policy_priority(dlq: bool) {
+    let schema = if dlq {
+        "awa_qs_aged_rescue_dlq"
+    } else {
+        "awa_qs_aged_rescue_retryable"
+    };
+    let max_attempts = if dlq { 1 } else { 3 };
+    let (_guard, pool, store, original) =
+        claim_aged_rescue_body_job(schema, true, Duration::ZERO, max_attempts).await;
+    let rescued = store
+        .rescue_stale_heartbeats_with_dlq(&pool, Duration::ZERO, &|_| dlq)
+        .await
+        .expect("rescue aged policy job");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(
+        rescued[0].priority, 1,
+        "deferred/DLQ policy keeps effective priority"
+    );
+    assert_eq!(rescued[0].args, original.job.args);
+    assert_eq!(rescued[0].max_attempts, max_attempts);
+    let table = if dlq { "dlq_entries" } else { "deferred_jobs" };
+    let stored: (i16, serde_json::Value, i16) = sqlx::query_as(audited_sql(format!(
+        "SELECT priority, args, max_attempts FROM {schema}.{table} WHERE job_id = $1"
+    )))
+    .bind(original.job.id)
+    .fetch_one(&pool)
+    .await
+    .expect("load self-contained policy row");
+    assert_eq!(stored, (1, original.job.args, max_attempts));
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_dlq_keeps_effective_priority() {
+    aged_rescue_keeps_effective_policy_priority(true).await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_retryable_keeps_effective_priority() {
+    aged_rescue_keeps_effective_policy_priority(false).await;
+}
