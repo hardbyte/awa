@@ -295,12 +295,71 @@ macro_rules! prepared_lane_sequences_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `definer_lane_provisioning` patch: the
+/// lane-sequence check and repair functions, and each installed queue-storage
+/// substrate (found as for `prepared_lane_sequences`) without
+/// the SECURITY DEFINER provisioning functions or whose lane helpers do not
+/// create sequences through them. Lane sequences the patch could not reassign
+/// do not keep it pending: `awa storage lane-sequences` reports those.
+macro_rules! definer_lane_provisioning_pending_sql {
+    () => {
+        "SELECT 'awa.lane_sequence_problems'::text AS target \
+         WHERE to_regprocedure('awa.lane_sequence_problems(text,text)') IS NULL \
+         UNION ALL \
+         SELECT 'awa.repair_lane_sequence' \
+         WHERE to_regprocedure('awa.repair_lane_sequence(text,text)') IS NULL \
+         UNION ALL \
+         SELECT 'awa.refresh_lane_sequence_helpers' \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'refresh_lane_sequence_helpers' \
+               AND p.prosrc NOT LIKE '%provision_lane_sequences%') \
+         UNION ALL \
+         SELECT format('lane provisioning in schema %s', n.nspname) \
+         FROM pg_namespace AS n \
+         WHERE EXISTS ( \
+                 SELECT 1 FROM pg_proc AS p \
+                 WHERE p.pronamespace = n.oid \
+                   AND p.proname = 'claim_ready_runtime' \
+                   AND oidvectortypes(p.proargtypes) \
+                       = 'text, bigint, double precision, double precision') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid AND c.relname = 'queue_enqueue_heads') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid AND c.relname = 'queue_claim_heads') \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname = 'queue_lane_sequence_name' \
+                         AND oidvectortypes(p.proargtypes) = 'text, text, smallint, smallint') \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname = 'set_sequence_next' \
+                         AND oidvectortypes(p.proargtypes) = 'text, bigint') \
+           AND ((SELECT count(DISTINCT p.proname) FROM pg_proc AS p \
+                 WHERE p.pronamespace = n.oid \
+                   AND p.proname IN ('provision_lane', 'provision_lane_sequences') \
+                   AND p.prosecdef \
+                   AND oidvectortypes(p.proargtypes) = 'text, smallint, smallint') < 2 \
+                OR (SELECT count(DISTINCT p.proname) FROM pg_proc AS p \
+                    WHERE p.pronamespace = n.oid \
+                      AND p.proname IN ('ensure_lane_sequences', \
+                                        'queue_enqueue_head_sequence_sync', \
+                                        'queue_claim_head_sequence_sync') \
+                      AND p.prosrc LIKE '%provision_lane_sequences%') < 3)"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
     match name {
         "prepared_lane_sequences" => Some(concat!(
             prepared_lane_sequences_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        "definer_lane_provisioning" => Some(concat!(
+            definer_lane_provisioning_pending_sql!(),
             " ORDER BY 1"
         )),
         _ => None,
@@ -344,6 +403,23 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         applied_probe: concat!(
             "SELECT NOT EXISTS (",
             prepared_lane_sequences_pending_sql!(),
+            ")"
+        ),
+    },
+    SchemaPatch {
+        name: "definer_lane_provisioning",
+        description: "Create queue lanes as the schema owner (awa 0.7 migration v053)",
+        // The v023 definitions first, so the installer and the helper refresh
+        // carry the provisioning functions; the patch then refreshes each
+        // installed schema and repairs its existing lane sequences.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/definer_lane_provisioning.sql"),
+        ),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            definer_lane_provisioning_pending_sql!(),
             ")"
         ),
     },
@@ -502,6 +578,11 @@ pub struct MigrationReport {
     /// change routing; both are `None` before the storage tables exist.
     pub storage_routing_before: Option<StorageRouting>,
     pub storage_routing_after: Option<StorageRouting>,
+    /// What the run did to each lane sequence that needed repair, when it
+    /// applied `definer_lane_provisioning`. Each sequence is repaired in its
+    /// own short transaction after the patch commits; a sequence left behind
+    /// does not make the run incomplete.
+    pub lane_sequences: Vec<crate::storage::LaneSequenceRepair>,
 }
 
 impl MigrationReport {
@@ -660,6 +741,28 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
         }));
     }
 
+    // ALTER SEQUENCE ... OWNER takes the sequence's ACCESS EXCLUSIVE lock
+    // until its transaction ends, so the patch only installs the definitions
+    // and each lane sequence is repaired here, in its own transaction with a
+    // bounded lock wait, once the patch has committed.
+    let mut lane_sequences = Vec::new();
+    if patches.iter().any(|patch| {
+        patch.name == "definer_lane_provisioning" && patch.outcome == PatchOutcome::Applied
+    }) {
+        match crate::storage::repair_lane_sequences_in_every_schema(conn).await {
+            Ok(repairs) => {
+                for next_step in crate::storage::lane_sequence_repair_next_steps(&repairs) {
+                    tracing::warn!("{next_step}");
+                }
+                lane_sequences = repairs;
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "Could not repair lane sequences; run `awa storage lane-sequences --repair`"
+            ),
+        }
+    }
+
     // Ensure the admin metadata cache is warm. Since v006 removed the
     // synchronous triggers on jobs_hot, the cache is only updated by the
     // maintenance leader. Refreshing here guarantees queue_stats() and
@@ -694,6 +797,7 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
         patches,
         storage_routing_before,
         storage_routing_after: storage_routing_conn(conn).await?,
+        lane_sequences,
     })
 }
 

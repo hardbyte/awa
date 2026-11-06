@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -1122,6 +1123,7 @@ impl ClientBuilder {
             dispatcher_handles: RwLock::new(Vec::new()),
             service_handles: RwLock::new(Vec::new()),
             job_set: Arc::new(Mutex::new(JoinSet::new())),
+            finalizers: TaskTracker::new(),
             in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
             dispatcher_alive,
@@ -1222,6 +1224,8 @@ pub struct Client {
     service_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
     /// JoinSet tracking in-flight job tasks for graceful drain.
     job_set: Arc<Mutex<JoinSet<()>>>,
+    /// Finalization of attempts whose handler has returned, drained on shutdown.
+    finalizers: TaskTracker,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
@@ -1635,6 +1639,7 @@ impl Client {
             completion_handle,
             effective_storage.clone(),
             self.dlq_policy.clone(),
+            self.finalizers.clone(),
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
@@ -1873,8 +1878,9 @@ impl Client {
     /// 1. Stop dispatchers (no new jobs claimed)
     /// 2. Signal in-flight jobs to cancel
     /// 3. Wait for dispatchers to exit
-    /// 4. Drain in-flight jobs (heartbeat + maintenance still alive!)
-    /// 5. Stop heartbeat + maintenance
+    /// 4. Drain in-flight jobs and their finalization (heartbeat,
+    ///    maintenance and the completion batcher still alive!)
+    /// 5. Stop heartbeat, maintenance and the completion batcher
     pub async fn shutdown(&self, timeout: Duration) {
         info!("Initiating graceful shutdown");
 
@@ -1930,6 +1936,14 @@ impl Client {
                 timeout_secs = timeout.as_secs(),
                 "Shutdown drain timeout exceeded, some jobs may not have completed"
             );
+        }
+
+        self.finalizers.close();
+        if tokio::time::timeout_at(drain_deadline, self.finalizers.wait())
+            .await
+            .is_err()
+        {
+            warn!("Shutdown drain timeout exceeded waiting for durable finalization");
         }
 
         // Phase 5: Stop background services (heartbeat + maintenance)

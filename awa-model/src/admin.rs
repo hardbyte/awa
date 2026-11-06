@@ -375,7 +375,10 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
               ON ready.ready_slot = leases.ready_slot
              AND ready.ready_generation = leases.ready_generation
              AND ready.queue = leases.queue
-             AND ready.priority = leases.priority
+             -- Leases record the aged effective priority while the ready row
+             -- keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = leases.job_id
+             AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             UNION ALL
@@ -725,7 +728,10 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
               ON ready.ready_slot = leases.ready_slot
              AND ready.ready_generation = leases.ready_generation
              AND ready.queue = leases.queue
-             AND ready.priority = leases.priority
+             -- Leases record the aged effective priority while the ready row
+             -- keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = leases.job_id
+             AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             WHERE ready.created_at >= {since}
@@ -844,7 +850,10 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
               ON ready.ready_slot = leases.ready_slot
              AND ready.ready_generation = leases.ready_generation
              AND ready.queue = leases.queue
-             AND ready.priority = leases.priority
+             -- Leases record the aged effective priority while the ready row
+             -- keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = leases.job_id
+             AND ready.run_lease + 1 = leases.run_lease
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             GROUP BY ready.kind, leases.queue
@@ -1075,7 +1084,10 @@ fn queue_storage_job_id_candidates_sql(
                   ON ready.ready_slot = leases.ready_slot
                  AND ready.ready_generation = leases.ready_generation
                  AND ready.queue = leases.queue
-                 AND ready.priority = leases.priority
+                 -- Leases record the aged effective priority while the ready row
+                 -- keeps its lane priority, so match the attempt instead.
+                 AND ready.job_id = leases.job_id
+                 AND ready.run_lease + 1 = leases.run_lease
                  AND ready.enqueue_shard = leases.enqueue_shard
                  AND ready.lane_seq = leases.lane_seq
                 WHERE TRUE{predicates}
@@ -1534,7 +1546,10 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
                 WHERE ready.ready_slot = leases.ready_slot
                   AND ready.ready_generation = leases.ready_generation
                   AND ready.queue = leases.queue
-                  AND ready.priority = leases.priority
+                  -- Leases record the aged effective priority while the ready row
+                  -- keeps its lane priority, so match the attempt instead.
+                  AND ready.job_id = leases.job_id
+                  AND ready.run_lease + 1 = leases.run_lease
                   AND ready.enqueue_shard = leases.enqueue_shard
                   AND ready.lane_seq = leases.lane_seq
                   AND ready.unique_key = $1
