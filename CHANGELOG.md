@@ -4,8 +4,79 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **The maintenance leader keeps planner statistics fresh on the queue-storage
+  tables autovacuum never analyses.** Autovacuum does not analyse partitioned
+  tables, so the thirteen ring parents (`ready_entries`, `done_entries`,
+  `leases`, ...) had no inherited statistics, and the two small head tables
+  (`queue_claim_heads`, `queue_enqueue_heads`) never reach the autoanalyze
+  threshold, so the planner priced lane joins against them at its defaults
+  while they drove joins over hundreds of thousands of retained rows. The
+  leader now runs `ANALYZE` on them when it is elected and then every five
+  minutes. `ClientBuilder::statistics_refresh_interval` (Python
+  `statistics_refresh_interval_ms`) changes the cadence; zero disables it. One
+  pass takes under a second on a small ring and a few seconds on a large one.
+  It analyses one relation per transaction with a 2 s `lock_timeout` (a call that
+  times out waiting for a lock is retried next interval and recorded as
+  `skipped_lock`) and never makes prune wait: a prune attempt that
+  lands while ANALYZE samples the oldest slot's tables returns `blocked` and
+  retries on its normal backoff. Results are in
+  `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`
+  (scope `heads`, `ring_parent` or `pass`; outcome `ok`, `skipped_privilege`,
+  `skipped_lock`, `unavailable` or `failed`).
+- **Migration v054 adds `awa.analyze_queue_storage_relation(schema, relation)`,
+  so a runtime role that does not own the tables can refresh statistics.**
+  `ANALYZE` skips a table its caller may not analyse, and the documented
+  runtime grants do not include `MAINTAIN`, so the refresh runs through this
+  `SECURITY DEFINER` function owned by the migration role. It analyses only a
+  head table or ring parent of a schema that `awa.queue_storage_schemas()`
+  reports as trusted. It is not executable by `PUBLIC`, because the lock it
+  takes lasts until the caller's transaction ends and would block ring prune:
+  the migration grants `EXECUTE` to the roles that already hold INSERT, UPDATE
+  and DELETE on the head tables (the runtime grantees), and the function
+  requires the calling session user to hold them. A role created later needs
+  the documented `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa`. Run
+  `awa migrate` as the schema owner (see
+  [database roles](docs/security/database-roles.md)). A binary running ahead of
+  the migration probes for the function once per pass and, like one whose
+  function's owner may not analyse the tables, logs one warning naming what is
+  missing and skips the refresh without making failing calls or affecting job
+  processing. Earlier binaries never call the function.
+  Missing EXECUTE or head-table privileges are checked before each pass,
+  avoiding a failing helper call for every relation.
+
 ### Fixed
 
+- Statistics-refresh permission warnings distinguish caller grants from
+  helper/table ownership and ANALYZE privileges.
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first (migration v053).** A lane's enqueue and claim sequences belonged to
+  the role that first enqueued into, claimed from or promoted into it, so with
+  several runtime roles sharing a group role, any role other than the creator
+  whose default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. Lanes are now created through two
+  `SECURITY DEFINER` functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. After v053 commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence per
+  transaction with a 300 ms lock wait, and only where it is allowed to, trying
+  the effective role and then the login role. A sequence an open transaction
+  holds is skipped and reported as busy; one it may not change is reported
+  with the roles that can repair it. Neither fails the migration. The new
+  read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the statements
+  to run and the roles to run them as, and exits 2 while any remain;
+  `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per sequence)
+  repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running ahead of v053 detects that `provision_lane` is missing and creates
+  lanes as before, and older binaries create correctly owned lanes once v053
+  has refreshed the helpers they call. See "Lane ownership and v053" in the
+  0.6 to 0.7 upgrade guide.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
