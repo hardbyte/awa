@@ -32,6 +32,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | B5 | Deadline rescue signals ctx.is_cancelled() | ✓ |  |
 | B6 | UniqueConflict.constraint field | ✓ |  |
 | B7 | Admin cancel signals in-flight handler cancellation | ✓ | ✓ |
+| B8 | Shutdown finalizes attempts whose handler returned during the drain, so a process exit cannot leave them for rescue | ✓ |  |
 | T75 | Priority aging maintenance task promotes long-waiting low-priority jobs | ✓ |  |
 
 ### Uniqueness (Python)

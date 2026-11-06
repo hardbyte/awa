@@ -6,6 +6,23 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A graceful shutdown no longer leaves a finished attempt for stale-heartbeat
+  rescue to run again.** Once a handler returned, its finalize (completion,
+  retry, cancel or failure, and any ADR-029 follow-up inserts) ran in a task
+  that `Client::shutdown` did not wait for. When the last handler returned
+  just as the drain ended, shutdown stopped the completion batcher before
+  that finalize reached it, and the direct fallback raced the process exit.
+  The attempt had already left the heartbeat set, so it went stale and was
+  rescued and executed again `heartbeat_staleness` later; a deploy could
+  re-run a few jobs on every rolling restart. Shutdown now waits for
+  pending finalization, within the same drain timeout, before it stops the
+  completion batcher, heartbeat and maintenance services. A finalize that
+  outlives the timeout is still left to rescue, as before.
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
 - **Callback completion, `get_job`, lifecycle events and the admin reads
   find running jobs that priority aging promoted on queue storage** (backport
   of #600). Claims and leases record a job's aged effective priority while its
