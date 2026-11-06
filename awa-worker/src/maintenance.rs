@@ -8,10 +8,10 @@ use awa_model::cron::{
 #[cfg(test)]
 use awa_model::SkipReason;
 use awa_model::{
-    JobRow, JobState, PeriodicJob, PruneOutcome, RescueBatch, RescueBatchOptions, RescueSlotOrder,
-    RotateOutcome, TerminalDeltaRollupOutcome,
+    JobRow, JobState, PeriodicJob, PruneOutcome, RescueBatch, RescueBatchOptions,
+    RescueScanProgress, RescueSlotOrder, RotateOutcome, TerminalDeltaRollupOutcome,
 };
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
@@ -232,10 +232,6 @@ pub(crate) const DEFAULT_RESCUE_PASS_BUDGET: Duration = Duration::from_secs(1);
 /// Default cap on attempts one queue-storage rescue pass rescues.
 pub(crate) const DEFAULT_RESCUE_PASS_MAX_ROWS: usize = 5_000;
 
-/// Attempts one rescue batch rescues at most per source (lease rows, receipt
-/// claims), each batch in its own transaction.
-const RESCUE_BATCH_ROWS: usize = 500;
-
 /// While a rescue kind still has a backlog, its next pass runs after this
 /// rather than after its full interval. With the per-pass row cap this bounds
 /// a drain to about `rescue_pass_max_rows` attempts per second per kind.
@@ -250,8 +246,7 @@ const RESCUE_FOLLOW_UP_SCAN_LIMIT: usize = 2_000;
 /// a long drain of the oldest slot leaves the rest at least that share.
 const RESCUE_OTHERS_FIRST_EVERY: usize = 4;
 
-/// Runtime snapshots the leader reads before letting a stale-heartbeat pass
-/// take more than one batch. A runtime is `fresh` while its snapshot is
+/// Runtime snapshots the leader reads before accelerating stale-heartbeat rescue. A runtime is `fresh` while its snapshot is
 /// within three snapshot intervals; one that is neither fresh nor silent for
 /// the whole heartbeat staleness ($1, milliseconds) could be a live runtime
 /// that is stalled rather than gone. `last_gone_heartbeat` bounds the last
@@ -278,7 +273,7 @@ const RESCUE_RUNTIME_EVIDENCE_SQL: &str = r#"
 "#;
 
 /// The queue-storage rescue kinds a leader drains in passes of batches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RescueKind {
     Heartbeat,
     Deadline,
@@ -334,7 +329,7 @@ impl RescuePassEnd {
 /// fleet-wide: every runtime snapshot is either fresh with its heartbeat
 /// loop alive, or silent for at least the heartbeat staleness. That must
 /// hold at every sample for a full staleness window before a stale-heartbeat
-/// pass may take more than one batch, so a live runtime coming out of a stall
+/// rescue may run extra batches or early passes, so a live runtime coming out of a stall
 /// has had the whole window to refresh its heartbeats first. A gap between
 /// samples longer than half the staleness restarts the window, because a
 /// stall the leader did not sample could have hidden behind it.
@@ -361,6 +356,96 @@ impl RescueOwnerEvidence {
         }
         let steady_since = *self.steady_since.get_or_insert(now);
         now.saturating_duration_since(steady_since) >= staleness
+    }
+}
+
+/// A sweep survives early re-arms: closed history must not keep the leader
+/// scanning once a cursor has made a full revolution. The first window is
+/// already visited, so crossing its end after wrapping completes the sweep.
+#[derive(Debug, Default)]
+struct RescueSweep {
+    cursors: HashMap<i32, Vec<RescueSweepCursor>>,
+    idle_slots: Vec<i32>,
+    last_revisit: Option<Instant>,
+    batches_started: usize,
+}
+
+#[derive(Debug, Default)]
+struct RescueSweepCursor {
+    first: Option<(DateTime<Utc>, i64, i64)>,
+    previous: Option<(DateTime<Utc>, i64, i64)>,
+    wrapped: bool,
+    done: bool,
+}
+
+impl RescueSweep {
+    /// A long drain must revisit slots whose claims have become eligible
+    /// since their last scan. Keep unfinished cursors so a large history
+    /// sweep still converges across these ordinary-cadence revisits.
+    fn revisit(&mut self, now: Instant, interval: Duration) {
+        if self
+            .last_revisit
+            .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            self.idle_slots.clear();
+            for cursor in self.cursors.values_mut().flatten() {
+                if cursor.done {
+                    *cursor = RescueSweepCursor::default();
+                }
+            }
+            self.last_revisit = Some(now);
+        }
+    }
+
+    fn observe(&mut self, progress: RescueScanProgress) {
+        let cursors = self.cursors.entry(progress.slot).or_default();
+        cursors.resize_with(progress.cursors.len(), RescueSweepCursor::default);
+        for (cursor, progress) in cursors.iter_mut().zip(progress.cursors) {
+            if !progress.saturated {
+                cursor.done = true;
+            }
+            if let Some(position) = progress.position {
+                if let Some(first) = cursor.first {
+                    let crossed = cursor.previous.is_some_and(|previous| position <= previous);
+                    cursor.done |= (cursor.wrapped && crossed)
+                        || ((cursor.wrapped || crossed) && position >= first);
+                    cursor.wrapped |= crossed;
+                } else {
+                    cursor.first = Some(position);
+                }
+                cursor.previous = Some(position);
+            }
+        }
+        if !cursors.is_empty() && cursors.iter().all(|cursor| cursor.done) {
+            self.idle_slots.push(progress.slot);
+        }
+    }
+}
+
+/// An early re-arm may run after owner evidence disappears. Keep ordinary
+/// first batches on their original cadence; every accelerated batch needs
+/// the same owner cutoff as follow-up batches.
+#[derive(Debug, Default)]
+struct RescueHeartbeatCadence {
+    last_baseline: Option<Instant>,
+}
+
+impl RescueHeartbeatCadence {
+    fn select(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+        cutoff: Option<DateTime<Utc>>,
+    ) -> Option<Option<DateTime<Utc>>> {
+        if self
+            .last_baseline
+            .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            self.last_baseline = Some(now);
+            Some(None)
+        } else {
+            cutoff.map(Some)
+        }
     }
 }
 
@@ -858,9 +943,9 @@ pub struct MaintenanceService {
     rescue_pass_budget: Duration,
     rescue_pass_max_rows: usize,
     rescue_owner_evidence: std::sync::Mutex<RescueOwnerEvidence>,
-    /// Earliest `run_at` for the next attempt a queue-storage rescue sends
-    /// back to `retryable`; see [`Self::rescue_retry_floor`].
-    rescue_retry_horizon: std::sync::Mutex<Option<DateTime<Utc>>>,
+    rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
+    rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
+
     rescue_others_first_offset: AtomicUsize,
     promote_interval: Duration,
     cleanup_interval: Duration,
@@ -946,7 +1031,8 @@ impl MaintenanceService {
             rescue_pass_budget: DEFAULT_RESCUE_PASS_BUDGET,
             rescue_pass_max_rows: DEFAULT_RESCUE_PASS_MAX_ROWS,
             rescue_owner_evidence: std::sync::Mutex::new(RescueOwnerEvidence::default()),
-            rescue_retry_horizon: std::sync::Mutex::new(None),
+            rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
+            rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
             rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
@@ -1085,7 +1171,8 @@ impl MaintenanceService {
     }
 
     /// Set how many attempts one queue-storage rescue pass rescues before it
-    /// stops (default: 5000). A pass always finishes the batch it started.
+    /// stops (default: 5000). A pass always finishes the batch it started;
+    /// zero keeps one batch per ordinary interval, as a zero pass budget does.
     pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
         self.rescue_pass_max_rows = max_rows;
         self
@@ -1247,6 +1334,20 @@ impl MaintenanceService {
             // Per-branch overrun tracker. Issue #242 — observability only;
             // the architectural split of this `tokio::select!` is deferred
             // to v0.7 conditional on the overrun counter showing fleet hits.
+            *self
+                .rescue_owner_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                RescueOwnerEvidence::default();
+            *self
+                .rescue_heartbeat_cadence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                RescueHeartbeatCadence::default();
+            self.rescue_sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             let branch_tracker = MaintenanceBranchTracker::new();
             // Per-segment prune backoff (#169). Gates the prune step of
             // each rotate branch so a pinned MVCC snapshot doesn't make
@@ -1859,13 +1960,41 @@ impl MaintenanceService {
         };
         let budget = self.rescue_pass_budget.min(interval / 2);
         let dlq_enabled = |queue: &str| self.dlq_policy.enabled_for(queue);
-        let mut bulk_heartbeat_cutoff: Option<Option<DateTime<Utc>>> = None;
+        let bulk_heartbeat_cutoff = if kind == RescueKind::Heartbeat {
+            self.stale_claim_owners_gone().await
+        } else {
+            None
+        };
+        let first_heartbeat_cutoff = if kind == RescueKind::Heartbeat {
+            let selected = self
+                .rescue_heartbeat_cadence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .select(started, interval, bulk_heartbeat_cutoff);
+            let Some(cutoff) = selected else {
+                self.rescue_sweeps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&kind);
+                return false;
+            };
+            cutoff
+        } else {
+            None
+        };
         let mut rescued_total = 0usize;
         let mut oldest_attempt: Option<DateTime<Utc>> = None;
         let mut batches = 0usize;
-        let mut idle_slots: Vec<i32> = Vec::new();
+        let mut sweep = self
+            .rescue_sweeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&kind)
+            .unwrap_or_default();
+        sweep.revisit(started, interval);
         let pass_end = loop {
-            let slot_order = if batches % RESCUE_OTHERS_FIRST_EVERY == RESCUE_OTHERS_FIRST_EVERY - 1
+            let slot_order = if sweep.batches_started % RESCUE_OTHERS_FIRST_EVERY
+                == RESCUE_OTHERS_FIRST_EVERY - 1
             {
                 RescueSlotOrder::OthersFirst(
                     self.rescue_others_first_offset
@@ -1876,16 +2005,20 @@ impl MaintenanceService {
             };
             let options = RescueBatchOptions {
                 slot_order,
-                skip_slots: idle_slots.clone(),
-                retry_not_before: self.rescue_retry_floor(),
+                skip_slots: sweep.idle_slots.clone(),
+                retry_not_before: None,
                 cursor_scan_limit: (batches > 0).then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
             };
             let outcome = match kind {
                 RescueKind::Heartbeat => {
                     // Follow-up batches take only claims last heartbeated
                     // before a runtime known to be gone stopped reporting.
-                    let staleness = bulk_heartbeat_cutoff
-                        .flatten()
+                    let cutoff = if batches == 0 {
+                        first_heartbeat_cutoff
+                    } else {
+                        bulk_heartbeat_cutoff
+                    };
+                    let staleness = cutoff
                         .and_then(|cutoff| (Utc::now() - cutoff).to_std().ok())
                         .map_or(self.heartbeat_staleness, |since_cutoff| {
                             since_cutoff.max(self.heartbeat_staleness)
@@ -1914,10 +2047,12 @@ impl MaintenanceService {
                 }
             };
             batches += 1;
+            sweep.batches_started = sweep.batches_started.wrapping_add(1);
             let RescueBatch {
                 rescued,
                 saturated,
                 idle_slots: batch_idle_slots,
+                scan_progress,
             } = match outcome {
                 Ok(batch) => batch,
                 Err(err) => {
@@ -1926,14 +2061,11 @@ impl MaintenanceService {
                     break RescuePassEnd::Error;
                 }
             };
-            idle_slots.extend(batch_idle_slots);
+            sweep.idle_slots.extend(batch_idle_slots);
+            for progress in scan_progress {
+                sweep.observe(progress);
+            }
             rescued_total += rescued.len();
-            self.advance_rescue_retry_horizon(
-                rescued
-                    .iter()
-                    .filter(|job| job.state == JobState::Retryable)
-                    .count(),
-            );
             if let Some(attempted_at) = rescued.iter().filter_map(|job| job.attempted_at).min() {
                 oldest_attempt =
                     Some(oldest_attempt.map_or(attempted_at, |oldest| oldest.min(attempted_at)));
@@ -1944,17 +2076,11 @@ impl MaintenanceService {
             if !saturated {
                 break RescuePassEnd::Drained;
             }
-            if budget.is_zero() {
+            if budget.is_zero() || self.rescue_pass_max_rows == 0 {
                 break RescuePassEnd::TimeBudget;
             }
-            if kind == RescueKind::Heartbeat {
-                let cutoff = match bulk_heartbeat_cutoff {
-                    Some(cutoff) => cutoff,
-                    None => *bulk_heartbeat_cutoff.insert(self.stale_claim_owners_gone().await),
-                };
-                if cutoff.is_none() {
-                    break RescuePassEnd::OwnersUnconfirmed;
-                }
+            if kind == RescueKind::Heartbeat && bulk_heartbeat_cutoff.is_none() {
+                break RescuePassEnd::OwnersUnconfirmed;
             }
             if rescued_total >= self.rescue_pass_max_rows {
                 break RescuePassEnd::RowLimit;
@@ -1984,7 +2110,17 @@ impl MaintenanceService {
                 "Queue-storage rescue pass drained a backlog"
             );
         }
-        pass_end.backlog_remains() && !budget.is_zero()
+        let rearm = pass_end.backlog_remains()
+            && !budget.is_zero()
+            && self.rescue_pass_max_rows > 0
+            && (kind != RescueKind::Heartbeat || bulk_heartbeat_cutoff.is_some());
+        if rearm {
+            self.rescue_sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(kind, sweep);
+        }
+        rearm
     }
 
     async fn process_queue_storage_rescues(
@@ -2011,7 +2147,7 @@ impl MaintenanceService {
     }
 
     /// Sample the runtime snapshots and update [`RescueOwnerEvidence`].
-    /// Returns the heartbeat cutoff for follow-up stale-heartbeat batches
+    /// Returns the heartbeat cutoff for accelerated stale-heartbeat batches
     /// when the evidence holds and some runtime is known to be gone; `None`
     /// keeps the pass to one batch. A failed read counts as no evidence.
     async fn stale_claim_owners_gone(&self) -> Option<DateTime<Utc>> {
@@ -2052,34 +2188,6 @@ impl MaintenanceService {
         } else {
             None
         }
-    }
-
-    /// The earliest `run_at` for the next attempt a queue-storage rescue
-    /// sends back to `retryable`. Rescued attempts become due no faster than
-    /// `rescue_pass_max_rows` per second across all rescue kinds, so a large
-    /// drain reaches promotion and the ready lanes spread over time rather
-    /// than all at once. `None` while rescue runs below that rate.
-    fn rescue_retry_floor(&self) -> Option<DateTime<Utc>> {
-        let horizon = *self
-            .rescue_retry_horizon
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        horizon.filter(|horizon| *horizon > Utc::now())
-    }
-
-    fn advance_rescue_retry_horizon(&self, retried: usize) {
-        if retried == 0 {
-            return;
-        }
-        let per_second = self.rescue_pass_max_rows.max(RESCUE_BATCH_ROWS) as i64;
-        let spread = TimeDelta::microseconds(retried as i64 * 1_000_000 / per_second);
-        let now = Utc::now();
-        let mut horizon = self
-            .rescue_retry_horizon
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let start = horizon.map_or(now, |horizon| horizon.max(now));
-        *horizon = Some(start + spread);
     }
 
     /// Batched canonical stale-heartbeat rescue with the #388 row-at-a-time
@@ -4692,6 +4800,179 @@ mod tests {
             Some(clock + BRANCH_COOLDOWN_MAX),
             "cap bounds the cooldown"
         );
+    }
+
+    #[test]
+    fn rescue_accelerated_first_batch_requires_owner_evidence() {
+        let mut cadence = RescueHeartbeatCadence::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let cutoff = Utc::now();
+        assert_eq!(cadence.select(now, interval, None), Some(None));
+        assert_eq!(
+            cadence.select(now + Duration::from_secs(1), interval, Some(cutoff)),
+            Some(Some(cutoff))
+        );
+        // The preceding accelerated pass re-armed the timer, but owners
+        // became unconfirmed before it fired: no ordinary batch may slip in.
+        assert_eq!(
+            cadence.select(now + Duration::from_secs(2), interval, None),
+            None
+        );
+        assert_eq!(cadence.select(now + interval, interval, None), Some(None));
+    }
+
+    #[test]
+    fn rescue_closed_history_sweep_stops_after_wrap() {
+        let mut sweep = RescueSweep::default();
+        let stamp = Utc::now();
+        // First window ends midway around a slot. Sweep state survives
+        // the pass's time budget and the next early timer fire.
+        for id in [20, 40, 60, 10] {
+            sweep.observe(RescueScanProgress {
+                slot: 1,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, id, 1)),
+                    saturated: true,
+                }],
+            });
+            assert!(sweep.idle_slots.is_empty());
+        }
+        sweep.observe(RescueScanProgress {
+            slot: 1,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: Some((stamp, 20, 1)),
+                saturated: true,
+            }],
+        });
+        assert_eq!(sweep.idle_slots, vec![1]);
+
+        let mut one = RescueSweep::default();
+        for _ in 0..2 {
+            one.observe(RescueScanProgress {
+                slot: 0,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 1, 1)),
+                    saturated: true,
+                }],
+            });
+        }
+        assert_eq!(one.idle_slots, vec![0]);
+    }
+
+    #[test]
+    fn rescue_sweep_revisits_newly_eligible_slots_at_the_ordinary_interval() {
+        let mut sweep = RescueSweep::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let stamp = Utc::now();
+        sweep.revisit(now, interval);
+        // Slot A's deadlines are in the future; B keeps a large pass open.
+        sweep.observe(RescueScanProgress {
+            slot: 0,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: None,
+                saturated: false,
+            }],
+        });
+        sweep.observe(RescueScanProgress {
+            slot: 1,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: Some((stamp, 100, 1)),
+                saturated: true,
+            }],
+        });
+        sweep.revisit(now + interval / 2, interval);
+        assert_eq!(sweep.idle_slots, vec![0]);
+        // A can now be expired (or contain claims from a reused generation).
+        sweep.revisit(now + interval, interval);
+        assert!(sweep.idle_slots.is_empty());
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "revisiting an idle slot must not restart an unfinished sweep"
+        );
+    }
+
+    #[test]
+    fn rescue_sweep_detects_a_window_crossing_its_origin() {
+        let mut sweep = RescueSweep::default();
+        let stamp = Utc::now();
+        // A window can cross the origin and wrap again before its last key.
+        // Its end alone need never equal or exceed the original last key.
+        for id in [10_000, 1_999, 3_999, 5_999, 7_999, 9_999, 1_998] {
+            sweep.observe(RescueScanProgress {
+                slot: 0,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, id, 1)),
+                    saturated: true,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_closed_history_stops_rearming() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.expect("migrations");
+        let config = QueueStorageConfig::default();
+        let store = QueueStorage::new(config.clone()).expect("queue storage");
+        store.install(&pool).await.expect("install");
+        sqlx::query(
+            "INSERT INTO awa.lease_claims
+             (claim_slot, job_id, run_lease, ready_slot, ready_generation,
+              queue, priority, attempt, max_attempts, lane_seq, claimed_at, closed_at, deadline_at)
+             SELECT 0, id, 1, 0, 0, 'closed_history', 0, 1, 3, id,
+                    now() - interval '1 hour', now(), now() - interval '1 minute'
+             FROM generate_series(1, 10001) AS id",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed more closed history than a scan window");
+        let runtime =
+            QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("runtime");
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime.clone()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .rescue_pass_budget(Duration::from_millis(200));
+        let mut drained = false;
+        for _ in 0..20 {
+            if !service
+                .rescue_queue_storage_pass(RescueKind::Deadline, &runtime, false)
+                .await
+            {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "closed history must finish a bounded sweep instead of rearming forever"
+        );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        // Zero is a documented way to retain the ordinary one-batch cadence.
+        let service = service.rescue_pass_max_rows(0);
+        assert!(
+            !service
+                .rescue_queue_storage_pass(RescueKind::Deadline, &runtime, false)
+                .await
+        );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        pool.close().await;
     }
 
     #[test]

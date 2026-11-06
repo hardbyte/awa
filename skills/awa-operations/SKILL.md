@@ -150,10 +150,16 @@ On queue storage a killed runtime's open claims stop the claim ring rotating
 until rescue closes them. Rescue drains such a backlog in passes of 500-attempt
 batches, bounded by `rescue_pass_budget` (1s) and `rescue_pass_max_rows`
 (5000), with the next pass a second later while a backlog remains.
-Stale-heartbeat rescue only drains past one batch per pass once the runtime
-snapshots show the claims' owner gone, which needs `heartbeat_rescue_interval`
-below half of `heartbeat_staleness`. Watch `awa.maintenance.rescue.pass_size`
-(by `awa.rescue.pass_end`) and `awa.maintenance.rescue.oldest_attempt_age`.
+Stale-heartbeat rescue runs extra batches and early passes only after runtime
+snapshots support a full settled staleness window. The ordinary first batch
+keeps its configured interval. This evidence needs `heartbeat_rescue_interval`
+below half of `heartbeat_staleness`; at the defaults acceleration usually
+starts 3–3.5 minutes after a runtime's last snapshot. Leadership changes reset
+the evidence window. Zero for either rescue pass control keeps one batch per
+ordinary interval. Retried jobs retain their backoff, and due times can cluster;
+the pass row cap does not cap promotion throughput. Watch
+`awa.maintenance.rescue.pass_size` (by `awa.rescue.pass_end`) and
+`awa.maintenance.rescue.oldest_attempt_age`, filtering to the current leader.
 
 Finished handlers retry durable finalization for up to 120s from the first
 finalize attempt when database writes are unavailable, including connection,
