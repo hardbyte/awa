@@ -130,6 +130,14 @@ fn spawn_process(
                 .to_string(),
         )
         .env("SOAK_ROLE", role)
+        .env(
+            "SOAK_DRAIN",
+            if shared.load_stop.is_stopped() {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("SOAK_QUEUE_WORK", QUEUE_WORK)
         .env("SOAK_QUEUE_DEADLINE", QUEUE_DEADLINE)
         .env("SOAK_QUEUE_SHARED", QUEUE_SHARED)
@@ -212,7 +220,72 @@ pub struct PythonHandle {
     process: tokio::sync::Mutex<PythonProcess>,
 }
 
+// Used in both phases: after load stops a dead process still needs a worker
+// replacement, but spawn_process disables its producers through SOAK_DRAIN.
+fn restart_if_needed(
+    child: &mut Option<Child>,
+    start: impl FnOnce() -> Result<Child, String>,
+) -> Result<Option<String>, String> {
+    let reason = match child.as_mut() {
+        Some(child) => match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => format!("process exited with {status}"),
+            None => return Ok(None),
+        },
+        None => "process was absent".to_string(),
+    };
+    child.take();
+    *child = Some(start()?);
+    Ok(Some(reason))
+}
+
+fn finished_probe_errors(probes: &mut tokio::task::JoinSet<()>) -> Vec<String> {
+    let mut errors = Vec::new();
+    while let Some(result) = probes.try_join_next() {
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+    }
+    errors
+}
+
+async fn begin_drain(
+    stop_producers: impl std::future::Future<Output = ()>,
+    probes: &mut tokio::task::JoinSet<()>,
+) -> Vec<String> {
+    // Startup probes may still be blocked. Stop production before waiting for
+    // them, and leave their observation tasks running beside worker recovery.
+    stop_producers.await;
+    finished_probe_errors(probes)
+}
+
 impl PythonHandle {
+    async fn ensure_running(&self, shared: &Arc<Shared>) {
+        let mut process = self.process.lock().await;
+        let python = process.python.clone();
+        let ledger_path = process.ledger_path.clone();
+        match restart_if_needed(&mut process.child, || {
+            spawn(shared, &python, &ledger_path, "full")
+        }) {
+            Ok(Some(reason)) => {
+                process.restarts += 1;
+                shared
+                    .stats(Persona::Python)
+                    .add("python_unexpected_exits", 1);
+                shared.note(
+                    "python",
+                    format!(
+                        "{reason}; restarted (draining={})",
+                        shared.load_stop.is_stopped()
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => shared.incomplete(
+                format!("Python worker liveness/restart check failed: {error}"),
+                vec![],
+            ),
+        }
+    }
     /// Kills the process without a shutdown handshake and starts a new one after `downtime`.
     pub async fn kill_and_restart(
         &self,
@@ -574,19 +647,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     while !shared.load_stop.sleep(Duration::from_secs(1)).await {
         importer.import(&shared);
         tail_terminal_rows(&shared, &tail_pool, &mut tail_tick).await;
-        {
-            let mut process = handle.process.lock().await;
-            if let Some(child) = process.child.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    shared.stats(persona).add("python_unexpected_exits", 1);
-                    shared.note(
-                        "python",
-                        format!("python process exited unexpectedly: {status}; restarting"),
-                    );
-                    process.child = spawn(&shared, &python, &ledger_path, "full").ok();
-                }
-            }
-        }
+        handle.ensure_running(&shared).await;
         if Instant::now() >= next_probe {
             next_probe = Instant::now() + probe_every;
             let (shared, python, ledger_path) =
@@ -595,24 +656,55 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         }
     }
 
-    while probes.join_next().await.is_some() {}
-    // Stop producing; the workers keep running while the system drains.
-    if let Some(pid) = handle
-        .process
-        .lock()
-        .await
-        .child
-        .as_ref()
-        .and_then(Child::id)
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-USR1", &pid.to_string()])
-            .status();
+    // Stop producing immediately; outstanding migration probes must not delay
+    // this signal or the liveness/evidence checks during the fixed drain grace.
+    let errors = begin_drain(
+        async {
+            if let Some(pid) = handle
+                .process
+                .lock()
+                .await
+                .child
+                .as_ref()
+                .and_then(Child::id)
+            {
+                match std::process::Command::new("kill")
+                    .args(["-USR1", &pid.to_string()])
+                    .status()
+                {
+                    Ok(status) if status.success() => {}
+                    result => shared.incomplete(
+                        format!("Python stop-production signal failed: {result:?}"),
+                        vec![],
+                    ),
+                }
+            }
+        },
+        &mut probes,
+    )
+    .await;
+    for error in errors {
+        shared.incomplete(format!("Python migration probe failed: {error}"), vec![]);
     }
     shared.note("python", "load stopped; draining");
     while !shared.drain_stop.sleep(Duration::from_secs(1)).await {
+        handle.ensure_running(&shared).await;
         importer.import(&shared);
         tail_terminal_rows(&shared, &tail_pool, &mut tail_tick).await;
+        for error in finished_probe_errors(&mut probes) {
+            shared.incomplete(format!("Python migration probe failed: {error}"), vec![]);
+        }
+    }
+    // Finished tasks retain their result. Only a task actually cancelled at
+    // shutdown lacks the required evidence; do not add time to the drain grace.
+    probes.abort_all();
+    while let Some(result) = probes.join_next().await {
+        if let Err(error) = result {
+            shared.incomplete(
+                format!("Python migration probe unfinished or failed at drain shutdown: {error}"),
+                vec![],
+            );
+        }
     }
     importer.import(&shared);
     if let Some(mut child) = handle.process.lock().await.child.take() {
@@ -654,6 +746,10 @@ async fn tail_terminal_rows(shared: &Arc<Shared>, pool: &sqlx::PgPool, tick: &mu
     let rows = match rows {
         Ok(rows) => rows,
         Err(error) => {
+            shared.incomplete(
+                format!("Python terminal evidence query failed: {error}"),
+                vec![],
+            );
             shared.stats(Persona::Python).add("python_tail_errors", 1);
             if shared.stats(Persona::Python).get("python_tail_errors") <= 3 {
                 shared.note("python", format!("terminal row tail failed: {error}"));
@@ -740,4 +836,64 @@ async fn check_rolled_back(shared: &Arc<Shared>, ids: &HashSet<i64>) -> Result<(
     }
     pool.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn finished_child() -> Result<Child, String> {
+        Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+            .arg("--list")
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn dead_child_is_restarted_for_the_drain_liveness_loop() {
+        let mut child = Some(finished_child().unwrap());
+        child.as_mut().unwrap().wait().await.unwrap();
+        let result = restart_if_needed(&mut child, finished_child).unwrap();
+        assert!(result.is_some(), "a dead drain worker needs a replacement");
+        assert!(child.is_some());
+        child.as_mut().unwrap().wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outstanding_probe_does_not_delay_stop_production_or_worker_recovery() {
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let (stopped, mut stop_seen) = tokio::sync::oneshot::channel();
+        let mut probes = tokio::task::JoinSet::new();
+        probes.spawn(async move {
+            let _ = blocked.await;
+        });
+        let errors = tokio::time::timeout(
+            crate::ci_timing::scaled_timeout(Duration::from_secs(1)),
+            begin_drain(
+                async {
+                    stopped.send(()).unwrap();
+                },
+                &mut probes,
+            ),
+        )
+        .await
+        .expect("stop production must precede waiting on a blocked probe");
+        assert!(errors.is_empty());
+        assert!(stop_seen.try_recv().is_ok());
+        assert!(
+            !probes.is_empty(),
+            "the probe remains blocked while drain proceeds"
+        );
+        release.send(()).unwrap();
+        probes.join_next().await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn failed_restart_is_reported_instead_of_losing_the_process_silently() {
+        let mut child = None;
+        let result = restart_if_needed(&mut child, || Err("injected spawn failure".into()));
+        assert_eq!(result.unwrap_err(), "injected spawn failure");
+        assert!(child.is_none());
+    }
 }

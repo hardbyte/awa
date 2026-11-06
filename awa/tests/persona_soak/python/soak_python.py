@@ -307,6 +307,13 @@ async def main():
     if ROLE == "migrate_probe":
         await migrate_probe_main()
         return
+    # A chaos restart can still be migrating when the load ends. Remember the
+    # drain request before startup awaits, then start workers without producers.
+    stop = asyncio.Event()
+    if os.environ.get("SOAK_DRAIN") == "1":
+        stop.set()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGUSR1, stop.set)
     rng = random.Random(SEED)
     client = awa.AsyncClient(URL, max_connections=14)
     await migrate_and_probe(client, "startup")
@@ -327,9 +334,6 @@ async def main():
     # The deadline queue serves a second kind through the same handler.
     print(f"READY pid={os.getpid()}", flush=True)
 
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGUSR1, stop.set)
     tasks = [
         asyncio.create_task(producer_singles(client, rng, stop)),
         asyncio.create_task(producer_batches(client, rng, stop)),
