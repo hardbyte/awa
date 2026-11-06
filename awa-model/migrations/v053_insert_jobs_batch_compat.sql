@@ -1,5 +1,6 @@
 -- v053: Batch producer insert that holds each enqueue lane lock only for the
 -- lane write.
+-- Tracking: https://github.com/hardbyte/awa/pull/635
 --
 -- awa.insert_job_compat takes the (queue, priority, shard) lane lock in
 -- reserve_enqueue_seq on a batch's first row and, because the lock is
@@ -22,11 +23,10 @@
 -- N-1 binaries: unchanged. They keep calling awa.insert_job_compat, whose
 -- definition this migration does not touch, and the two paths share the lane
 -- lock, so producers on either version serialise exactly as before.
--- Binaries that know the function: insert_many and insert_many_copy look for it
--- in the catalog and use the per-row function until it exists, so they run
--- unchanged before this migration and pick the function up after it, without a
--- restart. insert_many_skip_unique_conflicts needs it and reports a schema
--- without it.
+-- Binaries that know the function: insert_many_copy probes its own connection
+-- and uses the per-row function until it exists, picking up the migration
+-- without a restart. Generic insert_many always uses the per-row function;
+-- insert_many_skip_unique_conflicts requires the batch function.
 -- External runners: apply this file; nothing else reads it.
 -- Live load: one CREATE OR REPLACE FUNCTION, no table DDL.
 
