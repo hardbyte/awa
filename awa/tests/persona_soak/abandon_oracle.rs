@@ -286,6 +286,10 @@ impl AbandonState {
         self.ring.lock().expect("ring").episode.is_some()
     }
 
+    pub fn current_ring_episode(&self) -> Option<RingEpisode> {
+        self.ring.lock().expect("ring").episode.clone()
+    }
+
     pub fn episodes(&self) -> Vec<RingEpisode> {
         let ring = self.ring.lock().expect("ring");
         let mut all = ring.episodes.clone();

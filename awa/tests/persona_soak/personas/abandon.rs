@@ -593,6 +593,7 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
     };
     let staleness_secs = shared.config.heartbeat_staleness.as_secs_f64();
     let mut tick = 0u64;
+    let mut lock_captures = super::super::ring_locks::CaptureBudget::default();
     while !shared.drain_stop.sleep(Duration::from_secs(1)).await {
         tick += 1;
         let ring: Result<(i32, i64, i32), _> = sqlx::query_as(&format!(
@@ -632,6 +633,15 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
         shared
             .abandon
             .observe_ring(&shared, slot, ring_generation, next_slot);
+        super::super::ring_locks::observe(
+            &shared,
+            &pool,
+            &schema,
+            slot_count,
+            next_slot,
+            &mut lock_captures,
+        )
+        .await;
         if tick.is_multiple_of(3) {
             // Read what the live process has started before the probe, so a claim started
             // meanwhile cannot make a claim look missing.

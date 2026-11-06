@@ -116,6 +116,12 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     }
 
     let _ = writeln!(out, "## Run");
+    if shared.run.get("claim_ring_lock_capture_records") > 0 {
+        let _ = writeln!(
+            out,
+            "Lock evidence: [claim-ring-locks.jsonl](claim-ring-locks.jsonl)"
+        );
+    }
     for (name, value) in shared.run.counters() {
         let _ = writeln!(out, "- {name}: {value}");
     }

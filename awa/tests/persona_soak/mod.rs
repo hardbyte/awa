@@ -13,6 +13,7 @@ pub mod pgserver;
 pub mod python_probe;
 pub mod registry;
 pub mod report;
+pub mod ring_locks;
 pub mod rng;
 pub mod roles;
 pub mod run;
