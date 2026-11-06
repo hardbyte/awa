@@ -1,4 +1,5 @@
 use crate::executor::DlqPolicy;
+use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::cron::{
@@ -7,7 +8,8 @@ use awa_model::cron::{
 #[cfg(test)]
 use awa_model::SkipReason;
 use awa_model::{
-    JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome, TerminalDeltaRollupOutcome,
+    AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
+    RotateOutcome, TerminalDeltaRollupOutcome,
 };
 use chrono::Utc;
 use croner::Cron;
@@ -17,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -719,6 +721,224 @@ const CRON_CATCH_UP_LIMIT: usize = 1_000;
 const TERMINAL_COUNT_ROLLUP_MAX_SLOTS_PER_TICK: usize = 4;
 type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
 
+/// How long a promotion transaction waits on one lane's locks before the
+/// leader hands the lane to a dedicated waiter and goes on without it.
+const PROMOTE_LANE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
+/// Lock wait of a dedicated lane waiter. PostgreSQL grants a lock to its
+/// waiters in arrival order, so a waiter is served after the producers queued
+/// ahead of it, however busy the lane stays.
+const PROMOTE_LANE_WAITER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most lanes with a dedicated waiter at once. A waiter holds a pool
+/// connection while it waits.
+const PROMOTE_MAX_LANE_WAITERS: usize = 4;
+
+/// Queue-storage promotion of due scheduled and retryable rows, as the
+/// maintenance leader runs it for one store.
+///
+/// Each lane's share of a batch is promoted in its own transaction under a
+/// short `lock_timeout`, so a lane whose enqueue lock is busy delays only its
+/// own rows. A lane that times out keeps its rows deferred and is handed to a
+/// dedicated waiter task, which promotes it under a long lock timeout while
+/// the leader carries on with other lanes and other maintenance branches.
+/// Dropping the promoter aborts its waiters.
+#[doc(hidden)]
+pub struct QueueStoragePromoter {
+    pool: PgPool,
+    store: Arc<QueueStorage>,
+    metrics: AwaMetrics,
+    waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
+    waiters: std::sync::Mutex<JoinSet<()>>,
+}
+
+impl QueueStoragePromoter {
+    pub fn new(pool: PgPool, store: Arc<QueueStorage>, metrics: AwaMetrics) -> Self {
+        Self {
+            pool,
+            store,
+            metrics,
+            waiting: Arc::default(),
+            waiters: std::sync::Mutex::new(JoinSet::new()),
+        }
+    }
+
+    /// One promotion tick for `state`: batches until one selects fewer rows
+    /// than the batch size, each skipping lanes that have a waiter or were
+    /// contended earlier in the tick. Returns the rows promoted by the tick
+    /// itself, not by waiters.
+    pub async fn promote_due(
+        &self,
+        state: JobState,
+        cancel: &CancellationToken,
+    ) -> Result<usize, AwaError> {
+        {
+            let mut waiters = self.waiters.lock().expect("lane waiters poisoned");
+            while waiters.try_join_next().is_some() {}
+        }
+
+        let mut contended: Vec<PromotionLane> = Vec::new();
+        let mut promoted = 0usize;
+        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let mut skip = self.waiting_lanes(state);
+            skip.extend(contended.iter().cloned());
+            let batch_started = Instant::now();
+            let outcome = self
+                .store
+                .promote_due_lanes(
+                    &self.pool,
+                    state,
+                    PROMOTE_BATCH_SIZE,
+                    Some(PROMOTE_LANE_LOCK_TIMEOUT),
+                    &skip,
+                )
+                .await?;
+            self.metrics.record_promotion_batch(
+                state.as_str(),
+                outcome.promoted as u64,
+                batch_started.elapsed(),
+            );
+            promoted += outcome.promoted;
+            for lane in outcome.contended {
+                self.hand_off(state, lane.clone());
+                contended.push(lane);
+            }
+            if (outcome.selected as i64) < PROMOTE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(promoted)
+    }
+
+    fn waiting_lanes(&self, state: JobState) -> Vec<PromotionLane> {
+        self.waiting
+            .lock()
+            .expect("waiting lanes poisoned")
+            .iter()
+            .filter(|(waiting_state, _)| *waiting_state == state)
+            .map(|(_, lane)| lane.clone())
+            .collect()
+    }
+
+    fn hand_off(&self, state: JobState, lane: PromotionLane) {
+        let key = (state, lane);
+        {
+            let mut waiting = self.waiting.lock().expect("waiting lanes poisoned");
+            if waiting.len() >= PROMOTE_MAX_LANE_WAITERS {
+                self.metrics.record_promotion_lane_contention(
+                    state.as_str(),
+                    &key.1.queue,
+                    "waiter_limit",
+                );
+                debug!(
+                    queue = %key.1.queue,
+                    priority = key.1.priority,
+                    "Promotion lane contended with every lane waiter busy; retrying next tick"
+                );
+                return;
+            }
+            if !waiting.insert(key.clone()) {
+                return;
+            }
+        }
+        self.metrics
+            .record_promotion_lane_contention(state.as_str(), &key.1.queue, "handed_off");
+        let guard = WaitingLane {
+            waiting: Arc::clone(&self.waiting),
+            key,
+        };
+        let pool = self.pool.clone();
+        let store = Arc::clone(&self.store);
+        let metrics = self.metrics.clone();
+        self.waiters
+            .lock()
+            .expect("lane waiters poisoned")
+            .spawn(async move {
+                promote_waiting_lane(&pool, &store, &metrics, &guard.key).await;
+                drop(guard);
+            });
+    }
+}
+
+/// Holds a lane in [`QueueStoragePromoter`]'s waiting set until its waiter
+/// finishes, panics or is aborted.
+struct WaitingLane {
+    waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
+    key: (JobState, PromotionLane),
+}
+
+impl Drop for WaitingLane {
+    fn drop(&mut self) {
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.remove(&self.key);
+        }
+    }
+}
+
+async fn promote_waiting_lane(
+    pool: &PgPool,
+    store: &QueueStorage,
+    metrics: &AwaMetrics,
+    (state, lane): &(JobState, PromotionLane),
+) {
+    for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+        let batch_started = Instant::now();
+        match store
+            .promote_due_lane(
+                pool,
+                *state,
+                lane,
+                PROMOTE_BATCH_SIZE,
+                Some(PROMOTE_LANE_WAITER_LOCK_TIMEOUT),
+            )
+            .await
+        {
+            Ok(outcome) if !outcome.contended.is_empty() => {
+                metrics.record_promotion_lane_contention(
+                    state.as_str(),
+                    &lane.queue,
+                    "waiter_timed_out",
+                );
+                warn!(
+                    queue = %lane.queue,
+                    priority = lane.priority,
+                    lock_timeout_ms = PROMOTE_LANE_WAITER_LOCK_TIMEOUT.as_millis() as u64,
+                    "Promotion of a contended lane timed out waiting for its locks; retrying next tick"
+                );
+                return;
+            }
+            Ok(outcome) => {
+                metrics.record_promotion_batch(
+                    state.as_str(),
+                    outcome.promoted as u64,
+                    batch_started.elapsed(),
+                );
+                if (outcome.selected as i64) < PROMOTE_BATCH_SIZE {
+                    return;
+                }
+            }
+            Err(err) => {
+                error!(
+                    queue = %lane.queue,
+                    priority = lane.priority,
+                    error = %err,
+                    "Failed to promote a contended lane"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The leader's queue-storage promoters: its own store's, and the configured
+/// store a canonical-resolved leader promotes once routing has flipped
+/// (#456). Scoped to one leadership term.
+struct LeaderPromoters {
+    primary: Option<QueueStoragePromoter>,
+    standby: Option<QueueStoragePromoter>,
+}
+
 impl MaintenanceService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1019,6 +1239,22 @@ impl MaintenanceService {
             // tick. Local to the leader loop so a re-election resets
             // backoff to zero.
             let prune_tracker = PruneBackoffTracker::new();
+            let promoters = LeaderPromoters {
+                primary: self.storage.queue_storage().map(|runtime| {
+                    QueueStoragePromoter::new(
+                        self.pool.clone(),
+                        Arc::clone(&runtime.store),
+                        self.metrics.clone(),
+                    )
+                }),
+                standby: self.standby_queue_storage.as_ref().map(|runtime| {
+                    QueueStoragePromoter::new(
+                        self.pool.clone(),
+                        Arc::clone(&runtime.store),
+                        self.metrics.clone(),
+                    )
+                }),
+            };
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -1084,7 +1320,7 @@ impl MaintenanceService {
                     }
                     _ = promote_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
-                            self.promote_scheduled().await;
+                            self.promote_scheduled(&promoters).await;
                             timer.finish();
                         }
                     }
@@ -2324,13 +2560,20 @@ impl MaintenanceService {
     }
 
     /// Promote scheduled jobs that are now due.
-    #[tracing::instrument(skip(self), name = "maintenance.promote")]
-    async fn promote_scheduled(&self) {
-        if let Err(err) = self.promote_due_state("scheduled", "scheduled jobs").await {
+    #[tracing::instrument(skip(self, promoters), name = "maintenance.promote")]
+    async fn promote_scheduled(&self, promoters: &LeaderPromoters) {
+        if let Err(err) = self
+            .promote_due_state(JobState::Scheduled, "scheduled jobs", promoters)
+            .await
+        {
             error!(error = %err, "Failed to promote scheduled jobs");
         }
         if let Err(err) = self
-            .promote_due_state("retryable", "retryable jobs (backoff elapsed)")
+            .promote_due_state(
+                JobState::Retryable,
+                "retryable jobs (backoff elapsed)",
+                promoters,
+            )
             .await
         {
             error!(error = %err, "Failed to promote retryable jobs");
@@ -2339,138 +2582,55 @@ impl MaintenanceService {
 
     async fn promote_due_state(
         &self,
-        state: &'static str,
+        state: JobState,
         label: &'static str,
-    ) -> Result<(), awa_model::AwaError> {
+        promoters: &LeaderPromoters,
+    ) -> Result<(), AwaError> {
+        let canonical_state = match state {
+            JobState::Scheduled => "scheduled",
+            JobState::Retryable => "retryable",
+            other => {
+                return Err(AwaError::Validation(format!(
+                    "unsupported promote state: {other:?}"
+                )));
+            }
+        };
         let mut promoted_total = 0usize;
         let mut notified_queues = HashSet::new();
 
-        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
-            if self.cancel.is_cancelled() {
-                break;
-            }
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                promoted_total += self
+                    .promote_canonical_due(canonical_state, &mut notified_queues)
+                    .await?;
 
-            match &self.storage {
-                RuntimeStorage::Canonical => {
-                    let (promoted, queues) = self
-                        .promote_due_batch(state)
-                        .await
-                        .map_err(awa_model::AwaError::Database)?;
-                    if promoted == 0 {
-                        break;
-                    }
-
-                    promoted_total += promoted;
-                    notified_queues.extend(queues);
-
-                    if promoted < PROMOTE_BATCH_SIZE as usize {
-                        break;
-                    }
-                }
-                RuntimeStorage::QueueStorage(runtime) => {
-                    let job_state = match state {
-                        "scheduled" => awa_model::JobState::Scheduled,
-                        "retryable" => awa_model::JobState::Retryable,
-                        other => {
-                            return Err(awa_model::AwaError::Validation(format!(
-                                "unsupported queue storage promote state: {other}"
-                            )));
-                        }
-                    };
-                    let promote_start = std::time::Instant::now();
-                    let promoted = runtime
-                        .store
-                        .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
-                        .await?;
-                    self.metrics.record_promotion_batch(
-                        state,
-                        promoted as u64,
-                        promote_start.elapsed(),
-                    );
-                    if promoted == 0 {
-                        break;
-                    }
-
-                    promoted_total += promoted;
-
-                    if promoted < PROMOTE_BATCH_SIZE as usize {
-                        break;
+                // #456 mirror: a canonical-resolved (pre-flip) leader must
+                // promote the queue-storage deferred backlog once routing has
+                // flipped — re-scheduled canonical jobs migrate there, and
+                // post-flip runtimes that would promote them may not hold
+                // leadership. The active-schema guard keeps this a no-op until
+                // the flip.
+                if let Some(promoter) = &promoters.standby {
+                    if self.active_standby_queue_storage().await.is_some() {
+                        promoted_total += promoter.promote_due(state, &self.cancel).await?;
                     }
                 }
             }
-        }
+            RuntimeStorage::QueueStorage(_) => {
+                if let Some(promoter) = &promoters.primary {
+                    promoted_total += promoter.promote_due(state, &self.cancel).await?;
+                }
 
-        // #456: while a storage transition drains, due jobs can still sit in
-        // the canonical deferred backlog. Drain-only runtimes execute
-        // canonical work but stop leading maintenance once a post-flip
-        // runtime wins the election, so a queue-storage leader must promote
-        // the canonical plane too. Both queries are cheap no-ops once the
-        // canonical tables are empty (every finalized or fresh install).
-        if matches!(&self.storage, RuntimeStorage::QueueStorage(_)) {
-            for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
-                if self.cancel.is_cancelled() {
-                    break;
-                }
-                let (promoted, queues) = self
-                    .promote_due_batch(state)
-                    .await
-                    .map_err(awa_model::AwaError::Database)?;
-                if promoted == 0 {
-                    break;
-                }
-                promoted_total += promoted;
-                notified_queues.extend(queues);
-                if promoted < PROMOTE_BATCH_SIZE as usize {
-                    break;
-                }
-            }
-        }
-
-        // #456 mirror: a canonical-resolved (pre-flip) leader must promote
-        // the queue-storage deferred backlog once routing has flipped —
-        // re-scheduled canonical jobs migrate there, and post-flip runtimes
-        // that would promote them may not hold leadership. The active-schema
-        // guard keeps this a no-op until the flip.
-        if matches!(&self.storage, RuntimeStorage::Canonical) {
-            if let Some(runtime) = &self.standby_queue_storage {
-                let active_schema: Option<String> =
-                    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(awa_model::AwaError::Database)?;
-                if active_schema.as_deref() == Some(runtime.store.schema()) {
-                    let job_state = match state {
-                        "scheduled" => awa_model::JobState::Scheduled,
-                        "retryable" => awa_model::JobState::Retryable,
-                        other => {
-                            return Err(awa_model::AwaError::Validation(format!(
-                                "unsupported queue storage promote state: {other}"
-                            )));
-                        }
-                    };
-                    for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
-                        if self.cancel.is_cancelled() {
-                            break;
-                        }
-                        let promote_start = std::time::Instant::now();
-                        let promoted = runtime
-                            .store
-                            .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
-                            .await?;
-                        self.metrics.record_promotion_batch(
-                            state,
-                            promoted as u64,
-                            promote_start.elapsed(),
-                        );
-                        if promoted == 0 {
-                            break;
-                        }
-                        promoted_total += promoted;
-                        if promoted < PROMOTE_BATCH_SIZE as usize {
-                            break;
-                        }
-                    }
-                }
+                // #456: while a storage transition drains, due jobs can still
+                // sit in the canonical deferred backlog. Drain-only runtimes
+                // execute canonical work but stop leading maintenance once a
+                // post-flip runtime wins the election, so a queue-storage
+                // leader must promote the canonical plane too. This is a
+                // cheap no-op once the canonical tables are empty (every
+                // finalized or fresh install).
+                promoted_total += self
+                    .promote_canonical_due(canonical_state, &mut notified_queues)
+                    .await?;
             }
         }
 
@@ -2478,12 +2638,40 @@ impl MaintenanceService {
             debug!(
                 count = promoted_total,
                 queues = notified_queues.len(),
-                state,
+                state = canonical_state,
                 "Promoted {label}"
             );
         }
 
         Ok(())
+    }
+
+    /// Promote due canonical `scheduled_jobs` rows in batches until one comes
+    /// back short.
+    async fn promote_canonical_due(
+        &self,
+        state: &'static str,
+        notified_queues: &mut HashSet<String>,
+    ) -> Result<usize, AwaError> {
+        let mut promoted_total = 0usize;
+        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            let (promoted, queues) = self
+                .promote_due_batch(state)
+                .await
+                .map_err(AwaError::Database)?;
+            if promoted == 0 {
+                break;
+            }
+            promoted_total += promoted;
+            notified_queues.extend(queues);
+            if promoted < PROMOTE_BATCH_SIZE as usize {
+                break;
+            }
+        }
+        Ok(promoted_total)
     }
 
     /// SQL template for promotion. The state literal is injected directly

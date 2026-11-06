@@ -245,6 +245,7 @@ Retry backoff and `Snooze` use the same mechanism: the current attempt closes, a
 Operational knobs:
 
 - `promote_interval` controls how often maintenance checks for due deferred rows.
+- A queue whose enqueue lane is kept busy by producers does not delay promotion of other queues or the leader's rescue: promotion waits 50 ms for a lane's lock, then hands the lane to a dedicated waiter that is served in turn. `awa_maintenance_promote_lane_contention_total` counts those hand-offs by queue; a steady `waiter_limit` or `waiter_timed_out` rate means more lanes are saturated than the leader's four waiters cover, or a transaction is holding a lane lock for longer than 30 s.
 - Per-job `run_at` controls the due time.
 - Periodic schedules are declared in worker code with `periodic()` and managed through the CLI/UI `cron` surface.
 

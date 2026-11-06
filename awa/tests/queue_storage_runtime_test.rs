@@ -7,8 +7,8 @@ mod ci_timing;
 
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
-    BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
-    SubmitBatchOperation,
+    BatchOperationSpec, PromotionLane, PruneOutcome, QueueStorage, QueueStorageConfig,
+    RotateOutcome, SkipReason, SubmitBatchOperation,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -8029,9 +8029,10 @@ fn branch_overruns() -> Arc<std::sync::Mutex<Vec<BranchOverrun>>> {
 /// snoozed and retry-after jobs runnable, so overrunning promotion bodies must
 /// never arm a cooldown on it.
 ///
-/// The first three promotion bodies (two `DELETE`s each) take 1.2s against a
-/// 25ms promote interval, so the maintenance branch tracker flags promotion as
-/// overrunning. The test asserts on that overrun warning rather than on job
+/// Every promotion body runs the canonical-plane promotion `DELETE` once per
+/// state, even with nothing due. A statement trigger slows the first six, so
+/// the first three bodies take 1.2s against a 25ms promote interval and the
+/// maintenance branch tracker flags promotion as overrunning. The test asserts on that overrun warning rather than on job
 /// latency: the promotion warning must report no cooldown, while another
 /// branch in the same run (cleanup, whose bodies exceed its 1ms interval)
 /// does report one, so the check cannot pass vacuously. Jobs that fall due
@@ -8058,7 +8059,7 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
              END $$"
         ),
         format!(
-            "CREATE TRIGGER slow_first_promote_deletes BEFORE DELETE ON {schema}.deferred_jobs \
+            "CREATE TRIGGER slow_first_promote_deletes BEFORE DELETE ON awa.scheduled_jobs \
              FOR EACH STATEMENT EXECUTE FUNCTION {schema}.slow_first_promote_deletes()"
         ),
     ] {
@@ -8189,6 +8190,316 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
         "a cooldown-bearing branch should have armed a cooldown in this run: {overruns:?}"
     );
 
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// Advisory lock key of a lane's enqueue reservation, as
+/// `reserve_enqueue_seq` takes it. The lane must already exist.
+async fn enqueue_lane_lock_key(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT hashtextextended(format('%I.%I', $1::text, seq_name), 0) \
+         FROM {}.queue_enqueue_heads \
+         WHERE queue = $2 AND priority = $3 AND enqueue_shard = 0",
+        store.schema()
+    ))
+    .bind(store.schema())
+    .bind(queue)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .expect("derive enqueue lane lock key")
+}
+
+/// A promotion batch that meets a lane whose enqueue lock is held promotes
+/// the other lanes, reports the held lane as contended after its lock timeout
+/// and leaves its rows deferred. Promoted later, the lane's rows take lane
+/// sequence numbers in due order and are all claimable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_order() {
+    const PRIORITY: i16 = 2;
+    let (_db_guard, pool) = setup_pool(6).await;
+    let hot = "qs_promote_contended_hot";
+    let other = "qs_promote_contended_other";
+    let store = create_store(&pool, "awa_qs_promote_contended_lane").await;
+    let opts = |queue: &str, run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        priority: PRIORITY,
+        run_at,
+        ..Default::default()
+    };
+
+    let warm_job_id = enqueue_job(&pool, &store, &CompleteJob { id: 0 }, opts(hot, None)).await;
+    // Later job ids fall due earlier, so due order differs from id order.
+    let due_base = Utc::now() - chrono::Duration::seconds(60);
+    let mut hot_due = Vec::new();
+    for n in 0..6 {
+        let run_at = due_base - chrono::Duration::seconds(n);
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: n },
+            opts(hot, Some(run_at)),
+        )
+        .await;
+        hot_due.push((run_at, job_id));
+    }
+    hot_due.sort();
+    let hot_in_due_order: Vec<i64> = hot_due.iter().map(|(_, job_id)| *job_id).collect();
+    let other_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 100 },
+        opts(other, Some(due_base)),
+    )
+    .await;
+
+    let hot_lane = PromotionLane {
+        queue: hot.to_string(),
+        priority: PRIORITY,
+    };
+    let lock_key = enqueue_lane_lock_key(&pool, &store, hot, PRIORITY).await;
+    let mut holder = pool.begin().await.expect("begin lane holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(holder.as_mut())
+        .await
+        .expect("hold the hot lane's enqueue lock");
+
+    let lock_timeout = Duration::from_millis(100);
+    let started = Instant::now();
+    let outcome = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, Some(lock_timeout), &[])
+        .await
+        .expect("promote with the hot lane held");
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert_eq!(outcome.selected, 7, "{outcome:?}");
+    assert_eq!(outcome.contended, vec![hot_lane.clone()]);
+    assert!(
+        elapsed >= lock_timeout && elapsed < scaled_timeout(Duration::from_secs(1)),
+        "the held lane should cost one lock timeout, took {elapsed:?}"
+    );
+    let other_job = store
+        .load_job(&pool, other_job_id)
+        .await
+        .expect("load other job")
+        .expect("other job exists");
+    assert_eq!(other_job.state, JobState::Available);
+    for job_id in &hot_in_due_order {
+        let job = store
+            .load_job(&pool, *job_id)
+            .await
+            .expect("load hot job")
+            .expect("hot job exists");
+        assert_eq!(job.state, JobState::Scheduled, "job {job_id}");
+    }
+
+    let skipped = store
+        .promote_due_lanes(
+            &pool,
+            JobState::Scheduled,
+            100,
+            Some(lock_timeout),
+            std::slice::from_ref(&hot_lane),
+        )
+        .await
+        .expect("promote with the hot lane skipped");
+    assert_eq!(skipped, Default::default());
+
+    holder.commit().await.expect("release the hot lane");
+    let mut batches = 0;
+    loop {
+        let outcome = store
+            .promote_due_lane(&pool, JobState::Scheduled, &hot_lane, 4, None)
+            .await
+            .expect("promote the hot lane");
+        assert!(outcome.contended.is_empty(), "{outcome:?}");
+        if outcome.promoted == 0 {
+            break;
+        }
+        batches += 1;
+    }
+    assert_eq!(batches, 2);
+
+    let in_lane_order: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {}.ready_entries WHERE job_id = ANY($1) ORDER BY lane_seq",
+        store.schema()
+    ))
+    .bind(&hot_in_due_order)
+    .fetch_all(&pool)
+    .await
+    .expect("read hot lane order");
+    assert_eq!(in_lane_order, hot_in_due_order);
+
+    let mut claimed: Vec<i64> = store
+        .claim_runtime_batch(&pool, hot, 100, Duration::from_secs(60))
+        .await
+        .expect("claim the hot lane")
+        .into_iter()
+        .map(|claimed| claimed.job.id)
+        .collect();
+    claimed.sort_unstable();
+    let mut expected = hot_in_due_order.clone();
+    expected.push(warm_job_id);
+    expected.sort_unstable();
+    assert_eq!(claimed, expected);
+}
+
+/// The maintenance leader must not wait on a lane whose enqueue lock never
+/// comes free. Two sessions take turns holding the hot lane's lock for
+/// `HOLD` each, so a lock request queued behind them waits up to two holds.
+/// A due job on another queue must still run, and an abandoned attempt must
+/// still be rescued, well within one hold; the hot queue's due jobs must
+/// still be promoted while the lane stays busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_busy_lane_holds_back_neither_promotion_nor_rescue() {
+    const HOLD: Duration = Duration::from_secs(5);
+    const PRIORITY: i16 = 2;
+    let (_db_guard, pool) = setup_pool(12).await;
+    let hot = "qs_busy_lane_hot";
+    let other = "qs_busy_lane_other";
+    let abandoned = "qs_busy_lane_abandoned";
+    let schema = "awa_qs_busy_lane_leader";
+    let store = create_store(&pool, schema).await;
+    let opts = |queue: &str, run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        priority: PRIORITY,
+        run_at,
+        ..Default::default()
+    };
+
+    enqueue_job(&pool, &store, &CompleteJob { id: 0 }, opts(hot, None)).await;
+    let lock_key = enqueue_lane_lock_key(&pool, &store, hot, PRIORITY).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut holders = Vec::new();
+    for _ in 0..2 {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let pool = pool.clone();
+        let stop = Arc::clone(&stop);
+        holders.push(tokio::spawn(async move {
+            let mut held_tx = Some(held_tx);
+            let mut holds = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let mut tx = pool.begin().await.expect("begin lane holder");
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(lock_key)
+                    .execute(tx.as_mut())
+                    .await
+                    .expect("hold the hot lane's enqueue lock");
+                holds += 1;
+                if let Some(held_tx) = held_tx.take() {
+                    let _ = held_tx.send(());
+                }
+                tokio::time::sleep(HOLD).await;
+                tx.commit().await.expect("release the hot lane");
+            }
+            holds
+        }));
+        // The first holder takes the lock; wait for it so the second queues
+        // behind it rather than racing it.
+        if holders.len() == 1 {
+            held_rx.await.expect("first holder took the lane");
+        }
+    }
+
+    let due = Utc::now() - chrono::Duration::seconds(1);
+    let mut hot_jobs = Vec::new();
+    for n in 1..=3 {
+        hot_jobs
+            .push(enqueue_job(&pool, &store, &CompleteJob { id: n }, opts(hot, Some(due))).await);
+    }
+    let other_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 10 },
+        opts(other, Some(due)),
+    )
+    .await;
+    let abandoned_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 20 },
+        opts(abandoned, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, abandoned, 1, Duration::from_secs(3_600))
+        .await
+        .expect("claim the abandoned attempt");
+    assert_eq!(claimed.len(), 1);
+
+    let heartbeat_staleness = Duration::from_millis(500);
+    let worker_queue = || QueueConfig {
+        max_workers: 4,
+        poll_interval: Duration::from_millis(25),
+        ..QueueConfig::default()
+    };
+    let client = Client::builder(pool.clone())
+        .queue(hot, worker_queue())
+        .queue(other, worker_queue())
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .heartbeat_staleness(heartbeat_staleness)
+        .deadline_rescue_interval(Duration::from_secs(10))
+        .callback_rescue_interval(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build busy-lane client");
+    client
+        .start()
+        .await
+        .expect("Failed to start busy-lane client");
+
+    let bound = scaled_timeout(Duration::from_secs(2));
+    wait_for_job_state(&store, &pool, other_job, &[JobState::Completed], bound).await;
+    wait_for_job_state(
+        &store,
+        &pool,
+        abandoned_job,
+        &[JobState::Retryable, JobState::Available],
+        bound + heartbeat_staleness,
+    )
+    .await;
+
+    for job_id in &hot_jobs {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            scaled_timeout(HOLD * 3),
+        )
+        .await;
+    }
+    assert!(
+        holders.iter().all(|holder| !holder.is_finished()),
+        "the hot lane must stay busy until its jobs are promoted"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    for holder in holders {
+        assert!(holder.await.expect("lane holder") >= 1);
+    }
     client.shutdown(Duration::from_secs(5)).await;
 }
 
