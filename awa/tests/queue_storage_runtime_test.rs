@@ -17764,6 +17764,17 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     assert_eq!(overview.total_queued, 2);
     assert_eq!(overview.running, 0);
 
+    let kind = admin::job_kind_overview(&pool, "complete_job")
+        .await
+        .expect("read kind overview after reusing the retained lane")
+        .expect("the completed and newly enqueued jobs have a kind");
+    assert_eq!(
+        kind.job_count,
+        (completed.len() + waiting.len() - 1) as i64,
+        "retained completions and later jobs in the same lane count once"
+    );
+    assert_eq!(kind.completed_last_hour, (completed.len() - 1) as i64);
+
     // The dashboard's other two reads, over the same jobs.
     let counts = admin::state_counts(&pool)
         .await
