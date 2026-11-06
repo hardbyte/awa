@@ -95,6 +95,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         Persona::Sam,
         Persona::Python,
         Persona::Fanout,
+        Persona::ShardOps,
     ] {
         if shared.config.has(persona) {
             tasks.push((persona, spawn_persona(persona, shared.clone())));
@@ -179,6 +180,15 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         );
     }
     let log_tail = watch.log_since_start(&shared.config);
+    if shared.config.has(Persona::ShardOps) {
+        match &log_tail {
+            Some(log) => super::shard_oracle::scan_server_log(&shared, &oracle_pool, log).await,
+            None => shared.note(
+                "run",
+                "no Postgres log source is configured, so permission errors raised inside the runtimes are not scanned",
+            ),
+        }
+    }
 
     shared.drain_stop.trigger();
     for (persona, task) in tasks {
@@ -244,6 +254,7 @@ fn spawn_persona(
             Persona::Impatient => personas::ui::run_impatient(shared).await,
             Persona::Python => personas::python::run(shared).await,
             Persona::Fanout => personas::fanout::run(shared).await,
+            Persona::ShardOps => personas::shardops::run(shared).await,
         }
     })
 }

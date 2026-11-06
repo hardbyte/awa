@@ -1,6 +1,7 @@
 //! Database lifecycle, connection budgeting and the per-client runtime host.
 
-use super::config::{replace_database_name, SoakConfig};
+use super::config::{replace_database_name, Persona, SoakConfig};
+use super::roles;
 use awa::Client;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -49,13 +50,29 @@ pub async fn recreate_database(config: &SoakConfig) -> Result<(), String> {
         .execute(&admin)
         .await
         .map_err(|error| format!("drop database: {error}"))?;
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .map_err(|error| format!("create database: {error}"))?;
+    let restricted_roles = config.has(Persona::ShardOps);
+    if restricted_roles {
+        roles::create_roles(&admin).await?;
+        sqlx::query(&format!("CREATE DATABASE {name} OWNER {}", roles::OWNER))
+            .execute(&admin)
+            .await
+            .map_err(|error| format!("create database: {error}"))?;
+    } else {
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .map_err(|error| format!("create database: {error}"))?;
+    }
     admin.close().await;
 
-    let pool = connect_pool(&config.database_url, "awa_soak_setup", 2)
+    // With the shard-ops persona the schema belongs to a non-superuser owner role, as in
+    // a production install, and the application roles get the documented grants.
+    let setup_url = if restricted_roles {
+        roles::url_for_role(config, roles::OWNER)
+    } else {
+        config.database_url.clone()
+    };
+    let pool = connect_pool(&setup_url, "awa_soak_setup", 2)
         .await
         .map_err(|error| format!("connect to soak database: {error}"))?;
     awa::model::migrations::run(&pool)
@@ -63,6 +80,23 @@ pub async fn recreate_database(config: &SoakConfig) -> Result<(), String> {
         .map_err(|error| format!("migrate: {error}"))?;
     awa_testing::setup::activate_queue_storage(&pool).await;
     pool.close().await;
+    if restricted_roles {
+        let superuser = connect_pool(&config.database_url, "awa_soak_setup_grants", 1)
+            .await
+            .map_err(|error| format!("connect to soak database: {error}"))?;
+        let mixed_personas = config
+            .personas
+            .iter()
+            .any(|persona| *persona != Persona::ShardOps);
+        roles::grant_runtime(
+            &superuser,
+            &name,
+            config.shardops_schema_create,
+            mixed_personas,
+        )
+        .await?;
+        superuser.close().await;
+    }
     Ok(())
 }
 

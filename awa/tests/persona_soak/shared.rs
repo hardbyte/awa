@@ -129,6 +129,8 @@ pub struct Shared {
     /// Run-wide measurements (resource use, oracle probes).
     pub run: Stats,
     pub fleets: Mutex<HashMap<String, Arc<Fleet>>>,
+    /// State of the shard-ops persona and the checks that go with it.
+    pub shardops: super::shard_oracle::ShardOpsState,
     chaos_until_ms: AtomicI64,
 }
 
@@ -157,6 +159,7 @@ impl Shared {
             quiesced: std::sync::atomic::AtomicBool::new(false),
             python: Mutex::new(None),
             fleets: Mutex::new(HashMap::new()),
+            shardops: Default::default(),
             chaos_until_ms: AtomicI64::new(0),
         })
     }
@@ -397,6 +400,18 @@ impl Shared {
         );
         match event {
             UntypedJobEvent::Rescued { reason, .. } => {
+                if persona == Persona::ShardOps {
+                    self.note(
+                        "events",
+                        format!(
+                            "job {} on {} rescued ({}) at attempt {}",
+                            job.id,
+                            job.queue,
+                            reason.as_str(),
+                            job.attempt
+                        ),
+                    );
+                }
                 self.stats(persona)
                     .add(&format!("rescued_{}", reason.as_str()), 1);
             }

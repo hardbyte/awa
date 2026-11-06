@@ -36,6 +36,35 @@ impl Fleet {
         served: Vec<(Arc<QueueInfo>, i64)>,
         factory: ClientFactory,
     ) -> Result<Arc<Self>, String> {
+        let url = shared.config.database_url.clone();
+        Self::start_with_url(
+            shared,
+            url,
+            name,
+            persona,
+            replicas,
+            pool_size,
+            worker_threads,
+            served,
+            factory,
+        )
+        .await
+    }
+
+    /// As [`Fleet::start`], with every runtime connecting through `url`, for a fleet that
+    /// runs as a role other than the one in the run's database URL.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_url(
+        shared: &Arc<Shared>,
+        url: String,
+        name: &str,
+        persona: Persona,
+        replicas: usize,
+        pool_size: u32,
+        worker_threads: usize,
+        served: Vec<(Arc<QueueInfo>, i64)>,
+        factory: ClientFactory,
+    ) -> Result<Arc<Self>, String> {
         let budget_label = name.to_string();
         let granted = shared.budget.reserve(
             &budget_label,
@@ -50,7 +79,7 @@ impl Fleet {
             factory,
             pool_size,
             worker_threads,
-            url: shared.config.database_url.clone(),
+            url,
             hosts: Mutex::new(Vec::new()),
             budget_label,
         });

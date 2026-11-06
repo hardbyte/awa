@@ -11,9 +11,14 @@
 # Environment:
 #   AWA_SOAK_SECONDS          load phase length per engine (default 900)
 #   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos,
-#                             watchers,support,uiops,impatient,python,fanout
+#                             watchers,support,uiops,impatient,python,fanout,shardops
 #   AWA_SOAK_SEED             fixes the workload mix and chaos schedule
 #   AWA_SOAK_SCALE            multiplies rates and queue counts (default 1)
+#   AWA_SOAK_SHARDOPS_SCALE   multiplies the shardops persona's rates on its own (default 1)
+#   AWA_SOAK_SHARDOPS_SCHEMA_CREATE
+#                             1 (default) lets the shardops application roles create objects in
+#                             the schema, so lanes are created on the fly; 0 withholds schema
+#                             CREATE and has the operator provision lanes before raising a count
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
@@ -78,7 +83,7 @@ start_container() {
   local engine="$1" name="$2" port="$3"
   local cpu_args=()
   [ -n "${SOAK_PG_CPUS:-}" ] && cpu_args=(--cpus "$SOAK_PG_CPUS")
-  local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB)
+  local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a ")
   case "$engine" in
     pg17)
       docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;

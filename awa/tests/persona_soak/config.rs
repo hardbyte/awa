@@ -21,10 +21,13 @@ pub enum Persona {
     Python,
     /// Handlers that batch-insert unique child jobs into their own queue.
     Fanout,
+    /// An operator changing `enqueue_shards` on hot queues under live load, with the
+    /// actors running as different non-superuser roles.
+    ShardOps,
 }
 
 impl Persona {
-    pub const ALL: [Persona; 12] = [
+    pub const ALL: [Persona; 13] = [
         Persona::Mia,
         Persona::Tom,
         Persona::Priya,
@@ -37,6 +40,7 @@ impl Persona {
         Persona::Impatient,
         Persona::Python,
         Persona::Fanout,
+        Persona::ShardOps,
     ];
 
     pub fn name(self) -> &'static str {
@@ -53,6 +57,7 @@ impl Persona {
             Persona::Impatient => "impatient",
             Persona::Python => "python",
             Persona::Fanout => "fanout",
+            Persona::ShardOps => "shardops",
         }
     }
 
@@ -73,7 +78,7 @@ impl FromStr for Persona {
             .into_iter()
             .find(|persona| persona.name() == value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout")
+                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops")
             })
     }
 }
@@ -115,6 +120,13 @@ pub struct SoakConfig {
     pub min_free_disk_gb: i64,
     /// Extra tolerance added to the stall and promotion thresholds while chaos is active.
     pub chaos_slack: Duration,
+    /// Multiplies the shard-ops persona's rates independently of `scale`, which is
+    /// usually lowered to keep the other personas light.
+    pub shardops_scale: f64,
+    /// Whether the application roles may create objects in the schema. Without it the
+    /// operator provisions every lane before the shard count is raised, as the
+    /// restricted-runtime procedure in `docs/security.md` requires.
+    pub shardops_schema_create: bool,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -194,6 +206,10 @@ impl SoakConfig {
             chaos_slack: Duration::from_secs(
                 env_parse("AWA_SOAK_CHAOS_SLACK_SECONDS").unwrap_or(45),
             ),
+            shardops_scale: env_parse("AWA_SOAK_SHARDOPS_SCALE").unwrap_or(1.0),
+            shardops_schema_create: env_parse::<u8>("AWA_SOAK_SHARDOPS_SCHEMA_CREATE")
+                .map(|value| value != 0)
+                .unwrap_or(true),
         })
     }
 
@@ -236,4 +252,19 @@ pub fn replace_database_name(url: &str, database_name: &str) -> String {
         Some(query) => format!("{base}/{database_name}?{query}"),
         None => format!("{base}/{database_name}"),
     }
+}
+
+/// `url` with its user and password replaced.
+pub fn replace_credentials(url: &str, user: &str, password: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let host = rest[..authority_end]
+        .rsplit_once('@')
+        .map_or(&rest[..authority_end], |(_, host)| host);
+    format!(
+        "{scheme}://{user}:{password}@{host}{}",
+        &rest[authority_end..]
+    )
 }

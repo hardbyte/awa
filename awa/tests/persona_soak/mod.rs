@@ -12,6 +12,8 @@ pub mod pgserver;
 pub mod registry;
 pub mod report;
 pub mod rng;
+pub mod roles;
 pub mod run;
+pub mod shard_oracle;
 pub mod shared;
 pub mod stop;

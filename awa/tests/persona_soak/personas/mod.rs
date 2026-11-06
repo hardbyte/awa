@@ -8,6 +8,7 @@ pub mod mia;
 pub mod priya;
 pub mod python;
 pub mod sam;
+pub mod shardops;
 pub mod tom;
 pub mod ui;
 
