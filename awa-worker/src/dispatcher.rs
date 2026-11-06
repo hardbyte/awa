@@ -851,6 +851,7 @@ mod tests {
             completion,
             storage.clone(),
             crate::executor::DlqPolicy::default(),
+            tokio_util::task::TaskTracker::new(),
             CancellationToken::new(),
             1,
         ));

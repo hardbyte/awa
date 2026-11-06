@@ -82,6 +82,7 @@ Recommended practice:
 - monitor `pg_stat_activity` for long transactions
 - monitor `pg_stat_user_tables` on the active queue-storage schema; ready, tombstone, done, and terminal-delta segments should stay near zero dead tuples, lease segments may spike within the rotation window but should collapse after prune, and `attempt_state` should roughly track live long-running attempts
 - tune autovacuum for the database if the lease tables churn heavily
+- alert when `increase(awa_maintenance_prune_attempts_total{awa_ring_outcome=~"blocked|error"}[15m])` stays above zero for the alert's `for:` duration: the rings are not recycling. The counter is cumulative, so its raw value stays above zero after a single blocked attempt. If short readers of the ring partitions are the cause, raise [`prune_lock_timeout`](configuration.md#what-the-knobs-mean)
 
 Queue-storage depth metrics are designed for high-cadence monitoring. The worker records `available` from lane-head cursor differences and probes queue lag from the next claimable row per lane, instead of running the exact `queue_counts` ready-row scan on every metrics tick. Use the admin API or CLI when you need exact queue counts for an operator action.
 

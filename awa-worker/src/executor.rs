@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
@@ -269,6 +270,7 @@ pub struct JobExecutor {
     completion_batcher: CompletionBatcherHandle,
     storage: RuntimeStorage,
     dlq_policy: DlqPolicy,
+    finalizers: TaskTracker,
     finalize_cancel: CancellationToken,
     finalize_capacity: Arc<Semaphore>,
 }
@@ -292,6 +294,7 @@ impl JobExecutor {
         completion_batcher: CompletionBatcherHandle,
         storage: RuntimeStorage,
         dlq_policy: DlqPolicy,
+        finalizers: TaskTracker,
         finalize_cancel: CancellationToken,
         runtime_worker_capacity: u32,
     ) -> Self {
@@ -310,6 +313,7 @@ impl JobExecutor {
             completion_batcher,
             storage,
             dlq_policy,
+            finalizers,
             finalize_cancel,
             finalize_capacity,
         }
@@ -338,6 +342,7 @@ impl JobExecutor {
         let completion_batcher = self.completion_batcher.clone();
         let storage = self.storage.clone();
         let dlq_policy = self.dlq_policy.clone();
+        let finalizers = self.finalizers.clone();
         let finalize_cancel = self.finalize_cancel.clone();
         let finalize_capacity = self.finalize_capacity.clone();
         let job_id = job.id;
@@ -468,7 +473,10 @@ impl JobExecutor {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            tokio::spawn(async move {
+            // Graceful shutdown waits for this before it stops the completion
+            // batcher: the attempt has already left `in_flight`, so nothing
+            // heartbeats it, and a finalize lost at exit leaves it to rescue.
+            finalizers.spawn(async move {
                 // Every finalize path is one lease-guarded transaction, and a
                 // deadlock abort rolls the whole transaction back, so running
                 // it again is safe. Without the retry the job would sit
