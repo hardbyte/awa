@@ -6,6 +6,8 @@ Python bindings for [awa](https://github.com/hardbyte/awa), a Postgres-native ba
 pip install awa-pg
 ```
 
+CI tests Python 3.14 and 3.15, the newest two stable versions. The package remains installable on Python 3.10–3.13; those versions receive best-effort support.
+
 ## Quick start
 
 ```python
