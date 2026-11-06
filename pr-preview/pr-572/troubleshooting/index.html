@@ -1940,6 +1940,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#deadlock-detected-while-enqueueing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        deadlock detected while enqueueing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#relation-awajob_id_seq-does-not-exist" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2241,6 +2252,8 @@
       
         
       
+        
+      
     
     
     
@@ -2422,6 +2435,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2953,6 +2994,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#deadlock-detected-while-enqueueing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        deadlock detected while enqueueing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#relation-awajob_id_seq-does-not-exist" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3416,6 +3468,25 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <p>Fix:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate
 </span></code></pre></div>
+<h3 id="deadlock-detected-while-enqueueing"><code>deadlock detected</code> while enqueueing<a class="headerlink" href="#deadlock-detected-while-enqueueing" title="Permanent link">&para;</a></h3>
+<p>Cause:</p>
+<ul>
+<li>on queue storage every enqueue holds a transaction-scoped advisory lock on its <code>(queue, priority, shard)</code> lane until the transaction commits; the <code>DETAIL</code> names two 64-bit advisory keys, and two transactions that took lanes in opposite orders hold one each and wait on the other's</li>
+<li><code>insert_many</code>, <code>insert_many_copy</code> and the <code>QueueStorage</code> batch enqueues take their lane locks in one canonical order, <code>(queue, priority, shard)</code> ascending with queue names compared bytewise, so batches never deadlock with each other</li>
+<li>a transaction that enqueues with several separate statements (<code>insert</code> per job, handler-staged follow-ups, <code>Transaction.insert</code> in a loop) takes locks in statement order and can deadlock against a batch or another such transaction that touches the same lanes in a different order</li>
+</ul>
+<p>Fix:</p>
+<ul>
+<li>enqueue every lane an application transaction touches with one <code>insert_many</code> call, or issue the single-job inserts in <code>(queue, priority)</code> order</li>
+<li>keep transactions that hold enqueue locks short, since the locks last until commit</li>
+<li>retry on <code>40P01</code>: Postgres aborts one of the two transactions and the other proceeds</li>
+</ul>
+<p>Find the lane behind a key from the <code>DETAIL</code> line (<code>[database, high, low, 1]</code>, the key is <code>high &lt;&lt; 32 | low</code>):</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">queue</span><span class="p">,</span><span class="w"> </span><span class="n">priority</span><span class="p">,</span><span class="w"> </span><span class="n">enqueue_shard</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">FROM</span><span class="w"> </span><span class="o">&lt;</span><span class="n">queue_storage_schema</span><span class="o">&gt;</span><span class="p">.</span><span class="n">queue_enqueue_heads</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">hashtextextended</span><span class="p">(</span><span class="n">format</span><span class="p">(</span><span class="s1">'%I.%I'</span><span class="p">,</span><span class="w"> </span><span class="s1">'&lt;queue_storage_schema&gt;'</span><span class="p">,</span><span class="w"> </span><span class="n">seq_name</span><span class="p">),</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">high</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">bigint</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">32</span><span class="p">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">&lt;</span><span class="n">low</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">bigint</span><span class="p">;</span>
+</span></code></pre></div>
 <h3 id="relation-awajob_id_seq-does-not-exist"><code>relation "awa.job_id_seq" does not exist</code><a class="headerlink" href="#relation-awajob_id_seq-does-not-exist" title="Permanent link">&para;</a></h3>
 <p>Cause:</p>
 <ul>
@@ -3427,12 +3498,12 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>Wait for the first consumer pod to log <code>Awa worker runtime started</code> before scaling up producers.</li>
 <li>If the schema was deliberately reset, re-run <code>awa migrate</code> <strong>and</strong> let one worker pod boot to completion before resuming producer traffic.</li>
 <li>If the error persists after both, the runtime may be pointing at a different schema than the producer. Confirm with:
-  <div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">active_queue_storage_schema</span><span class="p">();</span>
+  <div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">active_queue_storage_schema</span><span class="p">();</span>
 </span></code></pre></div></li>
 </ul>
 <h3 id="cannot-delete-from-table-because-it-does-not-have-a-replica-identity"><code>cannot delete from table ... because it does not have a replica identity</code><a class="headerlink" href="#cannot-delete-from-table-because-it-does-not-have-a-replica-identity" title="Permanent link">&para;</a></h3>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>cannot delete from table "queue_terminal_rollup_deltas" because it does not
-</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>have a replica identity and publishes deletes
+<div class="language-text highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a>cannot delete from table "queue_terminal_rollup_deltas" because it does not
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>have a replica identity and publishes deletes
 </span></code></pre></div>
 <p>The awa schema is in a logical-replication publication (<code>CREATE PUBLICATION
 ... FOR ALL TABLES</code>, which Debezium creates by default, or <code>FOR TABLES IN
@@ -3461,17 +3532,17 @@ recommended publication shape and what to expect if the queue is published.</p>
 <li>Python <code>client.start(global_max_workers=...)</code> was used without explicit queue config dicts</li>
 </ul>
 <p>Fix:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
-</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>    <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"email"</span><span class="p">,</span> <span class="s2">"min_workers"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">:</span> <span class="mi">2</span><span class="p">}],</span>
-</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a>    <span class="n">global_max_workers</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
-</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a>    <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"email"</span><span class="p">,</span> <span class="s2">"min_workers"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">:</span> <span class="mi">2</span><span class="p">}],</span>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a>    <span class="n">global_max_workers</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="p">)</span>
 </span></code></pre></div>
 <h3 id="queue-or-job-kind-shows-stale-descriptor-in-the-ui">Queue or job-kind shows "stale descriptor" in the UI<a class="headerlink" href="#queue-or-job-kind-shows-stale-descriptor-in-the-ui" title="Permanent link">&para;</a></h3>
 <p>The descriptor catalog is refreshed by live workers on every runtime snapshot tick. A descriptor is flagged <strong>stale</strong> when no live runtime has touched <code>last_seen_at</code> within the snapshot window — typically because the code that declared it has been retired or no workers are currently running.</p>
 <ul>
 <li>If the queue/kind is genuinely retired, delete the row:
-  <div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">queue_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">queue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired-queue'</span><span class="p">;</span>
-</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">job_kind_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">kind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired_kind'</span><span class="p">;</span>
+  <div class="language-sql highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">queue_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">queue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired-queue'</span><span class="p">;</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">job_kind_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">kind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired_kind'</span><span class="p">;</span>
 </span></code></pre></div></li>
 <li>If workers <em>should</em> be running, check <code>/runtime</code> for missing instances.</li>
 <li>If the declaration moved to a different worker role that isn't deployed yet, the stale status will clear once that rollout completes.</li>

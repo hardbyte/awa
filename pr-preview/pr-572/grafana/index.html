@@ -1573,22 +1573,55 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#prometheus-otel-dashboard" class="md-nav__link">
+  <a href="#prometheus-otel-dashboards" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Prometheus / OTel Dashboard
+        Prometheus / OTel dashboards
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Prometheus / OTel Dashboard">
+    <nav class="md-nav" aria-label="Prometheus / OTel dashboards">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#panels" class="md-nav__link">
+  <a href="#template-variables" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Panels
+        Template variables
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overview-panels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview panels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#panel-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Panel reference
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-the-dashboards-cannot-show" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What the dashboards cannot show
       
     </span>
   </a>
@@ -2003,6 +2036,8 @@
       
         
       
+        
+      
     
     
     
@@ -2197,6 +2232,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2376,22 +2439,55 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#prometheus-otel-dashboard" class="md-nav__link">
+  <a href="#prometheus-otel-dashboards" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Prometheus / OTel Dashboard
+        Prometheus / OTel dashboards
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Prometheus / OTel Dashboard">
+    <nav class="md-nav" aria-label="Prometheus / OTel dashboards">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#panels" class="md-nav__link">
+  <a href="#template-variables" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Panels
+        Template variables
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overview-panels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview panels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#panel-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Panel reference
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-the-dashboards-cannot-show" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What the dashboards cannot show
       
     </span>
   </a>
@@ -2587,9 +2683,10 @@
 
 
 <h1 id="grafana-dashboards-for-awa">Grafana Dashboards for Awa<a class="headerlink" href="#grafana-dashboards-for-awa" title="Permanent link">&para;</a></h1>
-<p>Two dashboards are provided:</p>
+<p>Three dashboards are provided:</p>
 <ul>
-<li><strong><code>awa-dashboard.json</code></strong> — Prometheus / OTel metrics dashboard. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows time-series metrics: throughput, latency, queue depth, rescues, completion flush performance.</li>
+<li><strong><code>awa-dashboard.json</code></strong> — Prometheus / OTel fleet overview. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows backlog and lag, promotion of scheduled work, throughput and failures per queue, latency, dispatcher behaviour, rescues, DLQ, maintenance leader health and ring rotation/prune.</li>
+<li><strong><code>awa-queue-detail.json</code></strong> — Prometheus / OTel drill-down for one queue: backlog, latency, per-kind outcomes, dispatcher, DLQ and how the queue compares with its neighbours. The overview links to it from every per-queue series.</li>
 <li><strong><code>awa-dashboard-postgres.json</code></strong> — SQL dashboard querying Postgres directly. No collector needed. Shows queue depth, lag, descriptor health, recent failures, cron schedules, and runtime instances. Queue depth and backlog panels read from <code>queue_state_counts</code> (cache table, eventually consistent within the ~2s dirty-key recompute window). Lag and recent-failure panels read through the <code>awa.jobs</code> compatibility view, so they follow the active queue-storage schema instead of assuming <code>jobs_hot</code> is the live worker engine. Queue-related tables LEFT JOIN <code>queue_descriptors</code> so declared display names and owners appear alongside raw queue names, and declared-but-idle queues stay visible. The <strong>Descriptor Health</strong> panel surfaces stale and drifted descriptors (see <code>docs/architecture.md#descriptors-and-runtime-liveness</code> for the model); an empty table = healthy fleet.</li>
 </ul>
 <p>Previews (live demo workload, both dashboards rendered against a local <code>grafana/otel-lgtm</code> collector + Postgres):</p>
@@ -2622,8 +2719,90 @@
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="o">)</span>
 </span></code></pre></div>
 <p>The dashboard ships three example panels — <strong>Queue Descriptor Catalog</strong>, <strong>Job Kind Descriptor Catalog</strong> (both instant-query tables), and <strong>Throughput by Queue (with display names)</strong> (a live timeseries demonstrating the join). Descriptor drift / stale detection still lives on the Postgres dashboard because deriving it from metrics alone would require emitting per-runtime hash gauges, which the Postgres catalog does more cleanly.</p>
-<h2 id="prometheus-otel-dashboard">Prometheus / OTel Dashboard<a class="headerlink" href="#prometheus-otel-dashboard" title="Permanent link">&para;</a></h2>
-<h3 id="panels">Panels<a class="headerlink" href="#panels" title="Permanent link">&para;</a></h3>
+<h2 id="prometheus-otel-dashboards">Prometheus / OTel dashboards<a class="headerlink" href="#prometheus-otel-dashboards" title="Permanent link">&para;</a></h2>
+<h3 id="template-variables">Template variables<a class="headerlink" href="#template-variables" title="Permanent link">&para;</a></h3>
+<p>Both dashboards use the same variables, so they import unmodified against any Prometheus-compatible datasource:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>datasource</code></td>
+<td>Which Prometheus-compatible datasource to query.</td>
+</tr>
+<tr>
+<td><code>queue</code></td>
+<td>Queue filter (multi-select with All on the overview, single queue on the detail dashboard).</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td>Job kind filter (detail dashboard).</td>
+</tr>
+<tr>
+<td><code>filters</code></td>
+<td>Ad hoc label filters applied to every query. Use it to scope to an environment, cluster, namespace or service, whatever label your metrics pipeline attaches to awa's series, for example <code>service_name = my-worker</code>.</td>
+</tr>
+<tr>
+<td><code>awa_ui_url</code></td>
+<td>Base URL of awa-ui for drill-through links.</td>
+</tr>
+</tbody>
+</table>
+<p>The dashboards never reference a deployment label directly, so no edit is needed when a fleet runs in several environments behind one datasource: pick the environment in <code>filters</code>.</p>
+<p>Queue depth, queue lag, DLQ depth and the descriptor info gauges are published by the maintenance leader (or by every runtime, for the info gauges), so the dashboards collapse them with <code>max by (...)</code> to stay correct during a leader handover and when the metrics pipeline keeps per-instance labels.</p>
+<h3 id="overview-panels">Overview panels<a class="headerlink" href="#overview-panels" title="Permanent link">&para;</a></h3>
+<p>The overview opens with fleet stats in triage order (oldest job, DLQ, error rate, throughput, in flight, deferred, rescues, runtimes; the first four carry a sparkline) followed by these rows:</p>
+<table>
+<thead>
+<tr>
+<th>Row</th>
+<th>What it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Backlog &amp; lag</strong></td>
+<td>Is work waiting, and is it waiting to be claimed (lag) or to be promoted (deferred backlog against the promotion rate, batch size and duration)?</td>
+</tr>
+<tr>
+<td><strong>Throughput &amp; failures</strong></td>
+<td>Which queue or kind is failing; whether one queue is crowding out others (in-flight and claims by queue).</td>
+</tr>
+<tr>
+<td><strong>Latency</strong></td>
+<td>Wait time (creation to claim) and execution time percentiles per queue.</td>
+</tr>
+<tr>
+<td><strong>Dispatcher &amp; claims</strong></td>
+<td>Claim query latency and batch size, wake-ups by reason, empty claims, rate limiting, completion flush time.</td>
+</tr>
+<tr>
+<td><strong>Rescues, DLQ &amp; database retries</strong></td>
+<td>Rescues by kind (stale heartbeat, deadline, callback timeout), DLQ inflow and depth, deadlock and database-unavailability retries.</td>
+</tr>
+<tr>
+<td><strong>Maintenance leader</strong></td>
+<td>Whether exactly one runtime is running maintenance, which one, and how long each branch takes. A slow branch delays promotion, rescue and rotation.</td>
+</tr>
+<tr>
+<td><strong>Ring rotation &amp; prune</strong></td>
+<td>Rotation and prune outcomes, what blocks them, prune phase latency.</td>
+</tr>
+<tr>
+<td><strong>Job outputs &amp; follow-ups (0.7+)</strong>, <strong>Descriptor catalogs</strong>, <strong>Storage transition</strong></td>
+<td>Collapsed by default.</td>
+</tr>
+</tbody>
+</table>
+<p>Panels backed by metrics that a release does not emit render empty; the job output, staged follow-up, <code>awa_completion_reconnect_retry_total</code> and prune duration series arrive in 0.7.</p>
+<p>Fleets can have hundreds of queues, so the per-queue panels (queue lag, deepest queues, deferred backlog, throughput, in-flight and claim rate by queue, top kinds, and the queue detail dashboard's other-queue panels) draw the ten series with the highest value over the selected time range. The set is fixed for the whole range, and the legend is a table sorted by its maximum. Use the <strong>Queue</strong> variable to look at a specific queue.</p>
+<p>Event counters such as failures, retries, DLQ moves and parked jobs only exist after their first event, so those panels read "None in range" on a healthy fleet.</p>
+<p>Quantiles of the duration histograms (job duration, claim latency, wake-to-first-claim, completion flush, promotion duration) need AWA 0.6.13 or later; earlier versions export buckets that are too coarse below 5 s. Each of those panels also plots a dashed <code>mean</code> series, which is correct on every version.</p>
+<h3 id="panel-reference">Panel reference<a class="headerlink" href="#panel-reference" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
 <tr>
@@ -2636,7 +2815,7 @@
 <tr>
 <td><strong>Queue Lag</strong></td>
 <td>Time series</td>
-<td>Age of the oldest available job per queue</td>
+<td>Age of the oldest available job per queue; on queue storage, of the oldest next-to-claim job across its lanes (the admin UI shows the oldest overall)</td>
 </tr>
 <tr>
 <td><strong>Queue Depth</strong></td>
@@ -2741,6 +2920,13 @@
 </tbody>
 </table>
 <p>Color semantics are consistent across panels: green for healthy/fast paths, orange for warning/tail latency or retries, red for failures/high tail latency, blue for queue intake/backlog, and yellow for callback/external wait states.</p>
+<h3 id="what-the-dashboards-cannot-show">What the dashboards cannot show<a class="headerlink" href="#what-the-dashboards-cannot-show" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Due-but-unpromoted work.</strong> <code>awa_queue_depth{awa_job_state="scheduled"}</code> counts every deferred job, due or not, and queue lag only sees jobs already in the ready lanes. A stall in promotion shows up as the deferred backlog growing while the promotion rate is flat, not as a direct number.</li>
+<li><strong>Maintenance leader identity.</strong> No metric names the leader. The <em>Maintenance leader</em> row infers it from which series is running maintenance branches, so it needs a per-runtime label (<code>instance</code>, pod or similar) from your pipeline.</li>
+<li><strong>Runtime versions.</strong> No metric reports the awa version a runtime runs.</li>
+<li><strong>Maintenance task failures.</strong> Failed promotion, rescue or prune queries are logged, not counted.</li>
+</ul>
 <h2 id="setup">Setup<a class="headerlink" href="#setup" title="Permanent link">&para;</a></h2>
 <h3 id="1-configure-otlp-export-in-your-worker">1. Configure OTLP export in your worker<a class="headerlink" href="#1-configure-otlp-export-in-your-worker" title="Permanent link">&para;</a></h3>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">// In your worker binary, before starting the client:</span>
@@ -2763,17 +2949,20 @@
 <ol>
 <li>Open Grafana (default: http://localhost:3000)</li>
 <li>Go to Dashboards → Import</li>
-<li>Upload <code>awa-dashboard.json</code></li>
-<li>Select your Prometheus datasource</li>
+<li>Upload <code>awa-dashboard.json</code>, then repeat for <code>awa-queue-detail.json</code></li>
+<li>Choose the Prometheus datasource with the <strong>Datasource</strong> variable at the top of the dashboard</li>
 </ol>
-<p><strong>Option B: Provisioning</strong> Copy <code>awa-dashboard.json</code> to your Grafana provisioning directory:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>/etc/grafana/provisioning/dashboards/awa-dashboard.json
+<p><strong>Option B: Provisioning</strong> Copy <code>awa-dashboard.json</code> and <code>awa-queue-detail.json</code> to the directory a Grafana dashboard provider reads. The dashboards need no datasource substitution: the <code>datasource</code> variable defaults to your default Prometheus datasource.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>/var/lib/grafana/dashboards/awa-dashboard.json
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>/var/lib/grafana/dashboards/awa-queue-detail.json
 </span></code></pre></div>
 <p><strong>Option C: API</strong></p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># The Grafana API requires a wrapper object around the dashboard JSON</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="s2">"http://admin:admin@localhost:3000/api/dashboards/db"</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>-d<span class="w"> </span><span class="s2">"{\"dashboard\": </span><span class="k">$(</span>cat<span class="w"> </span>awa-dashboard.json<span class="k">)</span><span class="s2">, \"overwrite\": true}"</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">for</span><span class="w"> </span>dashboard<span class="w"> </span><span class="k">in</span><span class="w"> </span>awa-dashboard.json<span class="w"> </span>awa-queue-detail.json<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="s2">"http://admin:admin@localhost:3000/api/dashboards/db"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">    </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span>-d<span class="w"> </span><span class="s2">"{\"dashboard\": </span><span class="k">$(</span>cat<span class="w"> </span><span class="nv">$dashboard</span><span class="k">)</span><span class="s2">, \"overwrite\": true}"</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="k">done</span>
 </span></code></pre></div>
 <h3 id="3-verify-metrics-are-flowing">3. Verify metrics are flowing<a class="headerlink" href="#3-verify-metrics-are-flowing" title="Permanent link">&para;</a></h3>
 <p>Check Prometheus has awa metrics:</p>
