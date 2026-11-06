@@ -44,6 +44,8 @@ pub struct ShardOpsState {
     expected: Mutex<HashMap<u64, u8>>,
     /// Executions per job sequence number, and the job id that ran.
     executions: Mutex<HashMap<u64, (u16, i64)>>,
+    /// Executions per job sequence number whose handler returned outside a chaos window.
+    returned: Mutex<HashMap<u64, u16>>,
     keyed_window: Mutex<HashMap<(u64, u64), u64>>,
     keyed_starts: Mutex<Vec<(u64, u64, u64)>>,
     reported: Mutex<HashMap<String, u64>>,
@@ -102,6 +104,18 @@ impl ShardOpsState {
                 .lock()
                 .expect("keyed starts")
                 .push((key, key_seq, tick));
+        }
+    }
+
+    /// Called by the worker when the handler returns its result.
+    pub fn note_returned(&self, seq: u64, during_chaos: bool) {
+        if !during_chaos {
+            *self
+                .returned
+                .lock()
+                .expect("returned")
+                .entry(seq)
+                .or_insert(0) += 1;
         }
     }
 
@@ -362,15 +376,18 @@ pub async fn final_check(shared: &Arc<Shared>, pool: &PgPool, queues: &[String])
     let state = &shared.shardops;
     let expected = state.expected.lock().expect("expected").clone();
     let executions = state.executions.lock().expect("executions").clone();
+    let returned = state.returned.lock().expect("returned").clone();
     let mut missing = Vec::new();
     let mut repeated = Vec::new();
     let mut rescued = Vec::new();
+    let mut rescued_after_return = Vec::new();
     let mut short = Vec::new();
     for (seq, want) in &expected {
         let (ran, job_id) = executions.get(seq).copied().unwrap_or((0, 0));
+        let returned = returned.get(seq).copied().unwrap_or(0);
         let record = shared.ledger.get(job_id);
         let row = format!(
-            "{{\"seq\":{seq},\"job_id\":{job_id},\"expected_executions\":{want},\"executions\":{ran},\"max_attempt\":{},\"ledger_flags\":{}}}",
+            "{{\"seq\":{seq},\"job_id\":{job_id},\"expected_executions\":{want},\"executions\":{ran},\"returned\":{returned},\"max_attempt\":{},\"ledger_flags\":{}}}",
             record.as_ref().map_or(0, |record| record.max_attempt),
             record.as_ref().map_or(0, |record| record.flags)
         );
@@ -378,11 +395,15 @@ pub async fn final_check(shared: &Arc<Shared>, pool: &PgPool, queues: &[String])
             missing.push(row);
         } else if ran > u16::from(*want) {
             // A rescue re-runs a job whose attempt lost its lease, which is at-least-once
-            // delivery working as designed; any other repeat is a duplicate.
+            // delivery working as designed when a handler never returned. This persona's
+            // runtimes only stop gracefully, so when every execution returned outside a
+            // chaos window the rescue re-ran a finished attempt: a duplicate.
             let was_rescued = record
                 .as_ref()
                 .is_some_and(|record| record.has(flag::RESCUED));
-            if was_rescued {
+            if was_rescued && returned >= ran {
+                rescued_after_return.push(row);
+            } else if was_rescued {
                 rescued.push(row);
             } else {
                 repeated.push(row);
@@ -417,6 +438,12 @@ pub async fn final_check(shared: &Arc<Shared>, pool: &PgPool, queues: &[String])
         "ran again after a stale-heartbeat rescue",
         rescued,
         false,
+    );
+    report(
+        "rescued_after_return",
+        "ran again after a stale-heartbeat rescue although every execution's handler had returned",
+        rescued_after_return,
+        true,
     );
     report(
         "duplicate_execution",

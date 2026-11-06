@@ -68,6 +68,9 @@ impl Worker for ShardOpsWorker {
             args.key.map(|key| (key, args.key_seq)),
         );
         tokio::time::sleep(Duration::from_millis(5 + args.seq % 20)).await;
+        self.shared
+            .shardops
+            .note_returned(args.seq, self.shared.chaos_active());
         if args.mode == "retry" && ctx.job.attempt <= 1 {
             return Ok(JobResult::RetryAfter(Duration::from_millis(
                 1_000 + args.seq % 2_000,
