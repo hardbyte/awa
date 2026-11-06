@@ -68,8 +68,7 @@ pub mod names {
     pub const HEARTBEAT_BATCHES: &str = "awa.heartbeat.batches";
     pub const MAINTENANCE_RESCUES: &str = "awa.maintenance.rescues";
     pub const MAINTENANCE_RESCUE_PASS_SIZE: &str = "awa.maintenance.rescue.pass_size";
-    pub const MAINTENANCE_RESCUE_OLDEST_ATTEMPT_AGE: &str =
-        "awa.maintenance.rescue.oldest_attempt_age";
+    pub const MAINTENANCE_RESCUE_OLDEST_AGE: &str = "awa.maintenance.rescue.oldest_attempt_age";
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
@@ -512,7 +511,7 @@ impl AwaMetrics {
                 .with_boundaries(COUNT_BUCKETS.to_vec())
                 .build(),
             maintenance_rescue_oldest_attempt_age_seconds: meter
-                .f64_gauge(names::MAINTENANCE_RESCUE_OLDEST_ATTEMPT_AGE)
+                .f64_gauge(names::MAINTENANCE_RESCUE_OLDEST_AGE)
                 .with_description(
                     "Age of the oldest attempt rescued by the latest queue-storage rescue pass",
                 )
