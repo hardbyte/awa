@@ -30,6 +30,29 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Queue-storage completion of retried jobs or jobs carrying metadata now
+  addresses compact claims by their batch identity and item index, as on main.
+  It no longer expands every retained claim batch for each completion flush,
+  so bounded finalization can drain large recovery backlogs without that scan.
+
+- Finished attempts keep heartbeating until their durable finalization finishes,
+  including while completion writes are stalled. Compact receipt heartbeats
+  address claims by batch identity and skip attempts a closer already holds,
+  so one stalled completion cannot block the rest of a heartbeat pass. Late
+  heartbeats cannot recreate state for a completed attempt.
+
+- **A completion backlog no longer gets finished jobs rescued and run
+  again.** An attempt stops heartbeating when its handler returns, and its
+  finalize then waits for the completion batcher. The runtime released the
+  worker slot at the same moment and kept claiming, so when finalization was
+  slower than claiming (for example, retried jobs, whose completions take
+  the slower per-row path) the queue of finished, unheartbeated attempts grew
+  without bound. Attempts that waited longer than `heartbeat_staleness` were
+  rescued and executed again, some of them twice. The bound on attempts waiting
+  for finalization is `max(worker count, 2 × batch size × completion shards)`.
+  Past that, a finished attempt keeps its
+  worker slot and its heartbeat until there is room, so the dispatcher stops
+  claiming until finalization catches up.
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
