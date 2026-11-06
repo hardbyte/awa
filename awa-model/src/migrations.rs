@@ -350,6 +350,40 @@ macro_rules! definer_lane_provisioning_pending_sql {
     };
 }
 
+/// An existing function can still predate the hardened definition or its
+/// runtime grants. Keep the patch pending until all three are current.
+macro_rules! analyze_queue_storage_relation_pending_sql {
+    () => {
+        "SELECT 'awa.analyze_queue_storage_relation definition'::text AS target \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS helper \
+             WHERE helper.oid = to_regprocedure('awa.analyze_queue_storage_relation(text,text)') \
+               AND helper.prosecdef \
+               AND helper.prosrc LIKE '%awa_statistics_helper_v1%' \
+               AND helper.proconfig @> ARRAY['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']::text[]) \
+         UNION ALL \
+         SELECT 'PUBLIC EXECUTE on awa.analyze_queue_storage_relation' \
+         FROM pg_proc AS helper \
+         WHERE helper.oid = to_regprocedure('awa.analyze_queue_storage_relation(text,text)') \
+           AND EXISTS (SELECT 1 FROM aclexplode(COALESCE(helper.proacl, acldefault('f', helper.proowner))) AS privilege \
+                       WHERE privilege.grantee = 0 AND privilege.privilege_type = 'EXECUTE') \
+         UNION ALL \
+         SELECT format('EXECUTE on awa.analyze_queue_storage_relation for %s', pg_get_userbyid(runtime.grantee)) \
+         FROM ( \
+             SELECT privilege.grantee \
+             FROM pg_class AS heads \
+             CROSS JOIN LATERAL aclexplode(COALESCE(heads.relacl, acldefault('r', heads.relowner))) AS privilege \
+             WHERE heads.oid = to_regclass('awa.queue_claim_heads') \
+               AND privilege.grantee <> 0 \
+               AND privilege.privilege_type IN ('INSERT', 'UPDATE', 'DELETE') \
+             GROUP BY privilege.grantee \
+             HAVING count(DISTINCT privilege.privilege_type) = 3 \
+         ) AS runtime \
+         WHERE NOT COALESCE(has_function_privilege( \
+             runtime.grantee, to_regprocedure('awa.analyze_queue_storage_relation(text,text)'), 'EXECUTE'), false)"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
@@ -360,6 +394,10 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
         )),
         "definer_lane_provisioning" => Some(concat!(
             definer_lane_provisioning_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        "analyze_queue_storage_relation" => Some(concat!(
+            analyze_queue_storage_relation_pending_sql!(),
             " ORDER BY 1"
         )),
         _ => None,
@@ -420,6 +458,16 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         applied_probe: concat!(
             "SELECT NOT EXISTS (",
             definer_lane_provisioning_pending_sql!(),
+            ")"
+        ),
+    },
+    SchemaPatch {
+        name: "analyze_queue_storage_relation",
+        description: "Planner statistics helper for tables autovacuum never analyses (awa 0.7 migration v054)",
+        sql: include_str!("../migrations/patches/analyze_queue_storage_relation.sql"),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            analyze_queue_storage_relation_pending_sql!(),
             ")"
         ),
     },

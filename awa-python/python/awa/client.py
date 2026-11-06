@@ -859,6 +859,7 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
+        statistics_refresh_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
@@ -901,6 +902,11 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``statistics_refresh_interval_ms`` controls how often the maintenance
+        leader runs ``ANALYZE`` on the queue-storage head tables and
+        partitioned ring parents, which autovacuum never analyses (default 5
+        minutes; ``0`` disables the refresh).
+
         ``queue_storage_prune_lock_timeout_ms`` sets the PostgreSQL
         ``lock_timeout`` the maintenance leader uses when pruning the queue,
         lease and claim rings (default 10 ms). Each lock acquisition gets its
@@ -933,6 +939,7 @@ class AsyncClient:
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
+            statistics_refresh_interval_ms=statistics_refresh_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,
