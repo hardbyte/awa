@@ -6,6 +6,8 @@
 #[path = "../../awa-model/src/storage_footprint_sql.rs"]
 mod storage_footprint_sql;
 
+mod ci_timing;
+
 use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
@@ -447,6 +449,32 @@ async fn create_store_with_config(pool: &sqlx::PgPool, config: QueueStorageConfi
     store.reset(pool).await.expect("Failed to reset store");
     activate_queue_storage_transition(pool, store.schema()).await;
     store
+}
+
+/// Prune's success/accounting assertions allow a transient competing lock.
+/// Retry only the expected slot's Blocked result; errors and other outcomes
+/// still reach the caller's original assertions without being retried.
+async fn prune_until_not_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+    slot: i32,
+) -> PruneOutcome {
+    tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(5)), async {
+        loop {
+            let outcome = store
+                .prune_oldest(pool, retention)
+                .await
+                .expect("prune_oldest");
+            if matches!(outcome, PruneOutcome::Blocked { slot: blocked } if blocked == slot) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("prune remained Blocked past the assertion deadline")
 }
 
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
@@ -13614,11 +13642,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 0).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
@@ -13662,11 +13686,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
 
     // Second prune: current slot is 0, so the oldest sealed non-current
     // slot is slot 1 (the carried row). It is carried again into slot 0.
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest re-carry")
-    {
+    match prune_until_not_blocked(&store, &pool, Duration::from_secs(3600), 1).await {
         PruneOutcome::Pruned {
             slot: 1,
             carried_failed_rows: 1,
@@ -15622,14 +15642,121 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         .await
         .expect("Failed to release reader lock");
 
-    let pruned = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune after reader lock release");
+    let pruned = prune_until_not_blocked(&store, &pool, Duration::ZERO, 0).await;
     assert!(
         matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
     );
+}
+
+/// A later insert can remain locked after the explicit partition locks pass.
+/// Observe two distinct blocked attempts before releasing it, proving that the
+/// eventual-success helper actually retries rather than relying on a sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_prune_eventual_success_retries_a_post_child_lock_handoff() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_prune_retry_handoff";
+    let queue = "prune_retry_handoff";
+    let store = Arc::new(create_store(&pool, schema).await);
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim carry job")
+        .remove(0);
+    store
+        .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail carry job")
+        .expect("running job should fail");
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let retention = Duration::from_secs(3600);
+    let mut holder = pool.begin().await.expect("begin post-child blocker");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.queue_terminal_count_deltas_1 IN SHARE MODE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold carry destination");
+    assert!(matches!(
+        store.prune_oldest(&pool, retention).await.unwrap(),
+        PruneOutcome::Blocked { slot: 0 }
+    ));
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 1);
+    assert_eq!(pruned_rollup_sums(&pool, schema, queue).await, (0, 0));
+    let worker_store = store.clone();
+    let worker_pool = pool.clone();
+    let worker = tokio::spawn(async move {
+        prune_until_not_blocked(&worker_store, &worker_pool, retention, 0).await
+    });
+    let handoff = tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(5)), async {
+        let mut first_start: Option<DateTime<Utc>> = None;
+        loop {
+            if worker.is_finished() {
+                break false;
+            }
+            let waiting: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT query_start FROM pg_stat_activity
+                 WHERE datname = current_database() AND pid <> pg_backend_pid()
+                   AND wait_event_type = 'Lock' AND query LIKE $1
+                 ORDER BY query_start DESC LIMIT 1",
+            )
+            .bind(format!(
+                "%INSERT INTO {schema}.queue_terminal_count_deltas%"
+            ))
+            .fetch_optional(&pool)
+            .await
+            .expect("observe blocked carry insert");
+            if let Some(started) = waiting {
+                if first_start.is_some_and(|first| started > first) {
+                    break true;
+                }
+                first_start.get_or_insert(started);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    holder.rollback().await.expect("release carry destination");
+    let pruned = worker.await.expect("join eventual prune");
+    assert!(
+        handoff.expect("helper did not reach a retry before its deadline"),
+        "helper ended before the controlled retry handoff: {pruned:?}"
+    );
+    assert!(
+        matches!(
+            pruned,
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 1,
+                ..
+            }
+        ),
+        "{pruned:?}"
+    );
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 1);
+    let carried_slot: i32 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT ready_slot FROM {schema}.done_entries WHERE job_id = $1"
+    )))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("carried row slot");
+    assert_eq!(carried_slot, 1);
+    assert_invariant_holds(&pool, schema, queue, "after retry handoff").await;
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
 }
 
 /// The prune `lock_timeout` covers every statement after it is set, not
