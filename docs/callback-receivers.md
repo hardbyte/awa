@@ -44,6 +44,9 @@ struct CallbackState {
 struct CompletePayload {
     #[serde(default)]
     payload: Option<serde_json::Value>,
+    /// Stored as the job's output (ADR-048).
+    #[serde(default)]
+    output: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -68,9 +71,22 @@ async fn complete(
 
     let uuid = uuid::Uuid::parse_str(&callback_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let job = admin::complete_external(&state.pool, uuid, body.payload, None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let completed = match body.output {
+        Some(output) => {
+            admin::complete_external_with(
+                &state.pool,
+                uuid,
+                awa_model::ExternalCompletion::new().output(output),
+            )
+            .await
+        }
+        None => admin::complete_external(&state.pool, uuid, body.payload, None).await,
+    };
+    let job = completed.map_err(|e| match e {
+        // An output that is not JSON-storable or is over the size limit.
+        awa_model::AwaError::Validation(message) => (StatusCode::BAD_REQUEST, message),
+        e => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    })?;
 
     Ok(Json(CallbackResponse {
         id: job.id,
@@ -102,6 +118,7 @@ import uuid
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
+import awa
 from awa import AsyncClient, callback_contract
 
 CALLBACK_SECRET = bytes.fromhex(os.environ["AWA_CALLBACK_HMAC_SECRET"])
@@ -124,6 +141,8 @@ def verify_signature(
 
 class CompletePayload(BaseModel):
     payload: dict[str, Any] | None = None
+    # Stored as the job's output (ADR-048).
+    output: Any = None
 
 
 class FailPayload(BaseModel):
@@ -147,7 +166,12 @@ async def complete(
     client: AsyncClient = Depends(get_client),
     _: None = Depends(verify_signature),
 ) -> dict[str, Any]:
-    job = await client.complete_external(callback_id, body.payload)
+    try:
+        job = await client.complete_external(
+            callback_id, body.payload, output=body.output
+        )
+    except awa.OutputError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return {"id": job.id, "state": str(job.state)}
 
 

@@ -1120,6 +1120,75 @@ async fn test_migration_sql_matches_run() {
 }
 
 #[tokio::test]
+async fn test_substrate_replay_preserves_current_claimer_owner_index() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT awa.install_queue_storage_substrate('index_replay', 4, 2, 2)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let original: i64 = sqlx::query_scalar(
+        "SELECT 'index_replay.idx_index_replay_queue_claimer_leases_owner'::regclass::oid::bigint",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("SET LOCAL quote_all_identifiers = on")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        sqlx::query("SELECT awa.install_queue_storage_substrate('index_replay', 4, 2, 2)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let replayed: i64 = sqlx::query_scalar(
+            "SELECT 'index_replay.idx_index_replay_queue_claimer_leases_owner'::regclass::oid::bigint",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(replayed, original, "replay must retain the current index");
+    }
+    sqlx::query("SET LOCAL quote_all_identifiers = off")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    for definition in [
+        "(queue, owner_instance_id, expires_at)",
+        "(queue, owner_instance_id) INCLUDE (expires_at)",
+        "(queue, owner_instance_id) WHERE lease_epoch > 0",
+    ] {
+        sqlx::raw_sql(audited_sql(format!(
+            "DROP INDEX index_replay.idx_index_replay_queue_claimer_leases_owner; \
+             CREATE INDEX idx_index_replay_queue_claimer_leases_owner \
+             ON index_replay.queue_claimer_leases {definition}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT awa.install_queue_storage_substrate('index_replay', 4, 2, 2)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_indexdef('index_replay.idx_index_replay_queue_claimer_leases_owner'::regclass)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(
+            definition,
+            "CREATE INDEX idx_index_replay_queue_claimer_leases_owner ON index_replay.queue_claimer_leases USING btree (queue, owner_instance_id)"
+        );
+    }
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_v023_migrates_legacy_default_queue_storage_tables() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;

@@ -1,8 +1,15 @@
 ---- MODULE AwaExtended ----
 EXTENDS FiniteSets, Sequences, Integers
 
+\* Whether the worker drops a handler still running well past its deadline
+\* (#546). FALSE models the earlier runtime, where a rescued attempt whose
+\* handler never returned kept its worker slot forever.
+CONSTANT DropRescuedHandlers
+
 Instances == {"i1", "i2"}
 Jobs == {"j1", "j2", "j3"}
+\* One job is enough to show a hung handler holding the queue's only slot.
+HungHandlerJobs == {"j1"}
 Queues == {"q1", "q2"}
 QueueOf == [j \in Jobs |-> IF j = "j3" THEN "q2" ELSE "q1"]
 QueueSeq == <<"q1", "q2">>
@@ -13,8 +20,10 @@ BatchMax == 2
 RateMax == 1
 MaxAttempts == 2
 
-JobStates == {"available", "running", "retryable", "completed"}
-FinalStates == {"retryable", "completed"}
+JobStates == {"available", "running", "retryable", "completed", "failed"}
+\* Outcomes a handler's attempt can finalize to. `retryable` needs attempts
+\* left; on the last attempt a retryable error fails the job instead.
+FinalStates == {"retryable", "completed", "failed"}
 PermitKinds == {"none", "local", "overflow"}
 ShutdownPhases == {"running", "stop_claim", "draining", "stopped"}
 NoInstance == "no_instance"
@@ -30,6 +39,8 @@ VARIABLES
     permitKind,
     inFlight,
     taskLease,
+    rescuedSlot,      \* [i -> [j -> permit kind]]: the slot a rescued
+                      \* attempt's still-running handler keeps holding
     cancelRequested,
     heartbeatFresh,
     deadlineExpired,
@@ -42,7 +53,8 @@ VARIABLES
 
 vars ==
     <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
-      inFlight, taskLease, cancelRequested, heartbeatFresh, deadlineExpired,
+      inFlight, taskLease, rescuedSlot, cancelRequested, heartbeatFresh,
+      deadlineExpired,
       rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
       maintenanceAlive, leader>>
 
@@ -62,17 +74,24 @@ UnreservedAvailableInQueue(q) ==
 HeldJobs(i, q, kind) ==
     {j \in JobsInQueue(q) : permitHolder[j] = i /\ permitKind[j] = kind}
 
+\* A rescued attempt whose handler has not returned still holds its slot
+\* on that instance, beside any reservation for the job's retry.
+RescuedHeld(i, q, kind) ==
+    {j \in JobsInQueue(q) : rescuedSlot[i][j] = kind}
+
 HeldByInstance(i) ==
     Cardinality({j \in Jobs : permitHolder[j] = i})
+    + Cardinality({j \in Jobs : rescuedSlot[i][j] # "none"})
 
 LocalHeld(i, q) ==
-    Cardinality(HeldJobs(i, q, "local"))
+    Cardinality(HeldJobs(i, q, "local")) + Cardinality(RescuedHeld(i, q, "local"))
 
 OverflowHeld(i, q) ==
-    Cardinality(HeldJobs(i, q, "overflow"))
+    Cardinality(HeldJobs(i, q, "overflow")) + Cardinality(RescuedHeld(i, q, "overflow"))
 
 TotalOverflowHeld(i) ==
     Cardinality({j \in Jobs : permitHolder[j] = i /\ permitKind[j] = "overflow"})
+    + Cardinality({j \in Jobs : rescuedSlot[i][j] = "overflow"})
 
 InFlightJobs(i) ==
     {j \in Jobs : inFlight[i][j]}
@@ -130,6 +149,7 @@ Init ==
     /\ permitKind = [j \in Jobs |-> "none"]
     /\ inFlight = [i \in Instances |-> [j \in Jobs |-> FALSE]]
     /\ taskLease = [i \in Instances |-> [j \in Jobs |-> 0]]
+    /\ rescuedSlot = [i \in Instances |-> [j \in Jobs |-> "none"]]
     /\ cancelRequested = [i \in Instances |-> [j \in Jobs |-> FALSE]]
     /\ heartbeatFresh = [j \in Jobs |-> FALSE]
     /\ deadlineExpired = [j \in Jobs |-> FALSE]
@@ -153,7 +173,7 @@ ReserveLocal(i, j) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
                   heartbeatFresh, deadlineExpired, rateBudget,
                   shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 ReserveOverflow(i, j) ==
     LET q == QueueOf[j] IN
@@ -170,7 +190,7 @@ ReserveOverflow(i, j) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
                   heartbeatFresh, deadlineExpired, rateBudget,
                   shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 ReleaseReservation(i, j) ==
     /\ permitHolder[j] = i
@@ -181,7 +201,7 @@ ReleaseReservation(i, j) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
                   cancelRequested, heartbeatFresh, deadlineExpired,
                   rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 ClaimReserved(i, j) ==
     LET q == QueueOf[j] IN
@@ -189,7 +209,6 @@ ClaimReserved(i, j) ==
     /\ jobState[j] = "available"
     /\ permitHolder[j] = i
     /\ permitKind[j] \in {"local", "overflow"}
-    /\ attempt[j] < MaxAttempts
     /\ rateBudget[i][q] > 0
     /\ jobState' = [jobState EXCEPT ![j] = "running"]
     /\ attempt' = [attempt EXCEPT ![j] = @ + 1]
@@ -200,7 +219,7 @@ ClaimReserved(i, j) ==
     /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
     /\ UNCHANGED <<dbOwner, permitHolder, permitKind, inFlight, taskLease,
                   shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 StartExecution(i, j) ==
     /\ jobState[j] = "running"
@@ -215,7 +234,7 @@ StartExecution(i, j) ==
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
     /\ UNCHANGED <<jobState, attempt, lease, permitHolder, permitKind,
                   rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 HeartbeatPulse(i, j) ==
     /\ heartbeatAlive[i]
@@ -227,7 +246,7 @@ HeartbeatPulse(i, j) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, deadlineExpired,
                   rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 HeartbeatBecomesStale(j) ==
     /\ jobState[j] = "running"
@@ -237,7 +256,7 @@ HeartbeatBecomesStale(j) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, deadlineExpired,
                   rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 DeadlineExpires(j) ==
     /\ jobState[j] = "running"
@@ -247,10 +266,11 @@ DeadlineExpires(j) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 Finalize(i, j, toState) ==
     /\ toState \in FinalStates
+    /\ toState = "retryable" => attempt[j] < MaxAttempts
     /\ inFlight[i][j]
     /\ jobState[j] = "running"
     /\ dbOwner[j] = i
@@ -265,7 +285,7 @@ Finalize(i, j, toState) ==
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = FALSE]
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
     /\ UNCHANGED <<attempt, lease, rateBudget, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader, rescuedSlot>>
 
 FinalizeRejected(i, j, toState) ==
     /\ toState \in FinalStates
@@ -284,8 +304,37 @@ FinalizeRejected(i, j, toState) ==
         IF permitHolder[j] = i /\ lease[j] = taskLease[i][j]
         THEN [permitKind EXCEPT ![j] = "none"]
         ELSE permitKind
+    /\ rescuedSlot' = [rescuedSlot EXCEPT ![i][j] = "none"]
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, heartbeatFresh,
                   deadlineExpired, rateBudget, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
+
+\* Rescue spends the attempt like any other failure: retry while attempts
+\* remain, fail once the rescued attempt was the last (#546).
+RescueOutcome(j) ==
+    IF attempt[j] < MaxAttempts THEN "retryable" ELSE "failed"
+
+\* Rescue frees the job for its retry, but a handler still running for the
+\* rescued attempt keeps its worker slot until it returns or is dropped.
+RescuedSlotAfter(j) ==
+    LET h == permitHolder[j] IN
+    IF h \in Instances /\ inFlight[h][j]
+    THEN [rescuedSlot EXCEPT ![h][j] = permitKind[j]]
+    ELSE rescuedSlot
+
+\* The worker gives up on a handler still running past its deadline plus
+\* two deadline-rescue intervals: it drops the handler future and returns
+\* the slot without finalizing, since rescue has settled the attempt.
+DropRescuedHandler(i, j) ==
+    /\ DropRescuedHandlers
+    /\ rescuedSlot[i][j] # "none"
+    /\ inFlight[i][j]
+    /\ inFlight' = [inFlight EXCEPT ![i][j] = FALSE]
+    /\ taskLease' = [taskLease EXCEPT ![i][j] = 0]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
+    /\ rescuedSlot' = [rescuedSlot EXCEPT ![i][j] = "none"]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  heartbeatFresh, deadlineExpired, rateBudget, shutdownPhase,
                   dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
 
 RescueByHeartbeat(i, j) ==
@@ -294,10 +343,11 @@ RescueByHeartbeat(i, j) ==
     /\ jobState[j] = "running"
     /\ dbOwner[j] \in Instances
     /\ ~heartbeatFresh[j]
-    /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
+    /\ jobState' = [jobState EXCEPT ![j] = RescueOutcome(j)]
     /\ dbOwner' = [dbOwner EXCEPT ![j] = NoInstance]
     /\ permitHolder' = [permitHolder EXCEPT ![j] = NoInstance]
     /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
+    /\ rescuedSlot' = RescuedSlotAfter(j)
     /\ cancelRequested' =
         [cancelRequested EXCEPT ![i][j] = cancelRequested[i][j] \/ inFlight[i][j]]
     /\ UNCHANGED <<attempt, lease, inFlight, taskLease, heartbeatFresh,
@@ -310,10 +360,11 @@ RescueByDeadline(i, j) ==
     /\ jobState[j] = "running"
     /\ dbOwner[j] \in Instances
     /\ deadlineExpired[j]
-    /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
+    /\ jobState' = [jobState EXCEPT ![j] = RescueOutcome(j)]
     /\ dbOwner' = [dbOwner EXCEPT ![j] = NoInstance]
     /\ permitHolder' = [permitHolder EXCEPT ![j] = NoInstance]
     /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
+    /\ rescuedSlot' = RescuedSlotAfter(j)
     /\ cancelRequested' =
         [cancelRequested EXCEPT ![i][j] = cancelRequested[i][j] \/ inFlight[i][j]]
     /\ UNCHANGED <<attempt, lease, inFlight, taskLease, heartbeatFresh,
@@ -328,7 +379,7 @@ PromoteRetryable(j) ==
     /\ UNCHANGED <<attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, rateBudget,
                   shutdownPhase, dispatchersAlive, heartbeatAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 RefillBudget(i, q, n) ==
     /\ i \in Instances
@@ -340,7 +391,7 @@ RefillBudget(i, q, n) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive, leader>>
+                  heartbeatAlive, maintenanceAlive, leader, rescuedSlot>>
 
 AcquireLeadership(i) ==
     /\ leader = NoInstance
@@ -350,7 +401,7 @@ AcquireLeadership(i) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive>>
+                  heartbeatAlive, maintenanceAlive, rescuedSlot>>
 
 RelinquishLeadership(i) ==
     /\ leader = i
@@ -358,7 +409,7 @@ RelinquishLeadership(i) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive>>
+                  heartbeatAlive, maintenanceAlive, rescuedSlot>>
 
 ShutdownBegin(i) ==
     /\ shutdownPhase[i] = "running"
@@ -379,7 +430,7 @@ ShutdownBegin(i) ==
             [j \in Jobs |-> cancelRequested[i][j] \/ inFlight[i][j]]]
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
                   heartbeatFresh, deadlineExpired, rateBudget,
-                  heartbeatAlive, maintenanceAlive, leader>>
+                  heartbeatAlive, maintenanceAlive, leader, rescuedSlot>>
 
 EnterDraining(i) ==
     /\ shutdownPhase[i] = "stop_claim"
@@ -387,7 +438,7 @@ EnterDraining(i) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, rateBudget, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive, leader>>
+                  heartbeatAlive, maintenanceAlive, leader, rescuedSlot>>
 
 StopHeartbeat(i) ==
     /\ heartbeatAlive[i]
@@ -398,7 +449,7 @@ StopHeartbeat(i) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
-                  maintenanceAlive, leader>>
+                  maintenanceAlive, leader, rescuedSlot>>
 
 StopMaintenance(i) ==
     /\ maintenanceAlive[i]
@@ -409,7 +460,7 @@ StopMaintenance(i) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive>>
+                  heartbeatAlive, rescuedSlot>>
 
 DrainTimeout(i) ==
     /\ shutdownPhase[i] = "draining"
@@ -420,6 +471,7 @@ DrainTimeout(i) ==
     /\ dispatchersAlive' = [dispatchersAlive EXCEPT ![i] = FALSE]
     /\ inFlight' = [inFlight EXCEPT ![i] = [j \in Jobs |-> FALSE]]
     /\ taskLease' = [taskLease EXCEPT ![i] = [j \in Jobs |-> 0]]
+    /\ rescuedSlot' = [rescuedSlot EXCEPT ![i] = [j \in Jobs |-> "none"]]
     /\ cancelRequested' = [cancelRequested EXCEPT ![i] = [j \in Jobs |-> FALSE]]
     /\ permitHolder' =
         [j \in Jobs |->
@@ -441,7 +493,7 @@ FinishShutdown(i) ==
     /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
                   inFlight, taskLease, cancelRequested, heartbeatFresh,
                   deadlineExpired, rateBudget, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive, leader>>
+                  heartbeatAlive, maintenanceAlive, leader, rescuedSlot>>
 
 AnyFinalize ==
     \E i \in Instances, j \in Jobs, s \in FinalStates : Finalize(i, j, s)
@@ -491,6 +543,9 @@ AnyRescueByHeartbeat ==
 AnyRescueByDeadline ==
     \E i \in Instances, j \in Jobs : RescueByDeadline(i, j)
 
+AnyDropRescuedHandler ==
+    \E i \in Instances, j \in Jobs : DropRescuedHandler(i, j)
+
 Next ==
     \/ \E i \in Instances, j \in Jobs : ReserveLocal(i, j)
     \/ \E i \in Instances, j \in Jobs : ReserveOverflow(i, j)
@@ -504,6 +559,7 @@ Next ==
     \/ \E j \in Jobs : DeadlineExpires(j)
     \/ AnyRescueByHeartbeat
     \/ AnyRescueByDeadline
+    \/ AnyDropRescuedHandler
     \/ AnyPromoteRetryable
     \/ AnyRefill
     \/ AnyAcquireLeadership
@@ -523,6 +579,7 @@ TypeOK ==
     /\ permitKind \in [Jobs -> PermitKinds]
     /\ inFlight \in [Instances -> [Jobs -> BOOLEAN]]
     /\ taskLease \in [Instances -> [Jobs -> 0..MaxAttempts]]
+    /\ rescuedSlot \in [Instances -> [Jobs -> PermitKinds]]
     /\ cancelRequested \in [Instances -> [Jobs -> BOOLEAN]]
     /\ heartbeatFresh \in [Jobs -> BOOLEAN]
     /\ deadlineExpired \in [Jobs -> BOOLEAN]
@@ -568,6 +625,24 @@ DeferredRowsIdle ==
             /\ dbOwner[j] = NoInstance
             /\ permitHolder[j] = NoInstance
             /\ permitKind[j] = "none"
+
+\* No job is ever retried past its budget: whatever ends an attempt (an
+\* error, a crash, a hang), a job waiting to run has attempts left. Before
+\* #546 rescue sent exhausted attempts back to `retryable`, and the claim
+\* path has no attempt check to stop them.
+RetryHasBudget ==
+    \A j \in Jobs :
+        jobState[j] \in {"available", "retryable"} => attempt[j] < MaxAttempts
+
+\* A rescued slot belongs to a handler that is still running for an attempt
+\* the job has moved past.
+RescuedSlotHasStaleTask ==
+    \A i \in Instances, j \in Jobs :
+        rescuedSlot[i][j] # "none" =>
+            /\ inFlight[i][j]
+            /\ (jobState[j] # "running"
+                \/ dbOwner[j] # i
+                \/ taskLease[i][j] # lease[j])
 
 LocalCapacitySafe ==
     \A i \in Instances, q \in Queues : LocalHeld(i, q) <= MinWorkers[q]
@@ -632,6 +707,22 @@ FairSpec ==
     /\ WF_vars(AnyHeartbeatBecomesStale)
     /\ WF_vars(AnyRescueByHeartbeat)
     /\ WF_vars(AnyRescueByDeadline)
+    /\ WF_vars(AnyDropRescuedHandler)
+    /\ WF_vars(AnyRefill)
+
+\* Hung handlers: a handler whose attempt was rescued may never return, so
+\* a late finish gets no fairness. Only dropping it frees its slot.
+HungHandlerSpec ==
+    Spec
+    /\ WF_vars(AnyAcquireLeadership)
+    /\ WF_vars(AnyStartExecution)
+    /\ WF_vars(AnyFinalize)
+    /\ WF_vars(AnyPromoteRetryable)
+    /\ WF_vars(AnyHeartbeatPulse)
+    /\ WF_vars(AnyHeartbeatBecomesStale)
+    /\ WF_vars(AnyRescueByHeartbeat)
+    /\ WF_vars(AnyRescueByDeadline)
+    /\ WF_vars(AnyDropRescuedHandler)
     /\ WF_vars(AnyRefill)
 
 I1DrainEventuallyStops ==
@@ -640,6 +731,12 @@ I1DrainEventuallyStops ==
 I1Q1OverflowProgress ==
     NeedsOverflow("i1", "q1")
     ~> (OverflowHeld("i1", "q1") > 0 \/ ~NeedsOverflow("i1", "q1"))
+
+\* The Codex finding on #546: with one worker slot, a rescued handler that
+\* never returns must still give its slot back, or the retry never runs.
+RescuedSlotsReleased ==
+    \A i \in Instances, j \in Jobs :
+        (rescuedSlot[i][j] # "none") ~> (rescuedSlot[i][j] = "none")
 
 AbandonedJobsEventuallyLeaveRunning ==
     \A j \in Jobs : RecoverableAbandoned(j) ~> (jobState[j] # "running")

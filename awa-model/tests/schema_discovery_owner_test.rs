@@ -344,7 +344,10 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
             "COMMENT ON FUNCTION {OWNED_SCHEMA}.{CLAIM_SIGNATURE} IS 'stale'"
         ))))
         .await?;
-    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+    for (_, _, statement) in migrations::migration_sql_range(47, 48)
+        .into_iter()
+        .chain(migrations::migration_sql_range(50, 51))
+    {
         migrator_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
             .await?;
@@ -405,7 +408,10 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         vec!["awa".to_string(), OWNED_SCHEMA.to_string()],
         "role membership alone must not authorize refreshing foreign schemas"
     );
-    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+    for (_, _, statement) in migrations::migration_sql_range(47, 48)
+        .into_iter()
+        .chain(migrations::migration_sql_range(50, 51))
+    {
         superuser_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
             .await?;
@@ -473,7 +479,10 @@ async fn assert_foreign_when_clause_is_rejected(
         ))))
         .await?;
     let mut replay_failed_closed = false;
-    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+    for (_, _, statement) in migrations::migration_sql_range(47, 48)
+        .into_iter()
+        .chain(migrations::migration_sql_range(50, 51))
+    {
         if let Err(error) = migrator_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
             .await

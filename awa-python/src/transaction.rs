@@ -440,6 +440,15 @@ pub fn parse_run_at(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<DateT
     parse_datetime_str(&iso)
 }
 
+/// Parse `run_at` as staging and insert do, raising on a value they reject.
+/// Used by the `awa.testing.HandlerJob` stand-in so its rules cannot drift
+/// from the runtime's.
+#[pyfunction]
+#[pyo3(name = "_check_run_at")]
+pub fn check_run_at(py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+    parse_run_at(py, value.bind(py)).map(|_| ())
+}
+
 fn parse_datetime_str(value: &str) -> PyResult<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Ok(dt.with_timezone(&Utc));

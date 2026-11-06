@@ -31,9 +31,18 @@ use uuid::Uuid;
 ///
 /// `migrations::run` is `!Send` (it holds a pooled connection / open
 /// transaction across awaits), so it cannot be awaited directly inside the
-/// `future_into_py` bridge, whose future must be `Send`. We drive it on a
-/// throwaway `current_thread` runtime inside `spawn_blocking` — this keeps the
-/// asyncio loop free. Note that `asyncio.wait_for()` cancellation only detaches
+/// `future_into_py` bridge, whose future must be `Send`. We drive it with
+/// `Handle::block_on` on the shared bridge runtime inside `spawn_blocking`,
+/// which keeps the asyncio loop free and accepts a `!Send` future.
+///
+/// It must be the shared runtime, not a throwaway one: connections the pool
+/// opens during the migration register their sockets with whichever runtime
+/// is driving them, and they go back into the client's pool afterwards. With
+/// a throwaway runtime those connections outlive their I/O driver, and the
+/// next acquire that picks one up can stall until the pool's acquire timeout
+/// ("pool timed out while waiting for an open connection").
+///
+/// Note that `asyncio.wait_for()` cancellation only detaches
 /// the outer await: a `spawn_blocking` task cannot be interrupted, so the
 /// migration keeps running to completion in the background. The migration
 /// itself stays crash/cancel-safe through its transaction-scoped advisory lock.
@@ -48,16 +57,11 @@ use uuid::Uuid;
 /// versions (observed on 1.97); routing through this helper keeps the outer
 /// future unambiguously `Send` across toolchains.
 async fn run_migrations_offthread(pool: PgPool) -> PyResult<()> {
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build current_thread runtime for migrate");
-        rt.block_on(awa_model::migrations::run(&pool))
-    })
-    .await
-    .map_err(|e| state_error(format!("migration task failed: {e}")))?
-    .map_err(map_awa_error)
+    let runtime = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
+    tokio::task::spawn_blocking(move || runtime.block_on(awa_model::migrations::run(&pool)))
+        .await
+        .map_err(|e| state_error(format!("migration task failed: {e}")))?
+        .map_err(map_awa_error)
 }
 
 fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
@@ -399,6 +403,11 @@ pub struct WorkerEntry {
     pub kind: String,
     pub handler: Py<PyAny>,
     pub args_type: Py<PyAny>,
+    /// The output type given to `task(..., output=...)`, which `set_output`
+    /// checks values against.
+    pub output_type: Option<Py<PyAny>>,
+    /// Published as the kind descriptor's output.
+    pub output_descriptor: Option<awa_model::OutputDescriptor>,
     pub queue: String,
     pub task_locals: pyo3_async_runtimes::TaskLocals,
 }
@@ -409,6 +418,8 @@ impl Clone for WorkerEntry {
             kind: self.kind.clone(),
             handler: self.handler.clone_ref(py),
             args_type: self.args_type.clone_ref(py),
+            output_type: self.output_type.as_ref().map(|tp| tp.clone_ref(py)),
+            output_descriptor: self.output_descriptor.clone(),
             queue: self.queue.clone(),
             task_locals: self.task_locals.clone(),
         })
@@ -709,14 +720,25 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (args_type, *, kind=None, queue="default".to_string()))]
+    #[pyo3(signature = (args_type, *, kind=None, queue="default".to_string(), output=None, output_descriptor=None))]
     fn worker(
         &self,
         py: Python<'_>,
         args_type: Py<PyAny>,
         kind: Option<String>,
         queue: String,
+        output: Option<Py<PyAny>>,
+        output_descriptor: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        let output_descriptor = output_descriptor
+            .map(|descriptor| {
+                serde_json::from_value::<awa_model::OutputDescriptor>(py_to_json(
+                    py,
+                    descriptor.bind(py),
+                )?)
+                .map_err(|err| validation_error(format!("invalid output descriptor: {err}")))
+            })
+            .transpose()?;
         let workers = self.workers.clone();
         let kind_str = kind.unwrap_or_else(|| {
             Python::attach(|py| {
@@ -741,6 +763,8 @@ impl PyClient {
                     kind: kind_str.clone(),
                     handler: handler_py.clone_ref(py),
                     args_type: args_type.clone_ref(py),
+                    output_type: output.as_ref().map(|tp| tp.clone_ref(py)),
+                    output_descriptor: output_descriptor.clone(),
                     queue: queue.clone(),
                     task_locals: crate::async_bridge::get_current_locals(py)?,
                 };
@@ -1896,6 +1920,11 @@ impl PyClient {
             builder = builder.leader_election_interval(Duration::from_millis(ms));
         }
         if let Some(ms) = heartbeat_interval_ms {
+            if ms == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "heartbeat_interval_ms must be > 0",
+                ));
+            }
             builder = builder.heartbeat_interval(Duration::from_millis(ms));
         }
         if let Some(ms) = promote_interval_ms {
@@ -2041,11 +2070,19 @@ impl PyClient {
         for (queue, descriptor) in queue_descriptors {
             builder = builder.queue_descriptor(queue, descriptor);
         }
-        let job_kind_descriptors = self
+        let mut job_kind_descriptors = self
             .job_kind_descriptors
             .lock()
             .expect("job_kind_descriptors mutex poisoned")
             .clone();
+        for entry in &entries {
+            if let Some(output) = &entry.output_descriptor {
+                let descriptor = job_kind_descriptors.entry(entry.kind.clone()).or_default();
+                if descriptor.output.is_none() {
+                    descriptor.output = Some(output.clone());
+                }
+            }
+        }
         for (kind, descriptor) in job_kind_descriptors {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
@@ -2089,22 +2126,29 @@ impl PyClient {
 
     // ── External callback completion (async + sync) ─────────────────
 
-    #[pyo3(signature = (callback_id, payload=None))]
+    #[pyo3(signature = (callback_id, payload=None, *, output=None))]
     fn complete_external<'py>(
         &self,
         py: Python<'py>,
         callback_id: String,
         payload: Option<Py<PyAny>>,
+        output: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let payload_json = payload
             .as_ref()
             .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
             .transpose()?;
+        let output_json = output
+            .as_ref()
+            .map(|value| crate::job::output_json(py, value.bind(py)))
+            .transpose()?
+            .flatten();
         crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
+            let row = complete_external_row(&pool, &metrics, uuid, payload_json, output_json)
                 .await
                 .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
@@ -2234,23 +2278,30 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (callback_id, payload=None))]
+    #[pyo3(signature = (callback_id, payload=None, *, output=None))]
     fn complete_external_sync(
         &self,
         py: Python<'_>,
         callback_id: String,
         payload: Option<Py<PyAny>>,
+        output: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let payload_json = payload
             .as_ref()
             .map(|value| py_to_json(py, value.bind(py)))
             .transpose()?;
+        let output_json = output
+            .as_ref()
+            .map(|value| crate::job::output_json(py, value.bind(py)))
+            .transpose()?
+            .flatten();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
+                let row = complete_external_row(&pool, &metrics, uuid, payload_json, output_json)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
@@ -4023,6 +4074,33 @@ fn parse_queue_retention_overrides(
     }
 
     Ok(overrides)
+}
+
+/// Complete a waiting job externally, storing `output` as its output when
+/// one is given (ADR-048). The payload is not stored on completion.
+async fn complete_external_row(
+    pool: &sqlx::PgPool,
+    metrics: &awa_worker::AwaMetrics,
+    callback_id: uuid::Uuid,
+    payload: Option<serde_json::Value>,
+    output: Option<serde_json::Value>,
+) -> Result<awa_model::JobRow, awa_model::AwaError> {
+    match output {
+        Some(output) => {
+            let (row, dropped) = awa_model::admin::complete_external_reporting_output(
+                pool,
+                callback_id,
+                awa_model::ExternalCompletion::new().output(output),
+            )
+            .await?;
+            metrics.record_external_output(&row, dropped);
+            if let Some(reason) = dropped {
+                awa_model::admin::warn_external_output_dropped(reason);
+            }
+            Ok(row)
+        }
+        None => awa_model::admin::complete_external(pool, callback_id, payload, None).await,
+    }
 }
 
 #[cfg(test)]

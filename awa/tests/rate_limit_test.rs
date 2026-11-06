@@ -7,7 +7,7 @@ use awa_model::{insert_with, migrations, InsertOpts};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn database_url() -> String {
@@ -45,6 +45,27 @@ struct RateLimitJob {
 
 struct RateLimitWorker {
     completed_count: Arc<AtomicU32>,
+    started: JobStarts,
+}
+
+/// When each job's handler started. The spread between the first and last
+/// start is the dispatch time the rate limiter controls; wall time around
+/// `Client::start` also counts startup, which can overlap early dispatch.
+#[derive(Clone, Default)]
+struct JobStarts(Arc<Mutex<Vec<Instant>>>);
+
+impl JobStarts {
+    fn record(&self) {
+        self.0.lock().unwrap().push(Instant::now());
+    }
+
+    fn spread(&self) -> Duration {
+        let starts = self.0.lock().unwrap();
+        match (starts.iter().min(), starts.iter().max()) {
+            (Some(first), Some(last)) => *last - *first,
+            _ => Duration::ZERO,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -53,6 +74,7 @@ impl awa::Worker for RateLimitWorker {
         "rate_limit_job"
     }
     async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.started.record();
         self.completed_count.fetch_add(1, Ordering::SeqCst);
         Ok(JobResult::Completed)
     }
@@ -91,6 +113,7 @@ async fn test_no_rate_limit_fast_dispatch() {
         )
         .register_worker(RateLimitWorker {
             completed_count: completed.clone(),
+            started: JobStarts::default(),
         })
         .build()
         .unwrap();
@@ -139,6 +162,7 @@ async fn test_rate_limit_throttles_dispatch() {
     }
 
     let completed = Arc::new(AtomicU32::new(0));
+    let started = JobStarts::default();
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -154,6 +178,7 @@ async fn test_rate_limit_throttles_dispatch() {
         )
         .register_worker(RateLimitWorker {
             completed_count: completed.clone(),
+            started: started.clone(),
         })
         .build()
         .unwrap();
@@ -170,15 +195,15 @@ async fn test_rate_limit_throttles_dispatch() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let elapsed = start.elapsed();
     client.shutdown(Duration::from_secs(2)).await;
 
     let count = completed.load(Ordering::SeqCst);
     assert_eq!(count, 30, "All 30 jobs should complete");
     // With rate limit 10/sec and burst 10: first 10 immediately, remaining 20 at 10/sec = 2s
+    let spread = started.spread();
     assert!(
-        elapsed >= Duration::from_millis(1500),
-        "Rate-limited dispatch should take >= 1.5s, took {elapsed:?}"
+        spread >= Duration::from_millis(1500),
+        "Rate-limited dispatch should take >= 1.5s, took {spread:?}"
     );
 }
 
@@ -204,6 +229,7 @@ async fn test_rate_limit_burst_then_throttle() {
     }
 
     let completed = Arc::new(AtomicU32::new(0));
+    let started = JobStarts::default();
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -219,6 +245,7 @@ async fn test_rate_limit_burst_then_throttle() {
         )
         .register_worker(RateLimitWorker {
             completed_count: completed.clone(),
+            started: started.clone(),
         })
         .build()
         .unwrap();
@@ -235,15 +262,15 @@ async fn test_rate_limit_burst_then_throttle() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let elapsed = start.elapsed();
     client.shutdown(Duration::from_secs(2)).await;
 
     let count = completed.load(Ordering::SeqCst);
     assert_eq!(count, 30, "All 30 jobs should complete");
     // First 20 come from burst (fast), remaining 10 at 5/sec = 2s
+    let spread = started.spread();
     assert!(
-        elapsed >= Duration::from_millis(1500),
-        "After burst, remaining jobs should be throttled. Took {elapsed:?}"
+        spread >= Duration::from_millis(1500),
+        "After burst, remaining jobs should be throttled. Took {spread:?}"
     );
 }
 
@@ -284,6 +311,7 @@ async fn test_rate_limit_with_low_max_workers() {
         )
         .register_worker(RateLimitWorker {
             completed_count: completed.clone(),
+            started: JobStarts::default(),
         })
         .build()
         .unwrap();

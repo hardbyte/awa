@@ -26,6 +26,18 @@ AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; No
 AwaFinalizeReconnect.tla      ;; -                                      ;; pass ;; saved finalize replay after unknown commit acknowledgement
 AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectUnfenced.cfg        ;; NewerLeaseUnaffected is violated ;; old finalize changes a rescued and reclaimed attempt
 AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectSeparateFollowup.cfg ;; ResolvedFinalizeHasFollowup is violated ;; lost commit acknowledgement strands a separate follow-up
+AwaStagedFollowUps.tla        ;; -                                      ;; pass ;; handler-staged follow-ups commit with the guarded completion
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsEarlyInsert.cfg       ;; FollowupTracesToCommit is violated ;; handler inserts before its completion commits
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsSeparateTx.cfg        ;; ResolvedCompletionHasFollowup is violated ;; lost acknowledgement strands a separate staged insert
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsUnfenced.cfg          ;; CompletionByCurrentLease is violated ;; stale attempt completes a reclaimed job
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsDrainOnSend.cfg       ;; ResolvedCompletionHasFollowup is violated ;; retry after a drained first send loses the follow-up
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsBatchedPath.cfg       ;; CommittedHasFollowupOrDedup is violated ;; batched completion drops staged follow-ups
+AwaJobOutput.tla              ;; -                                      ;; pass ;; job output is published by the guarded transition of its own attempt
+AwaJobOutput.tla              ;; AwaJobOutputEarlyWrite.cfg              ;; OutputTracesToCommit is violated ;; output written when recorded, before the transition commits
+AwaJobOutput.tla              ;; AwaJobOutputSeparateTx.cfg              ;; ResolvedCompletionHasOutput is violated ;; lost acknowledgement strands an output written after the commit
+AwaJobOutput.tla              ;; AwaJobOutputDrainOnSend.cfg             ;; ResolvedCompletionHasOutput is violated ;; retry after a drained first send loses the output
+AwaJobOutput.tla              ;; AwaJobOutputBatchDrops.cfg              ;; ResolvedCompletionHasOutput is violated ;; batched completion drops the output
+AwaJobOutput.tla              ;; AwaJobOutputUnfenced.cfg                ;; NoOutputFromRescuedAttempt is violated ;; the output of a rescued attempt is published after its job is reclaimed
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
@@ -38,6 +50,9 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceReceiptOnlyCancel.cfg 
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceCallbackWait.cfg ;; CallbackWaitTraceIncomplete is violated ;; callback wait/resume trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqRetry.cfg    ;; DlqRetryTraceIncomplete is violated ;; DLQ retry trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; DlqPurgeTraceIncomplete is violated ;; DLQ purge trace consumed
+AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceRescueToDlq.cfg ;; RescueToDlqTraceIncomplete is violated ;; exhausted rescue dead-letters trace consumed
+AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceRescueToTerminal.cfg ;; RescueToTerminalTraceIncomplete is violated ;; exhausted rescue without a DLQ fails trace consumed
+AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceCallbackTimeoutToTerminal.cfg ;; CallbackTimeoutToTerminalTraceIncomplete is violated ;; exhausted callback timeout without a DLQ fails trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
 AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrder.cfg              ;; pass ;; segment-first queue prune with NOWAIT tail

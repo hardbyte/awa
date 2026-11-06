@@ -226,6 +226,168 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
+-- Retained job output (ADR-048): add the output columns to an existing
+-- substrate and expose them through terminal_jobs. Called by the installer
+-- and by migration v052, which does not replay the installer. Each column is
+-- added only when missing, so a re-run takes no lock on the tables, and the
+-- cardinality check is NOT VALID: it holds for new batch rows without
+-- scanning retained history.
+CREATE OR REPLACE FUNCTION awa.install_queue_storage_job_output(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, awa, public
+SET quote_all_identifiers = off
+AS $job_output$
+DECLARE
+    v_view REGCLASS := to_regclass(format('%I.terminal_jobs', p_schema));
+BEGIN
+    -- When anything is missing, lock in the order terminal_jobs readers do
+    -- (the view, then its tables), so a read that starts mid-migration
+    -- waits instead of deadlocking against the ALTERs.
+    IF v_view IS NOT NULL AND (
+        NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_view AND attname = 'output' AND NOT attisdropped
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+              AND conname = 'receipt_completion_batches_outputs_cardinality'
+        )
+    ) THEN
+        EXECUTE format(
+            'LOCK TABLE %1$I.terminal_jobs, %1$I.done_entries, %1$I.receipt_completion_batches IN ACCESS EXCLUSIVE MODE',
+            p_schema
+        );
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = format('%I.done_entries', p_schema)::regclass
+          AND attname = 'output'
+          AND NOT attisdropped
+    ) THEN
+        EXECUTE format('ALTER TABLE %I.done_entries ADD COLUMN IF NOT EXISTS output JSON', p_schema);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+          AND attname = 'outputs'
+          AND NOT attisdropped
+    ) THEN
+        EXECUTE format(
+            'ALTER TABLE %I.receipt_completion_batches ADD COLUMN IF NOT EXISTS outputs JSON[]',
+            p_schema
+        );
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+          AND conname = 'receipt_completion_batches_outputs_cardinality'
+    ) THEN
+        EXECUTE format(
+            $ddl$
+            ALTER TABLE %I.receipt_completion_batches
+                ADD CONSTRAINT receipt_completion_batches_outputs_cardinality
+                CHECK (outputs IS NULL OR completed_count = cardinality(outputs)) NOT VALID
+            $ddl$,
+            p_schema
+        );
+    END IF;
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE VIEW %1$I.terminal_jobs AS
+        SELECT
+            done.ready_slot,
+            done.ready_generation,
+            done.job_id,
+            done.kind,
+            done.queue,
+            COALESCE(done.args, ready.args, '{}'::jsonb) AS args,
+            done.state,
+            done.priority,
+            done.attempt,
+            done.run_lease,
+            COALESCE(done.max_attempts, ready.max_attempts, 25::smallint) AS max_attempts,
+            done.lane_seq,
+            done.enqueue_shard,
+            COALESCE(done.run_at, ready.run_at, done.finalized_at) AS run_at,
+            COALESCE(done.attempted_at, ready.attempted_at) AS attempted_at,
+            done.finalized_at,
+            COALESCE(done.created_at, ready.created_at, done.finalized_at) AS created_at,
+            COALESCE(done.unique_key, ready.unique_key) AS unique_key,
+            COALESCE(done.unique_states, ready.unique_states) AS unique_states,
+            COALESCE(done.payload, ready.payload, '{}'::jsonb) AS payload,
+            done.output
+        FROM %1$I.done_entries AS done
+        LEFT JOIN %1$I.ready_entries AS ready
+          ON ready.ready_slot       = done.ready_slot
+         AND ready.ready_generation = done.ready_generation
+         AND ready.queue            = done.queue
+         AND ready.priority         = done.priority
+         AND ready.enqueue_shard    = done.enqueue_shard
+         AND ready.lane_seq         = done.lane_seq
+        UNION ALL
+        SELECT
+            batch.ready_slot,
+            batch.ready_generation,
+            item.job_id,
+            ready.kind,
+            batch.queue,
+            ready.args,
+            'completed'::awa.job_state AS state,
+            batch.priority,
+            item.attempt,
+            item.run_lease,
+            ready.max_attempts,
+            item.lane_seq,
+            batch.enqueue_shard,
+            ready.run_at,
+            item.attempted_at,
+            batch.finalized_at,
+            ready.created_at,
+            ready.unique_key,
+            ready.unique_states,
+            COALESCE(ready.payload, '{}'::jsonb) AS payload,
+            -- Subscript rather than unnest, so only matching rows detoast
+            -- the batch's output array.
+            batch.outputs[item.ord] AS output
+        FROM %1$I.receipt_completion_batches AS batch
+        CROSS JOIN LATERAL unnest(
+            batch.job_ids,
+            batch.run_leases,
+            batch.lane_seqs,
+            batch.attempts,
+            batch.attempted_ats
+        ) WITH ORDINALITY AS item(job_id, run_lease, lane_seq, attempt, attempted_at, ord)
+        JOIN %1$I.ready_entries AS ready
+          ON ready.ready_slot       = batch.ready_slot
+         AND ready.ready_generation = batch.ready_generation
+         AND ready.queue            = batch.queue
+         AND ready.priority         = batch.priority
+         AND ready.enqueue_shard    = batch.enqueue_shard
+         AND ready.lane_seq         = item.lane_seq
+         AND ready.job_id           = item.job_id
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM %1$I.receipt_completion_tombstones AS tomb
+            WHERE tomb.ready_slot       = batch.ready_slot
+              AND tomb.ready_generation = batch.ready_generation
+              AND tomb.job_id           = item.job_id
+              AND tomb.run_lease        = item.run_lease
+        )
+        $ddl$,
+        p_schema
+    );
+END;
+$job_output$;
+
+REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_job_output(TEXT) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -237,6 +399,7 @@ RETURNS VOID
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, awa, public
+SET quote_all_identifiers = off
 AS $install$
 DECLARE
     v_slot           INT;
@@ -244,6 +407,7 @@ DECLARE
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
     v_identity_rel   REGCLASS;
+    v_claimer_owner_index REGCLASS;
     -- #371 staged rolling upgrade: was this a FRESH install (the ring
     -- state did not exist before this call) or an UPGRADE of an existing
     -- schema? A fresh install has no old binaries that could still read
@@ -1422,12 +1586,28 @@ BEGIN
         p_schema
     );
 
-    -- Drop the old expires_at-inclusive index shape (see queue_storage.rs
-    -- for the HOT-update rationale) and replace with the narrower shape.
-    EXECUTE format(
-        'DROP INDEX IF EXISTS %I.idx_%s_queue_claimer_leases_owner',
-        p_schema, p_schema
-    );
+    -- Retain the current index: dropping it on every replay retains locks
+    -- on each obsolete index OID until the whole migration range commits.
+    v_claimer_owner_index := to_regclass(format(
+        '%I.%I', p_schema, format('idx_%s_queue_claimer_leases_owner', p_schema)
+    ));
+    IF v_claimer_owner_index IS NOT NULL AND NOT EXISTS (
+        SELECT 1
+        FROM pg_index AS idx
+        JOIN pg_class AS rel ON rel.oid = idx.indexrelid
+        JOIN pg_am AS am ON am.oid = rel.relam
+        WHERE idx.indexrelid = v_claimer_owner_index
+          AND idx.indrelid = to_regclass(format('%I.queue_claimer_leases', p_schema))
+          AND idx.indisvalid AND idx.indisready AND idx.indislive
+          AND NOT idx.indisunique AND NOT idx.indisexclusion
+          AND idx.indnkeyatts = 2 AND idx.indnatts = 2
+          AND idx.indpred IS NULL AND idx.indexprs IS NULL
+          AND am.amname = 'btree'
+          AND pg_get_indexdef(idx.indexrelid, 1, false) = 'queue'
+          AND pg_get_indexdef(idx.indexrelid, 2, false) = 'owner_instance_id'
+    ) THEN
+        EXECUTE format('DROP INDEX %s', v_claimer_owner_index);
+    END IF;
 
     EXECUTE format(
         'CREATE INDEX IF NOT EXISTS idx_%s_queue_claimer_leases_owner ON %I.queue_claimer_leases (queue, owner_instance_id)',
@@ -2127,13 +2307,16 @@ BEGIN
             attempts         SMALLINT[] NOT NULL,
             attempted_ats    TIMESTAMPTZ[] NOT NULL,
             finalized_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            outputs          JSON[],
             PRIMARY KEY (ready_slot, batch_id),
             CHECK (completed_count > 0),
             CHECK (completed_count = cardinality(job_ids)),
             CHECK (completed_count = cardinality(run_leases)),
             CHECK (completed_count = cardinality(lane_seqs)),
             CHECK (completed_count = cardinality(attempts)),
-            CHECK (completed_count = cardinality(attempted_ats))
+            CHECK (completed_count = cardinality(attempted_ats)),
+            CONSTRAINT receipt_completion_batches_outputs_cardinality
+                CHECK (outputs IS NULL OR completed_count = cardinality(outputs))
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
         p_schema,
@@ -2199,6 +2382,7 @@ BEGIN
             unique_key       BYTEA,
             unique_states    TEXT,
             payload          JSONB,
+            output           JSON,
             PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
@@ -2300,87 +2484,9 @@ BEGIN
         p_schema
     );
 
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE VIEW %1$I.terminal_jobs AS
-        SELECT
-            done.ready_slot,
-            done.ready_generation,
-            done.job_id,
-            done.kind,
-            done.queue,
-            COALESCE(done.args, ready.args, '{}'::jsonb) AS args,
-            done.state,
-            done.priority,
-            done.attempt,
-            done.run_lease,
-            COALESCE(done.max_attempts, ready.max_attempts, 25::smallint) AS max_attempts,
-            done.lane_seq,
-            done.enqueue_shard,
-            COALESCE(done.run_at, ready.run_at, done.finalized_at) AS run_at,
-            COALESCE(done.attempted_at, ready.attempted_at) AS attempted_at,
-            done.finalized_at,
-            COALESCE(done.created_at, ready.created_at, done.finalized_at) AS created_at,
-            COALESCE(done.unique_key, ready.unique_key) AS unique_key,
-            COALESCE(done.unique_states, ready.unique_states) AS unique_states,
-            COALESCE(done.payload, ready.payload, '{}'::jsonb) AS payload
-        FROM %1$I.done_entries AS done
-        LEFT JOIN %1$I.ready_entries AS ready
-          ON ready.ready_slot       = done.ready_slot
-         AND ready.ready_generation = done.ready_generation
-         AND ready.queue            = done.queue
-         AND ready.priority         = done.priority
-         AND ready.enqueue_shard    = done.enqueue_shard
-         AND ready.lane_seq         = done.lane_seq
-        UNION ALL
-        SELECT
-            batch.ready_slot,
-            batch.ready_generation,
-            item.job_id,
-            ready.kind,
-            batch.queue,
-            ready.args,
-            'completed'::awa.job_state AS state,
-            batch.priority,
-            item.attempt,
-            item.run_lease,
-            ready.max_attempts,
-            item.lane_seq,
-            batch.enqueue_shard,
-            ready.run_at,
-            item.attempted_at,
-            batch.finalized_at,
-            ready.created_at,
-            ready.unique_key,
-            ready.unique_states,
-            COALESCE(ready.payload, '{}'::jsonb) AS payload
-        FROM %1$I.receipt_completion_batches AS batch
-        CROSS JOIN LATERAL unnest(
-            batch.job_ids,
-            batch.run_leases,
-            batch.lane_seqs,
-            batch.attempts,
-            batch.attempted_ats
-        ) WITH ORDINALITY AS item(job_id, run_lease, lane_seq, attempt, attempted_at, ord)
-        JOIN %1$I.ready_entries AS ready
-          ON ready.ready_slot       = batch.ready_slot
-         AND ready.ready_generation = batch.ready_generation
-         AND ready.queue            = batch.queue
-         AND ready.priority         = batch.priority
-         AND ready.enqueue_shard    = batch.enqueue_shard
-         AND ready.lane_seq         = item.lane_seq
-         AND ready.job_id           = item.job_id
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM %1$I.receipt_completion_tombstones AS tomb
-            WHERE tomb.ready_slot       = batch.ready_slot
-              AND tomb.ready_generation = batch.ready_generation
-              AND tomb.job_id           = item.job_id
-              AND tomb.run_lease        = item.run_lease
-        )
-        $ddl$,
-        p_schema
-    );
+    -- Retained job output (ADR-048): the output columns and the
+    -- terminal_jobs view that exposes them.
+    PERFORM awa.install_queue_storage_job_output(p_schema);
 
     EXECUTE format(
         $ddl$
@@ -4046,6 +4152,143 @@ BEGIN
                 RETURN;
             END IF;
 
+            -- The slot functions carry the claim CTE; the mode marker below
+            -- keeps the substrate reinstall loops' receipts detection working.
+            %2$s
+            RETURN QUERY EXECUTE format(
+                'SELECT * FROM %%I.claim_ready_slot_%%s($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
+                %1$L,
+                v_target_slot
+            )
+            USING
+                p_queue,
+                v_target_slot,
+                v_target_generation,
+                v_lane_priority,
+                v_lane_shard,
+                v_lane_claim_seq,
+                v_claim_limit,
+                p_aging_secs,
+                v_claimed_at,
+                v_deadline_at,
+                p_deadline_secs,
+                v_lane_next_seq;
+
+            GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
+
+            -- If a target ready row existed but the claim CTE produced no
+            -- rows, the spent-attempt pre-pass may still have moved the
+            -- sequence cursor over committed spent attempts. It deliberately
+            -- does not advance over unspent rows: newly emitted claims still
+            -- move the sequence only after the surrounding transaction
+            -- commits, because sequence movement is non-transactional and
+            -- cannot be recovered by rollback.
+            IF v_claimed_count = 0 THEN
+                RETURN;
+            END IF;
+        END;
+        $func$
+        $create_runtime$,
+        p_schema,
+        CASE
+            WHEN p_lease_claim_receipts THEN format('-- receipts mode: claim_ready_slot_N runs INSERT INTO %I.lease_claim_batches', p_schema)
+            ELSE format('-- legacy mode: claim_ready_slot_N runs INSERT INTO %I.leases', p_schema)
+        END,
+        p_lease_claim_receipts
+    );
+
+    EXECUTE format(
+        'COMMENT ON FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) IS %L',
+        p_schema,
+        'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
+    );
+
+    --------------------------------------------------------------------
+    -- Replica identity for the append-only delta tables, which have no
+    -- primary key. PostgreSQL refuses UPDATE and DELETE on a published
+    -- table without a replica identity, so a `FOR ALL TABLES` or
+    -- `FOR TABLES IN SCHEMA` publication would break the rollup fold and
+    -- prune. FULL costs nothing on INSERT or TRUNCATE, which is all the
+    -- hot path does to these tables. Partitions never inherit the
+    -- parent's setting, so each child is set here as well; the parent is
+    -- set for `publish_via_partition_root` publications.
+    --------------------------------------------------------------------
+
+    FOR v_identity_rel IN
+        SELECT c.oid::regclass
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = p_schema
+          AND c.relkind IN ('r', 'p')
+          AND c.relreplident <> 'f'
+          AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'
+        ORDER BY c.relname
+    LOOP
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+    END LOOP;
+
+
+    --------------------------------------------------------------------
+    -- Per-queue-slot claim bodies. Each addresses its own ring children
+    -- directly, so the statement plans against one child (no Append over
+    -- the partitioned parents), goes generic after a few executions, and
+    -- is invalidated only when that child is truncated.
+    --------------------------------------------------------------------
+
+    FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
+        EXECUTE format(
+            $create_slot$
+            CREATE OR REPLACE FUNCTION %1$I.claim_ready_slot_%4$s(
+                p_queue TEXT,
+                p_target_slot INT,
+                p_target_generation BIGINT,
+                p_lane_priority SMALLINT,
+                p_lane_shard SMALLINT,
+                p_lane_claim_seq BIGINT,
+                p_claim_limit BIGINT,
+                p_aging_secs DOUBLE PRECISION,
+                p_claimed_at TIMESTAMPTZ,
+                p_deadline_at TIMESTAMPTZ,
+                p_deadline_secs DOUBLE PRECISION,
+                p_lane_next_seq BIGINT
+            )
+        RETURNS TABLE(
+            ready_slot INT,
+            ready_generation BIGINT,
+            lane_seq BIGINT,
+            enqueue_shard SMALLINT,
+            lease_slot INT,
+            lease_generation BIGINT,
+            claim_slot INT,
+            receipt_id BIGINT,
+            claim_batch_id BIGINT,
+            claim_batch_index INT,
+            job_id BIGINT,
+            kind TEXT,
+            queue TEXT,
+            args JSONB,
+            lane_priority SMALLINT,
+            priority SMALLINT,
+            attempt SMALLINT,
+            run_lease BIGINT,
+            max_attempts SMALLINT,
+            run_at TIMESTAMPTZ,
+            heartbeat_at TIMESTAMPTZ,
+            deadline_at TIMESTAMPTZ,
+            attempted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ,
+            unique_key BYTEA,
+            unique_states TEXT,
+            payload JSONB,
+            lane_drained BOOLEAN)
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, awa, public
+        AS $func$
+        DECLARE
+            v_lane_shard SMALLINT := p_lane_shard;
+            v_claimed_at TIMESTAMPTZ := p_claimed_at;
+            v_deadline_at TIMESTAMPTZ := p_deadline_at;
+        BEGIN
             RETURN QUERY
             WITH lease_ring AS MATERIALIZED (
                 -- #371: current lease cursor via the authority resolver
@@ -4087,23 +4330,23 @@ BEGIN
                     ready.unique_states,
                     COALESCE(ready.payload, '{}'::jsonb) AS payload,
                     EXISTS (
-                        SELECT 1 FROM %1$I.ready_tombstones AS tomb
-                        WHERE tomb.ready_slot = v_target_slot
-                          AND tomb.ready_generation = v_target_generation
+                        SELECT 1 FROM %1$I.ready_tombstones_%4$s AS tomb
+                        WHERE tomb.ready_slot = p_target_slot
+                          AND tomb.ready_generation = p_target_generation
                           AND tomb.queue = ready.queue
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
                           AND tomb.lane_seq = ready.lane_seq
                     ) AS is_tombstone
-                FROM %1$I.ready_entries AS ready
+                FROM %1$I.ready_entries_%4$s AS ready
                 WHERE ready.queue = p_queue
-                  AND ready.priority = v_lane_priority
-                  AND ready.enqueue_shard = v_lane_shard
-                  AND ready.ready_slot = v_target_slot
-                  AND ready.ready_generation = v_target_generation
-                  AND ready.lane_seq >= v_lane_claim_seq
+                  AND ready.priority = p_lane_priority
+                  AND ready.enqueue_shard = p_lane_shard
+                  AND ready.ready_slot = p_target_slot
+                  AND ready.ready_generation = p_target_generation
+                  AND ready.lane_seq >= p_lane_claim_seq
                 ORDER BY ready.lane_seq ASC
-                LIMIT v_claim_limit
+                LIMIT p_claim_limit
             ),
             selected_with_spent AS (
                 SELECT
@@ -4116,7 +4359,7 @@ BEGIN
                 claimed.ready_slot,
                 claimed.ready_generation,
                 claimed.lane_seq,
-                v_lane_shard AS enqueue_shard,
+                p_lane_shard AS enqueue_shard,
                 lease_ring.lease_slot,
                 lease_ring.lease_generation,
                 claimed.claim_slot,
@@ -4134,19 +4377,19 @@ BEGIN
                 claimed.max_attempts,
                 selected.run_at,
                 CASE
-                    WHEN p_deadline_secs > 0 THEN v_claimed_at
+                    WHEN p_deadline_secs > 0 THEN p_claimed_at
                     ELSE NULL::timestamptz
                 END AS heartbeat_at,
-                v_deadline_at AS deadline_at,
+                p_deadline_at AS deadline_at,
                 CASE
-                    WHEN p_deadline_secs > 0 THEN v_claimed_at
+                    WHEN p_deadline_secs > 0 THEN p_claimed_at
                     ELSE NULL::timestamptz
                 END AS attempted_at,
                 selected.created_at,
                 selected.unique_key,
                 selected.unique_states,
                 selected.payload,
-                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained
+                (p_lane_claim_seq + p_claim_limit >= p_lane_next_seq) AS lane_drained
             FROM claimed
             CROSS JOIN lease_ring
             JOIN selected
@@ -4157,52 +4400,18 @@ BEGIN
              AND selected.lane_seq = claimed.lane_seq
             ORDER BY selected.lane_seq ASC;
 
-            GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
-
-            -- If a target ready row existed but the claim CTE produced no
-            -- rows, the spent-attempt pre-pass may still have moved the
-            -- sequence cursor over committed spent attempts. It deliberately
-            -- does not advance over unspent rows: newly emitted claims still
-            -- move the sequence only after the surrounding transaction
-            -- commits, because sequence movement is non-transactional and
-            -- cannot be recovered by rollback.
-            IF v_claimed_count = 0 THEN
-                RETURN;
-            END IF;
         END;
         $func$
-        $create_runtime$,
-        p_schema, v_claimed_cte, p_lease_claim_receipts
-    );
-
-    EXECUTE format(
-        'COMMENT ON FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) IS %L',
-        p_schema,
-        'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
-    );
-
-    --------------------------------------------------------------------
-    -- Replica identity for the append-only delta tables, which have no
-    -- primary key. PostgreSQL refuses UPDATE and DELETE on a published
-    -- table without a replica identity, so a `FOR ALL TABLES` or
-    -- `FOR TABLES IN SCHEMA` publication would break the rollup fold and
-    -- prune. FULL costs nothing on INSERT or TRUNCATE, which is all the
-    -- hot path does to these tables. Partitions never inherit the
-    -- parent's setting, so each child is set here as well; the parent is
-    -- set for `publish_via_partition_root` publications.
-    --------------------------------------------------------------------
-
-    FOR v_identity_rel IN
-        SELECT c.oid::regclass
-        FROM pg_class AS c
-        JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE n.nspname = p_schema
-          AND c.relkind IN ('r', 'p')
-          AND c.relreplident <> 'f'
-          AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'
-        ORDER BY c.relname
-    LOOP
-        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+            $create_slot$,
+            p_schema,
+            replace(
+                v_claimed_cte,
+                format('%I.ready_claim_attempt_batches', p_schema),
+                format('%I.ready_claim_attempt_batches_%s', p_schema, v_slot)
+            ),
+            p_lease_claim_receipts,
+            v_slot
+        );
     END LOOP;
 
     --------------------------------------------------------------------

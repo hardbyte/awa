@@ -1,0 +1,27 @@
+name: Release notes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-notes.yml
+      - scripts/previous-release-tag.py
+      - scripts/tests/test_previous_release_tag.py
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-notes.yml
+      - scripts/previous-release-tag.py
+      - scripts/tests/test_previous_release_tag.py
+
+permissions:
+  contents: read
+
+jobs:
+  release-tag-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - run: python3 -m unittest discover -s scripts/tests -p test_previous_release_tag.py -v

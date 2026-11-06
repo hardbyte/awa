@@ -183,7 +183,13 @@ timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.
 The DLQ is a separate physical table, not a job state; a DLQ'd job cannot be
 claimed until retried out. It is per-queue opt-in (`dlq_enabled`) with a
 default 30-day retention pruned by the maintenance leader. `dlq_reason` is
-`max_attempts`, `manual`, or `deadline_expired`.
+`max_attempts_exhausted`, `terminal_error`, `heartbeat_stale`,
+`deadline_exceeded`, `callback_timeout`, or the reason passed to `awa dlq move`.
+
+A poison job (one that crashes, hangs or panics on every attempt) stops after
+`max_attempts`: crash and deadline rescues spend attempts like handler errors.
+To contain one, `awa job cancel <id>` it or `awa queue pause` its queue, ship
+the fix, then `awa dlq retry-bulk --queue <q> --kind <kind>`.
 
 ```bash
 awa dlq depth --queue emails
@@ -368,6 +374,16 @@ the UI hides its buttons; read-only is auto-detected against a read-only
 connection. Set `--callback-hmac-secret` to verify callback signatures; for
 externally reachable callbacks with a private admin surface, run
 `awa callbacks serve` instead, whose router has no admin routes.
+
+`awa serve` caps every admin query at 60 seconds (`--statement-timeout` /
+`AWA_STATEMENT_TIMEOUT`, in seconds; `0` keeps the server's setting). Postgres
+keeps running a query after its HTTP request is abandoned, so this cap is what
+stops repeated dashboard polls from piling up slow queries. When embedding
+`awa_ui::router` in another service, build its pool with
+`awa_ui::admin_pool_options(PgPoolOptions::new())` and
+`connect_with(awa_ui::admin_connect_options(url.parse()?, Some(timeout)))`.
+The release hook recovers connections whose request was dropped mid-query;
+without it, a cancelled query can leak the pool slot over TLS.
 
 ## Before You Finish A Change
 
