@@ -506,10 +506,9 @@ async fn execute_is_limited_to_roles_that_may_maintain_queue_storage() {
             .expect_err("write privileges alone do not grant EXECUTE"),
         "permission denied for function",
     );
-    for (_, _, sql) in migrations::migration_sql_range(
-        migrations::CURRENT_VERSION - 1,
-        migrations::CURRENT_VERSION,
-    ) {
+    // Replay the statistics migration itself: later migrations do not repeat
+    // its EXECUTE grants for a runtime role created after initial migration.
+    for (_, _, sql) in migrations::migration_sql_range(53, 54) {
         run_sql(owner_pool, sql)
             .await
             .expect("re-run the migration");
