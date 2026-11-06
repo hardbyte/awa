@@ -4,8 +4,11 @@
 
 use awa::model::admin;
 use awa::model::queue_history::{self, FleetHistoryRow, QueueHistoryRow};
-use awa::model::{insert_with, InsertOpts};
-use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa::model::{insert, insert_with, InsertOpts};
+use awa::{
+    Client, JobArgs, JobContext, JobError, JobResult, JobState, QueueConfig, QueueStorage,
+    QueueStorageConfig, Worker,
+};
 use awa_testing::TestClient;
 use chrono::{DurationRound, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,154 @@ impl Worker for HistoryProbeWorker {
     async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Ok(JobResult::Completed)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct StripedOutcome {
+    action: String,
+}
+
+struct StripedOutcomeWorker;
+
+#[async_trait::async_trait]
+impl Worker for StripedOutcomeWorker {
+    fn kind(&self) -> &'static str {
+        "striped_outcome"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        assert!(
+            ctx.job.queue.starts_with("qh_striped#"),
+            "physical queue identity must reach the handler unchanged"
+        );
+        match ctx.job.args["action"].as_str().unwrap() {
+            "retry" if ctx.job.attempt == 1 => Ok(JobResult::RetryAfter(Duration::from_millis(10))),
+            "fail" => Err(JobError::Terminal("history probe".into())),
+            "park" => Ok(JobResult::WaitForCallback(
+                ctx.register_callback(Duration::from_secs(300))
+                    .await
+                    .map_err(JobError::retryable)?,
+            )),
+            _ => Ok(JobResult::Completed),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_striped_queue_snapshots_record_every_outcome_under_the_logical_queue() {
+    let _guard = LOCK.lock().await;
+    let client = setup().await;
+    let pool = client.pool();
+    let queue = "qh_striped";
+    let config = QueueStorageConfig {
+        schema: "qh_striped_counters".into(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        queue_stripe_count: 2,
+        lease_claim_receipts: true,
+    };
+    let store = QueueStorage::new(config.clone()).unwrap();
+    // This regression pins its backend instead of relying on fresh-install
+    // auto-finalization, which correctly refuses another test's canonical jobs.
+    store.install(pool).await.unwrap();
+    store.reset(pool).await.unwrap();
+    assert_eq!(
+        QueueStorage::active_schema(pool).await.unwrap().as_deref(),
+        Some(store.schema())
+    );
+    let params: Vec<_> = ["complete", "retry", "fail", "park"]
+        .into_iter()
+        .map(|action| {
+            insert::params_with(
+                &StripedOutcome {
+                    action: action.into(),
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    store.enqueue_params_batch(pool, &params).await.unwrap();
+    let jobs: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT job_id, args->>'action' FROM qh_striped_counters.ready_entries ORDER BY job_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs.len(), 4);
+
+    let runtime = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(config, Duration::from_secs(60), Duration::from_secs(60))
+        .claim_rotate_interval(Duration::from_secs(60))
+        .queue_history_retention(Duration::ZERO)
+        .promote_interval(Duration::from_millis(25))
+        .runtime_snapshot_interval(Duration::from_millis(100))
+        .register_worker(StripedOutcomeWorker)
+        .build()
+        .unwrap();
+    runtime.start().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut settled = true;
+        for (id, action) in &jobs {
+            let wanted = match action.as_str() {
+                "fail" => JobState::Failed,
+                "park" => JobState::WaitingExternal,
+                _ => JobState::Completed,
+            };
+            settled &= store
+                .load_job(pool, *id)
+                .await
+                .unwrap()
+                .is_some_and(|job| job.state == wanted);
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "striped outcomes did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Read a snapshot published after every durable outcome was observed,
+    // rather than waiting for the counter values that this regression tests.
+    let settled_at = Utc::now();
+    let counters = loop {
+        let instances = admin::list_runtime_instances(pool).await.unwrap();
+        if let Some(counters) = instances
+            .iter()
+            .filter(|instance| instance.last_seen_at >= settled_at)
+            .flat_map(|instance| &instance.queues)
+            .find(|snapshot| snapshot.queue == queue)
+            .and_then(|snapshot| snapshot.counters)
+        {
+            break counters;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no post-outcome runtime snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    runtime.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(counters.claimed, 5);
+    assert_eq!(counters.completed, 2);
+    assert_eq!(counters.failed, 1);
+    assert_eq!(counters.retried, 1);
+    assert_eq!(counters.parked, 1);
 }
 
 #[tokio::test]

@@ -11,10 +11,11 @@
 //! runtimes that predate the counters, and when the interval since the last
 //! sample is not about a minute. Completed, failed and retried counts are also
 //! unknown wherever a callback may have resolved a parked job, since that can
-//! happen in any process. A runtime that dies between samples loses at most
-//! its last snapshot interval of counts.
+//! happen in any process. A departing runtime contributes its final published
+//! counters once; its unpublished tail is lost. A participant disappearing
+//! without a final reading makes that interval unknown.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
@@ -87,7 +88,7 @@ impl QueueFlow {
 #[derive(Debug, Default)]
 pub struct CounterBaseline {
     sampled_at: Option<DateTime<Utc>>,
-    readings: HashMap<(Uuid, String), QueueOutcomeCounters>,
+    readings: HashMap<(Uuid, String), Option<QueueOutcomeCounters>>,
     waiting_external: HashMap<String, i64>,
 }
 
@@ -103,8 +104,10 @@ pub struct QueueCoverage {
 }
 
 impl CounterBaseline {
-    /// Difference the live runtimes' counters against the previous sample and
-    /// advance the baseline to `now`.
+    /// Difference participating runtimes' counters against the previous sample.
+    /// A departing runtime's final published snapshot contributes once, without
+    /// counting it as live capacity. A participant missing entirely makes the
+    /// interval unknown rather than turning its unobserved work into zero.
     pub fn advance(
         &mut self,
         now: DateTime<Utc>,
@@ -116,9 +119,20 @@ impl CounterBaseline {
             ((now - sampled_at) - TimeDelta::minutes(1)).abs() <= MINUTE_TOLERANCE
         });
         let mut readings = HashMap::new();
+        let mut observed = HashSet::new();
 
-        for instance in instances.iter().filter(|instance| !instance.stale) {
+        for instance in instances {
             for snapshot in &instance.queues {
+                let key = (instance.instance_id, snapshot.queue.clone());
+                if instance.stale
+                    && !self.readings.contains_key(&key)
+                    && self.sampled_at.is_none_or(|at| instance.last_seen_at < at)
+                {
+                    // This final snapshot was already consumed, or predates our
+                    // first baseline. It cannot contribute to this interval.
+                    continue;
+                }
+                observed.insert(key.clone());
                 let entry =
                     coverage
                         .entry(snapshot.queue.clone())
@@ -127,20 +141,24 @@ impl CounterBaseline {
                             live_workers: 0,
                             capacity: Some(0),
                         });
-                entry.live_workers += 1;
-                entry.capacity = match (entry.capacity, snapshot.config.mode) {
-                    (Some(total), QueueRuntimeMode::HardReserved) => {
-                        Some(total + i64::from(snapshot.config.max_workers.unwrap_or(0)))
-                    }
-                    _ => None,
-                };
+                if !instance.stale {
+                    entry.live_workers += 1;
+                    entry.capacity = match (entry.capacity, snapshot.config.mode) {
+                        (Some(total), QueueRuntimeMode::HardReserved) => {
+                            Some(total + i64::from(snapshot.config.max_workers.unwrap_or(0)))
+                        }
+                        _ => None,
+                    };
+                    // Retain missing counters too: disappearance of an older
+                    // participant cannot make the next interval known zero.
+                    readings.insert(key.clone(), snapshot.counters);
+                }
 
                 let Some(current) = snapshot.counters else {
                     unknown.insert(snapshot.queue.clone());
                     continue;
                 };
-                let key = (instance.instance_id, snapshot.queue.clone());
-                let previous = self.readings.get(&key);
+                let previous = self.readings.get(&key).and_then(Option::as_ref);
                 let started_since_last_sample = self
                     .sampled_at
                     .is_some_and(|sampled_at| instance.started_at >= sampled_at);
@@ -151,13 +169,13 @@ impl CounterBaseline {
                 } else if let Some(flow) = entry.flow.as_mut() {
                     flow.add(QueueFlow::between(previous, &current));
                 }
-                readings.insert(key, current);
             }
         }
+        for key in self.readings.keys().filter(|key| !observed.contains(*key)) {
+            unknown.insert(key.1.clone());
+        }
         for queue in unknown {
-            if let Some(entry) = coverage.get_mut(&queue) {
-                entry.flow = None;
-            }
+            coverage.entry(queue).or_default().flow = None;
         }
         self.sampled_at = Some(now);
         self.readings = readings;
@@ -247,7 +265,9 @@ pub fn build_sample(
         .iter()
         .map(|queue| {
             let covered = coverage.get(&queue.queue);
-            let flow = covered.and_then(|c| c.flow);
+            // No participant over this interval is a measured zero. A coverage
+            // entry with no flow is unknown, even if no workers remain live.
+            let flow = covered.map_or(Some(QueueFlow::default()), |c| c.flow);
             QueueHistoryRow {
                 queue: queue.queue.clone(),
                 bucket,
@@ -265,20 +285,11 @@ pub fn build_sample(
                 retried: flow.map(|f| f.retried),
                 rate_limited: flow.map(|f| f.rate_limited),
                 claim_wait_ms: flow.map(|f| f.claim_wait_ms),
-                // A queue nobody serves has no unknown counts: nothing ran.
                 live_workers: covered.map_or(0, |c| c.live_workers),
                 capacity: covered.and_then(|c| c.capacity),
             }
         })
         .map(|mut row| {
-            if row.live_workers == 0 {
-                row.claimed = Some(0);
-                row.completed = Some(0);
-                row.failed_attempts = Some(0);
-                row.retried = Some(0);
-                row.rate_limited = Some(0);
-                row.claim_wait_ms = Some(0);
-            }
             if callback_queues.contains(&row.queue) {
                 row.completed = None;
                 row.failed_attempts = None;
@@ -579,6 +590,106 @@ mod tests {
             )],
         );
         assert_eq!(coverage["email"].flow.unwrap().claimed, 3);
+    }
+
+    #[test]
+    fn departing_runtime_contributes_its_final_snapshot_once() {
+        let mut baseline = CounterBaseline::default();
+        baseline.advance(
+            at(60),
+            &[
+                instance(1, at(0), vec![("email", Some(counters(5, 5)), HARD)]),
+                instance(2, at(0), vec![("email", Some(counters(10, 10)), HARD)]),
+            ],
+        );
+        let mut departed = instance(2, at(0), vec![("email", Some(counters(18, 18)), HARD)]);
+        departed.last_seen_at = at(100);
+        departed.stale = true;
+        let coverage = baseline.advance(
+            at(120),
+            &[
+                instance(1, at(0), vec![("email", Some(counters(10, 10)), HARD)]),
+                departed.clone(),
+            ],
+        );
+        assert_eq!(coverage["email"].flow.unwrap().completed, 13);
+        assert_eq!(coverage["email"].live_workers, 1);
+        assert_eq!(coverage["email"].capacity, Some(8));
+
+        let coverage = baseline.advance(
+            at(180),
+            &[
+                instance(1, at(0), vec![("email", Some(counters(11, 11)), HARD)]),
+                departed,
+            ],
+        );
+        assert_eq!(coverage["email"].flow.unwrap().completed, 1);
+    }
+
+    #[test]
+    fn a_runtime_that_starts_and_dies_between_samples_contributes_once() {
+        let mut baseline = CounterBaseline::default();
+        baseline.advance(at(60), &[]);
+        let mut departed = instance(2, at(90), vec![("email", Some(counters(7, 6)), HARD)]);
+        departed.last_seen_at = at(100);
+        departed.stale = true;
+        let coverage = baseline.advance(at(120), &[departed.clone()]);
+        assert_eq!(coverage["email"].flow.unwrap().completed, 6);
+        assert_eq!(coverage["email"].live_workers, 0);
+        assert_eq!(coverage["email"].capacity, Some(0));
+        assert!(baseline.advance(at(180), &[departed]).is_empty());
+    }
+
+    #[test]
+    fn a_missing_participant_makes_the_interval_unknown_even_with_no_live_workers() {
+        let mut baseline = CounterBaseline::default();
+        baseline.advance(
+            at(60),
+            &[instance(
+                1,
+                at(0),
+                vec![("email", Some(counters(5, 5)), HARD)],
+            )],
+        );
+        let coverage = baseline.advance(at(120), &[]);
+        assert_eq!(coverage["email"].flow, None);
+        let (rows, _) = build_sample(
+            at(120),
+            &[overview("email", 0, 0)],
+            &coverage,
+            &BTreeSet::new(),
+            &[],
+        );
+        assert_eq!(rows[0].live_workers, 0);
+        assert_eq!(rows[0].claimed, None);
+        assert_eq!(rows[0].completed, None);
+        assert!(baseline.advance(at(180), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_departed_runtime_without_counters_cannot_turn_into_known_zero() {
+        let mut baseline = CounterBaseline::default();
+        baseline.advance(
+            at(60),
+            &[instance(
+                1,
+                at(0),
+                vec![("email", Some(counters(5, 5)), HARD)],
+            )],
+        );
+        let mut departed = instance(1, at(0), vec![("email", None, HARD)]);
+        departed.last_seen_at = at(100);
+        departed.stale = true;
+        let coverage = baseline.advance(at(120), &[departed]);
+        assert_eq!(coverage["email"].flow, None);
+        let (rows, _) = build_sample(
+            at(120),
+            &[overview("email", 0, 0)],
+            &coverage,
+            &BTreeSet::new(),
+            &[],
+        );
+        assert_eq!(rows[0].completed, None);
     }
 
     #[test]

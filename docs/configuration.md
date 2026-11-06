@@ -797,7 +797,11 @@ unknown for a minute in which a callback could have resolved one of the
 queue's jobs (a job parked for a callback during it, or was already waiting
 at its start), because callbacks resolve in whichever process receives them;
 the UI then shows the hourly completion average instead. A runtime that dies
-between samples loses at most its last snapshot interval of counts.
+between samples contributes its final published counters once; only its
+unpublished snapshot tail is lost. If a participating runtime disappears
+without a final reading, the affected interval is unknown, even when no
+workers remain live. The overview also keeps receiver-only callback outcome
+rates unknown and uses its documented hourly fallback.
 
 `awa serve` reads the tables, so every UI replica shows the same history and
 history survives UI restarts. On a schema before v051, or until a current

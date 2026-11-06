@@ -376,6 +376,11 @@ waiting over a minute with no live worker serving it, or nothing running or
 claimed; read its **Limited by** (no workers, rate limit, worker capacity,
 spare capacity) before changing anything.
 
+Missing counter coverage is a gap, including a worker disappearing without a
+final snapshot or callbacks completing without worker runtimes. Do not read a
+gap as zero throughput; the overview uses its hourly fallback when current
+completion rates are unknown.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.

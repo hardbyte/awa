@@ -760,6 +760,7 @@ impl Dispatcher {
                         job,
                         queue_storage_claim: None,
                         queue_storage_unique_states: None,
+                        queue_counters: self.executor.queue_counters(&self.queue),
                     })
                     .collect(),
                 Err(err) => {
@@ -805,6 +806,7 @@ impl Dispatcher {
                             job: claimed.job,
                             queue_storage_claim: Some(claimed.claim),
                             queue_storage_unique_states: claimed.unique_states,
+                            queue_counters: self.executor.queue_counters(&self.queue),
                         })
                         .collect(),
                     Err(err) => {

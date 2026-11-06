@@ -163,15 +163,25 @@ describe("totalRate", () => {
     expect(total).toBeNull();
   });
 
-  it("ignores unknown rates on queues nobody serves", () => {
+  it("keeps receiver-only completion rates unknown without worker runtimes", () => {
     const total = totalRate(
       report([
         assessment("a", 0, { completed_per_minute: 10 }),
-        assessment("orphan", 0, {}, 0),
+        assessment("callback-receiver", 0, {}, 0),
       ]),
       (flow) => flow.completed_per_minute,
     );
-    expect(total).toBe(10);
+    expect(total).toBeNull();
+  });
+
+  it("includes a known zero on an idle queue without worker runtimes", () => {
+    expect(totalRate(
+      report([
+        assessment("active", 0, { completed_per_minute: 10 }),
+        assessment("idle", 0, { completed_per_minute: 0 }, 0),
+      ]),
+      (flow) => flow.completed_per_minute,
+    )).toBe(10);
   });
 });
 

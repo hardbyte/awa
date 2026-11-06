@@ -113,8 +113,8 @@ export function totalBacklog(
   return totals;
 }
 
-/** Sum a per-queue rate across the report, or null when any queue with
- * live workers has it unknown: a partial total would read as a real drop. */
+/** Sum a per-queue rate, or null when any queue's rate is unknown. A callback
+ * receiver can complete work without worker runtimes; missing coverage is not zero. */
 export function totalRate(
   report: HealthReport | undefined,
   pick: (flow: QueueAssessment["flow"]) => number | null,
@@ -123,10 +123,7 @@ export function totalRate(
   let total = 0;
   for (const queue of report.queues) {
     const value = pick(queue.flow);
-    if (value === null) {
-      if (queue.live_workers > 0) return null;
-      continue;
-    }
+    if (value === null) return null;
     total += value;
   }
   return total;

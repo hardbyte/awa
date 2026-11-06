@@ -155,6 +155,11 @@ for each step.
 
 ### Fixed
 
+- Queue history retains a departing worker's final published counters once,
+  keeps missing intervals unknown, and attributes striped queue outcomes to
+  their logical dispatcher. The overview no longer treats unknown callback
+  rates as zero when no worker runtime serves the queue.
+
 - **A running job could be both finished and retried.** If a job completed,
   failed or was retried while stale-heartbeat or deadline rescue was examining
   it, rescue could miss that outcome and also send the job back for a retry,

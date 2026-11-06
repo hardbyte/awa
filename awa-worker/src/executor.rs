@@ -212,6 +212,9 @@ pub(crate) struct DispatchedJob {
     pub job: JobRow,
     pub queue_storage_claim: Option<ClaimedEntry>,
     pub queue_storage_unique_states: Option<String>,
+    /// The originating dispatcher's logical queue; `job.queue` can be a
+    /// physical stripe and must retain that identity for storage operations.
+    pub queue_counters: Option<Arc<QueueCounters>>,
 }
 
 /// Manages job execution — spawns worker futures and tracks in-flight jobs.
@@ -300,6 +303,7 @@ impl JobExecutor {
         let job = dispatched.job;
         let queue_storage_claim = dispatched.queue_storage_claim;
         let queue_storage_unique_states = dispatched.queue_storage_unique_states;
+        let counters = dispatched.queue_counters;
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let lifecycle_handlers = self.lifecycle_handlers.clone();
@@ -318,7 +322,6 @@ impl JobExecutor {
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
         let job_queue = job.queue.clone();
-        let counters = self.queue_counters(&job_queue);
 
         let span = info_span!(
             "job.execute",
@@ -3562,6 +3565,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            queue_counters: None,
         };
         executor
             .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
@@ -3640,6 +3644,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            queue_counters: None,
         };
         executor
             .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
@@ -3735,6 +3740,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            queue_counters: None,
         };
         let mut jobs = jobs.into_iter();
         for job in jobs.by_ref().take(4) {
