@@ -2388,9 +2388,9 @@ async fn test_queue_storage_runtime_stops_claiming_while_finalization_is_stalled
 /// A finished attempt keeps heartbeating until its finalize is over, so a
 /// finalize that waits behind a stalled completion batcher for several
 /// staleness windows is not mistaken for a dead worker and run again.
-/// Holding the first job's receipt-completion lock stalls the batcher's flush;
-/// the attempts that flush has locked are skipped by rescue for as long as it
-/// waits, and every other finished attempt must still be heartbeated.
+/// An independent trigger gate stalls a completion after it has acquired all
+/// of its attempts' locks. That batch remains protected from rescue while
+/// every other finished attempt must still be heartbeated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_finalizing_attempts_keep_heartbeating_through_a_stalled_finalize() {
     const WORKERS: u32 = 64;
@@ -2421,27 +2421,48 @@ async fn test_queue_storage_finalizing_attempts_keep_heartbeating_through_a_stal
             .expect("enqueue backlog");
     }
 
-    // Only the first job's lock: a held lock also keeps the heartbeat off that
-    // attempt, which is right only while a closer is working on it.
-    let first_job: i64 = sqlx::query_scalar(&format!(
-        "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT 1",
-        store.schema()
+    // The trigger runs after the completer owns every attempt lock in its
+    // flush. Holding an attempt lock directly would suppress its heartbeat
+    // before completion owns it, racing rescue when the test unlocks it.
+    sqlx::raw_sql(&format!(
+        r#"
+        CREATE FUNCTION {schema}.hold_completion_for_heartbeat_test() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.outcome = 'completed' THEN
+                PERFORM pg_catalog.pg_advisory_xact_lock(
+                    pg_catalog.hashtextextended('awa.test.finalize-heartbeat-gate', 0)
+                );
+            END IF;
+            RETURN NEW;
+        END
+        $$;
+        CREATE TRIGGER hold_completion_for_heartbeat_test
+        BEFORE INSERT ON {schema}.lease_claim_closure_batches
+        FOR EACH ROW EXECUTE FUNCTION {schema}.hold_completion_for_heartbeat_test();
+        "#,
+        schema = store.schema(),
     ))
-    .bind(queue)
-    .fetch_one(&pool)
+    .execute(&pool)
     .await
-    .expect("first job");
+    .expect("install the completion gate");
     let mut lock_holder = pool.acquire().await.expect("lock connection");
+    let lock_holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *lock_holder)
+        .await
+        .expect("gate holder PID");
     sqlx::query(
-        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended(
-             format('awa.receipt.complete:%s:%s', $1::bigint, 1), 0))",
+        "SELECT pg_catalog.pg_advisory_lock(
+             pg_catalog.hashtextextended('awa.test.finalize-heartbeat-gate', 0))",
     )
-    .bind(first_job)
     .execute(&mut *lock_holder)
     .await
-    .expect("stall the first job's finalization");
+    .expect("hold the independent completion gate");
 
-    let staleness = ci_timing::scaled_staleness(Duration::from_secs(1));
+    // Sequential heartbeat chunks can need several WAL-sync round trips
+    // under contention. Allow margin for those writes while blocking the
+    // completion for four full staleness windows below.
+    let staleness = ci_timing::scaled_staleness(Duration::from_secs(5));
     let runs: Arc<std::sync::Mutex<HashMap<i64, u32>>> = Arc::default();
     let recorded = runs.clone();
     let client = Client::builder(pool.clone())
@@ -2483,8 +2504,26 @@ async fn test_queue_storage_finalizing_attempts_keep_heartbeating_through_a_stal
 
     // Hold the stall for several staleness windows once claiming has stopped.
     let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
-    while runs.lock().expect("runs").len() < WORKERS as usize * 2 {
-        assert!(Instant::now() < deadline, "the runtime did not claim");
+    loop {
+        let completion_at_gate: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event = 'advisory'
+                   AND $1 = ANY(pg_catalog.pg_blocking_pids(pid))
+             )",
+        )
+        .bind(lock_holder_pid)
+        .fetch_one(&pool)
+        .await
+        .expect("observe the completion gate");
+        if completion_at_gate && runs.lock().expect("runs").len() >= WORKERS as usize * 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime did not queue attempts behind the completion gate"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     tokio::time::sleep(staleness * 4).await;
