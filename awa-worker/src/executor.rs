@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
@@ -267,6 +270,9 @@ pub struct JobExecutor {
     completion_batcher: CompletionBatcherHandle,
     storage: RuntimeStorage,
     dlq_policy: DlqPolicy,
+    finalizers: TaskTracker,
+    finalize_cancel: CancellationToken,
+    finalize_capacity: Arc<Semaphore>,
 }
 
 impl JobExecutor {
@@ -288,7 +294,13 @@ impl JobExecutor {
         completion_batcher: CompletionBatcherHandle,
         storage: RuntimeStorage,
         dlq_policy: DlqPolicy,
+        finalizers: TaskTracker,
+        finalize_cancel: CancellationToken,
+        runtime_worker_capacity: u32,
     ) -> Self {
+        let finalize_capacity = Arc::new(Semaphore::new(
+            completion_batcher.finalizer_capacity(runtime_worker_capacity),
+        ));
         Self {
             pool,
             workers,
@@ -301,6 +313,9 @@ impl JobExecutor {
             completion_batcher,
             storage,
             dlq_policy,
+            finalizers,
+            finalize_cancel,
+            finalize_capacity,
         }
     }
 
@@ -327,6 +342,9 @@ impl JobExecutor {
         let completion_batcher = self.completion_batcher.clone();
         let storage = self.storage.clone();
         let dlq_policy = self.dlq_policy.clone();
+        let finalizers = self.finalizers.clone();
+        let finalize_cancel = self.finalize_cancel.clone();
+        let finalize_capacity = self.finalize_capacity.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -352,6 +370,14 @@ impl JobExecutor {
             let in_flight_state = InFlightState {
                 cancel: cancel.clone(),
                 progress: progress_state.clone(),
+                claim: queue_storage_claim.as_ref().and_then(|claim| {
+                    awa_model::queue_storage::ClaimHeartbeatRef::from_claim(
+                        job_id,
+                        job_run_lease,
+                        claim,
+                    )
+                }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             if let Some(counter) = queue_in_flight.get(&job_queue) {
@@ -430,21 +456,39 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
-            // Remove from in-flight immediately after the handler returns and
-            // the progress snapshot is captured. This keeps local worker
-            // capacity tied to active handler execution, not to the tail
-            // latency of durable completion bookkeeping.
-            in_flight.remove((job_id, job_run_lease));
+            // The attempt stays in `in_flight`, and so keeps its heartbeat,
+            // until its finalize is over: a finalize that waits behind a
+            // completion backlog must not look like a dead worker to rescue.
+            // Only a bounded number of finished attempts may wait for
+            // finalization; while that queue is full the attempt also keeps
+            // its worker slot, so the dispatcher stops claiming.
+            in_flight.mark_finalizing((job_id, job_run_lease));
+            let heartbeat = HeartbeatUntilFinalized {
+                in_flight: in_flight.clone(),
+                key: (job_id, job_run_lease),
+            };
+            let finalize_permit = match result {
+                Some(_) => tokio::select! {
+                    permit = finalize_capacity.acquire_owned() => {
+                        Some(permit.expect("finalizer capacity is never closed"))
+                    }
+                    _ = finalize_cancel.cancelled() => None,
+                },
+                None => None,
+            };
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
-            let Some(result) = result else {
+            let (Some(result), Some(finalize_permit)) = (result, finalize_permit) else {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            tokio::spawn(async move {
+            // Graceful shutdown waits for this before stopping the completion
+            // batcher. The heartbeat guard keeps the attempt live until the
+            // durable write completes or this finalizer is abandoned.
+            finalizers.spawn(async move {
                 // Every finalize path is one lease-guarded transaction, and a
                 // deadlock abort rolls the whole transaction back, so running
                 // it again is safe. Without the retry the job would sit
@@ -487,6 +531,8 @@ impl JobExecutor {
                         outcome => break outcome,
                     }
                 };
+                drop(heartbeat);
+                drop(finalize_permit);
 
                 match &outcome {
                     Ok(CompletionOutcome::Applied { terminal, .. }) => {
@@ -566,6 +612,19 @@ impl JobExecutor {
             });
         }
         .instrument(span)
+    }
+}
+
+/// Keeps a finished attempt in the heartbeat set until its finalize is over,
+/// and takes it out however the finalizer ends.
+struct HeartbeatUntilFinalized {
+    in_flight: InFlightMap,
+    key: (i64, i64),
+}
+
+impl Drop for HeartbeatUntilFinalized {
+    fn drop(&mut self) {
+        self.in_flight.remove(self.key);
     }
 }
 
