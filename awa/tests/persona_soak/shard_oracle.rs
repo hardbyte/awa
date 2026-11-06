@@ -368,17 +368,19 @@ pub async fn final_check(shared: &Arc<Shared>, pool: &PgPool, queues: &[String])
     let mut short = Vec::new();
     for (seq, want) in &expected {
         let (ran, job_id) = executions.get(seq).copied().unwrap_or((0, 0));
+        let record = shared.ledger.get(job_id);
         let row = format!(
-            "{{\"seq\":{seq},\"job_id\":{job_id},\"expected_executions\":{want},\"executions\":{ran}}}"
+            "{{\"seq\":{seq},\"job_id\":{job_id},\"expected_executions\":{want},\"executions\":{ran},\"max_attempt\":{},\"ledger_flags\":{}}}",
+            record.as_ref().map_or(0, |record| record.max_attempt),
+            record.as_ref().map_or(0, |record| record.flags)
         );
         if ran == 0 {
             missing.push(row);
         } else if ran > u16::from(*want) {
             // A rescue re-runs a job whose attempt lost its lease, which is at-least-once
             // delivery working as designed; any other repeat is a duplicate.
-            let was_rescued = shared
-                .ledger
-                .get(job_id)
+            let was_rescued = record
+                .as_ref()
                 .is_some_and(|record| record.has(flag::RESCUED));
             if was_rescued {
                 rescued.push(row);
@@ -487,6 +489,13 @@ fn is_lane_error(message: &str) -> bool {
         || message.contains("must be owner")
         || message.contains("has not been provisioned")
         || message.contains("provision")
+        || is_lane_race(message)
+}
+
+/// Two sessions creating the same lane sequence at once: `CREATE SEQUENCE IF NOT EXISTS`
+/// loses the race with a unique violation on the catalog.
+fn is_lane_race(message: &str) -> bool {
+    message.contains("pg_class_relname_nsp_index")
 }
 
 /// Permission-denied and missing-lane errors in the server log, one violation per role
@@ -548,8 +557,13 @@ pub async fn scan_server_log(shared: &Arc<Shared>, pool: &PgPool, log: &str) {
     for ((role, message), (count, statement, applications)) in groups.into_iter().take(MAX_ROWS) {
         let (lane, owner) = describe_sequence(pool, &schema, &message).await;
         let applications = applications.into_iter().collect::<Vec<_>>().join(",");
+        let kind = if is_lane_race(&message) {
+            "lane_creation_race"
+        } else {
+            "permission_denied"
+        };
         shared.violation(
-            "permission_denied",
+            kind,
             format!("role {role}: {message} ({count}x; lane {lane}; sequence owner {owner})"),
             vec![format!(
                 "{{\"role\":\"{role}\",\"applications\":{},\"error\":{},\"lane\":{},\"sequence_owner\":{},\"occurrences\":{count},\"statement\":{}}}",
