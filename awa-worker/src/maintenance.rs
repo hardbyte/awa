@@ -238,9 +238,9 @@ pub(crate) const DEFAULT_RESCUE_PASS_MAX_ROWS: usize = 5_000;
 /// a drain to about `rescue_pass_max_rows` attempts per second per kind.
 const RESCUE_BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Claims each slot's cursor walk examines in a batch that follows a full
-/// one in the same pass. The first batch keeps the store's wider default so
-/// a pass can still walk past long runs of closed claims.
+/// Claims each slot's cursor walk examines during bulk heartbeat rescue and
+/// follow-up batches. Other first batches keep the store's wider default to
+/// walk past long closed prefixes when acceleration is unavailable or disabled.
 const RESCUE_FOLLOW_UP_SCAN_LIMIT: usize = 2_000;
 
 /// One batch in this many visits the other claim slots before the oldest, so
@@ -2033,7 +2033,12 @@ impl MaintenanceService {
                 slot_order,
                 skip_slots: sweep.idle_slots.clone(),
                 retry_not_before: None,
-                cursor_scan_limit: (batches > 0).then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
+                cursor_scan_limit: (batches > 0
+                    || (kind == RescueKind::Heartbeat
+                        && bulk_heartbeat_cutoff.is_some()
+                        && !budget.is_zero()
+                        && self.rescue_pass_max_rows > 0))
+                    .then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
             };
             let outcome = match kind {
                 RescueKind::Heartbeat => {
@@ -4898,6 +4903,252 @@ mod tests {
             });
         }
         assert_eq!(sweep.idle_slots, vec![0]);
+    }
+
+    struct SparseHeartbeatFixture {
+        pool: PgPool,
+        runtime: QueueStorageRuntime,
+        service: MaintenanceService,
+        stale_job: i64,
+        fresh_job: i64,
+        fresh_runtime: Uuid,
+    }
+
+    impl SparseHeartbeatFixture {
+        async fn new(budget: Duration, max_rows: usize, confirmed: bool) -> Self {
+            let pool = setup_pool(4).await;
+            reset_schema(&pool).await;
+            migrations::run(&pool).await.expect("migrations");
+            let config = QueueStorageConfig::default();
+            let store = QueueStorage::new(config.clone()).expect("queue storage");
+            store.install(&pool).await.expect("install");
+            let jobs: Vec<_> = (0..2)
+                .map(|id| awa_model::InsertParams {
+                    kind: "sparse_heartbeat".into(),
+                    args: serde_json::json!({ "id": id }),
+                    opts: awa_model::InsertOpts {
+                        queue: "sparse_heartbeat".into(),
+                        max_attempts: 3,
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            store
+                .enqueue_params_batch(&pool, &jobs)
+                .await
+                .expect("enqueue");
+            let claims = store
+                .claim_runtime_batch(&pool, "sparse_heartbeat", 2, Duration::from_secs(3600))
+                .await
+                .expect("claim real jobs");
+            assert_eq!(claims.len(), 2);
+            let slot = claims[0].claim.claim_slot;
+            assert_eq!(claims[1].claim.claim_slot, slot);
+            let stamp = Utc::now() - chrono::Duration::hours(2);
+
+            // Keep the old row-local representation valid on both versions.
+            // Closed history needs no payload; the two open claims retain their
+            // real ready rows so rescue exercises the actual disposition path.
+            sqlx::query("DELETE FROM awa.lease_claim_batches WHERE queue = 'sparse_heartbeat'")
+                .execute(&pool)
+                .await
+                .expect("replace compact claims with legacy rows");
+            for (index, claim) in claims.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO awa.lease_claims
+                     (claim_slot, receipt_id, job_id, run_lease, ready_slot, ready_generation,
+                      queue, priority, attempt, max_attempts, lane_seq, enqueue_shard, claimed_at, deadline_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+interval '1 hour')
+                     ON CONFLICT (claim_slot,job_id,run_lease) DO UPDATE
+                     SET claimed_at=EXCLUDED.claimed_at, deadline_at=EXCLUDED.deadline_at",
+                )
+                .bind(slot).bind(claim.claim.receipt_id).bind(claim.job.id).bind(claim.job.run_lease)
+                .bind(claim.claim.ready_slot).bind(claim.claim.ready_generation).bind(&claim.claim.queue)
+                .bind(claim.claim.priority).bind(claim.job.attempt).bind(claim.job.max_attempts)
+                .bind(claim.claim.lane_seq).bind(claim.claim.enqueue_shard)
+                .bind(stamp + chrono::Duration::microseconds(if index == 0 { 3500 } else { 4500 }))
+                .execute(&pool).await.expect("legacy open receipt");
+            }
+            sqlx::query(
+                "INSERT INTO awa.lease_claims
+                 (claim_slot,job_id,run_lease,ready_slot,ready_generation,queue,priority,
+                  attempt,max_attempts,lane_seq,claimed_at,closed_at)
+                 SELECT $1,1000000+id,1,0,0,'sparse_history',0,1,3,id,
+                        $2::timestamptz+id*interval '1 microsecond',clock_timestamp()
+                 FROM generate_series(1,6000) AS id",
+            )
+            .bind(slot)
+            .bind(stamp)
+            .execute(&pool)
+            .await
+            .expect("sparse closed prefix");
+            let stale_job = claims[0].job.id;
+            let fresh_job = claims[1].job.id;
+            sqlx::query(
+                "INSERT INTO awa.attempt_state(job_id,run_lease,heartbeat_at,updated_at)
+                 VALUES($1,$2,clock_timestamp(),clock_timestamp())",
+            )
+            .bind(fresh_job)
+            .bind(claims[1].job.run_lease)
+            .execute(&pool)
+            .await
+            .expect("protect fresh claim");
+            let fresh_runtime = Uuid::new_v4();
+            for (id, seen, heartbeat_alive) in [
+                (Uuid::new_v4(), stamp + chrono::Duration::hours(1), false),
+                (fresh_runtime, Utc::now(), true),
+            ] {
+                sqlx::query(
+                    "INSERT INTO awa.runtime_instances
+                     (instance_id,hostname,pid,version,started_at,last_seen_at,snapshot_interval_ms,
+                      healthy,postgres_connected,poll_loop_alive,heartbeat_alive,shutting_down,leader)
+                     VALUES($1,'sparse_test',1,'0.6.13',$2,$2,1000,true,true,true,$3,false,false)",
+                )
+                .bind(id).bind(seen).bind(heartbeat_alive)
+                .execute(&pool).await.expect("runtime evidence");
+            }
+            let runtime =
+                QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                    .expect("runtime");
+            let service = MaintenanceService::new(
+                pool.clone(),
+                metrics_for_test(),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                CancellationToken::new(),
+                Arc::new(Vec::new()),
+                InFlightMap::default(),
+                RuntimeStorage::QueueStorage(runtime.clone()),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+            )
+            .rescue_pass_budget(budget)
+            .rescue_pass_max_rows(max_rows);
+            if confirmed {
+                let now = Instant::now();
+                *service
+                    .rescue_owner_evidence
+                    .lock()
+                    .expect("owner evidence") = RescueOwnerEvidence {
+                    steady_since: Some(now - service.heartbeat_staleness * 2),
+                    last_sample: Some(now),
+                };
+            }
+            Self {
+                pool,
+                runtime,
+                service,
+                stale_job,
+                fresh_job,
+                fresh_runtime,
+            }
+        }
+
+        async fn pass(&self) -> bool {
+            sqlx::query("UPDATE awa.runtime_instances SET last_seen_at=clock_timestamp() WHERE instance_id=$1")
+                .bind(self.fresh_runtime).execute(&self.pool).await.expect("fresh owner snapshot");
+            self.service
+                .rescue_queue_storage_pass(RescueKind::Heartbeat, &self.runtime, false)
+                .await
+        }
+
+        async fn assert_dispositions(&self) {
+            let stale = self
+                .runtime
+                .store
+                .load_job(&self.pool, self.stale_job)
+                .await
+                .expect("stale job lookup")
+                .expect("stale job");
+            assert_eq!(stale.state, JobState::Retryable);
+            let fresh = self
+                .runtime
+                .store
+                .load_job(&self.pool, self.fresh_job)
+                .await
+                .expect("fresh job lookup")
+                .expect("fresh job");
+            assert_eq!(
+                fresh.state,
+                JobState::Running,
+                "fresh heartbeat stays protected"
+            );
+            let closures: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM awa.lease_claim_closures WHERE job_id=$1")
+                    .bind(self.stale_job)
+                    .fetch_one(&self.pool)
+                    .await
+                    .expect("closure count");
+            assert_eq!(closures, 1, "sparse stale attempt is rescued exactly once");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_confirmed_heartbeat_sparse_sweep_progresses_and_stops() {
+        let _guard = db_test_mutex().lock().await;
+        // A positive budget below any database round trip makes each pass
+        // finish its first batch and rearm; no elapsed-time assertion is used.
+        let run = SparseHeartbeatFixture::new(Duration::from_nanos(1), 5000, true).await;
+        assert!(run.pass().await, "closed prefix leaves a resumable sweep");
+        let cursor: i64 = sqlx::query_scalar(
+            "SELECT rescue_cursor_job_id FROM awa.claim_ring_slots WHERE slot=0",
+        )
+        .fetch_one(&run.pool)
+        .await
+        .expect("first persisted cursor");
+        assert_eq!(
+            cursor, 1002000,
+            "confirmed bulk starts with one small window"
+        );
+        let stale = run
+            .runtime
+            .store
+            .load_job(&run.pool, run.stale_job)
+            .await
+            .expect("unvisited job lookup")
+            .expect("unvisited job");
+        assert_eq!(
+            stale.state,
+            JobState::Running,
+            "sparse job lies beyond the first window"
+        );
+        let mut drained = false;
+        for _ in 0..12 {
+            if !run.pass().await {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "persisted sparse sweep converges instead of rearming forever"
+        );
+        assert!(run.service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        run.assert_dispositions().await;
+        run.pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_disabled_acceleration_keeps_wide_first_heartbeat_window() {
+        let _guard = db_test_mutex().lock().await;
+        for (budget, max_rows) in [(Duration::ZERO, 5000), (Duration::from_secs(1), 0)] {
+            let run = SparseHeartbeatFixture::new(budget, max_rows, true).await;
+            assert!(!run.pass().await, "disabled acceleration never rearms");
+            run.assert_dispositions().await;
+            run.pool.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_unconfirmed_heartbeat_keeps_wide_first_window() {
+        let _guard = db_test_mutex().lock().await;
+        let run = SparseHeartbeatFixture::new(Duration::from_nanos(1), 5000, false).await;
+        assert!(
+            !run.pass().await,
+            "unconfirmed owners keep the ordinary one-batch cadence"
+        );
+        run.assert_dispositions().await;
+        run.pool.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
