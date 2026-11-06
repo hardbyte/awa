@@ -77,6 +77,8 @@ pub mod names {
     pub const MAINTENANCE_PRUNE_ATTEMPTS: &str = "awa.maintenance.prune.attempts";
     pub const MAINTENANCE_PRUNE_SKIPPED_ROWS: &str = "awa.maintenance.prune.skipped_rows";
     pub const MAINTENANCE_PRUNE_DURATION: &str = "awa.maintenance.prune.duration";
+    pub const MAINTENANCE_ANALYZE_ATTEMPTS: &str = "awa.maintenance.analyze.attempts";
+    pub const MAINTENANCE_ANALYZE_DURATION: &str = "awa.maintenance.analyze.duration";
     pub const STORAGE_TRANSITION_READY: &str = "awa.storage.transition_ready";
     pub const STORAGE_CANONICAL_LIVE_BACKLOG: &str = "awa.storage.canonical_live_backlog";
     pub const STORAGE_LIVE_RUNTIME_CAPABILITY: &str = "awa.storage.live_runtime_capability";
@@ -277,6 +279,13 @@ pub struct AwaMetrics {
     /// rather than one per tick. Fleets alert on this rather than
     /// scraping the matching `tracing::warn!` line. Issue #242.
     pub maintenance_branch_overrun_total: Counter<u64>,
+    /// Planner-statistics `ANALYZE` calls by scope (`heads`, `ring_parent`, `pass`)
+    /// and outcome (`ok`, `skipped_privilege`, `skipped_lock`,
+    /// `unavailable`, `failed`). One increment per relation per refresh pass.
+    pub maintenance_analyze_attempts: Counter<u64>,
+    /// Wall-clock duration of one planner-statistics `ANALYZE` call, by scope
+    /// and outcome.
+    pub maintenance_analyze_duration_seconds: Histogram<f64>,
     /// Current ring `current_slot` per ring, sampled from each rotate call.
     /// The slot number itself isn't meaningful but the rate of advance is —
     /// dashboards plot `rate(slot_changes)` to see whether rotation is
@@ -619,6 +628,21 @@ impl AwaMetrics {
                     "Maintenance branch overrun episodes: a branch fired after its previous run exceeded its tick interval",
                 )
                 .with_unit("{episode}")
+                .build(),
+            maintenance_analyze_attempts: meter
+                .u64_counter(names::MAINTENANCE_ANALYZE_ATTEMPTS)
+                .with_description(
+                    "Planner-statistics ANALYZE calls by scope (heads/ring_parent) and outcome",
+                )
+                .with_unit("{attempt}")
+                .build(),
+            maintenance_analyze_duration_seconds: meter
+                .f64_histogram(names::MAINTENANCE_ANALYZE_DURATION)
+                .with_description(
+                    "Duration of one planner-statistics ANALYZE call by scope and outcome",
+                )
+                .with_unit("s")
+                .with_boundaries(WAIT_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             ring_current_slot: meter
                 .i64_gauge(names::RING_CURRENT_SLOT)
@@ -1280,6 +1304,24 @@ impl AwaMetrics {
         self.maintenance_branch_overrun_total.add(1, &attrs);
     }
 
+    /// Record one planner-statistics `ANALYZE` call. `scope` is `"heads"`,
+    /// `"ring_parent"` or `"pass"` (a pass-level probe or failure); `outcome` is `"ok"`, `"skipped_privilege"`,
+    /// `"skipped_lock"`, `"unavailable"` or `"failed"`.
+    pub fn record_statistics_analyze(
+        &self,
+        scope: &'static str,
+        outcome: &'static str,
+        duration: Duration,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.analyze.scope", scope),
+            opentelemetry::KeyValue::new("awa.analyze.outcome", outcome),
+        ];
+        self.maintenance_analyze_attempts.add(1, &attrs);
+        self.maintenance_analyze_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
     /// Record a ring prune outcome.
     pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
         let (label, reason, count) = match outcome {
@@ -1457,7 +1499,7 @@ mod tests {
             .build();
         let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
 
-        let seconds: [(&str, &Histogram<f64>, &[f64]); 9] = [
+        let seconds: [(&str, &Histogram<f64>, &[f64]); 10] = [
             (
                 names::ENQUEUE_DURATION,
                 &metrics.enqueue_duration_seconds,
@@ -1476,6 +1518,11 @@ mod tests {
             (
                 names::MAINTENANCE_BRANCH_DURATION,
                 &metrics.maintenance_branch_duration_seconds,
+                &WAIT_DURATION_BUCKETS_SECONDS,
+            ),
+            (
+                names::MAINTENANCE_ANALYZE_DURATION,
+                &metrics.maintenance_analyze_duration_seconds,
                 &WAIT_DURATION_BUCKETS_SECONDS,
             ),
             (
