@@ -142,11 +142,11 @@ impl AbandonState {
     }
 
     /// Folds in one reading of the oldest and newest heartbeat (epoch seconds) among the live
-    /// process's claims. While a pass runs the oldest heartbeat is still the previous pass's;
-    /// the reading that first shows a newer oldest heartbeat is taken just after the pass
-    /// finished, and the spread from oldest to newest is its duration (to within the last
-    /// chunk). The samples are bucketed by handler count so the report shows how pass time
-    /// grows with what a process holds.
+    /// process's claims. While a pass runs, the oldest heartbeat is still one the previous pass
+    /// wrote, so it cannot be newer than that pass's newest. The first reading whose oldest
+    /// heartbeat is newer was taken just after a pass finished, and the spread from oldest to
+    /// newest is its duration (to within the last chunk). The samples are bucketed by handler
+    /// count so the report shows how pass time grows with what a process holds.
     pub fn note_heartbeat_sample(
         &self,
         shared: &Shared,
@@ -156,15 +156,14 @@ impl AbandonState {
         active: i64,
     ) {
         let mut last = self.heartbeat_last.lock().expect("heartbeat last");
-        let previous = last.replace(oldest);
-        let Some(previous_oldest) = previous else {
+        let Some(settled_newest) = *last else {
+            *last = Some(newest);
             return;
         };
-        // Claims leaving (a rescue) can also move the oldest heartbeat a little; a pass moves
-        // it by at least the time since the previous pass began.
-        if oldest <= previous_oldest + 0.5 || active <= 0 || newest - oldest > 300.0 {
+        if oldest <= settled_newest || active <= 0 {
             return;
         }
+        *last = Some(newest);
         drop(last);
         let ms = ((newest - oldest) * 1000.0).round() as i64;
         let stats = shared.stats(Persona::ClaimAbandon);
