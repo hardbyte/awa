@@ -231,7 +231,7 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 | --- | --- | --- |
 | Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
-| Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, and extra metadata. They do not set dispatch limits or timeouts. |
+| Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, extra metadata and the declared [output type](../job-output/index.md#typed-outputs). They do not set dispatch limits or timeouts. |
 | Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout). |
 | Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
 | Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` currently applies to the queue-storage engine rather than to one named queue. |
@@ -772,7 +772,12 @@ Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 | `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Idle connection timeout (seconds) |
 | `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Max connection lifetime (seconds) |
 | `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Connection acquire timeout (seconds) |
+| `--statement-timeout` | `AWA_STATEMENT_TIMEOUT` | `60` | Longest any one UI statement may run (seconds); `0` leaves the server's setting |
 | `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Dashboard query cache TTL (seconds) |
+
+### Abandoned requests
+
+When a browser closes a tab or a proxy times out, the server drops the request, but Postgres keeps running its query and the pool keeps that query's connection until it ends. The statement timeout ends it, and the pool then reuses the connection. On Postgres 14 and later the pool also sets `client_connection_check_interval`, so a query stops within 5 s when its connection closes, for example when `awa serve` restarts. Raise `--statement-timeout` if a bulk action from the UI, such as purging a very large DLQ, needs longer.
 
 ### Dashboard cache
 
