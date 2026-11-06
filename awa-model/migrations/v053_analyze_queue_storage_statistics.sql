@@ -68,6 +68,7 @@ DECLARE
     v_relowner    OID;
     v_may_analyze BOOLEAN;
 BEGIN
+    -- awa_statistics_helper_v1: bump when the definition or grants change.
     IF NOT EXISTS (
         SELECT 1 FROM awa.queue_storage_schemas() AS substrate
         WHERE substrate.schema_name = p_schema

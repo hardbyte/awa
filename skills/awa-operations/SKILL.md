@@ -321,8 +321,11 @@ On queue storage the leader runs `ANALYZE` on `queue_claim_heads`,
 analyses them. It goes through the `SECURITY DEFINER` function
 `awa.analyze_queue_storage_relation` from migration v053, so a non-owner runtime
 role needs no `MAINTAIN` grant. Watch `awa.maintenance.analyze.attempts`: any
-`skipped_privilege` or `unavailable` means it is not running (run `awa migrate`
-as the schema owner). See `docs/configuration.md#planner-statistics`.
+`unavailable` means the helper is missing: run `awa migrate` as the schema
+owner. For `skipped_privilege`, restore helper EXECUTE and the login role's
+head-table DML, or correct the helper owner; migration reruns preserve an
+existing function's owner. See `docs/configuration.md#planner-statistics` and
+`docs/security/database-roles.md`.
 
 ## Managed Postgres
 

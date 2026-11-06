@@ -43,6 +43,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   function's owner may not analyse the tables, logs one warning naming what is
   missing and skips the refresh without making failing calls or affecting job
   processing. Earlier binaries never call the function.
+  Missing EXECUTE or head-table privileges are checked before each pass,
+  avoiding a failing helper call for every relation.
 
 ### Fixed
 
