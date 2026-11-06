@@ -14276,8 +14276,17 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries
-            WHERE job_id = $1
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.job_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+              )
             ORDER BY run_lease DESC, attempted_at DESC NULLS LAST, run_at DESC
             "#,
         )))

@@ -6,6 +6,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
 - **Callback completion, `get_job` and lifecycle events find running jobs
   that priority aging promoted** (the Rust side of
   [#569](https://github.com/hardbyte/awa/issues/569)). Claims and leases
