@@ -30,6 +30,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Close read connections if their transaction start is cancelled or fails before
+  SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
+
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
