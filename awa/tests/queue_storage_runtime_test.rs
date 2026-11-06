@@ -16205,3 +16205,114 @@ async fn test_aged_materialized_lease_is_visible_to_admin_reads() {
         .expect("cancel by unique key finds the aged running job");
     assert_eq!(cancelled.id, job_id);
 }
+
+/// A lane move leaves immutable source rows behind. Wrap the ring so the
+/// destination is in an earlier partition: point reads must use live evidence,
+/// rather than depending on which equal-timestamp ready row the plan emits last.
+async fn ready_point_read_wrap_fixture() -> (TestDbGuard, sqlx::PgPool, QueueStorage, i64) {
+    let (guard, pool) = setup_pool(4).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_point_read_wrap".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // A fresh empty ring can be positioned just before wrap without retaining
+    // unrelated jobs. This is the state reached after three rotations/prunes.
+    let schema = store.schema();
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 3 WHERE singleton"
+    ))
+    .execute(&pool)
+    .await
+    .expect("position empty ring before wrap");
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_slots SET generation = 3 WHERE slot = 3"
+    ))
+    .execute(&pool)
+    .await
+    .expect("set current slot generation");
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: "point_read_source".to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        store.rotate(&pool).await.expect("wrap to slot zero"),
+        RotateOutcome::Rotated { slot: 0, .. }
+    ));
+    (guard, pool, store, job_id)
+}
+
+async fn assert_live_ready_row(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+    expected_queue: &str,
+    expected_priority: i16,
+) {
+    let schema = store.schema();
+    let live: Vec<(String, i16, i32)> = sqlx::query_as(&format!(
+        "SELECT ready.queue, ready.priority, ready.ready_slot
+         FROM {schema}.ready_entries AS ready
+         WHERE ready.job_id = $1
+           AND NOT EXISTS (
+               SELECT 1 FROM {schema}.ready_tombstones AS tomb
+               WHERE tomb.ready_slot = ready.ready_slot
+                 AND tomb.ready_generation = ready.ready_generation
+                 AND tomb.queue = ready.queue
+                 AND tomb.priority = ready.priority
+                 AND tomb.enqueue_shard = ready.enqueue_shard
+                 AND tomb.lane_seq = ready.lane_seq
+           )"
+    ))
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .expect("read live ready evidence");
+    assert_eq!(
+        live,
+        vec![(expected_queue.to_string(), expected_priority, 0)]
+    );
+}
+
+#[tokio::test]
+async fn test_point_read_uses_live_ready_priority_after_ring_wrap() {
+    let (_guard, pool, store, job_id) = ready_point_read_wrap_fixture().await;
+    assert!(store
+        .set_priority(&pool, job_id, 1)
+        .await
+        .expect("set priority"));
+    assert_live_ready_row(&pool, &store, job_id, "point_read_source", 1).await;
+    let job = admin::get_job(&pool, job_id).await.expect("read moved job");
+    assert_eq!(
+        job.priority, 1,
+        "point read must ignore the tombstoned source"
+    );
+}
+
+#[tokio::test]
+async fn test_point_read_uses_live_ready_queue_after_ring_wrap() {
+    let (_guard, pool, store, job_id) = ready_point_read_wrap_fixture().await;
+    assert!(store
+        .move_queue(&pool, job_id, "point_read_destination", None)
+        .await
+        .expect("move queue"));
+    assert_live_ready_row(&pool, &store, job_id, "point_read_destination", 4).await;
+    let job = admin::get_job(&pool, job_id).await.expect("read moved job");
+    assert_eq!(
+        job.queue, "point_read_destination",
+        "point read must ignore the tombstoned source"
+    );
+}
