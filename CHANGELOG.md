@@ -30,6 +30,24 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only that `LOCK TABLE` and the final `TRUNCATE` turned a timeout into
+  `PruneOutcome::Blocked`. The timeout covers every later statement in the
+  transaction too: the post-lock liveness checks read the lease and claim
+  partitions, the failed-row carry inserts into the current slot's
+  `done_entries` and terminal-count deltas, and the fold writes
+  `queue_terminal_rollups` and deletes `queue_terminal_live_counts` rows. When
+  one of those waited out the timeout, for example behind autovacuum
+  truncating a relation or a hosted Postgres's own background workers, prune
+  failed with a `lock_not_available` (`55P03`) database error, was logged as
+  an error and skipped the prune backoff. A lock timeout anywhere in a queue,
+  lease or claim prune, or in a terminal-count rollup slot, now rolls the
+  whole transaction back and reports `Blocked` (`blocked_slots` for rollup),
+  so maintenance backs off and retries; nothing the attempt wrote survives
+  the rollback. A rollup pass stops at its first blocked slot rather than
+  waiting out the timeout again on each remaining one.
 - **On queue storage, a queue whose enqueue lane is busy no longer holds
   back promotion of other queues, nor the maintenance leader's rescue,
   rotation and prune.** Promotion re-enqueues due scheduled and retryable
