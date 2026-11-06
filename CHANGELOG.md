@@ -101,6 +101,23 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `QueueStorage::promote_due` keeps its signature and promotes lane by lane
   without a lock timeout; `promote_due_lanes` and `promote_due_lane` expose
   the per-lane form.
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only that `LOCK TABLE` and the final `TRUNCATE` turned a timeout into
+  `PruneOutcome::Blocked`. The timeout covers every later statement in the
+  transaction too: the post-lock liveness checks read the lease and claim
+  partitions, the failed-row carry inserts into the current slot's
+  `done_entries` and terminal-count deltas, and the fold writes
+  `queue_terminal_rollups` and deletes `queue_terminal_live_counts` rows. When
+  one of those waited out the timeout, for example behind autovacuum
+  truncating a relation or a hosted Postgres's own background workers, prune
+  failed with a `lock_not_available` (`55P03`) database error, was logged as
+  an error and skipped the prune backoff. A lock timeout anywhere in a queue,
+  lease or claim prune, or in a terminal-count rollup slot, now rolls the
+  whole transaction back and reports `Blocked` (`blocked_slots` for rollup),
+  so maintenance backs off and retries; nothing the attempt wrote survives
+  the rollback.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are
