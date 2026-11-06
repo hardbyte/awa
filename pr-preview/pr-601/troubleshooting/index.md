@@ -436,6 +436,29 @@ Fix:
 awa --database-url "$DATABASE_URL" migrate
 ```
 
+### `deadlock detected` while enqueueing
+
+Cause:
+
+- on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until the transaction commits; the `DETAIL` names two 64-bit advisory keys, and two transactions that took lanes in opposite orders hold one each and wait on the other's
+- `insert_many`, `insert_many_copy` and the `QueueStorage` batch enqueues take their lane locks in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so batches never deadlock with each other
+- a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a batch or another such transaction that touches the same lanes in a different order
+
+Fix:
+
+- enqueue every lane an application transaction touches with one `insert_many` call, or issue the single-job inserts in `(queue, priority)` order
+- keep transactions that hold enqueue locks short, since the locks last until commit
+- retry on `40P01`: Postgres aborts one of the two transactions and the other proceeds
+
+Find the lane behind a key from the `DETAIL` line (`[database, high, low, 1]`, the key is `high << 32 | low`):
+
+```sql
+SELECT queue, priority, enqueue_shard
+FROM <queue_storage_schema>.queue_enqueue_heads
+WHERE hashtextextended(format('%I.%I', '<queue_storage_schema>', seq_name), 0)
+      = (<high>::bigint << 32) | <low>::bigint;
+```
+
 ### `relation "awa.job_id_seq" does not exist`
 
 Cause:

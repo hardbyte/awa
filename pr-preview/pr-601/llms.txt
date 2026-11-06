@@ -43,7 +43,7 @@ These links are curated for agents. Each target is the Markdown representation o
 - [Migration overview](migrations/index.md): This guide explains how to install and upgrade the Awa schema, integrate an external migration runner, and plan rollback. Release-specific prerequisites and transition procedures live in the relevant upgrade guide.
 - [Upgrade 0.5 to 0.6](upgrade-0.5-to-0.6/index.md): This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; Migrations covers the general migration.
 - [Upgrade 0.6 to 0.7](upgrade-0.6-to-0.7/index.md): The 0.6 → 0.7 upgrade is short: the storage step is "be finalized." Everything else in 0.7 is additive.
-- [Observability](grafana/index.md): Two dashboards are provided.
+- [Observability](grafana/index.md): Three dashboards are provided.
 - [Troubleshooting](troubleshooting/index.md): This guide covers the operational issues that come up most often in practice: stuck running jobs, leader-election delays, and heartbeat timeouts.
 
 ## Security
@@ -61,6 +61,7 @@ These links are curated for agents. Each target is the Markdown representation o
 - [Python API](reference/python/index.md): Install awa-pg for the Python clients and worker runtime.
 - [Stability policy](stability/index.md): Awa is consumed through several distinct surfaces. This document states, per surface, what is covered by a compatibility promise, what is explicitly internal, and what each release type may change. Anything not listed here is internal and.
 - [Architecture decisions](adr/index.md): Each file in this directory captures a single architectural decision — its context, the decision itself, the alternatives considered, and the consequences. ADRs are written when a decision has a non-obvious rationale, trades off across.
+- [Incident reports](incidents/index.md): Public incident reports record what happened, its impact, causes, and follow-up work. Architecture decisions record design choices and their alternatives.
 
 ## Contributing
 
