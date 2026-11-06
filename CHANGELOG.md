@@ -74,6 +74,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Statistics-refresh permission warnings distinguish caller grants from
+  helper/table ownership and ANALYZE privileges.
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
