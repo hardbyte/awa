@@ -170,6 +170,15 @@ curl -X POST "https://awa.example.com/api/callbacks/$CALLBACK_ID/heartbeat" \
 
 The `complete` endpoint completes the job. It does not resume an in-process handler for sequential callback workflows; use the Rust/Python admin API `resume_external` path for that pattern.
 
+The `payload` is not stored. To keep a value on the completed job for later inspection, send it as `output` ([job output](../job-output/index.md)): at most 4 KiB of JSON, without NUL characters. An invalid `output` is a `400` and completes nothing. Callback servers older than 0.7 ignore the field. The signature covers the callback ID, not the body, so whoever holds a callback's signature also chooses its output; treat a stored output as the caller's claim, like the payload.
+
+```bash
+curl -X POST "$CALLBACK_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-Awa-Signature: $AWA_SIGNATURE" \
+  -d '{"output":{"approved":true,"pages":12}}'
+```
+
 ## Deploying callback ingress separately
 
 `awa serve` bundles the admin UI, admin REST API, static fallback, and the callback receiver behind a single router with permissive CORS. That is convenient for development but undesirable when callbacks must be externally reachable while the admin surface must stay private.

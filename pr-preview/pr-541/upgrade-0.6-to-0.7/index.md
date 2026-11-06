@@ -95,10 +95,12 @@ schema owner:
      provisions all four priorities of every shard of every queue already in
      use (the larger of `awa.queue_meta.enqueue_shards` and the highest shard
      in use). It grants the roles holding `CREATE` `USAGE, SELECT, UPDATE` on
-     the sequences it creates. It changes no table definitions and takes no
-     lock that producers or workers wait on. A schema with any other trust
-     violation is
-     listed under `blocking` and left unchanged; fix those first and re-run.
+     the sequences it creates. It changes no table definitions. Producers and
+     workers using already-provisioned lanes can continue reserving sequences;
+     a runtime provisioning a lane may wait on the preparation transaction's
+     lane advisory lock until preparation commits. A schema with any other
+     trust violation is listed under `blocking` and left unchanged; fix those
+     first and re-run.
   2. Run each `sequence_grants` statement as the role in its `run_as`, usually
      the runtime role. The migration reads and sets every lane sequence, and
      only a sequence's owner can grant that.
@@ -201,6 +203,64 @@ into job-id buckets, so this release keeps that shape in its own folds and
 rebuilds until the flip fences them. Exact terminal counts stay exact through a
 mixed-version rollout and through a rollback before the flip; no operator action
 is needed.
+
+## v051: per-slot claim functions
+
+v051 moves the claim query out of `claim_ready_runtime` into one
+`claim_ready_slot_<N>` function per queue-ring slot in the default and every
+discovered custom queue-storage schema. Each function addresses that slot's
+ready, tombstone and attempt-batch children directly, so PostgreSQL keeps a
+cached plan for it across ring rotations. `claim_ready_runtime` keeps its
+signature and result and dispatches to the slot function, and the claim
+evidence it writes is unchanged, so binaries before v051 claim unchanged on the
+migrated schema and the migration adds no runtime version gate.
+
+This is an installer replay, not a function-only change. Reinstalling each
+substrate drops and recreates ring-state and queue-head triggers and takes
+ACCESS EXCLUSIVE table locks that are held until the whole pending range
+commits, so enqueue and claim in those schemas wait for the migration. Use a
+quiet window and a bounded `lock_timeout` (for example
+`PGOPTIONS='-c lock_timeout=5s' awa migrate`); on timeout nothing is applied,
+so retry the complete migration. Apply it with credentials that own every
+installed substrate.
+
+The runtime role needs `EXECUTE` on the new functions. The
+[default privileges](../security/database-roles/index.md#runtime-grants) granted to `awa_runtime`
+cover functions the migrator creates; if you granted `EXECUTE ON ALL FUNCTIONS`
+once instead, run that grant again after migrating. External migration runners
+apply the complete generated `awa migrate --sql --from 50 --to 51` bundle, which
+refreshes the installer definition before the tail reinstalls the custom
+substrates.
+
+## v052: job output columns
+
+v052 adds the storage for [job output](../job-output/index.md) (ADR-048) to the default
+and every discovered custom queue-storage schema:
+- a nullable `output json` column on `done_entries`;
+- a nullable `outputs json[]` array on `receipt_completion_batches`, with a
+  `NOT VALID` check on its length;
+- a final `output` column on `terminal_jobs`.
+
+It is not an installer replay. It redefines the installer, so new schemas
+get the columns, then runs a targeted helper for each schema. Nothing is
+rewritten or scanned. Adding the columns and replacing the view still take
+`ACCESS EXCLUSIVE` locks on the terminal tables and view, held until the
+whole pending range commits, so completions and terminal reads wait while it
+runs. It locks `terminal_jobs` before its tables, the order terminal reads
+use. When no `lock_timeout` is set, each lock acquisition waits at most 2 s.
+On a timeout or a deadlock nothing is applied; retry the complete migration.
+
+Binaries before v052 run unchanged on the migrated schema: they name terminal
+columns explicitly. While both versions run, a 0.6 worker that claims the
+retry of an attempt a 0.7 worker failed sees that attempt's output in
+`job.errors`; 0.7 workers remove it from the row they dispatch. A 0.7 binary running before the migration checks its
+schema's catalog for the columns. Until they exist, it neither writes nor
+reads them, and it drops completion outputs (counted as
+`awa.job.output_dropped{awa.output.reason="schema_missing"}`). Health-gated
+workers report not ready until the migration runs, as for any version bump.
+
+External migration runners apply the complete `awa migrate --sql --from 51
+--to 52` bundle, which defines the helper before the tail calls it.
 
 ## The one gate
 

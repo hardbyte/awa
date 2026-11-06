@@ -685,6 +685,8 @@
       
         
       
+        
+      
     
     
     
@@ -802,6 +804,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../architecture/" class="md-nav__link">
         
   
@@ -869,6 +899,8 @@
       
         
           
+        
+      
         
       
         
@@ -978,6 +1010,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -1499,6 +1559,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v051-per-slot-claim-functions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v051: per-slot claim functions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v052-job-output-columns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v052: job output columns
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1948,6 +2030,8 @@
       
         
       
+        
+      
     
     
     
@@ -2129,6 +2213,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2364,6 +2476,28 @@
     <span class="md-ellipsis">
       
         Terminal live counts: one row per lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v051-per-slot-claim-functions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v051: per-slot claim functions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v052-job-output-columns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v052: job output columns
       
     </span>
   </a>
@@ -2647,10 +2781,12 @@ schema owner:</p>
  provisions all four priorities of every shard of every queue already in
  use (the larger of <code>awa.queue_meta.enqueue_shards</code> and the highest shard
  in use). It grants the roles holding <code>CREATE</code> <code>USAGE, SELECT, UPDATE</code> on
- the sequences it creates. It changes no table definitions and takes no
- lock that producers or workers wait on. A schema with any other trust
- violation is
- listed under <code>blocking</code> and left unchanged; fix those first and re-run.
+ the sequences it creates. It changes no table definitions. Producers and
+ workers using already-provisioned lanes can continue reserving sequences;
+ a runtime provisioning a lane may wait on the preparation transaction's
+ lane advisory lock until preparation commits. A schema with any other
+ trust violation is listed under <code>blocking</code> and left unchanged; fix those
+ first and re-run.
   2. Run each <code>sequence_grants</code> statement as the role in its <code>run_as</code>, usually
  the runtime role. The migration reads and sets every lane sequence, and
  only a sequence's owner can grant that.
@@ -2745,6 +2881,55 @@ into job-id buckets, so this release keeps that shape in its own folds and
 rebuilds until the flip fences them. Exact terminal counts stay exact through a
 mixed-version rollout and through a rollback before the flip; no operator action
 is needed.</p>
+<h2 id="v051-per-slot-claim-functions">v051: per-slot claim functions<a class="headerlink" href="#v051-per-slot-claim-functions" title="Permanent link">&para;</a></h2>
+<p>v051 moves the claim query out of <code>claim_ready_runtime</code> into one
+<code>claim_ready_slot_&lt;N&gt;</code> function per queue-ring slot in the default and every
+discovered custom queue-storage schema. Each function addresses that slot's
+ready, tombstone and attempt-batch children directly, so PostgreSQL keeps a
+cached plan for it across ring rotations. <code>claim_ready_runtime</code> keeps its
+signature and result and dispatches to the slot function, and the claim
+evidence it writes is unchanged, so binaries before v051 claim unchanged on the
+migrated schema and the migration adds no runtime version gate.</p>
+<p>This is an installer replay, not a function-only change. Reinstalling each
+substrate drops and recreates ring-state and queue-head triggers and takes
+ACCESS EXCLUSIVE table locks that are held until the whole pending range
+commits, so enqueue and claim in those schemas wait for the migration. Use a
+quiet window and a bounded <code>lock_timeout</code> (for example
+<code>PGOPTIONS='-c lock_timeout=5s' awa migrate</code>); on timeout nothing is applied,
+so retry the complete migration. Apply it with credentials that own every
+installed substrate.</p>
+<p>The runtime role needs <code>EXECUTE</code> on the new functions. The
+<a href="../security/database-roles/#runtime-grants">default privileges</a> granted to <code>awa_runtime</code>
+cover functions the migrator creates; if you granted <code>EXECUTE ON ALL FUNCTIONS</code>
+once instead, run that grant again after migrating. External migration runners
+apply the complete generated <code>awa migrate --sql --from 50 --to 51</code> bundle, which
+refreshes the installer definition before the tail reinstalls the custom
+substrates.</p>
+<h2 id="v052-job-output-columns">v052: job output columns<a class="headerlink" href="#v052-job-output-columns" title="Permanent link">&para;</a></h2>
+<p>v052 adds the storage for <a href="../job-output/">job output</a> (ADR-048) to the default
+and every discovered custom queue-storage schema:
+- a nullable <code>output json</code> column on <code>done_entries</code>;
+- a nullable <code>outputs json[]</code> array on <code>receipt_completion_batches</code>, with a
+  <code>NOT VALID</code> check on its length;
+- a final <code>output</code> column on <code>terminal_jobs</code>.</p>
+<p>It is not an installer replay. It redefines the installer, so new schemas
+get the columns, then runs a targeted helper for each schema. Nothing is
+rewritten or scanned. Adding the columns and replacing the view still take
+<code>ACCESS EXCLUSIVE</code> locks on the terminal tables and view, held until the
+whole pending range commits, so completions and terminal reads wait while it
+runs. It locks <code>terminal_jobs</code> before its tables, the order terminal reads
+use. When no <code>lock_timeout</code> is set, each lock acquisition waits at most 2 s.
+On a timeout or a deadlock nothing is applied; retry the complete migration.</p>
+<p>Binaries before v052 run unchanged on the migrated schema: they name terminal
+columns explicitly. While both versions run, a 0.6 worker that claims the
+retry of an attempt a 0.7 worker failed sees that attempt's output in
+<code>job.errors</code>; 0.7 workers remove it from the row they dispatch. A 0.7 binary running before the migration checks its
+schema's catalog for the columns. Until they exist, it neither writes nor
+reads them, and it drops completion outputs (counted as
+<code>awa.job.output_dropped{awa.output.reason="schema_missing"}</code>). Health-gated
+workers report not ready until the migration runs, as for any version bump.</p>
+<p>External migration runners apply the complete <code>awa migrate --sql --from 51
+--to 52</code> bundle, which defines the helper before the tail calls it.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
