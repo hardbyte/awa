@@ -146,6 +146,15 @@ Late completions from a rescued attempt lose against the newer attempt via the
 (default 90s) to at least 3× the heartbeat interval; detection latency is
 roughly `heartbeat_staleness + heartbeat_rescue_interval`.
 
+On queue storage a killed runtime's open claims stop the claim ring rotating
+until rescue closes them. Rescue drains such a backlog in passes of 500-attempt
+batches, bounded by `rescue_pass_budget` (1s) and `rescue_pass_max_rows`
+(5000), with the next pass a second later while a backlog remains.
+Stale-heartbeat rescue only drains past one batch per pass once the runtime
+snapshots show the claims' owner gone, which needs `heartbeat_rescue_interval`
+below half of `heartbeat_staleness`. Watch `awa.maintenance.rescue.pass_size`
+(by `awa.rescue.pass_end`) and `awa.maintenance.rescue.oldest_attempt_age`.
+
 Finished handlers retry durable finalization for up to 120s from the first
 finalize attempt when database writes are unavailable, including connection,
 pool-acquire and read-only-session errors. Recovery requires a writable endpoint

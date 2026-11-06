@@ -285,6 +285,31 @@ If long-running jobs are expected, remember:
 
 If a job really needs `20m`, set a longer deadline for that queue.
 
+## Claim Ring Stops Rotating After A Runtime Is Killed
+
+Symptoms on queue storage, usually after a high-throughput runtime was OOM-killed or lost without a graceful shutdown:
+
+- `awa.maintenance.rotate.attempts` for the claim ring reports `skipped_busy` with blocker `claim.rows`, and `awa.ring.generation` for the claim ring stops advancing
+- the current claim slot keeps growing
+- jobs the dead runtime held wait well past `heartbeat_staleness` before they run again
+
+The dead runtime's claims stay open until rescue closes them, and the ring cannot rotate back into a slot that still holds open claims. Rescue drains such a backlog in passes of 500-attempt batches ([Draining a backlog of abandoned claims](configuration.md#rescue-backlog)). To see where it is:
+
+- `awa.maintenance.rescue.oldest_attempt_age` by `awa.rescue.kind` shows how old the attempts rescue is closing are. It should fall towards `heartbeat_staleness` (or the queue's deadline) as the backlog drains.
+- `awa.maintenance.rescue.pass_size` by `awa.rescue.pass_end` shows why passes stop. `time_budget` or `row_limit` means a drain is running at its configured rate. `owners_unconfirmed` means stale-heartbeat rescue is waiting for evidence that the claims' runtime is gone and is taking one batch per pass.
+
+If stale-heartbeat passes stay at `owners_unconfirmed`, look at the runtime snapshots:
+
+```sql
+SELECT instance_id, hostname, last_seen_at, snapshot_interval_ms, heartbeat_alive
+FROM awa.runtime_instances
+ORDER BY last_seen_at DESC;
+```
+
+A runtime that has stopped reporting but has not yet been silent for `heartbeat_staleness`, or a reporting runtime with `heartbeat_alive = false`, holds the drain back until it is either gone or healthy. The drain also needs `heartbeat_rescue_interval` below half of `heartbeat_staleness`. Deadline rescue is not held back this way, so queues with a `deadline_duration` drain through it regardless.
+
+To drain faster, raise `rescue_pass_max_rows` and `rescue_pass_budget`, keeping in mind that a pass holds the maintenance leader for its budget and writes up to `rescue_pass_max_rows` closures and retry rows per pass.
+
 ## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means

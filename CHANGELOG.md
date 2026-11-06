@@ -6,6 +6,39 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Queue-storage rescue drains a large backlog of abandoned claims in
+  minutes, not hours (#627).** Stale-heartbeat, deadline and callback-timeout
+  rescue each closed at most 500 attempts per pass, one pass per rescue
+  interval (30 s by default). A runtime killed while holding tens of thousands
+  of claims left a backlog that took hours to clear, and the claim ring could
+  not rotate back into a slot that still held open claims for all that time.
+  A rescue pass now keeps taking 500-attempt batches, each in its own short
+  transaction, while the previous batch came back full, until it has spent
+  `rescue_pass_budget` (default 1 s, at most half the rescue interval) or
+  rescued `rescue_pass_max_rows` (default 5,000). While a backlog remains the
+  next pass runs a second later. Batches visit claim slots oldest first, with
+  every fourth batch visiting the other slots first so they are not starved,
+  and look only at the claims near each slot's rescue cursor rather than the
+  whole slot. Rescued attempts are settled in one statement per outcome
+  instead of several per attempt.
+
+  A stale heartbeat cannot tell a dead runtime from a stalled one, so a
+  stale-heartbeat pass takes more than one batch only once the runtime
+  snapshots show every runtime either fresh with its heartbeat loop alive or
+  silent for at least `heartbeat_staleness`, continuously for a whole
+  `heartbeat_staleness` window, and its extra batches take only claims last
+  heartbeated before the most recently gone runtime stopped reporting, so a
+  live runtime whose heartbeats lag is never drained in bulk. This needs
+  `heartbeat_rescue_interval` below half of `heartbeat_staleness`, as the
+  defaults are. Deadline and
+  callback-timeout rescues drain without that evidence. The per-attempt
+  rescue rules, attempt counting and DLQ moves are unchanged; rescued retries
+  become due no faster than `rescue_pass_max_rows` per second in total. New
+  metrics `awa.maintenance.rescue.pass_size` and
+  `awa.maintenance.rescue.oldest_attempt_age` show a drain's progress. Set
+  `rescue_pass_budget` to zero to keep one batch per pass. Python takes the
+  same settings as `rescue_pass_budget_ms` and `rescue_pass_max_rows`.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane

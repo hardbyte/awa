@@ -8,14 +8,15 @@ use awa_model::cron::{
 #[cfg(test)]
 use awa_model::SkipReason;
 use awa_model::{
-    JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome, TerminalDeltaRollupOutcome,
+    JobRow, JobState, PeriodicJob, PruneOutcome, RescueBatch, RescueBatchOptions, RescueSlotOrder,
+    RotateOutcome, TerminalDeltaRollupOutcome,
 };
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -224,6 +225,144 @@ const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
 
 /// How often the leader scans for attempts past their deadline by default.
 pub(crate) const DEFAULT_DEADLINE_RESCUE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default wall-clock budget for one queue-storage rescue pass.
+pub(crate) const DEFAULT_RESCUE_PASS_BUDGET: Duration = Duration::from_secs(1);
+
+/// Default cap on attempts one queue-storage rescue pass rescues.
+pub(crate) const DEFAULT_RESCUE_PASS_MAX_ROWS: usize = 5_000;
+
+/// Attempts one rescue batch rescues at most per source (lease rows, receipt
+/// claims), each batch in its own transaction.
+const RESCUE_BATCH_ROWS: usize = 500;
+
+/// While a rescue kind still has a backlog, its next pass runs after this
+/// rather than after its full interval. With the per-pass row cap this bounds
+/// a drain to about `rescue_pass_max_rows` attempts per second per kind.
+const RESCUE_BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Claims each slot's cursor walk examines in a batch that follows a full
+/// one in the same pass. The first batch keeps the store's wider default so
+/// a pass can still walk past long runs of closed claims.
+const RESCUE_FOLLOW_UP_SCAN_LIMIT: usize = 2_000;
+
+/// One batch in this many visits the other claim slots before the oldest, so
+/// a long drain of the oldest slot leaves the rest at least that share.
+const RESCUE_OTHERS_FIRST_EVERY: usize = 4;
+
+/// Runtime snapshots the leader reads before letting a stale-heartbeat pass
+/// take more than one batch. A runtime is `fresh` while its snapshot is
+/// within three snapshot intervals; one that is neither fresh nor silent for
+/// the whole heartbeat staleness ($1, milliseconds) could be a live runtime
+/// that is stalled rather than gone. `last_gone_heartbeat` bounds the last
+/// heartbeat any gone runtime can have written: it wrote a snapshot at least
+/// every interval while it lived.
+const RESCUE_RUNTIME_EVIDENCE_SQL: &str = r#"
+    SELECT
+        count(*) FILTER (WHERE fresh AND NOT heartbeat_alive)::bigint AS fresh_without_heartbeat,
+        count(*) FILTER (WHERE NOT fresh AND NOT gone)::bigint AS unconfirmed,
+        max(last_seen_at + snapshot_interval_ms * 2 * interval '1 millisecond')
+            FILTER (WHERE gone) AS last_gone_heartbeat
+    FROM (
+        SELECT
+            heartbeat_alive,
+            last_seen_at,
+            snapshot_interval_ms,
+            last_seen_at >= now() - GREATEST(snapshot_interval_ms, 1000) * 3 * interval '1 millisecond'
+                AS fresh,
+            last_seen_at < now() - GREATEST(snapshot_interval_ms, 1000) * 3 * interval '1 millisecond'
+                AND last_seen_at < now() - $1 * interval '1 millisecond'
+                AS gone
+        FROM awa.runtime_instances
+    ) AS runtimes
+"#;
+
+/// The queue-storage rescue kinds a leader drains in passes of batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescueKind {
+    Heartbeat,
+    Deadline,
+    Callback,
+}
+
+impl RescueKind {
+    /// The `awa.rescue.kind` attribute value, as on `awa.maintenance.rescues`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Heartbeat => "heartbeat",
+            Self::Deadline => "deadline",
+            Self::Callback => "callback_timeout",
+        }
+    }
+}
+
+/// Why a queue-storage rescue pass stopped taking batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescuePassEnd {
+    /// The last batch found fewer eligible attempts than its limit.
+    Drained,
+    /// The pass budget is spent.
+    TimeBudget,
+    /// The pass reached `rescue_pass_max_rows`.
+    RowLimit,
+    /// Stale-heartbeat only: the runtime snapshots do not yet show that the
+    /// owners of stale claims are gone, so the pass keeps to one batch.
+    OwnersUnconfirmed,
+    Error,
+}
+
+impl RescuePassEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::TimeBudget => "time_budget",
+            Self::RowLimit => "row_limit",
+            Self::OwnersUnconfirmed => "owners_unconfirmed",
+            Self::Error => "error",
+        }
+    }
+
+    /// The pass stopped with eligible attempts left that it was allowed to
+    /// take, so the next pass should come sooner than the interval.
+    fn backlog_remains(self) -> bool {
+        matches!(self, Self::TimeBudget | Self::RowLimit)
+    }
+}
+
+/// The leader's record of whether every runtime that could own a stale
+/// claim is gone. A claim does not record its runtime, so the evidence is
+/// fleet-wide: every runtime snapshot is either fresh with its heartbeat
+/// loop alive, or silent for at least the heartbeat staleness. That must
+/// hold at every sample for a full staleness window before a stale-heartbeat
+/// pass may take more than one batch, so a live runtime coming out of a stall
+/// has had the whole window to refresh its heartbeats first. A gap between
+/// samples longer than half the staleness restarts the window, because a
+/// stall the leader did not sample could have hidden behind it.
+#[derive(Debug, Default)]
+struct RescueOwnerEvidence {
+    steady_since: Option<Instant>,
+    last_sample: Option<Instant>,
+}
+
+impl RescueOwnerEvidence {
+    /// Record one sample and return whether the evidence now allows a
+    /// stale-heartbeat pass to take more than one batch.
+    fn observe(&mut self, now: Instant, settled: bool, staleness: Duration) -> bool {
+        let sampled_recently = self
+            .last_sample
+            .is_some_and(|last| now.saturating_duration_since(last) <= staleness / 2);
+        self.last_sample = Some(now);
+        if !settled {
+            self.steady_since = None;
+            return false;
+        }
+        if !sampled_recently {
+            self.steady_since = Some(now);
+        }
+        let steady_since = *self.steady_since.get_or_insert(now);
+        now.saturating_duration_since(steady_since) >= staleness
+    }
+}
 
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
@@ -716,6 +855,13 @@ pub struct MaintenanceService {
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
+    rescue_pass_budget: Duration,
+    rescue_pass_max_rows: usize,
+    rescue_owner_evidence: std::sync::Mutex<RescueOwnerEvidence>,
+    /// Earliest `run_at` for the next attempt a queue-storage rescue sends
+    /// back to `retryable`; see [`Self::rescue_retry_floor`].
+    rescue_retry_horizon: std::sync::Mutex<Option<DateTime<Utc>>>,
+    rescue_others_first_offset: AtomicUsize,
     promote_interval: Duration,
     cleanup_interval: Duration,
     cron_sync_interval: Duration,
@@ -797,6 +943,11 @@ impl MaintenanceService {
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: DEFAULT_DEADLINE_RESCUE_INTERVAL,
             callback_rescue_interval: Duration::from_secs(30),
+            rescue_pass_budget: DEFAULT_RESCUE_PASS_BUDGET,
+            rescue_pass_max_rows: DEFAULT_RESCUE_PASS_MAX_ROWS,
+            rescue_owner_evidence: std::sync::Mutex::new(RescueOwnerEvidence::default()),
+            rescue_retry_horizon: std::sync::Mutex::new(None),
+            rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
             cron_sync_interval: Duration::from_secs(60),
@@ -922,6 +1073,21 @@ impl MaintenanceService {
     /// Set the callback-timeout rescue interval (default: 30s).
     pub fn callback_rescue_interval(mut self, interval: Duration) -> Self {
         self.callback_rescue_interval = interval;
+        self
+    }
+
+    /// Set how long one queue-storage rescue pass may keep starting batches
+    /// (default: 1s, and never more than half the rescue interval). Zero
+    /// keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = budget;
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). A pass always finishes the batch it started.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = max_rows;
         self
     }
 
@@ -1135,20 +1301,29 @@ impl MaintenanceService {
                     }
                     _ = heartbeat_rescue_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
-                            self.rescue_stale_heartbeats().await;
+                            let backlog = self.rescue_stale_heartbeats().await;
                             timer.finish();
+                            if backlog {
+                                heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+                            }
                         }
                     }
                     _ = deadline_rescue_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
-                            self.rescue_expired_deadlines().await;
+                            let backlog = self.rescue_expired_deadlines().await;
                             timer.finish();
+                            if backlog {
+                                deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
+                            }
                         }
                     }
                     _ = callback_rescue_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
-                            self.rescue_expired_callbacks().await;
+                            let backlog = self.rescue_expired_callbacks().await;
                             timer.finish();
+                            if backlog {
+                                callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
+                            }
                         }
                     }
                     _ = promote_timer.tick() => {
@@ -1626,40 +1801,285 @@ impl MaintenanceService {
     /// `canonical_live_backlog` above zero and wedge `finalize --wait`,
     /// and stuck queue-storage rows would wait out a drain-only leader.
     /// Both cross-plane sweeps are cheap no-ops once their tables are empty.
+    ///
+    /// Returns whether the queue-storage pass left a backlog it may keep
+    /// draining, so the next pass should run before the full interval.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
-    async fn rescue_stale_heartbeats(&self) {
+    async fn rescue_stale_heartbeats(&self) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
                 self.process_heartbeat_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_stale_heartbeats_with_dlq(
-                            &self.pool,
-                            self.heartbeat_staleness,
-                            &|queue| self.dlq_policy.enabled_for(queue),
-                        )
-                        .await;
-                    self.process_heartbeat_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Heartbeat, runtime, false)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_stale_heartbeats_with_dlq(
-                        &self.pool,
-                        self.heartbeat_staleness,
-                        &|queue| self.dlq_policy.enabled_for(queue),
-                    )
-                    .await;
-                self.process_heartbeat_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Heartbeat, runtime, true)
                     .await;
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
                 self.process_heartbeat_rescues(outcome, false, None).await;
+                backlog
             }
         }
+    }
+
+    /// One queue-storage rescue pass: batches of up to 500 attempts per
+    /// source, each in its own transaction, until a batch comes back short,
+    /// the pass budget is spent, or the pass reaches `rescue_pass_max_rows`. Most batches visit the oldest claim slot
+    /// first, since the ring cannot rotate back into it while it holds open
+    /// claims; every [`RESCUE_OTHERS_FIRST_EVERY`]th visits the others first.
+    /// A slot a batch found nothing in is left out for the rest of the pass.
+    ///
+    /// A stale heartbeat cannot tell a dead runtime from a stalled one, so a
+    /// stale-heartbeat pass takes more than one batch only when
+    /// [`RescueOwnerEvidence`] holds, and its later batches take only claims
+    /// last heartbeated before the most recently gone runtime stopped
+    /// reporting. A live runtime whose heartbeats merely lag has refreshed its
+    /// claims since then. Deadline and callback rescues act on a deadline that
+    /// has passed whoever owns the attempt.
+    ///
+    /// Returns whether the pass stopped with a backlog it may keep draining,
+    /// so the next pass should run before the full interval.
+    async fn rescue_queue_storage_pass(
+        &self,
+        kind: RescueKind,
+        runtime: &QueueStorageRuntime,
+        signal_local: bool,
+    ) -> bool {
+        let started = Instant::now();
+        let interval = match kind {
+            RescueKind::Heartbeat => self.heartbeat_rescue_interval,
+            RescueKind::Deadline => self.deadline_rescue_interval,
+            RescueKind::Callback => self.callback_rescue_interval,
+        };
+        let budget = self.rescue_pass_budget.min(interval / 2);
+        let dlq_enabled = |queue: &str| self.dlq_policy.enabled_for(queue);
+        let mut bulk_heartbeat_cutoff: Option<Option<DateTime<Utc>>> = None;
+        let mut rescued_total = 0usize;
+        let mut oldest_attempt: Option<DateTime<Utc>> = None;
+        let mut batches = 0usize;
+        let mut idle_slots: Vec<i32> = Vec::new();
+        let pass_end = loop {
+            let slot_order = if batches % RESCUE_OTHERS_FIRST_EVERY == RESCUE_OTHERS_FIRST_EVERY - 1
+            {
+                RescueSlotOrder::OthersFirst(
+                    self.rescue_others_first_offset
+                        .fetch_add(1, Ordering::Relaxed),
+                )
+            } else {
+                RescueSlotOrder::OldestFirst
+            };
+            let options = RescueBatchOptions {
+                slot_order,
+                skip_slots: idle_slots.clone(),
+                retry_not_before: self.rescue_retry_floor(),
+                cursor_scan_limit: (batches > 0).then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
+            };
+            let outcome = match kind {
+                RescueKind::Heartbeat => {
+                    // Follow-up batches take only claims last heartbeated
+                    // before a runtime known to be gone stopped reporting.
+                    let staleness = bulk_heartbeat_cutoff
+                        .flatten()
+                        .and_then(|cutoff| (Utc::now() - cutoff).to_std().ok())
+                        .map_or(self.heartbeat_staleness, |since_cutoff| {
+                            since_cutoff.max(self.heartbeat_staleness)
+                        });
+                    runtime
+                        .store
+                        .rescue_stale_heartbeats_batch(
+                            &self.pool,
+                            staleness,
+                            &dlq_enabled,
+                            &options,
+                        )
+                        .await
+                }
+                RescueKind::Deadline => {
+                    runtime
+                        .store
+                        .rescue_expired_deadlines_batch(&self.pool, &dlq_enabled, &options)
+                        .await
+                }
+                RescueKind::Callback => {
+                    runtime
+                        .store
+                        .rescue_expired_callbacks_batch(&self.pool, &dlq_enabled, &options)
+                        .await
+                }
+            };
+            batches += 1;
+            let RescueBatch {
+                rescued,
+                saturated,
+                idle_slots: batch_idle_slots,
+            } = match outcome {
+                Ok(batch) => batch,
+                Err(err) => {
+                    self.process_queue_storage_rescues(kind, Err(err), signal_local, runtime)
+                        .await;
+                    break RescuePassEnd::Error;
+                }
+            };
+            idle_slots.extend(batch_idle_slots);
+            rescued_total += rescued.len();
+            self.advance_rescue_retry_horizon(
+                rescued
+                    .iter()
+                    .filter(|job| job.state == JobState::Retryable)
+                    .count(),
+            );
+            if let Some(attempted_at) = rescued.iter().filter_map(|job| job.attempted_at).min() {
+                oldest_attempt =
+                    Some(oldest_attempt.map_or(attempted_at, |oldest| oldest.min(attempted_at)));
+            }
+            self.process_queue_storage_rescues(kind, Ok(rescued), signal_local, runtime)
+                .await;
+
+            if !saturated {
+                break RescuePassEnd::Drained;
+            }
+            if budget.is_zero() {
+                break RescuePassEnd::TimeBudget;
+            }
+            if kind == RescueKind::Heartbeat {
+                let cutoff = match bulk_heartbeat_cutoff {
+                    Some(cutoff) => cutoff,
+                    None => *bulk_heartbeat_cutoff.insert(self.stale_claim_owners_gone().await),
+                };
+                if cutoff.is_none() {
+                    break RescuePassEnd::OwnersUnconfirmed;
+                }
+            }
+            if rescued_total >= self.rescue_pass_max_rows {
+                break RescuePassEnd::RowLimit;
+            }
+            if started.elapsed() >= budget {
+                break RescuePassEnd::TimeBudget;
+            }
+        };
+
+        let oldest_attempt_age = oldest_attempt
+            .and_then(|attempted_at| (Utc::now() - attempted_at).to_std().ok())
+            .unwrap_or_default();
+        self.metrics.record_rescue_pass(
+            kind.as_str(),
+            pass_end.as_str(),
+            rescued_total as u64,
+            oldest_attempt_age,
+        );
+        if batches > 1 {
+            info!(
+                rescue_kind = kind.as_str(),
+                rescued = rescued_total,
+                batches,
+                pass_end = pass_end.as_str(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                oldest_attempt_age_s = oldest_attempt_age.as_secs(),
+                "Queue-storage rescue pass drained a backlog"
+            );
+        }
+        pass_end.backlog_remains() && !budget.is_zero()
+    }
+
+    async fn process_queue_storage_rescues(
+        &self,
+        kind: RescueKind,
+        outcome: Result<Vec<JobRow>, awa_model::AwaError>,
+        signal_local: bool,
+        runtime: &QueueStorageRuntime,
+    ) {
+        match kind {
+            RescueKind::Heartbeat => {
+                self.process_heartbeat_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+            RescueKind::Deadline => {
+                self.process_deadline_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+            RescueKind::Callback => {
+                self.process_callback_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+        }
+    }
+
+    /// Sample the runtime snapshots and update [`RescueOwnerEvidence`].
+    /// Returns the heartbeat cutoff for follow-up stale-heartbeat batches
+    /// when the evidence holds and some runtime is known to be gone; `None`
+    /// keeps the pass to one batch. A failed read counts as no evidence.
+    async fn stale_claim_owners_gone(&self) -> Option<DateTime<Utc>> {
+        let staleness_ms = i64::try_from(self.heartbeat_staleness.as_millis()).unwrap_or(i64::MAX);
+        let (settled, last_gone_heartbeat) = match sqlx::query_as::<
+            _,
+            (i64, i64, Option<DateTime<Utc>>),
+        >(RESCUE_RUNTIME_EVIDENCE_SQL)
+        .bind(staleness_ms)
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok((fresh_without_heartbeat, unconfirmed, last_gone_heartbeat)) => {
+                if fresh_without_heartbeat > 0 || unconfirmed > 0 {
+                    debug!(
+                        fresh_without_heartbeat,
+                        unconfirmed,
+                        "Stale-heartbeat rescue kept to one batch: runtime snapshots do not show the claim owners gone"
+                    );
+                }
+                (
+                    fresh_without_heartbeat == 0 && unconfirmed == 0,
+                    last_gone_heartbeat,
+                )
+            }
+            Err(err) => {
+                warn!(error = %err, "Failed to read runtime snapshots for stale-heartbeat rescue");
+                (false, None)
+            }
+        };
+        let steady = self
+            .rescue_owner_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(Instant::now(), settled, self.heartbeat_staleness);
+        if steady {
+            last_gone_heartbeat
+        } else {
+            None
+        }
+    }
+
+    /// The earliest `run_at` for the next attempt a queue-storage rescue
+    /// sends back to `retryable`. Rescued attempts become due no faster than
+    /// `rescue_pass_max_rows` per second across all rescue kinds, so a large
+    /// drain reaches promotion and the ready lanes spread over time rather
+    /// than all at once. `None` while rescue runs below that rate.
+    fn rescue_retry_floor(&self) -> Option<DateTime<Utc>> {
+        let horizon = *self
+            .rescue_retry_horizon
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        horizon.filter(|horizon| *horizon > Utc::now())
+    }
+
+    fn advance_rescue_retry_horizon(&self, retried: usize) {
+        if retried == 0 {
+            return;
+        }
+        let per_second = self.rescue_pass_max_rows.max(RESCUE_BATCH_ROWS) as i64;
+        let spread = TimeDelta::microseconds(retried as i64 * 1_000_000 / per_second);
+        let now = Utc::now();
+        let mut horizon = self
+            .rescue_retry_horizon
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = horizon.map_or(now, |horizon| horizon.max(now));
+        *horizon = Some(start + spread);
     }
 
     /// Batched canonical stale-heartbeat rescue with the #388 row-at-a-time
@@ -1825,33 +2245,25 @@ impl MaintenanceService {
     /// #456 mirror: sweeps both storage planes; see
     /// [`Self::rescue_stale_heartbeats`].
     #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
-    async fn rescue_expired_deadlines(&self) {
+    async fn rescue_expired_deadlines(&self) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
-                            self.dlq_policy.enabled_for(queue)
-                        })
-                        .await;
-                    self.process_deadline_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Deadline, runtime, false)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
-                        self.dlq_policy.enabled_for(queue)
-                    })
-                    .await;
-                self.process_deadline_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Deadline, runtime, true)
                     .await;
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, false, None).await;
+                backlog
             }
         }
     }
@@ -1998,33 +2410,25 @@ impl MaintenanceService {
     /// doubly here because callback-carrying jobs never migrate off the
     /// canonical plane during a transition.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
-    async fn rescue_expired_callbacks(&self) {
+    async fn rescue_expired_callbacks(&self) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
-                            self.dlq_policy.enabled_for(queue)
-                        })
-                        .await;
-                    self.process_callback_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Callback, runtime, false)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
-                        self.dlq_policy.enabled_for(queue)
-                    })
-                    .await;
-                self.process_callback_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Callback, runtime, true)
                     .await;
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, false, None).await;
+                backlog
             }
         }
     }
@@ -4288,6 +4692,59 @@ mod tests {
             Some(clock + BRANCH_COOLDOWN_MAX),
             "cap bounds the cooldown"
         );
+    }
+
+    #[test]
+    fn rescue_owner_evidence_needs_a_full_settled_staleness_window() {
+        let staleness = Duration::from_secs(90);
+        let sample_every = Duration::from_secs(30);
+        let mut evidence = RescueOwnerEvidence::default();
+        let mut clock = Instant::now();
+
+        for _ in 0..3 {
+            assert!(!evidence.observe(clock, true, staleness));
+            clock += sample_every;
+        }
+        assert!(
+            evidence.observe(clock, true, staleness),
+            "settled at every sample across the staleness window"
+        );
+
+        clock += sample_every;
+        assert!(
+            !evidence.observe(clock, false, staleness),
+            "an unsettled sample closes the gate at once"
+        );
+        for _ in 0..3 {
+            clock += sample_every;
+            assert!(
+                !evidence.observe(clock, true, staleness),
+                "the window restarts after an unsettled sample"
+            );
+        }
+        clock += sample_every;
+        assert!(evidence.observe(clock, true, staleness));
+    }
+
+    #[test]
+    fn rescue_owner_evidence_restarts_after_an_unsampled_gap() {
+        let staleness = Duration::from_secs(90);
+        let mut evidence = RescueOwnerEvidence::default();
+        let mut clock = Instant::now();
+        for _ in 0..4 {
+            evidence.observe(clock, true, staleness);
+            clock += Duration::from_secs(30);
+        }
+        assert!(evidence.observe(clock, true, staleness));
+
+        // The leader did not sample for longer than half the staleness: a
+        // stall in that gap would have been invisible, so start over.
+        clock += Duration::from_secs(46);
+        assert!(!evidence.observe(clock, true, staleness));
+        clock += Duration::from_secs(45);
+        assert!(!evidence.observe(clock, true, staleness));
+        clock += Duration::from_secs(45);
+        assert!(evidence.observe(clock, true, staleness));
     }
 
     #[test]
