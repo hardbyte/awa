@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://hardbyte.github.io/awa/architecture/">
       
       
-        <link rel="prev" href="../concepts/transactional-enqueue/">
+        <link rel="prev" href="../concepts/failure-lab/">
       
       
         <link rel="next" href="../queue-storage-substrate/">
@@ -687,6 +687,8 @@
       
         
       
+        
+      
     
     
     
@@ -787,6 +789,34 @@
     
   
     Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
   
 
     
@@ -1126,6 +1156,8 @@
       
         
       
+        
+      
     
     
     
@@ -1223,6 +1255,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -1909,6 +1969,8 @@
       
         
       
+        
+      
     
     
     
@@ -2090,6 +2152,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2818,8 +2908,9 @@
 <p>There are two COPY-shaped producer paths:</p>
 <ul>
 <li>Direct queue-storage COPY is the high-throughput path: Rust producers use a configured <code>QueueStorage::enqueue_params_copy()</code>, and Python producers use <code>enqueue_many_copy()</code>. Each ready or deferred write group uses array-backed INSERT below 2,048 rows and CSV COPY for larger groups. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially <code>queue_stripe_count</code> / <code>queue_storage_queue_stripe_count</code>.</li>
-<li><code>insert_many_copy()</code> is the compatibility path. It stages rows with an array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff, then takes one of two branches. If any staged row has a <code>unique_key</code>, every row is replayed through <code>POSTGRES_INSERT_JOB_SQL</code> inside a per-row savepoint so SQLSTATE <code>23505</code> can skip that duplicate without aborting the batch; that statement itself calls <code>awa.insert_job_compat()</code>. An all-non-unique batch uses one lateral <code>awa.insert_job_compat()</code> call per staged row without savepoints. Both branches therefore preserve cross-storage behavior. The planned <code>awa.insert_job()</code> public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.</li>
+<li><code>insert_many_copy()</code> is the compatibility path. It stages rows with an array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff, then inserts them through <code>awa.insert_jobs_compat_batch</code> (migration v055; each lane's lock is held only for its reservation and the ready-row write, and unique conflicts are skipped in the same statement). It probes its own connection on every call; on a schema without the function it takes one of two per-row branches. If any staged row has a <code>unique_key</code>, every row is replayed through <code>POSTGRES_INSERT_JOB_SQL</code> inside a per-row savepoint so SQLSTATE <code>23505</code> can skip that duplicate without aborting the batch; that statement itself calls <code>awa.insert_job_compat()</code>. An all-non-unique batch uses one lateral <code>awa.insert_job_compat()</code> call per staged row without savepoints. Both branches therefore preserve cross-storage behavior. The planned <code>awa.insert_job()</code> public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.</li>
 </ul>
+<p>Generic <code>insert_many</code> always uses one statement that calls <code>awa.insert_job_compat</code> per row in canonical lane order. Its <code>PgExecutor</code> is consumed by that statement, so it cannot probe the connection first; it does not cache another database's schema availability. <code>insert_many_skip_unique_conflicts</code> explicitly requires the batch function.</p>
 <p>Claim is cursor-based rather than heap-scan based:</p>
 <ul>
 <li><code>queue_meta.enqueue_shards</code> controls how many independent enqueue/claim head rows a queue has. The default is one shard. Raising it changes the ordering contract to FIFO within <code>(queue, priority, enqueue_shard)</code>, with no global ordering promise across shards.</li>
@@ -2895,6 +2986,7 @@
 </tbody>
 </table>
 <p>The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.</p>
+<p>The leader also refreshes planner statistics on the two head tables and the ring parents when it is elected and every five minutes (<a href="../configuration/#planner-statistics">Planner statistics</a>): autovacuum never analyses partitioned tables or reaches its threshold on the head tables. It runs beside the ring ticks rather than in them, so a slow <code>ANALYZE</code> never delays a rotate or prune tick.</p>
 <p>The maintenance tick decides whether to seal the current slot. <code>ClientBuilder::ring_rotation_cadence</code> configures <code>RingRotationCadence</code>: a non-empty slot becomes eligible after <code>min_slot_age</code> since the maintenance store first observed rows (default 5 s) once it holds at least <code>min_slot_rows</code> (default 256, sampled with a bounded probe), when total physical storage reaches <code>target_slot_bytes</code> (default 2 MiB), or after <code>max_slot_age</code> (default 60 s) regardless of rows. At a trickle of writes a slot therefore seals about once a minute instead of every window. The minimum age uses a local monotonic clock: an empty observation clears the timer, and a newly elected leader starts a fresh window. <code>max_slot_age</code> also counts from the slot's <code>rotated_at</code> in the rotation ledger, on the database clock, so frequent leader changes cannot keep a trickle slot open past it. Under compat (pre-flip) authority an older rotator can leave the current generation without a ledger row; the ceiling then relies on the local observation, which a leader change restarts. The size measurement includes heap, indexes, TOAST, free-space maps and visibility maps. <code>RingRotationCadence::EAGER</code> restores eligibility on every tick.</p>
 <p>Queue pruning queues a bounded exclusive-lock request on routing metadata first, then acquires every other child with <code>NOWAIT</code>. Contention rolls back the attempt and retries next tick; active-data skip gates retain their backoff. This lets segment-first claim readers and entry-first producers finish without a prune lock cycle. It does not guarantee progress under perpetual contention.</p>
 <p>The cadence does not delay a logically empty slot, including a lease heap whose rows were deleted but whose pages or indexes still need reclamation. Existing busy-slot, whole-ring idle and closure checks still determine whether rotation and prune are safe. A filling skip leaves the current slot open and maintenance still attempts prune. This reduces repeated <code>TRUNCATE</code> operations and their catalog writes under steady traffic; a stalled logical slot can retain those catalog versions through <code>catalog_xmin</code>.</p>
@@ -3074,7 +3166,7 @@
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../concepts/transactional-enqueue/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Transactional enqueue">
+          <a href="../concepts/failure-lab/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Interactive failure lab">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
@@ -3084,7 +3176,7 @@
                 Previous
               </span>
               <div class="md-ellipsis">
-                Transactional enqueue
+                Interactive failure lab
               </div>
             </div>
           </a>

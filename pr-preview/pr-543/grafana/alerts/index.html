@@ -679,6 +679,8 @@
       
         
       
+        
+      
     
     
     
@@ -796,6 +798,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../architecture/" class="md-nav__link">
         
   
@@ -863,6 +893,8 @@
       
         
           
+        
+      
         
       
         
@@ -972,6 +1004,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -1658,6 +1718,8 @@
       
         
       
+        
+      
     
     
     
@@ -1839,6 +1901,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2171,6 +2261,18 @@
 <td>info</td>
 <td>descriptor drift detected for 15m</td>
 <td>all live runtimes agree</td>
+</tr>
+<tr>
+<td><code>awa_job_output_schema_missing</code> <em>(Prom only)</em></td>
+<td>warning</td>
+<td>a queue drops completion outputs because its schema predates migration v052, for 10m</td>
+<td><code>awa migrate</code> applies v052</td>
+</tr>
+<tr>
+<td><code>awa_staged_follow_ups_discarded</code> <em>(Prom only)</em></td>
+<td>info</td>
+<td>a kind discarded staged follow-ups (returned <code>WaitForCallback</code> after staging) in each of the last 15m</td>
+<td>no discards for 15m</td>
 </tr>
 </tbody>
 </table>
