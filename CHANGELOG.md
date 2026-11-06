@@ -32,8 +32,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - Close read connections if their transaction start is cancelled or fails before
   SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
-- Reduce running-count query work for partially closed compact receipt batches
-  by keeping closure membership lookups correlated.
+
+- Avoid repeated terminal-ledger probes when counting open deadline-backed
+  receipts, while preserving all closure and materialization exclusions.
 - Reduce running-count query work by keeping compact closure membership
   correlated and limiting row-local closure lookups to their claim partition.
 - Hydrate completed job-kind counts through each member's full ready-row key,
