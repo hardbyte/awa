@@ -6,6 +6,19 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Recover retained terminal bodies from the exact prior attempt when older
+  workers stored an aged effective priority in a narrow terminal key. Live
+  moved-lane metadata supplies defaults without replacing stored terminal
+  metadata, errors, tags or progress. Manual terminal retry restarts aging from
+  the physical lane; counter removal keeps the stored terminal key and failed
+  carry derives replacement counters from its inserted rows. The installed
+  `terminal_jobs` SQL view is unchanged for older mismatched-priority rows;
+  bodies whose ready backing was already pruned cannot be reconstructed.
+- Exclude tombstoned source lanes and require the prior run lease when
+  hydrating rescued attempts, retaining physical priority only for terminal
+  identity. Deferred retry and DLQ policy keep effective priority. The lookup
+  reads only validated referenced tombstone children; this adds read locks.
+
 - Preserve the original job body when manually retrying a priority-aged attempt
   that exhausted its retries during rescue. Retained failed reads and failed-row
   carry through pruning now use the physical ready-lane identity.
