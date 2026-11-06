@@ -1166,12 +1166,15 @@ async fn list_queue_storage_jobs(
             };
         }
         // As in `queue_overviews`: compiling costs more than running.
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
         let ids: Vec<i64> = query.fetch_all(tx.as_mut()).await?;
         tx.commit().await?;
+        drop(begin_guard);
         if ids.is_empty() {
             break;
         }
@@ -3229,7 +3232,9 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
 
         // JIT compiles this statement for longer than it runs (about 1.2 s
         // against 0.35 s with 100k retained completions).
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
@@ -3237,6 +3242,7 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
             .fetch_all(tx.as_mut())
             .await?;
         tx.commit().await?;
+        drop(begin_guard);
         return Ok(rows);
     }
 
@@ -3725,7 +3731,9 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             waiting_external,
         ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
             // As in `queue_overviews`: compiling costs more than running.
-            let mut tx = pool.begin().await?;
+            let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+            let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+            begin_guard.begin_pending = false;
             sqlx::query("SET LOCAL jit = off")
                 .execute(tx.as_mut())
                 .await?;
@@ -3733,6 +3741,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                 .fetch_one(tx.as_mut())
                 .await?;
             tx.commit().await?;
+            drop(begin_guard);
             counts
         };
 
@@ -3838,7 +3847,9 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
         );
 
         // As in `queue_overviews`: compiling costs more than running.
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
@@ -3846,6 +3857,7 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             .fetch_all(tx.as_mut())
             .await?;
         tx.commit().await?;
+        drop(begin_guard);
         return Ok(rows);
     }
 
@@ -4125,7 +4137,9 @@ pub async fn state_timeseries(
              ORDER BY bucket",
             queue_storage_recent_jobs_cte(store.schema(), "$1")
         );
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
@@ -4143,6 +4157,7 @@ pub async fn state_timeseries(
                 .fetch_all(tx.as_mut())
                 .await?;
         tx.commit().await?;
+        drop(begin_guard);
 
         return Ok(rows
             .into_iter()

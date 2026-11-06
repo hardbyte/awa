@@ -6,6 +6,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Close read connections if their transaction start is cancelled or fails before
+  SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
+
 - **Point reads show the live queue and priority after a lane move.** Retained
   ready rows from before a priority or queue change could win a read's tie
   after the ring wrapped, returning the old fields even though the batch
