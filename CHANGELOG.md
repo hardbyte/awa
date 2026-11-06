@@ -6,6 +6,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Avoid repeated terminal-ledger probes when counting open row-local receipts
+  retained from older writers, preserving closure and materialization exclusions.
+- Reduce running-count query work by keeping compact closure membership
+  correlated and limiting row-local closure lookups to their claim partition.
+- Hydrate completed job-kind counts through each member's full ready-row key,
+  avoiding repeated scans of other retained rows in the same enqueue lane.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
