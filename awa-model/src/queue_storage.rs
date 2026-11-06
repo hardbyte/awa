@@ -2511,8 +2511,11 @@ impl QueueStorage {
     /// next tick. The default is 10 ms, which keeps prune from queueing behind
     /// readers and so from stalling claims and enqueues behind its pending
     /// `ACCESS EXCLUSIVE` request. Raise it when prune is persistently
-    /// `Blocked` by short-lived readers of the ring partitions. The timeout is
-    /// applied at millisecond granularity.
+    /// `Blocked` by short-lived readers of the ring partitions. Keep it well
+    /// below `deadlock_timeout` (default 1 s) and any `statement_timeout`: a
+    /// prune that waits as long as `deadlock_timeout` triggers deadlock
+    /// detection, which may cancel a concurrent claim instead of the prune. The
+    /// timeout is applied at millisecond granularity.
     ///
     /// Returns a validation error for a zero timeout or one above PostgreSQL's
     /// `lock_timeout` maximum (`i32::MAX` milliseconds, about 24.8 days).

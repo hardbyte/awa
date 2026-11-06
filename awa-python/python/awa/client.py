@@ -905,7 +905,9 @@ class AsyncClient:
         ``lock_timeout`` the maintenance leader uses when pruning the queue,
         lease and claim rings (default 10 ms). A prune that cannot lock its
         partitions in time is counted as ``blocked`` and retried on the next
-        tick; raise it when ``blocked`` outcomes persist. Must be > 0.
+        tick; raise it when ``blocked`` outcomes persist, keeping it well below the
+        server's ``deadlock_timeout`` and ``statement_timeout`` (a warning is
+        logged at start otherwise). Must be > 0.
 
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
