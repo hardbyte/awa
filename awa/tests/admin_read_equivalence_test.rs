@@ -26,9 +26,6 @@ struct Fixture {
     store: QueueStorage,
     /// Jobs inserted, by kind.
     inserted: BTreeMap<String, i64>,
-    /// Jobs left running on open receipt claims, by kind. `current_jobs`
-    /// on this branch doesn't list them.
-    on_open_claims: BTreeMap<String, i64>,
 }
 
 impl Fixture {
@@ -56,7 +53,6 @@ impl Fixture {
             pool,
             store,
             inserted: BTreeMap::new(),
-            on_open_claims: BTreeMap::new(),
         })
     }
 
@@ -255,9 +251,6 @@ impl Fixture {
                 .await?;
         }
         // The rest stay running on open receipt claims.
-        for claim in iter {
-            *self.on_open_claims.entry(claim.job.kind).or_default() += 1;
-        }
 
         // Running on open receipt claims, with a callback registered on some
         // (which materialises a lease), and one waiting on its callback.
@@ -275,12 +268,6 @@ impl Fixture {
                 .await?;
         }
         let waiting = &running[2];
-        for claim in &running[3..] {
-            *self
-                .on_open_claims
-                .entry(claim.job.kind.clone())
-                .or_default() += 1;
-        }
         let callback = self
             .store
             .register_callback(
@@ -299,9 +286,7 @@ impl Fixture {
         let cancelled = self
             .enqueue("epsilon", "eq_cancel", 2, 9, &[], None)
             .await?;
-        for claim in self.claim("eq_cancel", 2).await? {
-            *self.on_open_claims.entry(claim.job.kind).or_default() += 1;
-        }
+        self.claim("eq_cancel", 2).await?;
         for job in &cancelled[4..7] {
             admin::cancel(&self.pool, job.id).await?;
         }
@@ -457,10 +442,9 @@ async fn job_kind_overviews_match_the_current_jobs_definition() -> TestResult {
                 .iter()
                 .find(|overview| &overview.kind == kind)
                 .unwrap_or_else(|| panic!("no overview for {kind}"));
-            let listed = inserted - fixture.on_open_claims.get(kind).copied().unwrap_or(0);
             assert_eq!(
-                overview.job_count, listed,
-                "job_count for {kind}: every listed job is counted once"
+                overview.job_count, *inserted,
+                "job_count for {kind}: every inserted job is counted once, including open receipts"
             );
         }
         let by_kind: BTreeMap<_, _> = actual
