@@ -988,10 +988,11 @@ impl ClientBuilder {
     /// partition locks use `NOWAIT`, so a reader holding one of them makes it
     /// `blocked` immediately whatever the timeout.
     ///
-    /// A prune that cannot take its locks within the timeout rolls back and is
-    /// recorded as `blocked` in `awa.maintenance.prune.attempts`; it retries on
-    /// the next maintenance tick. The short default keeps the pending
-    /// `ACCESS EXCLUSIVE` request from stalling claims and enqueues behind it.
+    /// Each lock acquisition gets its own timeout; this does not bound the
+    /// whole prune. A lock timeout rolls back the prune and records `blocked`
+    /// in `awa.maintenance.prune.attempts`; the maintenance loop retries on a
+    /// later tick. The short default keeps the pending `ACCESS EXCLUSIVE`
+    /// request from stalling claims and enqueues behind it.
     /// Raise it when `blocked` outcomes persist and the rings stop recycling
     /// because short-lived readers (admin queries, dashboards) repeatedly hold
     /// the ring partitions at the moment prune tries. Keep it well below

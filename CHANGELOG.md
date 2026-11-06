@@ -15,6 +15,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `blocked` every tick and the rings stopped recycling. Set it with
   `ClientBuilder::prune_lock_timeout` (Rust) or
   `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
+  timeout applies separately to each lock acquisition, not to the whole prune;
+  queue prune waits only on `ready_segments` and uses `NOWAIT` elsewhere. The
   default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
   maximum is rejected. Start logs a warning when the value is at or above the
   connection's `deadlock_timeout` (prune waiting that long can make deadlock

@@ -292,8 +292,7 @@ The condition to alert on is a frozen generation *with* accumulating rows
 
 ## Prune Lock Timeout
 
-Ring prune takes exclusive locks under a `lock_timeout` of 10 ms by default;
-when it cannot, it rolls back and counts `blocked` in
+Ring prune gives each lock acquisition its own `lock_timeout` of 10 ms by default; this does not bound the whole prune. A lock timeout rolls it back and counts `blocked` in
 `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. A sustained
 `increase()` of `blocked` (or `error`) means the rings are not recycling. Raise
 `ClientBuilder::prune_lock_timeout` (Python
