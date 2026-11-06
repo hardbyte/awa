@@ -115,6 +115,182 @@ async fn rescued_rows(pool: &PgPool, queue: &str) -> i64 {
     .expect("count rescued rows")
 }
 
+/// Failure-only evidence: never delay a passing test or replace its assertion.
+/// Row caps bound output; statement and outer deadlines also bound the scans.
+async fn live_rescue_diagnostic(
+    pool: &PgPool,
+    staleness: Duration,
+    heartbeat_interval: Duration,
+) -> serde_json::Value {
+    let capture = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '250ms'")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .execute(tx.as_mut())
+            .await?;
+        let result = sqlx::query_scalar::<_, serde_json::Value>(
+            r#"
+            WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at),
+            rescued AS MATERIALIZED (
+                SELECT * FROM (
+                    SELECT 'retryable' AS plane, job_id, run_lease, attempt,
+                           attempted_at, finalized_at, NULL::text AS dlq_reason,
+                           NULL::bigint AS original_run_lease, payload
+                    FROM awa.deferred_jobs WHERE queue = $1 AND state = 'retryable'
+                    UNION ALL
+                    SELECT 'dlq', job_id, run_lease, attempt,
+                           attempted_at, finalized_at, dlq_reason, original_run_lease, payload
+                    FROM awa.dlq_entries WHERE queue = $1
+                ) retained ORDER BY job_id LIMIT 16
+            ),
+            claims AS (
+                SELECT batch.claim_slot, batch.batch_id, batch.ready_slot,
+                       batch.ready_generation, batch.claimed_at, item.job_id,
+                       item.run_lease, item.receipt_id, attempt.heartbeat_at,
+                       extract(epoch FROM stamp.at - COALESCE(attempt.heartbeat_at, batch.claimed_at)) AS age_s
+                FROM awa.lease_claim_batches batch
+                CROSS JOIN LATERAL unnest(batch.job_ids, batch.run_leases, batch.receipt_ids)
+                    AS item(job_id, run_lease, receipt_id)
+                CROSS JOIN stamp
+                LEFT JOIN awa.attempt_state attempt
+                  ON attempt.job_id = item.job_id AND attempt.run_lease = item.run_lease
+                WHERE batch.queue = $1 AND item.job_id IN (SELECT job_id FROM rescued)
+                LIMIT 16
+            ),
+            runtimes AS (
+                SELECT instance_id, last_seen_at, heartbeat_alive, snapshot_interval_ms,
+                       extract(epoch FROM stamp.at - last_seen_at) AS age_s
+                FROM awa.runtime_instances CROSS JOIN stamp LIMIT 8
+            ),
+            activity AS (
+                SELECT pid, state, wait_event_type, wait_event,
+                       extract(epoch FROM stamp.at - query_start) AS query_age_s,
+                       pg_blocking_pids(pid) AS blocking_pids, left(query, 256) AS query
+                FROM pg_stat_activity CROSS JOIN stamp
+                WHERE datname = current_database() AND pid <> pg_backend_pid() AND state <> 'idle'
+                ORDER BY query_start LIMIT 24
+            ),
+            waiting AS (
+                SELECT locks.pid, locks.locktype, locks.mode, relation.relname
+                FROM pg_locks locks LEFT JOIN pg_class relation ON relation.oid = locks.relation
+                WHERE NOT locks.granted
+                  AND (locks.database IS NULL OR locks.database = (SELECT oid FROM pg_database WHERE datname = current_database()))
+                LIMIT 32
+            )
+            SELECT jsonb_build_object(
+                'at', (SELECT at FROM stamp), 'database', current_database(),
+                'rescued', (SELECT COALESCE(jsonb_agg(rescued), '[]') FROM rescued),
+                'claims', (SELECT COALESCE(jsonb_agg(claims), '[]') FROM claims),
+                'runtimes', (SELECT COALESCE(jsonb_agg(runtimes), '[]') FROM runtimes),
+                'claim_slots', (SELECT COALESCE(jsonb_agg(ring_slot), '[]') FROM (SELECT * FROM awa.claim_ring_slots ORDER BY slot LIMIT 8) ring_slot),
+                'activity', (SELECT COALESCE(jsonb_agg(activity), '[]') FROM activity),
+                'waiting_locks', (SELECT COALESCE(jsonb_agg(waiting), '[]') FROM waiting),
+                'wal', (SELECT to_jsonb(wal) FROM pg_stat_wal wal))
+            "#,
+        ).bind(ABANDONED_QUEUE).fetch_one(tx.as_mut()).await;
+        tx.rollback().await?;
+        result
+    };
+    let evidence = match tokio::time::timeout(Duration::from_secs(3), capture).await {
+        Ok(Ok(data)) => serde_json::json!({"status": "captured", "data": data}),
+        Ok(Err(error)) => serde_json::json!({"status": "incomplete", "error": error.to_string()}),
+        Err(_) => serde_json::json!({"status": "incomplete", "error": "3s diagnostic deadline"}),
+    };
+    serde_json::json!({
+        "staleness_ms": staleness.as_millis(),
+        "heartbeat_interval_ms": heartbeat_interval.as_millis(),
+        "CI": std::env::var("CI").ok(),
+        "multiplier_override": std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER").ok(),
+        "evidence": evidence,
+        "caveat": "current bounded snapshot, not historical heartbeat proof; missing attempt_state may follow rescue"
+    })
+}
+
+#[tokio::test]
+async fn live_rescue_diagnostic_captures_bounded_compact_evidence() {
+    let db = TestDatabase::queue_storage().await;
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let params: Vec<_> = (0..20)
+        .map(|n| {
+            awa::model::insert::params_with(
+                &AbandonedJob { n },
+                InsertOpts {
+                    queue: ABANDONED_QUEUE.into(),
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            )
+            .expect("diagnostic job")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(db.pool(), &params)
+        .await
+        .expect("enqueue");
+    let claims = store
+        .claim_runtime_batch(db.pool(), ABANDONED_QUEUE, 20, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claims.len(), 20);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.claim_batch_id.is_some()));
+    let rescued = store
+        .rescue_stale_heartbeats_with_dlq(db.pool(), Duration::ZERO, &|_| true)
+        .await
+        .expect("force diagnostic evidence");
+    assert_eq!(rescued.len(), 20);
+    let report = live_rescue_diagnostic(
+        db.pool(),
+        Duration::from_secs(18),
+        Duration::from_millis(2250),
+    )
+    .await;
+    assert_eq!(report["evidence"]["status"], "captured", "{report}");
+    let data = &report["evidence"]["data"];
+    assert_eq!(data["rescued"].as_array().unwrap().len(), 16);
+    assert_eq!(data["rescued"][0]["dlq_reason"], "heartbeat_stale");
+    assert_eq!(data["claims"].as_array().unwrap().len(), 16);
+    assert!(data["claim_slots"][0]["generation"].is_number());
+    for item in data["claims"].as_array().unwrap() {
+        assert!(claims.iter().any(
+            |claim| item["job_id"] == claim.job.id && item["run_lease"] == claim.job.run_lease
+        ));
+    }
+    assert_eq!(
+        rescued_rows(db.pool(), ABANDONED_QUEUE).await,
+        20,
+        "diagnostic is read-only"
+    );
+}
+
+#[tokio::test]
+async fn live_rescue_diagnostic_query_error_is_incomplete() {
+    let db = TestDatabase::queue_storage().await;
+    let mut gate = db.pool().begin().await.expect("begin diagnostic lock gate");
+    sqlx::query("LOCK TABLE awa.lease_claim_batches IN ACCESS EXCLUSIVE MODE")
+        .execute(gate.as_mut())
+        .await
+        .expect("hold the diagnostic claim relation");
+    let report = live_rescue_diagnostic(
+        db.pool(),
+        Duration::from_secs(18),
+        Duration::from_millis(2250),
+    )
+    .await;
+    gate.rollback().await.expect("release diagnostic lock gate");
+    assert_eq!(report["evidence"]["status"], "incomplete");
+    assert!(report["evidence"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("lock timeout"));
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, what: &str, mut done: F) -> Duration
 where
     F: FnMut() -> Fut,
@@ -403,9 +579,15 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         }
     }
     let claimed_in = claim_started.elapsed();
+    let rescued_while_alive = rescued_rows(&pool, ABANDONED_QUEUE).await;
+    if rescued_while_alive != 0 {
+        eprintln!(
+            "live-rescue diagnostic: {}",
+            live_rescue_diagnostic(&pool, staleness, heartbeat_interval).await
+        );
+    }
     assert_eq!(
-        rescued_rows(&pool, ABANDONED_QUEUE).await,
-        0,
+        rescued_while_alive, 0,
         "rescue took a claim while its runtime was alive and heartbeating"
     );
     let generation_at_kill = claim_ring_generation(&pool).await;
