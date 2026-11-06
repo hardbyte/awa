@@ -15,7 +15,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `blocked` every tick and the rings stopped recycling. Set it with
   `ClientBuilder::prune_lock_timeout` (Rust) or
   `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
-  default stays 10 ms and zero is rejected. `with_prune_lock_timeout` is now
+  default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
+  maximum is rejected. Start logs a warning when the value is at or above the
+  connection's `deadlock_timeout` (prune waiting that long can make deadlock
+  detection cancel a claim instead) or `statement_timeout`. `with_prune_lock_timeout` is now
   public, with `set_prune_lock_timeout` and `prune_lock_timeout()`.
   `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
   gains `backed_off` (prune skipped by the post-`skipped_active` backoff) and

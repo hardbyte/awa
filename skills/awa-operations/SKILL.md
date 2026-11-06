@@ -297,8 +297,9 @@ when it cannot, it rolls back and counts `blocked` in
 `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. A sustained
 `increase()` of `blocked` (or `error`) means the rings are not recycling. Raise
 `ClientBuilder::prune_lock_timeout` (Python
-`queue_storage_prune_lock_timeout_ms`) in steps when short readers of the ring
-partitions are the cause. Queue-ring prune waits under the timeout only on the
+`queue_storage_prune_lock_timeout_ms`) in small steps (`50ms`, `100ms`, `250ms`) when short readers of the ring
+partitions are the cause, and keep it well below `deadlock_timeout` (default 1 s)
+and any `statement_timeout`; start logs a warning otherwise. Queue-ring prune waits under the timeout only on the
 `ready_segments` partition and takes its other partitions with `NOWAIT`. `backed_off` means prune was skipped for a few ticks
 after repeated `skipped_active`.
 
