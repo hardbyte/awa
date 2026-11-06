@@ -6,6 +6,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
