@@ -545,10 +545,11 @@ async fn sample_heartbeats(
     schema: &str,
     since_epoch_ms: i64,
 ) {
-    let row: Result<(i64, Option<f64>, Option<f64>), _> = sqlx::query_as(&format!(
+    let row: Result<(i64, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(&format!(
         "SELECT count(*)::bigint,
                 EXTRACT(EPOCH FROM min(a.heartbeat_at))::float8,
-                EXTRACT(EPOCH FROM max(a.heartbeat_at))::float8
+                EXTRACT(EPOCH FROM max(a.heartbeat_at))::float8,
+                EXTRACT(EPOCH FROM clock_timestamp())::float8
          FROM {schema}.lease_claims c
          JOIN {schema}.attempt_state a ON a.job_id = c.job_id AND a.run_lease = c.run_lease
          WHERE c.queue = $1 AND c.closed_at IS NULL
@@ -558,13 +559,13 @@ async fn sample_heartbeats(
     .bind(since_epoch_ms as f64)
     .fetch_one(pool)
     .await;
-    let Ok((rows, Some(oldest), Some(newest))) = row else {
+    let Ok((rows, Some(oldest), Some(newest), now)) = row else {
         return;
     };
     let active = shared.abandon.child_active.load(Ordering::Relaxed);
     shared
         .abandon
-        .note_heartbeat_sample(shared, rows, oldest, newest, active);
+        .note_heartbeat_sample(shared, rows, oldest, newest, now, active);
 }
 
 /// Probes the backlog every few seconds and the claim ring every second, until the

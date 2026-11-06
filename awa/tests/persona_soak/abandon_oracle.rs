@@ -146,13 +146,15 @@ impl AbandonState {
     /// wrote, so it cannot be newer than that pass's newest. The first reading whose oldest
     /// heartbeat is newer was taken just after a pass finished, and the spread from oldest to
     /// newest is its duration (to within the last chunk). The samples are bucketed by handler
-    /// count so the report shows how pass time grows with what a process holds.
+    /// count so the report shows how pass time grows with what a process holds. `now` is the
+    /// database clock at the reading.
     pub fn note_heartbeat_sample(
         &self,
         shared: &Shared,
         rows: i64,
         oldest: f64,
         newest: f64,
+        now: f64,
         active: i64,
     ) {
         let mut last = self.heartbeat_last.lock().expect("heartbeat last");
@@ -165,6 +167,14 @@ impl AbandonState {
         }
         *last = Some(newest);
         drop(last);
+        // A reading taken long after the pass finished may include the next pass's first
+        // chunks, so only a fresh one measures the pass.
+        if now - newest > 2.0 {
+            shared
+                .stats(Persona::ClaimAbandon)
+                .add("heartbeat_passes_unmeasured", 1);
+            return;
+        }
         let ms = ((newest - oldest) * 1000.0).round() as i64;
         let stats = shared.stats(Persona::ClaimAbandon);
         stats.observe("heartbeat_pass_ms", ms);
