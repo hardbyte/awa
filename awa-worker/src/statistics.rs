@@ -54,6 +54,8 @@ const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
 pub(crate) enum RelationScope {
     Heads,
     RingParent,
+    /// The pass as a whole: a probe or listing failed, or the helper is absent.
+    Pass,
 }
 
 impl RelationScope {
@@ -61,6 +63,7 @@ impl RelationScope {
         match self {
             RelationScope::Heads => "heads",
             RelationScope::RingParent => "ring_parent",
+            RelationScope::Pass => "pass",
         }
     }
 }
@@ -193,7 +196,31 @@ impl StatisticsRefresher {
             Err(err) => {
                 warn!(error = %err, schema = %self.schema, "Could not check the queue-storage schema for statistics refresh");
                 self.record(
-                    RelationScope::RingParent,
+                    RelationScope::Pass,
+                    AnalyzeOutcome::Failed,
+                    started.elapsed(),
+                );
+                summary.record(AnalyzeOutcome::Failed);
+                return summary;
+            }
+        }
+
+        match self.helper_installed().await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.warn_unavailable_once();
+                self.record(
+                    RelationScope::Pass,
+                    AnalyzeOutcome::Unavailable,
+                    started.elapsed(),
+                );
+                summary.record(AnalyzeOutcome::Unavailable);
+                return summary;
+            }
+            Err(err) => {
+                warn!(error = %err, schema = %self.schema, "Could not probe for the statistics helper");
+                self.record(
+                    RelationScope::Pass,
                     AnalyzeOutcome::Failed,
                     started.elapsed(),
                 );
@@ -207,7 +234,7 @@ impl StatisticsRefresher {
             Err(err) => {
                 warn!(error = %err, schema = %self.schema, "Could not list ring tables for statistics refresh");
                 self.record(
-                    RelationScope::RingParent,
+                    RelationScope::Pass,
                     AnalyzeOutcome::Failed,
                     started.elapsed(),
                 );
@@ -248,6 +275,18 @@ impl StatisticsRefresher {
     fn record(&self, scope: RelationScope, outcome: AnalyzeOutcome, elapsed: Duration) {
         self.metrics
             .record_statistics_analyze(scope.as_str(), outcome.as_str(), elapsed);
+    }
+
+    /// One catalog lookup per pass. A missing helper (a binary running ahead
+    /// of the schema) then costs this query instead of a failing call, and a
+    /// server-side ERROR line, per relation; the pass interval is the
+    /// re-probe interval.
+    async fn helper_installed(&self) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT to_regprocedure('awa.analyze_queue_storage_relation(text,text)') IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
     }
 
     async fn ring_parents(&self) -> Result<Vec<String>, sqlx::Error> {
@@ -327,19 +366,14 @@ impl StatisticsRefresher {
                 AnalyzeOutcome::SkippedLock
             }
             Some(SQLSTATE_UNDEFINED_FUNCTION) => {
-                if !self.warned_unavailable.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        schema = %self.schema,
-                        "Planner statistics refresh is disabled: awa.analyze_queue_storage_relation() \
-                         is missing. Run `awa migrate` (schema v053 or later) to install it"
-                    );
-                }
+                self.warn_unavailable_once();
                 AnalyzeOutcome::Unavailable
             }
             Some(SQLSTATE_INSUFFICIENT_PRIVILEGE) => {
                 self.warn_privilege_once(
                     relation,
-                    "the runtime role may not execute awa.analyze_queue_storage_relation(); \
+                    "the runtime role may not execute awa.analyze_queue_storage_relation(), or lacks \
+                     INSERT, UPDATE and DELETE on the queue head tables; \
                      GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) to it",
                 );
                 AnalyzeOutcome::SkippedPrivilege
@@ -349,6 +383,17 @@ impl StatisticsRefresher {
                 AnalyzeOutcome::Failed
             }
         }
+    }
+
+    fn warn_unavailable_once(&self) {
+        if self.warned_unavailable.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        warn!(
+            schema = %self.schema,
+            "Planner statistics refresh is disabled: awa.analyze_queue_storage_relation() \
+             is missing. Run `awa migrate` (schema v053 or later) to install it"
+        );
     }
 
     fn warn_privilege_once(&self, relation: &str, missing: &str) {
@@ -393,5 +438,75 @@ impl RefreshGuard {
 impl Drop for RefreshGuard {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::str::FromStr;
+
+    /// A binary ahead of the schema must probe once and attempt no calls: a
+    /// failing call per relation would count as `unavailable` fifteen times
+    /// and write fifteen server-side ERROR lines per pass.
+    #[tokio::test]
+    async fn missing_helper_costs_one_probe_and_no_calls() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string());
+        let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("connect admin");
+        let database = format!("awa_stats_unit_{}", std::process::id());
+        sqlx::raw_sql(awa_model::audited_sql(format!(
+            "DROP DATABASE IF EXISTS {database} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop leftover database");
+        sqlx::raw_sql(awa_model::audited_sql(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create database");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.database(&database))
+            .await
+            .expect("connect test database");
+        awa_model::migrations::run(&pool).await.expect("migrate");
+
+        let refresher = StatisticsRefresher::new(
+            pool.clone(),
+            "awa".to_string(),
+            AwaMetrics::from_global(),
+            false,
+        );
+        let present = refresher.run_pass().await;
+        assert_eq!(present.ok, 15, "{present:?}");
+
+        sqlx::raw_sql("DROP FUNCTION awa.analyze_queue_storage_relation(text, text)")
+            .execute(&pool)
+            .await
+            .expect("drop the helper");
+        let absent = refresher.run_pass().await;
+        assert_eq!(
+            absent,
+            PassSummary {
+                unavailable: 1,
+                ..PassSummary::default()
+            }
+        );
+        pool.close().await;
+        sqlx::raw_sql(awa_model::audited_sql(format!(
+            "DROP DATABASE IF EXISTS {database} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop database");
     }
 }

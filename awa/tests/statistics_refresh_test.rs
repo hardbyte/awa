@@ -32,6 +32,13 @@ const RING_PARENTS: [&str; 13] = [
 
 static DATABASE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+async fn run_sql(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(audited_sql(sql))
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
 fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
@@ -380,7 +387,7 @@ async fn non_owner_runtime_role_refreshes_statistics() {
             "queue_claim_heads",
             "is not a queue-storage schema",
         ),
-        ("awa", "jobs", "is not a partitioned or head table"),
+        ("awa", "jobs", "is not a ring parent or head table"),
     ] {
         let error =
             sqlx::query_scalar::<_, String>("SELECT awa.analyze_queue_storage_relation($1, $2)")
@@ -414,6 +421,153 @@ async fn non_owner_runtime_role_refreshes_statistics() {
     .await;
 
     client.shutdown(Duration::from_secs(5)).await;
+    runtime_pool.close().await;
+    database.drop().await;
+}
+
+async fn call_helper(
+    pool: &PgPool,
+    schema: &str,
+    relation: &str,
+) -> Result<String, sqlx::error::Error> {
+    sqlx::query_scalar("SELECT awa.analyze_queue_storage_relation($1, $2)")
+        .bind(schema)
+        .bind(relation)
+        .fetch_one(pool)
+        .await
+}
+
+fn denied(error: &sqlx::Error, message: &str) {
+    let database_error = error.as_database_error().expect("database error");
+    assert_eq!(database_error.code().as_deref(), Some("42501"));
+    assert!(
+        database_error.message().contains(message),
+        "unexpected message: {}",
+        database_error.message()
+    );
+}
+
+/// EXECUTE is not public: holding the lock the helper takes until the end of
+/// a transaction would block ring prune of that table. A role needs EXECUTE and
+/// write privileges on the head tables, and the migration grants EXECUTE to
+/// the roles that already have them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execute_is_limited_to_roles_that_may_maintain_queue_storage() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("stats_owner_{suffix}");
+    let runtime = format!("stats_runtime_{suffix}");
+    let bystander = format!("stats_bystander_{suffix}");
+    let reader = format!("stats_reader_{suffix}");
+    let database = TestDatabase::create(Some(&owner), &[&runtime, &bystander, &reader]).await;
+    let owner_pool = &database.owner_pool;
+    run_sql(
+        owner_pool,
+        format!(
+            "GRANT USAGE ON SCHEMA awa TO {bystander}, {reader}, {runtime};
+             GRANT SELECT ON ALL TABLES IN SCHEMA awa TO {reader};
+             GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) TO {reader};
+             GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO {runtime}"
+        ),
+    )
+    .await
+    .expect("grant privileges");
+    let connect = |role: String| {
+        let options = database.options.clone();
+        async move {
+            PgPoolOptions::new()
+                .max_connections(2)
+                .connect_with(options.username(&role).password(ROLE_PASSWORD))
+                .await
+                .expect("connect role pool")
+        }
+    };
+    let bystander_pool = connect(bystander.clone()).await;
+    let reader_pool = connect(reader.clone()).await;
+    let runtime_pool = connect(runtime.clone()).await;
+
+    denied(
+        &call_helper(&bystander_pool, "awa", "queue_claim_heads")
+            .await
+            .expect_err("a role without EXECUTE is denied"),
+        "permission denied for function",
+    );
+    denied(
+        &call_helper(&reader_pool, "awa", "queue_claim_heads")
+            .await
+            .expect_err("EXECUTE without write privileges on the head tables is denied"),
+        "may not maintain queue storage",
+    );
+
+    // The runtime role holds write privileges but was granted no function
+    // EXECUTE: re-running the migration grants it, as an upgrade does.
+    denied(
+        &call_helper(&runtime_pool, "awa", "queue_claim_heads")
+            .await
+            .expect_err("write privileges alone do not grant EXECUTE"),
+        "permission denied for function",
+    );
+    for (_, _, sql) in migrations::migration_sql_range(
+        migrations::CURRENT_VERSION - 1,
+        migrations::CURRENT_VERSION,
+    ) {
+        run_sql(owner_pool, sql)
+            .await
+            .expect("re-run the migration");
+    }
+    assert_eq!(
+        call_helper(&runtime_pool, "awa", "queue_claim_heads")
+            .await
+            .expect("the migration granted EXECUTE to the runtime grantee"),
+        "analyzed"
+    );
+
+    for pool in [bystander_pool, reader_pool, runtime_pool] {
+        pool.close().await;
+    }
+    database.drop().await;
+}
+
+/// The helper analyses the ring parents and head tables only, not any other
+/// partitioned table of the schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helper_rejects_a_partitioned_table_that_is_not_a_ring_parent() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("stats_owner_{suffix}");
+    let runtime = format!("stats_runtime_{suffix}");
+    let database = TestDatabase::create(Some(&owner), &[&runtime]).await;
+    run_sql(
+        &database.owner_pool,
+        "CREATE TABLE awa.application_events (id int) PARTITION BY LIST (id)".to_string(),
+    )
+    .await
+    .expect("create a partitioned application table");
+    let runtime_pool = database.runtime_pool(&runtime).await;
+
+    for relation in ["application_events", "ready_entries_0", "jobs_hot"] {
+        let error = call_helper(&runtime_pool, "awa", relation)
+            .await
+            .expect_err("only ring parents and head tables are accepted");
+        let database_error = error.as_database_error().expect("database error");
+        assert_eq!(
+            database_error.code().as_deref(),
+            Some("22023"),
+            "{relation}"
+        );
+        assert!(
+            database_error
+                .message()
+                .contains("is not a ring parent or head table"),
+            "{relation}: {}",
+            database_error.message()
+        );
+    }
+    assert_eq!(
+        call_helper(&runtime_pool, "awa", "ready_entries")
+            .await
+            .expect("a ring parent is accepted"),
+        "analyzed"
+    );
+
     runtime_pool.close().await;
     database.drop().await;
 }
@@ -515,7 +669,8 @@ async fn unrunnable_refresh_is_recorded_and_does_not_fail_the_runtime() {
         .expect("let the schema owner hand over the function");
     sqlx::raw_sql(audited_sql(format!(
         "GRANT USAGE, CREATE ON SCHEMA awa TO {helper};
-         ALTER FUNCTION awa.analyze_queue_storage_relation(text, text) OWNER TO {helper}"
+         ALTER FUNCTION awa.analyze_queue_storage_relation(text, text) OWNER TO {helper};
+         GRANT EXECUTE ON FUNCTION awa.analyze_queue_storage_relation(text, text) TO {owner}"
     )))
     .execute(&database.owner_pool)
     .await

@@ -23,21 +23,26 @@ Notable changes between releases. Detailed migration notes for storage transitio
   lands while ANALYZE samples the oldest slot's tables returns `blocked` and
   retries on its normal backoff. Results are in
   `awa.maintenance.analyze.attempts` and `awa.maintenance.analyze.duration`
-  (scope `heads` or `ring_parent`; outcome `ok`, `skipped_privilege`,
+  (scope `heads`, `ring_parent` or `pass`; outcome `ok`, `skipped_privilege`,
   `skipped_lock`, `unavailable` or `failed`).
 - **Migration v053 adds `awa.analyze_queue_storage_relation(schema, relation)`,
   so a runtime role that does not own the tables can refresh statistics.**
   `ANALYZE` skips a table its caller may not analyse, and the documented
   runtime grants do not include `MAINTAIN`, so the refresh runs through this
   `SECURITY DEFINER` function owned by the migration role. It analyses only a
-  head table or partitioned table of a schema that
-  `awa.queue_storage_schemas()` reports as trusted, and `EXECUTE` is granted
-  to `PUBLIC` like the other runtime helpers. Run `awa migrate` as the schema
-  owner (see [database roles](docs/security/database-roles.md)); no grant
-  changes are needed. A binary running ahead of the migration, or against a
-  function whose owner may not analyse the tables, logs one warning naming what
-  is missing and skips the refresh without affecting job processing. Earlier
-  binaries never call the function.
+  head table or ring parent of a schema that `awa.queue_storage_schemas()`
+  reports as trusted. It is not executable by `PUBLIC`, because the lock it
+  takes lasts until the caller's transaction ends and would block ring prune:
+  the migration grants `EXECUTE` to the roles that already hold INSERT, UPDATE
+  and DELETE on the head tables (the runtime grantees), and the function
+  requires the calling session user to hold them. A role created later needs
+  the documented `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa`. Run
+  `awa migrate` as the schema owner (see
+  [database roles](docs/security/database-roles.md)). A binary running ahead of
+  the migration probes for the function once per pass and, like one whose
+  function's owner may not analyse the tables, logs one warning naming what is
+  missing and skips the refresh without making failing calls or affecting job
+  processing. Earlier binaries never call the function.
 
 ### Fixed
 

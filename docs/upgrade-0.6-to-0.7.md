@@ -260,8 +260,10 @@ v053 adds `awa.analyze_queue_storage_relation(schema, relation)`, a
 maintenance leader refresh planner statistics for the head tables and ring
 parents when the runtime role does not own them (see
 [Planner statistics](configuration.md#planner-statistics)). It creates one
-function and grants `EXECUTE` to `PUBLIC`; it takes no lock on any table and
-completes in milliseconds. Run the migration as the schema owner so the
+function, revokes `EXECUTE` from `PUBLIC` and grants it to the roles that
+already hold INSERT, UPDATE and DELETE on the `awa` head tables (the runtime
+grantees); it takes no table lock and completes in milliseconds. Roles created
+later need `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa`. Run the migration as the schema owner so the
 function's owner owns the tables.
 
 Binaries before v053 never call it. A 0.7 binary running before the migration

@@ -279,7 +279,7 @@ pub struct AwaMetrics {
     /// rather than one per tick. Fleets alert on this rather than
     /// scraping the matching `tracing::warn!` line. Issue #242.
     pub maintenance_branch_overrun_total: Counter<u64>,
-    /// Planner-statistics `ANALYZE` calls by scope (`heads`, `ring_parent`)
+    /// Planner-statistics `ANALYZE` calls by scope (`heads`, `ring_parent`, `pass`)
     /// and outcome (`ok`, `skipped_privilege`, `skipped_lock`,
     /// `unavailable`, `failed`). One increment per relation per refresh pass.
     pub maintenance_analyze_attempts: Counter<u64>,
@@ -1304,8 +1304,8 @@ impl AwaMetrics {
         self.maintenance_branch_overrun_total.add(1, &attrs);
     }
 
-    /// Record one planner-statistics `ANALYZE` call. `scope` is `"heads"` or
-    /// `"ring_parent"`; `outcome` is `"ok"`, `"skipped_privilege"`,
+    /// Record one planner-statistics `ANALYZE` call. `scope` is `"heads"`,
+    /// `"ring_parent"` or `"pass"` (a pass-level probe or failure); `outcome` is `"ok"`, `"skipped_privilege"`,
     /// `"skipped_lock"`, `"unavailable"` or `"failed"`.
     pub fn record_statistics_analyze(
         &self,
