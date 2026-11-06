@@ -852,6 +852,8 @@ mod tests {
             storage.clone(),
             crate::executor::DlqPolicy::default(),
             tokio_util::task::TaskTracker::new(),
+            CancellationToken::new(),
+            1,
         ));
         let config = QueueConfig {
             max_workers: 1,
