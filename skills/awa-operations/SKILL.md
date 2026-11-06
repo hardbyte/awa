@@ -96,7 +96,8 @@ From v053 any runtime role creates lanes through the schema owner's
 CREATE nor sequence default privileges, and `awa storage prepare-queue` is
 optional. Run migrations with the schema owner as the effective role. Check
 lane ownership with `awa storage lane-sequences` (exits 2 while lanes need
-repair) and fix it with `--repair` or the statements it prints; see
+repair) and fix it with `--repair`, connected as the migration role itself
+rather than as the schema owner, or with the statements it prints; see
 [Database roles](../../docs/security/database-roles.md#check-and-repair-lane-ownership).
 
 ## Rolling Upgrades

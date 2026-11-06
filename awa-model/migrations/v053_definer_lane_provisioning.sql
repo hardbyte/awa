@@ -6,26 +6,24 @@
 -- two SECURITY DEFINER functions, provision_lane and provision_lane_sequences,
 -- owned by the schema owner, and the lane helpers create a missing sequence
 -- through them. Each new sequence gets the grants of the head table it backs.
--- This migration then repairs existing lane sequences: it gives each one to
--- the schema owner and adds its missing grants, one sequence at a time and
--- only where the migrating role may. Sequences it cannot reassign are reported
--- in a warning and by awa.lane_sequence_problems(); the migration still commits.
+-- This migration does not reassign existing lane sequences: ALTER SEQUENCE
+-- OWNER takes the sequence's ACCESS EXCLUSIVE lock until commit, and the
+-- migration runs in one transaction. After it commits, `awa migrate` repairs
+-- each lane sequence in its own short transaction with a bounded lock wait
+-- (awa.repair_lane_sequence). Another runner can do the same with
+-- `awa storage lane-sequences --repair`.
 --
 -- N-1 binaries call the same helpers with the same arguments and cursor
 -- semantics, so lanes they create are owned by the schema owner too. A binary
 -- that predates provision_lane keeps using the helpers; this binary probes for
 -- provision_lane and uses the helpers when it is missing.
 --
--- Live load: function replacement, plus ALTER SEQUENCE OWNER on the lane
--- sequences that need it. That takes each such sequence's ACCESS EXCLUSIVE
--- lock until commit, so enqueues and claims on those lanes wait for the
--- migration to commit; correctly owned lanes are not touched. Reads the
--- catalog only; no table DDL or row scans.
+-- Live load: function replacement only. Reads the catalog; no table DDL, row
+-- scans or sequence locks.
 
 DO $$
 DECLARE
     v_schema TEXT;
-    v_leftovers TEXT;
     v_count BIGINT;
 BEGIN
     FOR v_schema IN
@@ -41,17 +39,13 @@ BEGIN
 
         PERFORM awa.refresh_lane_sequence_helpers(v_schema);
 
-        SELECT count(*),
-               string_agg(format('%s (owner %s, %s)', repair.sequence_name, repair.owner, repair.outcome),
-                          ', ' ORDER BY repair.sequence_name)
-        INTO v_count, v_leftovers
-        FROM awa.repair_lane_sequences(v_schema) AS repair
-        WHERE repair.outcome <> 'repaired';
+        SELECT count(*) INTO v_count
+        FROM awa.lane_sequence_problems(v_schema) AS problem;
 
         IF v_count > 0 THEN
-            RAISE WARNING '% lane sequence(s) in schema % still need repair: %', v_count, v_schema, v_leftovers
+            RAISE NOTICE '% lane sequence(s) in schema % are not owned by the schema owner or lack runtime grants', v_count, v_schema
                 USING HINT = format(
-                    'Run awa storage lane-sequences --schema %s for the statements to run and the role to run them as.',
+                    'awa migrate repairs them after this commits. Otherwise run awa storage lane-sequences --schema %s --repair as the migration role itself, without SET ROLE.',
                     v_schema
                 );
         END IF;

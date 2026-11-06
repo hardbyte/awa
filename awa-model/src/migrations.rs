@@ -423,9 +423,9 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
     // only sound because every migration is transaction-safe (no
     // `CREATE INDEX CONCURRENTLY`, `VACUUM`, or explicit transaction control).
     let mut retry = 0;
-    loop {
+    let version_before = loop {
         match run_migration_transaction(pool, &options, lock_key).await {
-            Ok(()) => break,
+            Ok(version_before) => break version_before,
             Err(error) if is_migration_deadlock(&error) && retry < MIGRATION_DEADLOCK_RETRIES => {
                 retry += 1;
                 let delay = std::time::Duration::from_millis(50 * (1 << (retry - 1)));
@@ -439,6 +439,10 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
             }
             Err(error) => return Err(error),
         }
+    };
+
+    if version_before < LANE_PROVISIONING_VERSION {
+        repair_lane_sequences_after_migration(pool).await;
     }
 
     // Best-effort admin-metadata cache warmup, deliberately outside the
@@ -449,29 +453,73 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
     Ok(())
 }
 
+/// Returns the schema version the transaction started from.
 async fn run_migration_transaction(
     pool: &PgPool,
     options: &MigrateOptions,
     lock_key: i64,
-) -> Result<(), AwaError> {
+) -> Result<i32, AwaError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
         .execute(&mut *tx)
         .await?;
-    apply_migrations(&mut tx, options).await?;
+    let version_before = apply_migrations(&mut tx, options).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(version_before)
+}
+
+/// The migration that makes lane sequences belong to the schema owner.
+const LANE_PROVISIONING_VERSION: i32 = 53;
+
+/// Repair existing lane sequences once v053 has committed.
+///
+/// `ALTER SEQUENCE ... OWNER` takes the sequence's ACCESS EXCLUSIVE lock until
+/// its transaction ends, so it cannot run inside the migration transaction
+/// without stalling every enqueue and claim on those lanes until the whole
+/// upgrade commits. Each sequence is repaired in its own short transaction
+/// with a bounded lock wait instead. Best-effort: the schema is committed, and
+/// whatever is left is reported with the command that finishes it.
+///
+/// Uses a detached connection for the reason given on
+/// [`warm_admin_metadata_cache`].
+async fn repair_lane_sequences_after_migration(pool: &PgPool) {
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn.detach(),
+        Err(error) => {
+            warn!(%error, "Could not connect to repair lane sequences; run `awa storage lane-sequences --repair`");
+            return;
+        }
+    };
+    match crate::storage::repair_lane_sequences_in_every_schema(&mut conn).await {
+        Ok(repairs) => {
+            let repaired = repairs
+                .iter()
+                .filter(|repair| repair.outcome == crate::storage::LaneSequenceOutcome::Repaired)
+                .count();
+            if repaired > 0 {
+                info!(repaired, "Gave lane sequences to the schema owner");
+            }
+            for next_step in crate::storage::lane_sequence_repair_next_steps(&repairs) {
+                warn!("{next_step}");
+            }
+        }
+        Err(error) => {
+            warn!(%error, "Could not repair lane sequences; run `awa storage lane-sequences --repair`");
+        }
+    }
+    let _ = conn.close().await;
 }
 
 fn is_migration_deadlock(error: &AwaError) -> bool {
     error.is_deadlock()
 }
 
+/// Returns the schema version before this run.
 async fn apply_migrations(
     conn: &mut PgConnection,
     options: &MigrateOptions,
-) -> Result<(), AwaError> {
+) -> Result<i32, AwaError> {
     let has_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
             .fetch_one(&mut *conn)
@@ -564,7 +612,7 @@ async fn apply_migrations(
         info!(version = current, "Schema is up to date");
     }
 
-    Ok(())
+    Ok(current)
 }
 
 /// Warm the admin-metadata cache after migrations commit.

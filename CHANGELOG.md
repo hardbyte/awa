@@ -18,14 +18,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
   the privileges of the head table it backs, explicitly rather than through
   default privileges. A runtime without schema `CREATE` can therefore create
   lanes itself, and `awa storage prepare-queue` is optional and may run as any
-  runtime role. v053 gives existing lane sequences to the schema owner and adds
-  their missing grants, one sequence at a time and only where the migrating
-  role is allowed to. It never fails on a sequence it cannot reassign. The new
+  runtime role. After v053 commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence per
+  transaction with a 300 ms lock wait, and only where it is allowed to, trying
+  the effective role and then the login role. A sequence an open transaction
+  holds is skipped and reported as busy; one it may not change is reported
+  with the roles that can repair it. Neither fails the migration. The new
   read-only `awa storage lane-sequences` (or
   `awa.lane_sequence_problems(schema)`) lists what remains, with the statements
   to run and the roles to run them as, and exits 2 while any remain;
-  `--repair` (or `awa.repair_lane_sequences(schema)`) repairs what the
-  connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per sequence)
+  repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
   running ahead of v053 detects that `provision_lane` is missing and creates
   lanes as before, and older binaries create correctly owned lanes once v053
   has refreshed the helpers they call. See "Lane ownership and v053" in the

@@ -273,6 +273,23 @@ fn sanitize_filename(description: &str) -> String {
 /// mutating commands require an explicit `--context` or `--database-url`
 /// once more than one context is defined, and are confirmation-gated on
 /// contexts marked `production = true`.
+/// After a migration, say which lane sequences still need repair and how to
+/// finish it. Read-only.
+async fn print_lane_sequence_leftovers(
+    pool: &sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut problems = Vec::new();
+    for (schema, _) in awa_model::storage::lane_sequence_problem_counts(pool).await? {
+        problems.extend(awa_model::storage::lane_sequence_problems(pool, &schema).await?);
+    }
+    for next_step in awa_model::storage::lane_sequence_next_steps(
+        problems.iter().map(|problem| (problem, false)),
+    ) {
+        eprintln!("warning: {next_step}");
+    }
+    Ok(())
+}
+
 fn access_for(command: &Commands) -> context::Access {
     use context::Access::{Mutating, ReadOnly};
     match command {
@@ -834,7 +851,8 @@ enum StorageCommands {
         /// Queue-storage schema to check
         #[arg(long, default_value = "awa")]
         schema: String,
-        /// Reassign and grant what the connected role is allowed to first
+        /// Reassign and grant first, as far as the connected role (or, failing
+        /// that, its login role) is allowed to
         #[arg(long)]
         repair: bool,
     },
@@ -1194,16 +1212,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 awa_model::migrations::run_with_options(&pool, options).await?;
                 println!("Migrations applied successfully.");
-                for (schema, count) in
-                    awa_model::storage::lane_sequence_problem_counts(&pool).await?
-                {
-                    eprintln!(
-                        "warning: {count} lane sequence(s) in schema {schema} are not owned by \
-                         the schema owner or lack runtime grants, and the migrating role could \
-                         not repair them. Run `awa storage lane-sequences --schema {schema}` for \
-                         the statements to run and the roles to run them as."
-                    );
-                }
+                print_lane_sequence_leftovers(&pool).await?;
             }
         }
 
@@ -1956,19 +1965,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     StorageCommands::LaneSequences { schema, repair } => {
-                        let remaining = if repair {
-                            let results =
-                                awa_model::storage::repair_lane_sequences(&pool, &schema).await?;
+                        let next_steps = if repair {
+                            let mut conn = pool.acquire().await?;
+                            let repairs =
+                                awa_model::storage::repair_lane_sequences(&mut conn, &schema)
+                                    .await?;
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&serde_json::json!({
-                                    "schema": schema, "results": results,
+                                    "schema": schema, "results": repairs,
                                 }))?
                             );
-                            results
-                                .iter()
-                                .filter(|result| result.outcome != "repaired")
-                                .count()
+                            awa_model::storage::lane_sequence_repair_next_steps(&repairs)
                         } else {
                             let problems =
                                 awa_model::storage::lane_sequence_problems(&pool, &schema).await?;
@@ -1978,15 +1986,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     "schema": schema, "problems": problems,
                                 }))?
                             );
-                            problems.len()
+                            awa_model::storage::lane_sequence_next_steps(
+                                problems.iter().map(|problem| (problem, false)),
+                            )
                         };
-                        if remaining > 0 {
-                            eprintln!(
-                                "{remaining} lane sequence(s) in schema {schema} need repair. Run \
-                                 each missing_grants statement as the sequence owner (or a role \
-                                 that can SET ROLE to it), and each reassign_sql statement as a \
-                                 role that can SET ROLE to both the owner and expected_owner."
-                            );
+                        if !next_steps.is_empty() {
+                            for next_step in next_steps {
+                                eprintln!("{next_step}");
+                            }
                             std::process::exit(2);
                         }
                     }
