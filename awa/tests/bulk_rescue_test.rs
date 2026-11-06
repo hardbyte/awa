@@ -70,6 +70,119 @@ async fn count(pool: &PgPool, sql: String) -> i64 {
         .unwrap_or_else(|err| panic!("{sql}: {err}"))
 }
 
+/// Retry promotion transfers a row between these states in one transaction.
+/// Read both counts from one statement so a commit between reads cannot count
+/// the same job once in deferred storage and again in ready storage.
+async fn waiting_retry_counts(pool: &PgPool, queue: &str) -> (i64, i64) {
+    let overview = awa::model::admin::queue_overview(pool, queue)
+        .await
+        .expect("retry accounting overview")
+        .expect("retry accounting queue");
+    (overview.retryable, overview.available)
+}
+
+#[tokio::test]
+async fn retry_accounting_uses_one_snapshot_during_promotion() {
+    let db = BulkRescueDatabase::create().await;
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let queue = "bulk_rescue_retry_snapshot";
+    let params = awa::model::insert::params_with(
+        &AbandonedJob { n: 0 },
+        InsertOpts {
+            queue: queue.into(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .expect("retry accounting job");
+    store
+        .enqueue_params_batch(db.pool(), &[params])
+        .await
+        .expect("enqueue retry accounting job");
+    let claims = store
+        .claim_runtime_batch(db.pool(), queue, 1, Duration::ZERO)
+        .await
+        .expect("claim retry accounting job");
+    assert_eq!(claims.len(), 1);
+    store
+        .retry_after(
+            db.pool(),
+            claims[0].job.id,
+            claims[0].job.run_lease,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .expect("retry accounting job")
+        .expect("claimed job becomes retryable");
+    assert_eq!(waiting_retry_counts(db.pool(), queue).await, (1, 0));
+
+    // Hold the observer's only connection after its first statement. A real
+    // promotion commits before any second observer statement can start. The
+    // old split read therefore counts this one job twice; the overview's two
+    // counts always describe the same statement snapshot.
+    let armed = Arc::new(AtomicBool::new(false));
+    let read_finished = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let observer = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(scaled_timeout(Duration::from_secs(10)))
+        .after_release({
+            let armed = armed.clone();
+            let read_finished = read_finished.clone();
+            let release = release.clone();
+            move |_, _| {
+                let gate = armed.swap(false, Ordering::SeqCst);
+                let read_finished = read_finished.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if gate {
+                        read_finished.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(true)
+                })
+            }
+        })
+        .connect(&db.url())
+        .await
+        .expect("retry accounting observer pool");
+    let primed = observer.acquire().await.expect("prime observer connection");
+    drop(primed);
+    tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), async {
+        while observer.num_idle() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observer's initial connection is idle before arming");
+    armed.store(true, Ordering::SeqCst);
+    let promote = async {
+        let observed = tokio::time::timeout(
+            scaled_timeout(Duration::from_secs(10)),
+            read_finished.notified(),
+        )
+        .await;
+        if observed.is_err() {
+            release.notify_one();
+            panic!("retry accounting observer did not finish its first statement");
+        }
+        let promoted = store
+            .promote_due(db.pool(), awa::JobState::Retryable, 1)
+            .await;
+        release.notify_one();
+        assert_eq!(promoted.expect("promote between accounting reads"), 1);
+    };
+    let (counts, ()) = tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), async {
+        tokio::join!(waiting_retry_counts(&observer, queue), promote)
+    })
+    .await
+    .expect("bounded retry accounting interleaving");
+    observer.close().await;
+    assert_eq!(counts.0 + counts.1, 1, "one job is waiting to retry");
+    assert_eq!(waiting_retry_counts(db.pool(), queue).await, (0, 1));
+}
+
 async fn running(pool: &PgPool, store: &QueueStorage, queue: &str) -> i64 {
     store
         .queue_counts(pool, queue)
@@ -175,7 +288,12 @@ struct BulkRescueDatabase {
 
 impl BulkRescueDatabase {
     async fn create() -> Self {
-        let name = format!("awa_bulk_rescue_{}", std::process::id());
+        static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "awa_bulk_rescue_{}_{}",
+            std::process::id(),
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        );
         let mut admin = PgConnection::connect(&with_database(&database_url(), "postgres"))
             .await
             .expect("admin connection");
@@ -546,19 +664,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         exhausted,
         "every one-attempt job is dead-lettered by its rescue"
     );
-    let retryable = count(
-        &pool,
-        format!(
-            "SELECT count(*) FROM awa.deferred_jobs
-             WHERE queue = '{ABANDONED_QUEUE}' AND state = 'retryable'"
-        ),
-    )
-    .await;
-    let promoted = store
-        .queue_counts(&pool, ABANDONED_QUEUE)
-        .await
-        .expect("abandoned queue counts")
-        .available;
+    let (retryable, promoted) = waiting_retry_counts(&pool, ABANDONED_QUEUE).await;
     assert_eq!(
         retryable + promoted,
         ABANDONED - exhausted,
