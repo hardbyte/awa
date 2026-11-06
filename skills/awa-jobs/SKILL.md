@@ -124,10 +124,7 @@ low-priority work cannot starve indefinitely.
 
 **Unique jobs** deduplicate on a BLAKE3 key over kind + optionally queue + args +
 a time-period bucket. Defaults: dedup by args, not by queue. Conflict handling
-depends on the API: a single-row `insert` / `insert_with` and the row-by-row
-`insert_many` **raise `AwaError::UniqueConflict`** (Python raises the
-corresponding error) on a duplicate — you must handle it, do not assume a silent
-no-op. Only the COPY bulk path (`insert_many_copy`) silently skips duplicates.
+depends on the API: a single-row `insert` / `insert_with` raises `AwaError::UniqueConflict` (Python raises the corresponding error), and `insert_many` fails the whole batch with SQLSTATE `23505`. `insert_many_copy` skips duplicates on every supported schema; Rust's `insert_many_skip_unique_conflicts` also skips them but requires migration v055. Both return only inserted rows, in input order. Generic `insert_many` always uses one per-row SQL statement; COPY probes its own connection and uses the batch function when installed.
 Cancel without storing the id via `cancel_by_unique_key(kind, queue=, args=,
 period_bucket=)` — the components must match those used at insert. It cancels
 the oldest live job holding the key. On queue storage, a `by_queue` key is

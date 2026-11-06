@@ -147,6 +147,10 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
         assert_eq!(before, after);
     }
     assert_no_head_table_ddl_locks(&owner_pool).await?;
+    for schema in SCHEMAS {
+        assert_enqueue_function_privileges_fall_back(&owner_pool, &runtime_pool, schema, runtime)
+            .await?;
+    }
     runtime_pool.close().await;
     owner_pool.close().await;
     Ok(())
@@ -250,21 +254,26 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
         INSERT INTO {schema}.queue_claim_heads(queue, priority, enqueue_shard) VALUES ('prepared_queue', 2, 0) ON CONFLICT DO NOTHING;
         SELECT {schema}.reserve_enqueue_seq('prepared_queue', 2::smallint, 0::smallint, 3);
     "#)))).await?;
-    let error = pool
-        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
-            "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint)"
-        ))))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.as_database_error().unwrap().code().as_deref(),
-        Some("42501")
-    );
-    assert!(error
-        .as_database_error()
-        .unwrap()
-        .message()
-        .contains("has not been provisioned"));
+    // An unprepared lane is created through the schema owner's provisioning
+    // function, so the runtime still issues no DDL of its own.
+    pool.execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+        "SELECT {schema}.ensure_lane_sequences('unprepared_queue', 2::smallint, 0::smallint); \
+         SELECT {schema}.provision_lane('unprepared_queue', 2::smallint, 0::smallint);"
+    ))))
+    .await?;
+    let foreign_owned: i64 = sqlx::query_scalar(awa_model::audited_sql(format!(
+        "SELECT count(*) FROM pg_class \
+         WHERE relnamespace = '{schema}'::regnamespace AND relkind = 'S' \
+           AND relowner <> (SELECT nspowner FROM pg_namespace WHERE nspname = '{schema}')"
+    )))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(foreign_owned, 0);
+    sqlx::query_scalar::<_, i64>(awa_model::audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq('unprepared_queue', 2::smallint, 0::smallint, 1)"
+    )))
+    .fetch_one(pool)
+    .await?;
     let error = pool
         .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
             "CREATE TABLE {schema}.must_not_create(id integer)"
@@ -275,6 +284,84 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
         error.as_database_error().unwrap().code().as_deref(),
         Some("42501")
     );
+    Ok(())
+}
+
+/// The one-call enqueue needs EXECUTE on enqueue_ready_rows and on
+/// ring_cursor. Without either the store keeps the multi-statement path; a
+/// grant revoked after the store has used the function falls back within
+/// the same call, after rolling back the store-owned transaction.
+async fn assert_enqueue_function_privileges_fall_back(
+    owner_pool: &PgPool,
+    runtime_pool: &PgPool,
+    schema: &str,
+    runtime: &str,
+) -> TestResult {
+    let enqueue = |pool: PgPool| async move {
+        QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            ..Default::default()
+        })
+        .expect("store")
+        .enqueue_batch(&pool, "prepared_queue", 2, 1)
+        .await
+    };
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "REVOKE EXECUTE ON FUNCTION {schema}.ring_cursor(text) FROM {runtime}"
+        ))))
+        .await?;
+    assert_eq!(
+        enqueue(runtime_pool.clone()).await?,
+        1,
+        "without ring_cursor EXECUTE the store keeps the multi-statement path"
+    );
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "GRANT EXECUTE ON FUNCTION {schema}.ring_cursor(text) TO {runtime}"
+        ))))
+        .await?;
+
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.into(),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        store
+            .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
+            .await?,
+        1
+    );
+    let signature: String = sqlx::query_scalar(awa_model::audited_sql(format!(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+         WHERE pronamespace = '{schema}'::regnamespace AND proname = 'enqueue_ready_rows'"
+    )))
+    .fetch_one(owner_pool)
+    .await?;
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {runtime}"
+        ))))
+        .await?;
+    assert_eq!(
+        store
+            .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
+            .await?,
+        1,
+        "the same call falls back after EXECUTE is revoked"
+    );
+    assert_eq!(
+        store
+            .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
+            .await?,
+        1,
+        "the next call probes again and uses the multi-statement path"
+    );
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "GRANT EXECUTE ON FUNCTION {signature} TO {runtime}"
+        ))))
+        .await?;
     Ok(())
 }
 
@@ -331,10 +418,14 @@ async fn exercise_lazy_lane(options: PgConnectOptions, owner: &str, runtime: &st
             "GRANT USAGE, CREATE ON SCHEMA awa TO {runtime}; \
              GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO {runtime}; \
              GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {runtime}; \
-             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime};"
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {runtime}; \
+             REVOKE EXECUTE ON FUNCTION awa.provision_lane_sequences(text, smallint, smallint) \
+               FROM PUBLIC, {runtime};"
         ),
     )
     .await?;
+    // Without the provisioning function the runtime creates the lane's
+    // sequences itself and owns them, as a 0.6 runtime with CREATE did.
     let runtime_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(options.username(runtime))

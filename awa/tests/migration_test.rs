@@ -4213,9 +4213,15 @@ async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
         .execute(&pool)
         .await
         .expect("drop the newest version row to simulate a one-behind schema");
+    let previous_version = migrations::migration_sql()
+        .iter()
+        .map(|(version, _, _)| *version)
+        .filter(|version| *version < migrations::CURRENT_VERSION)
+        .max()
+        .expect("a migration precedes CURRENT_VERSION");
     assert_eq!(
         migrations::current_version(&pool).await.unwrap(),
-        migrations::CURRENT_VERSION - 1
+        previous_version
     );
     migrations::run(&pool)
         .await
@@ -4542,4 +4548,66 @@ async fn v048_generated_bundle_refreshes_a_stale_installer() {
         .await
         .unwrap();
     assert_eq!(version, 48);
+}
+
+#[tokio::test]
+async fn test_v056_upgrades_from_output_and_batch_schemas_and_is_rerunnable() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    for from in [52, 55] {
+        reset_schema(&pool).await;
+        for (_, _, sql) in migrations::migration_sql_range(0, from) {
+            sqlx::raw_sql(audited_sql(sql))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // A previous binary's installed schema lacks this optional function.
+        let signature: String = sqlx::query_scalar(
+            "SELECT oid::regprocedure::text FROM pg_proc \
+             WHERE pronamespace = 'awa'::regnamespace AND proname = 'enqueue_ready_rows'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(audited_sql(format!("DROP FUNCTION {signature}")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = QueueStorage::new(Default::default()).unwrap();
+        before
+            .enqueue_batch(&pool, "v056_upgrade", 2, 2)
+            .await
+            .unwrap();
+        migrations::run(&pool).await.unwrap();
+        assert_eq!(migrations::current_version(&pool).await.unwrap(), 56);
+        let after = QueueStorage::new(Default::default()).unwrap();
+        after
+            .enqueue_batch(&pool, "v056_upgrade", 2, 2)
+            .await
+            .unwrap();
+        let versions: Vec<i32> = sqlx::query_scalar(
+            "SELECT version FROM awa.schema_version WHERE version BETWEEN 51 AND 56 ORDER BY version",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(versions, vec![51, 52, 53, 54, 55, 56]);
+        for _ in 0..2 {
+            let mut tx = pool.begin().await.unwrap();
+            for (_, _, sql) in migrations::migration_sql_range(55, 56) {
+                sqlx::raw_sql(audited_sql(sql))
+                    .execute(tx.as_mut())
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(
+            after
+                .queue_counts(&pool, "v056_upgrade")
+                .await
+                .unwrap()
+                .available,
+            4
+        );
+    }
+    pool.close().await;
 }
