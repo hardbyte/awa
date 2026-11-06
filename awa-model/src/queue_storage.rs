@@ -11759,6 +11759,13 @@ impl QueueStorage {
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let mut candidates = Vec::new();
+        // A job moves between these relations as it is promoted, claimed,
+        // completed or dead-lettered. Read them all from one snapshot so a
+        // move between two reads cannot hide the job or surface a stale row.
+        let mut tx = pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .await
+            .map_err(map_sqlx_error)?;
 
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(&format!(
             r#"
@@ -11783,7 +11790,7 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in ready_rows {
@@ -11814,7 +11821,7 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in deferred_rows {
@@ -11858,7 +11865,10 @@ impl QueueStorage {
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
-             AND ready.priority = lease.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = lease.job_id
+             AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
             LEFT JOIN {schema}.attempt_state AS attempt
@@ -11869,7 +11879,7 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_rows {
@@ -11915,7 +11925,10 @@ impl QueueStorage {
               ON ready.ready_slot = claims.ready_slot
              AND ready.ready_generation = claims.ready_generation
              AND ready.queue = claims.queue
-             AND ready.priority = claims.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = claims.job_id
+             AND ready.run_lease + 1 = claims.run_lease
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
             LEFT JOIN {schema}.attempt_state AS attempt
@@ -11935,7 +11948,7 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_rows {
@@ -12036,7 +12049,7 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_batch_rows {
@@ -12072,7 +12085,7 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in done_rows {
@@ -12107,13 +12120,14 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in dlq_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(candidates.into_iter().max_by_key(|job| {
             (
                 job.run_lease,
@@ -12439,7 +12453,10 @@ impl QueueStorage {
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
-             AND ready.priority = lease.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = lease.job_id
+             AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
             LEFT JOIN {schema}.attempt_state AS attempt
@@ -12635,7 +12652,10 @@ impl QueueStorage {
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
-             AND ready.priority = lease.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = lease.job_id
+             AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
             LEFT JOIN {schema}.attempt_state AS attempt

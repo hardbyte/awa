@@ -3,6 +3,8 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+mod ci_timing;
+
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
     BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
@@ -2007,6 +2009,231 @@ impl Worker for MultiClientTrackingWorker {
         tokio::time::sleep(Duration::from_millis(10)).await;
         Ok(JobResult::Completed)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct GracefulRestartJob {
+    id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct GracefulRestartFollowUp {
+    id: i64,
+}
+
+/// The first execution reports its attempt and returns `Completed` once
+/// shutdown signals cancellation; later executions complete at once.
+#[derive(Clone, Default)]
+struct GracefulRestartWorker {
+    executions: Arc<AtomicU32>,
+    first_attempt: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+    entered: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Worker for GracefulRestartWorker {
+    fn kind(&self) -> &'static str {
+        "graceful_restart_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if self.executions.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(JobResult::Completed);
+        }
+        *self.first_attempt.lock().expect("first attempt") = Some((ctx.job.id, ctx.job.run_lease));
+        self.entered.notify_one();
+        while !ctx.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(JobResult::Completed)
+    }
+}
+
+/// A runtime on its own tokio runtime and pool, so stopping it after a
+/// graceful shutdown drops whatever the client left running, as a process
+/// exit does.
+struct ProcessHost {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+}
+
+impl ProcessHost {
+    async fn start(
+        options: sqlx::postgres::PgConnectOptions,
+        build: impl FnOnce(sqlx::PgPool) -> Client + Send + 'static,
+    ) -> Self {
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build process runtime");
+            let client = runtime.block_on(async move {
+                let pool = PgPoolOptions::new()
+                    .max_connections(6)
+                    .connect_with(options)
+                    .await
+                    .expect("connect process pool");
+                let client = build(pool);
+                client.start().await.expect("start process client");
+                client
+            });
+            Self {
+                runtime,
+                client: Arc::new(client),
+            }
+        })
+        .await
+        .expect("start process host")
+    }
+
+    async fn exit_gracefully(self, timeout: Duration) {
+        let client = self.client.clone();
+        self.runtime
+            .spawn(async move { client.shutdown(timeout).await })
+            .await
+            .expect("graceful shutdown");
+        tokio::task::spawn_blocking(move || self.runtime.shutdown_background())
+            .await
+            .expect("stop process runtime");
+    }
+}
+
+/// A graceful shutdown must finalize every attempt whose handler returned
+/// during the drain. Finalization used to run detached from the drain, so a
+/// process that exited after `shutdown` returned could drop it: the attempt
+/// stayed open with no heartbeat and stale-heartbeat rescue ran the completed
+/// job again. A held receipt-attempt lock keeps this attempt's finalize in
+/// flight while shutdown drains, which the detached version did not wait for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_graceful_shutdown_finalizes_returned_attempts() {
+    // Each host below opens its own pool of 6, and only one runs at a time.
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_graceful_restart";
+    let store_config = QueueStorageConfig {
+        schema: "awa_qs_graceful_restart".to_string(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &GracefulRestartJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let worker = GracefulRestartWorker::default();
+    let options = (*pool.connect_options()).clone();
+    let build = |worker: GracefulRestartWorker, store_config: QueueStorageConfig| {
+        move |pool: sqlx::PgPool| {
+            Client::builder(pool)
+                .queue(
+                    queue,
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        deadline_duration: Duration::ZERO,
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config,
+                    Duration::from_secs(60),
+                    Duration::from_millis(50),
+                )
+                .claim_rotate_interval(Duration::from_secs(60))
+                .register_worker(worker)
+                // The follow-up's queue is not served; it only routes the
+                // completion through a transaction of its own.
+                .on_completed_enqueue::<GracefulRestartJob, GracefulRestartFollowUp, _>(
+                    |args, _job| GracefulRestartFollowUp { id: args.id },
+                )
+                .heartbeat_interval(Duration::from_millis(100))
+                .heartbeat_staleness(ci_timing::scaled_staleness(Duration::from_secs(1)))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .build()
+                .expect("build graceful restart client")
+        }
+    };
+
+    let host =
+        ProcessHost::start(options.clone(), build(worker.clone(), store_config.clone())).await;
+    tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(10)),
+        worker.entered.notified(),
+    )
+    .await
+    .expect("the job should start");
+    let (attempt_job_id, run_lease) = worker
+        .first_attempt
+        .lock()
+        .expect("first attempt")
+        .expect("first attempt recorded");
+    assert_eq!(attempt_job_id, job_id);
+
+    let mut lock_holder = pool.acquire().await.expect("lock connection");
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("hold the attempt's finalize lock");
+
+    let exit =
+        tokio::spawn(host.exit_gracefully(ci_timing::scaled_timeout(Duration::from_secs(10))));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("release the attempt's finalize lock");
+    drop(lock_holder);
+    exit.await.expect("graceful exit");
+
+    let after_exit = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load job")
+        .expect("job row");
+
+    // A later runtime rescues anything the exit left open.
+    let rescuer = ProcessHost::start(options, build(worker.clone(), store_config)).await;
+    let finished = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        ci_timing::scaled_timeout(Duration::from_secs(15)),
+    )
+    .await;
+    rescuer
+        .exit_gracefully(ci_timing::scaled_timeout(Duration::from_secs(10)))
+        .await;
+
+    assert_eq!(
+        (after_exit.state, after_exit.run_lease),
+        (JobState::Completed, run_lease),
+        "graceful shutdown returned before the completed attempt was finalized"
+    );
+    assert_eq!(
+        (worker.executions.load(Ordering::SeqCst), finished.run_lease),
+        (1, run_lease),
+        "the job ran again after a graceful shutdown"
+    );
 }
 
 /// ADR-023 claim-ring control-plane smoke test. Exercises
@@ -15366,4 +15593,184 @@ async fn test_queue_storage_receipt_claims_are_locked_before_the_heartbeat_state
         .await
         .expect("join heartbeat")
         .expect("heartbeat after the rewrite");
+}
+
+/// Claims and leases record a job's aged effective priority while its ready
+/// row keeps the lane priority. Reads that join the two must still find the
+/// running attempt: `load_job` (behind `get_job` and lifecycle events) and
+/// the callback lookup behind external completion.
+async fn aged_claim_is_visible_to_job_and_callback_reads(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_aged_claim_reads";
+    let schema = if receipts {
+        "awa_qs_aged_claim_reads_receipts"
+    } else {
+        "awa_qs_aged_claim_reads_leases"
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 902 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim with aging");
+    assert_eq!(claimed.len(), 1);
+    let run_lease = claimed[0].job.run_lease;
+    assert!(
+        claimed[0].job.priority < 4,
+        "the claim must have aged the job for this test to mean anything"
+    );
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load aged job")
+        .expect("aged job exists");
+    assert_eq!(loaded.state, JobState::Running);
+    assert_eq!(loaded.run_lease, run_lease);
+
+    let callback_id = store
+        .register_callback(&pool, job_id, run_lease, Duration::from_secs(300))
+        .await
+        .expect("register callback on aged job");
+    let mut tx = pool.begin().await.unwrap();
+    let by_callback = store
+        .callback_job_in_tx(&mut tx, callback_id, Some(run_lease), false)
+        .await
+        .expect("callback lookup")
+        .expect("callback lookup finds the aged job");
+    tx.rollback().await.unwrap();
+    assert_eq!(by_callback.id, job_id);
+    assert_eq!(by_callback.run_lease, run_lease);
+}
+
+#[tokio::test]
+async fn test_aged_receipt_claim_is_visible_to_job_and_callback_reads() {
+    aged_claim_is_visible_to_job_and_callback_reads(true).await;
+}
+
+#[tokio::test]
+async fn test_aged_materialized_lease_is_visible_to_job_and_callback_reads() {
+    aged_claim_is_visible_to_job_and_callback_reads(false).await;
+}
+
+/// The admin reads join a materialized lease to its ready row. A lease records
+/// the aged effective priority, so joining on priority hid a job that aged
+/// before its claim from the job list, the kinds page and unique-key cancel.
+#[tokio::test]
+async fn test_aged_materialized_lease_is_visible_to_admin_reads() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_aged_lease_admin_reads";
+    let schema = "awa_qs_aged_lease_admin_reads";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: false,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("aged"),
+        InsertOpts {
+            priority: 4,
+            ..unique_cancel_opts(queue, None)
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim with aging");
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        claimed[0].job.priority < 4,
+        "the claim must have aged the job for this test to mean anything"
+    );
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id],
+        "the aged running job must be listed"
+    );
+
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .expect("job kind overviews");
+    let kind = overview
+        .iter()
+        .find(|row| row.kind == UniqueCancelJob::kind())
+        .expect("the aged job's kind is listed");
+    assert_eq!(kind.job_count, 1, "the aged running job must be counted");
+
+    let cancelled = cancel_unique(&pool, Some(queue), "aged")
+        .await
+        .expect("cancel by unique key finds the aged running job");
+    assert_eq!(cancelled.id, job_id);
 }
