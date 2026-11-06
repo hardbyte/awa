@@ -15762,10 +15762,21 @@ async fn test_queue_storage_prune_lock_timeout_after_child_locks_reports_blocked
         .await;
     }
 
-    let pruned = store
-        .prune_oldest(&pool, retention)
-        .await
-        .expect("prune after locks released");
+    // Hosted Postgres background workers can briefly hold a partition after
+    // the test's own locks are gone. Only Blocked may defer the prune; every
+    // error or other outcome still fails below.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    let pruned = loop {
+        let pruned = store
+            .prune_oldest(&pool, retention)
+            .await
+            .expect("prune after locks released");
+        if matches!(pruned, PruneOutcome::Blocked { slot: 0 }) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        } else {
+            break pruned;
+        }
+    };
     assert!(
         matches!(
             pruned,
@@ -15828,12 +15839,24 @@ async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_re
     assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
 
-    let outcome = store
-        .rollup_terminal_count_deltas(&pool, 4)
-        .await
-        .expect("rollup after lock released");
-    assert_eq!(outcome.rolled_slots, 2);
-    assert_eq!(outcome.blocked_slots, 0);
+    // As above, a background lock may briefly block a slot after ours is
+    // released. Slots rolled by a partly blocked pass stay rolled, so count
+    // them across attempts.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    let mut rolled_slots = 0;
+    loop {
+        let outcome = store
+            .rollup_terminal_count_deltas(&pool, 4)
+            .await
+            .expect("rollup after lock released");
+        rolled_slots += outcome.rolled_slots;
+        if outcome.blocked_slots == 0 || Instant::now() >= deadline {
+            assert_eq!(outcome.blocked_slots, 0);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(rolled_slots, 2);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
 }
