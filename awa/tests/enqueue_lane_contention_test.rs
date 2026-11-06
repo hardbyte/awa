@@ -667,7 +667,7 @@ fn scenario(
 ) -> Scenario {
     Scenario {
         name: name.to_string(),
-        mode: Mode::InsertMany,
+        mode: Mode::InsertManySkip,
         producers,
         batch_size: 185,
         unique,

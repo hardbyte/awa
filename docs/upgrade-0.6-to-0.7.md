@@ -255,8 +255,8 @@ External migration runners apply the complete `awa migrate --sql --from 51
 
 ## v053: batch producer insert
 
-v053 adds `awa.insert_jobs_compat_batch`, the function `insert_many` and
-`insert_many_copy` call. It is one `CREATE OR REPLACE FUNCTION`: no table DDL,
+v053 adds `awa.insert_jobs_compat_batch`, the function `insert_many_copy` and
+`insert_many_skip_unique_conflicts` call. It is one `CREATE OR REPLACE FUNCTION`: no table DDL,
 no scan, no lock beyond the catalog, so it applies instantly under live load.
 `awa.insert_job_compat` is unchanged, and binaries before v053 keep calling it;
 both paths take the same per-lane reservation lock, so producers on either
@@ -266,14 +266,7 @@ The runtime role needs `EXECUTE` on the new function; the
 [default privileges](security/database-roles.md#runtime-grants) cover functions
 the migrator creates.
 
-A 0.7 binary running before the migration keeps inserting: `insert_many` and
-`insert_many_copy` look for the function in the catalog, use the per-row
-function until it exists, and switch to the batch function without a restart
-once it does. `insert_many_skip_unique_conflicts` needs the function and returns
-a validation error before the migration. The per-row and batch paths take the
-same lane lock, so a fleet that mixes them keeps each batch contiguous and in
-order. External migration runners apply the `awa migrate --sql --from 52 --to
-53` bundle.
+A 0.7 binary running before the migration keeps inserting. `insert_many_copy` probes its own connection on every call, uses the per-row function until the batch function exists, and switches without a restart. Generic `insert_many` always uses the per-row function in one statement, so one process can write to databases at different migration levels without aborting a caller transaction on an unavailable function. `insert_many_skip_unique_conflicts` needs the function and returns a validation error before the migration. The per-row and batch paths take the same lane lock, so a fleet that mixes them keeps each batch contiguous and in order. External migration runners apply the `awa migrate --sql --from 52 --to 53` bundle.
 
 ## The one gate
 

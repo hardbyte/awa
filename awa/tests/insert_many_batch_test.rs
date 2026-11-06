@@ -1,4 +1,4 @@
-//! `insert_many` and `insert_many_copy` on the batch insert function.
+//! Compatibility inserts and the opt-in batch insert function.
 //!
 //! A batch does its lane-independent work (job ids, unique claims, lane
 //! registration) before it reserves its lanes, and holds a lane lock only for
@@ -341,7 +341,7 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
     let producer = {
         let pool = pool.clone();
         let jobs = jobs_for_probe.clone();
-        tokio::spawn(async move { insert_many(&pool, &jobs).await })
+        tokio::spawn(async move { insert_many_skip_unique_conflicts(&pool, &jobs).await })
     };
 
     let started = Instant::now();
@@ -440,7 +440,7 @@ async fn old_and_new_producers_share_a_lane_without_reordering() {
     setup::activate_queue_storage(&pool).await;
     let queue = unique_queue("mixed_fleet");
 
-    // Make sure the batch function is the one `insert_many` uses.
+    // Provision the lane before mixing generic and batch producers.
     insert_many(&pool, &[job(&queue, -1, false)])
         .await
         .expect("warm up");
@@ -464,7 +464,7 @@ async fn old_and_new_producers_share_a_lane_without_reordering() {
                 if task % 2 == 0 {
                     insert_through_row_function(&pool, &jobs).await;
                 } else {
-                    insert_many(&pool, &jobs)
+                    insert_many_skip_unique_conflicts(&pool, &jobs)
                         .await
                         .expect("batch function insert");
                 }

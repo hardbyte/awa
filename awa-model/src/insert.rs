@@ -4,16 +4,16 @@ use crate::queue_storage::ordering_key_hash64;
 use crate::unique::compute_unique_key;
 use crate::JobArgs;
 use sqlx::postgres::PgConnection;
-use sqlx::{FromRow, PgExecutor, PgPool, Row};
-use std::sync::atomic::{AtomicU8, Ordering};
+use sqlx::{PgExecutor, PgPool};
 
 // ── Lane lock order ─────────────────────────────────────────────────────
 //
 // On queue storage every available-state insert holds a transaction-scoped
 // advisory lock on its `(queue, priority, enqueue_shard)` lane until the
 // enclosing transaction ends, so two transactions that enqueue into the same
-// lanes in opposite orders can deadlock. The batch inserts here go through
-// `awa.insert_jobs_compat_batch` (migration v053), which does the
+// lanes in opposite orders can deadlock. `insert_many_copy` and
+// `insert_many_skip_unique_conflicts` use `awa.insert_jobs_compat_batch`
+// (migration v053), which does the
 // lane-independent work first and then reserves its lanes in one canonical
 // order: `(queue, priority, shard)` ascending, queues compared bytewise
 // (`COLLATE "C"`, the order of Rust's `str`). `QueueStorage` batch enqueues
@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 // the reservation and the ready-row writes keeps a lane's lock window
 // independent of the batch's unique-claim and payload work.
 //
-// A schema without the function (a binary running ahead of the migration) is
-// served by the per-row path: rows are sorted by the same key, stably, before
+// Generic `insert_many` always uses the per-row path, as does
+// `insert_many_copy` before the migration: rows are sorted by the same key before
 // they reach `awa.insert_job_compat`, and returned in input order. Both paths
 // take the same lane lock, so producers on either, and older binaries, share a
 // lane without reordering it.
@@ -245,8 +245,8 @@ const INSERT_MANY_BATCH_SQL: &str = r#"
 /// The per-row form of [`INSERT_MANY_BATCH_SQL`], for schemas without
 /// `awa.insert_jobs_compat_batch`: one `awa.insert_job_compat` call per row,
 /// rows inserted in canonical lane order (see "Lane lock order" above) and
-/// returned in input order. `batch_insert_available` reports whether the batch
-/// function exists, so the caller can switch to it.
+/// returned in input order. It works before and after the batch migration,
+/// including when one process writes to databases at different schema versions.
 const INSERT_MANY_ROW_FUNCTION_SQL: &str = r#"
     WITH input AS MATERIALIZED (
         SELECT
@@ -281,7 +281,7 @@ const INSERT_MANY_ROW_FUNCTION_SQL: &str = r#"
         )
         ORDER BY raw.queue COLLATE "C", raw.priority, lane_shard, raw.ord
     )
-    SELECT inserted.*, (SELECT to_regprocedure('awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)') IS NOT NULL ) AS batch_insert_available
+    SELECT inserted.*
     FROM input
     CROSS JOIN LATERAL awa.insert_job_compat(
         input.kind,
@@ -513,10 +513,12 @@ fn ordering_hash_text(row: &PreparedRow) -> Option<String> {
 /// (SQLSTATE `23505`, as [`AwaError::Database`]); use
 /// [`insert_many_skip_unique_conflicts`] to insert the rest instead.
 ///
-/// Uses `awa.insert_jobs_compat_batch` when the schema has migration v053 and
-/// the per-row `awa.insert_job_compat` path when it does not, deciding from the
-/// schema itself. The first calls of a process use the per-row path until one
-/// of them has seen the function.
+/// Calls `awa.insert_job_compat` per row, in canonical lane order, on every
+/// supported schema. A generic executor is consumed by one statement and
+/// cannot be probed separately, so this path never assumes another database
+/// has the same schema. [`insert_many_copy`] probes its concrete connection
+/// and uses the batch function when available;
+/// [`insert_many_skip_unique_conflicts`] requires that function.
 #[tracing::instrument(
     skip(executor, jobs),
     fields(
@@ -532,7 +534,16 @@ pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Ve
 where
     E: PgExecutor<'e>,
 {
-    insert_many_batch(executor, jobs, false).await
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = precompute_rows(jobs)?;
+    Ok(bind_row_function_columns(
+        sqlx::query_as::<_, JobRow>(INSERT_MANY_ROW_FUNCTION_SQL),
+        &rows,
+    )
+    .fetch_all(executor)
+    .await?)
 }
 
 /// Insert multiple jobs in a single statement, skipping those whose unique key
@@ -567,125 +578,20 @@ pub async fn insert_many_skip_unique_conflicts<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    insert_many_batch(executor, jobs, true).await
-}
-
-async fn insert_many_batch<'e, E>(
-    executor: E,
-    jobs: &[InsertParams],
-    skip_unique_conflicts: bool,
-) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
-
     let rows = precompute_rows(jobs)?;
-
-    // Skipping conflicts has no per-row equivalent in one statement, so it
-    // always calls the batch function and reports a schema without it.
-    if skip_unique_conflicts {
-        return match bind_batch_columns(sqlx::query_as::<_, JobRow>(INSERT_MANY_BATCH_SQL), &rows)
-            .bind(true)
-            .fetch_all(executor)
-            .await
-        {
-            Ok(results) => {
-                BATCH_INSERT_FUNCTION.record(BatchFunction::Present);
-                Ok(results)
-            }
-            Err(err) if is_missing_batch_function(&err) => {
-                BATCH_INSERT_FUNCTION.record(BatchFunction::Absent);
-                Err(AwaError::Validation(
-                    "insert_many_skip_unique_conflicts needs migration v053; run `awa migrate`"
-                        .to_string(),
-                ))
-            }
-            Err(err) => Err(err.into()),
-        };
-    }
-
-    if BATCH_INSERT_FUNCTION.load() == BatchFunction::Present {
-        return match bind_batch_columns(sqlx::query_as::<_, JobRow>(INSERT_MANY_BATCH_SQL), &rows)
-            .bind(false)
-            .fetch_all(executor)
-            .await
-        {
-            Ok(results) => Ok(results),
-            Err(err) => {
-                // The schema no longer has the function (restored from an
-                // older backup, or a different database): probe again on the
-                // next call. This call's executor is spent, and inside a
-                // transaction it would be aborted anyway.
-                if is_missing_batch_function(&err) {
-                    BATCH_INSERT_FUNCTION.record(BatchFunction::Unknown);
-                }
-                Err(err.into())
-            }
-        };
-    }
-
-    // Not known to be present: insert through the per-row function, which
-    // every schema has, and learn from the same statement whether the batch
-    // function exists so the next call can use it.
-    let rows_out = bind_row_function_columns(sqlx::query(INSERT_MANY_ROW_FUNCTION_SQL), &rows)
+    match bind_batch_columns(sqlx::query_as::<_, JobRow>(INSERT_MANY_BATCH_SQL), &rows)
+        .bind(true)
         .fetch_all(executor)
-        .await?;
-    let mut results = Vec::with_capacity(rows_out.len());
-    let mut available = false;
-    for row in &rows_out {
-        results.push(JobRow::from_row(row)?);
-        available = row.try_get::<bool, _>("batch_insert_available")?;
-    }
-    BATCH_INSERT_FUNCTION.record(if available {
-        BatchFunction::Present
-    } else {
-        BatchFunction::Absent
-    });
-    Ok(results)
-}
-
-/// Whether `awa.insert_jobs_compat_batch` exists in the schema this process
-/// writes to, as far as it has seen.
-///
-/// The executors the insert functions take are consumed by one statement, so
-/// the answer comes from the per-row statement, which asks the catalog as it
-/// inserts, and is cached for the process: present stays present until a
-/// call finds the function missing, absent is asked again by every per-row
-/// call and so is picked up as soon as the migration has run. A process that
-/// writes to databases at different migration levels may see one failed call
-/// when it switches to one that lacks the function.
-struct BatchFunctionState(AtomicU8);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BatchFunction {
-    Unknown,
-    Present,
-    Absent,
-}
-
-static BATCH_INSERT_FUNCTION: BatchFunctionState = BatchFunctionState(AtomicU8::new(0));
-
-impl BatchFunctionState {
-    fn load(&self) -> BatchFunction {
-        match self.0.load(Ordering::Relaxed) {
-            1 => BatchFunction::Present,
-            2 => BatchFunction::Absent,
-            _ => BatchFunction::Unknown,
-        }
-    }
-
-    fn record(&self, state: BatchFunction) {
-        self.0.store(
-            match state {
-                BatchFunction::Unknown => 0,
-                BatchFunction::Present => 1,
-                BatchFunction::Absent => 2,
-            },
-            Ordering::Relaxed,
-        );
+        .await
+    {
+        Ok(results) => Ok(results),
+        Err(err) if is_missing_batch_function(&err) => Err(AwaError::Validation(
+            "insert_many_skip_unique_conflicts needs migration v053; run `awa migrate`".to_string(),
+        )),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -740,9 +646,9 @@ fn bind_batch_columns<'q, O>(
 }
 
 fn bind_row_function_columns<'q>(
-    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    query: sqlx::query::QueryAs<'q, sqlx::Postgres, JobRow, sqlx::postgres::PgArguments>,
     rows: &'q [PreparedRow],
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, JobRow, sqlx::postgres::PgArguments> {
     query
         .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
         .bind(
@@ -909,21 +815,15 @@ pub async fn insert_many_copy_from_pool(
     Ok(results)
 }
 
+/// Probe this connection on every COPY call. A process can write to databases
+/// at different migration levels, and the generic executor path cannot safely
+/// seed a shared answer for them.
 async fn batch_function_available(conn: &mut PgConnection) -> Result<bool, AwaError> {
-    if BATCH_INSERT_FUNCTION.load() == BatchFunction::Present {
-        return Ok(true);
-    }
-    let available: bool = sqlx::query_scalar(
+    Ok(sqlx::query_scalar(
         "SELECT to_regprocedure('awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)') IS NOT NULL",
     )
     .fetch_one(&mut *conn)
-    .await?;
-    BATCH_INSERT_FUNCTION.record(if available {
-        BatchFunction::Present
-    } else {
-        BatchFunction::Absent
-    });
-    Ok(available)
+    .await?)
 }
 
 async fn insert_staged_rows_with_batch_function(

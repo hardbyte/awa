@@ -17,26 +17,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
-- **Batch enqueues hold a lane lock for the lane write only.** `insert_many`
-  and `insert_many_copy` called `awa.insert_job_compat` per row, which takes
-  the `(queue, priority, shard)` lane lock on the batch's first row and holds
-  it, because the lock lasts to commit, while every remaining row is
-  processed: concurrent producers on one lane queued behind whole batches.
-  Migration v053 adds `awa.insert_jobs_compat_batch`, which allocates job ids,
-  claims unique keys (in key order), registers new lanes and builds the rows
-  first, then reserves each lane's sequence range once, in lane order, and
-  writes the ready rows and segments in two statements. A 185-row batch into
-  one lane holds the lock for a fraction of the time it did, which raises the
-  per-lane ceiling several times over and cuts the time producers, promotion
-  and rescue spend waiting for the lane. `insert_many_copy` skips unique
-  conflicts in one pass instead of one savepoint per row. A binary that runs
-  ahead of the migration keeps working: `insert_many` and `insert_many_copy`
-  look for the function in the catalog and use the per-row path until it
-  exists, then switch to the batch function without a restart (the process
-  keeps the answer; a call that finds a cached function gone fails once with
-  `undefined_function` and the next call probes again). Binaries before this
-  release keep calling `awa.insert_job_compat` and share the lane lock with the
-  new path, so a mixed fleet keeps each batch contiguous and in order.
+- **COPY and opt-in skip-conflict batch enqueues hold lane locks only for reservation, ready-row writes and commit.** Migration v053 adds `awa.insert_jobs_compat_batch`, which allocates job ids, claims unique keys in key order, registers lanes and prepares rows before reserving each lane's sequence range in lane order. `insert_many_copy` probes its own connection on every call and uses the function when installed, falling back to per-row inserts on older schemas. `insert_many_skip_unique_conflicts` requires the function. Generic `insert_many` keeps its single-statement per-row path on every supported schema, preserving caller transactions when one process writes to databases at different migration levels. All paths return rows in input order and share the same per-lane lock with older binaries.
 
 ### Fixed
 
