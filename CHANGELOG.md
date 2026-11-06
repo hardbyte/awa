@@ -4,8 +4,24 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **Alert rules for ring maintenance, the DLQ and long transactions**
+  ([#376](https://github.com/hardbyte/awa/issues/376)). The Prometheus rule
+  set adds `awa_ring_rotation_stalled` (a ring has skipped every rotation as
+  busy for 15 minutes), `awa_ring_prune_blocked` (every prune of a ring for
+  30 minutes was blocked by a lock), `awa_maintenance_branch_overrunning` and
+  `awa_dlq_growing`. The Postgres rule set adds `awa_pg_long_transaction`,
+  which fires on a transaction older than 5 minutes. `validate-grafana.sh`
+  now evaluates every rule's query against the live Prometheus and Postgres,
+  and fails on a rule with an incomplete query.
+
 ### Fixed
 
+- **The `awa_job_output_schema_missing` alert rule imports.** Its query had
+  no expression or datasource and the rule had no threshold, so Grafana
+  refused to provision it. It now fires when a queue drops outputs with
+  reason `schema_missing` for 10 minutes.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
