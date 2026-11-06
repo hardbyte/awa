@@ -30,6 +30,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Admin job lists and kind counts include running receipt claims before
+  they materialize into leases, including compact and legacy row-local claims.
+- Exclude tombstoned source rows when hydrating moved running jobs, including
+  compact receipts. Point reads retain the [concurrent-prune limitation](docs/troubleshooting.md#transient-admin-reads-during-partition-pruning).
 - Close read connections if their transaction start is cancelled or fails before
   SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
 
