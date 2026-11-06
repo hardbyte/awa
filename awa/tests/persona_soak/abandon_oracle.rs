@@ -846,7 +846,10 @@ pub async fn probe_backlog(
             WHERE NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closures cl
                               WHERE cl.claim_slot = x.claim_slot AND cl.job_id = x.job_id AND cl.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closure_batches cb
-                              WHERE cb.claim_slot = x.claim_slot AND cb.receipt_ranges @> x.receipt_id)
+                              WHERE cb.claim_slot = x.claim_slot AND cb.receipt_ranges @> x.receipt_id
+                              -- Keep membership correlated: joining by slot can multiply
+                              -- receipt members by retained closure batches.
+                              OFFSET 0)
               AND NOT EXISTS (SELECT 1 FROM {schema}.done_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.deferred_jobs d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.dlq_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
