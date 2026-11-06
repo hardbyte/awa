@@ -228,6 +228,24 @@ impl AbandonState {
             .insert(generation, at_epoch_ms);
     }
 
+    /// Signal and publish the death before a waiting probe can classify its result.
+    /// The live-state lock also fences the probe's post-query check; no await occurs
+    /// between a successful signal and publishing its generation and timestamp.
+    pub fn signal_generation_killed(
+        &self,
+        generation: u32,
+        signal: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<i64> {
+        let mut live = self.live.lock().expect("live");
+        signal()?;
+        let signalled_at = epoch_ms();
+        self.note_generation_killed(generation, signalled_at);
+        if live.is_some_and(|(current, _)| current == generation) {
+            *live = None;
+        }
+        Ok(signalled_at)
+    }
+
     pub fn set_live(&self, live: Option<(u32, i64)>) {
         *self.heartbeat_last.lock().expect("heartbeat last") = None;
         *self.live.lock().expect("live") = live;
@@ -318,28 +336,49 @@ impl AbandonState {
         );
         stats.observe("probe_ms", probe_ms);
 
-        // Every claim a live process started stays open until the process dies, so any
-        // missing from the store were rescued from under it.
+        // A probe can begin while the child is alive and finish after its kill. Only
+        // a generation still alive after the query proves missing claims were taken
+        // from a live owner. Keep this check serialized with signaling the kill.
         if let Some(live) = live {
             let lost = (live.started - probe.open_since).max(0);
-            let mut peaks = self.live_lost.lock().expect("live lost");
-            let peak = peaks.entry(live.generation).or_insert(0);
-            let first = lost > 0 && *peak == 0;
-            *peak = (*peak).max(lost);
-            drop(peaks);
-            stats.set_max("live_claims_rescued_peak", lost);
-            if first {
-                shared.violation(
-                    "live_owner_rescued",
+            let current = self.live.lock().expect("live");
+            let still_live = current.is_some_and(|(generation, _)| generation == live.generation)
+                && !self
+                    .killed_at
+                    .lock()
+                    .expect("killed at")
+                    .contains_key(&live.generation);
+            if lost > 0 && !still_live {
+                shared.incomplete(
                     format!(
-                        "claims of process {} were rescued while it was alive: it had started {} handler(s) and only {} of its claims were still open ({} claim(s) were eligible for rescue)",
-                        live.generation, live.started, probe.open_since, probe.expired
+                        "claim probe for process {} crossed its kill or replacement; {lost} missing claim(s) cannot be classified as a live-owner rescue",
+                        live.generation
                     ),
                     vec![format!(
-                        "{{\"process\":{},\"started\":{},\"claims_still_open\":{},\"eligible_for_rescue\":{}}}",
-                        live.generation, live.started, probe.open_since, probe.expired
+                        "{{\"process\":{},\"started\":{},\"claims_still_open\":{}}}",
+                        live.generation, live.started, probe.open_since
                     )],
                 );
+            } else {
+                let mut peaks = self.live_lost.lock().expect("live lost");
+                let peak = peaks.entry(live.generation).or_insert(0);
+                let first = lost > 0 && *peak == 0;
+                *peak = (*peak).max(lost);
+                drop(peaks);
+                stats.set_max("live_claims_rescued_peak", lost);
+                if first {
+                    shared.violation(
+                        "live_owner_rescued",
+                        format!(
+                            "claims of process {} were rescued while it was alive: it had started {} handler(s) and only {} of its claims were still open ({} claim(s) were eligible for rescue)",
+                            live.generation, live.started, probe.open_since, probe.expired
+                        ),
+                        vec![format!(
+                            "{{\"process\":{},\"started\":{},\"claims_still_open\":{},\"eligible_for_rescue\":{}}}",
+                            live.generation, live.started, probe.open_since, probe.expired
+                        )],
+                    );
+                }
             }
         }
         let staleness_ms = shared.config.heartbeat_staleness.as_millis() as i64 + 3_000;
@@ -864,12 +903,140 @@ pub async fn probe_backlog(
 
 #[cfg(test)]
 mod tests {
-    use super::{probe_backlog, Scope};
+    use super::{epoch_ms, probe_backlog, LiveCheck, Probe, Scope};
     use crate::persona_soak::config::{replace_database_name, SoakConfig};
-    use crate::persona_soak::db;
+    use crate::persona_soak::db::{self, Budget, ServerInfo};
+    use crate::persona_soak::shared::Shared;
     use awa::model::{ClaimedRuntimeJob, QueueStorage, QueueStorageConfig};
     use sqlx::PgPool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    fn live_probe_fixture(generation: u32) -> (Arc<Shared>, LiveCheck) {
+        let config = SoakConfig::for_test(
+            "postgres://postgres:test@localhost/awa_soak_live_probe".to_string(),
+        );
+        let info = ServerInfo::default();
+        let budget = Budget::new(&info, 0);
+        let shared = Shared::new(config, info, budget);
+        shared.abandon.set_live(Some((generation, epoch_ms())));
+        let live = LiveCheck {
+            generation: shared.abandon.live().expect("live generation").0,
+            started: 1_000,
+        };
+        (shared, live)
+    }
+
+    fn observe_live_probe(shared: &Shared, live: LiveCheck, open: i64) {
+        shared.abandon.observe(
+            shared,
+            &Probe {
+                open,
+                expired: 0,
+                oldest_expired_s: 0.0,
+                open_since: open,
+            },
+            Some(live),
+            0,
+            1,
+        );
+    }
+
+    fn live_rescue_reports(shared: &Shared) -> usize {
+        shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .filter(|violation| violation.kind == "live_owner_rescued")
+            .count()
+    }
+
+    #[test]
+    fn live_probe_crossing_its_generation_kill_is_incomplete() {
+        let (shared, captured) = live_probe_fixture(1);
+        // The query was dispatched with this owner alive, but its snapshot
+        // boundary relative to the signal is unknown when the result arrives.
+        shared.abandon.note_generation_killed(1, epoch_ms());
+        shared.abandon.set_live(None);
+        observe_live_probe(&shared, captured, 500);
+
+        assert!(shared.oracle_incomplete.load(Ordering::Relaxed));
+        assert_eq!(live_rescue_reports(&shared), 0);
+        assert_eq!(shared.abandon.live_lost(1), 0);
+        // The usable backlog evidence is retained even though liveness is unknown.
+        assert_eq!(shared.abandon.open_claims.load(Ordering::Relaxed), 500);
+    }
+
+    #[test]
+    fn live_probe_still_alive_missing_claims_remain_a_violation() {
+        let (shared, captured) = live_probe_fixture(1);
+        observe_live_probe(&shared, captured, 500);
+
+        assert_eq!(live_rescue_reports(&shared), 1);
+        assert_eq!(shared.abandon.live_lost(1), 500);
+        assert!(!shared.oracle_incomplete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn live_probe_other_generation_kill_does_not_hide_live_loss() {
+        let (shared, captured) = live_probe_fixture(2);
+        shared.abandon.note_generation_killed(1, epoch_ms());
+        observe_live_probe(&shared, captured, 500);
+
+        assert_eq!(live_rescue_reports(&shared), 1);
+        assert_eq!(shared.abandon.live_lost(2), 500);
+        assert!(!shared.oracle_incomplete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn live_probe_kill_overlap_preserves_prior_proven_loss() {
+        let (shared, captured) = live_probe_fixture(1);
+        observe_live_probe(&shared, captured, 500);
+        assert_eq!(shared.abandon.live_lost(1), 500);
+
+        shared.abandon.note_generation_killed(1, epoch_ms());
+        shared.abandon.set_live(None);
+        observe_live_probe(&shared, captured, 100);
+
+        assert_eq!(live_rescue_reports(&shared), 1);
+        assert_eq!(shared.abandon.live_lost(1), 500);
+        assert!(shared.oracle_incomplete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn live_probe_successful_signal_publishes_death_before_returning() {
+        let (shared, _) = live_probe_fixture(1);
+        let at = shared
+            .abandon
+            .signal_generation_killed(1, || Ok(()))
+            .expect("successful signal");
+
+        assert_eq!(shared.abandon.live(), None);
+        assert_eq!(
+            shared.abandon.killed_at.lock().expect("killed at").get(&1),
+            Some(&at)
+        );
+    }
+
+    #[test]
+    fn live_probe_failed_signal_does_not_publish_a_death() {
+        let (shared, _) = live_probe_fixture(1);
+        let before = shared.abandon.live();
+        let result = shared
+            .abandon
+            .signal_generation_killed(1, || Err(std::io::Error::other("signal failed")));
+
+        assert!(result.is_err());
+        assert_eq!(shared.abandon.live(), before);
+        assert!(shared
+            .abandon
+            .killed_at
+            .lock()
+            .expect("killed at")
+            .is_empty());
+    }
 
     struct SlotProbe {
         config: SoakConfig,

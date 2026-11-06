@@ -861,20 +861,56 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             }
         }
 
-        let signalled_epoch_ms = epoch_ms();
-        let signalled_run_ms = shared.now_ms();
         let held = shared.abandon.child_active.load(Ordering::Relaxed);
-        if !unexpected_exit {
+        let signalled_epoch_ms = if unexpected_exit {
+            let at = epoch_ms();
+            shared.abandon.note_generation_killed(generation, at);
+            shared.abandon.set_live(None);
+            at
+        } else {
             // SIGKILL: no shutdown handshake, no chance to release a claim.
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        shared
-            .abandon
-            .note_generation_killed(generation, signalled_epoch_ms);
-        shared.abandon.set_live(None);
+            match shared
+                .abandon
+                .signal_generation_killed(generation, || child.start_kill())
+            {
+                Ok(at) => at,
+                Err(error) => {
+                    shared.incomplete(
+                        format!("could not signal claiming process {generation}: {error}"),
+                        vec![],
+                    );
+                    // No confirmed signal means no valid death boundary. Stop this
+                    // persona and clean up its owned tasks instead of inventing one.
+                    shared.abandon.set_live(None);
+                    shared.abandon.child_alive.store(false, Ordering::Relaxed);
+                    shared.abandon.child_active.store(0, Ordering::Relaxed);
+                    drop(child); // kill_on_drop remains a best-effort cleanup.
+                    canary_task.abort();
+                    monitor_task.abort();
+                    let _ = canary_task.await;
+                    let _ = monitor_task.await;
+                    survivors
+                        .shutdown_all(Duration::from_secs(20), &shared)
+                        .await;
+                    producer_pool.close().await;
+                    backlog_pool.close().await;
+                    return Ok(());
+                }
+            }
+        };
+        let signalled_run_ms = shared.now_ms();
         shared.abandon.child_alive.store(false, Ordering::Relaxed);
         shared.abandon.child_active.store(0, Ordering::Relaxed);
+        if !unexpected_exit {
+            if let Err(error) = child.wait().await {
+                shared.incomplete(
+                    format!(
+                        "could not reap claiming process {generation} after signaling it: {error}"
+                    ),
+                    vec![],
+                );
+            }
+        }
         importer.import(&shared);
         let open_after_kill = probe_backlog(
             &backlog_pool,
