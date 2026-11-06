@@ -64,6 +64,7 @@ pub mod names {
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
+    pub const MAINTENANCE_PROMOTE_LANE_CONTENTION: &str = "awa.maintenance.promote.lane_contention";
     pub const MAINTENANCE_BRANCH_DURATION: &str = "awa.maintenance.branch.duration";
     pub const MAINTENANCE_BRANCH_OVERRUN: &str = "awa.maintenance.branch.overrun";
     pub const MAINTENANCE_ROTATE_ATTEMPTS: &str = "awa.maintenance.rotate.attempts";
@@ -164,6 +165,11 @@ pub struct AwaMetrics {
     pub promotion_batch_size: Histogram<u64>,
     /// Promotion query duration.
     pub promotion_duration_seconds: Histogram<f64>,
+    /// Promotion lanes whose locks were busy past the leader's wait budget,
+    /// attributed to (state, queue, outcome): `handed_off` to a dedicated
+    /// waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out`
+    /// when a waiter's own budget ran out.
+    pub promotion_lane_contention: Counter<u64>,
     /// Current in-flight jobs (can go up and down).
     pub jobs_in_flight: UpDownCounter<i64>,
     /// Total heartbeat batches sent.
@@ -223,8 +229,11 @@ pub struct AwaMetrics {
     /// pinned by handfuls of stragglers or by mountains of unfinished work.
     pub maintenance_rotate_skipped_rows: Histogram<u64>,
     /// Maintenance ring prune attempts, attributed to (ring, outcome, reason).
-    /// reason="none" for Pruned/Noop/Blocked; otherwise carries the
-    /// SkipReason discriminator (e.g. "queue.active_leases",
+    /// Outcomes: `pruned`, `noop`, `blocked` (the exclusive locks were not
+    /// available within the prune lock timeout), `skipped_active`,
+    /// `backed_off` (the tick skipped prune while the ring's backoff after
+    /// consecutive `skipped_active` or `blocked` results ran down) and `error`. reason="none" except for `skipped_active`, which
+    /// carries the SkipReason discriminator (e.g. "queue.active_leases",
     /// "queue.pending_ready", "claim.open").
     pub maintenance_prune_attempts: Counter<u64>,
     /// Magnitude of the reason count when prune returns SkippedActive.
@@ -412,6 +421,11 @@ impl AwaMetrics {
                 .with_description("Promotion batch duration")
                 .with_unit("s")
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
+                .build(),
+            promotion_lane_contention: meter
+                .u64_counter(names::MAINTENANCE_PROMOTE_LANE_CONTENTION)
+                .with_description("Promotion lanes whose locks were busy, by state/queue/outcome")
+                .with_unit("{lane}")
                 .build(),
             jobs_in_flight: meter
                 .i64_up_down_counter(names::JOB_IN_FLIGHT)
@@ -771,6 +785,23 @@ impl AwaMetrics {
         self.promotion_batch_size.record(batch_size, &attrs);
         self.promotion_duration_seconds
             .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record a promotion lane whose locks were busy past the leader's wait
+    /// budget, with what became of it (`handed_off`, `waiter_limit`,
+    /// `waiter_timed_out`).
+    pub fn record_promotion_lane_contention(
+        &self,
+        state: &str,
+        queue: &str,
+        outcome: &'static str,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.state", state.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.promote.outcome", outcome),
+        ];
+        self.promotion_lane_contention.add(1, &attrs);
     }
 
     /// Record in-flight change.
@@ -1134,6 +1165,28 @@ impl AwaMetrics {
             .record(duration.as_secs_f64(), &attrs);
     }
 
+    /// Record a maintenance tick that skipped prune because the ring's
+    /// backoff after consecutive `skipped_active` or `blocked` results had not
+    /// yet elapsed.
+    pub fn record_prune_backed_off(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "backed_off");
+    }
+
+    /// Record a prune attempt that failed with a database error rather than
+    /// returning an outcome.
+    pub fn record_prune_error(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "error");
+    }
+
+    fn record_prune_attempt_without_reason(&self, ring: &'static str, outcome: &'static str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", ring),
+            opentelemetry::KeyValue::new("awa.ring.outcome", outcome),
+            opentelemetry::KeyValue::new("awa.ring.reason", "none"),
+        ];
+        self.maintenance_prune_attempts.add(1, &attrs);
+    }
+
     /// Record a ring prune outcome.
     pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
         let (label, reason, count) = match outcome {
@@ -1202,6 +1255,153 @@ mod tests {
             &["outbound".to_string()],
         );
         metrics.record_job_kind_info("minimal", None, None, None, None, &[]);
+    }
+
+    #[test]
+    fn prune_attempts_count_every_outcome_per_ring() {
+        use awa_model::{PruneOutcome, SkipReason};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        for ring in ["queue", "lease", "claim"] {
+            metrics.record_prune_outcome(
+                ring,
+                &PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 0,
+                },
+            );
+            metrics.record_prune_outcome(ring, &PruneOutcome::Blocked { slot: 0 });
+            metrics.record_prune_outcome(ring, &PruneOutcome::Noop);
+            metrics.record_prune_backed_off(ring);
+            metrics.record_prune_error(ring);
+        }
+        metrics.record_prune_outcome("claim", &PruneOutcome::Blocked { slot: 1 });
+        metrics.record_prune_outcome(
+            "claim",
+            &PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::ClaimOpen,
+                count: 3,
+            },
+        );
+        provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+
+        let mut counts: std::collections::BTreeMap<(String, String, String), u64> =
+            std::collections::BTreeMap::new();
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let (
+                        names::MAINTENANCE_PRUNE_ATTEMPTS,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    else {
+                        continue;
+                    };
+                    for point in sum.data_points() {
+                        let label = |key: &str| {
+                            point
+                                .attributes()
+                                .find(|attribute| attribute.key.as_str() == key)
+                                .map(|attribute| attribute.value.as_str().into_owned())
+                                .unwrap_or_default()
+                        };
+                        counts.insert(
+                            (
+                                label("awa.ring"),
+                                label("awa.ring.outcome"),
+                                label("awa.ring.reason"),
+                            ),
+                            point.value(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let count = |ring: &str, outcome: &str, reason: &str| {
+            counts
+                .get(&(ring.to_string(), outcome.to_string(), reason.to_string()))
+                .copied()
+        };
+        for ring in ["queue", "lease", "claim"] {
+            for outcome in ["pruned", "noop", "backed_off", "error"] {
+                assert_eq!(count(ring, outcome, "none"), Some(1), "{ring} {outcome}");
+            }
+            let expected_blocked = if ring == "claim" { 2 } else { 1 };
+            assert_eq!(
+                count(ring, "blocked", "none"),
+                Some(expected_blocked),
+                "{ring} blocked"
+            );
+        }
+        assert_eq!(count("claim", "skipped_active", "claim.open"), Some(1));
+        assert_eq!(count("queue", "skipped_active", "claim.open"), None);
+    }
+
+    #[test]
+    fn promotion_lane_contention_counts_each_outcome_per_state_and_queue() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_promotion_lane_contention("scheduled", "emails", "handed_off");
+        metrics.record_promotion_lane_contention("scheduled", "emails", "handed_off");
+        metrics.record_promotion_lane_contention("retryable", "emails", "waiter_limit");
+        metrics.record_promotion_lane_contention("scheduled", "billing", "waiter_timed_out");
+        provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+
+        let mut counts = BTreeMap::new();
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if let (
+                        names::MAINTENANCE_PROMOTE_LANE_CONTENTION,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    {
+                        for point in sum.data_points() {
+                            let label = |key: &str| {
+                                point
+                                    .attributes()
+                                    .find(|kv| kv.key.as_str() == key)
+                                    .map(|kv| kv.value.as_str().into_owned())
+                                    .unwrap_or_default()
+                            };
+                            counts.insert(
+                                (
+                                    label("awa.job.state"),
+                                    label("awa.job.queue"),
+                                    label("awa.promote.outcome"),
+                                ),
+                                point.value(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let key = |state: &str, queue: &str, outcome: &str| {
+            (state.to_string(), queue.to_string(), outcome.to_string())
+        };
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                (key("retryable", "emails", "waiter_limit"), 1),
+                (key("scheduled", "billing", "waiter_timed_out"), 1),
+                (key("scheduled", "emails", "handed_off"), 2),
+            ])
+        );
     }
 
     /// A second-scale observation must not fall in the SDK's default

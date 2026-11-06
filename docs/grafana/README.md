@@ -156,6 +156,7 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.maintenance.promote_batches` | Counter | state | Promotion batches |
 | `awa.maintenance.promote_batch_size` | Histogram | state | Jobs promoted |
 | `awa.maintenance.promote_duration` | Histogram (s) | state | Promotion time |
+| `awa.maintenance.promote.lane_contention` | Counter | state, queue, outcome | Promotion lanes whose lock was busy: `handed_off` to a dedicated waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out` when a waiter's 30 s wait ran out |
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
 | `awa.maintenance.analyze.attempts` | Counter | scope (`heads`, `ring_parent`, `pass`), outcome | Planner-statistics `ANALYZE` calls on the head tables and ring parents (`ok`, `skipped_privilege`, `skipped_lock`, `unavailable`, `failed`) |
 | `awa.maintenance.analyze.duration` | Histogram (s) | scope, outcome | Duration of one planner-statistics `ANALYZE` call |

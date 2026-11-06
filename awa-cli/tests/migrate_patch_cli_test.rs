@@ -321,12 +321,11 @@ fn psql(database_url: &str, sql: &str, lock_timeout: Option<&str>) -> Output {
     let mut child = command
         .spawn()
         .expect("psql must be on PATH for the exported-SQL test");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
+    // psql stops reading once ON_ERROR_STOP fires, which can be before the
+    // whole script is written.
+    if let Err(err) = child.stdin.take().unwrap().write_all(sql.as_bytes()) {
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+    }
     child.wait_with_output().unwrap()
 }
 
