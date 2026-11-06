@@ -6,6 +6,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Reduce running-count query work for partially closed compact receipt batches
+  by keeping closure membership lookups correlated.
+
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
