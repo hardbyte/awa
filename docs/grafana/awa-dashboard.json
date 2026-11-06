@@ -1,847 +1,4070 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_PROMETHEUS",
-      "label": "Prometheus",
-      "description": "Prometheus-compatible datasource receiving OTLP metrics from awa workers",
-      "type": "datasource",
-      "pluginId": "prometheus",
-      "pluginName": "Prometheus"
-    }
-  ],
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": []
+  },
+  "description": "Operator overview of an Awa job queue fleet: backlog and lag, promotion, throughput, failures, rescues, DLQ, maintenance leader and ring health. Drill into one queue with the Awa Queue Detail dashboard.",
   "editable": true,
   "graphTooltip": 1,
-  "links": [],
-  "templating": {
-    "list": [
-      {
-        "name": "queue",
-        "label": "Queue",
-        "type": "query",
-        "query": "label_values(awa_job_in_flight, awa_job_queue)",
-        "refresh": 2,
-        "multi": true,
-        "includeAll": true,
-        "current": {},
-        "datasource": { "uid": "${DS_PROMETHEUS}" }
-      },
-      {
-        "name": "awa_ui_url",
-        "label": "awa-ui base URL",
-        "description": "Base URL of the awa-ui admin site. Panels drill-link to awa-ui for transactional views (pause, retry, drain) this dashboard intentionally doesn't duplicate.",
-        "type": "textbox",
-        "query": "http://localhost:3000",
-        "current": { "value": "http://localhost:3000", "text": "http://localhost:3000" },
-        "hide": 0
-      }
-    ]
-  },
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": [
+        "awa"
+      ],
+      "title": "Awa dashboards",
+      "asDropdown": true,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
   "panels": [
+    {
+      "id": 105,
+      "type": "stat",
+      "title": "Oldest job",
+      "description": "Age of the oldest available job in the worst queue. The first signal that workers are not keeping up. It does not see jobs still in scheduled/retryable that are due but not yet promoted; see Deferred jobs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 120
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(max by (awa_job_queue) (awa_queue_lag_seconds{awa_job_queue=~\"$queue\"}))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 107,
+      "type": "stat",
+      "title": "DLQ",
+      "description": "Jobs currently in the dead-letter queue.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 3,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (awa_job_queue) (awa_job_dlq_depth{awa_job_queue=~\"$queue\"}))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
     {
       "id": 100,
       "type": "stat",
       "title": "Error rate",
       "description": "failed / (completed + failed) over the last 5 minutes.",
-      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 6,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "noValue": "0%",
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green",  "value": null },
-            { "color": "orange", "value": 0.01 },
-            { "color": "red",    "value": 0.05 }
-          ]}
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       },
       "targets": [
         {
           "expr": "sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[5m])) / clamp_min(sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[5m])) + sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[5m])), 1e-9)",
-          "legendFormat": "error rate"
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
-    },
-    {
-      "id": 101,
-      "type": "stat",
-      "title": "In-flight",
-      "description": "Total currently-executing jobs across all selected queues.",
-      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 0 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }]},
-          "links": [{ "title": "Open /runtime in awa-ui", "url": "${awa_ui_url}/runtime", "targetBlank": true }]
-        }
-      },
-      "targets": [
-        { "expr": "sum(awa_job_in_flight{awa_job_queue=~\"$queue\"})", "legendFormat": "in flight" }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
+      ]
     },
     {
       "id": 102,
       "type": "stat",
-      "title": "Throughput (1m)",
-      "description": "Completions per second averaged over the last minute.",
-      "gridPos": { "h": 4, "w": 5, "x": 10, "y": 0 },
+      "title": "Throughput",
+      "description": "Jobs completed per second, averaged over 5 minutes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 9,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }]}
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       },
       "targets": [
-        { "expr": "sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[1m]))", "legendFormat": "throughput" }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
+        {
+          "expr": "sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[5m]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
     },
     {
-      "id": 103,
+      "id": 101,
       "type": "stat",
-      "title": "Rescues (5m)",
-      "description": "Jobs rescued by heartbeat, deadline, or callback-timeout in the last 5 minutes. Non-zero means workers are losing grip of jobs.",
-      "gridPos": { "h": 4, "w": 5, "x": 15, "y": 0 },
+      "title": "In flight",
+      "description": "Jobs executing right now, across all runtimes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 12,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "noValue": "0",
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green",  "value": null },
-            { "color": "orange", "value": 1 },
-            { "color": "red",    "value": 10 }
-          ]}
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       },
       "targets": [
-        { "expr": "sum(increase(awa_maintenance_rescues_total[5m]))", "legendFormat": "rescues" }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
+        {
+          "expr": "sum(awa_job_in_flight{awa_job_queue=~\"$queue\"})",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 106,
+      "type": "stat",
+      "title": "Deferred",
+      "description": "Jobs in scheduled or retryable state, due or not. Compare with the promotion rate in Backlog & lag: a deferred count that keeps growing while promotion is flat is jobs piling up un-promoted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 15,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=~\"scheduled|retryable\"}))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "type": "stat",
+      "title": "Rescues 15m",
+      "description": "Jobs rescued by the maintenance leader (stale heartbeat, deadline, callback timeout) in the last 15 minutes. Anything non-zero is worth a look; see Rescues, DLQ & database retries for the kind.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 18,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(awa_maintenance_rescues_total[15m]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 104,
       "type": "stat",
-      "title": "Active runtimes",
-      "description": "Distinct runtime instances that emitted the in-flight gauge in the last minute. Falls to 0 if the whole fleet is down.",
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "title": "Runtimes",
+      "description": "Runtimes the database currently counts as alive, as reported by queue-storage-capable runtimes (largest capability group). Independent of metric label cardinality, so it stays correct when the pipeline drops per-instance labels.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "red",   "value": null },
-            { "color": "green", "value": 1 }
-          ]}
+          "noValue": "n/a",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       },
       "targets": [
-        { "expr": "count(count by (service_name, instance) (awa_job_in_flight))", "legendFormat": "runtimes" }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
+        {
+          "expr": "sum(max by (awa_storage_capability) (awa_storage_live_runtime_capability))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1004,
+      "type": "row",
+      "title": "Backlog & lag",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "panels": []
     },
     {
       "id": 110,
       "type": "timeseries",
-      "title": "Queue Lag",
-      "description": "Age of the oldest available job per queue. The #1 operator signal — jumps when workers can't keep up. Display name lifted in via the awa_queue_info join.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "title": "Queue lag",
+      "description": "Age of the oldest available job for the ten queues with the highest lag in the selected range; on queue storage, of the oldest next-to-claim job across its lanes. Click a series for the queue detail dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 },
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green",  "value": null },
-            { "color": "yellow", "value": 30 },
-            { "color": "red",    "value": 120 }
-          ]},
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 120
+              }
+            ]
+          },
           "links": [
-            { "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}", "targetBlank": true }
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
           ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "(awa_queue_lag_seconds{awa_job_queue=~\"$queue\"} * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info) or label_replace(awa_queue_lag_seconds{awa_job_queue=~\"$queue\"}, \"awa_queue_display_name\", \"$1\", \"awa_job_queue\", \"(.*)\")",
-          "legendFormat": "{{awa_queue_display_name}} ({{awa_job_queue}})"
+          "expr": "((max by (awa_job_queue) (awa_queue_lag_seconds{awa_job_queue=~\"$queue\"})) and on (awa_job_queue) topk(10, max_over_time((max by (awa_job_queue) (awa_queue_lag_seconds{awa_job_queue=~\"$queue\"}))[$__range:$__interval] @ end()))) * on (awa_job_queue) group_left (queue_label) (label_join(max by (awa_job_queue, awa_queue_display_name) (awa_queue_info{awa_queue_display_name!=\"\"}), \"queue_label\", \" · \", \"awa_queue_display_name\", \"awa_job_queue\") or on (awa_job_queue) label_replace(max by (awa_job_queue) (awa_queue_lag_seconds{awa_job_queue=~\"$queue\"}) * 0 + 1, \"queue_label\", \"$1\", \"awa_job_queue\", \"(.*)\"))",
+          "legendFormat": "{{queue_label}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
+      ]
+    },
+    {
+      "id": 112,
+      "type": "timeseries",
+      "title": "Deepest queues",
+      "description": "Total jobs across all states for the ten deepest queues in the selected range. Click a series for the queue detail dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_queue) (max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\"}))) and on (awa_job_queue) topk(10, max_over_time((sum by (awa_job_queue) (max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\"})))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 111,
       "type": "timeseries",
-      "title": "Queue Depth",
-      "description": "Stacked depth per queue and state. Backlog shape + execution pressure at a glance.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "title": "Queue depth by state",
+      "description": "Jobs per state across the selected queues, as published by the maintenance leader. 'available' is an upper bound (enqueued minus claimed); 'running' counts materialised leases only and can under-report on queue storage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "normal" } },
-          "links": [
-            { "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}", "targetBlank": true }
-          ]
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
         },
-        "overrides": [
-          { "matcher": { "id": "byRegexp", "options": "available" },        "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "running" },          "properties": [{ "id": "color", "value": { "fixedColor": "blue",   "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "failed" },           "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "retryable" },        "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "scheduled" },        "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "waiting_external" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
-        ]
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "expr": "awa_queue_depth{awa_job_queue=~\"$queue\"}",
-          "legendFormat": "{{awa_job_queue}} {{awa_job_state}}"
-        }
-      ],
-      "datasource": { "uid": "${DS_PROMETHEUS}" }
-    },
-    {
-      "collapsed": true,
-      "id": 200,
-      "type": "row",
-      "title": "Latency",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
-      "panels": [
-        {
-          "id": 201,
-          "type": "timeseries",
-          "title": "Job Wait Time (p50 / p95 / p99)",
-          "description": "Time from job creation to claim. Rising wait time with steady throughput = under-provisioned workers. Rising with steady workers = producer burst.",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
-          "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
-          "targets": [
-            { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
-            { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" },
-            { "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p99 {{awa_job_queue}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
-        },
-        {
-          "id": 202,
-          "type": "timeseries",
-          "title": "Job Duration (p50 / p95 / p99)",
-          "description": "Execution time per queue. A regression in duration usually precedes a backlog alert.",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
-          "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
-          "targets": [
-            { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
-            { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" },
-            { "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p99 {{awa_job_queue}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "expr": "sum by (awa_job_state) (max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\"}))",
+          "legendFormat": "{{awa_job_state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         }
       ]
     },
     {
-      "collapsed": true,
-      "id": 300,
-      "type": "row",
-      "title": "Throughput",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
-      "panels": [
+      "id": 1001,
+      "type": "timeseries",
+      "title": "Deferred backlog (scheduled + retryable)",
+      "description": "Jobs waiting for a future run_at, for the ten queue and state series with the highest backlog in the selected range. Rising while the lag stays low means work is accumulating un-promoted rather than starving workers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 8,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
         {
-          "id": 301,
-          "type": "timeseries",
-          "title": "Completions / failures / retries / cancellations",
-          "description": "Per-result rate across the selected queues.",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
-          "fieldConfig": {
-            "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "stacking": { "mode": "normal" } } },
-            "overrides": [
-              { "matcher": { "id": "byRegexp", "options": "completed" }, "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
-              { "matcher": { "id": "byRegexp", "options": "failed" },    "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
-              { "matcher": { "id": "byRegexp", "options": "retried" },   "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
-              { "matcher": { "id": "byRegexp", "options": "cancelled" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+          "expr": "((max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=~\"scheduled|retryable\"})) and on (awa_job_queue, awa_job_state) topk(10, max_over_time((max by (awa_job_queue, awa_job_state) (awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=~\"scheduled|retryable\"}))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_queue}} · {{awa_job_state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1002,
+      "type": "timeseries",
+      "title": "Promotion rate",
+      "description": "Jobs promoted from scheduled/retryable to available per second, by state. Not queue-scoped. Flat zero against a growing deferred backlog is a promotion stall.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_state) (rate(awa_maintenance_promote_batch_size_sum[$__rate_interval]))",
+          "legendFormat": "{{awa_job_state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1003,
+      "type": "timeseries",
+      "title": "Promotion batch size p99 / duration p99",
+      "description": "Size and duration of promotion batches. A batch size pinned at one value while the backlog grows points at a per-batch cap; a long duration points at the database. Quantiles need AWA 0.6.13 or later; earlier versions export buckets too coarse below 5 s, so use the mean.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
             ]
           },
-          "targets": [
-            { "expr": "sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "completed" },
-            { "expr": "sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",    "legendFormat": "failed" },
-            { "expr": "sum(rate(awa_job_retried_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",   "legendFormat": "retried" },
-            { "expr": "sum(rate(awa_job_cancelled_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "cancelled" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, awa_job_state) (rate(awa_maintenance_promote_batch_size_bucket[$__rate_interval])))",
+          "legendFormat": "size p99 {{awa_job_state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         },
         {
-          "id": 302,
-          "type": "timeseries",
-          "title": "Throughput by Queue (with display names)",
-          "description": "Completed jobs/s per queue with the declared display name lifted in via awa_queue_info. Falls back to raw queue name when no descriptor is declared.",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
-          "fieldConfig": {
-            "defaults": {
-              "unit": "ops",
-              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 },
-              "links": [
-                { "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}", "targetBlank": true }
-              ]
-            }
+          "expr": "histogram_quantile(0.99, sum by (le, awa_job_state) (rate(awa_maintenance_promote_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "duration p99 {{awa_job_state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "targets": [
-            {
-              "expr": "sum by (awa_job_queue, awa_queue_display_name) (\n  rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])\n  * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info\n) or label_replace(\n  sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])),\n  \"awa_queue_display_name\", \"$1\", \"awa_job_queue\", \"(.*)\"\n)",
-              "legendFormat": "{{awa_queue_display_name}} ({{awa_job_queue}})"
-            }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "refId": "B"
         },
         {
-          "id": 303,
-          "type": "timeseries",
-          "title": "Top 10 Kinds by Throughput",
-          "description": "Completed jobs/s broken down by kind, capped at the 10 busiest. Click through to /jobs?q=kind:... in awa-ui.",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
-          "fieldConfig": {
-            "defaults": {
-              "unit": "ops",
-              "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 80, "stacking": { "mode": "normal" } },
-              "links": [
-                { "title": "Open /jobs (kind filter) in awa-ui", "url": "${awa_ui_url}/jobs?q=kind:${__field.labels.awa_job_kind}", "targetBlank": true }
-              ]
-            }
+          "expr": "sum by (awa_job_state) (rate(awa_maintenance_promote_duration_seconds_sum[$__rate_interval])) / sum by (awa_job_state) (rate(awa_maintenance_promote_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "duration mean {{awa_job_state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "targets": [
-            { "expr": "topk(10, sum by (awa_job_kind) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "{{awa_job_kind}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "refId": "C"
         }
       ]
     },
     {
-      "collapsed": true,
-      "id": 400,
+      "id": 1010,
       "type": "row",
-      "title": "Worker internals",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
-      "panels": [
+      "title": "Throughput & failures",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "panels": []
+    },
+    {
+      "id": 301,
+      "type": "timeseries",
+      "title": "Completions / failures / retries / cancellations",
+      "description": "Jobs per second by outcome.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "noValue": "None in range"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "completed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "retried"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
         {
-          "id": 401,
-          "type": "timeseries",
-          "title": "Claim Latency (p50 / p95)",
-          "description": "Postgres dequeue query time per queue.",
-          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
-          "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
-          "targets": [
-            { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
-            { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "expr": "sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "completed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         },
         {
-          "id": 402,
-          "type": "timeseries",
-          "title": "Claim Batch Size",
-          "description": "Average jobs claimed per dispatch poll. High values indicate the claim loop is keeping up; 1s mean bursty traffic.",
-          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
-          "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } } },
-          "targets": [
+          "expr": "sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "failed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(awa_job_retried_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "retried",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(awa_job_cancelled_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "cancelled",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 1005,
+      "type": "timeseries",
+      "title": "Failure ratio by queue",
+      "description": "failed / (completed + failed) per queue. A queue failing while others are healthy is a handler or dependency problem, not a platform one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "links": [
             {
-              "expr": "sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_sum{awa_job_queue=~\"$queue\"}[$__rate_interval])) / clamp_min(sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_count{awa_job_queue=~\"$queue\"}[$__rate_interval])), 1e-9)",
-              "legendFormat": "avg {{awa_job_queue}}"
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
             }
           ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_queue) (rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])) / clamp_min(sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])) + sum by (awa_job_queue) (rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 302,
+      "type": "timeseries",
+      "title": "Throughput by queue",
+      "description": "Completed jobs per second for the ten busiest queues in the selected range, with display names from the queue descriptor.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))) and on (awa_job_queue) topk(10, max_over_time((sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))[$__range:$__interval] @ end()))) * on (awa_job_queue) group_left (queue_label) (label_join(max by (awa_job_queue, awa_queue_display_name) (awa_queue_info{awa_queue_display_name!=\"\"}), \"queue_label\", \" · \", \"awa_queue_display_name\", \"awa_job_queue\") or on (awa_job_queue) label_replace(max by (awa_job_queue) (awa_job_completed_total{awa_job_queue=~\"$queue\"}) * 0 + 1, \"queue_label\", \"$1\", \"awa_job_queue\", \"(.*)\"))",
+          "legendFormat": "{{queue_label}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 303,
+      "type": "timeseries",
+      "title": "Top 10 kinds by throughput",
+      "description": "Completed jobs per second for the ten job kinds with the highest rate in the selected range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_kind) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))) and on (awa_job_kind) topk(10, max_over_time((sum by (awa_job_kind) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1006,
+      "type": "timeseries",
+      "title": "In-flight by queue",
+      "description": "Executing jobs for the ten queues with the most in flight in the selected range. One queue holding most of the in-flight slots while another waits is the noisy-neighbour signature.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_queue) (awa_job_in_flight{awa_job_queue=~\"$queue\"})) and on (awa_job_queue) topk(10, max_over_time((sum by (awa_job_queue) (awa_job_in_flight{awa_job_queue=~\"$queue\"}))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1007,
+      "type": "timeseries",
+      "title": "Claim rate by queue",
+      "description": "Jobs claimed per second for the ten queues with the highest claim rate in the selected range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_queue) (rate(awa_job_claimed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))) and on (awa_job_queue) topk(10, max_over_time((sum by (awa_job_queue) (rate(awa_job_claimed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1008,
+      "type": "timeseries",
+      "title": "Top 10 kinds by failures",
+      "description": "Failed jobs per second for the ten job kinds with the highest rate in the selected range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_kind) (rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))) and on (awa_job_kind) topk(10, max_over_time((sum by (awa_job_kind) (rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1009,
+      "type": "timeseries",
+      "title": "Top 10 kinds by retries",
+      "description": "Retried jobs per second for the ten job kinds with the highest rate in the selected range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum by (awa_job_kind) (rate(awa_job_retried_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))) and on (awa_job_kind) topk(10, max_over_time((sum by (awa_job_kind) (rate(awa_job_retried_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))[$__range:$__interval] @ end())))",
+          "legendFormat": "{{awa_job_kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1011,
+      "type": "row",
+      "title": "Latency",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
+      "panels": []
+    },
+    {
+      "id": 201,
+      "type": "timeseries",
+      "title": "Job wait time (p50 / p95 / p99)",
+      "description": "Time from job creation to claim. Rising wait with steady throughput means under-provisioned workers; rising with steady workers means a producer burst.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 67
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         },
         {
-          "id": 403,
-          "type": "timeseries",
-          "title": "Maintenance Rescues",
-          "description": "Rate of rescued jobs by kind.",
-          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "stacking": { "mode": "normal" } } } },
-          "targets": [
-            { "expr": "sum by (awa_rescue_kind) (rate(awa_maintenance_rescues_total[$__rate_interval]))", "legendFormat": "{{awa_rescue_kind}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
         },
         {
-          "id": 404,
-          "type": "timeseries",
-          "title": "Completion Flush Performance",
-          "description": "Time per batched completion flush (p50/p95).",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
-          "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
-          "targets": [
-            { "expr": "histogram_quantile(0.50, sum by (le) (rate(awa_completion_flush_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 flush" },
-            { "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_completion_flush_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 flush" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 202,
+      "type": "timeseries",
+      "title": "Job duration (p50 / p95 / p99)",
+      "description": "Execution time per queue. A regression in duration usually precedes a backlog. Quantiles need AWA 0.6.13 or later; earlier versions export buckets too coarse below 5 s, so use the mean.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 67
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
         },
         {
-          "id": 405,
-          "type": "timeseries",
-          "title": "Promotion Throughput",
-          "description": "Rate of scheduled/retryable jobs promoted to available by the maintenance leader.",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 60, "stacking": { "mode": "normal" } } } },
-          "targets": [
-            { "expr": "sum by (awa_job_state) (rate(awa_maintenance_promote_batches_total[$__rate_interval]))", "legendFormat": "{{awa_job_state}} promoted/s" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+          "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
         },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (awa_job_queue) (rate(awa_job_duration_seconds_sum{awa_job_queue=~\"$queue\"}[$__rate_interval])) / sum by (awa_job_queue) (rate(awa_job_duration_seconds_count{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "mean {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 1015,
+      "type": "row",
+      "title": "Dispatcher & claims",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 77
+      },
+      "panels": []
+    },
+    {
+      "id": 401,
+      "type": "timeseries",
+      "title": "Claim latency (p50 / p95 / p99)",
+      "description": "Postgres dequeue query time per queue. A rise here with healthy Postgres CPU usually means contention between queues or a bloated claim path. Quantiles need AWA 0.6.13 or later; earlier versions export buckets too coarse below 5 s, so use the mean.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 0,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_sum{awa_job_queue=~\"$queue\"}[$__rate_interval])) / sum by (awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_count{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "mean {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 402,
+      "type": "timeseries",
+      "title": "Claim batch size",
+      "description": "Average jobs claimed per claim query.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 8,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_sum{awa_job_queue=~\"$queue\"}[$__rate_interval])) / clamp_min(sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_count{awa_job_queue=~\"$queue\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1012,
+      "type": "timeseries",
+      "title": "Wake to first claim (p95)",
+      "description": "Time from a dispatcher wake-up to its first claim attempt, by wake reason. Quantiles need AWA 0.6.13 or later; earlier versions export buckets too coarse below 5 s, so use the mean.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 16,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, awa_dispatch_reason) (rate(awa_dispatch_wake_to_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{awa_dispatch_reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (awa_dispatch_reason) (rate(awa_dispatch_wake_to_claim_duration_seconds_sum{awa_job_queue=~\"$queue\"}[$__rate_interval])) / sum by (awa_dispatch_reason) (rate(awa_dispatch_wake_to_claim_duration_seconds_count{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "mean {{awa_dispatch_reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 1013,
+      "type": "timeseries",
+      "title": "Dispatcher wake-ups by reason",
+      "description": "Wake-ups per second by reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_dispatch_reason) (rate(awa_dispatch_wakeups_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{awa_dispatch_reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1014,
+      "type": "timeseries",
+      "title": "Empty claims & rate-limited wakes",
+      "description": "Wakes that found no work despite free capacity, and wakes blocked by a rate limit. Persistent rate limiting explains a backlog with idle workers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_queue) (rate(awa_dispatch_empty_claims_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "empty {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (awa_job_queue) (rate(awa_dispatch_rate_limited_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "rate-limited {{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 404,
+      "type": "timeseries",
+      "title": "Completion flush (p50 / p95)",
+      "description": "Time per batched completion flush. Quantiles need AWA 0.6.13 or later; earlier versions export buckets too coarse below 5 s, so use the mean.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(awa_completion_flush_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 flush",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_completion_flush_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 flush",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        },
+        {
+          "expr": "sum (rate(awa_completion_flush_duration_seconds_sum[$__rate_interval])) / sum (rate(awa_completion_flush_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "mean flush",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 1021,
+      "type": "row",
+      "title": "Rescues, DLQ & database retries",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "panels": []
+    },
+    {
+      "id": 403,
+      "type": "timeseries",
+      "title": "Maintenance rescues by kind",
+      "description": "Jobs rescued per interval by kind: stale heartbeat (worker died), deadline (attempt ran past its deadline) and callback timeout. Not queue-scoped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_rescue_kind) (increase(awa_maintenance_rescues_total[$__rate_interval]))",
+          "legendFormat": "{{awa_rescue_kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1016,
+      "type": "timeseries",
+      "title": "DLQ inflow by queue & reason",
+      "description": "Jobs moved to the dead-letter queue per interval. Bulk admin moves carry no queue label and only appear while the queue filter is All.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ],
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_queue, awa_dlq_reason) (increase(awa_job_dlq_moved_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{awa_job_queue}} · {{awa_dlq_reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1017,
+      "type": "timeseries",
+      "title": "DLQ depth by queue",
+      "description": "Jobs currently in the dead-letter queue.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "links": [
+            {
+              "title": "Queue detail dashboard",
+              "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__field.labels.awa_job_queue}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}",
+              "targetBlank": false
+            },
+            {
+              "title": "Open queue in awa-ui",
+              "url": "${awa_ui_url}/queues/${__field.labels.awa_job_queue}",
+              "targetBlank": true
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max by (awa_job_queue) (awa_job_dlq_depth{awa_job_queue=~\"$queue\"})",
+          "legendFormat": "{{awa_job_queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1018,
+      "type": "timeseries",
+      "title": "DLQ retried / purged",
+      "description": "Jobs retried out of, or purged from, the dead-letter queue per interval.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "auto"
+          },
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(awa_job_dlq_retried_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "retried",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(awa_job_dlq_purged_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "purged",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 1019,
+      "type": "timeseries",
+      "title": "Completion retries (deadlock / reconnect)",
+      "description": "Finalize transactions re-run after a Postgres deadlock abort, and retries started after the database became unavailable (connection loss, pool timeout, failover). Any sustained rate is a database-side problem. The reconnect counter exists from 0.7.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(awa_completion_deadlock_retry_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "deadlock",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(awa_completion_reconnect_retry_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "reconnect",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 1020,
+      "type": "timeseries",
+      "title": "Jobs parked for callback",
+      "description": "Jobs parked waiting for an external callback, per second by kind.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "noValue": "None in range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_kind) (rate(awa_job_waiting_external_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{awa_job_kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1027,
+      "type": "row",
+      "title": "Maintenance leader",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 113
+      },
+      "panels": []
+    },
+    {
+      "id": 1022,
+      "type": "timeseries",
+      "title": "Instances running maintenance",
+      "description": "Number of series executing maintenance branches. Healthy is 1. Zero or no data means no leader is running maintenance (promotion, rescue, rotation and prune all stop); more than 1 is a handover window or a split.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 114
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "count(sum without (awa_maintenance_branch) (rate(awa_maintenance_branch_duration_seconds_count[$__rate_interval])) > 0)",
+          "legendFormat": "instances",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1023,
+      "type": "table",
+      "title": "Current maintenance leader",
+      "description": "Series that ran a maintenance branch in the last 5 minutes. The labels identify the leading runtime (instance, pod or service labels, depending on your pipeline).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 114
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": []
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "Value": true
+            },
+            "includeByName": {
+              "instance": true,
+              "pod": true,
+              "k8s_pod_name": true,
+              "service_instance_id": true,
+              "service_name": true,
+              "job": true
+            },
+            "renameByName": {
+              "instance": "Instance",
+              "pod": "Pod",
+              "k8s_pod_name": "Pod",
+              "service_instance_id": "Instance",
+              "service_name": "Service",
+              "job": "Job"
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "expr": "sum without (awa_maintenance_branch) (rate(awa_maintenance_branch_duration_seconds_count[5m])) > 0",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 1026,
+      "type": "timeseries",
+      "title": "Branch overrun episodes",
+      "description": "Transitions of a branch from on-time to running past its own tick interval.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 114
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_maintenance_branch) (increase(awa_maintenance_branch_overrun_total[$__rate_interval]))",
+          "legendFormat": "{{awa_maintenance_branch}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1024,
+      "type": "timeseries",
+      "title": "Branch executions",
+      "description": "Maintenance branch executions per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 122
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_maintenance_branch) (rate(awa_maintenance_branch_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{awa_maintenance_branch}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1025,
+      "type": "timeseries",
+      "title": "Branch duration p99",
+      "description": "Wall-clock time of each maintenance branch body. The branch loop is single-threaded, so one slow branch delays all the others.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 122
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, awa_maintenance_branch) (rate(awa_maintenance_branch_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{awa_maintenance_branch}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1028,
+      "type": "row",
+      "title": "Ring rotation & prune (queue-storage)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 132
+      },
+      "panels": []
+    },
+    {
+      "id": 701,
+      "type": "timeseries",
+      "title": "Rotation rate by ring + outcome",
+      "description": "Ring rotation attempts per second by ring (queue/lease/claim) and outcome. Healthy rings rotate on a regular cadence; pinned rings are dominated by skipped_busy.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 133
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_ring, awa_ring_outcome) (rate(awa_maintenance_rotate_attempts_total[$__rate_interval]))",
+          "legendFormat": "{{awa_ring}} · {{awa_ring_outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 702,
+      "type": "timeseries",
+      "title": "Rotation skip blockers (queue ring)",
+      "description": "What is pinning the queue ring when rotation is skipped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 133
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_ring_blocker) (rate(awa_maintenance_rotate_attempts_total{awa_ring=\"queue\", awa_ring_outcome=\"skipped_busy\"}[$__rate_interval]))",
+          "legendFormat": "{{awa_ring_blocker}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 703,
+      "type": "timeseries",
+      "title": "Rotation skip blocker presence p95",
+      "description": "p95 of the non-empty signal at the blocker when rotation is skipped. Indicates presence, not backlog magnitude.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 141
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, awa_ring, awa_ring_blocker) (rate(awa_maintenance_rotate_skipped_rows_bucket[$__rate_interval])))",
+          "legendFormat": "{{awa_ring}} · {{awa_ring_blocker}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 704,
+      "type": "timeseries",
+      "title": "Prune rate by ring + outcome",
+      "description": "Ring prune attempts per second by outcome.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 141
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_ring, awa_ring_outcome) (rate(awa_maintenance_prune_attempts_total[$__rate_interval]))",
+          "legendFormat": "{{awa_ring}} · {{awa_ring_outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 705,
+      "type": "timeseries",
+      "title": "Prune skip reasons (all rings)",
+      "description": "Why prune skipped an active partition.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 149
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_ring_reason) (rate(awa_maintenance_prune_attempts_total{awa_ring_outcome=\"skipped_active\"}[$__rate_interval]))",
+          "legendFormat": "{{awa_ring_reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 706,
+      "type": "timeseries",
+      "title": "Rotations per minute (generation derivative)",
+      "description": "Per-ring rotation cadence derived from the generation gauge.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 149
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "60 * deriv(max by (awa_ring) (awa_ring_generation)[$__rate_interval:])",
+          "legendFormat": "{{awa_ring}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 707,
+      "type": "timeseries",
+      "title": "Prune database phase latency p99",
+      "description": "Latency of the lock, truncate and commit phases of a destructive prune.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 149
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, awa_ring, awa_maintenance_phase) (rate(awa_maintenance_prune_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{awa_ring}} · {{awa_maintenance_phase}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1029,
+      "type": "row",
+      "title": "Job outputs & follow-ups (0.7+)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 157
+      },
+      "panels": [
         {
           "id": 406,
           "type": "timeseries",
-          "title": "Job Outputs (recorded / dropped)",
-          "description": "Job outputs (ADR-048) published per second by outcome, and outputs not published, by reason. A sustained schema_missing rate means a binary is running ahead of migration v052; too_large and invalid count recordings the handler made that were rejected.",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
+          "title": "Job outputs (recorded / dropped)",
+          "description": "Job outputs published per second by outcome, and outputs not published, by reason. A sustained schema_missing rate means a binary is running ahead of its migration.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 158
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
           "targets": [
-            { "expr": "sum by (awa_job_outcome) (rate(awa_job_output_recorded_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "recorded {{awa_job_outcome}}" },
-            { "expr": "sum by (awa_output_reason) (rate(awa_job_output_dropped_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "dropped {{awa_output_reason}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "sum by (awa_job_outcome) (rate(awa_job_output_recorded_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "recorded {{awa_job_outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (awa_output_reason) (rate(awa_job_output_dropped_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "dropped {{awa_output_reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "B"
+            }
+          ]
         },
         {
           "id": 407,
           "type": "timeseries",
-          "title": "Job Output Size (p50 / p95)",
-          "description": "Size of published job outputs in bytes of JSON text. Outputs are capped at 4 KiB; large outputs make compact completion batches hold fewer jobs.",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
-          "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
+          "title": "Job output size (p50 / p95)",
+          "description": "Size of published outputs in bytes of JSON text.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 158
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
           "targets": [
-            { "expr": "histogram_quantile(0.50, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50" },
-            { "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p50",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "p95",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "B"
+            }
+          ]
         },
         {
           "id": 408,
           "type": "timeseries",
-          "title": "Staged Follow-ups (inserted / duplicate / discarded)",
-          "description": "Handler-staged follow-ups (ADR-046) per second, by what their attempt came to: inserted with the completion, skipped as a duplicate of an existing unique key, or discarded because the handler returned WaitForCallback. Discards are almost always a handler bug.",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
+          "title": "Staged follow-ups (inserted / duplicate / discarded)",
+          "description": "Handler-staged follow-ups per second by result, and follow-ups discarded because the handler returned WaitForCallback (almost always a handler bug).",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 166
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
           "targets": [
-            { "expr": "sum by (awa_follow_up_result) (rate(awa_job_staged_follow_ups_committed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "{{awa_follow_up_result}}" },
-            { "expr": "sum(rate(awa_job_staged_follow_ups_discarded_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "discarded" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "sum by (awa_follow_up_result) (rate(awa_job_staged_follow_ups_committed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{awa_follow_up_result}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(awa_job_staged_follow_ups_discarded_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "discarded",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "B"
+            }
+          ]
         }
       ]
     },
     {
-      "collapsed": true,
-      "id": 500,
+      "id": 1030,
       "type": "row",
       "title": "Descriptor catalogs (summary; full tables in awa-ui)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 158
+      },
       "panels": [
         {
           "id": 501,
           "type": "table",
-          "title": "Declared queues · joins to runtime metrics via awa_queue_info",
-          "description": "awa_queue_info is always 1; it's a label-join target. Full queue table (with pause/drain actions) lives at /queues in awa-ui.",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "title": "Declared queues",
+          "description": "awa_queue_info is always 1; it is a label-join target. The full queue table, with pause/drain actions, lives in awa-ui.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 159
+          },
           "fieldConfig": {
-            "defaults": { "custom": { "align": "left" } },
+            "defaults": {
+              "custom": {
+                "align": "left"
+              }
+            },
             "overrides": [
-              { "matcher": { "id": "byName", "options": "awa_job_queue" },         "properties": [{ "id": "displayName", "value": "queue" }, { "id": "custom.width", "value": 180 }, { "id": "links", "value": [{ "title": "Open in awa-ui", "url": "${awa_ui_url}/queues/${__value.text}", "targetBlank": true }]}] },
-              { "matcher": { "id": "byName", "options": "awa_queue_display_name" }, "properties": [{ "id": "displayName", "value": "display name" }, { "id": "custom.width", "value": 200 }] },
-              { "matcher": { "id": "byName", "options": "awa_queue_owner" },        "properties": [{ "id": "displayName", "value": "owner" }, { "id": "custom.width", "value": 160 }] },
-              { "matcher": { "id": "byName", "options": "awa_queue_tags" },         "properties": [{ "id": "displayName", "value": "tags" }] },
-              { "matcher": { "id": "byName", "options": "awa_queue_docs_url" },     "properties": [{ "id": "displayName", "value": "docs" }] },
-              { "matcher": { "id": "byName", "options": "Value" },                   "properties": [{ "id": "custom.hidden", "value": true }] }
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_job_queue"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "queue"
+                  },
+                  {
+                    "id": "custom.width",
+                    "value": 180
+                  },
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "title": "Queue detail dashboard",
+                        "url": "/d/awa-queue-detail/awa-queue-detail?var-queue=${__value.text}&${__url_time_range}&${datasource:queryparam}&${filters:queryparam}"
+                      },
+                      {
+                        "title": "Open in awa-ui",
+                        "url": "${awa_ui_url}/queues/${__value.text}",
+                        "targetBlank": true
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_queue_display_name"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "display name"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_queue_owner"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "owner"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_queue_tags"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "tags"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_queue_docs_url"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "docs"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Value"
+                },
+                "properties": [
+                  {
+                    "id": "custom.hidden",
+                    "value": true
+                  }
+                ]
+              }
             ]
           },
           "transformations": [
-            { "id": "labelsToFields", "options": { "mode": "columns" } },
-            { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true, "awa_queue_description": true }, "indexByName": {} } }
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true
+                }
+              }
+            }
           ],
           "targets": [
-            { "expr": "awa_queue_info", "instant": true, "format": "table", "legendFormat": "" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "max by (awa_job_queue, awa_queue_display_name, awa_queue_owner, awa_queue_tags, awa_queue_docs_url) (awa_queue_info)",
+              "legendFormat": "",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A",
+              "instant": true,
+              "format": "table"
+            }
+          ]
         },
         {
           "id": 502,
           "type": "table",
-          "title": "Declared job kinds · joins to runtime metrics via awa_job_kind_info",
-          "description": "awa_job_kind_info is always 1; it's a label-join target for per-kind panels. Full kind table with per-kind metadata lives at /kinds in awa-ui.",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "title": "Declared job kinds",
+          "description": "awa_job_kind_info is always 1; it is a label-join target.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 159
+          },
           "fieldConfig": {
-            "defaults": { "custom": { "align": "left" } },
+            "defaults": {
+              "custom": {
+                "align": "left"
+              }
+            },
             "overrides": [
-              { "matcher": { "id": "byName", "options": "awa_job_kind" },              "properties": [{ "id": "displayName", "value": "kind" }, { "id": "custom.width", "value": 200 }, { "id": "links", "value": [{ "title": "Open in awa-ui", "url": "${awa_ui_url}/jobs?q=kind:${__value.text}", "targetBlank": true }]}] },
-              { "matcher": { "id": "byName", "options": "awa_job_kind_display_name" }, "properties": [{ "id": "displayName", "value": "display name" }, { "id": "custom.width", "value": 200 }] },
-              { "matcher": { "id": "byName", "options": "awa_job_kind_owner" },        "properties": [{ "id": "displayName", "value": "owner" }, { "id": "custom.width", "value": 160 }] },
-              { "matcher": { "id": "byName", "options": "awa_job_kind_tags" },         "properties": [{ "id": "displayName", "value": "tags" }] },
-              { "matcher": { "id": "byName", "options": "awa_job_kind_docs_url" },     "properties": [{ "id": "displayName", "value": "docs" }] },
-              { "matcher": { "id": "byName", "options": "Value" },                     "properties": [{ "id": "custom.hidden", "value": true }] }
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_job_kind"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "kind"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_job_kind_display_name"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "display name"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_job_kind_owner"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "owner"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_job_kind_tags"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "tags"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_job_kind_docs_url"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "docs"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Value"
+                },
+                "properties": [
+                  {
+                    "id": "custom.hidden",
+                    "value": true
+                  }
+                ]
+              }
             ]
           },
           "transformations": [
-            { "id": "labelsToFields", "options": { "mode": "columns" } },
-            { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true, "awa_job_kind_description": true }, "indexByName": {} } }
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true
+                }
+              }
+            }
           ],
           "targets": [
-            { "expr": "awa_job_kind_info", "instant": true, "format": "table", "legendFormat": "" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "max by (awa_job_kind, awa_job_kind_display_name, awa_job_kind_owner, awa_job_kind_tags, awa_job_kind_docs_url) (awa_job_kind_info)",
+              "legendFormat": "",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A",
+              "instant": true,
+              "format": "table"
+            }
+          ]
         }
       ]
     },
     {
-      "collapsed": true,
-      "id": 600,
+      "id": 1031,
       "type": "row",
       "title": "Storage transition",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 159
+      },
       "panels": [
         {
           "id": 601,
           "type": "table",
           "title": "Current storage transition state",
-          "description": "One-hot state/engine gauge exported by queue-storage-capable runtimes. Use this to distinguish steady-state canonical operation from prepared or mixed-transition rollout windows.",
-          "gridPos": { "h": 7, "w": 10, "x": 0, "y": 25 },
+          "description": "One-hot state/engine gauge exported by queue-storage-capable runtimes. Distinguishes steady-state operation from prepared or mixed-transition rollout windows.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 10,
+            "x": 0,
+            "y": 160
+          },
           "fieldConfig": {
-            "defaults": { "custom": { "align": "left" } },
+            "defaults": {
+              "custom": {
+                "align": "left"
+              }
+            },
             "overrides": [
-              { "matcher": { "id": "byName", "options": "awa_storage_state" }, "properties": [{ "id": "displayName", "value": "state" }] },
-              { "matcher": { "id": "byName", "options": "awa_storage_current_engine" }, "properties": [{ "id": "displayName", "value": "current engine" }] },
-              { "matcher": { "id": "byName", "options": "awa_storage_active_engine" }, "properties": [{ "id": "displayName", "value": "active engine" }] },
-              { "matcher": { "id": "byName", "options": "awa_storage_prepared_engine" }, "properties": [{ "id": "displayName", "value": "prepared engine" }] },
-              { "matcher": { "id": "byName", "options": "Value" }, "properties": [{ "id": "custom.hidden", "value": true }] }
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_storage_state"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "state"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_storage_current_engine"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "current engine"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_storage_active_engine"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "active engine"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "awa_storage_prepared_engine"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "prepared engine"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Value"
+                },
+                "properties": [
+                  {
+                    "id": "custom.hidden",
+                    "value": true
+                  }
+                ]
+              }
             ]
           },
           "transformations": [
-            { "id": "labelsToFields", "options": { "mode": "columns" } },
-            { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true }, "indexByName": {} } }
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true
+                }
+              }
+            }
           ],
           "targets": [
-            { "expr": "awa_storage_state", "instant": true, "format": "table", "legendFormat": "" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "max by (awa_storage_state, awa_storage_current_engine, awa_storage_active_engine, awa_storage_prepared_engine) (awa_storage_state)",
+              "legendFormat": "",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A",
+              "instant": true,
+              "format": "table"
+            }
+          ]
         },
         {
           "id": 602,
           "type": "stat",
           "title": "Canonical live backlog",
-          "description": "Jobs still live in canonical tables. Must reach zero before finalize is safe.",
-          "gridPos": { "h": 7, "w": 4, "x": 10, "y": 25 },
+          "description": "Jobs still live on the canonical engine during a storage transition.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 5,
+            "x": 10,
+            "y": 160
+          },
           "fieldConfig": {
             "defaults": {
               "unit": "short",
-              "thresholds": { "mode": "absolute", "steps": [
-                { "color": "green", "value": null },
-                { "color": "orange", "value": 1 }
-              ]}
+              "noValue": "0",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
             }
           },
           "targets": [
-            { "expr": "max(awa_storage_canonical_live_backlog)", "legendFormat": "backlog" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "max(awa_storage_canonical_live_backlog)",
+              "legendFormat": "",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A"
+            }
+          ]
         },
         {
           "id": 603,
           "type": "stat",
           "title": "Enter mixed transition",
-          "description": "1 means the fleet is ready to flip routing into queue storage. 0 means a blocker remains.",
-          "gridPos": { "h": 7, "w": 5, "x": 14, "y": 25 },
+          "description": "1 when the transition into mixed mode is ready.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 4,
+            "x": 15,
+            "y": 160
+          },
           "fieldConfig": {
             "defaults": {
-              "unit": "none",
-              "mappings": [
-                { "type": "value", "options": { "0": { "text": "Blocked" }, "1": { "text": "Ready" } } }
+              "unit": "short",
+              "noValue": "0",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
               ],
-              "thresholds": { "mode": "absolute", "steps": [
-                { "color": "red", "value": null },
-                { "color": "green", "value": 1 }
-              ]}
+              "fields": "",
+              "values": false
             }
           },
           "targets": [
-            { "expr": "max(awa_storage_transition_ready{awa_storage_action=\"enter_mixed_transition\"})", "legendFormat": "enter-mixed-transition" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "max(awa_storage_transition_ready{awa_storage_action=\"enter_mixed_transition\"})",
+              "legendFormat": "",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A"
+            }
+          ]
         },
         {
           "id": 604,
           "type": "stat",
           "title": "Finalize",
-          "description": "1 means canonical backlog and runtime-capability gates are clear for finalization.",
-          "gridPos": { "h": 7, "w": 5, "x": 19, "y": 25 },
+          "description": "1 when the transition is ready to finalize.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 5,
+            "x": 19,
+            "y": 160
+          },
           "fieldConfig": {
             "defaults": {
-              "unit": "none",
-              "mappings": [
-                { "type": "value", "options": { "0": { "text": "Blocked" }, "1": { "text": "Ready" } } }
+              "unit": "short",
+              "noValue": "0",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
               ],
-              "thresholds": { "mode": "absolute", "steps": [
-                { "color": "red", "value": null },
-                { "color": "green", "value": 1 }
-              ]}
+              "fields": "",
+              "values": false
             }
           },
           "targets": [
-            { "expr": "max(awa_storage_transition_ready{awa_storage_action=\"finalize\"})", "legendFormat": "finalize" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
+            {
+              "expr": "max(awa_storage_transition_ready{awa_storage_action=\"finalize\"})",
+              "legendFormat": "",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "refId": "A"
+            }
+          ]
         },
         {
           "id": 605,
           "type": "timeseries",
           "title": "Live runtime capability counts",
-          "description": "How many live runtimes currently report each storage capability. During mixed rollout you should see queue_storage targets before the routing flip, then canonical_drain_only fall to zero before finalize.",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+          "description": "Live runtimes reporting each storage capability. During a mixed rollout queue_storage rises before the routing flip and canonical_drain_only falls to zero before finalize.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 167
+          },
           "fieldConfig": {
             "defaults": {
               "unit": "short",
-              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
-            }
-          },
-          "targets": [
-            { "expr": "awa_storage_live_runtime_capability", "legendFormat": "{{awa_storage_capability}}" }
-          ],
-          "datasource": { "uid": "${DS_PROMETHEUS}" }
-        }
-      ]
-    }
-  ,
-    {
-      "id": 700,
-      "type": "row",
-      "title": "Ring rotation & prune (queue-storage)",
-      "collapsed": false,
-      "gridPos": {
-        "x": 0,
-        "y": 41,
-        "w": 24,
-        "h": 1
-      },
-      "panels": [
-        {
-          "id": 701,
-          "type": "timeseries",
-          "title": "Rotation rate by ring + outcome",
-          "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Healthy rings show non-zero `rotated` on a regular cadence; pinned rings dominate `skipped_busy`.",
-          "gridPos": {
-            "x": 0,
-            "y": 42,
-            "w": 12,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2,
-                "fillOpacity": 10
-              },
-              "unit": "ops"
+                "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
             }
           },
           "targets": [
             {
-              "expr": "sum by(awa_ring, awa_ring_outcome) (rate(awa_maintenance_rotate_attempts_total[1m]))",
-              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_outcome}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "id": 702,
-          "type": "timeseries",
-          "title": "Rotation skip blockers (queue ring)",
-          "description": "When queue rotation is SkippedBusy, which queue/lease/claim partition family held it. These are bounded presence signals, not exact row counts.",
-          "gridPos": {
-            "x": 12,
-            "y": 42,
-            "w": 12,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "lineWidth": 2,
-                "fillOpacity": 10
+              "expr": "max by (awa_storage_capability) (awa_storage_live_runtime_capability)",
+              "legendFormat": "{{awa_storage_capability}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
               },
-              "unit": "ops"
+              "refId": "A"
             }
-          },
-          "targets": [
-            {
-              "expr": "sum by(awa_ring_blocker) (rate(awa_maintenance_rotate_attempts_total{awa_ring=\"queue\", awa_ring_outcome=\"skipped_busy\"}[1m]))",
-              "legendFormat": "{{awa_ring_blocker}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "id": 703,
-          "type": "timeseries",
-          "title": "Rotation skip blocker presence p95",
-          "description": "p95 non-empty signal seen at the blocker side when rotation is SkippedBusy. Values are bounded to indicate presence; use queue depth and partition size panels for backlog magnitude.",
-          "gridPos": {
-            "x": 0,
-            "y": 50,
-            "w": 12,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "lineWidth": 2,
-                "fillOpacity": 10
-              },
-              "unit": "short"
-            }
-          },
-          "targets": [
-            {
-              "expr": "histogram_quantile(0.95, sum by(le, awa_ring, awa_ring_blocker) (rate(awa_maintenance_rotate_skipped_rows_bucket[5m])))",
-              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_blocker}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "id": 704,
-          "type": "timeseries",
-          "title": "Prune rate by ring + outcome",
-          "description": "Ring prune attempts/sec by outcome. `pruned` = destructive reclaim. `already_pruned` = idle tick avoided repeat DDL. `skipped_active` = target still live. `blocked` = lock contention.",
-          "gridPos": {
-            "x": 12,
-            "y": 50,
-            "w": 12,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "lineWidth": 2,
-                "fillOpacity": 10
-              },
-              "unit": "ops"
-            }
-          },
-          "targets": [
-            {
-              "expr": "sum by(awa_ring, awa_ring_outcome) (rate(awa_maintenance_prune_attempts_total[1m]))",
-              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_outcome}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "id": 705,
-          "type": "timeseries",
-          "title": "Prune skip reasons (all rings)",
-          "description": "When prune returns SkippedActive, which gate fired? `queue.active_leases` = leases on prior generation. `queue.pending_ready` = ready rows without matching done. `claim.open` = open receipt-plane claims. `lease.current`/`claim.current` = rotator race (benign if rare).",
-          "gridPos": {
-            "x": 0,
-            "y": 58,
-            "w": 12,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "lineWidth": 2,
-                "fillOpacity": 10
-              },
-              "unit": "ops"
-            }
-          },
-          "targets": [
-            {
-              "expr": "sum by(awa_ring_reason) (rate(awa_maintenance_prune_attempts_total{awa_ring_outcome=\"skipped_active\"}[1m]))",
-              "legendFormat": "{{awa_ring_reason}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "id": 706,
-          "type": "timeseries",
-          "title": "Rotations per minute (generation derivative)",
-          "description": "Rate of ring generation advance. Headline 'is rotation working' signal \u2014 flat at zero with non-zero `skipped_busy` traffic above means the ring is pinned.",
-          "gridPos": {
-            "x": 12,
-            "y": 58,
-            "w": 12,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "lineWidth": 2,
-                "fillOpacity": 10
-              },
-              "unit": "opm"
-            }
-          },
-          "targets": [
-            {
-              "expr": "60 * deriv(awa_ring_generation[1m])",
-              "legendFormat": "{{awa_ring}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "id": 707,
-          "type": "timeseries",
-          "title": "Prune database phase latency p99",
-          "description": "Successful destructive prune latency split by explicit child lock, TRUNCATE, and COMMIT. A high truncate phase with low lock time points to database storage/WAL latency rather than relation contention.",
-          "gridPos": {
-            "x": 0,
-            "y": 66,
-            "w": 24,
-            "h": 8
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "lineWidth": 2,
-                "fillOpacity": 10
-              },
-              "unit": "s"
-            }
-          },
-          "targets": [
-            {
-              "expr": "histogram_quantile(0.99, sum by(le, awa_ring, awa_maintenance_phase) (rate(awa_maintenance_prune_duration_seconds_bucket[5m])))",
-              "legendFormat": "{{awa_ring}} · {{awa_maintenance_phase}}"
-            }
-          ],
-          "datasource": {
-            "uid": "${DS_PROMETHEUS}"
-          }
+          ]
         }
       ]
     }
   ],
+  "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["awa", "job-queue"],
-  "time": { "from": "now-5m", "to": "now" },
+  "tags": [
+    "awa",
+    "job-queue"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "description": "Prometheus-compatible datasource receiving awa's OTLP metrics.",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "queue",
+        "label": "Queue",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"awa_queue_depth|awa_job_in_flight|awa_job_completed_total\", awa_job_queue!=\"\"}, awa_job_queue)",
+          "refId": "queue"
+        },
+        "definition": "label_values({__name__=~\"awa_queue_depth|awa_job_in_flight|awa_job_completed_total\", awa_job_queue!=\"\"}, awa_job_queue)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {},
+        "sort": 1,
+        "regex": ""
+      },
+      {
+        "name": "filters",
+        "label": "Filters",
+        "type": "adhoc",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "description": "Optional label filters applied to every query, for example an environment, cluster, namespace or service label that your metrics pipeline attaches to awa's series.",
+        "filters": [],
+        "baseFilters": [],
+        "hide": 0
+      },
+      {
+        "name": "awa_ui_url",
+        "label": "awa-ui base URL",
+        "type": "textbox",
+        "description": "Base URL of the awa-ui admin site. Panels link to awa-ui for the transactional views (pause, retry, drain) these dashboards deliberately do not duplicate.",
+        "query": "http://localhost:3000",
+        "current": {
+          "value": "http://localhost:3000",
+          "text": "http://localhost:3000"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "",
   "title": "Awa Job Queue",
   "uid": "awa-job-queue",
-  "version": 5,
-  "refresh": "30s"
+  "version": 6
 }
