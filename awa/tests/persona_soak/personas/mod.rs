@@ -1,6 +1,7 @@
 //! The personas. Each one owns its queues, job kinds, runtimes and producers, and
 //! reports what it did through [`Shared::stats`].
 
+pub mod abandon;
 pub mod alex;
 pub mod chaos;
 pub mod fanout;
@@ -46,15 +47,30 @@ pub fn tune(builder: ClientBuilder, shared: &Shared) -> ClientBuilder {
     } else {
         builder
     };
+    let builder = timings(builder);
+    match shared.config.rescue_interval {
+        Some(interval) => builder
+            .heartbeat_rescue_interval(interval)
+            .deadline_rescue_interval(interval),
+        None => builder,
+    }
+}
+
+/// The timings of [`tune`] that do not depend on the run, for runtimes that live in a
+/// process of their own.
+pub fn timings(builder: ClientBuilder) -> ClientBuilder {
     builder
         .heartbeat_interval(Duration::from_secs(2))
-        .heartbeat_staleness(Duration::from_secs(12))
+        .heartbeat_staleness(Duration::from_secs(HEARTBEAT_STALENESS_SECS))
         .heartbeat_rescue_interval(Duration::from_secs(3))
         .deadline_rescue_interval(Duration::from_secs(2))
         .promote_interval(Duration::from_millis(250))
         .runtime_snapshot_interval(Duration::from_secs(5))
         .dlq_enabled_by_default(true)
 }
+
+/// Seconds without a heartbeat after which a claim is eligible for rescue.
+pub const HEARTBEAT_STALENESS_SECS: u64 = 12;
 
 pub fn queue(max_workers: u32) -> QueueConfig {
     QueueConfig {

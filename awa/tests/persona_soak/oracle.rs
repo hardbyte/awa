@@ -574,8 +574,19 @@ impl Oracle {
                 .shared
                 .python_active
                 .load(std::sync::atomic::Ordering::Relaxed);
+            // Claims abandoned by a killed process sit in no table the live count reads.
+            let abandoned_open = self
+                .shared
+                .abandon
+                .open_claims
+                .load(std::sync::atomic::Ordering::Relaxed);
             match live {
-                Ok(count) if in_flight == 0 && python_active == 0 && count_is_idle(count) => {
+                Ok(count)
+                    if in_flight == 0
+                        && python_active == 0
+                        && abandoned_open == 0
+                        && count_is_idle(count) =>
+                {
                     quiet_polls += 1
                 }
                 _ => quiet_polls = 0,

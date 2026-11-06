@@ -31,3 +31,12 @@ async fn persona_soak() {
         shared.config.report_dir.display()
     );
 }
+
+/// The claiming process of the claim-and-abandon persona. The harness runs this test binary
+/// again with only this test selected and kills the process with SIGKILL; started any
+/// other way it returns at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run by the claim-and-abandon persona as a separate process"]
+async fn claim_abandon_child() {
+    persona_soak::personas::abandon::run_child().await;
+}

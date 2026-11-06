@@ -131,6 +131,8 @@ pub struct Shared {
     pub fleets: Mutex<HashMap<String, Arc<Fleet>>>,
     /// State of the shard-ops persona and the checks that go with it.
     pub shardops: super::shard_oracle::ShardOpsState,
+    /// State of the claim-and-abandon persona and the checks that go with it.
+    pub abandon: super::abandon_oracle::AbandonState,
     chaos_until_ms: AtomicI64,
 }
 
@@ -160,6 +162,7 @@ impl Shared {
             python: Mutex::new(None),
             fleets: Mutex::new(HashMap::new()),
             shardops: Default::default(),
+            abandon: Default::default(),
             chaos_until_ms: AtomicI64::new(0),
         })
     }

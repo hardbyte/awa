@@ -11,7 +11,7 @@
 # Environment:
 #   AWA_SOAK_SECONDS          load phase length per engine (default 900)
 #   AWA_SOAK_PERSONAS         comma list, default all of mia,tom,priya,sam,alex,chaos,
-#                             watchers,support,uiops,impatient,python,fanout,shardops
+#                             watchers,support,uiops,impatient,python,fanout,shardops,abandon
 #   AWA_SOAK_SEED             fixes the workload mix and chaos schedule
 #   AWA_SOAK_SCALE            multiplies rates and queue counts (default 1)
 #   AWA_SOAK_SHARDOPS_SCALE   multiplies the shardops persona's rates on its own (default 1)
@@ -19,6 +19,17 @@
 #                             1 (default) lets the shardops application roles create objects in
 #                             the schema, so lanes are created on the fly; 0 withholds schema
 #                             CREATE and has the operator provision lanes before raising a count
+#   AWA_SOAK_ABANDON_CLAIMS   claims held by each killed process of the abandon persona (default 4000;
+#                             25000 or more reproduces a large abandoned-claim backlog)
+#   AWA_SOAK_ABANDON_KILLS, AWA_SOAK_ABANDON_KILL_SECONDS
+#                             how many processes are SIGKILLed (default 4) and the seconds between
+#                             kills (default 180)
+#   AWA_SOAK_ABANDON_BOUND_SECONDS
+#                             seconds after a kill within which the rescue backlog must clear and the
+#                             claim ring must be free to rotate (default 120)
+#   AWA_SOAK_RESCUE_INTERVAL_SECONDS
+#                             heartbeat and deadline rescue interval of every runtime (default: the
+#                             harness's 3 s and 2 s; the library default for heartbeat rescue is 30 s)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
@@ -27,6 +38,8 @@
 #                             -epqlog5 build, which logs every partition-pruning setup with its
 #                             query text, is opt-in for diagnosing pruning crashes)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
+#                             (neither is needed without the UI and python personas)
+#   SOAK_TEST_BIN             a prebuilt harness binary to run instead of `cargo test`
 #   CARGO_TARGET_DIR          cargo target directory, as for any cargo build
 #
 # The admin UI personas drive the real `awa serve` binary and the python persona runs
@@ -148,6 +161,12 @@ sample_stats() {
   done
 }
 
+if [ -n "${SOAK_TEST_BIN:-}" ]; then
+  harness_cmd=("$SOAK_TEST_BIN" persona_soak --ignored --nocapture --exact)
+else
+  harness_cmd=(cargo test --release -p awa --test persona_soak_test -- --ignored --nocapture)
+fi
+
 overall=0
 for index in "${!ENGINES[@]}"; do
   engine="${ENGINES[$index]}"
@@ -171,8 +190,7 @@ for index in "${!ENGINES[@]}"; do
     AWA_SOAK_SECONDS="$SECONDS_PER_ENGINE" \
     AWA_SOAK_REPORT_DIR="$out" \
     "${log_env[@]}" \
-    cargo test --release -p awa --test persona_soak_test -- --ignored --nocapture \
-    >"$out/run.log" 2>&1
+    "${harness_cmd[@]}" >"$out/run.log" 2>&1
   status=$?
 
   kill "$STATS_PID" 2>/dev/null

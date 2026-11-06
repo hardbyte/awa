@@ -1,6 +1,7 @@
 //! Persona-driven soak harness with an invariant oracle. See the test binary
 //! `persona_soak_test.rs` for how to run it.
 
+pub mod abandon_oracle;
 pub mod adminserver;
 pub mod config;
 pub mod db;

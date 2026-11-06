@@ -24,10 +24,12 @@ pub enum Persona {
     /// An operator changing `enqueue_shards` on hot queues under live load, with the
     /// actors running as different non-superuser roles.
     ShardOps,
+    /// A separate process that claims as much as it can and is SIGKILLed again and again.
+    ClaimAbandon,
 }
 
 impl Persona {
-    pub const ALL: [Persona; 13] = [
+    pub const ALL: [Persona; 14] = [
         Persona::Mia,
         Persona::Tom,
         Persona::Priya,
@@ -41,6 +43,7 @@ impl Persona {
         Persona::Python,
         Persona::Fanout,
         Persona::ShardOps,
+        Persona::ClaimAbandon,
     ];
 
     pub fn name(self) -> &'static str {
@@ -58,6 +61,7 @@ impl Persona {
             Persona::Python => "python",
             Persona::Fanout => "fanout",
             Persona::ShardOps => "shardops",
+            Persona::ClaimAbandon => "abandon",
         }
     }
 
@@ -78,7 +82,7 @@ impl FromStr for Persona {
             .into_iter()
             .find(|persona| persona.name() == value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops")
+                format!("unknown persona {value:?}; expected one of mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops,abandon")
             })
     }
 }
@@ -127,6 +131,18 @@ pub struct SoakConfig {
     /// operator provisions every lane before the shard count is raised, as the
     /// restricted-runtime procedure in `docs/security.md` requires.
     pub shardops_schema_create: bool,
+    /// Claim-and-abandon persona: claims held by each killed process, seconds between
+    /// kills, how many kills, and the bound within which the rescue backlog has to clear
+    /// and the claim ring has to resume after a kill. Independent of `scale`.
+    pub abandon_claims: u64,
+    pub abandon_kill_every: Duration,
+    pub abandon_kills: u32,
+    pub abandon_bound: Duration,
+    /// Pause between a kill and the replacement process.
+    pub abandon_restart_delay: Duration,
+    /// Overrides the heartbeat and deadline rescue intervals of every runtime, to run the
+    /// soak with production's cadence instead of the harness's fast one.
+    pub rescue_interval: Option<Duration>,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -210,6 +226,19 @@ impl SoakConfig {
             shardops_schema_create: env_parse::<u8>("AWA_SOAK_SHARDOPS_SCHEMA_CREATE")
                 .map(|value| value != 0)
                 .unwrap_or(true),
+            abandon_claims: env_parse("AWA_SOAK_ABANDON_CLAIMS").unwrap_or(4_000),
+            abandon_kill_every: Duration::from_secs(
+                env_parse("AWA_SOAK_ABANDON_KILL_SECONDS").unwrap_or(180),
+            ),
+            abandon_kills: env_parse("AWA_SOAK_ABANDON_KILLS").unwrap_or(4),
+            abandon_bound: Duration::from_secs(
+                env_parse("AWA_SOAK_ABANDON_BOUND_SECONDS").unwrap_or(120),
+            ),
+            abandon_restart_delay: Duration::from_secs(
+                env_parse("AWA_SOAK_ABANDON_RESTART_SECONDS").unwrap_or(3),
+            ),
+            rescue_interval: env_parse::<u64>("AWA_SOAK_RESCUE_INTERVAL_SECONDS")
+                .map(Duration::from_secs),
         })
     }
 

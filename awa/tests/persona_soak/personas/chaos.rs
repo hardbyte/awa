@@ -97,7 +97,8 @@ async fn terminate_runtime_connections(shared: &Arc<Shared>, pool: &PgPool, rng:
              SELECT pid FROM pg_stat_activity
              WHERE application_name LIKE 'soak\\_%' AND application_name NOT LIKE '%producer%'
                AND application_name NOT LIKE '%operator%' AND application_name NOT LIKE '%oracle%'
-               AND application_name NOT LIKE '%chaos%' AND backend_type = 'client backend'
+               AND application_name NOT LIKE '%chaos%' AND application_name NOT LIKE 'soak\\_abandon\\_%'
+               AND backend_type = 'client backend'
                AND pid <> pg_backend_pid()
              ORDER BY random() LIMIT $1
          ) victims WHERE pg_terminate_backend(pid)",

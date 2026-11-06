@@ -1,0 +1,705 @@
+//! Checks for the claim-and-abandon persona: a process holding thousands of claims is
+//! SIGKILLed again and again. After each kill the rescue backlog has to clear within a
+//! bound, the claim ring has to keep rotating, no job whose owner is alive may be
+//! rescued, and attempts and the dead-letter queue have to follow `max_attempts`.
+
+use super::config::Persona;
+use super::shared::Shared;
+use serde::Serialize;
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_ROWS: usize = 25;
+/// The ring rotates about once a second; this long without a rotation is a stall.
+const RING_STALL_AFTER_MS: i64 = 6_000;
+/// Owner of attempts run by the surviving in-process runtime, which is never killed.
+pub const FINISHER: u32 = u32::MAX;
+/// Heartbeat staleness every runtime in the run uses.
+pub const STALENESS_SECS: f64 = super::personas::HEARTBEAT_STALENESS_SECS as f64;
+
+pub fn epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Attempt {
+    pub attempt: i16,
+    pub owner: u32,
+    pub at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Kill {
+    pub number: u32,
+    pub generation: u32,
+    /// Milliseconds since the run started, and since the epoch, when SIGKILL was sent.
+    pub at_run_ms: i64,
+    pub signalled_epoch_ms: i64,
+    /// Handlers the process had started, which is what it held when it died.
+    pub started_by_process: i64,
+    /// Open claims on the persona's queues right after the kill.
+    pub open_after_kill: i64,
+    pub expired_peak: i64,
+    pub oldest_expired_peak_s: f64,
+    pub cleared_after_s: Option<f64>,
+    pub reported_slow: bool,
+    pub load_ended: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RingEpisode {
+    pub start_ms: i64,
+    pub end_ms: Option<i64>,
+    pub generation: i64,
+    pub slot: i32,
+    /// The last time the slot the ring has to enter next held a claim whose owner is
+    /// alive, which explains a stall. Starts at the beginning of the episode.
+    pub last_live_ms: i64,
+    pub expired_in_next_slot: i64,
+    pub reported: bool,
+}
+
+#[derive(Default)]
+struct RingMonitor {
+    last: Option<(i32, i64)>,
+    last_change_ms: i64,
+    episode: Option<RingEpisode>,
+    episodes: Vec<RingEpisode>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Sample {
+    pub at_ms: i64,
+    pub open: i64,
+    pub expired: i64,
+    pub oldest_expired_s: f64,
+    pub ring_generation: i64,
+    pub probe_ms: i64,
+}
+
+#[derive(Default)]
+pub struct AbandonState {
+    /// Open claims on the persona's queues at the last probe.
+    pub open_claims: AtomicI64,
+    /// A child process is running.
+    pub child_alive: AtomicBool,
+    /// Handlers running in the child process at its last report.
+    pub child_active: AtomicI64,
+    started_by_process: Mutex<HashMap<u32, i64>>,
+    attempts: Mutex<HashMap<i64, Vec<Attempt>>>,
+    max_attempts: Mutex<HashMap<i64, i16>>,
+    /// Epoch milliseconds at which each process generation was killed.
+    killed_at: Mutex<HashMap<u32, i64>>,
+    kills: Mutex<Vec<Kill>>,
+    samples: Mutex<Vec<Sample>>,
+    ring: Mutex<RingMonitor>,
+    csv: Mutex<Option<PathBuf>>,
+}
+
+pub struct Probe {
+    pub open: i64,
+    pub expired: i64,
+    pub oldest_expired_s: f64,
+}
+
+impl AbandonState {
+    pub fn set_csv(&self, path: PathBuf) {
+        if let Ok(mut file) = std::fs::File::create(&path) {
+            let _ = writeln!(
+                file,
+                "run_s,open_claims,expired_claims,oldest_expired_s,claim_ring_generation,probe_ms"
+            );
+        }
+        *self.csv.lock().expect("csv") = Some(path);
+    }
+
+    pub fn register_job(&self, job_id: i64, max_attempts: i16) {
+        self.max_attempts
+            .lock()
+            .expect("max attempts")
+            .insert(job_id, max_attempts);
+    }
+
+    pub fn note_attempt(&self, job_id: i64, attempt: Attempt) {
+        if attempt.owner != FINISHER {
+            *self
+                .started_by_process
+                .lock()
+                .expect("started")
+                .entry(attempt.owner)
+                .or_insert(0) += 1;
+        }
+        self.attempts
+            .lock()
+            .expect("attempts")
+            .entry(job_id)
+            .or_default()
+            .push(attempt);
+    }
+
+    pub fn note_generation_killed(&self, generation: u32, at_epoch_ms: i64) {
+        self.killed_at
+            .lock()
+            .expect("killed at")
+            .insert(generation, at_epoch_ms);
+    }
+
+    pub fn record_kill(&self, kill: Kill) {
+        self.kills.lock().expect("kills").push(kill);
+    }
+
+    pub fn kills(&self) -> Vec<Kill> {
+        self.kills.lock().expect("kills").clone()
+    }
+
+    pub fn started_by(&self, generation: u32) -> i64 {
+        self.started_by_process
+            .lock()
+            .expect("started")
+            .get(&generation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether the ring has been still for long enough to count as stalled.
+    pub fn ring_stalled(&self) -> bool {
+        self.ring.lock().expect("ring").episode.is_some()
+    }
+
+    pub fn episodes(&self) -> Vec<RingEpisode> {
+        let ring = self.ring.lock().expect("ring");
+        let mut all = ring.episodes.clone();
+        all.extend(ring.episode.clone());
+        all
+    }
+
+    /// Records one probe and advances the per-kill clocks.
+    pub fn observe(&self, shared: &Shared, probe: &Probe, ring_generation: i64, probe_ms: i64) {
+        let now = shared.now_ms();
+        self.open_claims.store(probe.open, Ordering::Relaxed);
+        let sample = Sample {
+            at_ms: now,
+            open: probe.open,
+            expired: probe.expired,
+            oldest_expired_s: probe.oldest_expired_s,
+            ring_generation,
+            probe_ms,
+        };
+        self.samples.lock().expect("samples").push(sample);
+        if let Some(path) = self.csv.lock().expect("csv").as_ref() {
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                let _ = writeln!(
+                    file,
+                    "{:.1},{},{},{:.1},{},{}",
+                    now as f64 / 1000.0,
+                    probe.open,
+                    probe.expired,
+                    probe.oldest_expired_s,
+                    ring_generation,
+                    probe_ms
+                );
+            }
+        }
+        let stats = shared.stats(Persona::ClaimAbandon);
+        stats.set_max("peak_open_claims", probe.open);
+        stats.set_max("peak_expired_claims", probe.expired);
+        stats.set_max(
+            "peak_oldest_expired_s",
+            probe.oldest_expired_s.round() as i64,
+        );
+        stats.observe("probe_ms", probe_ms);
+
+        let staleness_ms = (STALENESS_SECS as i64 + 3) * 1_000;
+        let epoch = epoch_ms();
+        let bound = shared.config.abandon_bound;
+        let mut slow: Vec<String> = Vec::new();
+        {
+            let mut kills = self.kills.lock().expect("kills");
+            for kill in kills
+                .iter_mut()
+                .filter(|kill| kill.cleared_after_s.is_none())
+            {
+                kill.expired_peak = kill.expired_peak.max(probe.expired);
+                kill.oldest_expired_peak_s = kill.oldest_expired_peak_s.max(probe.oldest_expired_s);
+                let since_kill_ms = epoch - kill.signalled_epoch_ms;
+                // Claims of the dead process only count as stale after the staleness
+                // window, so a probe sooner than that proves nothing.
+                if since_kill_ms >= staleness_ms && probe.expired == 0 {
+                    kill.cleared_after_s = Some(since_kill_ms as f64 / 1000.0);
+                    continue;
+                }
+                let mut allowed = bound;
+                if shared.chaos_active() {
+                    allowed += shared.config.chaos_slack;
+                }
+                if !kill.reported_slow && since_kill_ms as u64 > allowed.as_millis() as u64 {
+                    kill.reported_slow = true;
+                    slow.push(format!(
+                        "{{\"kill\":{},\"seconds_since_kill\":{:.0},\"open_claims\":{},\"expired_claims\":{},\"oldest_expired_s\":{:.0},\"bound_s\":{}}}",
+                        kill.number,
+                        since_kill_ms as f64 / 1000.0,
+                        probe.open,
+                        probe.expired,
+                        probe.oldest_expired_s,
+                        bound.as_secs()
+                    ));
+                }
+            }
+        }
+        for row in slow {
+            shared.violation(
+                "rescue_backlog_slow",
+                format!(
+                    "the rescue backlog left by a killed process was not cleared within {}s of the kill ({} expired claim(s) remain, the oldest eligible for {:.0}s)",
+                    bound.as_secs(),
+                    probe.expired,
+                    probe.oldest_expired_s
+                ),
+                vec![row],
+            );
+        }
+    }
+
+    /// Watches the claim ring; called about once a second.
+    ///
+    /// `next_slot` is the number of live and expired open claims in the slot the ring
+    /// enters next, known only while the ring is stalled.
+    pub fn observe_ring(
+        &self,
+        shared: &Shared,
+        current_slot: i32,
+        generation: i64,
+        next_slot: Option<(i64, i64)>,
+    ) {
+        let now = shared.now_ms();
+        let mut report: Option<RingEpisode> = None;
+        {
+            let mut ring = self.ring.lock().expect("ring");
+            let moved = ring.last != Some((current_slot, generation));
+            if moved {
+                ring.last = Some((current_slot, generation));
+                ring.last_change_ms = now;
+                if let Some(mut episode) = ring.episode.take() {
+                    episode.end_ms = Some(now);
+                    ring.episodes.push(episode);
+                }
+                return;
+            }
+            let mut threshold = RING_STALL_AFTER_MS;
+            if shared.chaos_active() {
+                threshold += shared.config.chaos_slack.as_millis() as i64;
+            }
+            if now - ring.last_change_ms >= threshold && ring.episode.is_none() {
+                ring.episode = Some(RingEpisode {
+                    start_ms: ring.last_change_ms,
+                    end_ms: None,
+                    generation,
+                    slot: current_slot,
+                    last_live_ms: now,
+                    expired_in_next_slot: 0,
+                    reported: false,
+                });
+            }
+            let bound_ms = shared.config.abandon_bound.as_millis() as i64;
+            if let Some(episode) = ring.episode.as_mut() {
+                if let Some((live, expired)) = next_slot {
+                    if live > 0 {
+                        episode.last_live_ms = now;
+                    }
+                    episode.expired_in_next_slot = expired;
+                }
+                // A stall is expected while a live process holds the next slot; it is a
+                // violation once nothing alive holds it and the ring still does not move.
+                if !episode.reported && now - episode.last_live_ms > bound_ms {
+                    episode.reported = true;
+                    report = Some(episode.clone());
+                }
+            }
+        }
+        if let Some(episode) = report {
+            shared.violation(
+                "claim_ring_stalled",
+                format!(
+                    "the claim ring has not rotated for more than {}s with no live claim in the slot it has to enter next ({} expired claim(s) there); stuck at slot {}, generation {}",
+                    shared.config.abandon_bound.as_secs(),
+                    episode.expired_in_next_slot,
+                    episode.slot,
+                    episode.generation
+                ),
+                vec![format!(
+                    "{{\"stalled_since_s\":{:.1},\"slot\":{},\"generation\":{},\"expired_in_next_slot\":{}}}",
+                    episode.start_ms as f64 / 1000.0,
+                    episode.slot,
+                    episode.generation,
+                    episode.expired_in_next_slot
+                )],
+            );
+        }
+    }
+
+    /// Closes the ring episode left open when the run ends.
+    pub fn finish_ring(&self, shared: &Shared) {
+        let now = shared.now_ms();
+        let mut ring = self.ring.lock().expect("ring");
+        if let Some(mut episode) = ring.episode.take() {
+            episode.end_ms = Some(now);
+            ring.episodes.push(episode);
+        }
+    }
+
+    /// Stall time and resume time of the ring in each kill's window.
+    fn ring_by_kill(&self) -> Vec<(f64, Option<f64>)> {
+        let kills = self.kills();
+        let episodes = self.episodes();
+        kills
+            .iter()
+            .enumerate()
+            .map(|(index, kill)| {
+                let from = kill.at_run_ms;
+                let until = kills.get(index + 1).map_or(i64::MAX, |next| next.at_run_ms);
+                let mut stalled = 0i64;
+                let mut resumed: Option<i64> = None;
+                for episode in &episodes {
+                    let end = episode.end_ms.unwrap_or(i64::MAX);
+                    if end <= from || episode.start_ms >= until {
+                        continue;
+                    }
+                    stalled += end.min(until) - episode.start_ms.max(from);
+                    if let Some(end) = episode.end_ms {
+                        resumed = Some(resumed.map_or(end, |seen| seen.max(end)));
+                    }
+                }
+                (
+                    stalled as f64 / 1000.0,
+                    resumed.map(|end| (end - from) as f64 / 1000.0),
+                )
+            })
+            .collect()
+    }
+
+    /// The per-kill table for the report.
+    pub fn render(&self) -> String {
+        let kills = self.kills();
+        if kills.is_empty() {
+            return String::new();
+        }
+        let ring = self.ring_by_kill();
+        let samples = self.samples.lock().expect("samples");
+        let mut out = String::new();
+        out.push_str("### Kills\n\n");
+        out.push_str("| kill | held by the process | open claims after kill | peak expired | oldest expired (s) | time to clear (s) | ring stalled (s) | ring resumed after (s) |\n");
+        out.push_str("| -- | -- | -- | -- | -- | -- | -- | -- |\n");
+        for (kill, (stalled, resumed)) in kills.iter().zip(ring) {
+            out.push_str(&format!(
+                "| {}{} | {} | {} | {} | {:.0} | {} | {:.0} | {} |\n",
+                kill.number,
+                if kill.load_ended { " (load end)" } else { "" },
+                kill.started_by_process,
+                kill.open_after_kill,
+                kill.expired_peak,
+                kill.oldest_expired_peak_s,
+                kill.cleared_after_s
+                    .map_or("not cleared".to_string(), |seconds| format!("{seconds:.0}")),
+                stalled,
+                resumed.map_or("-".to_string(), |seconds| format!("{seconds:.0}")),
+            ));
+        }
+        let ring_episodes = self.episodes();
+        out.push_str(&format!(
+            "\nSamples: {}. Ring stall episodes: {}.\n",
+            samples.len(),
+            ring_episodes.len()
+        ));
+        out
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kills": self.kills(),
+            "ring_episodes": self.episodes(),
+            "samples": self.samples.lock().expect("samples").len(),
+        })
+    }
+
+    /// Final checks over everything the child processes and the survivors reported.
+    pub async fn analyse(&self, shared: &Shared, pool: &PgPool, queues: &[String]) {
+        let killed_at = self.killed_at.lock().expect("killed at").clone();
+        let max_attempts = self.max_attempts.lock().expect("max attempts").clone();
+        let attempts = self.attempts.lock().expect("attempts").clone();
+        let stats = shared.stats(Persona::ClaimAbandon);
+
+        let mut live_rescued: Vec<String> = Vec::new();
+        let mut live_rescued_count = 0usize;
+        let mut duplicates_from_dead = 0i64;
+        let mut over_max: Vec<String> = Vec::new();
+        let mut gaps: Vec<String> = Vec::new();
+        let mut exhausted_by_attempts: Vec<i64> = Vec::new();
+        for (job_id, list) in &attempts {
+            let mut list = list.clone();
+            list.sort_by_key(|attempt| attempt.at_ms);
+            for pair in list.windows(2) {
+                let (previous, next) = (pair[0], pair[1]);
+                let previous_died_at = if previous.owner == FINISHER {
+                    None
+                } else {
+                    killed_at.get(&previous.owner).copied()
+                };
+                match previous_died_at {
+                    Some(died_at) if next.at_ms >= died_at => duplicates_from_dead += 1,
+                    _ => {
+                        live_rescued_count += 1;
+                        if live_rescued.len() < MAX_ROWS {
+                            live_rescued.push(format!(
+                                "{{\"job_id\":{job_id},\"attempt\":{},\"owner\":\"{}\",\"owner_alive_until_ms\":{},\"next_attempt\":{},\"next_owner\":\"{}\",\"next_started_ms\":{}}}",
+                                previous.attempt,
+                                owner_name(previous.owner),
+                                previous_died_at.map_or("null".to_string(), |at| at.to_string()),
+                                next.attempt,
+                                owner_name(next.owner),
+                                next.at_ms
+                            ));
+                        }
+                    }
+                }
+                if next.attempt != previous.attempt + 1 && gaps.len() < MAX_ROWS {
+                    gaps.push(format!(
+                        "{{\"job_id\":{job_id},\"attempt\":{},\"next_attempt\":{}}}",
+                        previous.attempt, next.attempt
+                    ));
+                }
+            }
+            let highest = list
+                .iter()
+                .map(|attempt| attempt.attempt)
+                .max()
+                .unwrap_or(0);
+            if let Some(max) = max_attempts.get(job_id) {
+                if highest > *max && over_max.len() < MAX_ROWS {
+                    over_max.push(format!(
+                        "{{\"job_id\":{job_id},\"attempts_seen\":{highest},\"max_attempts\":{max}}}"
+                    ));
+                }
+                let last = list.last().copied();
+                if highest == *max
+                    && last.is_some_and(|last| last.owner != FINISHER && last.attempt == *max)
+                {
+                    exhausted_by_attempts.push(*job_id);
+                }
+            }
+        }
+        stats.add("duplicate_executions_after_kill", duplicates_from_dead);
+        stats.add("live_owner_rescues", live_rescued_count as i64);
+        if live_rescued_count > 0 {
+            shared.violation(
+                "live_owner_rescued",
+                format!("{live_rescued_count} job(s) were run again while the process that held them was still alive"),
+                live_rescued,
+            );
+        }
+        if !over_max.is_empty() {
+            shared.violation(
+                "attempts_exceeded_max",
+                format!(
+                    "{} job(s) ran more attempts than max_attempts",
+                    over_max.len()
+                ),
+                over_max,
+            );
+        }
+        if !gaps.is_empty() {
+            shared.finding(
+                "abandon_attempt_gap",
+                format!(
+                    "{} job(s) skipped an attempt number between executions",
+                    gaps.len()
+                ),
+                gaps,
+            );
+        }
+
+        // Jobs whose last attempt was abandoned at max_attempts have to be dead-lettered.
+        let dlq: Result<Vec<(i64, i16, i16)>, _> = sqlx::query_as(&format!(
+            "SELECT job_id, attempt, max_attempts FROM {}.dlq_entries WHERE queue = ANY($1)",
+            schema(shared)
+        ))
+        .bind(queues)
+        .fetch_all(pool)
+        .await;
+        match dlq {
+            Ok(rows) => {
+                stats.add("dead_lettered", rows.len() as i64);
+                let early: Vec<String> = rows
+                    .iter()
+                    .filter(|(_, attempt, max)| attempt < max)
+                    .take(MAX_ROWS)
+                    .map(|(job, attempt, max)| {
+                        format!("{{\"job_id\":{job},\"attempt\":{attempt},\"max_attempts\":{max}}}")
+                    })
+                    .collect();
+                if !early.is_empty() {
+                    shared.violation(
+                        "dead_lettered_early",
+                        format!(
+                            "{} job(s) were dead-lettered before reaching max_attempts",
+                            early.len()
+                        ),
+                        early,
+                    );
+                }
+                let in_dlq: std::collections::HashSet<i64> =
+                    rows.iter().map(|(job, _, _)| *job).collect();
+                let missing: Vec<String> = exhausted_by_attempts
+                    .iter()
+                    .filter(|job| !in_dlq.contains(job))
+                    .take(MAX_ROWS)
+                    .map(|job| {
+                        format!(
+                            "{{\"job_id\":{job},\"max_attempts\":{}}}",
+                            max_attempts.get(job).copied().unwrap_or(0)
+                        )
+                    })
+                    .collect();
+                stats.add("exhausted_after_kill", exhausted_by_attempts.len() as i64);
+                if !missing.is_empty() && !shared.quiesced.load(Ordering::Relaxed) {
+                    // The rescue was still working when the run ended.
+                    shared.finding(
+                        "abandon_rescue_unfinished",
+                        format!(
+                            "{} job(s) abandoned on their last attempt were not yet dead-lettered when the drain grace ended",
+                            missing.len()
+                        ),
+                        missing,
+                    );
+                } else if !missing.is_empty() {
+                    shared.violation(
+                        "exhausted_not_dead_lettered",
+                        format!(
+                            "{} job(s) abandoned on their last attempt are not in the dead-letter queue",
+                            missing.len()
+                        ),
+                        missing,
+                    );
+                }
+            }
+            Err(error) => shared.note("abandon", format!("dead-letter check failed: {error}")),
+        }
+    }
+}
+
+fn owner_name(owner: u32) -> String {
+    if owner == FINISHER {
+        "survivor".to_string()
+    } else {
+        format!("process-{owner}")
+    }
+}
+
+fn schema(shared: &Shared) -> String {
+    shared
+        .info
+        .queue_storage_schema
+        .clone()
+        .unwrap_or_else(|| "awa".to_string())
+}
+
+/// Which claims a backlog probe looks at.
+pub enum Scope<'a> {
+    /// Open receipt claims and running leases of these queues.
+    Queues(&'a [String]),
+    /// Open receipt claims, of any queue, in one claim-ring slot.
+    Slot(i32),
+}
+
+/// Open claims in `scope`, and the ones the rescue is already entitled to take: claims
+/// whose last heartbeat (or claim time, when there never was one) is older than
+/// `staleness_secs`, or whose deadline has passed.
+pub async fn probe_backlog(
+    pool: &PgPool,
+    schema: &str,
+    scope: Scope<'_>,
+    staleness_secs: f64,
+) -> Result<Probe, sqlx::Error> {
+    let (batch_filter, row_filter, lease_leg) = match &scope {
+        Scope::Queues(_) => (
+            "b.queue = ANY($1)",
+            "c.queue = ANY($1)",
+            format!(
+                "UNION ALL
+            SELECT COALESCE(a.heartbeat_at, l.heartbeat_at, l.attempted_at), l.deadline_at
+            FROM {schema}.leases l
+            LEFT JOIN {schema}.attempt_state a ON a.job_id = l.job_id AND a.run_lease = l.run_lease
+            WHERE l.queue = ANY($1) AND l.state = 'running'"
+            ),
+        ),
+        Scope::Slot(_) => ("b.claim_slot = $3", "c.claim_slot = $3", String::new()),
+    };
+    let sql = format!(
+        r#"
+        WITH bounds AS (
+            SELECT clock_timestamp() AS now_ts,
+                   clock_timestamp() - make_interval(secs => $2) AS stale_before
+        ),
+        batch_claims AS (
+            SELECT b.claim_slot, i.receipt_id, i.job_id, i.run_lease, b.queue, b.claimed_at, b.deadline_at
+            FROM {schema}.lease_claim_batches b
+            CROSS JOIN LATERAL unnest(b.job_ids, b.run_leases, b.receipt_ids) AS i(job_id, run_lease, receipt_id)
+            WHERE {batch_filter}
+        ),
+        row_claims AS (
+            SELECT c.claim_slot, c.receipt_id, c.job_id, c.run_lease, c.queue, c.claimed_at, c.deadline_at
+            FROM {schema}.lease_claims c
+            WHERE {row_filter} AND c.closed_at IS NULL
+        ),
+        open_receipts AS (
+            SELECT x.* FROM (SELECT * FROM batch_claims UNION ALL SELECT * FROM row_claims) x
+            WHERE NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closures cl
+                              WHERE cl.claim_slot = x.claim_slot AND cl.job_id = x.job_id AND cl.run_lease = x.run_lease)
+              AND NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closure_batches cb
+                              WHERE cb.claim_slot = x.claim_slot AND cb.receipt_ranges @> x.receipt_id)
+              AND NOT EXISTS (SELECT 1 FROM {schema}.leases l WHERE l.job_id = x.job_id AND l.run_lease = x.run_lease)
+              AND NOT EXISTS (SELECT 1 FROM {schema}.done_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
+              AND NOT EXISTS (SELECT 1 FROM {schema}.deferred_jobs d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
+              AND NOT EXISTS (SELECT 1 FROM {schema}.dlq_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
+        ),
+        holders AS (
+            SELECT COALESCE(a.heartbeat_at, x.claimed_at) AS beat_at, x.deadline_at
+            FROM open_receipts x
+            LEFT JOIN {schema}.attempt_state a ON a.job_id = x.job_id AND a.run_lease = x.run_lease
+            {lease_leg}
+        ),
+        eligible AS (
+            SELECT LEAST(
+                       CASE WHEN beat_at < stale_before THEN beat_at + make_interval(secs => $2) END,
+                       CASE WHEN deadline_at < now_ts THEN deadline_at END
+                   ) AS eligible_at
+            FROM holders, bounds
+        )
+        SELECT count(*)::bigint,
+               count(eligible_at)::bigint,
+               COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - min(eligible_at))), 0)::float8
+        FROM eligible
+        "#
+    );
+    let query = sqlx::query_as::<_, (i64, i64, f64)>(&sql);
+    let query = match scope {
+        Scope::Queues(queues) => query.bind(queues.to_vec()).bind(staleness_secs).bind(0_i32),
+        Scope::Slot(slot) => query
+            .bind(Vec::<String>::new())
+            .bind(staleness_secs)
+            .bind(slot),
+    };
+    let (open, expired, oldest) = query.fetch_one(pool).await?;
+    Ok(Probe {
+        open,
+        expired,
+        oldest_expired_s: oldest.max(0.0),
+    })
+}

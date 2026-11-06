@@ -96,6 +96,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         Persona::Python,
         Persona::Fanout,
         Persona::ShardOps,
+        Persona::ClaimAbandon,
     ] {
         if shared.config.has(persona) {
             tasks.push((persona, spawn_persona(persona, shared.clone())));
@@ -255,6 +256,7 @@ fn spawn_persona(
             Persona::Python => personas::python::run(shared).await,
             Persona::Fanout => personas::fanout::run(shared).await,
             Persona::ShardOps => personas::shardops::run(shared).await,
+            Persona::ClaimAbandon => personas::abandon::run(shared).await,
         }
     })
 }

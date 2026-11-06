@@ -100,6 +100,9 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
                 summary.count, summary.p50, summary.p99, summary.max
             );
         }
+        if persona == Persona::ClaimAbandon {
+            let _ = writeln!(out, "{}", shared.abandon.render());
+        }
         let _ = writeln!(out);
     }
 
@@ -191,6 +194,7 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "elapsed_seconds": outcome.elapsed_seconds,
         "quiesced": outcome.quiesced,
         "personas_stats": per_persona,
+        "abandon": shared.abandon.to_json(),
         "run": { "counters": shared.run.counters(), "samples": shared.run.summaries() },
         "violations": violations,
         "findings": shared.findings.lock().expect("findings").clone(),
