@@ -1108,12 +1108,23 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
 
     killed_sources.insert(worker_c.kill().await);
     killed_sources.insert(worker_d.kill().await);
-    let worker_e = spawn_released_worker(&fixture.runtime_url, &log, &queues).await;
-    let worker_f = spawn_released_worker(&fixture.runtime_url, &log, &queues).await;
+    let restricted_queues = [
+        MAIN,
+        BANKED,
+        NEW_AFTER_PATCH,
+        NEW_AFTER_ROLLBACK,
+        PROVISIONED,
+        UNPROVISIONED,
+    ];
+    let worker_e = spawn_released_worker(&fixture.runtime_url, &log, &restricted_queues).await;
+    let worker_f = spawn_released_worker(&fixture.runtime_url, &log, &restricted_queues).await;
+    // A released producer without CREATE creates an unprepared queue's lane
+    // through the schema owner's provisioning function.
     for (queue, seq_start) in [
         (MAIN, 9_000),
         (PROVISIONED, 10_000),
         (NEW_AFTER_ROLLBACK, 11_000),
+        (UNPROVISIONED, 12_000),
     ] {
         released_produce(
             &fixture.runtime_url,
@@ -1130,21 +1141,22 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         .await
         .unwrap_or_else(|error| panic!("restricted released enqueue on {queue}: {error}"));
     }
-    let refused = released_produce(
-        &fixture.runtime_url,
-        &log,
-        ProduceSpec {
-            queue: UNPROVISIONED,
-            seq_start: 12_000,
-            count: 1,
-            modes: "ok",
-            delay_s: 0.0,
-            pause_ms: 0,
-        },
-    )
+    let new_lane_owners: Vec<bool> = sqlx::query_scalar(&format!(
+        "SELECT sequence.relowner = namespace.nspowner \
+         FROM {SCHEMA}.queue_enqueue_heads AS heads \
+         JOIN pg_namespace AS namespace ON namespace.nspname = '{SCHEMA}' \
+         JOIN pg_class AS sequence \
+           ON sequence.relnamespace = namespace.oid AND sequence.relname = heads.seq_name \
+         WHERE heads.queue = $1"
+    ))
+    .bind(UNPROVISIONED)
+    .fetch_all(&fixture.admin)
     .await
-    .expect_err("an unprovisioned queue needs provisioning once CREATE is revoked");
-    assert!(refused.contains("has not been provisioned"), "{refused}");
+    .unwrap();
+    assert!(
+        !new_lane_owners.is_empty() && new_lane_owners.iter().all(|owned| *owned),
+        "the new lane's sequences belong to the schema owner: {new_lane_owners:?}"
+    );
     wait_for_drain(&log, Duration::from_secs(120)).await;
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(PROVISIONED), "{stats}");
