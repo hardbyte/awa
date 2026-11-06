@@ -6,6 +6,21 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Callback completion, `get_job`, lifecycle events and the admin reads
+  find running jobs that priority aging promoted on queue storage** (backport
+  of #600). Claims and leases record a job's aged effective priority while its
+  ready row keeps the lane priority, and eight reads joined the two on
+  priority. With aging on (the default, every 60 s), a job that waited past a
+  minute before it was claimed could not be completed by callback with an
+  expected kind, failed the mixed-transition callback routing check, read back
+  from `get_job` in the wrong state, was missing from the job list, the kinds
+  page and the dashboard's recent-jobs counts, and was not found by
+  `cancel_by_unique_key`. They now match the attempt (`job_id` and `run_lease`). No
+  migration.
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing. It now reads all of them from one read-only snapshot.
 - **`admin::job_kind_overviews` on queue storage no longer depends on the
   planner's row estimates.** Behind the admin UI's kinds page, it counted
   every job through the `current_jobs` view. Two nodes of that view are
