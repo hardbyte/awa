@@ -1,0 +1,3137 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/048-retained-job-output/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>ADR-048: Retained job output - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  
+  
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="ADR-048: Retained job output — AWA">
+  <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/048-retained-job-output/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#adr-048-retained-job-output" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              ADR-048: Retained job output
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../security/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Security
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Migrations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#context" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Context">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#cost-measured" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cost, measured
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Decision">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rust-surface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust surface
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-surface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python surface
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#typed-outputs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Typed outputs
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lifetime-of-the-output-slot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lifetime of the output slot
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#where-an-attempts-output-goes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where an attempt's output goes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#external-completion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        External completion
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#storage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#retention-and-erasure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retention and erasure
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#observability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#testing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Testing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#guarantees" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Guarantees
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#non-goals-not-a-results-store-for-workflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Non-goals: not a results store for workflows
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rollout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rollout
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#relationship-to-other-adrs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to other ADRs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#positive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positive
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#negative" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Negative
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternatives considered
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#completed-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Completed only
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#keep-every-failed-attempts-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keep every failed attempt's output
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-output-per-job-last-write-wins-across-every-transition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One output per job, last write wins across every transition
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-column-on-done_entries-or-a-key-in-the-payload-for-every-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A column on done_entries or a key in the payload, for every output
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#jsonb-as-args-use" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        jsonb, as args use
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bytea" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        bytea
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-side-table-keyed-by-job" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A side table keyed by job
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#metadata_awa_result" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        metadata._awa_result
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#typed-storage-or-a-generic-handler-signature" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Typed storage or a generic handler signature
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#converts-outputerror-into-a-terminal-job-error" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ? converts OutputError into a terminal job error
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-marker-instead-of-an-error" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A marker instead of an error
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-return-values-as-the-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python return values as the output
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#outputs-read-by-specs-or-derived-follow-ups-in-core" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Outputs read by specs, or derived follow-ups in core
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#record-what-the-attempt-staged" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Record what the attempt staged
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#open-extensions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open extensions
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
+                  
+
+
+  
+  
+
+
+<h1 id="adr-048-retained-job-output">ADR-048: Retained job output<a class="headerlink" href="#adr-048-retained-job-output" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Accepted. Builds on <a href="../046-handler-staged-follow-ups/">ADR-046</a> staged follow-ups and <a href="../026-narrow-terminal-history/">ADR-026</a> narrow terminal history. Depends on <code>JobRow</code> becoming <code>#[non_exhaustive]</code> (<a href="https://github.com/hardbyte/awa/pull/564">#564</a>). Adds migration v052: output columns for queue storage, and an output type on job-kind descriptors. Implemented by <code>awa-model/src/output.rs</code>, <code>awa-worker/src/output.rs</code>, the output path in <code>awa-worker/src/executor.rs</code>, migration v052, the <code>AwaJobOutput</code> TLA+ model and <code>awa/tests/job_output_test.rs</code>; user guide: <code>docs/job-output.md</code>.</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p>ADR-046 split a request for "metadata on <code>JobResult</code> or <code>JobRow</code>" into three questions:</p>
+<ol>
+<li>How does A pass a value it computed into B reliably?</li>
+<li>Can someone inspect A's result afterwards?</li>
+<li>Does B depend on fetching A's stored result later?</li>
+</ol>
+<p>Staging answers the first. Its answer to the third is no: B gets its value in its own args. This ADR answers the second.</p>
+<p>Today a handler's return value is discarded. A Rust handler returns only an outcome. Python maps any unrecognised return value to <code>Completed</code>. <code>complete_external</code> drops its payload on completion. Operators who want to know what a job produced read logs, or the handler writes the value somewhere else.</p>
+<p>Queues that keep a result do so for one of two reasons:</p>
+<ul>
+<li><strong>Inspection.</strong> River's <code>RecordOutput</code> is opt-in, size-capped and pruned with the job. pg-boss stores an <code>output</code> column.</li>
+<li><strong>A declared workflow engine needs it.</strong> Oban Pro workflows, Celery chords, Hatchet, Temporal and Step Functions.</li>
+</ul>
+<p>Awa disclaims the second (<a href="../046-handler-staged-follow-ups/#non-goals-this-is-not-a-workflow-engine">ADR-046, non-goals</a>). The failures those systems document come from the second use or from defaults:</p>
+<ul>
+<li>result stores bloated by default-on storage (Celery, BullMQ);</li>
+<li>downstream steps that fetch a result after it has expired: Celery chords whose body never runs, and Oban Pro's <code>{:error, :missing}</code>.</li>
+</ul>
+<p>The requirement:</p>
+<blockquote>
+<p>A handler can record an optional, size-bounded JSON value describing what an attempt produced. It is published only with that attempt's own lease-guarded transition, readable for as long as the job is, and never read by Awa or by other jobs to decide what runs.</p>
+</blockquote>
+<h3 id="cost-measured">Cost, measured<a class="headerlink" href="#cost-measured" title="Permanent link">&para;</a></h3>
+<p>The deciding constraint on queue storage was the compact completion path of ADR-026, which writes one batch row for many jobs instead of a terminal row per job. These measurements, on Postgres 16 with fsync on and 512-job batches, are of the terminal write with a 100-byte value on every job:</p>
+<table>
+<thead>
+<tr>
+<th>Representation</th>
+<th>Keeps the compact path</th>
+<th>Extra WAL per job</th>
+<th>Completion statement throughput</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>None (today)</td>
+<td>yes</td>
+<td>0</td>
+<td>502k jobs/s</td>
+</tr>
+<tr>
+<td>Array on the compact batch row</td>
+<td>yes</td>
+<td>+46 B</td>
+<td>295k jobs/s</td>
+</tr>
+<tr>
+<td>Side table keyed by job</td>
+<td>yes</td>
+<td>+294 B</td>
+<td>251k jobs/s</td>
+</tr>
+<tr>
+<td>Column on <code>done_entries</code>, or a key in the payload</td>
+<td>no</td>
+<td>+507 B</td>
+<td>174k jobs/s</td>
+</tr>
+</tbody>
+</table>
+<p>End to end, forcing a job onto the general terminal path costs about two thirds of throughput (11.2k down to 3.6–5.7k jobs/s) and adds 427 B of WAL per job.</p>
+<p>A job's whole lifecycle on the compact path (insert, claim, completion) writes about 1.3 KB of WAL. A 100-byte output carried on the compact batch adds under 1%. A 4 KiB output that does not compress adds about 4.4 KB, more than quadrupling it, which is why the value is capped; one that compresses well costs a small fraction of that. For comparison, staging one follow-up per job adds about 2,400 B of WAL per job.</p>
+<p>Every bound below is stated in bytes of JSON text, which is also how the value is stored (<a href="#storage">Storage</a>). The benchmark gates in <a href="#validation">Validation</a> include worst-case shapes.</p>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>A handler may <strong>record an output</strong> for its attempt: a JSON value of at most 4 KiB of text. The output is attempt-scoped, like ADR-046's staging buffer, and is sealed with it when the handler returns. The transition that the attempt's own executor writes publishes it:</p>
+<ul>
+<li><strong>on completion</strong>, it becomes the job's <strong>output</strong>;</li>
+<li><strong>on a failure</strong> the executor records, it is kept in that attempt's <strong>error entry</strong>; at most one entry, the latest to record one, keeps an output.</li>
+</ul>
+<p>Neither Awa nor any job reads it to decide what runs.</p>
+<p>It is called <em>output</em> rather than <em>result</em>. <code>JobResult</code> is already the outcome enum, and every handler returns a <code>Result</code>.</p>
+<h3 id="rust-surface">Rust surface<a class="headerlink" href="#rust-surface" title="Permanent link">&para;</a></h3>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">impl</span><span class="w"> </span><span class="n">JobContext</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="sd">/// Record this attempt's output, replacing any earlier one. Recording</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="sd">/// JSON null clears it. A failed call also clears it.</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">set_output</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">Serialize</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">?</span><span class="nb">Sized</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">output</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">T</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">OutputError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">clear_output</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">);</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="sd">/// The output recorded so far.</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">output</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="sd">/// A cloneable handle for futures that cannot borrow the context.</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">output_slot</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">OutputSlot</span><span class="p">;</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="p">}</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="cp">#[derive(Clone)]</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">OutputSlot</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* Arc to the attempt's output slot */</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="k">impl</span><span class="w"> </span><span class="n">OutputSlot</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">set</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">Serialize</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">?</span><span class="nb">Sized</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">output</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">T</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">OutputError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">    </span><span class="sd">/// After the handler returns this does nothing; `set(&amp;())` reports</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">    </span><span class="sd">/// `Sealed` for a caller that needs to know.</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">clear</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">);</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="p">}</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="cp">#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]</span>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="cp">#[non_exhaustive]</span>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">OutputError</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="w">    </span><span class="sd">/// The value would not serialize, or contains a NUL character.</span>
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="w">    </span><span class="n">Invalid</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="w">    </span><span class="n">TooLarge</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">size_bytes</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">limit_bytes</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="w">    </span><span class="sd">/// The handler already returned.</span>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="w">    </span><span class="n">Sealed</span><span class="p">,</span>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="p">}</span>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a>
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="k">pub</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">MAX_OUTPUT_BYTES</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">;</span>
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a>
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a><span class="cp">#[non_exhaustive]</span>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">JobRow</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a><span class="w">    </span><span class="c1">// ...existing fields...</span>
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="w">    </span><span class="sd">/// The completed attempt's output (queue storage). `None` for jobs that</span>
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="w">    </span><span class="sd">/// did not complete with one, and on list reads, which do not load it.</span>
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a><span class="w">    </span><span class="sd">/// A failed attempt's output is in its entry in `errors`.</span>
+</span><span id="__span-0-40"><a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a><span class="w">    </span><span class="cp">#[sqlx(default)]</span>
+</span><span id="__span-0-41"><a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a><span class="w">    </span><span class="cp">#[serde(default)]</span>
+</span><span id="__span-0-42"><a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">output</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="o">&gt;</span><span class="p">,</span>
+</span><span id="__span-0-43"><a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>For example, a handler that leaves a summary of what it did:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">client_builder</span><span class="p">.</span><span class="n">register</span><span class="p">::</span><span class="o">&lt;</span><span class="n">SyncInventory</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">args</span><span class="p">,</span><span class="w"> </span><span class="n">ctx</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ctx</span><span class="p">.</span><span class="n">output_slot</span><span class="p">();</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">report</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sync</span><span class="p">(</span><span class="o">&amp;</span><span class="n">args</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">err</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">output</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">json</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="s">"updated"</span><span class="p">:</span><span class="w"> </span><span class="nc">report</span><span class="p">.</span><span class="n">updated</span><span class="p">,</span><span class="w"> </span><span class="s">"skipped"</span><span class="p">:</span><span class="w"> </span><span class="nc">report</span><span class="p">.</span><span class="n">skipped</span><span class="w"> </span><span class="p">}))</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">            </span><span class="n">tracing</span><span class="p">::</span><span class="n">warn</span><span class="o">!</span><span class="p">(</span><span class="o">%</span><span class="n">err</span><span class="p">,</span><span class="w"> </span><span class="s">"inventory summary not recorded"</span><span class="p">);</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">        </span><span class="p">}</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">JobResult</span><span class="p">::</span><span class="n">Completed</span><span class="p">)</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="p">})</span>
+</span></code></pre></div>
+<p><strong>Recording.</strong> <code>set_output</code> serializes the value at once and checks its size and content, so nothing that can fail reaches the transition. Serialization runs outside the slot's lock.</p>
+<p><strong>Failures do not poison the attempt.</strong> Nothing depends on the output, so a missing one breaks no guarantee, unlike a missing follow-up.</p>
+<p><strong>No automatic conversion to <code>JobError</code>.</strong> <code>OutputError</code> deliberately has no <code>From</code> impl, so a bare <code>?</code> does not compile. A data-dependent <code>TooLarge</code> should not send a job to the DLQ after its side effects have run unless the handler chooses that explicitly. Staging differs on purpose: there, a missing follow-up does break a guarantee.</p>
+<p><strong>A failed call clears the slot.</strong> An earlier value left in place would look like the current one.</p>
+<p><strong>Calls take effect in the order they reach the slot's lock.</strong> A call from any clone of the slot replaces, clears or fails against what is there at that moment, so among concurrent calls the last to finish wins, whether it succeeded or failed. Because serialization runs before the lock, a slow call can finish after one that started later. A handler that records from several tasks orders those tasks itself.</p>
+<p><strong>Field rather than method.</strong> <code>JobRow</code> gains a field because the row is the value that flows to HTTP, the admin UI, lifecycle events and Python. <code>#[non_exhaustive]</code> makes the field a non-breaking addition. <code>#[sqlx(default)]</code> and <code>#[serde(default)]</code> keep explicit-column queries and JSON from older servers working.</p>
+<p><strong>Getters.</strong> <code>ctx.output()</code> and <code>OutputSlot::get</code> let unit tests assert what a handler recorded. <code>ctx.job</code> stays the row as claimed, before the run.</p>
+<h3 id="python-surface">Python surface<a class="headerlink" href="#python-surface" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">handle</span><span class="p">(</span><span class="n">job</span><span class="p">):</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">report</span> <span class="o">=</span> <span class="k">await</span> <span class="n">sync</span><span class="p">(</span><span class="n">job</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">job</span><span class="o">.</span><span class="n">set_output</span><span class="p">({</span><span class="s2">"updated"</span><span class="p">:</span> <span class="n">report</span><span class="o">.</span><span class="n">updated</span><span class="p">,</span> <span class="s2">"skipped"</span><span class="p">:</span> <span class="n">report</span><span class="o">.</span><span class="n">skipped</span><span class="p">})</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="n">row</span> <span class="o">=</span> <span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">get_job</span><span class="p">(</span><span class="n">job_id</span><span class="p">)</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">row</span><span class="o">.</span><span class="n">output</span>            <span class="c1"># {"updated": ..., "skipped": ...}, or None</span>
+</span></code></pre></div>
+<p><strong>Methods.</strong> <code>job.set_output(value)</code> records a value, <code>job.clear_output()</code> empties the slot, and <code>set_output(None)</code> clears it too. During dispatch, <code>job.output</code> returns the value recorded so far. On a row read from the database it returns the stored output.</p>
+<p><strong>Conversion.</strong> Values are converted to JSON when set, while the handler holds the GIL, by one converter shared with the test stand-in:</p>
+<ul>
+<li>pydantic models are dumped in JSON mode;</li>
+<li>dataclasses are converted at any depth;</li>
+<li>tuples become lists.</li>
+</ul>
+<p>Sets, non-finite floats, non-string keys and integers outside 64 bits are rejected.</p>
+<p><strong>Errors.</strong> A value that cannot be recorded raises <code>awa.OutputError</code>, a subclass of <code>awa.TerminalError</code>, and clears the slot without poisoning the attempt. This differs from Rust on purpose: Python has no <code>Result</code> to ignore, so an uncaught error must be classified, and failing terminally is better than retrying the handler's side effects up to <code>max_attempts</code> times. Handlers whose output size depends on their data should record it before their side effects, or catch the error. <code>awa.MAX_OUTPUT_BYTES</code> is exported.</p>
+<p><strong>Return values are unchanged.</strong> A worker that returns a dict today has it discarded, so making return values the output would change existing handlers. An opt-in is listed under <a href="#open-extensions">Open extensions</a>.</p>
+<h3 id="typed-outputs">Typed outputs<a class="headerlink" href="#typed-outputs" title="Permanent link">&para;</a></h3>
+<p>Storage and the wire stay JSON. A kind can declare the type its handler records, and the declaration types the API on top of the JSON core:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="cp">#[derive(Serialize, Deserialize, JobArgs)]</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="cp">#[awa(output = Thumbnail)]</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">struct</span><span class="w"> </span><span class="nc">Resize</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">width</span><span class="p">:</span><span class="w"> </span><span class="kt">u32</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="sd">/// Implemented by `#[awa(output = T)]`.</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">JobOutput</span><span class="p">:</span><span class="w"> </span><span class="nc">JobArgs</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">    </span><span class="k">type</span><span class="w"> </span><span class="nc">Output</span><span class="p">:</span><span class="w"> </span><span class="nc">Serialize</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">DeserializeOwned</span><span class="p">;</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="p">}</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="k">impl</span><span class="w"> </span><span class="n">JobContext</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="w">    </span><span class="sd">/// A slot that accepts only `T::Output`. On a job of another kind every</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="w">    </span><span class="sd">/// `set` fails with `OutputError::Invalid`.</span>
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">typed_output</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">JobOutput</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">TypedOutputSlot</span><span class="o">&lt;</span><span class="n">T</span><span class="p">::</span><span class="n">Output</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-3-14"><a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="p">}</span>
+</span><span id="__span-3-15"><a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>
+</span><span id="__span-3-16"><a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="k">impl</span><span class="w"> </span><span class="n">JobRow</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-17"><a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="w">    </span><span class="sd">/// Fails with `AwaError::Validation` on a job of another kind, and with</span>
+</span><span id="__span-3-18"><a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="w">    </span><span class="sd">/// a decode error when the stored JSON does not fit `T::Output`.</span>
+</span><span id="__span-3-19"><a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">output_as</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">JobOutput</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">T</span><span class="p">::</span><span class="n">Output</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">AwaError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-3-20"><a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="w">    </span><span class="sd">/// The same for the latest failed attempt that recorded an output.</span>
+</span><span id="__span-3-21"><a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">error_output_as</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">JobOutput</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">T</span><span class="p">::</span><span class="n">Output</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">AwaError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-3-22"><a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a><span class="p">}</span>
+</span><span id="__span-3-23"><a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a>
+</span><span id="__span-3-24"><a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a><span class="k">impl</span><span class="w"> </span><span class="n">ExternalCompletion</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-25"><a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a><span class="w">    </span><span class="sd">/// The completion then fails, writing nothing, if the job is not of kind `T`.</span>
+</span><span id="__span-3-26"><a id="__codelineno-3-26" name="__codelineno-3-26" href="#__codelineno-3-26"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">output_for</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">JobOutput</span><span class="o">&gt;</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">output</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">T</span><span class="p">::</span><span class="n">Output</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="bp">Self</span><span class="p">,</span><span class="w"> </span><span class="n">OutputError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-3-27"><a id="__codelineno-3-27" name="__codelineno-3-27" href="#__codelineno-3-27"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>In Python, <code>@client.task(Resize, output=Thumbnail)</code> makes <code>set_output</code> refuse an instance of another class. A type <code>isinstance</code> cannot check, such as <code>list[int]</code> or a <code>TypedDict</code>, is not enforced. <code>job.output_as(Thumbnail)</code> and <code>job.error_output_as(Thumbnail)</code> decode the way dispatch decodes args: <code>model_validate</code> for pydantic models, keyword construction for dataclasses, and an <code>isinstance</code> check for other classes.</p>
+<p><strong>The type is published, not enforced by the database.</strong> Registering a kind with a declared output stores <code>{"type": name}</code> in a new <code>output</code> column of <code>awa.job_kind_descriptors</code>. A JSON Schema is added when the declaring runtime has one: Python adds it when pydantic can produce one, and Rust takes one passed explicitly in <code>JobKindDescriptor::output</code>. An explicit descriptor output wins over the declared name. The admin UI labels a job's output with its kind's type and lists each kind's type and schema. The column is <code>jsonb</code>, capped at 64 KiB, and the descriptor sync probes for it, so a binary ahead of v052 syncs the rest of the descriptor.</p>
+<p><strong>Why not typed storage.</strong> A row read later may have been written by an older deployment of the handler, by another language, or before the kind declared a type. Decoding at the reader keeps every such row readable as JSON and makes a mismatch an error the reader handles, rather than a failed completion. Changing a declared output type is a schema change for readers, as changing args is; the descriptor shows the current one.</p>
+<h3 id="lifetime-of-the-output-slot">Lifetime of the output slot<a class="headerlink" href="#lifetime-of-the-output-slot" title="Permanent link">&para;</a></h3>
+<p>The slot belongs to one attempt and is created with its context. It is <strong>sealed when the handler returns</strong>, at the same point as ADR-046's staging buffer. Later calls return <code>OutputError::Sealed</code>.</p>
+<p>The finalizer owns the sealed value and lends it to every finalize retry, so a retry after a lost connection publishes the same value. A retried attempt starts with an empty slot.</p>
+<h3 id="where-an-attempts-output-goes">Where an attempt's output goes<a class="headerlink" href="#where-an-attempts-output-goes" title="Permanent link">&para;</a></h3>
+<p>The rule:</p>
+<ul>
+<li><strong><code>Completed</code></strong> stores it as the job's output.</li>
+<li><strong>Any failure the attempt's executor records</strong> keeps it in that failure's error entry: an error, a panic, <code>Cancel</code>, <code>RetryAfter</code>, exhaustion, poisoning, or a contract violation.</li>
+<li><strong><code>Snooze</code> and <code>WaitForCallback</code></strong> discard it.</li>
+<li><strong>A process that never saw it</strong>, meaning rescue, an admin action or an external completer, publishes none of it.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Attempt ends with</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Completed</code>, and the lease-guarded completion commits</td>
+<td>Stored as the job's output</td>
+</tr>
+<tr>
+<td><code>Completed</code>, but the guard matches no row (rescued, cancelled, taken over or completed externally first)</td>
+<td>Discarded with the transaction</td>
+</tr>
+<tr>
+<td><code>Completed</code> after a failed stage (ADR-046 poisoning)</td>
+<td>Kept in the poisoned attempt's terminal error entry</td>
+</tr>
+<tr>
+<td><code>Err</code>, retryable or terminal, including retries exhausted</td>
+<td>Kept in that attempt's error entry</td>
+</tr>
+<tr>
+<td>A panic</td>
+<td>Kept in the error entry the executor writes for it</td>
+</tr>
+<tr>
+<td><code>JobResult::Cancel</code> from the handler</td>
+<td>Kept in the cancellation's error entry</td>
+</tr>
+<tr>
+<td><code>RetryAfter</code></td>
+<td>Kept in an error entry, <code>retry requested after Ns</code>. One is written when, and only when, an output was recorded; <code>RetryAfter</code> already marks the attempt as failed. A job with an error entry completes on the general path, so a polling handler that records an output on every <code>RetryAfter</code> gives up the compact path for its eventual completion</td>
+</tr>
+<tr>
+<td><code>WaitForCallback</code> without a registered callback</td>
+<td>Kept in the contract-violation error entry</td>
+</tr>
+<tr>
+<td><code>Snooze</code>, <code>WaitForCallback</code></td>
+<td>Discarded and counted. Neither ends the attempt with a record; use progress (<a href="../014-structured-progress/">ADR-014</a>) for state a later run should see</td>
+</tr>
+<tr>
+<td><code>ctx.wait_for_callback(...)</code> inside the handler, resumed, then <code>Completed</code></td>
+<td>Stored: the handler and its slot stay alive across the wait</td>
+</tr>
+<tr>
+<td>Heartbeat, deadline or callback-timeout rescue; admin cancel; shutdown before finalization</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<p>An error entry with an output is <code>{"error": ..., "attempt": ..., "at": ..., "output": ...}</code>.</p>
+<p><strong>At most one entry keeps an output: the latest that recorded one.</strong> An entry that carries an output strips <code>output</code> from the earlier entries in the row it is written to. A later entry without one, such as a rescue or an admin cancel, leaves the earlier output in place. Retries copy the error history into each new ready row, so keeping every attempt's output would grow retained bytes with the square of the attempt count; with one, the live row carries at most 4 KiB of failed output, and the append-only ready rows of earlier attempts keep their copies until prune, so retained bytes are linear in the attempt count. River keeps a single output per job too, overwritten by each attempt. Attempt numbers restart after a DLQ retry, so the entry is identified by its position, not its <code>attempt</code>.</p>
+<p><strong>The dispatch row strips failed outputs.</strong> The row a handler receives at dispatch has <code>output</code> removed from its error entries. A failed output is a report for people, not a checkpoint for the next attempt. Progress remains the sanctioned checkpoint: it is mutable, flushed while the attempt runs, seeded into the next attempt and cleared on completion.</p>
+<h3 id="external-completion">External completion<a class="headerlink" href="#external-completion" title="Permanent link">&para;</a></h3>
+<p><code>complete_external</code> discards its payload on completion today. Storing it by default would expose callback bodies that may hold tokens or personal data. An external completion stores an output only when the caller passes one, through an options struct, so later options do not multiply signatures:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="cp">#[non_exhaustive]</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="cp">#[derive(Default)]</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ExternalCompletion</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* output, run_lease */</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">impl</span><span class="w"> </span><span class="n">ExternalCompletion</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="p">;</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">output</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">output</span><span class="p">:</span><span class="w"> </span><span class="nc">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="p">;</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">run_lease</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">run_lease</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="p">;</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="p">}</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="n">admin</span><span class="p">::</span><span class="n">complete_external_with</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span><span class="w"> </span><span class="n">callback_id</span><span class="p">,</span><span class="w"> </span><span class="n">opts</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="n">JobRow</span><span class="p">,</span><span class="w"> </span><span class="n">AwaError</span><span class="o">&gt;</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="n">admin</span><span class="p">::</span><span class="n">complete_external_with_in_tx</span><span class="p">(</span><span class="n">tx</span><span class="p">,</span><span class="w"> </span><span class="n">callback_id</span><span class="p">,</span><span class="w"> </span><span class="n">opts</span><span class="p">)</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="n">Client</span><span class="p">::</span><span class="n">complete_external_with</span><span class="p">(</span><span class="n">callback_id</span><span class="p">,</span><span class="w"> </span><span class="n">opts</span><span class="p">)</span><span class="w">    </span><span class="c1">// also runs registered Completed specs</span>
+</span></code></pre></div>
+<ul>
+<li><strong>Python:</strong> <code>client.complete_external(callback_id, payload=None, *, output=None)</code> and <code>complete_external_sync</code> take the same <code>output</code> keyword. The <code>payload</code> is still not stored.</li>
+<li><strong>HTTP:</strong> <code>POST /api/callbacks/{id}/complete</code> accepts an optional <code>output</code> field beside <code>payload</code>. An invalid one is a 400 and completes nothing.</li>
+</ul>
+<p><strong>Validation.</strong> The value goes through the same validation as <code>set_output</code>, and an invalid one fails the call before anything is written. A valid output that the engine cannot store (canonical, or a schema before v052) is dropped and counted, as a handler's would be, and the completion goes ahead: a webhook sender cannot recover from a refused completion.</p>
+<p><strong>Compatibility.</strong> An N−1 callback server ignores an unknown <code>output</code> field, so a mixed fleet behind one endpoint can drop it. The upgrade notes say so.</p>
+<p><code>resolve_callback</code> stores no output; see <a href="#open-extensions">Open extensions</a>.</p>
+<h3 id="storage">Storage<a class="headerlink" href="#storage" title="Permanent link">&para;</a></h3>
+<p><strong>Queue storage.</strong> Migration v052 changes every substrate schema:</p>
+<ul>
+<li><strong>Compact completions.</strong> <code>receipt_completion_batches</code> gains <code>outputs json[]</code>, aligned with <code>job_ids</code> by the same <code>ORDER BY lane_seq, job_id</code>.</li>
+<li>It is NULL when no job in the batch recorded an output, so a batch without outputs costs nothing.</li>
+<li>A <code>NOT VALID</code> check constraint enforces <code>outputs IS NULL OR cardinality(outputs) = completed_count</code> on new rows without scanning old ones.</li>
+<li>Recording an output does not take a job off the compact path.</li>
+<li><strong>General-path completions.</strong> <code>done_entries</code> gains a nullable <code>output json</code> column. It is separate from <code>payload</code>, so the payload-elision rule never touches it. Jobs with tags, unique keys, custom metadata, errors or staged follow-ups already take this path.</li>
+<li><strong>Failed attempts.</strong> The output is the <code>output</code> key of the attempt's error entry, inside the existing payload. It needs no schema change and is kept even before v052.</li>
+<li><strong><code>json</code>, not <code>jsonb</code>.</strong> A completion's output is stored as the JSON text the runtime serialized, so it reads back exactly: <code>1.0</code> stays a float and key order is kept. Postgres only validates <code>json</code> on input, while <code>jsonb</code> parses it into a tree. Measured on Postgres 16, building a batch's array of 2,000-element numeric outputs cost 5.4 times as much as <code>jsonb</code>, and an object of 400 keys 2.1 times, with small outputs about equal. The 4 KiB numeric array also takes about 24 KiB as <code>jsonb</code>. End to end, on the benchmark's worst shapes, <code>json</code> completes 1.2 to 1.7 times as many jobs per second, and a numeric array's completion writes about a third of the WAL. The price is that <code>json</code> has no equality operator: SQL that compares outputs casts them to <code>jsonb</code> first. A failed output lives in the <code>jsonb</code> payload, so it is normalized as job args are.</li>
+<li><strong>Batch size.</strong> A compact batch row is one value, and reading one job's output detoasts the whole array. The completion flush therefore starts a new batch row once the recorded outputs in a batch exceed 64 KiB of text. The rows are written in the flush's one transaction, so a flush still commits or fails as a whole.</li>
+</ul>
+<p>Only the compact-receipt and general per-job completion paths carry outputs. The completion flush partitions its requests, so requests with a claim always take those paths even when another request in the same flush has none. Queue-storage dispatch always passes a claim today; a request that carries an output and no claim is completed without it and counted as <code>no_claim</code>.</p>
+<p>The batch split happens before the flush's statement, so each run of jobs becomes its own statement and batch rows. Outputs are aggregated from the completed rows in the same <code>ORDER BY</code> as <code>job_ids</code>, so a job that drops out as stale shifts nothing.</p>
+<p><strong>Reading.</strong></p>
+<ul>
+<li><code>{schema}.terminal_jobs</code> gains a final <code>output</code> column: <code>done.output</code> on the general branch, and <code>batch.outputs[item.ord]</code> on the compact branch.</li>
+<li>The compact branch subscripts the array rather than unnesting it, so only matching rows detoast it.</li>
+<li><code>get_job</code>, the admin UI's job detail and its HTTP endpoint read the column into <code>JobRow.output</code>.</li>
+<li>List reads (<code>list_jobs</code>, the jobs page, <code>GET /api/jobs</code>) do not load it, and their rows carry <code>None</code>.</li>
+<li><code>UntypedJobEvent::Completed</code> carries the sealed output, set in memory rather than re-read, so lifecycle hooks see it without detoasting a batch array.</li>
+<li>Registered enqueue specs (ADR-029) receive the completed row with <code>output</code> cleared, so no spec can derive a follow-up from an output.</li>
+</ul>
+<p><strong>Canonical</strong> stores no output, successful or failed. It is deprecated in 0.7 and removed in 0.8 (<a href="../037-canonical-engine-deprecation/">ADR-037</a>), and every 0.7 feature needs only one storage implementation.</p>
+<ul>
+<li>A canonical worker accepts <code>set_output</code> and discards the value at finalization, logging at most once per kind per minute and counting it.</li>
+<li>An output passed to <code>complete_external_with</code> is dropped and counted.</li>
+</ul>
+<p><strong>The <code>awa.jobs</code> compatibility view is not extended.</strong> It selects from <code>awa.jobs_compat()</code>, whose <code>RETURNS TABLE</code> cannot gain a column in place, and <code>awa.insert_job_compat</code> returns its row type. SQL readers of queue storage query <code>{schema}.terminal_jobs</code>.</p>
+<h3 id="retention-and-erasure">Retention and erasure<a class="headerlink" href="#retention-and-erasure" title="Permanent link">&para;</a></h3>
+<p>An output lives as long as its job is queryable. It is truncated with its ready slot when queue storage prunes, together with the job's args and payload. Failed jobs carried over by prune keep their error entries, including the retained failed output.</p>
+<p>Deletion does not erase the bytes:</p>
+<ul>
+<li><strong>General path.</strong> Deleting a terminal job deletes its <code>done_entries</code> row with the output. The tuple stays until vacuum.</li>
+<li><strong>Compact path.</strong> Deleting a compact-completed job writes a tombstone. The tombstone hides the job and its output from every read, but the bytes stay in the batch row until prune.</li>
+<li><strong>Failed outputs.</strong> These live in payloads that earlier ready rows also hold. They too stay until prune.</li>
+</ul>
+<p>So a completion output's maximum physical residency is the retention window plus slot rotation, plus whatever WAL archives and backups keep. A failed output lives as long as the row that carries its error entry: through failed-job retention, through DLQ retention while dead-lettered, and through completed-job retention on a job that later completes. There is no call that erases an output and keeps its job.</p>
+<p>Outputs often hold derived data, which can be more sensitive than the args that produced it. Keep secrets and personal data out of them. Erasing an output on delete is listed under <a href="#open-extensions">Open extensions</a>.</p>
+<h3 id="observability">Observability<a class="headerlink" href="#observability" title="Permanent link">&para;</a></h3>
+<p>Outputs are never logged, and <code>OutputError</code> messages name the type and position of a failure, not the value. Metrics:</p>
+<ul>
+<li><code>awa.job.output_recorded</code>, a counter with the existing <code>awa.job.kind</code> and <code>awa.job.queue</code> attributes and <code>awa.job.outcome</code> (<code>completed</code> or <code>failed</code>);</li>
+<li><code>awa.job.output_size</code>, a histogram of text bytes;</li>
+<li><code>awa.job.output_dropped</code>, a counter with <code>awa.job.kind</code>, <code>awa.job.queue</code> and <code>awa.output.reason</code>: <code>canonical</code>, <code>schema_missing</code>, <code>outcome</code> (<code>Snooze</code> or <code>WaitForCallback</code>), <code>abandoned</code> or <code>no_claim</code>.</li>
+</ul>
+<p>Invalid and oversized values never reach the slot; the handler sees the error.</p>
+<p>Warnings for dropped outputs are rate-limited to one per kind and reason per minute, and external-completion drops to one per minute. The Grafana dashboard gains recorded and dropped panels. A sustained <code>schema_missing</code> rate means a binary is running ahead of its migration.</p>
+<h3 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h3>
+<p>The test harnesses behave like the runtime:</p>
+<ul>
+<li><strong><code>awa-testing</code>'s <code>work_one</code> (queue storage).</strong></li>
+<li>It publishes the output with its own completion, and in the error entry on failure. A retryable failure now writes its error entry, as the runtime does.</li>
+<li><code>WorkResult</code> carries the row re-read after finalization, so <code>WorkResult::Completed(row).output</code> is the stored output.</li>
+<li><strong><code>awa.testing.HandlerJob</code>.</strong></li>
+<li>It gains <code>set_output</code>, <code>clear_output</code> and a read-only <code>output</code> property.</li>
+<li>It validates through the same converter and limits as the runtime, by calling into the Rust validator.</li>
+<li><strong>Python's <code>AwaTestClient</code>.</strong> It finalizes canonical rows, so it exposes the sealed value as <code>WorkResult.output</code>, documented as harness-only. Moving it to queue storage is tracked separately.</li>
+</ul>
+<h2 id="guarantees">Guarantees<a class="headerlink" href="#guarantees" title="Permanent link">&para;</a></h2>
+<p>For a job A whose attempt recorded output O:</p>
+<ul>
+<li><strong>Published with its own transition.</strong> O is stored as A's output if and only if that attempt's own <code>Completed</code> finalization committed under its run lease. O appears in an error entry only if that attempt's own failure transition committed under its run lease. No output comes from an attempt that was rescued or superseded, or whose transition rolled back.</li>
+<li><strong>One output per job.</strong> A job row completes at most once. Its output is therefore either the sealed output of the attempt whose completion committed, or the value passed to the external completion that committed. An external completion that wins a race with a handler waiting in <code>ctx.wait_for_callback</code> stores its own output, if any, and the handler's later completion is stale.</li>
+<li><strong>Never on a dispatch path.</strong> No scheduler, spec, dependency or follow-up reads an output, and the dispatch row carries none. The one exception is a mixed-version fleet: an N−1 worker does not strip failed outputs, so a retry it claims carries the previous attempt's output in <code>errors</code> (see Migrate first).</li>
+</ul>
+<p>Not guaranteed:</p>
+<ul>
+<li><strong>That O matches anything else.</strong> A handler that also writes the value into a follow-up's args writes it twice, and nothing compares the two.</li>
+<li><strong>An output for every attempt.</strong> Rescue, admin actions, <code>Snooze</code> and <code>WaitForCallback</code> record none, and only the most recent failure keeps its output.</li>
+<li><strong>Retention beyond the job.</strong> O goes when A is pruned. Deleting A hides O but does not erase its bytes.</li>
+<li><strong>Outputs on canonical.</strong></li>
+</ul>
+<h2 id="non-goals-not-a-results-store-for-workflows">Non-goals: not a results store for workflows<a class="headerlink" href="#non-goals-not-a-results-store-for-workflows" title="Permanent link">&para;</a></h2>
+<p><a href="../046-handler-staged-follow-ups/#non-goals-this-is-not-a-workflow-engine">ADR-046's test</a>, verbatim: "A feature crosses into workflow-engine territory if it requires Awa to remember a relationship between jobs after the triggering transaction commits: a join, a step's result that the engine or another job reads, a chain's status, or a compensation."</p>
+<p>An output is a value on one job. People and tools read it; neither the engine nor another job does. Several rules follow:</p>
+<ul>
+<li><strong>B must not read A's output.</strong> A value B needs travels in B's args, through staging. A B that fetches A's output by ID recreates question 3: it fails once A is pruned, which is exactly the failure Celery and Oban Pro document. No API offers "the output of the job that enqueued me": <code>output_as</code> decodes a row its caller already holds and looks nothing up. The docs say so.</li>
+<li><strong>No output-driven follow-ups.</strong> No <code>on_*_enqueue*</code> spec receives an output, and no predicate evaluates one. A seal-time mapper that derives follow-ups from the output can be written in user code on top of <code>OutputSlot</code> and staging. It is not core API.</li>
+<li><strong>No checkpoints across attempts.</strong> Handlers do not see failed outputs at dispatch, so an attempt cannot resume from the previous attempt's output. That is what progress is for, and progress is cleared on completion and on DLQ retry.</li>
+<li><strong>Not on by default.</strong> A job records an output only when its handler asks. Each open extension needs its own ADR that passes the test above.</li>
+</ul>
+<h2 id="rollout">Rollout<a class="headerlink" href="#rollout" title="Permanent link">&para;</a></h2>
+<p>Migration v052 first redefines the v023 installer, without running it, so fresh installs and <code>prepare_schema</code> create the new columns. A targeted tail then updates each schema that <code>awa.queue_storage_schemas()</code> discovers. It does not replay the installer.</p>
+<p>The tail, per schema:</p>
+<ul>
+<li>adds the two nullable columns, each guarded by a catalog check so a re-run takes no lock;</li>
+<li>adds the <code>NOT VALID</code> check;</li>
+<li>replaces the <code>terminal_jobs</code> view.</li>
+</ul>
+<p><strong>Locking.</strong> Adding a column to a partitioned parent takes an <code>ACCESS EXCLUSIVE</code> lock on the parent and every partition, and replacing the view takes one on the view, even on a re-run. The runner applies the whole pending range in one transaction, so these locks are held until it commits; while they are held, completions and <code>terminal_jobs</code> reads wait. The helper locks <code>terminal_jobs</code> before its tables, the order readers take them, so a read that starts mid-migration waits rather than deadlocking. When no <code>lock_timeout</code> is set, the tail sets 2 s and restores the previous value afterwards, as v050 does, so a busy system fails the migration fast instead of stalling the fleet. A timeout or deadlock rolls back every pending migration, which can then be re-run. Nothing is rewritten or scanned.</p>
+<p><strong>Migrate first.</strong> N−1 binaries insert with explicit column lists, so they write NULL. They read <code>terminal_jobs</code> by explicit column, so they ignore the new one. They do not strip failed outputs from the row they dispatch, so while versions are mixed an N−1 worker that claims a retry sees the previous attempt's output in <code>errors</code>.</p>
+<p><strong>Binary first.</strong></p>
+<ul>
+<li>A new binary checks the catalog of its own schema for both columns, so a custom schema that the migration skipped is handled correctly. A positive answer is cached; a negative one is re-checked at most every 30 seconds, so the binary picks the columns up without a restart. Until then it neither writes nor reads them: its terminal reads leave <code>output</code> out.</li>
+<li>Completion outputs are dropped and counted as <code>schema_missing</code>. Outputs in error entries need no schema change and are kept.</li>
+<li>Startup is unchanged. <code>/readyz</code> reports not ready until the migration runs, as for any version bump, so binary-first applies to deployments that do not gate on readiness.</li>
+</ul>
+<p><strong>Mixed versions.</strong> v052 adds nullable columns and changes no representation or authority, so <a href="../041-rolling-upgrade-policy/">ADR-041</a>'s expand, flip and contract steps do not apply. A job without an output runs byte-for-byte the statements N−1 binaries run: the output columns are named only when an output is present. The integration suite runs every existing terminal path against a v052 schema, and the binary-first tests run the new binary against a v051 schema.</p>
+<h2 id="relationship-to-other-adrs">Relationship to other ADRs<a class="headerlink" href="#relationship-to-other-adrs" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>ADR-046.</strong> Staging remains the only way to hand a value to another job. The output slot shares the staging buffer's seal point and finalize-retry rule. ADR-046 sketched a starting contract in which a failed attempt's value is never visible and the value is deleted with the job. This ADR departs from both, for the reasons in <a href="#where-an-attempts-output-goes">Where an attempt's output goes</a> and <a href="#retention-and-erasure">Retention and erasure</a>: a failed attempt's output is kept in its own error entry, never as the job's output, and deletion hides an output while its bytes stay until prune.</li>
+<li><strong>ADR-026.</strong> Outputs ride the compact completion batch; the general path gains a column.</li>
+<li><strong>ADR-014.</strong> Progress and output stay separate, as above.</li>
+<li><strong>ADR-036.</strong> These join the stable surface in 0.7:</li>
+<li>the Rust and Python APIs: <code>set_output</code>, <code>clear_output</code>, <code>output</code>, <code>OutputSlot</code>, <code>OutputError</code>, <code>MAX_OUTPUT_BYTES</code>, <code>JobRow.output</code>, <code>ExternalCompletion</code>;</li>
+<li>the <code>output</code> column of <code>{schema}.terminal_jobs</code>, part of the covered terminal read surface;</li>
+<li>the <code>output</code> field of the HTTP callback body and of the job-detail response;</li>
+<li>the metric names and attribute keys above.</li>
+</ul>
+<p>The <code>outputs</code> array on compact batches and the <code>output</code> column of <code>done_entries</code> are internal, as all storage tables are. The <code>output</code> key in error entries is documented but best-effort, like the rest of the error-entry shape, which <code>docs/stability.md</code> does not list.
+- <strong>ADR-037.</strong> Canonical is not extended.
+- <strong>ADR-041.</strong> v052 is additive, and the binary-first behaviour keeps the current binary operable before the migration.
+- <strong>ADR-042 (proposed).</strong> When caller-owned completion ships, its completion function should accept an output.</p>
+<h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>A TLA+ model</strong>, <code>correctness/storage/AwaJobOutput.tla</code>.</li>
+<li><strong>What it models.</strong> Attempts record a nondeterministic output, then complete or fail under a lease guard. Completion is sent on the batched or direct path, with lost acknowledgements and finalize retries. Rescue, reclaim, and external completion with or without an output are modelled too.</li>
+<li><strong>Invariants.</strong><ul>
+<li>A stored output traces to the committing attempt and equals what it sealed, or to the external completion.</li>
+<li>Only completed jobs have an output.</li>
+<li>An error entry's output belongs to the failed attempt that wrote it.</li>
+<li>Every committed completion whose attempt sealed an output stored it.</li>
+</ul>
+</li>
+<li><strong>Negative configs</strong>, each expected to fail:<ul>
+<li>write the output when it is recorded;</li>
+<li>write it after the commit in a separate step;</li>
+<li>drain it on the first finalize send;</li>
+<li>drop it on the batched path;</li>
+<li>complete without the lease guard.</li>
+</ul>
+</li>
+<li><strong>Integration tests on queue storage.</strong></li>
+<li>Every existing terminal path still passes against a v052 schema, and a new binary runs against a v051 schema.</li>
+<li>Output is stored on the compact and the general path.</li>
+<li>Failed outputs land in error entries:<ul>
+<li>only the latest entry to record one keeps it, across retries, rescue, the DLQ and DLQ retry;</li>
+<li>they are stripped from the dispatch-time row.</li>
+</ul>
+</li>
+<li>Discard on snooze and <code>WaitForCallback</code>, and an entry on <code>RetryAfter</code>.</li>
+<li>Sealing, clearing on failure and on null, and non-poisoning.</li>
+<li>External completion with and without an output.</li>
+<li>A stale completion stores nothing.</li>
+<li>Canonical discards.</li>
+<li>Reads and writes against a schema without the columns.</li>
+<li>List reads omit outputs.</li>
+<li><strong>Property tests.</strong> Any value either fails <code>set_output</code> or reads back equal through both terminal paths. The Python fuzz test extends to <code>set_output</code> and the <code>HandlerJob</code> stand-in.</li>
+<li><strong>Benchmark gates.</strong></li>
+<li><strong>Throughput and WAL</strong> of completions with 100 B and 4 KiB outputs on every job, against the compact baseline, including a numeric-array and a many-key worst case.</li>
+<li><strong>Read latency:</strong> <code>get_job</code> for a compact-completed job when batches are full of 4 KiB outputs.</li>
+<li><strong>Retry-storm WAL:</strong> every attempt fails with an output.</li>
+</ul>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
+<ul>
+<li>"What did this job produce?" can be answered from the API, the admin UI and SQL for as long as the job is retained.</li>
+<li>The most recent failed attempt keeps what it produced, attached to the error that ended it.</li>
+<li>No public type changes shape beyond one field on a <code>#[non_exhaustive]</code> struct.</li>
+<li>A job that records an output keeps the compact completion path.</li>
+</ul>
+<h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>More surface to keep stable:</strong> an API on the context, a row field, an options struct and an HTTP field.</li>
+<li><strong>A value that must be both inspected and handed on is written twice.</strong></li>
+<li><strong>Larger compact batches cost more to read.</strong> With large outputs a compact batch holds fewer jobs: as few as 17 at the 4 KiB cap. Reading one output still detoasts its batch's outputs: about 64 KiB of text.</li>
+<li><strong>Earlier failures lose their outputs.</strong> Only the latest entry to record one keeps it.</li>
+<li><strong>Canonical users get nothing</strong> until they move to queue storage.</li>
+<li><strong>Deleted outputs persist</strong> physically until prune, as args do.</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="completed-only">Completed only<a class="headerlink" href="#completed-only" title="Permanent link">&para;</a></h3>
+<p>Store only the successful attempt's output. That is simpler, and enough for "what did this job produce?". Rejected because the most useful output is often from the attempt that failed.</p>
+<h3 id="keep-every-failed-attempts-output">Keep every failed attempt's output<a class="headerlink" href="#keep-every-failed-attempts-output" title="Permanent link">&para;</a></h3>
+<p>Rejected on cost. Retries copy the payload into each new ready row, and those rows are append-only until prune, so retained bytes grow with the square of the attempt count. At the default 25 attempts that is over a megabyte per job before jsonb expansion.</p>
+<h3 id="one-output-per-job-last-write-wins-across-every-transition">One output per job, last write wins across every transition<a class="headerlink" href="#one-output-per-job-last-write-wins-across-every-transition" title="Permanent link">&para;</a></h3>
+<p>Publish the output on retries, snoozes and failures as well as on completion, each overwriting the last. Rejected:</p>
+<ul>
+<li>It is progress under another name: it is carried the same way and survives retries the same way.</li>
+<li>It needs three stores: deferred rows, terminal rows and DLQ rows.</li>
+<li>After a rescue, the previous attempt's value survives and looks current.</li>
+</ul>
+<h3 id="a-column-on-done_entries-or-a-key-in-the-payload-for-every-output">A column on <code>done_entries</code> or a key in the payload, for every output<a class="headerlink" href="#a-column-on-done_entries-or-a-key-in-the-payload-for-every-output" title="Permanent link">&para;</a></h3>
+<p>One representation and no batch array. Rejected on cost: every job that records an output would leave the compact path (measured above).</p>
+<h3 id="jsonb-as-args-use"><code>jsonb</code>, as args use<a class="headerlink" href="#jsonb-as-args-use" title="Permanent link">&para;</a></h3>
+<p>One JSON type across the schema, with equality and containment operators. Rejected: it parses every output into a tree on the completion path, stores a numeric array at up to six times its text size, and normalizes numbers, so <code>1.0</code> would read back as <code>1</code>. Queries that need operators cast with <code>output::jsonb</code>.</p>
+<h3 id="bytea"><code>bytea</code><a class="headerlink" href="#bytea" title="Permanent link">&para;</a></h3>
+<p>Opaque bytes would also keep the exact value and skip parsing. Rejected: an output could not be read in SQL, the admin UI could not render it, and Rust and Python handlers would need a shared encoding beyond JSON.</p>
+<h3 id="a-side-table-keyed-by-job">A side table keyed by job<a class="headerlink" href="#a-side-table-keyed-by-job" title="Permanent link">&para;</a></h3>
+<p>This gives a uniform point lookup and one shape for every terminal family, at about six times the WAL of the batch array. It is kept as the fallback if outputs larger than 4 KiB become a requirement.</p>
+<h3 id="metadata_awa_result"><code>metadata._awa_result</code><a class="headerlink" href="#metadata_awa_result" title="Permanent link">&para;</a></h3>
+<p>Merge the output into metadata on read, as callback results are. Rejected:</p>
+<ul>
+<li>metadata belongs to the user;</li>
+<li><code>_awa_callback_result</code> is a handler <em>input</em>;</li>
+<li>reads would differ between storage families.</li>
+</ul>
+<h3 id="typed-storage-or-a-generic-handler-signature">Typed storage or a generic handler signature<a class="headerlink" href="#typed-storage-or-a-generic-handler-signature" title="Permanent link">&para;</a></h3>
+<p>Making the slot generic (<code>JobContext&lt;O&gt;</code>) or the output part of the handler's return type would change every handler signature, including <code>Worker</code>, and would not type the rows readers get from the database, which is where a type is needed. Validating outputs against the published schema at write time would make a schema change fail completions after their side effects ran. Both were rejected for the opt-in declaration and reader-side decode above.</p>
+<h3 id="converts-outputerror-into-a-terminal-job-error"><code>?</code> converts <code>OutputError</code> into a terminal job error<a class="headerlink" href="#converts-outputerror-into-a-terminal-job-error" title="Permanent link">&para;</a></h3>
+<p>This would match <code>StageError</code>. Rejected: a data-dependent size failure would send jobs to the DLQ after their side effects, for a value nothing depends on.</p>
+<h3 id="a-marker-instead-of-an-error">A marker instead of an error<a class="headerlink" href="#a-marker-instead-of-an-error" title="Permanent link">&para;</a></h3>
+<p>Store <code>{"_awa": "output_too_large", ...}</code> and return <code>Ok</code>. Rejected: it puts a reserved shape into user outputs and hides the failure from the handler. The metric and the cleared slot make the failure visible instead.</p>
+<h3 id="python-return-values-as-the-output">Python return values as the output<a class="headerlink" href="#python-return-values-as-the-output" title="Permanent link">&para;</a></h3>
+<p>Rejected as a default, because it would silently change existing handlers that return values today. Kept as an opt-in extension.</p>
+<h3 id="outputs-read-by-specs-or-derived-follow-ups-in-core">Outputs read by specs, or derived follow-ups in core<a class="headerlink" href="#outputs-read-by-specs-or-derived-follow-ups-in-core" title="Permanent link">&para;</a></h3>
+<p>Rejected by ADR-046 for dispatch. The type meets the spec only inside the completion transaction, and Python would run inside it. A mapper in user code keeps the topology in the handler without engine support.</p>
+<h3 id="record-what-the-attempt-staged">Record what the attempt staged<a class="headerlink" href="#record-what-the-attempt-staged" title="Permanent link">&para;</a></h3>
+<p>A's output would list the follow-ups it inserted, with their IDs or "duplicate", which would answer "why is there no B?". But B's ID is known only after the insert, so this would mean updating A's append-only row, or reordering the completion's inserts and its lock order. Deferred: ADR-046's planned provenance key and deduplication metric answer most of the question more cheaply.</p>
+<h2 id="open-extensions">Open extensions<a class="headerlink" href="#open-extensions" title="Permanent link">&para;</a></h2>
+<p>Each needs its own ADR that passes ADR-046's test.</p>
+<ul>
+<li><strong>Python return values</strong>: an opt-in on <code>@client.task(...)</code> would make a handler's return value its output.</li>
+<li><strong>Callback outputs</strong>: a registration-time <code>store_output</code> option on the callback, covering <code>complete_external</code>, <code>resolve_callback</code> and its transformed payload, and the HTTP endpoint alike.</li>
+<li><strong>Erasure on delete</strong>: deleting a compact-completed job also sets its element of <code>outputs</code> to NULL.</li>
+<li><strong>Larger outputs</strong> in a side table, if a use case appears.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../javascripts/language-switch.js"></script>
+      
+        <script src="../../javascripts/agent-docs.js"></script>
+      
+    
+  </body>
+</html>
