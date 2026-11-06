@@ -71,6 +71,8 @@ The maintenance leader runs `ANALYZE` on the queue-storage head tables and parti
 
 Run migrations with the schema owner as the effective role, as shown above, so the function's owner owns the tables. A function owned by a role that may not analyse them (it is not the table owner, the database owner, or a `MAINTAIN` holder) makes every pass report `skipped_privilege` and logs one warning. The function only analyses the two head tables and the thirteen ring parents of a schema that `awa.queue_storage_schemas()` reports as trusted, and `ANALYZE` changes statistics only.
 
+If the helper's owner may not analyse the tables, run `ALTER FUNCTION awa.analyze_queue_storage_relation(text, text) OWNER TO awa_owner` as a role permitted to transfer ownership, or grant its owner `MAINTAIN` on the target tables on PostgreSQL 17+. Replacing the function body leaves its owner unchanged.
+
 ## Provision queues before starting restricted runtimes
 
 From schema v049, runtime calls use existing lane sequences without issuing
