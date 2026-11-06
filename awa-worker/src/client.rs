@@ -773,8 +773,10 @@ impl ClientBuilder {
 
     /// Set how many attempts one queue-storage rescue pass rescues before it
     /// stops (default: 5000). With a pass a second while a backlog remains,
-    /// this caps a drain at about this many attempts per second per rescue
-    /// kind, and rescued retries become due no faster than this per second.
+    /// this bounds the number rescued per second per kind, allowing one
+    /// final batch beyond the cap. Zero disables follow-up batches and early
+    /// re-arms. Retried attempts retain their normal backoff; their due times
+    /// can cluster, so this does not cap the promotion rate.
     pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
         self.rescue_pass_max_rows = Some(max_rows);
         self

@@ -5611,6 +5611,188 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rescue_batch_keeps_a_partially_rescued_scan_active() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_rescue_partial_window";
+    let queue = "rescue_partial_window";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    for id in 0..501 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let claims = store
+        .claim_runtime_batch(&pool, queue, 501, Duration::from_secs(30))
+        .await
+        .expect("claim a backlog larger than one rescue batch");
+    assert_eq!(claims.len(), 501);
+    for table in ["lease_claims", "lease_claim_batches"] {
+        sqlx::query(&format!("UPDATE {schema}.{table} SET claimed_at = now() - interval '1 hour', deadline_at = now() - interval '1 minute'"))
+            .execute(&pool).await.expect("expire attempts");
+    }
+    let batch = store
+        .rescue_expired_deadlines_batch(&pool, &|_| false, &Default::default())
+        .await
+        .expect("first rescue batch");
+    assert_eq!(batch.rescued.len(), 500);
+    assert!(batch.saturated);
+    let slot = claims[0].claim.claim_slot;
+    assert!(!batch.idle_slots.contains(&slot));
+    assert!(
+        batch
+            .scan_progress
+            .iter()
+            .filter(|scan| scan.slot == slot)
+            .flat_map(|scan| &scan.cursors)
+            .any(|cursor| cursor.saturated),
+        "a partially rescued candidate window must not complete that slot's sweep"
+    );
+    let tail = store
+        .rescue_expired_deadlines_batch(&pool, &|_| false, &Default::default())
+        .await
+        .expect("rescue the remaining attempt");
+    assert_eq!(tail.rescued.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rescue_batch_continues_past_closed_scan_windows() {
+    for (deadline, fresh_history) in [(false, false), (true, false), (false, true)] {
+        let (_db_guard, pool) = setup_pool(10).await;
+        let suffix = if deadline {
+            "deadline"
+        } else if fresh_history {
+            "fresh"
+        } else {
+            "heartbeat"
+        };
+        let schema = format!("awa_rescue_sparse_{suffix}");
+        let queue = format!("rescue_sparse_{suffix}");
+        let store = create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.clone(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: true,
+                claim_slot_count: 2,
+            },
+        )
+        .await;
+        for id in 0..3 {
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        let claims = store
+            .claim_runtime_batch(&pool, &queue, 3, Duration::from_secs(30))
+            .await
+            .expect("claim sparse backlog");
+        assert_eq!(claims.len(), 3);
+        for claim in &claims {
+            age_receipt_claim(
+                &pool,
+                &store,
+                claim.job.id,
+                claim.job.run_lease,
+                Duration::from_secs(300),
+            )
+            .await;
+        }
+        if deadline {
+            sqlx::query(&format!(
+                "UPDATE {schema}.lease_claims SET deadline_at = now() - interval '1 second'"
+            ))
+            .execute(&pool)
+            .await
+            .expect("expire deadlines");
+        }
+        if fresh_history {
+            for claim in &claims[..2] {
+                sqlx::query(&format!("INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at) VALUES ($1, $2, now(), now())"))
+                    .bind(claim.job.id).bind(claim.job.run_lease).execute(&pool).await.expect("fresh heartbeat history");
+            }
+        } else {
+            store
+                .complete_runtime_batch(&pool, &claims[..2])
+                .await
+                .expect("complete history");
+        }
+        let options = awa::model::RescueBatchOptions {
+            cursor_scan_limit: Some(1),
+            ..Default::default()
+        };
+        let batch = if deadline {
+            store
+                .rescue_expired_deadlines_batch(&pool, &|_| false, &options)
+                .await
+        } else {
+            store
+                .rescue_stale_heartbeats_batch(&pool, Duration::from_secs(90), &|_| false, &options)
+                .await
+        }
+        .expect("walk first closed window");
+        assert!(batch.rescued.is_empty());
+        assert!(
+            batch.saturated,
+            "a full closed scan window must continue toward unseen abandoned claims ({suffix})"
+        );
+        assert!(
+            !batch.idle_slots.contains(&claims[0].claim.claim_slot),
+            "cursor progress is not an idle slot"
+        );
+        let mut rescued = Vec::new();
+        for _ in 0..3 {
+            let batch = if deadline {
+                store
+                    .rescue_expired_deadlines_batch(&pool, &|_| false, &options)
+                    .await
+            } else {
+                store
+                    .rescue_stale_heartbeats_batch(
+                        &pool,
+                        Duration::from_secs(90),
+                        &|_| false,
+                        &options,
+                    )
+                    .await
+            }
+            .expect("continue sparse scan");
+            rescued.extend(batch.rescued);
+        }
+        assert_eq!(
+            rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![claims[2].job.id]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_rescue_cursor";

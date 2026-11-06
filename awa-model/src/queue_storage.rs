@@ -379,11 +379,30 @@ pub struct RescueBatchOptions {
 #[derive(Debug, Default)]
 pub struct RescueBatch {
     pub rescued: Vec<JobRow>,
-    /// A scan stopped at its row limit, so more attempts may already be
-    /// eligible. False means the batch rescued everything it found.
+    /// A scan window or rescue quota was exhausted, so another bounded
+    /// batch may find eligible attempts.
     pub saturated: bool,
-    /// Claim slots this batch searched and found nothing to rescue in.
+    /// Claim slots whose bounded scans completed without eligible attempts.
     pub idle_slots: Vec<i32>,
+    /// Last cursor reached by each bounded receipt scan. A caller continuing
+    /// batches can stop a sweep once its cursor returns to its first window.
+    pub scan_progress: Vec<RescueScanProgress>,
+}
+
+/// Cursor progress from a bounded receipt rescue scan.
+#[derive(Debug, Clone)]
+pub struct RescueScanProgress {
+    pub slot: i32,
+    /// One cursor per representation, in a stable order. A slot is drained
+    /// only after every representation has completed its sweep.
+    pub cursors: Vec<RescueScanCursor>,
+}
+
+/// Progress of one independently ordered receipt representation.
+#[derive(Debug, Clone)]
+pub struct RescueScanCursor {
+    pub position: Option<(DateTime<Utc>, i64, i64)>,
+    pub saturated: bool,
 }
 
 /// Receipt claims one rescue batch took, and what it found on the way.
@@ -392,7 +411,21 @@ struct ReceiptRescueBatch {
     rescued: Vec<DeletedLeaseRow>,
     saturated: bool,
     idle_slots: Vec<i32>,
+    scan_progress: Vec<RescueScanProgress>,
 }
+
+type ReceiptRescueScan = (
+    Vec<DeletedLeaseRow>,
+    bool,
+    Option<(DateTime<Utc>, i64, i64)>,
+);
+type ReceiptRescueScanRow = (
+    sqlx::types::Json<Vec<DeletedLeaseRow>>,
+    bool,
+    Option<DateTime<Utc>>,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// Where a rescue sends an exhausted attempt on a queue whose DLQ is enabled.
 struct RescueDlq<'a> {
@@ -2201,7 +2234,7 @@ struct ExistingReadyRow {
     payload: serde_json::Value,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Deserialize, sqlx::FromRow)]
 struct DeletedLeaseRow {
     ready_slot: i32,
     ready_generation: i64,
@@ -10913,7 +10946,7 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
         for slot in self.rescue_slot_order_tx(tx, options).await? {
-            let slot_rescued = self
+            let (slot_rescued, scan_full, cursor) = self
                 .rescue_stale_receipt_claims_for_slot_tx(
                     tx,
                     slot,
@@ -10926,9 +10959,17 @@ impl QueueStorage {
                     remaining,
                 )
                 .await?;
-            if slot_rescued.is_empty() {
+            batch.saturated |= scan_full;
+            if !scan_full && slot_rescued.is_empty() {
                 batch.idle_slots.push(slot);
             }
+            batch.scan_progress.push(RescueScanProgress {
+                slot,
+                cursors: vec![RescueScanCursor {
+                    position: cursor,
+                    saturated: scan_full,
+                }],
+            });
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
             batch.rescued.extend(slot_rescued);
             if remaining == 0 {
@@ -10976,7 +11017,7 @@ impl QueueStorage {
         cutoff: DateTime<Utc>,
         scan_limit: i64,
         rescue_limit: i64,
-    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+    ) -> Result<ReceiptRescueScan, AwaError> {
         let schema = self.schema();
         let claim_child = claim_child_name(schema, slot as usize);
         let claim_batch_child = claim_batch_child_name(schema, slot as usize);
@@ -11309,7 +11350,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?
             .into_iter()
             .unzip();
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+        let (rescued, scan_full, cursor_at, cursor_job_id, cursor_run_lease): ReceiptRescueScanRow = sqlx::query_as(&format!(
             r#"
             WITH {candidate_ctes},
             stale_row_locked AS (
@@ -11505,11 +11546,9 @@ impl QueueStorage {
                     rescue_cursor_run_lease = advance_target.run_lease
                 FROM advance_target
                 WHERE slots.slot = $1
-                RETURNING slots.slot
+                RETURNING slots.rescue_cursor_claimed_at, slots.rescue_cursor_job_id, slots.rescue_cursor_run_lease
             ),
-            cursor_advance AS (
-                SELECT count(*) FROM advance_cursor
-            )
+            rescued_rows AS (
             SELECT
                 stale_locked.ready_slot,
                 stale_locked.ready_generation,
@@ -11528,7 +11567,13 @@ impl QueueStorage {
               ON closed_locked.claim_slot = stale_locked.claim_slot
              AND closed_locked.job_id = stale_locked.job_id
              AND closed_locked.run_lease = stale_locked.run_lease
-            CROSS JOIN cursor_advance
+            )
+            SELECT
+                COALESCE((SELECT jsonb_agg(to_jsonb(rescued_rows)) FROM rescued_rows), '[]'::jsonb),
+                (SELECT count(*) >= $3 FROM candidates),
+                (SELECT rescue_cursor_claimed_at FROM advance_cursor),
+                (SELECT rescue_cursor_job_id FROM advance_cursor),
+                (SELECT rescue_cursor_run_lease FROM advance_cursor)
             "#
         ))
         .bind(slot)
@@ -11537,10 +11582,18 @@ impl QueueStorage {
         .bind(rescue_limit)
         .bind(&locked_job_ids)
         .bind(&locked_run_leases)
-        .fetch_all(tx.as_mut())
+        .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        Ok(rescued)
+        let scan_full = scan_full || rescued.0.len() as i64 >= rescue_limit;
+        Ok((
+            rescued.0,
+            scan_full,
+            cursor_at
+                .zip(cursor_job_id)
+                .zip(cursor_run_lease)
+                .map(|((at, id), lease)| (at, id, lease)),
+        ))
     }
 
     /// Receipt-side counterpart to `rescue_expired_deadlines`: scans
@@ -11568,7 +11621,7 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
         for slot in self.rescue_slot_order_tx(tx, options).await? {
-            let slot_rescued = self
+            let (slot_rescued, scan_full, cursor) = self
                 .rescue_expired_receipt_deadlines_for_slot_tx(
                     tx,
                     slot,
@@ -11580,9 +11633,17 @@ impl QueueStorage {
                     remaining,
                 )
                 .await?;
-            if slot_rescued.is_empty() {
+            batch.saturated |= scan_full;
+            if !scan_full && slot_rescued.is_empty() {
                 batch.idle_slots.push(slot);
             }
+            batch.scan_progress.push(RescueScanProgress {
+                slot,
+                cursors: vec![RescueScanCursor {
+                    position: cursor,
+                    saturated: scan_full,
+                }],
+            });
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
             batch.rescued.extend(slot_rescued);
             if remaining == 0 {
@@ -11640,9 +11701,9 @@ impl QueueStorage {
         slot: i32,
         scan_limit: i64,
         rescue_limit: i64,
-    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+    ) -> Result<ReceiptRescueScan, AwaError> {
         if rescue_limit <= 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false, None));
         }
 
         let schema = self.schema();
@@ -11779,7 +11840,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?
             .into_iter()
             .unzip();
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+        let (rescued, scan_full, cursor_at, cursor_job_id, cursor_run_lease): ReceiptRescueScanRow = sqlx::query_as(&format!(
             r#"
             WITH {candidate_ctes},
             expired_locked AS (
@@ -11857,11 +11918,9 @@ impl QueueStorage {
                     deadline_cursor_run_lease = advance_target.run_lease
                 FROM advance_target
                 WHERE slots.slot = $1
-                RETURNING slots.slot
+                RETURNING slots.deadline_cursor_deadline_at, slots.deadline_cursor_job_id, slots.deadline_cursor_run_lease
             ),
-            cursor_advance AS (
-                SELECT count(*) FROM advance_cursor
-            )
+            rescued_rows AS (
             SELECT
                 expired_locked.ready_slot,
                 expired_locked.ready_generation,
@@ -11880,7 +11939,13 @@ impl QueueStorage {
               ON inserted.claim_slot = expired_locked.claim_slot
              AND inserted.job_id = expired_locked.job_id
              AND inserted.run_lease = expired_locked.run_lease
-            CROSS JOIN cursor_advance
+            )
+            SELECT
+                COALESCE((SELECT jsonb_agg(to_jsonb(rescued_rows)) FROM rescued_rows), '[]'::jsonb),
+                (SELECT count(*) >= $2 FROM candidates),
+                (SELECT deadline_cursor_deadline_at FROM advance_cursor),
+                (SELECT deadline_cursor_job_id FROM advance_cursor),
+                (SELECT deadline_cursor_run_lease FROM advance_cursor)
             "#
         ))
         .bind(slot)
@@ -11888,10 +11953,18 @@ impl QueueStorage {
         .bind(rescue_limit)
         .bind(&locked_job_ids)
         .bind(&locked_run_leases)
-        .fetch_all(tx.as_mut())
+        .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        Ok(rescued)
+        let scan_full = scan_full || rescued.0.len() as i64 >= rescue_limit;
+        Ok((
+            rescued.0,
+            scan_full,
+            cursor_at
+                .zip(cursor_job_id)
+                .zip(cursor_run_lease)
+                .map(|((at, id), lease)| (at, id, lease)),
+        ))
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
@@ -14618,12 +14691,15 @@ impl QueueStorage {
         }
         saturated |= receipts.saturated;
         let idle_slots = receipts.idle_slots;
+        let scan_progress = receipts.scan_progress;
         let rescued_receipts = receipts.rescued;
 
         if deleted.is_empty() && rescued_receipts.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RescueBatch {
                 idle_slots,
+                scan_progress,
+                saturated,
                 ..RescueBatch::default()
             });
         }
@@ -14663,6 +14739,7 @@ impl QueueStorage {
             rescued,
             saturated,
             idle_slots,
+            scan_progress,
         })
     }
 
@@ -14752,12 +14829,15 @@ impl QueueStorage {
         }
         saturated |= receipts.saturated;
         let idle_slots = receipts.idle_slots;
+        let scan_progress = receipts.scan_progress;
         let receipt_deleted = receipts.rescued;
 
         if deleted.is_empty() && receipt_deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RescueBatch {
                 idle_slots,
+                scan_progress,
+                saturated,
                 ..RescueBatch::default()
             });
         }
@@ -14785,6 +14865,7 @@ impl QueueStorage {
             rescued,
             saturated,
             idle_slots,
+            scan_progress,
         })
     }
 
@@ -14887,6 +14968,7 @@ impl QueueStorage {
             rescued,
             saturated,
             idle_slots: Vec::new(),
+            scan_progress: Vec::new(),
         })
     }
 
