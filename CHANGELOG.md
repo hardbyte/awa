@@ -34,6 +34,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
   they materialize into leases, including compact and legacy row-local claims.
 - Exclude tombstoned source rows when hydrating moved running jobs, including
   compact receipts. Point reads retain the [concurrent-prune limitation](docs/troubleshooting.md#transient-admin-reads-during-partition-pruning).
+- Close read connections if their transaction start is cancelled or fails before
+  SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
+
+- Avoid repeated terminal-ledger probes when counting open deadline-backed
+  receipts, while preserving all closure and materialization exclusions.
+- Reduce running-count query work by keeping compact closure membership
+  correlated and limiting row-local closure lookups to their claim partition.
+- Hydrate completed job-kind counts through each member's full ready-row key,
+  avoiding repeated scans of other retained rows in the same enqueue lane.
+
 - **Ring prune and terminal-count rollup report `Blocked` when any of their
   statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
   by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but

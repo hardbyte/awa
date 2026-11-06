@@ -1082,14 +1082,20 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
                 batch.run_leases,
                 batch.lane_seqs
             ) AS item(job_id, run_lease, lane_seq)
-            JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = batch.ready_slot
-             AND ready.ready_generation = batch.ready_generation
-             AND ready.queue = batch.queue
-             AND ready.priority = batch.priority
-             AND ready.enqueue_shard = batch.enqueue_shard
-             AND ready.lane_seq = item.lane_seq
-             AND ready.job_id = item.job_id
+            CROSS JOIN LATERAL (
+                SELECT ready.kind
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = batch.ready_slot
+                  AND ready.ready_generation = batch.ready_generation
+                  AND ready.queue = batch.queue
+                  AND ready.priority = batch.priority
+                  AND ready.enqueue_shard = batch.enqueue_shard
+                  AND ready.lane_seq = item.lane_seq
+                  AND ready.job_id = item.job_id
+                -- Keep the full member key in the parameterized lookup,
+                -- rather than scanning its retained lane for every member.
+                OFFSET 0
+            ) AS ready
             WHERE NOT EXISTS (
                 SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
                 WHERE tomb.ready_slot = batch.ready_slot
@@ -1461,12 +1467,15 @@ async fn list_queue_storage_jobs(
             };
         }
         // As in `queue_overviews`: compiling costs more than running.
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
         let ids: Vec<i64> = query.fetch_all(tx.as_mut()).await?;
         tx.commit().await?;
+        drop(begin_guard);
         if ids.is_empty() {
             break;
         }
@@ -3368,7 +3377,9 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
         );
 
         // JIT compiles this statement for longer than it runs.
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
@@ -3376,6 +3387,7 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
             .fetch_all(tx.as_mut())
             .await?;
         tx.commit().await?;
+        drop(begin_guard);
         return Ok(rows);
     }
 
@@ -3846,12 +3858,15 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             waiting_external,
         ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
             // As in `queue_overviews`: compiling costs more than running.
-            let mut tx = pool.begin().await?;
+            let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+            let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+            begin_guard.begin_pending = false;
             sqlx::query("SET LOCAL jit = off")
                 .execute(tx.as_mut())
                 .await?;
             let counts = sqlx::query_as(&sql).fetch_one(tx.as_mut()).await?;
             tx.commit().await?;
+            drop(begin_guard);
             counts
         };
 
@@ -3956,7 +3971,9 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
         );
 
         // As in `queue_overviews`: compiling costs more than running.
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
@@ -3964,6 +3981,7 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             .fetch_all(tx.as_mut())
             .await?;
         tx.commit().await?;
+        drop(begin_guard);
         return Ok(rows);
     }
 
@@ -4242,7 +4260,9 @@ pub async fn state_timeseries(
              ORDER BY bucket",
             queue_storage_recent_jobs_cte(store.schema(), "$1")
         );
-        let mut tx = pool.begin().await?;
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
@@ -4259,6 +4279,7 @@ pub async fn state_timeseries(
             .fetch_all(tx.as_mut())
             .await?;
         tx.commit().await?;
+        drop(begin_guard);
 
         return Ok(rows
             .into_iter()

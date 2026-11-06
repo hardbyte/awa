@@ -8840,6 +8840,109 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+#[tokio::test]
+async fn test_row_local_receipt_admin_counts_follow_durable_dispositions() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_row_receipt_dispositions";
+    let schema = "awa_qs_row_receipt_dispositions";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    async fn counts(pool: &sqlx::PgPool, queue: &str) -> (i64, i64, i64) {
+        let overview = admin::queue_overview(pool, queue)
+            .await
+            .expect("read receipt disposition counts")
+            .expect("receipt queue exists");
+        (
+            overview.running,
+            overview.retryable,
+            overview.completed_last_hour,
+        )
+    }
+
+    store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+        .await
+        .expect("claim three deadline-backed receipts");
+    assert_eq!(claimed.len(), 3);
+    assert_eq!(lease_claim_count(&pool, &store).await, 3);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(counts(&pool, queue).await, (3, 0, 0));
+
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        completed,
+        vec![(claimed[0].job.id, claimed[0].job.run_lease)]
+    );
+    let null_fences: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2 AND closed_at IS NULL"))
+        .bind(claimed[0].job.id)
+        .bind(claimed[0].job.run_lease)
+        .fetch_one(&pool)
+        .await
+        .expect("completed row-local claim remains behind compact closure evidence");
+    assert_eq!(null_fences, 1);
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+    assert_eq!(counts(&pool, queue).await, (2, 0, 1));
+
+    let retried = store
+        .fail_retryable(
+            &pool,
+            claimed[1].job.id,
+            claimed[1].job.run_lease,
+            "retry",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("second attempt moves to retryable");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(counts(&pool, queue).await, (1, 1, 1));
+
+    let callback = store
+        .register_callback(
+            &pool,
+            claimed[2].job.id,
+            claimed[2].job.run_lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease_count(&pool, &store).await, 1);
+    assert_eq!(
+        counts(&pool, queue).await,
+        (1, 1, 1),
+        "materialization counts the attempt once"
+    );
+    let finished = store
+        .complete_external(&pool, callback, None, Some(claimed[2].job.run_lease), false)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, JobState::Completed);
+    assert_eq!(counts(&pool, queue).await, (0, 1, 2));
+    for (claim, expected) in claimed.iter().zip([
+        JobState::Completed,
+        JobState::Retryable,
+        JobState::Completed,
+    ]) {
+        let job = store.load_job(&pool, claim.job.id).await.unwrap().unwrap();
+        assert_eq!(
+            job.state, expected,
+            "point reads and aggregate counts agree"
+        );
+    }
+}
+
 /// With lease-claim receipts on, a running job is an open receipt claim and
 /// `leases` stays empty, so every running count must read the claims too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -14617,6 +14720,17 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     assert_eq!(overview.available, 2, "the cancelled job is not available");
     assert_eq!(overview.total_queued, 2);
     assert_eq!(overview.running, 0);
+
+    let kind = admin::job_kind_overview(&pool, "complete_job")
+        .await
+        .expect("read kind overview after reusing the retained lane")
+        .expect("the completed and newly enqueued jobs have a kind");
+    assert_eq!(
+        kind.job_count,
+        (completed.len() + waiting.len() - 1) as i64,
+        "retained completions and later jobs in the same lane count once"
+    );
+    assert_eq!(kind.completed_last_hour, (completed.len() - 1) as i64);
 
     // The dashboard's other two reads, over the same jobs.
     let counts = admin::state_counts(&pool)
