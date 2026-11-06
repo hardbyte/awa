@@ -685,6 +685,8 @@
       
         
       
+        
+      
     
     
     
@@ -802,6 +804,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../architecture/" class="md-nav__link">
         
   
@@ -869,6 +899,8 @@
       
         
           
+        
+      
         
       
         
@@ -978,6 +1010,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -1666,6 +1726,8 @@
       
         
       
+        
+      
     
     
     
@@ -1986,6 +2048,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2348,7 +2438,7 @@ changelog will say so explicitly.</p>
 </tr>
 <tr>
 <td><strong>Terminal read surface</strong></td>
-<td><code>{schema}.terminal_jobs</code> (per ADR-026) and the documented public views.</td>
+<td><code>{schema}.terminal_jobs</code> (per ADR-026), including its <code>output</code> column (ADR-048), and the documented public views. The <code>output</code> key in <code>errors</code> entries is documented but, like the rest of the error-entry shape, not covered.</td>
 <td><code>done_entries</code> physical layout and all segment/ring/ledger internals — compact batches mean not every completed job is physically a <code>done_entries</code> row.</td>
 </tr>
 <tr>

@@ -679,6 +679,8 @@
       
         
       
+        
+      
     
     
     
@@ -796,6 +798,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../architecture/" class="md-nav__link">
         
   
@@ -863,6 +893,8 @@
       
         
           
+        
+      
         
       
         
@@ -972,6 +1004,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -1658,6 +1718,8 @@
       
         
       
+        
+      
     
     
     
@@ -1839,6 +1901,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2296,6 +2386,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#amendment-conditional-registered-follow-ups" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Amendment: conditional registered follow-ups
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2326,7 +2427,7 @@
 
 <h1 id="adr-029-transactional-follow-up-jobs-for-durable-lifecycle-effects">ADR-029: Transactional follow-up jobs for durable lifecycle effects<a class="headerlink" href="#adr-029-transactional-follow-up-jobs-for-durable-lifecycle-effects" title="Permanent link">&para;</a></h1>
 <h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>Accepted. Worker-driven outcomes and callback resolution via the worker <code>Client</code> commit follow-ups atomically with the state transition; maintenance rescue dispatches follow-ups best-effort in a separate transaction (see <a href="#atomicity-matrix">Atomicity matrix</a>).</p>
+<p>Accepted. Worker-driven outcomes and callback resolution via the worker <code>Client</code> commit follow-ups atomically with the state transition; maintenance rescue dispatches follow-ups best-effort in a separate transaction (see <a href="#atomicity-matrix">Atomicity matrix</a>). Amended for 0.7: a <code>_with</code> closure may return <code>None</code> to enqueue nothing (see <a href="#amendment-conditional-registered-follow-ups">Amendment: conditional registered follow-ups</a>).</p>
 <h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
 <p>Awa exposes two ways for application code to react to a job's lifecycle:</p>
 <ul>
@@ -2386,7 +2487,7 @@
 </span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">        </span><span class="p">}</span>
 </span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">    </span><span class="p">});</span>
 </span></code></pre></div>
-<p>The closure returns a follow-up <code>JobArgs</code> value (default <code>InsertOpts</code>) or an <code>EnqueueRequest&lt;F&gt;</code> with <code>InsertOpts</code> overrides. For worker-driven outcomes and callback resolution via the worker <code>Client</code>, the engine <code>INSERT</code>s the follow-up in the same transaction as the triggering state change; the follow-up commits with the trigger or rolls back with it (a spec INSERT failure or a panic in the user-supplied closure rolls the trigger transition back as well). For maintenance rescue the engine <code>INSERT</code>s the follow-up in a separate transaction opened <em>after</em> the rescue commits (see <a href="#atomicity-matrix">Atomicity matrix</a>). In either case, once the follow-up <code>INSERT</code> commits the row is durably visible and rides Awa's existing retry / DLQ machinery.</p>
+<p>The closure returns a follow-up <code>JobArgs</code> value (default <code>InsertOpts</code>) or, from a <code>_with</code> builder, an <code>Option&lt;EnqueueRequest&lt;F&gt;&gt;</code> with <code>InsertOpts</code> overrides, where <code>None</code> enqueues nothing (<a href="#amendment-conditional-registered-follow-ups">amendment</a>). A follow-up whose unique key conflicts with an existing job is skipped rather than failing the dispatch: unique options on a follow-up exist to collapse duplicates, so the duplicate is the expected outcome. The <code>INSERT</code> runs under a savepoint so the conflict does not abort the trigger's transaction. For worker-driven outcomes and callback resolution via the worker <code>Client</code>, the engine <code>INSERT</code>s the follow-up in the same transaction as the triggering state change; the follow-up commits with the trigger or rolls back with it (a spec INSERT failure or a panic in the user-supplied closure rolls the trigger transition back as well). For maintenance rescue the engine <code>INSERT</code>s the follow-up in a separate transaction opened <em>after</em> the rescue commits (see <a href="#atomicity-matrix">Atomicity matrix</a>). In either case, once the follow-up <code>INSERT</code> commits the row is durably visible and rides Awa's existing retry / DLQ machinery.</p>
 <p>Counterparts cover the outcomes that benefit most from durable delivery: <code>on_completed_enqueue</code>, <code>on_retried_enqueue</code>, <code>on_exhausted_enqueue</code>, <code>on_cancelled_enqueue</code>, <code>on_waiting_for_callback_enqueue</code>, and <code>on_rescued_enqueue</code>. <code>Started</code> is intentionally excluded — claim-time enqueue would join the dispatcher's hot path and the use case for "job started" is observation, which <code>on_event</code> already covers. <code>Snooze</code> continues to emit nothing on either surface.</p>
 <h3 id="where-the-enqueue-runs">Where the enqueue runs<a class="headerlink" href="#where-the-enqueue-runs" title="Permanent link">&para;</a></h3>
 <p>The enqueue is performed by whatever process performs the state transition:</p>
@@ -2504,11 +2605,12 @@
 <li><strong>ADR-021</strong> (sequential callbacks, callback heartbeats). The callback resolution surface is unchanged; resolution through the worker <code>Client</code> dispatches follow-ups in the same transaction, while bare storage/admin callers have no process-local registry to dispatch.</li>
 <li><strong>ADR-006</strong> (insert-only transaction bridge) and <strong>ADR-016/017</strong> (Postgres adapter / Python transaction bridge). The same transactional insert primitive is reused; nothing new is added to the bridge contract.</li>
 <li><strong>ADR-042</strong> (caller-owned finalization). A caller-owned completion cannot evaluate a process-local <code>on_completed_enqueue</code> closure from the generic SQL function. Its v1 contract therefore rejects combining registered Completed specs and caller-owned completion for the same kind; the handler inserts explicit follow-up/outbox work in its transaction instead.</li>
+<li><strong>ADR-046</strong> (handler-staged follow-ups). A second source of follow-ups for the worker-driven <code>Completed</code> row: the handler stages requests built from values it computed, and they are inserted in the same completion transaction after the registered specs, with the same deduplication.</li>
 </ul>
 <h2 id="implementation">Implementation<a class="headerlink" href="#implementation" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Outcome surface.</strong> <code>Outcome::{Completed, Retried, Exhausted, Cancelled, WaitingForCallback, Rescued}</code>. <code>Started</code> is intentionally excluded — claim-time enqueue would join the dispatcher's hot path, and the durable-side-effect use case for "job started" is uncommon. Observation belongs to <code>on_event</code>. <code>on_started_enqueue</code> is not blocked by anything in this design; whether to add it is left as an open question rather than a v1 commitment.</li>
-<li><strong>Builder API.</strong> Each outcome has a pair of builders: <code>on_&lt;outcome&gt;_enqueue</code> (closure returns <code>JobArgs</code>) and <code>on_&lt;outcome&gt;_enqueue_with</code> (closure returns <code>EnqueueRequest&lt;F&gt;</code> for <code>InsertOpts</code> overrides — queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key).</li>
+<li><strong>Builder API.</strong> Each outcome has a pair of builders: <code>on_&lt;outcome&gt;_enqueue</code> (closure returns <code>JobArgs</code>) and <code>on_&lt;outcome&gt;_enqueue_with</code> (closure returns <code>Option&lt;EnqueueRequest&lt;F&gt;&gt;</code>: <code>Some</code> with <code>InsertOpts</code> overrides — queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key — or <code>None</code> to enqueue nothing, per the <a href="#amendment-conditional-registered-follow-ups">amendment</a>).</li>
 <li><strong>Closure signatures</strong> carry the per-outcome context: Completed/WaitingForCallback: <code>(args, &amp;job_row)</code>; Cancelled: <code>(args, &amp;job_row, &amp;reason)</code>; Retried: <code>(args, &amp;job_row, &amp;error, attempt, next_run_at)</code>; Exhausted: <code>(args, &amp;job_row, &amp;error, attempt)</code>; Rescued: <code>(args, &amp;job_row, RescueReason)</code>.</li>
 <li><strong>Rescued event variant.</strong> Maintenance rescues fire <code>JobEvent::Rescued { args, job, reason: RescueReason }</code> alongside the follow-up spec dispatch, keeping rescue context distinct from Retried/Exhausted rather than overloading either.</li>
 </ul>
@@ -2543,17 +2645,30 @@
 </tr>
 </tbody>
 </table>
-<p>Worker-driven outcomes inherit ADR-013's run-lease guard (zero rows matched → tx rollback → no follow-up); callback resolution inherits a matching guard from the <code>SELECT ... FOR UPDATE</code> lookup on <code>awa.jobs_hot</code> or <code>FOR UPDATE OF lease</code> on the queue-storage leases table. The trigger transition and the follow-up <code>INSERT</code> either both commit or neither does, so each committed worker-driven outcome or callback resolution enqueues each registered follow-up exactly once. <em>Delivery</em> of the follow-up itself is at-least-once — once enqueued the row rides Awa's normal claim/retry semantics, and the follow-up handler must remain safe under re-execution. The maintenance rescue path remains best-effort because coupling rescue liveness to the correctness of user follow-up code (a panic in <code>on_rescued_enqueue</code>) would be a worse trade than a missed Rescued follow-up; the rescue UPDATE has already committed when the dispatch runs, so the worst case is a missing follow-up — not a phantom follow-up.</p>
+<p>Worker-driven outcomes inherit ADR-013's run-lease guard (zero rows matched → tx rollback → no follow-up); callback resolution inherits a matching guard from the <code>SELECT ... FOR UPDATE</code> lookup on <code>awa.jobs_hot</code> or <code>FOR UPDATE OF lease</code> on the queue-storage leases table. The trigger transition and the follow-up <code>INSERT</code> either both commit or neither does, so each committed worker-driven outcome or callback resolution enqueues each registered follow-up exactly once. The exception is a follow-up with unique options whose key already exists: its <code>INSERT</code> is skipped and the transition commits on its own. Any other unique violation still rolls the transition back. <em>Delivery</em> of the follow-up itself is at-least-once — once enqueued the row rides Awa's normal claim/retry semantics, and the follow-up handler must remain safe under re-execution. The maintenance rescue path remains best-effort because coupling rescue liveness to the correctness of user follow-up code (a panic in <code>on_rescued_enqueue</code>) would be a worse trade than a missed Rescued follow-up; the rescue UPDATE has already committed when the dispatch runs, so the worst case is a missing follow-up — not a phantom follow-up.</p>
 <h3 id="open-extensions">Open extensions<a class="headerlink" href="#open-extensions" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>Python parity.</strong> The Python binding does not yet expose <code>on_*_enqueue</code> or <code>on_event</code>. The implementation path mirrors <code>register_worker</code> in <code>awa-python/src/worker.rs</code>: a <code>PythonFollowUp</code> type that wraps a Python callable, takes the GIL inside <code>dispatch_specs_in_tx</code>, serialises <code>JobRow + OutcomeContext</code> to Python, invokes the callable, and decodes the returned dict to (<code>JobArgs</code>, <code>InsertOpts</code>) before the underlying <code>insert_with</code> fires. ADR-015's hook surface (<code>@on_event</code>) needs the same scaffold first.</li>
 <li><strong>Atomic callback-resolution for callback-only ingress (ADR-027).</strong> The worker <code>Client::*_external</code> paths now drive the resolution and spec dispatch in a single tx via <code>admin::*_external_in_tx</code> and the matching <code>store::*_external_in_tx</code> helpers. The callback-only ingress process landed by ADR-027 will need its own registry hookup to reuse the same <code>_in_tx</code> admin path; until then, callback ingress outside the worker <code>Client</code> remains a separate transition with no follow-up dispatch.</li>
 <li><strong>Atomic rescue + follow-up enqueue: deliberately not pursued.</strong> Threading <code>&amp;mut tx</code> through <code>maintenance::rescue_*</code> would couple rescue liveness to the correctness of user follow-up code — a panic in <code>on_rescued_enqueue</code> could roll back a rescue UPDATE and prevent maintenance from recovering stale jobs. A future zero-loss rescue-notification design should use an outbox/sweeper rather than inlining user code into the rescue tx.</li>
 <li><strong><code>on_started_enqueue</code>.</strong> Not blocked by the design; deliberately out of scope to keep the claim/dispatch hot path uncontended. The observation use case is already covered by <code>on_event</code>.</li>
-<li><strong>Conditional spec dispatch.</strong> Skipping enqueue based on a predicate over the triggering row is not part of the API; conditioning belongs inside the follow-up handler instead.</li>
+<li><strong>Conditional spec dispatch.</strong> Superseded by the <a href="#amendment-conditional-registered-follow-ups">amendment below</a>: a <code>_with</code> closure returns <code>None</code> to enqueue nothing.</li>
 <li><strong>In-DB spec registry.</strong> Not part of the design; the in-process registry is sufficient while specs are declared in one place per deployment.</li>
 <li><strong>NOTIFY-as-wakeup-hint for follow-up queue poll cadence.</strong> An implementation-level tuning lever rather than an architectural concern.</li>
 </ul>
+<h2 id="amendment-conditional-registered-follow-ups">Amendment: conditional registered follow-ups<a class="headerlink" href="#amendment-conditional-registered-follow-ups" title="Permanent link">&para;</a></h2>
+<p><strong>0.7.</strong> <code>on_&lt;outcome&gt;_enqueue_with</code> closures return <code>Option&lt;EnqueueRequest&lt;F&gt;&gt;</code>. <code>None</code> enqueues nothing for that trigger, and the trigger's transition commits as before. The plain <code>on_&lt;outcome&gt;_enqueue</code> builders are unchanged and always enqueue.</p>
+<p>This reverses the earlier open-extension note that conditioning "belongs inside the follow-up handler". That advice had two costs:
+- <strong>Wasted work.</strong> Every trigger that should produce nothing still produced a follow-up job, which then ran only to decide it had nothing to do. That is a row, a claim and a completion per no-op, plus misleading counts in the admin UI.
+- <strong>A gap.</strong> <a href="../046-handler-staged-follow-ups/">ADR-046</a> lets a handler that runs decide in code (an <code>if</code> around <code>enqueue_on_completion</code>). Completions with no handler had no such option: <code>complete_external</code>, <code>resolve_callback</code>, and the rescue paths. Only a registered spec runs there.</p>
+<p>The condition is evaluated by the same closure that already maps the trigger's args and job row to the follow-up, and it sees the same data. It runs wherever that insert runs. For worker-driven outcomes and callback resolution through the worker <code>Client</code>, that is the transition's transaction. For maintenance rescue it is the separate, best-effort transaction opened after the rescue commits, as in the <a href="#atomicity-matrix">atomicity matrix</a>. It is ordinary process-local code, not a stored predicate, so:
+- <strong>No new evaluation site.</strong> The panic handling and atomicity matrix above apply unchanged.
+- <strong>No stored relation.</strong> The engine keeps no state about which jobs follow which. This stays inside ADR-046's <a href="../046-handler-staged-follow-ups/#non-goals-this-is-not-a-workflow-engine">workflow-engine test</a>.
+- <strong>The in-database registry stays deferred.</strong> That is the open extension above, which would bring stored predicates such as CEL. Its trigger is still registry drift between processes, not conditionality.</p>
+<p><strong>Cost.</strong> A job whose kind has a registered <code>Completed</code> spec still takes the per-job completion transaction when the closure returns <code>None</code>, because the closure runs inside that transaction.</p>
+<p><strong>Compatibility.</strong> This is a breaking change from 0.6. Existing <code>_with</code> closures wrap their result in <code>Some(...)</code>, and the turbofish (<code>::&lt;T, F, _&gt;</code>) does not change. Two non-breaking shapes were rejected:
+- <strong>A fourth type parameter</strong> (<code>R: Into&lt;Option&lt;EnqueueRequest&lt;F&gt;&gt;&gt;</code>) would keep closure bodies compiling, but every turbofish would become <code>::&lt;T, F, _, _&gt;</code>.
+- <strong>Six new <code>on_*_enqueue_if</code> builders</strong> would grow the builder surface ADR-046 already counted as a cost.</p>
 
 
 

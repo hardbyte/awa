@@ -28,3 +28,5 @@ This produces an **at-least-once** contract. The ownership guard prevents a stal
 - `awa-cli` and the web UI provide migrations and operational inspection.
 
 See the detailed [architecture](../architecture/index.md) and [queue storage substrate](../queue-storage-substrate/index.md) when you need implementation-level invariants.
+
+Explore these boundaries in the [interactive failure lab](failure-lab/index.md): stop a worker after it sends a receipt, recover the job, and compare receipts with and without a provider idempotency key.
