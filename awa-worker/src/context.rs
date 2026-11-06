@@ -1,3 +1,4 @@
+use crate::runtime::lock_progress;
 pub use crate::runtime::ProgressState;
 use crate::storage::RuntimeStorage;
 use awa_model::{AwaError, CallbackConfig, JobRow, QueueStorage};
@@ -333,7 +334,7 @@ impl JobContext {
     ///
     /// `percent` is clamped to 0-100. For progress without a message, pass `""`.
     pub fn set_progress(&self, percent: u8, message: &str) {
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let mut guard = lock_progress(&self.progress);
         guard.set_progress(percent, Some(message));
     }
 
@@ -346,7 +347,7 @@ impl JobContext {
             .as_object()
             .ok_or_else(|| AwaError::Validation("update_metadata requires a JSON object".into()))?;
 
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let mut guard = lock_progress(&self.progress);
         if !guard.merge_metadata(obj) {
             return Err(AwaError::Validation(
                 "progress.metadata is not a JSON object; cannot merge".into(),
@@ -361,7 +362,7 @@ impl JobContext {
     /// or the job is no longer in running state (rescued/cancelled).
     pub async fn flush_progress(&self) -> Result<(), AwaError> {
         let (snapshot, target_generation) = {
-            let guard = self.progress.lock().expect("progress lock poisoned");
+            let guard = lock_progress(&self.progress);
             match guard.pending_snapshot() {
                 Some(pair) => pair,
                 None => return Ok(()),
@@ -400,7 +401,7 @@ impl JobContext {
             }
         }
 
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let mut guard = lock_progress(&self.progress);
         guard.ack(target_generation);
 
         Ok(())

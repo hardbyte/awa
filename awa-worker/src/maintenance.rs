@@ -47,68 +47,116 @@ fn is_unique_claim_conflict(err: &awa_model::AwaError) -> bool {
 /// WHERE clause narrows to one id (re-checking the staleness predicate so a
 /// row that recovered between selection and update is left alone).
 const HEARTBEAT_RESCUE_PER_ROW_SQL: &str = r#"
-    WITH deleted AS (
-        DELETE FROM awa.jobs_hot
+    WITH candidates AS (
+        SELECT id, attempt, max_attempts FROM awa.jobs_hot
         WHERE id = $1
           AND state = 'running'
           AND heartbeat_at < now() - ($2 * interval '1 millisecond')
+        FOR UPDATE
+    ),
+    failed AS (
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'heartbeat stale: worker presumed dead',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+        RETURNING *
+    ),
+    deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+        RETURNING *
+    ),
+    moved AS (
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+            run_at, NULL, NULL, attempted_at, now(),
+            created_at,
+            errors || jsonb_build_object(
+                'error', 'heartbeat stale: worker presumed dead',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb,
+            metadata, tags, unique_key, unique_states,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            run_lease, progress
+        FROM deleted
         RETURNING *
     )
-    INSERT INTO awa.scheduled_jobs (
-        id, kind, queue, args, state, priority, attempt, max_attempts,
-        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-        created_at, errors, metadata, tags, unique_key, unique_states,
-        callback_id, callback_timeout_at, callback_filter,
-        callback_on_complete, callback_on_fail, callback_transform,
-        run_lease, progress
-    )
-    SELECT
-        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-        run_at, NULL, NULL, attempted_at, now(),
-        created_at,
-        errors || jsonb_build_object(
-            'error', 'heartbeat stale: worker presumed dead',
-            'attempt', attempt,
-            'at', now()
-        )::jsonb,
-        metadata, tags, unique_key, unique_states,
-        NULL, NULL, NULL, NULL, NULL, NULL,
-        run_lease, progress
-    FROM deleted
-    RETURNING *
+    SELECT * FROM failed
+    UNION ALL
+    SELECT * FROM moved
 "#;
 
 const DEADLINE_RESCUE_PER_ROW_SQL: &str = r#"
-    WITH deleted AS (
-        DELETE FROM awa.jobs_hot
+    WITH candidates AS (
+        SELECT id, attempt, max_attempts FROM awa.jobs_hot
         WHERE id = $1
           AND state = 'running'
           AND deadline_at IS NOT NULL
           AND deadline_at < now()
+        FOR UPDATE
+    ),
+    failed AS (
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'hard deadline exceeded',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+        RETURNING *
+    ),
+    deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+        RETURNING *
+    ),
+    moved AS (
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+            run_at, NULL, NULL, attempted_at, now(),
+            created_at,
+            errors || jsonb_build_object(
+                'error', 'hard deadline exceeded',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb,
+            metadata, tags, unique_key, unique_states,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            run_lease, progress
+        FROM deleted
         RETURNING *
     )
-    INSERT INTO awa.scheduled_jobs (
-        id, kind, queue, args, state, priority, attempt, max_attempts,
-        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-        created_at, errors, metadata, tags, unique_key, unique_states,
-        callback_id, callback_timeout_at, callback_filter,
-        callback_on_complete, callback_on_fail, callback_transform,
-        run_lease, progress
-    )
-    SELECT
-        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-        run_at, NULL, NULL, attempted_at, now(),
-        created_at,
-        errors || jsonb_build_object(
-            'error', 'hard deadline exceeded',
-            'attempt', attempt,
-            'at', now()
-        )::jsonb,
-        metadata, tags, unique_key, unique_states,
-        NULL, NULL, NULL, NULL, NULL, NULL,
-        run_lease, progress
-    FROM deleted
-    RETURNING *
+    SELECT * FROM failed
+    UNION ALL
+    SELECT * FROM moved
 "#;
 
 const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
@@ -173,6 +221,9 @@ const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
     SELECT * FROM moved
 "#;
 
+/// How often the leader scans for attempts past their deadline by default.
+pub(crate) const DEFAULT_DEADLINE_RESCUE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
@@ -220,13 +271,12 @@ struct MaintenanceBranchState {
     /// delayed -> on-time recovery with the same K-consecutive
     /// requirement.
     consecutive_ontime: u32,
-    /// Tick counter that suppresses the branch body while the branch
-    /// is unhealthy. Decremented every tick; while non-zero the
-    /// caller's body is skipped. Re-armed on every flip-to-delayed
-    /// AND every overrun observation while already delayed, so a
-    /// branch that keeps failing keeps quietly waiting instead of
-    /// hammering the database.
-    cooldown_ticks_remaining: u32,
+    /// Wall-clock deadline that suppresses the branch body while the
+    /// branch is unhealthy: ticks arriving before it are skipped. Armed on
+    /// flip-to-delayed AND on every overrun observation while already
+    /// delayed, so a branch that keeps failing keeps quietly waiting
+    /// instead of hammering the database.
+    cooldown_until: Option<Instant>,
 }
 
 /// How many consecutive observations the branch tracker requires before
@@ -257,11 +307,33 @@ const OVERRUN_UPPER_DEN: u32 = 2;
 const OVERRUN_LOWER_NUM: u32 = 7;
 const OVERRUN_LOWER_DEN: u32 = 10;
 
-/// Number of ticks to suppress a delayed branch's body. At the default
-/// `lease_rotate_interval = 1000ms`, 120 ticks = 120s wall time of quiet
-/// before the branch tries again. Re-armed on every overrun
-/// observation while still delayed.
-const BRANCH_COOLDOWN_TICKS: u32 = 120;
+/// Cooldown armed after an overrun, as a multiple of the offending body's
+/// duration. A branch that merely runs slower than its interval settles at
+/// roughly a one-third duty cycle (`D / (D + 2D)`) instead of going
+/// near-silent.
+const BRANCH_COOLDOWN_BODY_MULTIPLE: u32 = 2;
+
+/// Upper bound on a single cooldown. The cooldown is a wall-clock duration
+/// because the leader loop's ticks are not evenly serviced: under CPU
+/// starvation a branch's tick is consumed only once many loop iterations
+/// have passed, so a tick-count cooldown stretches to many times its nominal
+/// length. Five seconds bounds how long a pathologically slow body (minutes
+/// long) can silence a branch, and is shorter than the default interval of
+/// every rescue and cleanup branch, so at default settings the cooldown has
+/// expired by the next tick.
+const BRANCH_COOLDOWN_MAX: Duration = Duration::from_secs(5);
+
+/// Interval for one branch of the leader loop. A tick that is serviced late
+/// (the loop was busy with another branch, or the runtime was starved)
+/// restarts the period from that moment, so a branch never gets back-to-back
+/// catch-up ticks that would crowd out the others. `Skip` would realign to
+/// the original grid and could fire again almost immediately after a late
+/// tick; `Delay` guarantees a full period between consecutive bodies.
+fn leader_loop_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 /// Records the start of one branch body and emits observability when the
 /// body returns. Constructed by [`MaintenanceBranchTracker::try_begin`], which
@@ -317,12 +389,11 @@ impl MaintenanceBranchTracker {
     ///
     /// Two gating phases:
     ///
-    /// 1. **Cooldown.** If `cooldown_ticks_remaining > 0`, decrement
-    ///    and return `None`. While cooldown is non-zero the branch is
-    ///    quiet; this is set on flip-to-delayed and re-armed on
-    ///    every subsequent overrun observation, so an unhealthy
-    ///    branch backs off instead of beating on the database every
-    ///    tick.
+    /// 1. **Cooldown.** If `cooldown_until` is in the future, return
+    ///    `None`. The deadline is wall-clock, set on flip-to-delayed and
+    ///    re-armed on every subsequent overrun observation, so an
+    ///    unhealthy branch backs off instead of beating on the database
+    ///    every tick.
     /// 2. **Duration-margin hysteresis.** Compare `last_duration` to
     ///    `tick_interval * UPPER/LOWER`. Outside the deadband, advance
     ///    the matching K-counter; inside, leave both alone. Crossing
@@ -334,24 +405,28 @@ impl MaintenanceBranchTracker {
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
     ) -> Option<BranchTimer<'a>> {
-        self.try_begin_with_cooldown(branch, tick_interval, metrics, BRANCH_COOLDOWN_TICKS)
+        self.try_begin_at(branch, tick_interval, metrics, true, Instant::now())
     }
 
+    /// Like [`Self::try_begin`] for latency-critical, cheap, idempotent
+    /// branches that must run on every tick: overruns are still tracked,
+    /// warned about and counted, but never suppress the body.
     fn try_begin_without_cooldown<'a>(
         &'a self,
         branch: &'static str,
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
     ) -> Option<BranchTimer<'a>> {
-        self.try_begin_with_cooldown(branch, tick_interval, metrics, 0)
+        self.try_begin_at(branch, tick_interval, metrics, false, Instant::now())
     }
 
-    fn try_begin_with_cooldown<'a>(
+    fn try_begin_at<'a>(
         &'a self,
         branch: &'static str,
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
-        cooldown_ticks: u32,
+        arm_cooldown: bool,
+        now: Instant,
     ) -> Option<BranchTimer<'a>> {
         let mut branches = self
             .branches
@@ -359,11 +434,12 @@ impl MaintenanceBranchTracker {
             .expect("maintenance branch tracker mutex");
         let state = branches.entry(branch).or_default();
 
-        // Phase 1: cooldown gate. Counts down regardless of any
-        // other signal; the branch stays quiet while non-zero.
-        if state.cooldown_ticks_remaining > 0 {
-            state.cooldown_ticks_remaining -= 1;
-            return None;
+        // Phase 1: cooldown gate. Purely wall-clock; the branch stays
+        // quiet until the deadline passes, however many ticks that takes.
+        match state.cooldown_until {
+            Some(until) if now < until => return None,
+            Some(_) => state.cooldown_until = None,
+            None => {}
         }
 
         // Phase 2: duration-margin + K-consecutive hysteresis.
@@ -375,6 +451,12 @@ impl MaintenanceBranchTracker {
         // forever. The branch would never run its body again until
         // the worker restarts. Codex + CodeRabbit both flagged this
         // on PR #318.
+        //
+        // Cooldowns are paced by the offending body's own duration so a
+        // consistently slow branch keeps a bounded duty cycle (~1/3).
+        let cooldown_for = |last_duration: Duration| -> Duration {
+            (last_duration * BRANCH_COOLDOWN_BODY_MULTIPLE).min(BRANCH_COOLDOWN_MAX)
+        };
         if let Some(last_duration) = state.last_duration.take() {
             // Integer-ratio thresholds — avoid f64 in the hot path.
             let upper_threshold = tick_interval * OVERRUN_UPPER_NUM / OVERRUN_UPPER_DEN;
@@ -386,24 +468,26 @@ impl MaintenanceBranchTracker {
                 let cross_threshold = state.consecutive_overrun >= OVERRUN_HYSTERESIS_K;
                 if cross_threshold && !state.is_delayed {
                     state.is_delayed = true;
-                    state.cooldown_ticks_remaining = cooldown_ticks;
+                    let cooldown = arm_cooldown.then(|| cooldown_for(last_duration));
+                    state.cooldown_until = cooldown.map(|cooldown| now + cooldown);
                     warn!(
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
                         upper_threshold_ms = upper_threshold.as_millis() as u64,
                         consecutive_overrun = state.consecutive_overrun,
-                        cooldown_ticks,
+                        cooldown_ms = cooldown.map_or(0, |cooldown| cooldown.as_millis() as u64),
                         "maintenance branch overran tick interval",
                     );
                     metrics.record_maintenance_branch_overrun(branch);
-                    if cooldown_ticks > 0 {
+                    if cooldown.is_some() {
                         return None;
                     }
-                } else if cross_threshold && state.is_delayed && cooldown_ticks > 0 {
+                } else if cross_threshold && state.is_delayed && arm_cooldown {
                     // Already delayed and another overrun arrived —
-                    // re-arm cooldown but stay quiet about it.
-                    state.cooldown_ticks_remaining = cooldown_ticks;
+                    // re-arm a duration-paced cooldown but stay quiet
+                    // about it.
+                    state.cooldown_until = Some(now + cooldown_for(last_duration));
                     return None;
                 }
             } else if last_duration < lower_threshold {
@@ -459,17 +543,17 @@ impl MaintenanceBranchTracker {
             .map(|state| (state.last_duration, state.is_delayed))
     }
 
-    /// Test-only — read the per-branch cooldown counter and consecutive
+    /// Test-only — read the per-branch cooldown deadline and consecutive
     /// counters so tests can assert on the full state machine.
     #[cfg(test)]
-    fn cooldown_snapshot(&self, branch: &'static str) -> Option<(u32, u32, u32)> {
+    fn cooldown_snapshot(&self, branch: &'static str) -> Option<(Option<Instant>, u32, u32)> {
         let branches = self
             .branches
             .lock()
             .expect("maintenance branch tracker mutex");
         branches.get(branch).map(|state| {
             (
-                state.cooldown_ticks_remaining,
+                state.cooldown_until,
                 state.consecutive_overrun,
                 state.consecutive_ontime,
             )
@@ -667,7 +751,7 @@ impl MaintenanceService {
             enqueue_specs,
             lifecycle_handlers,
             heartbeat_rescue_interval: Duration::from_secs(30),
-            deadline_rescue_interval: Duration::from_secs(30),
+            deadline_rescue_interval: DEFAULT_DEADLINE_RESCUE_INTERVAL,
             callback_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
@@ -882,33 +966,33 @@ impl MaintenanceService {
             self.leader.store(true, Ordering::SeqCst);
 
             // Run maintenance tasks as leader
-            let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
-            let mut deadline_rescue_timer = tokio::time::interval(self.deadline_rescue_interval);
-            let mut callback_rescue_timer = tokio::time::interval(self.callback_rescue_interval);
-            let mut promote_timer = tokio::time::interval(self.promote_interval);
-            let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
-            let mut cron_sync_timer = tokio::time::interval(self.cron_sync_interval);
-            let mut leader_check_timer = tokio::time::interval(self.leader_check_interval);
-            let mut queue_stats_timer = tokio::time::interval(self.queue_stats_interval);
-            let mut dirty_key_timer = tokio::time::interval(self.dirty_key_recompute_interval);
+            let mut heartbeat_rescue_timer = leader_loop_interval(self.heartbeat_rescue_interval);
+            let mut deadline_rescue_timer = leader_loop_interval(self.deadline_rescue_interval);
+            let mut callback_rescue_timer = leader_loop_interval(self.callback_rescue_interval);
+            let mut promote_timer = leader_loop_interval(self.promote_interval);
+            let mut cleanup_timer = leader_loop_interval(self.cleanup_interval);
+            let mut cron_sync_timer = leader_loop_interval(self.cron_sync_interval);
+            let mut leader_check_timer = leader_loop_interval(self.leader_check_interval);
+            let mut queue_stats_timer = leader_loop_interval(self.queue_stats_interval);
+            let mut dirty_key_timer = leader_loop_interval(self.dirty_key_recompute_interval);
             let mut metadata_reconciliation_timer =
-                tokio::time::interval(self.metadata_reconciliation_interval);
-            let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
-            let mut batch_operations_timer = tokio::time::interval(self.batch_operations_interval);
+                leader_loop_interval(self.metadata_reconciliation_interval);
+            let mut priority_aging_timer = leader_loop_interval(self.priority_aging_interval);
+            let mut batch_operations_timer = leader_loop_interval(self.batch_operations_interval);
             let mut terminal_count_rollup_timer =
-                tokio::time::interval(self.terminal_count_rollup_interval);
+                leader_loop_interval(self.terminal_count_rollup_interval);
             let mut vacuum_queue_timer = self
                 .storage
                 .queue_storage()
-                .map(|runtime| tokio::time::interval(runtime.queue_rotate_interval));
+                .map(|runtime| leader_loop_interval(runtime.queue_rotate_interval));
             let mut vacuum_lease_timer = self
                 .storage
                 .queue_storage()
-                .map(|runtime| tokio::time::interval(runtime.lease_rotate_interval));
+                .map(|runtime| leader_loop_interval(runtime.lease_rotate_interval));
             let mut vacuum_claim_timer = self
                 .storage
                 .queue_storage()
-                .map(|runtime| tokio::time::interval(runtime.claim_rotate_interval));
+                .map(|runtime| leader_loop_interval(runtime.claim_rotate_interval));
             // Cache rotate intervals alongside the timers so the per-branch
             // observability calls can recover the configured period. Both
             // derive from the same `queue_storage()` source so they are
@@ -999,7 +1083,7 @@ impl MaintenanceService {
                         }
                     }
                     _ = promote_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("promote_scheduled", self.promote_interval, &self.metrics) {
+                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
                             self.promote_scheduled().await;
                             timer.finish();
                         }
@@ -1330,66 +1414,99 @@ impl MaintenanceService {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
-                self.process_heartbeat_rescues(outcome, true).await;
+                self.process_heartbeat_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
                     let outcome = runtime
                         .store
-                        .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                        .rescue_stale_heartbeats_with_dlq(
+                            &self.pool,
+                            self.heartbeat_staleness,
+                            &|queue| self.dlq_policy.enabled_for(queue),
+                        )
                         .await;
-                    self.process_heartbeat_rescues(outcome, false).await;
+                    self.process_heartbeat_rescues(outcome, false, Some(runtime))
+                        .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
                 let outcome = runtime
                     .store
-                    .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                    .rescue_stale_heartbeats_with_dlq(
+                        &self.pool,
+                        self.heartbeat_staleness,
+                        &|queue| self.dlq_policy.enabled_for(queue),
+                    )
                     .await;
-                self.process_heartbeat_rescues(outcome, true).await;
+                self.process_heartbeat_rescues(outcome, true, Some(runtime))
+                    .await;
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
-                self.process_heartbeat_rescues(outcome, false).await;
+                self.process_heartbeat_rescues(outcome, false, None).await;
             }
         }
     }
 
     /// Batched canonical stale-heartbeat rescue with the #388 row-at-a-time
-    /// fallback on unique-claim conflict.
+    /// fallback on unique-claim conflict. Exhausted attempts fail in place,
+    /// as callback timeouts do, so a job that keeps killing or hanging its
+    /// worker stops at `max_attempts`; the rest move to `scheduled_jobs` as
+    /// `retryable`.
     async fn rescue_canonical_stale_heartbeats(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
         let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
         let outcome = sqlx::query_as::<_, JobRow>(
             r#"
-                WITH deleted AS (
+                WITH candidates AS (
+                    SELECT id, attempt, max_attempts FROM awa.jobs_hot
+                    WHERE state = 'running'
+                      AND heartbeat_at < now() - ($1 * interval '1 millisecond')
+                    LIMIT 500
+                    FOR UPDATE SKIP LOCKED
+                ),
+                failed AS (
+                    UPDATE awa.jobs_hot
+                    SET state = 'failed',
+                        finalized_at = now(),
+                        heartbeat_at = NULL,
+                        deadline_at = NULL,
+                        errors = errors || jsonb_build_object(
+                            'error', 'heartbeat stale: worker presumed dead',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+                    RETURNING *
+                ),
+                deleted AS (
                     DELETE FROM awa.jobs_hot
-                    WHERE id IN (
-                        SELECT id FROM awa.jobs_hot
-                        WHERE state = 'running'
-                          AND heartbeat_at < now() - ($1 * interval '1 millisecond')
-                        LIMIT 500
-                        FOR UPDATE SKIP LOCKED
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+                    RETURNING *
+                ),
+                moved AS (
+                    INSERT INTO awa.scheduled_jobs (
+                        id, kind, queue, args, state, priority, attempt, max_attempts,
+                        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                        created_at, errors, metadata, tags, unique_key, unique_states,
+                        callback_id, callback_timeout_at, callback_filter,
+                        callback_on_complete, callback_on_fail, callback_transform,
+                        run_lease, progress
                     )
+                    SELECT
+                        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                        run_at, NULL, NULL, attempted_at, now(),
+                        created_at,
+                        errors || jsonb_build_object(
+                            'error', 'heartbeat stale: worker presumed dead',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb,
+                        metadata, tags, unique_key, unique_states,
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        run_lease, progress
+                    FROM deleted
                     RETURNING *
                 )
-                INSERT INTO awa.scheduled_jobs (
-                    id, kind, queue, args, state, priority, attempt, max_attempts,
-                    run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-                    created_at, errors, metadata, tags, unique_key, unique_states,
-                    callback_id, callback_timeout_at, callback_filter,
-                    callback_on_complete, callback_on_fail, callback_transform,
-                    run_lease, progress
-                )
-                SELECT
-                    id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-                    run_at, NULL, NULL, attempted_at, now(),
-                    created_at,
-                    errors || jsonb_build_object(
-                        'error', 'heartbeat stale: worker presumed dead',
-                        'attempt', attempt,
-                        'at', now()
-                    )::jsonb,
-                    metadata, tags, unique_key, unique_states,
-                    NULL, NULL, NULL, NULL, NULL, NULL,
-                    run_lease, progress
-                FROM deleted
-                RETURNING *
+                SELECT * FROM failed
+                UNION ALL
+                SELECT * FROM moved
                 "#,
         )
         .bind(staleness_ms)
@@ -1428,6 +1545,7 @@ impl MaintenanceService {
         &self,
         outcome: Result<Vec<JobRow>, awa_model::AwaError>,
         signal_local: bool,
+        dlq_runtime: Option<&QueueStorageRuntime>,
     ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
@@ -1456,6 +1574,7 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::StaleHeartbeat)
                         .await;
                 }
+                self.record_rescued_dlq_moves(&rescued, dlq_runtime, "heartbeat_stale");
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
@@ -1493,61 +1612,96 @@ impl MaintenanceService {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_deadlines().await;
-                self.process_deadline_rescues(outcome, true).await;
+                self.process_deadline_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
-                    self.process_deadline_rescues(outcome, false).await;
+                    let outcome = runtime
+                        .store
+                        .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
+                            self.dlq_policy.enabled_for(queue)
+                        })
+                        .await;
+                    self.process_deadline_rescues(outcome, false, Some(runtime))
+                        .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
-                self.process_deadline_rescues(outcome, true).await;
+                let outcome = runtime
+                    .store
+                    .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
+                        self.dlq_policy.enabled_for(queue)
+                    })
+                    .await;
+                self.process_deadline_rescues(outcome, true, Some(runtime))
+                    .await;
                 let outcome = self.rescue_canonical_expired_deadlines().await;
-                self.process_deadline_rescues(outcome, false).await;
+                self.process_deadline_rescues(outcome, false, None).await;
             }
         }
     }
 
     /// Batched canonical deadline rescue with the #388 row-at-a-time
-    /// fallback on unique-claim conflict.
+    /// fallback on unique-claim conflict. Exhausted attempts fail in place,
+    /// as callback timeouts do, so a job that keeps killing or hanging its
+    /// worker stops at `max_attempts`; the rest move to `scheduled_jobs` as
+    /// `retryable`.
     async fn rescue_canonical_expired_deadlines(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
         let outcome = sqlx::query_as::<_, JobRow>(
             r#"
-            WITH deleted AS (
-                DELETE FROM awa.jobs_hot
-                WHERE id IN (
-                    SELECT id FROM awa.jobs_hot
+                WITH candidates AS (
+                    SELECT id, attempt, max_attempts FROM awa.jobs_hot
                     WHERE state = 'running'
                       AND deadline_at IS NOT NULL
                       AND deadline_at < now()
                     LIMIT 500
                     FOR UPDATE SKIP LOCKED
+                ),
+                failed AS (
+                    UPDATE awa.jobs_hot
+                    SET state = 'failed',
+                        finalized_at = now(),
+                        heartbeat_at = NULL,
+                        deadline_at = NULL,
+                        errors = errors || jsonb_build_object(
+                            'error', 'hard deadline exceeded',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+                    RETURNING *
+                ),
+                deleted AS (
+                    DELETE FROM awa.jobs_hot
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+                    RETURNING *
+                ),
+                moved AS (
+                    INSERT INTO awa.scheduled_jobs (
+                        id, kind, queue, args, state, priority, attempt, max_attempts,
+                        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                        created_at, errors, metadata, tags, unique_key, unique_states,
+                        callback_id, callback_timeout_at, callback_filter,
+                        callback_on_complete, callback_on_fail, callback_transform,
+                        run_lease, progress
+                    )
+                    SELECT
+                        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                        run_at, NULL, NULL, attempted_at, now(),
+                        created_at,
+                        errors || jsonb_build_object(
+                            'error', 'hard deadline exceeded',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb,
+                        metadata, tags, unique_key, unique_states,
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        run_lease, progress
+                    FROM deleted
+                    RETURNING *
                 )
-                RETURNING *
-            )
-            INSERT INTO awa.scheduled_jobs (
-                id, kind, queue, args, state, priority, attempt, max_attempts,
-                run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-                created_at, errors, metadata, tags, unique_key, unique_states,
-                callback_id, callback_timeout_at, callback_filter,
-                callback_on_complete, callback_on_fail, callback_transform,
-                run_lease, progress
-            )
-            SELECT
-                id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-                run_at, NULL, NULL, attempted_at, now(),
-                created_at,
-                errors || jsonb_build_object(
-                    'error', 'hard deadline exceeded',
-                    'attempt', attempt,
-                    'at', now()
-                )::jsonb,
-                metadata, tags, unique_key, unique_states,
-                NULL, NULL, NULL, NULL, NULL, NULL,
-                run_lease, progress
-            FROM deleted
-            RETURNING *
-            "#,
+                SELECT * FROM failed
+                UNION ALL
+                SELECT * FROM moved
+                "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -1582,6 +1736,7 @@ impl MaintenanceService {
         &self,
         outcome: Result<Vec<JobRow>, awa_model::AwaError>,
         signal_local: bool,
+        dlq_runtime: Option<&QueueStorageRuntime>,
     ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
@@ -1610,6 +1765,7 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::DeadlineExceeded)
                         .await;
                 }
+                self.record_rescued_dlq_moves(&rescued, dlq_runtime, "deadline_exceeded");
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
@@ -1631,13 +1787,23 @@ impl MaintenanceService {
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime.store.rescue_expired_callbacks(&self.pool).await;
+                    let outcome = runtime
+                        .store
+                        .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
+                            self.dlq_policy.enabled_for(queue)
+                        })
+                        .await;
                     self.process_callback_rescues(outcome, false, Some(runtime))
                         .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime.store.rescue_expired_callbacks(&self.pool).await;
+                let outcome = runtime
+                    .store
+                    .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
+                        self.dlq_policy.enabled_for(queue)
+                    })
+                    .await;
                 self.process_callback_rescues(outcome, true, Some(runtime))
                     .await;
                 let outcome = self.rescue_canonical_expired_callbacks().await;
@@ -1780,40 +1946,34 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::ExpiredCallback)
                         .await;
                 }
-                if let Some(runtime) = dlq_runtime {
-                    for job in &rescued {
-                        if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue)
-                        {
-                            continue;
-                        }
-                        match runtime
-                            .store
-                            .move_failed_to_dlq(&self.pool, job.id, "callback_timeout")
-                            .await
-                        {
-                            Ok(Some(_)) => {
-                                self.metrics.record_dlq_moved(
-                                    &job.kind,
-                                    &job.queue,
-                                    "callback_timeout",
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                error!(
-                                    job_id = job.id,
-                                    error = %err,
-                                    "Failed to move rescued callback timeout into DLQ"
-                                );
-                            }
-                        }
-                    }
-                }
+                self.record_rescued_dlq_moves(&rescued, dlq_runtime, "callback_timeout");
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
             }
             _ => {}
+        }
+    }
+
+    /// Count rescued attempts that the queue-storage rescue dead-lettered.
+    /// The store moves an exhausted attempt into the DLQ in the rescue
+    /// transaction whenever the queue's policy enables it, so every `failed`
+    /// row on a DLQ-enabled queue here is already in `dlq_entries`.
+    /// `runtime` is the queue-storage runtime that owns the rows' plane;
+    /// canonical rows have no DLQ (see [`Self::process_callback_rescues`]).
+    fn record_rescued_dlq_moves(
+        &self,
+        rescued: &[JobRow],
+        runtime: Option<&QueueStorageRuntime>,
+        reason: &str,
+    ) {
+        if runtime.is_none() {
+            return;
+        }
+        for job in rescued {
+            if job.state == JobState::Failed && self.dlq_policy.enabled_for(&job.queue) {
+                self.metrics.record_dlq_moved(&job.kind, &job.queue, reason);
+            }
         }
     }
 
@@ -3709,8 +3869,9 @@ mod tests {
         );
     }
 
-    /// Drive `n` consecutive `try_begin` ticks. When the body would
-    /// have run (try_begin returns Some), call `record_finish` with
+    /// Drive `n` consecutive ticks on a virtual clock that advances by
+    /// `tick_interval` before each one. When the body would have run
+    /// (`try_begin_at` returns Some), call `record_finish` with
     /// `body_duration` to simulate the body completing in that time.
     /// When the body is skipped (cooldown returns None), `last_duration`
     /// is intentionally NOT updated — matching production where a
@@ -3722,6 +3883,7 @@ mod tests {
     /// observation) must call `seed_last_duration` first.
     fn replay_ticks(
         tracker: &MaintenanceBranchTracker,
+        clock: &mut Instant,
         branch: &'static str,
         body_duration: Duration,
         tick_interval: Duration,
@@ -3730,8 +3892,10 @@ mod tests {
         let metrics = metrics_for_test();
         let mut ran = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let timer_opt = tracker.try_begin(branch, tick_interval, &metrics);
-            let did_run = timer_opt.is_some();
+            *clock += tick_interval;
+            let did_run = tracker
+                .try_begin_at(branch, tick_interval, &metrics, true, *clock)
+                .is_some();
             ran.push(did_run);
             if did_run {
                 tracker.record_finish(branch, body_duration);
@@ -3753,17 +3917,41 @@ mod tests {
             .last_duration = Some(dur);
     }
 
+    const TICK_100MS: Duration = Duration::from_millis(100);
+
+    /// Tracker for "cleanup" driven through the K-th overrun, so the next
+    /// tick falls inside the armed cooldown. Returns the tracker, the
+    /// virtual clock at the flip, and the cooldown deadline it armed.
+    fn tracker_flipped_by_250ms_bodies() -> (MaintenanceBranchTracker, Instant, Instant) {
+        let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
+        replay_ticks(
+            &tracker,
+            &mut clock,
+            "cleanup",
+            Duration::from_millis(250),
+            TICK_100MS,
+            OVERRUN_HYSTERESIS_K,
+        );
+        let (deadline, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        let deadline = deadline.expect("flip arms a cooldown");
+        (tracker, clock, deadline)
+    }
+
     #[test]
     fn branch_tracker_single_overrun_does_not_flip() {
         // A single overrun sample (clearly above the upper threshold)
         // shouldn't flip is_delayed — K-consecutive is required.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(200));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(200), // upper threshold for 100ms tick is 150
-            Duration::from_millis(100),
+            TICK_100MS,
             1,
         );
         assert!(
@@ -3779,16 +3967,22 @@ mod tests {
         // is the fix the bench post-mortem prescribed: 49ms-vs-51ms
         // flap at the boundary no longer accumulates toward a flip.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(101));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(101),
-            Duration::from_millis(100),
+            TICK_100MS,
             5,
         );
-        let (cooldown, overrun, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, 0, "deadband samples should not arm cooldown");
+        let (cooldown_until, overrun, ontime) =
+            tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(
+            cooldown_until.is_none(),
+            "deadband samples should not arm cooldown"
+        );
         assert_eq!(overrun, 0, "deadband sample 101ms must not advance overrun");
         assert_eq!(ontime, 0, "deadband sample 101ms must not advance ontime");
     }
@@ -3801,21 +3995,75 @@ mod tests {
         // flip-tick skips the body so we don't immediately do more
         // expensive work).
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(250),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
         assert_eq!(ran, vec![true, true, false], "flip-tick skips body");
-        let (cooldown, overrun, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        let (cooldown_until, overrun, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
         assert!(tracker.snapshot("cleanup").unwrap().1, "flipped to delayed");
         assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
+        // The cooldown is a wall-clock duration paced by the offending
+        // body: 2 × 250ms from the flip tick.
         assert_eq!(
-            cooldown, BRANCH_COOLDOWN_TICKS,
-            "cooldown armed to BRANCH_COOLDOWN_TICKS at flip"
+            cooldown_until,
+            Some(clock + Duration::from_millis(500)),
+            "cooldown is 2× the overrunning body, from the flip"
+        );
+    }
+
+    /// A branch whose body always overruns keeps a bounded duty cycle:
+    /// each post-cooldown run re-arms a duration-paced cooldown, so the
+    /// body still executes roughly every `3×duration` of wall time —
+    /// never once per many seconds. This is the regression shape behind
+    /// the starved deadline-rescue sweep: a ~250ms sweep on a 100ms
+    /// interval must keep rescuing.
+    #[test]
+    fn branch_tracker_persistent_overrun_keeps_bounded_duty_cycle() {
+        let (tracker, mut clock, _) = tracker_flipped_by_250ms_bodies();
+
+        // 40 further 100ms ticks (4s) with every executed body still
+        // overrunning.
+        let ran = replay_ticks(
+            &tracker,
+            &mut clock,
+            "cleanup",
+            Duration::from_millis(250),
+            TICK_100MS,
+            40,
+        );
+        let executed = ran.iter().filter(|&&r| r).count();
+        assert!(
+            executed >= 5,
+            "an always-overrunning branch must keep a ~1-in-6 duty cycle, ran {executed}/40"
+        );
+    }
+
+    /// Pathologically long bodies clamp at BRANCH_COOLDOWN_MAX.
+    #[test]
+    fn branch_tracker_cooldown_clamps_at_cap() {
+        let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
+        seed_last_duration(&tracker, "cleanup", Duration::from_secs(60));
+        replay_ticks(
+            &tracker,
+            &mut clock,
+            "cleanup",
+            Duration::from_secs(60),
+            TICK_100MS,
+            OVERRUN_HYSTERESIS_K,
+        );
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            cooldown_until,
+            Some(clock + BRANCH_COOLDOWN_MAX),
+            "cap bounds the cooldown"
         );
     }
 
@@ -3823,35 +4071,35 @@ mod tests {
     fn branch_tracker_without_cooldown_tracks_overrun_but_keeps_running() {
         let tracker = MaintenanceBranchTracker::new();
         let metrics = metrics_for_test();
+        let mut clock = Instant::now();
         seed_last_duration(
             &tracker,
             "terminal_count_rollup",
             Duration::from_millis(250),
         );
 
-        let mut ran = Vec::new();
-        for _ in 0..OVERRUN_HYSTERESIS_K {
-            let timer = tracker.try_begin_without_cooldown(
-                "terminal_count_rollup",
-                Duration::from_millis(100),
-                &metrics,
+        // Well past the point where a cooling-down branch would have been
+        // skipped several times over.
+        let ticks = OVERRUN_HYSTERESIS_K * 10;
+        for _ in 0..ticks {
+            clock += TICK_100MS;
+            let timer =
+                tracker.try_begin_at("terminal_count_rollup", TICK_100MS, &metrics, false, clock);
+            assert!(
+                timer.is_some(),
+                "no-cooldown branches should keep running on overrun"
             );
-            ran.push(timer.is_some());
-            if timer.is_some() {
-                tracker.record_finish("terminal_count_rollup", Duration::from_millis(250));
-            }
+            tracker.record_finish("terminal_count_rollup", Duration::from_millis(250));
         }
 
-        assert_eq!(
-            ran,
-            vec![true, true, true],
-            "no-cooldown branches should keep running on overrun"
-        );
-        let (cooldown, overrun, _) = tracker
+        let (cooldown_until, overrun, _) = tracker
             .cooldown_snapshot("terminal_count_rollup")
             .expect("snapshot");
-        assert_eq!(cooldown, 0, "no-cooldown branch must not arm cooldown");
-        assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
+        assert!(
+            cooldown_until.is_none(),
+            "no-cooldown branch must not arm cooldown"
+        );
+        assert!(overrun >= OVERRUN_HYSTERESIS_K);
         assert!(
             tracker.snapshot("terminal_count_rollup").unwrap().1,
             "overrun state should still be observable"
@@ -3859,75 +4107,100 @@ mod tests {
     }
 
     #[test]
-    fn branch_tracker_cooldown_skips_body() {
-        // Drive past the flip, then assert subsequent ticks return
-        // None until cooldown decrements to zero. After the flip,
-        // `last_duration` was consumed by `take()`, so the cooldown
-        // gate is the only thing returning None here — exactly the
-        // production shape we want.
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        // Subsequent ticks return None until cooldown drains. We pass
-        // 50ms as the body_duration but it's unused — `record_finish`
-        // is only called when a body actually runs.
+    fn branch_tracker_cooldown_skips_body_until_deadline() {
+        // Drive past the flip, then assert every tick before the
+        // deadline returns None. After the flip, `last_duration` was
+        // consumed by `take()`, so the cooldown gate is the only thing
+        // returning None here — exactly the production shape we want.
+        let (tracker, mut clock, deadline) = tracker_flipped_by_250ms_bodies();
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
+            TICK_100MS,
+            4,
         );
+        assert!(clock < deadline, "test must stay inside the cooldown");
         assert!(
             ran.iter().all(|&r| !r),
             "every tick during cooldown must skip body"
         );
-        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, 0, "cooldown decrements to zero");
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            cooldown_until,
+            Some(deadline),
+            "skips do not move the deadline"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_cooldown_is_wall_clock_not_tick_count() {
+        // A tick-count cooldown only drains as ticks are serviced, and
+        // under CPU starvation a branch is serviced rarely. The cooldown
+        // here must end on time no matter how few ticks arrive, and must
+        // not end early no matter how many do.
+        let (tracker, clock, deadline) = tracker_flipped_by_250ms_bodies();
+        let metrics = metrics_for_test();
+
+        // A burst of ticks all inside the cooldown does not shorten it.
+        for _ in 0..1_000 {
+            assert!(
+                tracker
+                    .try_begin_at("cleanup", TICK_100MS, &metrics, true, clock)
+                    .is_none(),
+                "ticks inside the cooldown are skipped however many arrive"
+            );
+        }
+        assert!(
+            tracker
+                .try_begin_at(
+                    "cleanup",
+                    TICK_100MS,
+                    &metrics,
+                    true,
+                    deadline - Duration::from_millis(1)
+                )
+                .is_none(),
+            "still cooling down 1ms before the deadline"
+        );
+
+        // A single tick after the deadline runs, though only one tick
+        // was serviced since the flip.
+        assert!(
+            tracker
+                .try_begin_at("cleanup", TICK_100MS, &metrics, true, deadline)
+                .is_some(),
+            "first tick at the deadline runs the body"
+        );
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(cooldown_until.is_none(), "expired cooldown is cleared");
     }
 
     #[test]
     fn branch_tracker_cooldown_expires_then_body_runs() {
-        // After cooldown drains, the first post-cooldown try_begin
+        // After cooldown expires, the first post-cooldown try_begin
         // sees `last_duration = None` (consumed at the flip, no body
         // ran during cooldown), so no hysteresis check fires; the
         // body simply runs. The counters do NOT advance on this
         // first post-cooldown tick — the sample this body produces
         // is evaluated on the *next* try_begin.
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
-        );
+        let (tracker, _, deadline) = tracker_flipped_by_250ms_bodies();
+        let mut clock = deadline;
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
+            TICK_100MS,
             1,
         );
         assert_eq!(ran, vec![true], "post-cooldown body runs");
-        let (cooldown, overrun, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(
-            cooldown, 0,
-            "cooldown stays at zero after a single fast body"
+        let (cooldown_until, overrun, ontime) =
+            tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(
+            cooldown_until.is_none(),
+            "cooldown stays cleared after a single fast body"
         );
         assert_eq!(
             overrun, OVERRUN_HYSTERESIS_K,
@@ -3941,36 +4214,23 @@ mod tests {
 
     #[test]
     fn branch_tracker_cooldown_rearms_on_continued_overrun() {
-        // After cooldown drains, the first post-cooldown body runs
+        // After cooldown expires, the first post-cooldown body runs
         // and is slow. That slow body's sample is evaluated on the
         // *second* post-cooldown try_begin, where it re-arms cooldown
         // because consecutive_overrun is already at K (preserved
         // across the cooldown).
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
-        );
+        let (tracker, _, deadline) = tracker_flipped_by_250ms_bodies();
+        let mut clock = deadline;
 
         // Tick 1 post-cooldown: take None, no eval, body runs slow.
         // Tick 2: take Some(250), consecutive_overrun saturates past
         // K, is_delayed && cross → re-arm cooldown.
         let ran = replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(250),
-            Duration::from_millis(100),
+            TICK_100MS,
             2,
         );
         assert_eq!(
@@ -3978,8 +4238,12 @@ mod tests {
             vec![true, false],
             "first tick runs body; second tick re-arms cooldown"
         );
-        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS, "cooldown re-armed");
+        let (cooldown_until, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            cooldown_until,
+            Some(clock + Duration::from_millis(500)),
+            "cooldown re-armed, paced by the slow body"
+        );
         assert!(
             tracker.snapshot("cleanup").unwrap().1,
             "still delayed across re-arm"
@@ -3992,6 +4256,7 @@ mod tests {
         // clearly-on-time samples. Non-consecutive overruns never
         // accumulate K=3 because each on-time tick resets the counter.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(200));
         for over in [true, false, true, false, true] {
             let dur = if over {
@@ -3999,7 +4264,7 @@ mod tests {
             } else {
                 Duration::from_millis(50)
             };
-            replay_ticks(&tracker, "cleanup", dur, Duration::from_millis(100), 1);
+            replay_ticks(&tracker, &mut clock, "cleanup", dur, TICK_100MS, 1);
         }
         assert!(
             !tracker.snapshot("cleanup").unwrap().1,
@@ -4009,35 +4274,22 @@ mod tests {
 
     #[test]
     fn branch_tracker_recovers_only_after_k_ontime_ticks_post_cooldown() {
-        // After cooldown drains, K consecutive on-time samples must be
+        // After cooldown expires, K consecutive on-time samples must be
         // *evaluated* before is_delayed clears. The very first
         // post-cooldown body has no sample to evaluate (last_duration
         // was consumed at the flip), so K evaluable samples require
         // K+1 post-cooldown ticks: one to seed, K to advance ontime.
-        let tracker = MaintenanceBranchTracker::new();
-        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(250),
-            Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K,
-        );
-        replay_ticks(
-            &tracker,
-            "cleanup",
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
-        );
+        let (tracker, _, deadline) = tracker_flipped_by_250ms_bodies();
+        let mut clock = deadline;
 
         // K post-cooldown ticks: tick 1 seeds, ticks 2..K evaluate K-1
         // on-time samples. Still delayed.
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
         assert!(
@@ -4048,9 +4300,10 @@ mod tests {
         // (K+1)-th tick evaluates the K-th on-time sample → recovery.
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(50),
-            Duration::from_millis(100),
+            TICK_100MS,
             1,
         );
         assert!(
@@ -4065,17 +4318,20 @@ mod tests {
         // "promote_scheduled" stays on-time the whole time. Branches
         // must not share state.
         let tracker = MaintenanceBranchTracker::new();
+        let mut clock = Instant::now();
         seed_last_duration(&tracker, "cleanup", Duration::from_millis(500));
         replay_ticks(
             &tracker,
+            &mut clock,
             "cleanup",
             Duration::from_millis(500),
-            Duration::from_millis(100),
+            TICK_100MS,
             OVERRUN_HYSTERESIS_K,
         );
         seed_last_duration(&tracker, "promote_scheduled", Duration::from_millis(10));
         replay_ticks(
             &tracker,
+            &mut clock,
             "promote_scheduled",
             Duration::from_millis(10),
             Duration::from_millis(250),
@@ -4083,6 +4339,25 @@ mod tests {
         );
         assert!(tracker.snapshot("cleanup").unwrap().1);
         assert!(!tracker.snapshot("promote_scheduled").unwrap().1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_loop_interval_does_not_burst_after_a_stall() {
+        let period = Duration::from_millis(100);
+        let mut interval = leader_loop_interval(period);
+        interval.tick().await;
+
+        // The loop is stalled for ten periods; a `Burst` interval would
+        // now hand back ten immediate catch-up ticks.
+        tokio::time::sleep(period * 10).await;
+        interval.tick().await;
+
+        let before_next = tokio::time::Instant::now();
+        interval.tick().await;
+        assert!(
+            before_next.elapsed() >= period,
+            "the tick after a late one waits a full period instead of catching up"
+        );
     }
 
     // ── PruneBackoffTracker (#169) ────────────────────────────────────

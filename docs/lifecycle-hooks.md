@@ -34,7 +34,7 @@ let client = Client::builder(pool)
 | `WaitingForCallback` | the handler returned `WaitForCallback` and the job parked (`job.state == waiting_external`; `job.callback_id` is set) |
 | `Completed` | the job finished successfully |
 | `Retried` | the attempt failed (or `RetryAfter`) and the job will run again |
-| `Exhausted` | the job exhausted its retries, or failed terminally, and moved to `failed` |
+| `Exhausted` | the handler's result exhausted the job's retries, or failed it terminally, and it moved to `failed` |
 | `Cancelled` | the job was cancelled |
 | `Rescued` | maintenance rescued the job (expired callback, stale heartbeat, or exceeded deadline) — `reason: RescueReason` carries which |
 
@@ -45,7 +45,8 @@ How `JobResult` / outcomes map to events:
 | claim commits | `Started` |
 | `Ok(Completed)` | `Completed` |
 | `Ok(RetryAfter)` / retryable `Err` (retries left) | `Retried` |
-| retries exhausted, or `Err(Terminal)` | `Exhausted` |
+| retries exhausted (final attempt returned `RetryAfter` or a retryable `Err`, or the handler panicked), or `Err(Terminal)` | `Exhausted` |
+| maintenance rescue: stale heartbeat, exceeded deadline or expired callback, whether the job retries or the rescued attempt was its last | `Rescued` |
 | `Ok(Cancel)` | `Cancelled` |
 | `Ok(Snooze)` | none — an internal reschedule, not an outcome |
 | `Ok(WaitForCallback)` | `WaitingForCallback` |
@@ -118,6 +119,19 @@ There is one builder per outcome, plus a `_with` variant whose closure returns `
     EnqueueRequest::new(WelcomeEmail { user_id: args.user_id })
         .queue("email")
         .priority(1)
+})
+```
+
+### Deduplicating follow-ups
+
+Give the follow-up unique options to collapse duplicates. When several triggers produce a follow-up with the same unique key, the first insert wins and the later ones are skipped: each trigger's transition still commits, and exactly one follow-up job exists. With `UniqueOpts::default()` the key covers the follow-up's kind and args, so put only the deduplication key in the follow-up's args. Custom options can add the queue or a time period, or set `by_args: false` so the key leaves args out; then follow-ups of the same kind collapse whatever their args. `UniqueOpts::states` decides how long the deduplication lasts: the default includes `completed`, so a finished follow-up keeps blocking duplicates until its terminal row is pruned. Drop `completed` from the states to block only concurrent duplicates.
+
+```rust
+.on_completed_enqueue_with::<StageA, StageB, _>(|args, _job| {
+    EnqueueRequest::new(StageB { item_id: args.item_id }).with_opts(InsertOpts {
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    })
 })
 ```
 

@@ -1,7 +1,7 @@
 use crate::completion::CompletionBatcherHandle;
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
-use crate::runtime::{InFlightMap, InFlightState, ProgressState};
+use crate::runtime::{lock_progress, InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
@@ -20,11 +20,11 @@ use tracing::{error, info, info_span, warn, Instrument};
 /// Three primitives can put the job back on the queue. They differ in
 /// what they say about *why*:
 ///
-/// | Primitive | Means | Increments `attempt` | Delay shape |
-/// |-----------|-------|----------------------|-------------|
-/// | [`JobError::Retryable`] | "this attempt failed; try again" | yes | DB-computed exponential backoff |
-/// | [`JobResult::RetryAfter`] | "this attempt failed; try again after delay X" | yes | caller-specified |
-/// | [`JobResult::Snooze`] | "this attempt didn't fail — it's just not time yet" | no | caller-specified |
+/// | Primitive | Means | Increments `attempt` | Delay shape | Bounded by `max_attempts` |
+/// |-----------|-------|----------------------|-------------|---------------------------|
+/// | [`JobError::Retryable`] | "this attempt failed; try again" | yes | DB-computed exponential backoff | yes |
+/// | [`JobResult::RetryAfter`] | "this attempt failed; try again after delay X" | yes | caller-specified | yes |
+/// | [`JobResult::Snooze`] | "this attempt didn't fail — it's just not time yet" | no | caller-specified | no |
 ///
 /// Rule of thumb: if every "non-success" return is a "not yet" rather
 /// than a failure (polling, waiting for an upstream signal, rate
@@ -45,6 +45,11 @@ pub enum JobResult {
     /// `attempt`. Use when this attempt failed and you want a
     /// caller-specified delay instead of the default exponential
     /// backoff produced by [`JobError::Retryable`].
+    ///
+    /// A retry requested on the final attempt (`attempt >= max_attempts`)
+    /// exhausts the job: it fails into the DLQ exactly like a retryable
+    /// error would. For indefinite rescheduling that must not consume the
+    /// attempt budget, return [`Snooze`](JobResult::Snooze) instead.
     RetryAfter(std::time::Duration),
     /// Job should be re-scheduled after the given duration without
     /// counting as a failed attempt. Use for polling-style waits
@@ -101,6 +106,42 @@ impl JobError {
     pub fn terminal(msg: impl Into<String>) -> Self {
         JobError::Terminal(msg.into())
     }
+}
+
+/// Polls a handler future, turning a panic into an `Err` with its payload.
+///
+/// Without this a panicking handler unwinds out of the job task before
+/// finalization: the job stays registered in-flight, heartbeats keep it
+/// looking alive until its deadline, the attempt is never counted, and the
+/// panic message is lost. Caught, a panic is an ordinary retryable failure.
+struct CatchUnwind<F>(F);
+
+impl<F: std::future::Future + Unpin> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Unwind safety: the handler future is dropped after a panic and
+        // never polled again, so no broken invariant inside it is observed.
+        let inner = &mut self.0;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::pin::Pin::new(inner).poll(cx)
+        })) {
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// Per-queue DLQ policy resolved at `Client::start`.
@@ -202,6 +243,10 @@ pub(crate) struct DispatchedJob {
     pub job: JobRow,
     pub queue_storage_claim: Option<ClaimedEntry>,
     pub queue_storage_unique_states: Option<String>,
+    /// How long the handler may run before the executor drops it, set past
+    /// the queue's deadline so maintenance has rescued the attempt by then.
+    /// `None` when the queue has no deadline.
+    pub abandon_after: Option<Duration>,
 }
 
 /// Manages job execution — spawns worker futures and tracks in-flight jobs.
@@ -270,6 +315,7 @@ impl JobExecutor {
         let job = dispatched.job;
         let queue_storage_claim = dispatched.queue_storage_claim;
         let queue_storage_unique_states = dispatched.queue_storage_unique_states;
+        let abandon_after = dispatched.abandon_after;
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let lifecycle_handlers = self.lifecycle_handlers.clone();
@@ -339,14 +385,40 @@ impl JobExecutor {
                             .await;
                         });
                     }
-                    worker.perform(&ctx).await
+                    let perform = CatchUnwind(worker.perform(&ctx));
+                    let outcome = match abandon_after {
+                        Some(limit) => tokio::time::timeout(limit, perform).await.ok(),
+                        None => Some(perform.await),
+                    };
+                    match outcome {
+                        Some(Ok(result)) => Some(result),
+                        Some(Err(panic)) => {
+                            let message = panic_message(panic.as_ref());
+                            error!(kind = %job.kind, job_id, panic = %message, "Job handler panicked");
+                            Some(Err(JobError::retryable_msg(format!(
+                                "handler panicked: {message}"
+                            ))))
+                        }
+                        // The deadline rescue has taken this attempt; a
+                        // handler that ignored the cancel signal would
+                        // otherwise hold its worker slot forever and starve
+                        // the retry. Drop it and leave the outcome to rescue.
+                        None => {
+                            warn!(
+                                kind = %job.kind,
+                                job_id,
+                                "Abandoned a handler still running well past its deadline"
+                            );
+                            None
+                        }
+                    }
                 }
                 None => {
                     error!(kind = %job.kind, job_id, "No worker registered for job kind");
-                    Err(JobError::Terminal(format!(
+                    Some(Err(JobError::Terminal(format!(
                         "unknown job kind: {}",
                         job.kind
-                    )))
+                    ))))
                 }
             };
 
@@ -354,7 +426,7 @@ impl JobExecutor {
 
             // Snapshot progress for state transition
             let progress_snapshot = {
-                let guard = progress_state.lock().expect("progress lock poisoned");
+                let guard = lock_progress(&progress_state);
                 guard.clone_latest()
             };
 
@@ -368,6 +440,9 @@ impl JobExecutor {
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
+            let Some(result) = result else {
+                return;
+            };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
             tokio::spawn(async move {
                 // Every finalize path is one lease-guarded transaction, and a
@@ -423,7 +498,11 @@ impl JobExecutor {
                                 metrics.record_job_completed(&job_kind, &job_queue, duration);
                             }
                             Ok(JobResult::RetryAfter(_)) => {
-                                metrics.record_job_retried(&job_kind, &job_queue);
+                                if *terminal {
+                                    metrics.record_job_failed(&job_kind, &job_queue, true);
+                                } else {
+                                    metrics.record_job_retried(&job_kind, &job_queue);
+                                }
                             }
                             Ok(JobResult::Cancel(_)) => {
                                 metrics.jobs_cancelled.add(
@@ -563,6 +642,245 @@ async fn complete_job(
     }
 }
 
+type EnqueueSpecsByOutcome = HashMap<
+    crate::enqueue_specs::Outcome,
+    HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+>;
+
+/// Terminal exhaustion on the canonical engine: mark the job `failed`, append
+/// the error, and emit the `Exhausted` outcome (with follow-ups when
+/// registered). Shared by the retryable-error path and a [`JobResult::RetryAfter`]
+/// returned on the final attempt — `max_attempts` bounds failed attempts
+/// regardless of which primitive reported the failure.
+async fn exhaust_canonical(
+    pool: &PgPool,
+    job: &JobRow,
+    error_msg: String,
+    enqueue_specs: &EnqueueSpecsByOutcome,
+    progress_snapshot: &Option<serde_json::Value>,
+    needs_event: bool,
+) -> Result<CompletionOutcome, AwaError> {
+    tracing::Span::current().record("otel.status_code", "ERROR");
+    error!(
+        job_id = job.id,
+        kind = %job.kind,
+        attempt = job.attempt,
+        max_attempts = job.max_attempts,
+        error = %error_msg,
+        "Job failed (max attempts exhausted)"
+    );
+
+    // ADR-029: retries exhausted -> Exhausted outcome.
+    let kind_specs = enqueue_specs
+        .get(&crate::enqueue_specs::Outcome::Exhausted)
+        .and_then(|by_kind| by_kind.get(&job.kind))
+        .cloned();
+    if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+        let result = exhaust_canonical_with_followups(
+            pool,
+            job,
+            &error_msg,
+            progress_snapshot.as_ref(),
+            &specs,
+        )
+        .await?;
+        return match result {
+            None => {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, failure ignored"
+                );
+                Ok(CompletionOutcome::IgnoredStale)
+            }
+            Some(updated_job) => {
+                let event = if needs_event {
+                    Some(UntypedJobEvent::Exhausted {
+                        job: updated_job,
+                        error: error_msg,
+                        attempt: job.attempt,
+                    })
+                } else {
+                    None
+                };
+                Ok(CompletionOutcome::Applied {
+                    event,
+                    terminal: true,
+                })
+            }
+        };
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            errors = errors || $2::jsonb,
+            progress = $4
+        WHERE id = $1 AND state = 'running' AND run_lease = $3
+        "#,
+    )
+    .bind(job.id)
+    .bind(serde_json::json!({
+        "error": error_msg,
+        "attempt": job.attempt,
+        "at": chrono::Utc::now().to_rfc3339()
+    }))
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        warn!(
+            job_id = job.id,
+            "Job already rescued/cancelled, failure ignored"
+        );
+        return Ok(CompletionOutcome::IgnoredStale);
+    }
+    if needs_event {
+        let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await?;
+        Ok(CompletionOutcome::Applied {
+            event: Some(UntypedJobEvent::Exhausted {
+                job: updated_job,
+                error: error_msg,
+                attempt: job.attempt,
+            }),
+            terminal: true,
+        })
+    } else {
+        Ok(CompletionOutcome::Applied {
+            event: None,
+            terminal: true,
+        })
+    }
+}
+
+/// Terminal exhaustion on queue storage: fail into the DLQ when enabled
+/// (reason `max_attempts_exhausted`), else fail terminally, and emit the
+/// `Exhausted` outcome (with follow-ups when registered). Shared by the
+/// retryable-error path and a [`JobResult::RetryAfter`] returned on the
+/// final attempt.
+#[allow(clippy::too_many_arguments)]
+async fn exhaust_queue_storage(
+    runtime: &QueueStorageRuntime,
+    pool: &PgPool,
+    job: &JobRow,
+    error_msg: String,
+    enqueue_specs: &EnqueueSpecsByOutcome,
+    progress_snapshot: Option<serde_json::Value>,
+    dlq_enabled: bool,
+    metrics: &crate::metrics::AwaMetrics,
+    needs_event: bool,
+) -> Result<CompletionOutcome, AwaError> {
+    tracing::Span::current().record("otel.status_code", "ERROR");
+    error!(
+        job_id = job.id,
+        kind = %job.kind,
+        attempt = job.attempt,
+        max_attempts = job.max_attempts,
+        error = %error_msg,
+        "Job failed (max attempts exhausted)"
+    );
+
+    // ADR-029: retries exhausted -> Exhausted outcome.
+    let kind_specs = enqueue_specs
+        .get(&crate::enqueue_specs::Outcome::Exhausted)
+        .and_then(|by_kind| by_kind.get(&job.kind))
+        .cloned();
+    if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+        let result = fail_queue_storage_with_followups(
+            runtime,
+            pool,
+            job,
+            "max_attempts_exhausted",
+            &error_msg,
+            progress_snapshot.clone(),
+            dlq_enabled,
+            metrics,
+            &specs,
+        )
+        .await?;
+        return match result {
+            None => {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, failure ignored"
+                );
+                Ok(CompletionOutcome::IgnoredStale)
+            }
+            Some(updated_job) => {
+                let event = if needs_event {
+                    Some(UntypedJobEvent::Exhausted {
+                        job: updated_job,
+                        error: error_msg,
+                        attempt: job.attempt,
+                    })
+                } else {
+                    None
+                };
+                Ok(CompletionOutcome::Applied {
+                    event,
+                    terminal: true,
+                })
+            }
+        };
+    }
+
+    let updated_job = if dlq_enabled {
+        let moved = runtime
+            .store
+            .fail_to_dlq(
+                pool,
+                job.id,
+                job.run_lease,
+                "max_attempts_exhausted",
+                &error_msg,
+                progress_snapshot.clone(),
+            )
+            .await?;
+        if moved.is_some() {
+            metrics.record_dlq_moved(&job.kind, &job.queue, "max_attempts_exhausted");
+        }
+        moved
+    } else {
+        runtime
+            .store
+            .fail_terminal(
+                pool,
+                job.id,
+                job.run_lease,
+                &error_msg,
+                progress_snapshot.clone(),
+            )
+            .await?
+    };
+    let Some(updated_job) = updated_job else {
+        warn!(
+            job_id = job.id,
+            "Job already rescued/cancelled, failure ignored"
+        );
+        return Ok(CompletionOutcome::IgnoredStale);
+    };
+    if needs_event {
+        Ok(CompletionOutcome::Applied {
+            event: Some(UntypedJobEvent::Exhausted {
+                job: updated_job,
+                error: error_msg,
+                attempt: job.attempt,
+            }),
+            terminal: true,
+        })
+    } else {
+        Ok(CompletionOutcome::Applied {
+            event: None,
+            terminal: true,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_job_canonical(
     pool: &PgPool,
@@ -661,6 +979,24 @@ async fn complete_job_canonical(
         }
 
         Ok(JobResult::RetryAfter(retry_duration)) => {
+            // RetryAfter reports a failed attempt with a caller-chosen delay,
+            // so a retry requested on the final attempt exhausts the job
+            // exactly like a retryable error would.
+            if job.attempt >= job.max_attempts {
+                let error_msg = format!(
+                    "max_attempts exhausted (handler requested retry after {retry_duration:?})"
+                );
+                return exhaust_canonical(
+                    pool,
+                    job,
+                    error_msg,
+                    enqueue_specs,
+                    &progress_snapshot,
+                    needs_event,
+                )
+                .await;
+            }
+
             let seconds = retry_duration.as_secs() as f64;
             info!(
                 job_id = job.id,
@@ -1140,103 +1476,15 @@ async fn complete_job_canonical(
         Err(JobError::Retryable(err)) => {
             let error_msg = err.to_string();
             if job.attempt >= job.max_attempts {
-                tracing::Span::current().record("otel.status_code", "ERROR");
-                error!(
-                    job_id = job.id,
-                    kind = %job.kind,
-                    attempt = job.attempt,
-                    max_attempts = job.max_attempts,
-                    error = %error_msg,
-                    "Job failed (max attempts exhausted)"
-                );
-
-                // ADR-029: retries exhausted -> Exhausted outcome.
-                let kind_specs = enqueue_specs
-                    .get(&crate::enqueue_specs::Outcome::Exhausted)
-                    .and_then(|by_kind| by_kind.get(&job.kind))
-                    .cloned();
-                if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
-                    let result = exhaust_canonical_with_followups(
-                        pool,
-                        job,
-                        &error_msg,
-                        progress_snapshot.as_ref(),
-                        &specs,
-                    )
-                    .await?;
-                    return match result {
-                        None => {
-                            warn!(
-                                job_id = job.id,
-                                "Job already rescued/cancelled, failure ignored"
-                            );
-                            Ok(CompletionOutcome::IgnoredStale)
-                        }
-                        Some(updated_job) => {
-                            let event = if needs_event {
-                                Some(UntypedJobEvent::Exhausted {
-                                    job: updated_job,
-                                    error: error_msg,
-                                    attempt: job.attempt,
-                                })
-                            } else {
-                                None
-                            };
-                            Ok(CompletionOutcome::Applied {
-                                event,
-                                terminal: true,
-                            })
-                        }
-                    };
-                }
-
-                let result = sqlx::query(
-                    r#"
-                    UPDATE awa.jobs_hot
-                    SET state = 'failed',
-                        finalized_at = now(),
-                        errors = errors || $2::jsonb,
-                        progress = $4
-                    WHERE id = $1 AND state = 'running' AND run_lease = $3
-                    "#,
+                exhaust_canonical(
+                    pool,
+                    job,
+                    error_msg,
+                    enqueue_specs,
+                    &progress_snapshot,
+                    needs_event,
                 )
-                .bind(job.id)
-                .bind(serde_json::json!({
-                    "error": error_msg,
-                    "attempt": job.attempt,
-                    "at": chrono::Utc::now().to_rfc3339()
-                }))
-                .bind(job.run_lease)
-                .bind(&progress_snapshot)
-                .execute(pool)
-                .await?;
-                if result.rows_affected() == 0 {
-                    warn!(
-                        job_id = job.id,
-                        "Job already rescued/cancelled, failure ignored"
-                    );
-                    return Ok(CompletionOutcome::IgnoredStale);
-                }
-                if needs_event {
-                    let updated_job: JobRow =
-                        sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
-                            .bind(job.id)
-                            .fetch_one(pool)
-                            .await?;
-                    Ok(CompletionOutcome::Applied {
-                        event: Some(UntypedJobEvent::Exhausted {
-                            job: updated_job,
-                            error: error_msg,
-                            attempt: job.attempt,
-                        }),
-                        terminal: true,
-                    })
-                } else {
-                    Ok(CompletionOutcome::Applied {
-                        event: None,
-                        terminal: true,
-                    })
-                }
+                .await
             } else {
                 warn!(
                     job_id = job.id,
@@ -1520,6 +1768,27 @@ async fn complete_job_queue_storage(
         }
 
         Ok(JobResult::RetryAfter(retry_duration)) => {
+            // RetryAfter reports a failed attempt with a caller-chosen delay,
+            // so a retry requested on the final attempt exhausts the job
+            // exactly like a retryable error would.
+            if job.attempt >= job.max_attempts {
+                let error_msg = format!(
+                    "max_attempts exhausted (handler requested retry after {retry_duration:?})"
+                );
+                return exhaust_queue_storage(
+                    runtime,
+                    pool,
+                    job,
+                    error_msg,
+                    enqueue_specs,
+                    progress_snapshot.clone(),
+                    dlq_enabled,
+                    metrics,
+                    needs_event,
+                )
+                .await;
+            }
+
             info!(
                 job_id = job.id,
                 kind = %job.kind,
@@ -1943,110 +2212,18 @@ async fn complete_job_queue_storage(
         Err(JobError::Retryable(err)) => {
             let error_msg = err.to_string();
             if job.attempt >= job.max_attempts {
-                tracing::Span::current().record("otel.status_code", "ERROR");
-                error!(
-                        job_id = job.id,
-                        kind = %job.kind,
-                        attempt = job.attempt,
-                        max_attempts = job.max_attempts,
-                    error = %error_msg,
-                    "Job failed (max attempts exhausted)"
-                );
-
-                // ADR-029: retries exhausted -> Exhausted outcome.
-                let kind_specs = enqueue_specs
-                    .get(&crate::enqueue_specs::Outcome::Exhausted)
-                    .and_then(|by_kind| by_kind.get(&job.kind))
-                    .cloned();
-                if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
-                    let result = fail_queue_storage_with_followups(
-                        runtime,
-                        pool,
-                        job,
-                        "max_attempts_exhausted",
-                        &error_msg,
-                        progress_snapshot.clone(),
-                        dlq_enabled,
-                        metrics,
-                        &specs,
-                    )
-                    .await?;
-                    return match result {
-                        None => {
-                            warn!(
-                                job_id = job.id,
-                                "Job already rescued/cancelled, failure ignored"
-                            );
-                            Ok(CompletionOutcome::IgnoredStale)
-                        }
-                        Some(updated_job) => {
-                            let event = if needs_event {
-                                Some(UntypedJobEvent::Exhausted {
-                                    job: updated_job,
-                                    error: error_msg,
-                                    attempt: job.attempt,
-                                })
-                            } else {
-                                None
-                            };
-                            Ok(CompletionOutcome::Applied {
-                                event,
-                                terminal: true,
-                            })
-                        }
-                    };
-                }
-
-                let updated_job = if dlq_enabled {
-                    let moved = runtime
-                        .store
-                        .fail_to_dlq(
-                            pool,
-                            job.id,
-                            job.run_lease,
-                            "max_attempts_exhausted",
-                            &error_msg,
-                            progress_snapshot.clone(),
-                        )
-                        .await?;
-                    if moved.is_some() {
-                        metrics.record_dlq_moved(&job.kind, &job.queue, "max_attempts_exhausted");
-                    }
-                    moved
-                } else {
-                    runtime
-                        .store
-                        .fail_terminal(
-                            pool,
-                            job.id,
-                            job.run_lease,
-                            &error_msg,
-                            progress_snapshot.clone(),
-                        )
-                        .await?
-                };
-                let Some(updated_job) = updated_job else {
-                    warn!(
-                        job_id = job.id,
-                        "Job already rescued/cancelled, failure ignored"
-                    );
-                    return Ok(CompletionOutcome::IgnoredStale);
-                };
-                if needs_event {
-                    Ok(CompletionOutcome::Applied {
-                        event: Some(UntypedJobEvent::Exhausted {
-                            job: updated_job,
-                            error: error_msg,
-                            attempt: job.attempt,
-                        }),
-                        terminal: true,
-                    })
-                } else {
-                    Ok(CompletionOutcome::Applied {
-                        event: None,
-                        terminal: true,
-                    })
-                }
+                exhaust_queue_storage(
+                    runtime,
+                    pool,
+                    job,
+                    error_msg,
+                    enqueue_specs,
+                    progress_snapshot.clone(),
+                    dlq_enabled,
+                    metrics,
+                    needs_event,
+                )
+                .await
             } else {
                 warn!(
                     job_id = job.id,

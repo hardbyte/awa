@@ -112,6 +112,10 @@ The key `QueueConfig` fields:
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
+A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
+
+With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_interval` when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain `poll_interval`. The cap is internal, preserving existing `QueueConfig` struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.
+
 ### Partitioned Queues
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
@@ -432,7 +436,7 @@ These knobs control **how fast a stuck or crashed handler is noticed and rescued
 
 ### Heartbeat — detecting crashed workers
 
-A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:
+A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against `max_attempts`: the job is re-enqueued for another attempt, or fails (and moves to the DLQ when the queue has it enabled) if that was its last. Three knobs participate:
 
 | Knob | Default | What it does |
 | --- | --- | --- |
@@ -450,7 +454,9 @@ For a 5-second crash detection target: `heartbeat_interval=1s`, `heartbeat_stale
 
 ### Deadline — bounding a single attempt
 
-Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
+Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against `max_attempts` like a failed one, so a job that hangs every time ends in `failed` or the DLQ.
+
+A handler that ignores cancellation and is still running two `deadline_rescue_interval`s (one minute by default) past its deadline is dropped at its next `.await`, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python handler's worker slot is freed the same way, but its coroutine is not cancelled: it keeps running on its event loop until it finishes on its own, so while it runs the process can have more handlers executing than `max_workers`. Python handlers should enforce their own timeouts, for example with `asyncio.timeout`.
 
 | Knob | Default | What it does |
 | --- | --- | --- |

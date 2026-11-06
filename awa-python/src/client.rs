@@ -27,6 +27,26 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Run the migrations on the shared bridge runtime.
+///
+/// `migrations::run` is `!Send` (it holds a pooled connection across awaits),
+/// so it cannot be awaited inside the `future_into_py` bridge, whose future
+/// must be `Send`. `Handle::block_on` inside `spawn_blocking` accepts the
+/// `!Send` future and keeps the asyncio loop free.
+///
+/// It must be the shared runtime, not a throwaway one: connections the pool
+/// opens during the migration register their sockets with whichever runtime
+/// drives them and go back into the client's pool afterwards. On a throwaway
+/// runtime they outlive their I/O driver, and the next acquire that picks one
+/// up can stall until the pool's acquire timeout.
+async fn run_migrations_offthread(pool: PgPool) -> PyResult<()> {
+    let runtime = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
+    tokio::task::spawn_blocking(move || runtime.block_on(awa_model::migrations::run(&pool)))
+        .await
+        .map_err(|e| state_error(format!("migration task failed: {e}")))?
+        .map_err(map_awa_error)
+}
+
 fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     if !timeout_seconds.is_finite() || timeout_seconds.is_sign_negative() {
         return Err(map_awa_error(awa_model::AwaError::Validation(
@@ -570,20 +590,8 @@ impl PyClient {
 
     fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        // migrations::run() is !Send (holds PoolConnection across awaits).
-        // We bridge it via spawn_blocking + a current_thread runtime so the
-        // asyncio event loop stays free and asyncio.wait_for() can cancel.
         crate::async_bridge::future_into_py(py, async move {
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build current_thread runtime for migrate");
-                rt.block_on(awa_model::migrations::run(&pool))
-            })
-            .await
-            .map_err(|e| state_error(format!("migration task failed: {e}")))?
-            .map_err(map_awa_error)?;
+            run_migrations_offthread(pool).await?;
             Ok(())
         })
     }
@@ -657,24 +665,7 @@ impl PyClient {
                     // awa.job_state` parses. When the queue-storage
                     // schema is configured to a non-`awa` name this is
                     // just a quick idempotent no-op.
-                    //
-                    // `migrations::run` is `!Send` (holds a
-                    // `PoolConnection` across awaits), and this async
-                    // block goes through `future_into_py` which
-                    // requires `Send`. Bridge via spawn_blocking +
-                    // current_thread runtime, the same pattern
-                    // `Self::migrate` uses.
-                    let pool_for_migrate = pool.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("failed to build current_thread runtime for migrate");
-                        rt.block_on(awa_model::migrations::run(&pool_for_migrate))
-                    })
-                    .await
-                    .map_err(|e| state_error(format!("migration task failed: {e}")))?
-                    .map_err(map_awa_error)?;
+                    run_migrations_offthread(pool.clone()).await?;
                     store.prepare_schema(&pool).await.map_err(map_awa_error)?;
                     store.reset(&pool).await.map_err(map_awa_error)?;
                     store.activate_backend(&pool).await.map_err(map_awa_error)?;

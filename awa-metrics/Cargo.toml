@@ -18,3 +18,6 @@ categories = ["asynchronous"]
 [dependencies]
 awa-model.workspace = true
 opentelemetry.workspace = true
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

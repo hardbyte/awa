@@ -4,19 +4,228 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
-- **Callback completion, `get_job` and lifecycle events find running jobs
-  that priority aging promoted on queue storage** (backport of #600). Claims
-  and leases record a job's aged effective priority while its ready row keeps
-  the lane priority, and three reads joined the two on priority. With aging on
-  (the default, every 60 s), a job that waited past a minute before it was
-  claimed could not be completed by callback with an expected kind, failed the
-  mixed-transition callback routing check, and read back from `get_job` in the
-  wrong state. They now match the attempt (`job_id` and `run_lease`). No
+### Fixed
+
+- **Callback completion, `get_job`, lifecycle events and the admin reads
+  find running jobs that priority aging promoted on queue storage** (backport
+  of #600). Claims and leases record a job's aged effective priority while its
+  ready row keeps the lane priority, and eight reads joined the two on
+  priority. With aging on (the default, every 60 s), a job that waited past a
+  minute before it was claimed could not be completed by callback with an
+  expected kind, failed the mixed-transition callback routing check, read back
+  from `get_job` in the wrong state, was missing from the job list, the kinds
+  page and the dashboard's recent-jobs counts, and was not found by
+  `cancel_by_unique_key`. They now match the attempt (`job_id` and `run_lease`). No
   migration.
 - **`get_job` no longer misses a job that moves while it reads.** It read
   ready, deferred, leased, claimed, completed and DLQ rows in separate
   statements, so a job promoted, claimed or completed between two of them
   could read as missing. It now reads all of them from one read-only snapshot.
+- **`admin::job_kind_overviews` on queue storage no longer depends on the
+  planner's row estimates.** Behind the admin UI's kinds page, it counted
+  every job through the `current_jobs` view. Two nodes of that view are
+  estimated at one row whatever the statistics say: the join from completion
+  batches to `ready_entries`, and the `UNION ALL` over every place a job can
+  live. Postgres therefore chose nested loops that visit each retained row,
+  and the join on `queue_claim_heads` was only as good as that table's
+  estimate, which autovacuum never refreshes. It now aggregates each place to
+  `(kind, queue)` on its own and combines the results: available jobs are
+  found per lane from the claim cursor, and a completion batch's members are
+  unnested and probed along the ready primary key. The rows are identical,
+  and a test compares them with the former definition across every job
+  state. With 2.6 million retained ready rows (1.8 million of them available)
+  and 860,000 retained completions it takes about 6 to 8 s instead of 20 s on
+  PostgreSQL 17 and 18. It still reads each available job and each retained
+  completion's ready row, because a job's kind lives there. JIT is off for
+  the read.
+- **`admin::list_jobs` on queue storage reads only the places that can hold
+  the requested state.** It selected candidate ids from the `current_jobs`
+  view, so every listing, whatever its filter, planned around the same
+  single-row estimates and joined each retained completion to a scan of the
+  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
+  timeout. Each place a job can live is now read and limited on its own,
+  only those that can hold the state asked for, with a predicate for each
+  filter that is set rather than `$n IS NULL OR` terms, which a prepared
+  statement's generic plan can't drop. Completion batches are ordered by job
+  id before their ready rows are probed, so a page probes only as many as it
+  returns. The ids are identical, and a test compares them with the former
+  definition for every state, kind, queue, limit and page. On the dataset
+  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
+  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
+  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
+  from more than four minutes). Available jobs and completions are still read
+  in full when the state allows them. JIT is off for the read.
+
+## [0.6.13] — 2026-11-06
+
+Ships everything in 0.6.13-alpha.1, which soaked without regressions, plus the batch-enqueue deadlock fix.
+
+### Added
+
+- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
+  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
+  take a per-queue predicate and dead-letter exhausted attempts in the rescue
+  transaction. The existing methods keep their behaviour and fail exhausted
+  attempts into `done_entries`.
+
+### Changed
+
+- **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
+
+### Fixed
+
+- **Batch enqueues take their lane locks in one order, so they no longer
+  deadlock with each other.** On queue storage every enqueue holds a
+  transaction-scoped advisory lock on its `(queue, priority, shard)` lane
+  until commit. `insert_many` and `insert_many_copy` took those locks in input
+  order, while `QueueStorage` batch enqueues took them in sorted order, so a
+  batch spanning several queues listed differently from another batch or from
+  a `QueueStorage` enqueue could deadlock with it (`40P01`). The two insert
+  paths now sort rows by `(queue, priority, shard)`, queues compared bytewise,
+  before they reach `awa.insert_job_compat`, the order `QueueStorage` already
+  used, and still return rows in input order. Job ids within a batch that
+  spans several lanes are now allocated lane by lane rather than in input
+  order, and when an `insert_many_copy` batch carries the same unique key in
+  more than one lane, the row in the lowest lane is the one inserted. A
+  transaction that enqueues with separate statements still takes locks in
+  statement order; see "`deadlock detected` while enqueueing" in the
+  troubleshooting guide.
+
+- **Scheduled, snoozed and retry-after jobs are no longer held back while
+  the maintenance leader is overloaded.** The leader backs a maintenance
+  branch off for a cooldown after its body repeatedly runs longer than its
+  interval, and promotion, which makes every scheduled, snoozed and
+  retry-after job runnable, was backed off like the rest, so those jobs
+  waited out the cooldown. The cooldown also counted ticks, and under CPU
+  starvation the leader loop services a branch's tick only once many other
+  branches have run, so a cooldown of a few seconds could last several times
+  that. Promotion is no longer backed off; other branches (rescues, cleanup)
+  back off for a wall-clock duration of twice the overrunning body, capped
+  at five seconds. The leader's interval timers also delay rather than burst
+  after a stall, so a stall no longer queues back-to-back catch-up ticks. This replaces the fixed 120-tick
+  cooldown, which a branch running slightly over 1.5x its interval re-armed
+  on every overrun: a 250 ms promote interval could go quiet for about 30
+  seconds at a time, and slow rescue sweeps left expired claims waiting the
+  same way.
+- **Queue storage's admin counts no longer report zero running jobs when
+  lease-claim receipts are on** (backport of the running count in
+  [#581](https://github.com/hardbyte/awa/pull/581)). A receipt-held job is
+  running without a `leases` row, and `admin::queue_overviews`,
+  `admin::queue_overview`, `admin::state_counts` and `admin::state_timeseries`
+  counted only `leases`, so `awa queue stats` and the web UI showed no running
+  jobs. They now also count open receipt claims.
+
+- **`insert_many` no longer fails above 5,461 jobs in one call.** It built one
+  multi-row `VALUES` statement with twelve bind parameters per job, so a call
+  with more than 5,461 jobs exceeded PostgreSQL's 65,535-parameter limit and
+  failed client-side with `too many arguments for query` before reaching the
+  server. It now sends one array per column through a single fixed-text
+  statement over `unnest(...)`, so the bind count no longer depends on the
+  batch size and the call keeps its single-statement, caller-transaction
+  semantics, on both the canonical and queue-storage engines.
+
+- **Cancelling a running job on queue storage no longer races its completion
+  into two outcomes.** The fast completion path closes a receipt-backed
+  attempt under the attempt's completion lock without locking its claim, and
+  the receipt-only cancel locked only the claim. A cancel that ran while a
+  completion was uncommitted saw no closure, so both committed: the attempt
+  ended with a completion record and a cancelled terminal row. Cancel now finds
+  the open attempt, takes its completion lock, and looks again, so it either
+  sees the completion and leaves the job alone or cancels it before the
+  completion can close it. Bulk cancels take every attempt's lock up front, in
+  the order completion batches use.
+
+- **A duplicate unique follow-up no longer fails the job that triggered it.**
+  A follow-up enqueued with unique options whose key already existed returned
+  `UniqueConflict` from the follow-up `INSERT`, which aborted the trigger's
+  transaction and rolled back its completion (or other outcome). The executor
+  does not retry a unique conflict, so the attempt stayed running until
+  rescue, re-ran, hit the same conflict, and failed once its attempts ran out;
+  every trigger after the first failed this way. Each follow-up with unique
+  options now inserts under a savepoint, and a conflict on the unique-key
+  index skips the duplicate while the trigger commits and the existing
+  follow-up stands. Any other unique violation, or a follow-up without unique
+  options, still rolls the trigger back as before. The guide to
+  [lifecycle hooks](docs/lifecycle-hooks.md) gains a section on deduplicating
+  follow-ups.
+- **Python: a query after `AsyncClient.migrate()` no longer stalls until the
+  pool's acquire timeout.** `migrate()` and `install_queue_storage(reset=True)`
+  ran the migrations on a throwaway tokio runtime but with the client's pool,
+  so connections the pool opened during the migration went back into it tied
+  to a runtime that no longer existed. A later query that picked one up could
+  wait 30 s and fail with `pool timed out while waiting for an open
+  connection`. The migrations now run on the bindings' shared runtime.
+- **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
+  numbers in plain decimal, and serde_json's default parser could round a long
+  one to the neighbouring `f64`, so a value like `5.130112436774387e-96` in job
+  args read back one unit in the last place off. serde_json's
+  `float_roundtrip` feature is now enabled in the workspace and in the Python
+  bindings.
+- **Poison jobs no longer cycle forever.** A job whose worker crashed or hung
+  on every attempt was rescued back to `retryable` indefinitely: stale-heartbeat
+  and deadline rescue never checked `max_attempts`, so `attempt` climbed past
+  it, on both storage engines. Those rescues now fail the job once its attempts
+  are spent, as callback timeouts already did, and on queue storage a
+  DLQ-enabled queue dead-letters it with reason `heartbeat_stale` or
+  `deadline_exceeded`. On queue storage the DLQ row is written in the rescue
+  transaction for all three rescue reasons, including `callback_timeout`; an
+  exhausted callback timeout used to be moved in a second transaction, so an
+  error between the two left it `failed` outside the DLQ. A job with `max_attempts = 1` that loses its worker
+  therefore fails instead of running again. Rescue runs on the maintenance
+  leader, so the new behaviour applies once the leader runs this release.
+- **A hung handler no longer holds its worker slot forever.** Rescue only
+  signalled cancellation, so a handler awaiting something that never resolved
+  kept its permit: the rescued retry could not be claimed, and a one-worker
+  queue stopped. A handler still running two `deadline_rescue_interval`s past
+  its deadline is now dropped at its next `.await`. Blocking code that never
+  yields still keeps its slot. For a Python handler the slot is freed but the
+  coroutine is not cancelled: it keeps running on its event loop until it
+  finishes on its own, so concurrency can exceed `max_workers` while it runs.
+  Python handlers should enforce their own timeouts.
+- **`JobResult::RetryAfter` now respects `max_attempts`.** `RetryAfter` is
+  documented as "this attempt failed; try again after delay X", but the
+  completion path never checked exhaustion: a handler that always returned
+  `RetryAfter` looped forever, invisible to the DLQ and appending nothing to
+  `errors`. A retry requested on the final attempt (`attempt >= max_attempts`)
+  now exhausts the job exactly like a retryable error: `failed` state,
+  `dlq_reason = max_attempts_exhausted` when the DLQ is enabled, an `Exhausted`
+  event, and `on_exhausted_enqueue` follow-ups. A job gets exactly
+  `max_attempts` executions regardless of which failure primitive reports
+  them. **If your `RetryAfter` loop meant "not yet" rather than "failed",
+  return `Snooze`**, which reschedules without consuming the attempt budget.
+  `TestClient` (Rust and Python) mirrors the bound.
+- **A panicking Rust handler is a failed attempt.** A panic used to escape the
+  job task: the job stayed registered in flight, kept heartbeating until its
+  deadline rescued it (5 minutes by default), and its message was lost. The
+  executor now catches the panic and records `handler panicked: <message>` as
+  a retryable failure.
+- **An attempt lost to a stall or to a shutdown whose drain timed out now
+  costs a real attempt.** On the final attempt, the stale-heartbeat or deadline
+  rescue fails the job, or dead-letters it when the queue's DLQ is enabled,
+  instead of running it again, and the late completion from the original
+  worker is ignored as stale. A job with `max_attempts = 1` therefore fails if
+  a deploy's drain times out while it runs.
+- **Rescue-exhausted jobs are reported as rescues.** When a stale-heartbeat,
+  deadline or callback-timeout rescue takes a job's last attempt, the job emits
+  the `Rescued` lifecycle event and runs its `on_rescued_enqueue` follow-ups,
+  not `Exhausted` and `on_exhausted_enqueue`. It counts in `maintenance_rescues`
+  (and in `dlq_moved` when queue storage dead-letters it) rather than
+  `jobs_failed`, as an exhausted callback timeout already did.
+
+- **Duration and size histograms now export explicit bucket boundaries, so latency quantiles are accurate.** `awa.job.duration`, `awa.dispatch.claim_duration`, `awa.dispatch.wake_to_claim_duration`, `awa.completion.flush_duration` and `awa.maintenance.promote_duration` record seconds but were exported with the OpenTelemetry SDK's default millisecond-scale buckets (0, 5, 10, 25, ... 10000), so almost every observation landed in the first bucket and `histogram_quantile` p50/p95/p99 were flat lines near 2.5 s, 4.75 s and 4.95 s whatever the real latency. Latency histograms now use 0.5 ms to 30 s buckets and job duration uses 1 ms to 1 h buckets. The batch-size, capacity and skipped-row histograms (`awa.enqueue.batch_size`, `awa.dispatch.capacity_available`, `awa.dispatch.claim_batch_size`, `awa.completion.flush_batch_size`, `awa.maintenance.promote_batch_size`, `awa.maintenance.rotate.skipped_rows`, `awa.maintenance.prune.skipped_rows`) now use power-of-two buckets from 0 to 8192. Quantile panels become accurate after upgrading. The `le` labels of these histograms change, so a quantile computed over a range that spans the upgrade mixes old and new buckets until the old series age out.
+
+- **Stale-heartbeat and deadline rescue on queue storage no longer reopen an
+  attempt that a worker has just completed.** The rescues checked an
+  attempt's closure evidence and took its completion lock in the same
+  statement. Under READ COMMITTED that statement's snapshot is taken first, so
+  a completion that committed between the snapshot and the lock released the
+  lock and let the rescue take it while its checks still could not see the
+  completion, most easily when the rescue had waited on the claim slot's
+  cursor row. The attempt then had a `completed` closure and a `rescued` or
+  `deadline_expired` one, plus a retryable row, and the job ran again after it
+  had finished. Each rescue now takes the completion locks in a statement of
+  its own and decides in a second statement that starts after them, as the
+  completion, retry and failure paths already do.
 
 ## [0.6.12] — 2026-11-05
 
