@@ -30,6 +30,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Preserve the original job body when manually retrying a priority-aged attempt
+  that exhausted its retries during rescue. Retained failed reads and failed-row
+  carry through pruning now use the physical ready-lane identity.
+
 - Close read connections if their transaction start is cancelled or fails before
   SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
 
