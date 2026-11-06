@@ -89,7 +89,7 @@ STATS_PID=""
 cleanup() {
   [ -n "$STATS_PID" ] && kill "$STATS_PID" 2>/dev/null
   for container in "${CONTAINERS[@]:-}"; do
-    [ -n "$container" ] && docker rm -f "$container" >/dev/null 2>&1
+    [ -n "$container" ] && docker rm -f -v "$container" >/dev/null 2>&1
   done
 }
 trap cleanup EXIT
@@ -177,10 +177,9 @@ for index in "${!ENGINES[@]}"; do
   name="awa-soak-$engine-$$"
   out="$RESULTS_DIR/$engine"
   mkdir -p "$out"
-  CONTAINERS+=("$name")
-
   echo "== $engine on port $port (container $name)"
   start_container "$engine" "$name" "$port" || exit 2
+  CONTAINERS+=("$name")
   wait_ready "$name" || exit 2
 
   log_env=(AWA_SOAK_PG_CONTAINER="$name")
@@ -207,7 +206,7 @@ for index in "${!ENGINES[@]}"; do
   else
     echo "   passed; report in $out/report.md"
   fi
-  docker rm -f "$name" >/dev/null 2>&1
+  docker rm -f -v "$name" >/dev/null 2>&1
 done
 
 echo "results: $RESULTS_DIR"

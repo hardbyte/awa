@@ -743,7 +743,8 @@ fn schema(shared: &Shared) -> String {
 pub enum Scope<'a> {
     /// Open receipt claims and running leases of these queues.
     Queues(&'a [String]),
-    /// Open receipt claims, of any queue, in one claim-ring slot.
+    /// Open receipt identities in one claim-ring slot, including attempts
+    /// materialized into running or callback-waiting leases.
     Slot(i32),
 }
 
@@ -759,20 +760,26 @@ pub async fn probe_backlog(
     staleness_secs: f64,
     since_epoch_ms: i64,
 ) -> Result<Probe, sqlx::Error> {
-    let (batch_filter, row_filter, lease_leg) = match &scope {
+    let (batch_filter, row_filter, receipt_lease_filter, lease_leg) = match &scope {
         Scope::Queues(_) => (
             "b.queue = ANY($1)",
             "c.queue = ANY($1)",
+            "l.job_id IS NULL",
             format!(
                 "UNION ALL
             SELECT COALESCE(a.heartbeat_at, l.heartbeat_at, l.attempted_at), l.deadline_at,
-                   COALESCE(l.attempted_at, l.heartbeat_at)
+                   COALESCE(l.attempted_at, l.heartbeat_at), NULL::timestamptz
             FROM {schema}.leases l
             LEFT JOIN {schema}.attempt_state a ON a.job_id = l.job_id AND a.run_lease = l.run_lease
             WHERE l.queue = ANY($1) AND l.state = 'running'"
             ),
         ),
-        Scope::Slot(_) => ("b.claim_slot = $4", "c.claim_slot = $4", String::new()),
+        Scope::Slot(_) => (
+            "b.claim_slot = $4",
+            "c.claim_slot = $4",
+            "l.job_id IS NULL OR l.state IN ('running', 'waiting_external')",
+            String::new(),
+        ),
     };
     let sql = format!(
         r#"
@@ -797,21 +804,31 @@ pub async fn probe_backlog(
                               WHERE cl.claim_slot = x.claim_slot AND cl.job_id = x.job_id AND cl.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closure_batches cb
                               WHERE cb.claim_slot = x.claim_slot AND cb.receipt_ranges @> x.receipt_id)
-              AND NOT EXISTS (SELECT 1 FROM {schema}.leases l WHERE l.job_id = x.job_id AND l.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.done_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.deferred_jobs d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
               AND NOT EXISTS (SELECT 1 FROM {schema}.dlq_entries d WHERE d.job_id = x.job_id AND d.run_lease = x.run_lease)
         ),
         holders AS (
-            SELECT COALESCE(a.heartbeat_at, x.claimed_at) AS beat_at, x.deadline_at, x.claimed_at
+            SELECT CASE WHEN l.state = 'waiting_external' THEN NULL
+                        ELSE COALESCE(a.heartbeat_at, l.heartbeat_at, l.attempted_at, x.claimed_at)
+                   END AS beat_at,
+                   CASE WHEN l.job_id IS NULL THEN x.deadline_at
+                        WHEN l.state = 'running' THEN l.deadline_at
+                   END AS deadline_at,
+                   x.claimed_at,
+                   CASE WHEN l.state = 'waiting_external' THEN l.callback_timeout_at END
+                       AS callback_timeout_at
             FROM open_receipts x
+            LEFT JOIN {schema}.leases l ON l.job_id = x.job_id AND l.run_lease = x.run_lease
             LEFT JOIN {schema}.attempt_state a ON a.job_id = x.job_id AND a.run_lease = x.run_lease
+            WHERE {receipt_lease_filter}
             {lease_leg}
         ),
         eligible AS (
             SELECT LEAST(
                        CASE WHEN beat_at < stale_before THEN beat_at + make_interval(secs => $2) END,
-                       CASE WHEN deadline_at < now_ts THEN deadline_at END
+                       CASE WHEN deadline_at < now_ts THEN deadline_at END,
+                       CASE WHEN callback_timeout_at < now_ts THEN callback_timeout_at END
                    ) AS eligible_at,
                    claimed_at >= to_timestamp($3::float8 / 1000.0) AS since_start
             FROM holders, bounds
@@ -843,4 +860,189 @@ pub async fn probe_backlog(
         oldest_expired_s: oldest.max(0.0),
         open_since,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{probe_backlog, Scope};
+    use crate::persona_soak::config::{replace_database_name, SoakConfig};
+    use crate::persona_soak::db;
+    use awa::model::{ClaimedRuntimeJob, QueueStorage, QueueStorageConfig};
+    use sqlx::PgPool;
+    use std::time::Duration;
+
+    struct SlotProbe {
+        config: SoakConfig,
+        pool: PgPool,
+        store: QueueStorage,
+    }
+
+    impl SlotProbe {
+        async fn create() -> Self {
+            let base = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:test@localhost:15432/awa_test".to_string()
+            });
+            let name = format!("awa_soak_slot_probe_{}", uuid::Uuid::new_v4().simple());
+            let config = SoakConfig::for_test(replace_database_name(&base, &name));
+            db::recreate_database(&config)
+                .await
+                .expect("isolated database");
+            let pool = db::connect_pool(&config.database_url, "slot_probe_regression", 4)
+                .await
+                .expect("connect");
+            let store = QueueStorage::new(QueueStorageConfig::default()).expect("store");
+            Self {
+                config,
+                pool,
+                store,
+            }
+        }
+
+        async fn claim(&self, deadline: Duration) -> ClaimedRuntimeJob {
+            self.store
+                .enqueue_batch(&self.pool, "slot_probe", 2, 1)
+                .await
+                .expect("enqueue");
+            self.store
+                .claim_runtime_batch(&self.pool, "slot_probe", 1, deadline)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("one claim")
+        }
+
+        async fn assert_counts(&self, slot: i32, open: i64, expired: i64) {
+            let probe = probe_backlog(&self.pool, "awa", Scope::Slot(slot), 30.0, 0)
+                .await
+                .expect("slot probe");
+            assert_eq!((probe.open, probe.expired), (open, expired));
+        }
+
+        async fn age_heartbeat(&self, claim: &ClaimedRuntimeJob) {
+            sqlx::query(
+                "UPDATE awa.leases
+                 SET heartbeat_at = clock_timestamp() - interval '1 minute'
+                 WHERE job_id = $1 AND run_lease = $2",
+            )
+            .bind(claim.job.id)
+            .bind(claim.job.run_lease)
+            .execute(&self.pool)
+            .await
+            .expect("age lease heartbeat");
+            sqlx::query(
+                "INSERT INTO awa.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+                 VALUES ($1, $2, clock_timestamp() - interval '1 minute', clock_timestamp())
+                 ON CONFLICT (job_id, run_lease) DO UPDATE
+                 SET heartbeat_at = EXCLUDED.heartbeat_at",
+            )
+            .bind(claim.job.id)
+            .bind(claim.job.run_lease)
+            .execute(&self.pool)
+            .await
+            .expect("age attempt heartbeat");
+        }
+
+        async fn drop(self) {
+            self.pool.close().await;
+            let admin = db::connect_pool(&self.config.admin_url(), "slot_probe_cleanup", 1)
+                .await
+                .expect("cleanup connection");
+            sqlx::query(&format!(
+                "DROP DATABASE {} WITH (FORCE)",
+                self.config.database_name()
+            ))
+            .execute(&admin)
+            .await
+            .expect("drop isolated database");
+            admin.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_probe_keeps_materialized_running_claims_until_durable_completion() {
+        let run = SlotProbe::create().await;
+        // Zero-deadline receipts are compact; deadline receipts are row-local.
+        for deadline in [Duration::ZERO, Duration::from_secs(3600)] {
+            let claim = run.claim(deadline).await;
+            run.store
+                .register_callback(
+                    &run.pool,
+                    claim.job.id,
+                    claim.job.run_lease,
+                    Duration::from_secs(3600),
+                )
+                .await
+                .expect("materialize the running receipt");
+            let slot = claim.claim.claim_slot;
+            run.assert_counts(slot, 1, 0).await;
+            run.assert_counts((slot + 1) % 8, 0, 0).await;
+            run.age_heartbeat(&claim).await;
+            run.assert_counts(slot, 1, 1).await;
+            run.store
+                .heartbeat_batch(&run.pool, &[(claim.job.id, claim.job.run_lease)])
+                .await
+                .expect("refresh authoritative attempt heartbeat");
+            // The stale leases.heartbeat_at must not override attempt_state.
+            run.assert_counts(slot, 1, 0).await;
+            run.store
+                .complete_runtime_batch(&run.pool, std::slice::from_ref(&claim))
+                .await
+                .expect("durably complete");
+            run.assert_counts(slot, 0, 0).await;
+        }
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn slot_probe_uses_callback_timeout_for_waiting_materialized_claims() {
+        let run = SlotProbe::create().await;
+        for deadline in [Duration::ZERO, Duration::from_secs(3600)] {
+            let claim = run.claim(deadline).await;
+            let callback = run
+                .store
+                .register_callback(
+                    &run.pool,
+                    claim.job.id,
+                    claim.job.run_lease,
+                    Duration::from_secs(3600),
+                )
+                .await
+                .expect("materialize the receipt");
+            assert!(run
+                .store
+                .enter_callback_wait(&run.pool, claim.job.id, claim.job.run_lease, callback)
+                .await
+                .expect("wait for callback"));
+            run.age_heartbeat(&claim).await;
+            sqlx::query(
+                "UPDATE awa.leases SET deadline_at = clock_timestamp() - interval '1 second'
+                 WHERE job_id = $1 AND run_lease = $2",
+            )
+            .bind(claim.job.id)
+            .bind(claim.job.run_lease)
+            .execute(&run.pool)
+            .await
+            .expect("expire the original job deadline");
+            let slot = claim.claim.claim_slot;
+            // Waiting ignores the old heartbeat and deadline until its callback times out.
+            run.assert_counts(slot, 1, 0).await;
+            run.assert_counts((slot + 1) % 8, 0, 0).await;
+            sqlx::query(
+                "UPDATE awa.leases SET callback_timeout_at = clock_timestamp() - interval '1 second'
+                 WHERE job_id = $1 AND run_lease = $2",
+            )
+            .bind(claim.job.id)
+            .bind(claim.job.run_lease)
+            .execute(&run.pool)
+            .await
+            .expect("expire callback");
+            run.assert_counts(slot, 1, 1).await;
+            run.store
+                .complete_external(&run.pool, callback, None, Some(claim.job.run_lease), false)
+                .await
+                .expect("durably complete callback");
+            run.assert_counts(slot, 0, 0).await;
+        }
+        run.drop().await;
+    }
 }
