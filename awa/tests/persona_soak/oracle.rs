@@ -1012,6 +1012,10 @@ mod tests {
 
     impl TestRun {
         async fn create() -> Self {
+            Self::create_with(true, true).await
+        }
+
+        async fn create_with(no_events: bool, sampled: bool) -> Self {
             let base = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:test@localhost:15432/awa_test".to_string()
             });
@@ -1041,8 +1045,8 @@ mod tests {
                 .expect("claim sample");
             let claim = claimed
                 .into_iter()
-                .find(|claim| samples_terminal_proof(claim.job.id))
-                .expect("immutable job ID selects a sample");
+                .find(|claim| samples_terminal_proof(claim.job.id) == sampled)
+                .expect("immutable job ID selects the requested sample status");
             shared.ledger.register(
                 claim.job.id,
                 JobRecord::new(
@@ -1050,11 +1054,11 @@ mod tests {
                     queue.index,
                     0,
                     expect::COMPLETED,
-                    flag::NO_EVENTS,
+                    if no_events { flag::NO_EVENTS } else { 0 },
                 ),
             );
             // The handler returned, but its caller has not finalized the claim.
-            let execution = shared.begin_execution(Persona::Priya, &claim.job, true);
+            let execution = shared.begin_execution(Persona::Priya, &claim.job, no_events);
             shared.ledger.mark(claim.job.id, flag::RETURNED_COMPLETED);
             drop(execution);
             let oracle = Oracle::new(shared.clone(), pool.clone(), watch);
@@ -1141,6 +1145,143 @@ mod tests {
             run.shared.violations.lock().expect("violations").is_empty(),
             "captured durable proof must survive pruning"
         );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn eventful_observed_terminal_without_callback_survives_pruning() {
+        let mut run = TestRun::create_with(false, false).await;
+        assert!(!samples_terminal_proof(run.claim.job.id));
+        let completed = run
+            .store
+            .complete_runtime_batch(&run.pool, &[run.claim.clone()])
+            .await
+            .expect("commit completion without a lifecycle callback");
+        assert_eq!(completed, vec![(run.claim.job.id, run.claim.job.run_lease)]);
+        let durable: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM awa.receipt_completion_batches AS batch,
+                 LATERAL unnest(batch.job_ids, batch.run_leases) AS item(job_id, run_lease)
+                 WHERE item.job_id = $1 AND item.run_lease = $2
+             )",
+        )
+        .bind(run.claim.job.id)
+        .bind(run.claim.job.run_lease)
+        .fetch_one(&run.pool)
+        .await
+        .expect("read committed completion independently of the observer");
+        assert!(durable);
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        let record = run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("eventful record");
+        assert!(record.has_durable_terminal());
+        assert!(record.has(flag::DB_SEEN_COMPLETED));
+        assert_eq!(record.completed_events, 0);
+        run.store
+            .reset(&run.pool)
+            .await
+            .expect("prune retained evidence");
+        run.oracle.final_check(true).await;
+        assert!(run.shared.violations.lock().expect("violations").is_empty());
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn eventful_return_without_finalization_cannot_gain_terminal_proof() {
+        let mut run = TestRun::create_with(false, false).await;
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        assert!(!run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("record")
+            .has_durable_terminal());
+        run.oracle.final_check(true).await;
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|violation| violation.kind == "stuck_job"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn eventful_terminal_pruned_before_observation_stays_inconclusive() {
+        let mut run = TestRun::create_with(false, false).await;
+        run.store
+            .complete_runtime_batch(&run.pool, &[run.claim.clone()])
+            .await
+            .expect("commit completion");
+        run.store
+            .reset(&run.pool)
+            .await
+            .expect("remove evidence before observation");
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        run.oracle.final_check(true).await;
+        assert!(run.shared.oracle_incomplete.load(Ordering::Relaxed));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn eventful_terminal_observer_query_failure_stays_inconclusive() {
+        let run = TestRun::create_with(false, false).await;
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("commit completion");
+        sqlx::query("ALTER TABLE awa.receipt_completion_batches RENAME TO receipt_completion_batches_unavailable")
+            .execute(&run.pool).await.expect("inject observer query failure");
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        assert!(run.shared.oracle_incomplete.load(Ordering::Relaxed));
+        assert!(!run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("record")
+            .has_durable_terminal());
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn eventful_terminal_observer_requires_the_exact_attempt() {
+        let run = TestRun::create_with(false, false).await;
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete old attempt");
+        run.shared.ledger.with(
+            run.claim.job.id,
+            || unreachable!("registered"),
+            |record| {
+                record.latest_run_lease += 1;
+            },
+        );
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        let record = run.shared.ledger.get(run.claim.job.id).expect("record");
+        assert!(!record.has_durable_terminal());
+        assert!(!record.has(flag::DB_SEEN_COMPLETED));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn unsampled_no_events_job_does_not_gain_periodic_terminal_proof() {
+        let run = TestRun::create_with(true, false).await;
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("commit completion");
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        assert!(!run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("record")
+            .has_durable_terminal());
         run.drop().await;
     }
 
