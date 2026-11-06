@@ -306,6 +306,11 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 
 ## Persona soak
 
+Durable loss detection covers every lifecycle-observed job and a deterministic `job_id % 64 = 0` sample of `NO_EVENTS` workloads. The other 63/64 returned `NO_EVENTS` jobs remain in enqueue/execution accounting, but their terminal commits are not proven. A bulk observer polls sampled terminal rows once per second (2 s query timeout, 100,000-row cap) and keeps the run lease in the client ledger, so captured proof survives pruning. A handler return is never terminal proof. Missing sampled proof after pruning or a failed invariant query makes the report `INCONCLUSIVE` and fails the test; it does not assert job loss or establish a pass. Reports include sampled, confirmed and excluded counts.
+
+On CI, assertion waits and heartbeat staleness use `ci_timing.rs` scaling; load durations, kill schedules and measurement windows retain their configured values.
+
+
 `awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`, Python side in `awa/tests/persona_soak/python/`) runs several
 application-shaped workloads concurrently against one database, the way different
 applications share an `awa` schema, and fails the run on any invariant violation.

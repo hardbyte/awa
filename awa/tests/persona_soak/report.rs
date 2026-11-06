@@ -38,10 +38,18 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     let _ = writeln!(
         out,
         "verdict: {}",
-        if violations.is_empty() {
-            "PASS"
-        } else {
+        if violations
+            .iter()
+            .any(|violation| violation.kind != "oracle_incomplete")
+        {
             "FAIL"
+        } else if shared
+            .oracle_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            "INCONCLUSIVE"
+        } else {
+            "PASS"
         }
     );
     let _ = writeln!(
@@ -75,6 +83,7 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
         outcome.quiesced
     );
     let _ = writeln!(out, "ledger jobs: {}", shared.ledger.len());
+    let _ = writeln!(out, "NO_EVENTS durable loss detection: job_id % {} = 0; other returned NO_EVENTS jobs are excluded from terminal-commit proof.", super::ledger::TERMINAL_PROOF_STRIDE);
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Connection budget");
@@ -183,7 +192,10 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         })
         .collect();
     let summary = json!({
-        "verdict": if violations.is_empty() { "pass" } else { "fail" },
+        "verdict": if violations.iter().any(|violation| violation.kind != "oracle_incomplete") { "fail" }
+            else if shared.oracle_incomplete.load(std::sync::atomic::Ordering::Relaxed) { "inconclusive" } else { "pass" },
+        "terminal_proof_sample_stride": super::ledger::TERMINAL_PROOF_STRIDE,
+        "oracle_complete": !shared.oracle_incomplete.load(std::sync::atomic::Ordering::Relaxed),
         "seed": shared.config.seed,
         "personas": shared.config.personas.iter().map(|p| p.name()).collect::<Vec<_>>(),
         "engine": shared.info.engine,

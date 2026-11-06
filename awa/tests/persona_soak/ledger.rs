@@ -8,6 +8,14 @@ use std::sync::Mutex;
 
 const SHARDS: usize = 64;
 
+/// NO_EVENTS workloads keep their fast path; durable loss detection covers
+/// this deterministic sample, chosen from the immutable assigned job ID.
+pub const TERMINAL_PROOF_STRIDE: i64 = 64;
+
+pub fn samples_terminal_proof(job_id: i64) -> bool {
+    job_id.rem_euclid(TERMINAL_PROOF_STRIDE) == 0
+}
+
 /// What a job is allowed to end as.
 pub mod expect {
     pub const COMPLETED: u8 = 1;
@@ -57,6 +65,8 @@ pub struct JobRecord {
     pub in_flight: u8,
     pub overlapped: bool,
     pub max_attempt: i16,
+    pub latest_run_lease: i64,
+    pub terminal_run_lease: Option<i64>,
     pub first_start_ms: u32,
     pub last_start_ms: u32,
     pub completed_events: u8,
@@ -79,6 +89,8 @@ impl JobRecord {
             in_flight: 0,
             overlapped: false,
             max_attempt: 0,
+            latest_run_lease: 0,
+            terminal_run_lease: None,
             first_start_ms: 0,
             last_start_ms: 0,
             completed_events: 0,
@@ -87,6 +99,18 @@ impl JobRecord {
             completed_event_ms: 0,
             operator_cancel_ms: 0,
         }
+    }
+
+    pub fn note_terminal(&mut self, run_lease: i64) {
+        self.terminal_run_lease = Some(
+            self.terminal_run_lease
+                .map_or(run_lease, |old| old.max(run_lease)),
+        );
+    }
+
+    pub fn has_durable_terminal(&self) -> bool {
+        self.terminal_run_lease
+            .is_some_and(|lease| lease >= self.latest_run_lease)
     }
 
     pub fn has(&self, flag: u32) -> bool {

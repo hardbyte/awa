@@ -579,10 +579,10 @@ async fn tail_terminal_rows(shared: &Arc<Shared>, pool: &sqlx::PgPool, tick: &mu
         QUEUE_DEADLINE.to_string(),
         QUEUE_SHARED.to_string(),
     ];
-    let rows: Result<Vec<(i64, String)>, _> = sqlx::query_as(&format!(
-        "SELECT job_id, state::text FROM {schema}.done_entries WHERE queue = ANY($1) AND finalized_at > now() - interval '25 seconds'
-         UNION ALL SELECT job_id, 'failed' FROM {schema}.dlq_entries WHERE queue = ANY($1) AND dlq_at > now() - interval '25 seconds'
-         UNION ALL SELECT b.job_id, 'completed' FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids) AS b(job_id)
+    let rows: Result<Vec<(i64, i64, String)>, _> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease, state::text FROM {schema}.done_entries WHERE queue = ANY($1) AND finalized_at > now() - interval '25 seconds'
+         UNION ALL SELECT job_id, run_lease, 'failed' FROM {schema}.dlq_entries WHERE queue = ANY($1) AND dlq_at > now() - interval '25 seconds'
+         UNION ALL SELECT b.job_id, b.run_lease, 'completed' FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids, c.run_leases) AS b(job_id, run_lease)
            WHERE c.queue = ANY($1) AND c.finalized_at > now() - interval '25 seconds'"
     ))
     .bind(&queues)
@@ -602,7 +602,7 @@ async fn tail_terminal_rows(shared: &Arc<Shared>, pool: &sqlx::PgPool, tick: &mu
         .stats(Persona::Python)
         .add("python_tail_rows", rows.len() as i64);
     let now = shared.now_ms() as u32;
-    for (id, state) in rows {
+    for (id, run_lease, state) in rows {
         shared.ledger.with(
             id,
             || {
@@ -614,11 +614,14 @@ async fn tail_terminal_rows(shared: &Arc<Shared>, pool: &sqlx::PgPool, tick: &mu
                     flag::NO_EVENTS,
                 )
             },
-            |record| match state.as_str() {
-                "completed" => record.flags |= flag::DB_SEEN_COMPLETED,
-                "failed" => record.flags |= flag::DB_SEEN_FAILED,
-                "cancelled" => record.flags |= flag::DB_SEEN_CANCELLED,
-                _ => {}
+            |record| {
+                record.note_terminal(run_lease);
+                match state.as_str() {
+                    "completed" => record.flags |= flag::DB_SEEN_COMPLETED,
+                    "failed" => record.flags |= flag::DB_SEEN_FAILED,
+                    "cancelled" => record.flags |= flag::DB_SEEN_CANCELLED,
+                    _ => {}
+                }
             },
         );
     }

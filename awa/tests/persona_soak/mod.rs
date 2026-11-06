@@ -18,3 +18,4 @@ pub mod run;
 pub mod shard_oracle;
 pub mod shared;
 pub mod stop;
+pub mod terminal_proof;

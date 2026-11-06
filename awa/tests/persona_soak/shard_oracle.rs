@@ -236,8 +236,12 @@ pub async fn watch(shared: Arc<Shared>, pool: PgPool, queues: Vec<String>, stop:
     // (queue, priority, shard) -> when backlog above the configured count was first seen
     let mut above_since: HashMap<(String, i16, i16), (i64, bool)> = HashMap::new();
     while !stop.sleep(Duration::from_secs(5)).await {
-        let Ok(rows) = shard_rows(&pool, &schema, &queues).await else {
-            continue;
+        let rows = match shard_rows(&pool, &schema, &queues).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                shared.incomplete(format!("shard cursor query failed: {error}"), vec![]);
+                continue;
+            }
         };
         let now = shared.now_ms();
         let mut window = shared.config.stall_window;
@@ -356,7 +360,7 @@ pub async fn final_check(shared: &Arc<Shared>, pool: &PgPool, queues: &[String])
                 }
             }
         }
-        Err(error) => shared.note("shards", format!("final shard query failed: {error}")),
+        Err(error) => shared.incomplete(format!("final shard query failed: {error}"), vec![]),
     }
 
     let state = &shared.shardops;

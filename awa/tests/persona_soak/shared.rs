@@ -10,7 +10,7 @@ use super::stop::Stop;
 use awa::{JobRow, UntypedJobEvent};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -116,6 +116,8 @@ pub struct Shared {
     pub drain_stop: Stop,
     pub timeline: Mutex<Vec<TimelineEvent>>,
     pub violations: Mutex<Vec<Violation>>,
+    /// Required oracle evidence was unavailable; the run cannot establish a pass.
+    pub oracle_incomplete: AtomicBool,
     /// Problems that are not invariant violations (slow admin queries); reported, not fatal.
     pub findings: Mutex<Vec<Violation>>,
     pub stats: HashMap<Persona, Stats>,
@@ -153,6 +155,7 @@ impl Shared {
             drain_stop: Stop::new(),
             timeline: Mutex::new(Vec::new()),
             violations: Mutex::new(Vec::new()),
+            oracle_incomplete: AtomicBool::new(false),
             findings: Mutex::new(Vec::new()),
             stats,
             run: Stats::default(),
@@ -214,6 +217,13 @@ impl Shared {
             violation.summary
         );
         self.violations.lock().expect("violations").push(violation);
+    }
+
+    pub fn incomplete(&self, summary: impl Into<String>, rows: Vec<String>) {
+        self.run.add("oracle_incomplete_checks", 1);
+        if !self.oracle_incomplete.swap(true, Ordering::Relaxed) {
+            self.violation("oracle_incomplete", summary, rows);
+        }
     }
 
     /// Records a non-fatal finding: something worth a bug report that is not one of the
@@ -306,6 +316,7 @@ impl Shared {
                 record.in_flight = record.in_flight.saturating_add(1);
                 record.executions = record.executions.saturating_add(1);
                 record.max_attempt = record.max_attempt.max(job.attempt);
+                record.latest_run_lease = record.latest_run_lease.max(job.run_lease);
                 if record.first_start_ms == 0 {
                     record.first_start_ms = now.max(1);
                 }
@@ -384,16 +395,19 @@ impl Shared {
             || JobRecord::new(persona, queue_index, now, expect::ANY_TERMINAL, 0),
             |record| match event {
                 UntypedJobEvent::Completed { .. } => {
+                    record.note_terminal(job.run_lease);
                     record.completed_events = record.completed_events.saturating_add(1);
                     record.completed_event_ms = now;
                     record.flags |= flag::COMPLETED_EVENT;
                     double_complete = record.completed_events > 1 && !record.has(flag::DLQ_RETRIED);
                 }
                 UntypedJobEvent::Exhausted { .. } => {
+                    record.note_terminal(job.run_lease);
                     record.exhausted_events = record.exhausted_events.saturating_add(1);
                     record.flags |= flag::EXHAUSTED;
                 }
                 UntypedJobEvent::Cancelled { .. } => {
+                    record.note_terminal(job.run_lease);
                     record.cancel_events = record.cancel_events.saturating_add(1);
                     record.flags |= flag::HANDLER_CANCELLED;
                 }

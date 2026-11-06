@@ -12,6 +12,7 @@
 //! for the engine matrix.
 
 #![allow(dead_code)]
+mod ci_timing;
 mod persona_soak;
 
 use persona_soak::config::SoakConfig;

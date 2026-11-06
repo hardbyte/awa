@@ -84,6 +84,12 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         None
     };
 
+    let terminal_observer = tokio::spawn(super::terminal_proof::run(
+        shared.clone(),
+        oracle_pool.clone(),
+        shared.drain_stop.clone(),
+    ));
+
     // Personas start their runtimes and then produce until the load stops. Chaos, the
     // operator and the UI users reach other personas' fleets and queues, so they start
     // once the rest are up.
@@ -171,6 +177,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         .quiesced
         .store(quiesced, std::sync::atomic::Ordering::Relaxed);
     shared.note("run", format!("quiesced: {quiesced}"));
+    super::terminal_proof::observe(&shared, &oracle_pool).await;
     oracle.final_check(quiesced).await;
     let excerpts = oracle.crash_scan();
     for excerpt in &excerpts {
@@ -193,7 +200,12 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
 
     shared.drain_stop.trigger();
     for (persona, task) in tasks {
-        match tokio::time::timeout(Duration::from_secs(180), task).await {
+        match tokio::time::timeout(
+            crate::ci_timing::scaled_timeout(Duration::from_secs(180)),
+            task,
+        )
+        .await
+        {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => shared.violation(
                 "persona_failed",
@@ -213,6 +225,9 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
     }
 
+    terminal_observer
+        .await
+        .map_err(|error| format!("terminal observer task: {error}"))?;
     personas::ui::analyse(&shared);
     if let Some(mut server) = admin_server {
         if !server.is_running() {

@@ -1,5 +1,6 @@
 //! Run configuration, read from the environment.
 
+use crate::ci_timing::{scaled_staleness, scaled_timeout};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -168,6 +169,17 @@ impl SoakConfig {
         let database_url = env_string("AWA_SOAK_DATABASE_URL").ok_or(
             "AWA_SOAK_DATABASE_URL is required (postgres://user:pass@host:port/awa_soak_<name>)",
         )?;
+        Self::from_database_url(database_url)
+    }
+
+    #[cfg(test)]
+    pub fn for_test(database_url: String) -> Self {
+        let mut config = Self::from_database_url(database_url).expect("test database URL");
+        config.personas.clear();
+        config
+    }
+
+    fn from_database_url(database_url: String) -> Result<Self, String> {
         let database_name = database_name(&database_url);
         if !database_name.starts_with("awa_soak")
             || !database_name
@@ -201,9 +213,9 @@ impl SoakConfig {
             database_url,
             personas,
             load: Duration::from_secs(env_parse("AWA_SOAK_SECONDS").unwrap_or(900)),
-            drain_grace: Duration::from_secs(
+            drain_grace: scaled_timeout(Duration::from_secs(
                 env_parse("AWA_SOAK_DRAIN_GRACE_SECONDS").unwrap_or(120),
-            ),
+            )),
             seed,
             scale: env_parse("AWA_SOAK_SCALE").unwrap_or(1.0),
             report_dir,
@@ -223,13 +235,15 @@ impl SoakConfig {
                 env_parse("AWA_SOAK_ADMIN_READ_SECONDS").unwrap_or(2),
             ),
             min_free_disk_gb: env_parse("AWA_SOAK_MIN_FREE_DISK_GB").unwrap_or(8),
-            promotion_overdue: Duration::from_secs(
+            promotion_overdue: scaled_timeout(Duration::from_secs(
                 env_parse("AWA_SOAK_PROMOTION_OVERDUE_SECONDS").unwrap_or(10),
-            ),
-            stall_window: Duration::from_secs(env_parse("AWA_SOAK_STALL_SECONDS").unwrap_or(30)),
-            chaos_slack: Duration::from_secs(
+            )),
+            stall_window: scaled_timeout(Duration::from_secs(
+                env_parse("AWA_SOAK_STALL_SECONDS").unwrap_or(30),
+            )),
+            chaos_slack: scaled_timeout(Duration::from_secs(
                 env_parse("AWA_SOAK_CHAOS_SLACK_SECONDS").unwrap_or(45),
-            ),
+            )),
             shardops_scale: env_parse("AWA_SOAK_SHARDOPS_SCALE").unwrap_or(1.0),
             shardops_schema_create: env_parse::<u8>("AWA_SOAK_SHARDOPS_SCHEMA_CREATE")
                 .map(|value| value != 0)
@@ -239,9 +253,9 @@ impl SoakConfig {
                 env_parse("AWA_SOAK_ABANDON_KILL_SECONDS").unwrap_or(180),
             ),
             abandon_kills: env_parse("AWA_SOAK_ABANDON_KILLS").unwrap_or(4),
-            abandon_bound: Duration::from_secs(
+            abandon_bound: scaled_timeout(Duration::from_secs(
                 env_parse("AWA_SOAK_ABANDON_BOUND_SECONDS").unwrap_or(120),
-            ),
+            )),
             abandon_restart_delay: Duration::from_secs(
                 env_parse("AWA_SOAK_ABANDON_RESTART_SECONDS").unwrap_or(3),
             ),
@@ -250,9 +264,9 @@ impl SoakConfig {
             heartbeat_interval: Duration::from_secs(
                 env_parse("AWA_SOAK_HEARTBEAT_SECONDS").unwrap_or(DEFAULT_HEARTBEAT_SECONDS),
             ),
-            heartbeat_staleness: Duration::from_secs(
+            heartbeat_staleness: scaled_staleness(Duration::from_secs(
                 env_parse("AWA_SOAK_STALENESS_SECONDS").unwrap_or(DEFAULT_STALENESS_SECONDS),
-            ),
+            )),
         })
     }
 

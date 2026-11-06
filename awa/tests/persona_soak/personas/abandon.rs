@@ -600,8 +600,12 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
         ))
         .fetch_one(&pool)
         .await;
-        let Ok((slot, ring_generation, slot_count)) = ring else {
-            continue;
+        let (slot, ring_generation, slot_count) = match ring {
+            Ok(ring) => ring,
+            Err(error) => {
+                shared.incomplete(format!("claim-ring monitor query failed: {error}"), vec![]);
+                continue;
+            }
         };
         if let Some((_, spawned)) = shared.abandon.live() {
             sample_heartbeats(&shared, &pool, &schema, spawned).await;
@@ -617,8 +621,11 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
                 0,
             )
             .await
-            .ok()
             .map(|probe| (probe.open - probe.expired, probe.expired))
+            .map_err(|error| {
+                shared.incomplete(format!("claim-slot monitor query failed: {error}"), vec![])
+            })
+            .ok()
         } else {
             None
         };
@@ -651,6 +658,10 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
                     started.elapsed().as_millis() as i64,
                 ),
                 Err(error) => {
+                    shared.incomplete(
+                        format!("abandoned-claim backlog query failed: {error}"),
+                        vec![],
+                    );
                     shared.stats(Persona::ClaimAbandon).add("probe_errors", 1);
                     if shared.stats(Persona::ClaimAbandon).get("probe_errors") <= 3 {
                         shared.note("abandon", format!("backlog probe failed: {error}"));
@@ -873,7 +884,11 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
             0,
         )
         .await
-        .map_or(-1, |probe| probe.open);
+        .map(|probe| probe.open)
+        .unwrap_or_else(|error| {
+            shared.incomplete(format!("post-kill backlog query failed: {error}"), vec![]);
+            -1
+        });
         let started = shared.abandon.started_by(generation);
         shared.abandon.record_kill(Kill {
             number,

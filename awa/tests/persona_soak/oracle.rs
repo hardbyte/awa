@@ -1,7 +1,7 @@
 //! The invariant oracle: periodic checks while the load runs and a final
 //! reconciliation of the client ledger against the database.
 
-use super::ledger::{expect, flag};
+use super::ledger::{expect, flag, samples_terminal_proof};
 use super::pgserver::PgWatch;
 use super::shared::Shared;
 use super::stop::Stop;
@@ -118,7 +118,14 @@ impl Oracle {
             sqlx::query_scalar("SELECT stats_reset::text FROM pg_stat_bgwriter")
                 .fetch_one(&self.pool)
                 .await;
-        let Ok(reset) = reset else { return };
+        let reset = match reset {
+            Ok(reset) => reset,
+            Err(error) => {
+                self.shared
+                    .incomplete(format!("crash-recovery probe failed: {error}"), vec![]);
+                return;
+            }
+        };
         let mut initial = self.initial_stats_reset.lock().expect("stats reset");
         match initial.as_ref() {
             None => *initial = Some(reset),
@@ -157,9 +164,9 @@ impl Oracle {
             }
         }
         self.shared.run.add("server_probe_failures", 1);
-        self.shared.note(
-            "oracle",
+        self.shared.incomplete(
             format!("server probe failed repeatedly: {last_error}"),
+            vec![],
         );
     }
 
@@ -197,10 +204,9 @@ impl Oracle {
                     );
                 }
             }
-            Err(error) => self.shared.note(
-                "oracle",
-                format!("terminal uniqueness query failed: {error}"),
-            ),
+            Err(error) => self
+                .shared
+                .incomplete(format!("terminal uniqueness query failed: {error}"), vec![]),
         }
 
         let available = available_cte(&schema);
@@ -233,9 +239,16 @@ impl Oracle {
                 .bind(&ids)
                 .fetch_all(&self.pool)
                 .await;
-                let confirmed: std::collections::HashSet<i64> = still
-                    .map(|rows| rows.into_iter().map(|row| row.0).collect())
-                    .unwrap_or_default();
+                let confirmed: std::collections::HashSet<i64> = match still {
+                    Ok(rows) => rows.into_iter().map(|row| row.0).collect(),
+                    Err(error) => {
+                        self.shared.incomplete(
+                            format!("terminal/live confirmation failed: {error}"),
+                            vec![],
+                        );
+                        Default::default()
+                    }
+                };
                 let confirmed_rows: Vec<String> = rows
                     .iter()
                     .filter(|row| confirmed.contains(&row.0))
@@ -258,7 +271,7 @@ impl Oracle {
             Ok(_) => {}
             Err(error) => self
                 .shared
-                .note("oracle", format!("terminal/live query failed: {error}")),
+                .incomplete(format!("terminal/live query failed: {error}"), vec![]),
         }
         self.shared.run.observe(
             "oracle_terminal_check_ms",
@@ -281,7 +294,14 @@ impl Oracle {
         .fetch_all(&self.pool)
         .await;
         self.last_cancel_scan_ms = scan_started_ms;
-        let Ok(rows) = rows else { return };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.shared
+                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                return;
+            }
+        };
         let mut unexplained = Vec::new();
         for (job_id, queue_name, run_lease) in rows {
             let Some(record) = self.shared.ledger.get(job_id) else {
@@ -350,7 +370,14 @@ impl Oracle {
         .bind(threshold.as_secs_f64())
         .fetch_all(&self.pool)
         .await;
-        let Ok(rows) = rows else { return };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.shared
+                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                return;
+            }
+        };
         if rows.is_empty() {
             return;
         }
@@ -363,7 +390,14 @@ impl Oracle {
         .bind(&ids)
         .fetch_all(&self.pool)
         .await;
-        let Ok(still) = still else { return };
+        let still = match still {
+            Ok(still) => still,
+            Err(error) => {
+                self.shared
+                    .incomplete(format!("promotion confirmation failed: {error}"), vec![]);
+                return;
+            }
+        };
         let stuck: Vec<_> = rows.iter().filter(|row| still.contains(&row.0)).collect();
         if stuck.is_empty() {
             return;
@@ -403,7 +437,14 @@ impl Oracle {
         ))
         .fetch_all(&self.pool)
         .await;
-        let Ok(rows) = rows else { return };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.shared
+                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                return;
+            }
+        };
         let now = self.shared.now_ms();
         let mut window = self.shared.config.stall_window;
         if self.shared.chaos_active() {
@@ -447,7 +488,14 @@ impl Oracle {
             .bind(&queue_name)
             .fetch_one(&self.pool)
             .await;
-            let Ok(available) = exact else { continue };
+            let available = match exact {
+                Ok(available) => available,
+                Err(error) => {
+                    self.shared
+                        .incomplete(format!("exact claimable-row check failed: {error}"), vec![]);
+                    continue;
+                }
+            };
             if available > 0 {
                 if let Some(entry) = self.stall.cursors.get_mut(&queue_name) {
                     entry.2 = true;
@@ -563,6 +611,21 @@ impl Oracle {
             ))
             .fetch_one(&self.pool)
             .await;
+            if let Err(error) = &live {
+                self.shared
+                    .incomplete(format!("quiescence query failed: {error}"), vec![]);
+            }
+            let mut pending_terminal_proof = 0usize;
+            self.shared.ledger.for_each(|id, record| {
+                if record.has(flag::RETURNED_COMPLETED)
+                    && !record.has_durable_terminal()
+                    && !record.has(flag::OPERATOR_REMOVED)
+                    && !record.has(flag::DLQ_PURGED)
+                    && (!record.has(flag::NO_EVENTS) || samples_terminal_proof(id))
+                {
+                    pending_terminal_proof += 1;
+                }
+            });
             let in_flight: i64 = self
                 .shared
                 .queues
@@ -585,6 +648,7 @@ impl Oracle {
                     if in_flight == 0
                         && python_active == 0
                         && abandoned_open == 0
+                        && pending_terminal_proof == 0
                         && count_is_idle(count) =>
                 {
                     quiet_polls += 1
@@ -633,17 +697,17 @@ impl Oracle {
         // Jobs with no terminal evidence on the client side have to be found in the database.
         let mut unresolved: Vec<i64> = Vec::new();
         let mut unexpected: Vec<String> = Vec::new();
+        let mut sampled = 0i64;
+        let mut confirmed = 0i64;
+        let mut excluded = 0i64;
         self.shared.ledger.for_each(|id, record| {
             if record.has(flag::OPERATOR_REMOVED) || record.has(flag::DLQ_PURGED) {
                 return;
             }
-            let db_seen = flag::DB_SEEN_COMPLETED | flag::DB_SEEN_FAILED | flag::DB_SEEN_CANCELLED;
-            let evidence = record.completed_events > 0
-                || record.exhausted_events > 0
-                || record.cancel_events > 0
-                || record.flags & db_seen != 0
-                || (record.has(flag::NO_EVENTS) && record.has(flag::RETURNED_COMPLETED));
-            if evidence {
+            let sampled_no_events = record.has(flag::NO_EVENTS) && samples_terminal_proof(id);
+            sampled += i64::from(sampled_no_events);
+            if record.has_durable_terminal() {
+                confirmed += i64::from(sampled_no_events);
                 let completed = record.completed_events > 0
                     || record.has(flag::RETURNED_COMPLETED)
                     || record.has(flag::DB_SEEN_COMPLETED);
@@ -675,6 +739,13 @@ impl Oracle {
                         record.expect
                     ));
                 }
+            } else if record.has(flag::NO_EVENTS)
+                && record.has(flag::RETURNED_COMPLETED)
+                && !sampled_no_events
+            {
+                // This optimized workload is sampled, not proven per job.
+                // A return is execution evidence only, never commit evidence.
+                excluded += 1;
             } else {
                 unresolved.push(id);
             }
@@ -696,26 +767,35 @@ impl Oracle {
         let mut lost_after_run = Vec::new();
         let mut terminal_in_db = 0usize;
         for chunk in unresolved.chunks(5000) {
-            let found: Result<Vec<(i64, String)>, _> = sqlx::query_as(&format!(
-                "SELECT job_id, string_agg(place, ',') FROM (
-                    SELECT job_id, 'done:' || state::text AS place FROM {schema}.done_entries WHERE job_id = ANY($1)
-                    UNION ALL SELECT job_id, 'dlq' FROM {schema}.dlq_entries WHERE job_id = ANY($1)
-                    UNION ALL SELECT b.job_id, 'receipt_completed'
-                      FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids) AS b(job_id)
+            let found: Result<Vec<(i64, String, Option<i64>)>, _> = sqlx::query_as(&format!(
+                "SELECT job_id, string_agg(place, ','), max(terminal_run_lease) FROM (
+                    SELECT job_id, 'done:' || state::text AS place, run_lease AS terminal_run_lease FROM {schema}.done_entries WHERE job_id = ANY($1)
+                    UNION ALL SELECT job_id, 'dlq', run_lease FROM {schema}.dlq_entries WHERE job_id = ANY($1)
+                    UNION ALL SELECT b.job_id, 'receipt_completed', b.run_lease
+                      FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids, c.run_leases) AS b(job_id, run_lease)
                       WHERE c.job_ids && $1 AND b.job_id = ANY($1)
-                    UNION ALL SELECT job_id, 'deferred:' || state::text FROM {schema}.deferred_jobs WHERE job_id = ANY($1)
-                    UNION ALL SELECT job_id, 'ready' FROM {schema}.ready_entries WHERE job_id = ANY($1)
-                    UNION ALL SELECT job_id, 'leased:' || state::text FROM {schema}.leases WHERE job_id = ANY($1)
+                    UNION ALL SELECT job_id, 'deferred:' || state::text, NULL::bigint FROM {schema}.deferred_jobs WHERE job_id = ANY($1)
+                    UNION ALL SELECT job_id, 'ready', NULL::bigint FROM {schema}.ready_entries WHERE job_id = ANY($1)
+                    UNION ALL SELECT job_id, 'leased:' || state::text, NULL::bigint FROM {schema}.leases WHERE job_id = ANY($1)
                  ) places GROUP BY job_id"
             ))
             .bind(chunk)
             .fetch_all(&self.pool)
             .await;
-            let found: HashMap<i64, String> = match found {
-                Ok(rows) => rows.into_iter().collect(),
+            let found: HashMap<i64, (String, Option<i64>)> = match found {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|(id, place, lease)| (id, (place, lease)))
+                    .collect(),
                 Err(error) => {
-                    self.shared
-                        .note("oracle", format!("final lookup failed: {error}"));
+                    self.shared.run.add("final_lookup_errors", 1);
+                    self.shared.incomplete(
+                        format!(
+                            "final lookup failed for {} unresolved jobs: {error}",
+                            chunk.len()
+                        ),
+                        vec![],
+                    );
                     continue;
                 }
             };
@@ -735,13 +815,31 @@ impl Oracle {
                             .map_or("?".to_string(), |queue| queue.name.clone())
                     )
                 };
+                if record
+                    .as_ref()
+                    .is_some_and(|record| record.has_durable_terminal())
+                {
+                    confirmed += i64::from(
+                        record
+                            .as_ref()
+                            .is_some_and(|record| record.has(flag::NO_EVENTS))
+                            && samples_terminal_proof(*id),
+                    );
+                    continue;
+                }
                 match found.get(id) {
-                    Some(place)
-                        if place.contains("done:")
-                            || place.contains("dlq")
-                            || place.contains("receipt_completed") =>
+                    Some((place, terminal_lease))
+                        if terminal_lease.is_some_and(|lease| {
+                            lease >= record.as_ref().map_or(0, |record| record.latest_run_lease)
+                        }) =>
                     {
                         terminal_in_db += 1;
+                        confirmed += i64::from(
+                            record
+                                .as_ref()
+                                .is_some_and(|record| record.has(flag::NO_EVENTS))
+                                && samples_terminal_proof(*id),
+                        );
                         if place.contains("done:cancelled") {
                             if let Some(record) = &record {
                                 let queue = self.shared.queues.by_index(record.queue);
@@ -760,7 +858,7 @@ impl Oracle {
                             }
                         }
                     }
-                    Some(place) => live_stuck.push(describe(place)),
+                    Some((place, _)) => live_stuck.push(describe(place)),
                     None => {
                         let executed = record.as_ref().is_some_and(|r| r.executions > 0);
                         let returned = record
@@ -783,6 +881,11 @@ impl Oracle {
                         } else if !returned {
                             lost_after_run.push(describe("absent"));
                             forensic_ids.push(*id);
+                        } else {
+                            self.shared.incomplete(
+                                "a returned handler has no durable terminal proof; a missed pruned outcome cannot be distinguished from a lost finalize",
+                                vec![describe("absent without durable terminal evidence")],
+                            );
                         }
                     }
                 }
@@ -791,6 +894,15 @@ impl Oracle {
         if !forensic_ids.is_empty() {
             self.record_forensics(&schema, &forensic_ids).await;
         }
+        self.shared
+            .run
+            .add("terminal_proof_no_events_sampled", sampled);
+        self.shared
+            .run
+            .add("terminal_proof_no_events_confirmed", confirmed);
+        self.shared
+            .run
+            .add("terminal_proof_no_events_excluded", excluded);
         self.shared
             .run
             .add("final_unresolved_ids", unresolved.len() as i64);
@@ -879,4 +991,173 @@ impl Oracle {
 
 fn count_is_idle(count: i64) -> bool {
     count <= 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persona_soak::config::{replace_database_name, Persona, SoakConfig};
+    use crate::persona_soak::db::{self, Budget};
+    use crate::persona_soak::ledger::JobRecord;
+    use awa::model::{ClaimedRuntimeJob, QueueStorage, QueueStorageConfig};
+    use std::sync::atomic::Ordering;
+
+    struct TestRun {
+        shared: Arc<Shared>,
+        pool: PgPool,
+        store: QueueStorage,
+        claim: ClaimedRuntimeJob,
+        oracle: Oracle,
+    }
+
+    impl TestRun {
+        async fn create() -> Self {
+            let base = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:test@localhost:15432/awa_test".to_string()
+            });
+            let name = format!("awa_soak_oracle_{}", uuid::Uuid::new_v4().simple());
+            let config = SoakConfig::for_test(replace_database_name(&base, &name));
+            db::recreate_database(&config)
+                .await
+                .expect("create isolated oracle database");
+            let pool = db::connect_pool(&config.database_url, "soak_oracle_regression", 4)
+                .await
+                .expect("connect oracle");
+            let info = db::server_info(&pool).await.expect("server info");
+            let watch = Arc::new(PgWatch::begin(&config, &pool).await.expect("watch server"));
+            let budget = Budget::new(&info, 0);
+            let shared = Shared::new(config, info, budget);
+            let queue = shared
+                .queues
+                .register("oracle_proof", Persona::Priya, false);
+            let store = QueueStorage::new(QueueStorageConfig::default()).expect("store");
+            store
+                .enqueue_batch(&pool, "oracle_proof", 2, 64)
+                .await
+                .expect("enqueue sample candidates");
+            let claimed = store
+                .claim_runtime_batch(&pool, "oracle_proof", 64, Duration::ZERO)
+                .await
+                .expect("claim sample");
+            let claim = claimed
+                .into_iter()
+                .find(|claim| samples_terminal_proof(claim.job.id))
+                .expect("immutable job ID selects a sample");
+            shared.ledger.register(
+                claim.job.id,
+                JobRecord::new(
+                    Persona::Priya,
+                    queue.index,
+                    0,
+                    expect::COMPLETED,
+                    flag::NO_EVENTS,
+                ),
+            );
+            // The handler returned, but its caller has not finalized the claim.
+            let execution = shared.begin_execution(Persona::Priya, &claim.job, true);
+            shared.ledger.mark(claim.job.id, flag::RETURNED_COMPLETED);
+            drop(execution);
+            let oracle = Oracle::new(shared.clone(), pool.clone(), watch);
+            Self {
+                shared,
+                pool,
+                store,
+                claim,
+                oracle,
+            }
+        }
+
+        async fn drop(self) {
+            self.pool.close().await;
+            let admin = db::connect_pool(&self.shared.config.admin_url(), "oracle_cleanup", 1)
+                .await
+                .expect("cleanup connection");
+            sqlx::query(&format!(
+                "DROP DATABASE {} WITH (FORCE)",
+                self.shared.config.database_name()
+            ))
+            .execute(&admin)
+            .await
+            .expect("drop oracle database");
+            admin.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn returned_handler_without_finalization_cannot_pass_the_oracle() {
+        let mut run = TestRun::create().await;
+        run.oracle.final_check(true).await;
+        assert!(
+            run.shared
+                .violations
+                .lock()
+                .expect("violations")
+                .iter()
+                .any(|violation| violation.kind == "stuck_job"),
+            "a handler return must not stand in for a terminal commit"
+        );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn sampled_terminal_pruned_before_observation_is_inconclusive() {
+        let mut run = TestRun::create().await;
+        run.store
+            .complete_runtime_batch(&run.pool, &[run.claim.clone()])
+            .await
+            .expect("commit completion");
+        run.store
+            .reset(&run.pool)
+            .await
+            .expect("remove retained evidence");
+        run.oracle.final_check(true).await;
+        assert!(
+            run.shared.oracle_incomplete.load(Ordering::Relaxed),
+            "an unobserved pruned result cannot establish a pass or a lost-job claim"
+        );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn observed_terminal_survives_pruning_in_the_client_ledger() {
+        let mut run = TestRun::create().await;
+        run.store
+            .complete_runtime_batch(&run.pool, &[run.claim.clone()])
+            .await
+            .expect("commit completion");
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        assert!(run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("sample record")
+            .has_durable_terminal());
+        run.store
+            .reset(&run.pool)
+            .await
+            .expect("prune retained evidence");
+        run.oracle.final_check(true).await;
+        assert!(
+            run.shared.violations.lock().expect("violations").is_empty(),
+            "captured durable proof must survive pruning"
+        );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn failed_final_lookup_cannot_omit_unchecked_jobs_and_pass() {
+        let mut run = TestRun::create().await;
+        sqlx::query("ALTER TABLE awa.ready_entries RENAME TO ready_entries_unavailable")
+            .execute(&run.pool)
+            .await
+            .expect("inject a lookup failure");
+        run.oracle.final_check(true).await;
+        assert!(run.shared.oracle_incomplete.load(Ordering::Relaxed));
+        assert_eq!(
+            run.shared.run.get("final_lookup_errors"),
+            1,
+            "the failed lookup chunk must be accounted for"
+        );
+        run.drop().await;
+    }
 }

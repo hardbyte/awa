@@ -418,7 +418,10 @@ impl AbandonState {
                 }
                 return;
             }
-            let mut threshold = RING_STALL_AFTER_MS;
+            let mut threshold = crate::ci_timing::scaled_timeout(std::time::Duration::from_millis(
+                RING_STALL_AFTER_MS as u64,
+            ))
+            .as_millis() as i64;
             if shared.chaos_active() {
                 threshold += shared.config.chaos_slack.as_millis() as i64;
             }
@@ -715,7 +718,7 @@ impl AbandonState {
                     );
                 }
             }
-            Err(error) => shared.note("abandon", format!("dead-letter check failed: {error}")),
+            Err(error) => shared.incomplete(format!("dead-letter check failed: {error}"), vec![]),
         }
     }
 }
