@@ -862,12 +862,45 @@ fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, Aw
     Ok(index)
 }
 
+enum ReceiptEvidence {
+    Closed,
+    Open,
+}
+
 fn receipt_closed_evidence_sql(
     schema: &str,
     closure_rel: &str,
     closure_batch_rel: &str,
     claims_alias: &str,
 ) -> String {
+    receipt_evidence_sql(
+        schema,
+        closure_rel,
+        closure_batch_rel,
+        claims_alias,
+        ReceiptEvidence::Closed,
+    )
+}
+
+fn receipt_evidence_sql(
+    schema: &str,
+    closure_rel: &str,
+    closure_batch_rel: &str,
+    claims_alias: &str,
+    evidence: ReceiptEvidence,
+) -> String {
+    let (null_test, join, exists, range_fence) = match evidence {
+        ReceiptEvidence::Closed => ("NOT NULL", "OR", "EXISTS", ""),
+        ReceiptEvidence::Open => (
+            "NULL",
+            "AND",
+            "NOT EXISTS",
+            "
+                -- Keep receipt membership correlated while the other closure
+                -- exclusions can use full-identity anti joins.
+                OFFSET 0",
+        ),
+    };
     // `receipt_id` is allocated from a global sequence and identifies a claim.
     // Closures retain that claim's slot; match it to prune unrelated partitions.
     // Compact closure batches retain the raw receipt array for audit/debugging,
@@ -875,30 +908,30 @@ fn receipt_closed_evidence_sql(
     format!(
         r#"
         (
-            {claims_alias}.closed_at IS NOT NULL
-            OR EXISTS (
+            {claims_alias}.closed_at IS {null_test}
+            {join} {exists} (
                 SELECT 1 FROM {closure_rel} AS closures
                 WHERE closures.claim_slot = {claims_alias}.claim_slot
                   AND closures.job_id = {claims_alias}.job_id
                   AND closures.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1
                 FROM {closure_batch_rel} AS closure_batches
                 WHERE closure_batches.claim_slot = {claims_alias}.claim_slot
-                  AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id
+                  AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id{range_fence}
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.done_entries AS done
                 WHERE done.job_id = {claims_alias}.job_id
                   AND done.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.deferred_jobs AS deferred
                 WHERE deferred.job_id = {claims_alias}.job_id
                   AND deferred.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.dlq_entries AS dlq
                 WHERE dlq.job_id = {claims_alias}.job_id
                   AND dlq.run_lease = {claims_alias}.run_lease
@@ -1295,12 +1328,11 @@ pub fn queue_signals_sql(schema: &str, reads: QueueSignalReads) -> String {
 
 /// A subquery that yields the identity `(job_id, run_lease, queue)` of every
 /// receipt claim currently open (i.e. `running`) but not yet materialised
-/// into `leases`. Since #246 receipt claims — zero-deadline and
-/// deadline-backed alike — are written as compact `lease_claim_batches` rows
-/// rather than one `lease_claims` row per job, so the "open receipt claims"
-/// set is the union of legacy row-local `lease_claims` and the unnested
-/// members of `lease_claim_batches`, each anti-joined against every durable
-/// closure/terminal/materialised-lease evidence shape.
+/// into `leases`. Current writers use compact `lease_claim_batches` for both
+/// zero-deadline and deadline-backed receipts. Row-local `lease_claims` remain
+/// for in-flight claims written before the compact-deadline upgrade. The open
+/// set unions those retained rows with unnested compact members, excluding
+/// every durable closure, terminal, and materialised-lease evidence shape.
 ///
 /// This is the canonical open-receipt-claim shape (mirrors `queue_counts`'s
 /// `live_running` derivation). Compose it wherever a running enumeration must
@@ -1326,8 +1358,13 @@ pub fn open_receipt_running_claims_sql(schema: &str) -> String {
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
     let closure_rel = format!("{schema}.lease_claim_closures");
     let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-    let row_closed =
-        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    let row_open = receipt_evidence_sql(
+        schema,
+        &closure_rel,
+        &closure_batch_rel,
+        "claims",
+        ReceiptEvidence::Open,
+    );
     let (row_filter, batch_filter) = match job_ids {
         Some(ids) => (
             format!("claims.job_id = ANY({ids}) AND "),
@@ -1339,7 +1376,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
         FROM {schema}.lease_claims AS claims
-        WHERE {row_filter}NOT {row_closed}
+        WHERE {row_filter}{row_open}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
               WHERE lease.job_id = claims.job_id
