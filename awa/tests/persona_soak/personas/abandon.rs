@@ -535,19 +535,27 @@ async fn canary_producer(shared: Arc<Shared>, pool: sqlx::PgPool) {
 /// Measures the live process's heartbeat passes from the timestamps its heartbeats write.
 /// A pass updates every in-flight claim with the time of its own chunk, so once a pass has
 /// finished the oldest heartbeat is newer than anything the previous pass wrote, and the
-/// spread from oldest to newest is the pass's duration (to within the last chunk). Only the
-/// deadline queue's claims are read: they are interleaved with the other queue's in the
-/// pass's job-id order, so they span the whole pass.
-async fn sample_heartbeats(shared: &Arc<Shared>, pool: &sqlx::PgPool, schema: &str) {
+/// spread from oldest to newest is the pass's duration (to within the last chunk). Only
+/// claims taken since the process started are read, so the dead processes' open claims,
+/// whose heartbeats stopped, do not count. They are the deadline queue's, which are
+/// interleaved with the other queue's in the pass's job-id order and so span the whole pass.
+async fn sample_heartbeats(
+    shared: &Arc<Shared>,
+    pool: &sqlx::PgPool,
+    schema: &str,
+    since_epoch_ms: i64,
+) {
     let row: Result<(i64, Option<f64>, Option<f64>), _> = sqlx::query_as(&format!(
         "SELECT count(*)::bigint,
                 EXTRACT(EPOCH FROM min(a.heartbeat_at))::float8,
                 EXTRACT(EPOCH FROM max(a.heartbeat_at))::float8
          FROM {schema}.lease_claims c
          JOIN {schema}.attempt_state a ON a.job_id = c.job_id AND a.run_lease = c.run_lease
-         WHERE c.queue = $1 AND c.closed_at IS NULL"
+         WHERE c.queue = $1 AND c.closed_at IS NULL
+           AND c.claimed_at >= to_timestamp($2::float8 / 1000.0)"
     ))
     .bind(QUEUE_DEADLINE)
+    .bind(since_epoch_ms as f64)
     .fetch_one(pool)
     .await;
     let Ok((rows, Some(oldest), Some(newest))) = row else {
@@ -594,8 +602,8 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
         let Ok((slot, ring_generation, slot_count)) = ring else {
             continue;
         };
-        if shared.abandon.live().is_some() {
-            sample_heartbeats(&shared, &pool, &schema).await;
+        if let Some((_, spawned)) = shared.abandon.live() {
+            sample_heartbeats(&shared, &pool, &schema, spawned).await;
         }
         // While the ring is still, look at the slot it has to enter next: live claims
         // there explain the stall.
