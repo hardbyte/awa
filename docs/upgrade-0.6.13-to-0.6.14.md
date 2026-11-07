@@ -40,7 +40,7 @@ The patch:
 
 ### External migration runners
 
-`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database; with `--extract-to`, apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the role that owns the existing `awa` functions, normally the schema owner; `CREATE OR REPLACE` fails with `must be owner of function` otherwise, and nothing is applied. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
+`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database. To write it as a file instead, run `awa migrate --extract-to <dir> --pending` (without `--sql`, which can't be combined with it) and apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the role that owns the existing `awa` functions, normally the schema owner; `CREATE OR REPLACE` fails with `must be owner of function` otherwise, and nothing is applied. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
 
 Each `R__` patch carries the full lane-helper definitions, so an older patch file applied after this one reinstalls the 0.6.13 helpers:
 

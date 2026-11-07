@@ -20,6 +20,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   the whole rescue. Before, one such attempt stopped rescue of every other
   stale attempt in the schema. The skipped attempt stays running until its
   bodies are repaired.
+- `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql`
+  silently won and nothing was extracted.
 
 ## [0.6.14-alpha.1] — 2026-11-07
 
