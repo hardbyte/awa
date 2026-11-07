@@ -20,9 +20,21 @@ Use five fixed database-wide scopes: `dispatch`, `cron`, `maintenance.prune`, `m
 
 Always allow at most one strong-relation-lock transaction admission per second per leader, with concurrency one across all rings and substrates. Strong means potentially requesting `SHARE`, `SHARE ROW EXCLUSIVE`, `EXCLUSIVE` or `ACCESS EXCLUSIVE`; ordinary `ROW EXCLUSIVE` writes do not qualify. The map identifies capped operations. Each nested transaction needs its own admission before its first possible strong-lock request; one permit cannot cover an entire multi-transaction timer callback.
 
-Wait at least one monotonic second after a capped transaction settles before admitting the next; store no catch-up credit. Apply the cap during normal operation, startup, leadership changes and resume, preserving ordinary cadences and backoff. A locally cancelled task cannot release an unresolved SQL operation's slot. Keep the existing 10 ms prune lock timeout; it does not bound an entire operation.
+Wait at least one monotonic second after a capped transaction settles before admitting the next; store no catch-up credit. Apply the cap during normal operation, startup, leadership changes and resume, preserving ordinary cadences and backoff. A capped transaction settles only when its commit or rollback is acknowledged, or when its connection is known closed or `pg_cancel_backend` has succeeded; a locally cancelled task or client-side timeout alone cannot release the slot. Keep the existing 10 ms prune lock timeout; it does not bound an entire operation.
 
 This cap is independent of the control schema and can ship in a budget-only build before any control table exists.
+
+### Reclamation capacity
+
+The cap is only safe when reclamation demand stays well below it. Each ring rotation eventually needs one capped prune transaction, so steady-state demand per leader is approximately
+
+> Σ over every queue-storage schema the leader serves of (1/`queue_rotate_interval` + 1/`lease_rotate_interval` + 1/`claim_rotate_interval`), plus terminal-rollup slot transactions per second and any other capped housekeeping.
+
+`Blocked` attempts consume admissions too. Today's defaults rotate all three rings every 1 s, a demand of about three admissions per second against a cap below one. That configuration would exhaust free slots within seconds, rotation would report `SkippedBusy`, and the rings would stop recycling. Phase 1 therefore:
+
+- Raises the default rotation intervals so default demand is at most half the cap. The rehearsal compares candidate defaults (for example 5 s, 10 s and 30 s) and the operator guidance states their cost: rows per slot grow with the interval, and retained history spans about the slot count multiplied by the interval.
+- Computes configured demand at leader start and on configuration change. Demand above half the cap logs a warning and is exported as a metric; demand at or above the cap fails validation, because the backlog would then grow without bound.
+- Keeps the cap fixed rather than scaling it with configuration, so the strong-lock ceiling stays predictable.
 
 Install one `maintenance.prune` row in ordinary table `awa.runtime_controls`, with revision, halt ID, mode, reason, actor and update time. Support drain-only halt and halt-ID-checked resume through operator-only functions. Gate rotation, pruning, retention, terminal rollups, ledger folds, automatic storage-authority changes and the housekeeping assigned to this scope below. Other duties continue normally; unsupported scope or cancel requests fail explicitly.
 
@@ -79,6 +91,7 @@ Dirty keys here maintain dashboard metadata, not execution readiness. Housekeepi
 Acceptance is a pass/fail PostgreSQL 17 and 18 rehearsal, with retained admission/lock traces and exact job accounting:
 
 - The exhaustive branch map above is implemented, and every strong-relation-lock transaction passes through the shared cap. Normal operation, backlog, resume and leadership changes respect its spacing and concurrency without catch-up.
+- At the default and each documented rotation configuration, a one-hour mixed workload keeps measured capped demand at or below half the cap, and ring occupancy and slots awaiting prune stay bounded. Configured demand at or above the cap is rejected at validation.
 - With healthy established leader/operator sessions, denying new connections or separately exhausting the worker pool does not stop observation: apply a readable halt revision within 3 s. Failed reads stop new gated admissions after 5 s. Admitted SQL remains reported as draining until settled.
 - Halt suppresses every listed reclamation path while enqueue, dispatch, promotion and rescue continue in a separate mixed-workload run. A stale resume cannot clear a newer halt; drain-mode resume succeeds without waiting for a missing runtime or reconciliation.
 - Repeat the additive patch safely; verify operator access and producer/runtime mutation denial. The cap also works without the schema in budget-only mode. Claims and substrate installers are unchanged on 0.6.
@@ -130,11 +143,11 @@ The proposed `awa control reconcile --halt <id> --runtime <id> --fence-evidence 
 
 ## Alternatives considered
 
-An all-work switch unnecessarily stops recovery during reclamation incidents. Queue pause/startup settings do not provide live maintenance control. Mandatory external flags or extra observer connections add dependencies. One stale-state rule for every scope sacrifices recovery availability; a resume-only limiter leaves normal-operation lock pressure uncontrolled.
+An all-work switch unnecessarily stops recovery during reclamation incidents. Queue pause/startup settings do not provide live maintenance control. Mandatory external flags or extra observer connections add dependencies. One stale-state rule for every scope sacrifices recovery availability; a resume-only limiter leaves normal-operation lock pressure uncontrolled. A cap that scales with configured rotation keeps reclamation current but gives no fixed strong-lock ceiling, so Phase 1 fixes the cap and moves the defaults instead.
 
 ## Consequences
 
-The permanent cap may increase reclamation backlog, and a prune halt also pauses housekeeping. Promotion and rescue can continue on stale observed permission; their explicit halt can therefore be delayed by a control-read outage. Unpersisted local stops protect only that runtime's lifetime.
+The permanent cap bounds strong-lock admissions but requires longer default rotation intervals, which enlarge each slot and lengthen retained history. A prune halt also pauses housekeeping, including descriptor publication, so runtimes that start during the halt do not appear in admin views until it ends. Promotion and rescue can continue on stale observed permission; their explicit halt can therefore be delayed by a control-read outage. Unpersisted local stops protect only that runtime's lifetime.
 
 Full dispatch control is main-only work. A wrapper patch cannot cover canonical inline callers or unpatched slot functions, and older maintenance leaders need an upgrade or enforced fence. Follow [ADR-041](../041-rolling-upgrade-policy/index.md); align privilege separation with proposed [ADR-043](../043-postgresql-capability-functions/index.md).
 
