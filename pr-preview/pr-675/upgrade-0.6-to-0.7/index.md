@@ -7,7 +7,7 @@ The 0.6 → 0.7 upgrade is short: **the storage step is "be finalized."** Everyt
 
 ## Reclamation controls and v054
 
-v054 adds one `maintenance.prune` control row and a runtime-observation column. It does not refresh claim functions or substrate installers. Apply it with the schema owner, grant runtimes `SELECT` on the control table, and grant halt/resume functions only to a separate operator, as described in [Database roles](../security/database-roles/index.md#runtime-grants). Repeat installation preserves the current halt and intentional operator grants.
+v054 adds one `maintenance.prune` control row and a runtime-observation column. It does not refresh claim functions or substrate installers. Apply it with the schema owner, grant runtimes `SELECT` on the control table, and grant halt/resume functions only to a separate operator, as described in [Database roles](../security/database-roles/index.md#runtime-grants). Repeat installation preserves the current halt and intentional operator grants. Runtimes with column-specific grants also need `SELECT` and `UPDATE` on the `awa.runtime_instances.runtime_control_observation` column.
 
 Upgrade or independently fence every possible maintenance leader before relying on a fleet halt. Older leaders ignore the control. A compatible runtime started before v054 runs with the permanent budget and discovers the control through its existing leader session after installation. Once installed, missing or malformed control state closes reclamation admission. Runtime readiness can still report an older schema until migration completes.
 
