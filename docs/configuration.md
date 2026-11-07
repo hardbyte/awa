@@ -585,6 +585,19 @@ Use the defaults unless you have a reason not to:
 - Increase rotation intervals to reduce partition churn and metadata activity.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 
+Longer rotation intervals accumulate more work in each slot. At a steady enqueue
+rate, ready rows per queue slot are roughly the enqueue rate multiplied by
+`queue_rotate_interval`; retries and blocked recycling can increase the retained
+footprint. Budget for larger partitions and indexes. Queue-ring history becomes
+coarser and generally spans about `queue_slot_count × queue_rotate_interval`;
+active or blocked slots can retain it longer. The independent
+`claim_rotate_interval` changes claim-evidence retention, not completed-job
+history in the ready/terminal ring.
+
+A longer interval does not remove the locks required by each prune.
+`prune_lock_timeout` still applies separately to each acquisition; queue prune
+can lock up to eight partitions before its later reads and writes.
+
 ### Sharding the enqueue head per queue
 
 Each queue's `awa.queue_meta.enqueue_shards` (default `1`, range `1..=64`) governs how many independent enqueue head rows the queue has. With the default value, the queue uses a single head row and the ordering contract is strict FIFO per `(queue, priority)` — identical to v016.
