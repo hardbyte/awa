@@ -764,6 +764,109 @@ async fn migration_repairs_lanes_it_may_and_reports_the_rest() -> TestResult {
     cluster.teardown().await
 }
 
+#[tokio::test]
+async fn set_only_schema_owner_membership_repairs_legacy_lanes_and_restores_role() -> TestResult {
+    let cluster = Cluster::new(Schema::BeforeProvisioning, false).await?;
+    let queue = "set_only_owner_lane";
+    assert_eq!(enqueue(&cluster.migrator, queue, 1, 1).await?, 1);
+    let sequences = cluster.lane_sequence_owners(queue).await?;
+    assert_eq!(sequences.len(), 2);
+    for (sequence, owner) in &sequences {
+        assert_eq!(owner, &cluster.migrator_name);
+        cluster
+            .migrator
+            .execute(sqlx::raw_sql(sql(format!(
+                "REVOKE ALL ON SEQUENCE awa.{sequence} FROM {}",
+                cluster.runtime_name
+            ))))
+            .await?;
+    }
+    for (_, _, statement) in migrations::migration_sql_range(52, migrations::CURRENT_VERSION) {
+        cluster.owner.execute(sqlx::raw_sql(sql(statement))).await?;
+    }
+    cluster
+        .owner
+        .execute(sqlx::raw_sql(sql(format!(
+            "GRANT USAGE, CREATE ON SCHEMA awa TO {migrator}; \
+             GRANT EXECUTE ON FUNCTION awa.repair_lane_sequence(text, text) TO {migrator}",
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    cluster
+        .admin
+        .execute(sqlx::raw_sql(sql(format!(
+            "GRANT {owner} TO {migrator} WITH INHERIT FALSE; \
+             GRANT {owner} TO {migrator} WITH SET TRUE",
+            owner = cluster.owner_name,
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+
+    let mut conn = cluster.migrator.acquire().await?;
+    let (inherits_owner, can_set_owner, can_create): (bool, bool, bool) = sqlx::query_as(
+        "SELECT pg_has_role(current_user, $1, 'USAGE'), \
+                pg_has_role(current_user, $1, 'SET'), \
+                has_schema_privilege(current_user, 'awa', 'USAGE') \
+                AND has_schema_privilege(current_user, 'awa', 'CREATE')",
+    )
+    .bind(&cluster.owner_name)
+    .fetch_one(&mut *conn)
+    .await?;
+    assert!(!inherits_owner);
+    assert!(can_set_owner);
+    assert!(can_create);
+    let role_before: (String, String) =
+        sqlx::query_as("SELECT current_user::text, current_setting('role')")
+            .fetch_one(&mut *conn)
+            .await?;
+    assert_eq!(role_before.0, cluster.migrator_name);
+
+    let problems = storage::lane_sequence_problems(&mut *conn, "awa").await?;
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    for problem in &problems {
+        assert_eq!(problem.owner, cluster.migrator_name);
+        assert!(!problem.missing_grants.is_empty(), "{problem:?}");
+        assert!(
+            problem.repair_roles.contains(&cluster.migrator_name),
+            "{problem:?}"
+        );
+    }
+    let repaired = storage::repair_lane_sequences(&mut conn, "awa").await?;
+    assert_eq!(repaired.len(), 2, "{repaired:?}");
+    for repair in &repaired {
+        assert_eq!(repair.outcome, LaneSequenceOutcome::Repaired, "{repair:?}");
+        assert_eq!(repair.owner, cluster.owner_name);
+        assert!(repair.missing_grants.is_empty(), "{repair:?}");
+        assert!(repair.reassign_sql.is_none(), "{repair:?}");
+    }
+    let role_after: (String, String) =
+        sqlx::query_as("SELECT current_user::text, current_setting('role')")
+            .fetch_one(&mut *conn)
+            .await?;
+    assert_eq!(role_after, role_before);
+    assert!(storage::lane_sequence_problems(&mut *conn, "awa")
+        .await?
+        .is_empty());
+    drop(conn);
+
+    for (sequence, _) in sequences {
+        let runtime_grants_complete: bool = sqlx::query_scalar(
+            "SELECT has_sequence_privilege($1, $2, 'USAGE') \
+                    AND has_sequence_privilege($1, $2, 'SELECT') \
+                    AND has_sequence_privilege($1, $2, 'UPDATE')",
+        )
+        .bind(&cluster.runtime_name)
+        .bind(format!("awa.{sequence}"))
+        .fetch_one(&cluster.owner)
+        .await?;
+        assert!(runtime_grants_complete, "{sequence}");
+    }
+    cluster.assert_lanes_owned_by_owner(queue, 1).await?;
+    assert_eq!(enqueue(&cluster.app_b, queue, 1, 1).await?, 1);
+    assert_eq!(drain(&cluster.app_b, queue).await?, 2);
+    cluster.teardown().await
+}
+
 /// Reassigning a lane sequence waits on any open enqueue or claim on the lane,
 /// so the repair bounds that wait and holds each sequence's lock only for its
 /// own short transaction. A held sequence is skipped and reported; the rest

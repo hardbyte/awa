@@ -267,12 +267,6 @@ fn sanitize_filename(description: &str) -> String {
         .collect()
 }
 
-/// Classify a command as read-only or mutating for context resolution.
-///
-/// Read-only commands may fall back to `DATABASE_URL` or `default_context`;
-/// mutating commands require an explicit `--context` or `--database-url`
-/// once more than one context is defined, and are confirmation-gated on
-/// contexts marked `production = true`.
 /// After a migration, say which lane sequences still need repair and how to
 /// finish it. Read-only.
 async fn print_lane_sequence_leftovers(
@@ -290,6 +284,12 @@ async fn print_lane_sequence_leftovers(
     Ok(())
 }
 
+/// Classify a command as read-only or mutating for context resolution.
+///
+/// Read-only commands may fall back to `DATABASE_URL` or `default_context`;
+/// mutating commands require an explicit `--context` or `--database-url`
+/// once more than one context is defined, and are confirmation-gated on
+/// contexts marked `production = true`.
 fn access_for(command: &Commands) -> context::Access {
     use context::Access::{Mutating, ReadOnly};
     match command {

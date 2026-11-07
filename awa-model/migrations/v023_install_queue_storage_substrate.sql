@@ -500,13 +500,12 @@ AS $problems$
                  AND NOT candidate.rolsuper
                  AND pg_has_role(candidate.oid, lane_sequence.relowner, 'USAGE')
                  AND (lane_sequence.relowner = lane_sequence.nspowner
-                      OR (pg_has_role(candidate.oid, lane_sequence.nspowner, 'USAGE')
-                          AND pg_has_role(
+                      OR pg_has_role(
                               candidate.oid,
                               lane_sequence.nspowner,
                               CASE WHEN current_setting('server_version_num')::int >= 160000
                                    THEN 'SET' ELSE 'MEMBER' END
-                          )))
+                          ))
                ORDER BY candidate.rolname
            )
     FROM lane_sequence
@@ -544,6 +543,9 @@ AS $repair$
 DECLARE
     v_problem RECORD;
     v_remaining RECORD;
+    v_original_role TEXT := current_setting('role');
+    v_reassigned BOOLEAN := false;
+    v_role_changed BOOLEAN := false;
     v_busy BOOLEAN := false;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
                             THEN 'SET' ELSE 'MEMBER' END;
@@ -565,6 +567,7 @@ BEGIN
            AND pg_has_role(current_user, to_regrole(quote_ident(v_problem.expected_owner)), v_set_mode) THEN
             BEGIN
                 EXECUTE v_problem.reassign_sql;
+                v_reassigned := true;
             EXCEPTION WHEN insufficient_privilege THEN
                 NULL;
             END;
@@ -574,14 +577,29 @@ BEGIN
         FROM awa.lane_sequence_problems(p_schema, p_sequence) AS problem;
         IF FOUND
            AND cardinality(v_remaining.missing_grants) > 0
-           AND pg_has_role(current_user, to_regrole(quote_ident(v_remaining.owner)), 'USAGE') THEN
-            FOREACH v_statement IN ARRAY v_remaining.missing_grants LOOP
-                BEGIN
-                    EXECUTE v_statement;
-                EXCEPTION WHEN insufficient_privilege THEN
-                    NULL;
-                END;
-            END LOOP;
+           AND (pg_has_role(current_user, to_regrole(quote_ident(v_remaining.owner)), 'USAGE')
+                OR v_reassigned) THEN
+            BEGIN
+                IF v_reassigned
+                   AND NOT pg_has_role(current_user, to_regrole(quote_ident(v_remaining.owner)), 'USAGE') THEN
+                    PERFORM set_config('role', v_remaining.owner, true);
+                    v_role_changed := true;
+                END IF;
+
+                FOREACH v_statement IN ARRAY v_remaining.missing_grants LOOP
+                    BEGIN
+                        EXECUTE v_statement;
+                    EXCEPTION WHEN insufficient_privilege THEN
+                        NULL;
+                    END;
+                END LOOP;
+
+                IF v_role_changed THEN
+                    PERFORM set_config('role', v_original_role, true);
+                END IF;
+            EXCEPTION WHEN insufficient_privilege THEN
+                NULL;
+            END;
         END IF;
     EXCEPTION WHEN lock_not_available THEN
         v_busy := true;

@@ -39,10 +39,10 @@ detects that `provision_lane` is missing and creates lanes as before.
 
 To adopt it:
 
-1. Check the current state: `awa storage lane-sequences` (read-only, exits 2
-   while lanes need repair).
-2. Run `awa migrate` with the schema owner as the effective role, as described
+1. Run `awa migrate` with the schema owner as the effective role, as described
    in [Database roles](security/database-roles.md).
+2. Check the remaining state: `awa storage lane-sequences` (read-only, exits 2
+   while lanes need repair). This command requires v053 to be installed.
 3. Read the migrate output. Any lane sequence it could not repair is listed in
    a warning. A busy one needs another run of
    `awa storage lane-sequences --repair` as the migration role (without

@@ -100,6 +100,18 @@ Which role can repair a sequence:
 
 The schema owner holds neither the migration role's nor an application role's privileges, so a repair running as `awa_owner` cannot reassign sequences those roles created. That includes the migration role connected with `PGOPTIONS='-c role=awa_owner'`. Run the repair as the migration role itself, without `PGOPTIONS`, as above. `awa migrate` and `--repair` retry each sequence the effective role could not repair as the login role, so `awa migrate` run with `PGOPTIONS='-c role=awa_owner'`, as documented, still repairs the migration role's sequences.
 
+For a migrator with SET-only membership in `awa_owner`, grant schema access and helper execution explicitly before running the repair. Run as the schema owner:
+
+```sql
+GRANT USAGE ON SCHEMA awa TO awa_migrator;
+GRANT EXECUTE ON FUNCTION
+  awa.lane_sequence_problems(TEXT, TEXT),
+  awa.repair_lane_sequence(TEXT, TEXT)
+  TO awa_migrator;
+```
+
+For a custom queue-storage schema, also grant `USAGE` on that schema. The migrator must still hold the old sequence owner's privileges and be allowed to `SET ROLE` to the schema owner; inherited privileges from the schema owner are not required.
+
 For each sequence that remains, the output lists `repair_roles`, the login roles other than superusers that can repair it, and the statements to run. A busy sequence only needs another `--repair`. When `repair_roles` is empty, which is usual for a sequence an application role created on managed PostgreSQL, either:
 
 - run `missing_grants` as the current owner. Every runtime role can then use the lane, although the owner stays unchanged; or
@@ -112,7 +124,6 @@ SELECT format('SELECT * FROM awa.repair_lane_sequence(%L, %L)', 'awa', sequence_
 FROM awa.lane_sequence_problems('awa') \gexec
 ```
 
-## Custom queue-storage schemas
 ## Custom queue-storage schemas
 
 Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and `TRUNCATE`, but never DDL. Check lanes in a custom schema with `awa storage lane-sequences --schema <name>`. See [Queue storage](../queue-storage-substrate.md).
