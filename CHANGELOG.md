@@ -30,6 +30,20 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Preserve the original job body when manually retrying a priority-aged attempt
+  that exhausted its retries during rescue. Retained failed reads and failed-row
+  carry through pruning now use the physical ready-lane identity.
+  Hydration excludes tombstoned source lanes and verifies the prior run lease.
+  Rust terminal retry and failed-row carry also recover retained bodies written
+  by older workers with an effective priority in the terminal key. Manual
+  terminal retry restarts aging from the physical lane; automatic retryable
+  rescue and automatic DLQ routing retain the effective priority. Manual
+  terminal-to-DLQ moves preserve the recovered body and physical priority for
+  later DLQ retry, while decrementing the original terminal counter key. The installed `terminal_jobs`
+  SQL view still cannot hydrate those older mismatched-priority rows before
+  carry widens them; this change does not update that view or repair bodies
+  whose ready backing has already been pruned.
+
 - Admin job lists and kind counts include running receipt claims before
   they materialize into leases, including compact and legacy row-local claims.
 - Exclude tombstoned source rows when hydrating moved running jobs, including

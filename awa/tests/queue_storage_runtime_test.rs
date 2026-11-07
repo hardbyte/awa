@@ -17388,3 +17388,921 @@ async fn test_receipt_admin_scope_row_local() {
 async fn test_receipt_admin_scope_materialized_control() {
     receipt_admin_reads_preserve_scope_and_disposition(false, false).await;
 }
+
+async fn claim_aged_rescue_body_job(
+    schema: &str,
+    receipts: bool,
+    deadline: Duration,
+    max_attempts: i16,
+) -> (
+    TestDbGuard,
+    sqlx::PgPool,
+    QueueStorage,
+    awa::model::ClaimedRuntimeJob,
+) {
+    let (guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: receipts,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_aged_rescue_body";
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9027 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts,
+            metadata: serde_json::json!({"retained": "aged-rescue-body"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Control elapsed queue age without waiting five minutes; all claim,
+    // rescue, terminal and retry transitions below use their real APIs.
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let mut claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, deadline, Duration::from_secs(60))
+        .await
+        .expect("claim aged job");
+    assert_eq!(claimed.len(), 1);
+    let original = claimed.remove(0);
+    assert_eq!(original.job.id, job_id);
+    assert_eq!(original.claim.priority, 4, "physical ready lane");
+    assert_eq!(original.job.priority, 1, "aged effective priority");
+    (guard, pool, store, original)
+}
+
+#[derive(Clone, Copy)]
+enum AgedFailedConsumer {
+    Retry,
+    Carry,
+    View,
+}
+
+async fn aged_rescued_failure_keeps_body(
+    schema: &str,
+    receipts: bool,
+    deadline: Duration,
+    consumer: AgedFailedConsumer,
+) {
+    let (_guard, pool, store, original) =
+        claim_aged_rescue_body_job(schema, receipts, deadline, 1).await;
+    let job_id = original.job.id;
+    // Zero staleness makes this committed attempt eligible without sleeps
+    // or rewriting receipt timestamps. No worker is running in this test.
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("rescue exhausted aged attempt");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    assert_eq!(rescued[0].args, original.job.args);
+    assert_eq!(rescued[0].max_attempts, 1);
+    let raw_body = done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        raw_body.0.is_none() && raw_body.1.is_none(),
+        "ready-backed failure stays narrow"
+    );
+
+    if matches!(consumer, AgedFailedConsumer::Carry) {
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry failed row")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected carry prune outcome: {other:?}"),
+            }
+        }
+        let carried = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(
+            carried.0,
+            Some(original.job.args.clone()),
+            "carry must hydrate before truncating ready backing"
+        );
+        assert_eq!(carried.1, Some(original.job.max_attempts));
+        assert_eq!(carried.3, Some(original.job.created_at));
+        let ready_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.ready_entries WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pruned ready body");
+        assert_eq!(
+            ready_count, 0,
+            "carried body must survive without ready backing"
+        );
+    }
+
+    // This is the installed SQL view, independent of the Rust hydration helper.
+    let view = terminal_view_body_columns(&pool, &store, job_id).await;
+    if matches!(consumer, AgedFailedConsumer::View) {
+        assert_eq!(
+            view.0, original.job.args,
+            "terminal_jobs must hydrate the aged failure"
+        );
+        assert_eq!(view.1, original.job.max_attempts);
+    }
+    let retained = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load retained failure")
+        .expect("retained failure");
+    let retry = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry aged failure")
+        .expect("failed job retries");
+    assert_eq!(
+        retry.args, original.job.args,
+        "manual retry must retain original arguments"
+    );
+    assert_eq!(
+        retry.max_attempts, original.job.max_attempts,
+        "manual retry must not default to25"
+    );
+    assert_eq!(retry.created_at, original.job.created_at);
+    assert_eq!(retry.metadata["retained"], "aged-rescue-body");
+    assert_eq!(retry.state, JobState::Available);
+    assert_eq!(retry.attempt, 0);
+    assert_eq!(view.0, original.job.args);
+    assert_eq!(view.1, original.job.max_attempts);
+    assert_eq!(view.3, original.job.created_at);
+    assert_eq!(retained.args, original.job.args);
+    assert_eq!(retained.max_attempts, original.job.max_attempts);
+    let rerun = store
+        .claim_runtime_batch(&pool, &original.job.queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim manual retry");
+    assert_eq!(rerun.len(), 1);
+    assert_eq!(rerun[0].job.args, original.job.args);
+    assert_eq!(rerun[0].job.max_attempts, original.job.max_attempts);
+    assert_eq!(rerun[0].job.run_lease, original.job.run_lease + 1);
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_compact_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_compact",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_deadline_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_deadline",
+        true,
+        Duration::from_secs(300),
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_legacy_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_legacy",
+        false,
+        Duration::from_secs(300),
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_carry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_carry",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::Carry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_terminal_view_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_view",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::View,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_expired_deadline_retry_preserves_body() {
+    let (_guard, pool, store, original) = claim_aged_rescue_body_job(
+        "awa_qs_aged_rescue_expired_deadline",
+        true,
+        Duration::from_micros(1),
+        1,
+    )
+    .await;
+    // The real positive deadline has expired by the time its claim commits.
+    // This exercises deadline rescue itself, separately from heartbeat rescue.
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue expired aged attempt");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, original.job.id);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    let view = terminal_view_body_columns(&pool, &store, original.job.id).await;
+    let retry = store
+        .retry_job(&pool, original.job.id)
+        .await
+        .expect("retry expired aged failure")
+        .expect("failed job retries");
+    assert_eq!(retry.args, original.job.args);
+    assert_eq!(retry.max_attempts, original.job.max_attempts);
+    assert_eq!(retry.created_at, original.job.created_at);
+    assert_eq!(view.0, original.job.args);
+    assert_eq!(view.1, original.job.max_attempts);
+}
+
+async fn aged_rescue_keeps_effective_policy_priority(dlq: bool) {
+    let schema = if dlq {
+        "awa_qs_aged_rescue_dlq"
+    } else {
+        "awa_qs_aged_rescue_retryable"
+    };
+    let max_attempts = if dlq { 1 } else { 3 };
+    let (_guard, pool, store, original) =
+        claim_aged_rescue_body_job(schema, true, Duration::ZERO, max_attempts).await;
+    let rescued = store
+        .rescue_stale_heartbeats_with_dlq(&pool, Duration::ZERO, &|_| dlq)
+        .await
+        .expect("rescue aged policy job");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(
+        rescued[0].priority, 1,
+        "deferred/DLQ policy keeps effective priority"
+    );
+    assert_eq!(rescued[0].args, original.job.args);
+    assert_eq!(rescued[0].max_attempts, max_attempts);
+    let table = if dlq { "dlq_entries" } else { "deferred_jobs" };
+    let stored: (i16, serde_json::Value, i16) = sqlx::query_as(&format!(
+        "SELECT priority, args, max_attempts FROM {schema}.{table} WHERE job_id = $1"
+    ))
+    .bind(original.job.id)
+    .fetch_one(&pool)
+    .await
+    .expect("load self-contained policy row");
+    assert_eq!(stored, (1, original.job.args, max_attempts));
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_dlq_keeps_effective_priority() {
+    aged_rescue_keeps_effective_policy_priority(true).await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_retryable_keeps_effective_priority() {
+    aged_rescue_keeps_effective_policy_priority(false).await;
+}
+
+async fn moved_rescued_failure_keeps_live_lane(
+    initial_priority: i16,
+    runtime_aging: Duration,
+    consumer: AgedFailedConsumer,
+) {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_moved_rescue_identity";
+    let queue = "qs_moved_rescue_identity";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9028 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: initial_priority,
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    assert_eq!(
+        store
+            .age_waiting_priorities(&pool, Duration::from_secs(60), 1)
+            .await
+            .expect("move queued job"),
+        vec![job_id]
+    );
+    let claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, runtime_aging)
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    let physical_priority = initial_priority - 1;
+    assert_eq!(claimed[0].claim.priority, physical_priority);
+    assert_eq!(claimed[0].job.priority, 1);
+    // A physical reorder of the disposable fixture preserves all logical
+    // tuples while exposing both legal fetch orders of the retained body.
+    sqlx::raw_sql(&format!(
+        "CLUSTER {schema}.ready_entries_0 USING idx_{schema}_ready_0_lane_shard"
+    ))
+    .execute(&pool)
+    .await
+    .expect("order retained fixture rows by physical lane");
+    let physical_order: Vec<i16> = sqlx::query_scalar(&format!(
+        "SELECT priority FROM {schema}.ready_entries_0 WHERE job_id = $1 ORDER BY ctid"
+    ))
+    .bind(job_id)
+    .fetch_all(&pool)
+    .await
+    .expect("verify fixture row order");
+    assert_eq!(physical_order, vec![physical_priority, initial_priority]);
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("rescue moved job");
+    assert_eq!(rescued.len(), 1);
+    if matches!(consumer, AgedFailedConsumer::Carry) {
+        // Queued aging leaves its tombstoned source lane's cursor behind.
+        // A real empty claim consumes it before that queue slot can prune.
+        let remaining = store
+            .claim_runtime_batch(&pool, queue, 10, Duration::ZERO)
+            .await
+            .expect("advance tombstoned source lane");
+        assert!(
+            remaining.is_empty(),
+            "closed moved attempt must not run again"
+        );
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry moved failure")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                other => panic!("unexpected moved-failure prune outcome: {other:?}"),
+            }
+        }
+        let body = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(body.0, Some(claimed[0].job.args.clone()));
+        assert_eq!(body.1, Some(1));
+    }
+    let terminal: (i16, serde_json::Value, i16) = sqlx::query_as(&format!(
+        "SELECT priority,args,max_attempts FROM {schema}.terminal_jobs WHERE job_id=$1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read moved terminal view");
+    if matches!(consumer, AgedFailedConsumer::View) {
+        assert_eq!(
+            terminal.0, physical_priority,
+            "terminal view must retain the live lane"
+        );
+        assert_eq!(terminal.1, claimed[0].job.args);
+        assert_eq!(terminal.2, 1);
+    }
+    let retried = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry moved failure")
+        .expect("failed job retries");
+    assert_eq!(
+        retried.priority, claimed[0].claim.priority,
+        "retry must not select the tombstoned source lane"
+    );
+    assert_eq!(retried.args, claimed[0].job.args);
+    assert_eq!(retried.max_attempts, 1);
+    assert_eq!(terminal.0, physical_priority);
+    assert_eq!(terminal.1, claimed[0].job.args);
+    assert_eq!(
+        retried.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(initial_priority))
+    );
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_retry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(2, Duration::ZERO, AgedFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_retry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::Retry)
+        .await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_carry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::Carry)
+        .await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_view_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::View)
+        .await;
+}
+
+async fn terminal_counts_by_priority(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+) -> Vec<(i16, i64)> {
+    sqlx::query_as(&format!(
+        r#"
+        SELECT priority, sum(n)::bigint
+        FROM (
+            SELECT priority, live_terminal_count AS n
+            FROM {schema}.queue_terminal_live_counts WHERE queue = $1
+            UNION ALL
+            SELECT priority, terminal_delta AS n
+            FROM {schema}.queue_terminal_count_deltas WHERE queue = $1
+        ) AS counters
+        GROUP BY priority HAVING sum(n) <> 0 ORDER BY priority
+        "#
+    ))
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("read per-priority terminal accounting")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyFailedConsumer {
+    Retry,
+    Carry,
+    SingleDlq,
+    BulkDlq,
+    Discard,
+}
+
+async fn legacy_aged_failure_recovers_body(moved: bool, consumer: LegacyFailedConsumer) {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_legacy_aged_body";
+    let queue = "qs_legacy_aged_body";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9029 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts: 1,
+            metadata: serde_json::json!({"retained": "legacy-aged-body", "ready_only": true, "shared": "ready"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    if moved {
+        assert_eq!(
+            store
+                .age_waiting_priorities(&pool, Duration::from_secs(60), 1)
+                .await
+                .expect("move queued job"),
+            vec![job_id]
+        );
+    }
+    let claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, Duration::from_secs(60))
+        .await
+        .expect("claim aged legacy-shape fixture");
+    assert_eq!(claimed.len(), 1);
+    let original = &claimed[0].job;
+    let physical_priority = if moved { 3 } else { 4 };
+    assert_eq!(claimed[0].claim.priority, physical_priority);
+    assert_eq!(original.priority, 1);
+    assert_eq!(
+        store
+            .rescue_stale_heartbeats(&pool, Duration::ZERO)
+            .await
+            .expect("rescue aged fixture")
+            .len(),
+        1
+    );
+
+    // Reproduce the persisted shape of an older writer: its narrow failed
+    // row and positive terminal delta used the effective attempt priority.
+    // The ready body and all real claim/closure evidence remain intact.
+    assert_eq!(
+        sqlx::query(&format!(
+            "UPDATE {schema}.done_entries SET priority = $2 WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .bind(original.priority)
+        .execute(&pool)
+        .await
+        .expect("seed old terminal priority")
+        .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query(&format!(
+            "UPDATE {schema}.queue_terminal_count_deltas SET priority = $2 WHERE queue = $1"
+        ))
+        .bind(queue)
+        .bind(original.priority)
+        .execute(&pool)
+        .await
+        .expect("seed matching old terminal delta")
+        .rows_affected(),
+        1
+    );
+    // An old moved-body lookup could retain the source payload, losing
+    // live-lane provenance. Keep terminal errors/custom overrides authoritative.
+    let terminal_payload: serde_json::Value = sqlx::query_scalar(&format!(
+        r#"UPDATE {schema}.done_entries
+        SET payload = jsonb_set(
+            COALESCE(payload, '{{}}'::jsonb), '{{metadata}}',
+            (COALESCE(payload -> 'metadata', '{{}}'::jsonb) - '_awa_original_priority' - 'ready_only')
+                || '{{"terminal_only":true,"shared":"terminal"}}'::jsonb
+        ) || '{{"tags":["terminal-tag"],"progress":{{"terminal":true}}}}'::jsonb
+        WHERE job_id = $1 RETURNING payload"#
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed old terminal payload without live provenance");
+    assert!(terminal_payload["metadata"]
+        .get("_awa_original_priority")
+        .is_none());
+    assert!(!terminal_payload["errors"].as_array().unwrap().is_empty());
+    let body = done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        body.0.is_none() && body.1.is_none(),
+        "old row requires its ready body"
+    );
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, queue).await,
+        vec![(1, 1)]
+    );
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
+
+    if matches!(consumer, LegacyFailedConsumer::Carry) {
+        let remaining = store
+            .claim_runtime_batch(&pool, queue, 10, Duration::ZERO)
+            .await
+            .expect("advance any tombstoned source cursor");
+        assert!(remaining.is_empty());
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry old failed row")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected legacy carry outcome: {other:?}"),
+            }
+        }
+        let body = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(body.0, Some(original.args.clone()));
+        assert_eq!(body.1, Some(original.max_attempts));
+        let ready_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.ready_entries WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ready_count, 0,
+            "carry must preserve the body before its backing is pruned"
+        );
+        assert_eq!(
+            terminal_counts_by_priority(&pool, schema, queue).await,
+            vec![(physical_priority, 1)],
+            "carried delta must match its replacement lane"
+        );
+        assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
+    }
+    let retry = match consumer {
+        LegacyFailedConsumer::Retry | LegacyFailedConsumer::Carry => store
+            .retry_job(&pool, job_id)
+            .await
+            .expect("retry legacy failure")
+            .expect("legacy failed row retries"),
+        LegacyFailedConsumer::SingleDlq | LegacyFailedConsumer::BulkDlq => {
+            if matches!(consumer, LegacyFailedConsumer::SingleDlq) {
+                let moved = store
+                    .move_failed_to_dlq(&pool, job_id, "manual-legacy-test")
+                    .await
+                    .expect("move old failed row to DLQ")
+                    .expect("one row moves");
+                assert_eq!(moved.id, job_id);
+                assert_eq!(moved.args, original.args);
+                assert_eq!(moved.max_attempts, original.max_attempts);
+            } else {
+                assert_eq!(
+                    store
+                        .bulk_move_failed_to_dlq(
+                            &pool,
+                            Some(CompleteJob::kind()),
+                            Some(queue),
+                            "manual-legacy-test",
+                        )
+                        .await
+                        .expect("bulk move old failed row to DLQ"),
+                    1,
+                    "one terminal row must not multiply through moved ready bodies"
+                );
+            }
+            let dlq_rows: Vec<(i16, serde_json::Value, i16, serde_json::Value)> =
+                sqlx::query_as(&format!(
+                    "SELECT priority,args,max_attempts,COALESCE(payload,'{{}}'::jsonb) FROM {schema}.dlq_entries WHERE job_id=$1"
+                )).bind(job_id).fetch_all(&pool).await.expect("read actual stored DLQ row");
+            assert_eq!(dlq_rows.len(), 1);
+            assert_eq!(dlq_rows[0].0, physical_priority);
+            assert_eq!(dlq_rows[0].1, original.args);
+            assert_eq!(dlq_rows[0].2, original.max_attempts);
+            assert_eq!(dlq_rows[0].3["metadata"]["_awa_original_priority"], 4);
+            assert_eq!(dlq_rows[0].3["metadata"]["shared"], "terminal");
+            assert_eq!(dlq_rows[0].3["errors"], terminal_payload["errors"]);
+            assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+            assert!(
+                terminal_counts_by_priority(&pool, schema, queue)
+                    .await
+                    .is_empty(),
+                "DLQ move must decrement the stored priority-1 terminal key"
+            );
+            assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+            store
+                .retry_from_dlq(&pool, job_id, &awa::model::RetryFromDlqOpts::default())
+                .await
+                .expect("retry recovered DLQ row")
+                .expect("DLQ row retries")
+        }
+        LegacyFailedConsumer::Discard => {
+            assert_eq!(
+                store
+                    .discard_failed_by_kind(&pool, CompleteJob::kind())
+                    .await
+                    .expect("discard old failed row"),
+                1,
+                "one terminal row must not multiply through moved ready bodies"
+            );
+            assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+            let dlq_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {schema}.dlq_entries WHERE job_id=$1"
+            ))
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(dlq_count, 0);
+            assert!(
+                terminal_counts_by_priority(&pool, schema, queue)
+                    .await
+                    .is_empty(),
+                "discard must decrement exactly its stored terminal lane"
+            );
+            assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+            return;
+        }
+    };
+    assert_eq!(retry.args, original.args);
+    assert_eq!(retry.max_attempts, original.max_attempts);
+    assert_eq!(retry.created_at, original.created_at);
+    assert_eq!(
+        retry.priority, physical_priority,
+        "manual retry restarts aging from its live lane"
+    );
+    assert_eq!(retry.metadata["retained"], "legacy-aged-body");
+    assert_eq!(
+        retry.metadata["ready_only"], true,
+        "recover ready metadata defaults"
+    );
+    assert_eq!(retry.metadata["shared"], "terminal", "stored metadata wins");
+    assert_eq!(retry.metadata["terminal_only"], true);
+    if moved {
+        assert_eq!(retry.metadata["_awa_original_priority"], 4);
+    }
+    assert_eq!(retry.tags, vec!["terminal-tag"]);
+    assert_eq!(
+        serde_json::to_value(&retry.errors).unwrap(),
+        terminal_payload["errors"]
+    );
+    let expected_progress = if matches!(
+        consumer,
+        LegacyFailedConsumer::SingleDlq | LegacyFailedConsumer::BulkDlq
+    ) {
+        None // Existing DLQ retry clears progress before making the job ready.
+    } else {
+        Some(serde_json::json!({"terminal": true}))
+    };
+    assert_eq!(retry.progress, expected_progress);
+    assert_eq!(retry.attempt, 0);
+    assert_eq!(retry.state, JobState::Available);
+    assert!(
+        terminal_counts_by_priority(&pool, schema, queue)
+            .await
+            .is_empty(),
+        "remove the stored terminal lane, not the recovered retry lane"
+    );
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+}
+
+#[tokio::test]
+async fn test_legacy_aged_failure_retry_recovers_body() {
+    legacy_aged_failure_recovers_body(false, LegacyFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_failure_retry_recovers_live_body() {
+    legacy_aged_failure_recovers_body(true, LegacyFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_failure_carry_recovers_body_and_counters() {
+    legacy_aged_failure_recovers_body(true, LegacyFailedConsumer::Carry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_terminal_dlq_and_discard_consumers() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut failures = Vec::new();
+            for consumer in [
+                LegacyFailedConsumer::SingleDlq,
+                LegacyFailedConsumer::BulkDlq,
+                LegacyFailedConsumer::Discard,
+            ] {
+                // Exercise every parameter even after another panics. These
+                // database futures do not require Send on a local task.
+                if let Err(error) =
+                    tokio::task::spawn_local(legacy_aged_failure_recovers_body(true, consumer))
+                        .await
+                {
+                    failures.push(format!("{consumer:?}: {error}"));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "terminal consumer failures: {failures:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_legacy_narrow_available_cancel_retry_keeps_tombstoned_body() {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_legacy_cancel_body";
+    let queue = "qs_legacy_cancel_body";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9030 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 3,
+            max_attempts: 7,
+            metadata: serde_json::json!({"retained": "legacy-cancel-body"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    let cancelled = store
+        .cancel_job(&pool, job_id)
+        .await
+        .expect("cancel available job")
+        .expect("available job cancels");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    let backing: (i64, i64, bool) = sqlx::query_as(&format!(
+        r#"
+        SELECT done.run_lease, ready.run_lease, EXISTS (
+            SELECT 1 FROM {schema}.ready_tombstones tomb
+            WHERE tomb.ready_slot = ready.ready_slot
+              AND tomb.ready_generation = ready.ready_generation
+              AND tomb.queue = ready.queue AND tomb.priority = ready.priority
+              AND tomb.enqueue_shard = ready.enqueue_shard
+              AND tomb.lane_seq = ready.lane_seq AND tomb.job_id = ready.job_id
+        )
+        FROM {schema}.done_entries done JOIN {schema}.ready_entries ready
+        ON ready.job_id = done.job_id AND ready.priority = done.priority
+        WHERE done.job_id = $1
+    "#
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cancelled body identity");
+    assert_eq!(
+        backing.0, backing.1,
+        "unclaimed cancellation keeps the same run lease"
+    );
+    assert!(backing.2, "cancellation tombstones its retained body");
+    // Older narrow cancellations legitimately hydrate a same-lease body
+    // even though cancellation has already tombstoned that exact lane.
+    assert_eq!(sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET args=NULL, max_attempts=NULL, run_at=NULL, created_at=NULL WHERE job_id=$1"
+    )).bind(job_id).execute(&pool).await.unwrap().rows_affected(), 1);
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, queue).await,
+        vec![(3, 1)]
+    );
+    let retry = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry narrow cancellation")
+        .expect("cancelled job retries");
+    assert_eq!(retry.args, cancelled.args);
+    assert_eq!(retry.max_attempts, 7);
+    assert_eq!(retry.priority, 3);
+    assert_eq!(retry.created_at, cancelled.created_at);
+    assert_eq!(retry.metadata["retained"], "legacy-cancel-body");
+    assert!(terminal_counts_by_priority(&pool, schema, queue)
+        .await
+        .is_empty());
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+}

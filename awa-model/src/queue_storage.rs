@@ -539,20 +539,84 @@ fn terminal_delta_child_name(schema: &str, slot: usize) -> String {
 }
 
 fn done_ready_join(schema: &str, done_alias: &str, ready_alias: &str) -> String {
+    done_ready_join_from(
+        done_alias,
+        ready_alias,
+        &format!("{schema}.ready_entries"),
+        &format!("{schema}.ready_tombstones"),
+    )
+}
+
+// Old writers could store effective priority in a narrow terminal row. Prefer
+// the live body of that exact claimed attempt, while retaining same-lease,
+// exact-lane bodies tombstoned by an available-job cancellation. Choose one
+// body so moved source rows cannot multiply terminal mutations or counters.
+fn done_ready_join_from(
+    done_alias: &str,
+    ready_alias: &str,
+    ready_relation: &str,
+    tombstone_relation: &str,
+) -> String {
     format!(
         r#"
-            LEFT JOIN {schema}.ready_entries AS {ready_alias}
-              ON {ready_alias}.ready_slot = {done_alias}.ready_slot
-             AND {ready_alias}.ready_generation = {done_alias}.ready_generation
-             AND {ready_alias}.queue = {done_alias}.queue
-             AND {ready_alias}.priority = {done_alias}.priority
-             AND {ready_alias}.enqueue_shard = {done_alias}.enqueue_shard
-             AND {ready_alias}.lane_seq = {done_alias}.lane_seq
+            LEFT JOIN LATERAL (
+                SELECT candidate.*
+                FROM (
+                    SELECT body.*,
+                        (
+                            body.run_lease + 1 = {done_alias}.run_lease
+                            AND NOT EXISTS (
+                                SELECT 1 FROM {tombstone_relation} AS tomb
+                                WHERE tomb.ready_slot = body.ready_slot
+                                  AND tomb.ready_generation = body.ready_generation
+                                  AND tomb.queue = body.queue
+                                  AND tomb.priority = body.priority
+                                  AND tomb.enqueue_shard = body.enqueue_shard
+                                  AND tomb.lane_seq = body.lane_seq
+                                  AND tomb.job_id = body.job_id
+                            )
+                        ) AS live_attempt_body
+                    FROM {ready_relation} AS body
+                    WHERE body.ready_slot = {done_alias}.ready_slot
+                      AND body.ready_generation = {done_alias}.ready_generation
+                      AND body.queue = {done_alias}.queue
+                      AND body.enqueue_shard = {done_alias}.enqueue_shard
+                      AND body.lane_seq = {done_alias}.lane_seq
+                      AND body.job_id = {done_alias}.job_id
+                      AND (body.run_lease = {done_alias}.run_lease
+                           OR body.run_lease + 1 = {done_alias}.run_lease)
+                ) AS candidate
+                WHERE candidate.priority = {done_alias}.priority
+                   OR candidate.live_attempt_body
+                ORDER BY candidate.live_attempt_body DESC,
+                         (candidate.priority = {done_alias}.priority) DESC,
+                         candidate.priority
+                LIMIT 1
+            ) AS {ready_alias} ON TRUE
         "#
     )
 }
 
+fn done_payload_projection(done_alias: &str, ready_alias: &str) -> String {
+    // A narrow old terminal payload can lack metadata from its live moved
+    // body. Supply only metadata defaults; terminal errors/tags/progress and
+    // explicit metadata overrides remain authoritative. Keep default {} elision.
+    format!(
+        r#"CASE
+            WHEN {done_alias}.args IS NULL
+             AND {ready_alias}.live_attempt_body
+             AND COALESCE({ready_alias}.payload -> 'metadata', '{{}}'::jsonb) <> '{{}}'::jsonb
+            THEN COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb)
+                || jsonb_build_object('metadata',
+                    COALESCE({ready_alias}.payload -> 'metadata', '{{}}'::jsonb)
+                    || COALESCE({done_alias}.payload -> 'metadata', '{{}}'::jsonb))
+            ELSE COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb)
+        END"#
+    )
+}
+
 fn done_row_projection(done_alias: &str, ready_alias: &str) -> String {
+    let payload = done_payload_projection(done_alias, ready_alias);
     format!(
         r#"
                 {done_alias}.ready_slot,
@@ -574,7 +638,7 @@ fn done_row_projection(done_alias: &str, ready_alias: &str) -> String {
                 COALESCE({done_alias}.created_at, {ready_alias}.created_at, {done_alias}.finalized_at) AS created_at,
                 COALESCE({done_alias}.unique_key, {ready_alias}.unique_key) AS unique_key,
                 COALESCE({done_alias}.unique_states, {ready_alias}.unique_states) AS unique_states,
-                COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb) AS payload
+                {payload} AS payload
         "#
     )
 }
@@ -2030,6 +2094,15 @@ struct DoneJobRow {
     payload: serde_json::Value,
 }
 
+// Keep the stored terminal priority for decrementing its old counter key.
+// Manual retry and terminal-to-DLQ moves recover the retained physical lane.
+#[derive(Debug, sqlx::FromRow)]
+struct HydratedTerminalRow {
+    #[sqlx(flatten)]
+    terminal: DoneJobRow,
+    body_priority: i16,
+}
+
 impl DoneJobRow {
     fn into_job_row(self) -> Result<JobRow, AwaError> {
         let payload = RuntimePayload::from_json(self.payload)?;
@@ -2250,6 +2323,7 @@ struct ReadySnapshotRow {
     kind: String,
     queue: String,
     args: serde_json::Value,
+    priority: i16,
     lane_seq: i64,
     enqueue_shard: i16,
     run_at: DateTime<Utc>,
@@ -2281,6 +2355,7 @@ struct LeaseTransitionRow {
     args: serde_json::Value,
     state: JobState,
     priority: i16,
+    ready_priority: i16,
     attempt: i16,
     run_lease: i64,
     max_attempts: i16,
@@ -2310,7 +2385,9 @@ impl LeaseTransitionRow {
             queue: self.queue,
             args: self.args,
             state,
-            priority: self.priority,
+            // Terminal rows retain their ready-lane identity for body hydration.
+            // The effective attempt priority is still used by deferred/DLQ rows.
+            priority: self.ready_priority,
             attempt: self.attempt,
             run_lease: self.run_lease,
             max_attempts: self.max_attempts,
@@ -7774,7 +7851,7 @@ impl QueueStorage {
 
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let terminal: Option<DoneJobRow> = sqlx::query_as(&format!(
+        let terminal: Option<HydratedTerminalRow> = sqlx::query_as(&format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -7789,7 +7866,7 @@ impl QueueStorage {
             )
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -7799,7 +7876,9 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if let Some(terminal) = terminal {
+        if let Some(hydrated) = terminal {
+            let body_priority = hydrated.body_priority;
+            let terminal = hydrated.terminal;
             self.ensure_terminal_removed_receipt_closures_tx(tx, std::slice::from_ref(&terminal))
                 .await?;
             // The DELETE FROM done_entries above removes one terminal row;
@@ -7814,7 +7893,7 @@ impl QueueStorage {
                 kind: terminal.kind,
                 queue: terminal.queue.clone(),
                 args: terminal.args,
-                priority: terminal.priority,
+                priority: body_priority,
                 attempt: 0,
                 run_lease: terminal.run_lease,
                 max_attempts: terminal.max_attempts,
@@ -10513,10 +10592,21 @@ impl QueueStorage {
         let job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
 
+        // Resolve moved ready bodies without opening the whole tombstone ring.
+        // Empty input returned above; every remaining slot is validated here.
+        let tombstone_sources = ready_slots
+            .iter()
+            .map(|&slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .map(|slot| format!("SELECT * FROM {}", ready_tombstone_child_name(schema, slot)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+
         let ready_rows: Vec<ReadySnapshotRow> = sqlx::query_as(&format!(
             r#"
-            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id) AS (
-                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[])
+            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id, run_lease) AS (
+                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[], $7::bigint[])
             )
             SELECT
                 ready.ready_slot,
@@ -10525,6 +10615,7 @@ impl QueueStorage {
                 ready.kind,
                 ready.queue,
                 ready.args,
+                ready.priority,
                 ready.lane_seq,
                 ready.enqueue_shard,
                 ready.run_at,
@@ -10540,6 +10631,17 @@ impl QueueStorage {
              AND ready.enqueue_shard = refs.enqueue_shard
              AND ready.lane_seq = refs.lane_seq
              AND ready.job_id = refs.job_id
+             AND ready.run_lease + 1 = refs.run_lease
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ({tombstone_sources}) AS tomb
+                WHERE tomb.ready_slot = ready.ready_slot
+                  AND tomb.ready_generation = ready.ready_generation
+                  AND tomb.queue = ready.queue
+                  AND tomb.priority = ready.priority
+                  AND tomb.enqueue_shard = ready.enqueue_shard
+                  AND tomb.lane_seq = ready.lane_seq
+                  AND tomb.job_id = ready.job_id
+            )
             "#
         ))
         .bind(&ready_slots)
@@ -10548,6 +10650,7 @@ impl QueueStorage {
         .bind(&enqueue_shards)
         .bind(&lane_seqs)
         .bind(&job_ids)
+        .bind(&run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10746,6 +10849,7 @@ impl QueueStorage {
                 args: ready.args.clone(),
                 state: deleted_row.state,
                 priority: deleted_row.priority,
+                ready_priority: ready.priority,
                 attempt: deleted_row.attempt,
                 run_lease: deleted_row.run_lease,
                 max_attempts: deleted_row.max_attempts,
@@ -14001,7 +14105,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let moved: Option<DoneJobRow> = sqlx::query_as(&format!(
+        let moved: Option<HydratedTerminalRow> = sqlx::query_as(&format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -14016,7 +14120,7 @@ impl QueueStorage {
                 )
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -14026,10 +14130,11 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        let Some(hydrated) = moved else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
+        let mut moved = hydrated.terminal;
 
         self.ensure_terminal_removed_receipt_closures_tx(&mut tx, std::slice::from_ref(&moved))
             .await?;
@@ -14040,6 +14145,7 @@ impl QueueStorage {
             &Self::done_rows_to_counter_keys(std::slice::from_ref(&moved)),
         )
         .await?;
+        moved.priority = hydrated.body_priority;
         let dlq_row = moved
             .clone()
             .into_dlq_row(dlq_reason.to_string(), Utc::now());
@@ -14065,7 +14171,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let moved: Vec<DoneJobRow> = sqlx::query_as(&format!(
+        let moved: Vec<HydratedTerminalRow> = sqlx::query_as(&format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -14074,7 +14180,7 @@ impl QueueStorage {
                   AND ($2::text IS NULL OR queue = $2)
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -14090,6 +14196,10 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let (moved, body_priorities): (Vec<_>, Vec<_>) = moved
+            .into_iter()
+            .map(|row| (row.terminal, row.body_priority))
+            .unzip();
         self.ensure_terminal_removed_receipt_closures_tx(&mut tx, &moved)
             .await?;
         // Bulk DLQ move deletes from done_entries. Append negative deltas by
@@ -14099,7 +14209,11 @@ impl QueueStorage {
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
             .into_iter()
-            .map(|row| row.into_dlq_row(dlq_reason.to_string(), dlq_at))
+            .zip(body_priorities)
+            .map(|(mut row, priority)| {
+                row.priority = priority;
+                row.into_dlq_row(dlq_reason.to_string(), dlq_at)
+            })
             .collect();
         self.insert_dlq_rows_tx(&mut tx, &rows, Some(JobState::Failed))
             .await?;
@@ -15951,8 +16065,12 @@ impl QueueStorage {
                 // never-resetting sequences, so a PK collision means
                 // corrupted terminal state and must abort the prune loudly
                 // rather than silently drop a terminal fact.
-                let carried = sqlx::query(&format!(
+                let carry_ready_join =
+                    done_ready_join_from("done", "ready", &ready_child, &tomb_child);
+                let carry_payload = done_payload_projection("done", "ready");
+                let groups: Vec<(String, i16, i16, i16, i64)> = sqlx::query_as(&format!(
                     r#"
+                    WITH carried AS (
                     INSERT INTO {schema}.done_entries (
                         ready_slot, ready_generation, job_id, kind, queue,
                         args, state, priority, attempt, run_lease,
@@ -15968,7 +16086,7 @@ impl QueueStorage {
                         done.queue,
                         COALESCE(done.args, ready.args, '{{}}'::jsonb),
                         done.state,
-                        done.priority,
+                        COALESCE(ready.priority, done.priority),
                         done.attempt,
                         done.run_lease,
                         COALESCE(done.max_attempts, ready.max_attempts, 25::smallint),
@@ -15980,70 +16098,45 @@ impl QueueStorage {
                         COALESCE(done.created_at, ready.created_at, done.finalized_at),
                         COALESCE(done.unique_key, ready.unique_key),
                         COALESCE(done.unique_states, ready.unique_states),
-                        COALESCE(done.payload, ready.payload, '{{}}'::jsonb)
+                        {carry_payload}
                     FROM {done_child} AS done
-                    LEFT JOIN {ready_child} AS ready
-                      ON ready.ready_slot = done.ready_slot
-                     AND ready.ready_generation = done.ready_generation
-                     AND ready.queue = done.queue
-                     AND ready.priority = done.priority
-                     AND ready.enqueue_shard = done.enqueue_shard
-                     AND ready.lane_seq = done.lane_seq
+                    {carry_ready_join}
                     WHERE done.state = 'failed'
                       AND done.finalized_at >= now() - make_interval(secs => $1::bigint)
+                    RETURNING queue, priority, enqueue_shard, job_id
+                    )
+                    SELECT
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        mod(
+                            mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
+                                + {TERMINAL_COUNTER_BUCKETS}::bigint,
+                            {TERMINAL_COUNTER_BUCKETS}::bigint
+                        )::smallint AS counter_bucket,
+                        count(*)::bigint
+                    FROM carried
+                    GROUP BY queue, priority, enqueue_shard, counter_bucket
+                    ORDER BY queue, priority, enqueue_shard, counter_bucket
                     "#
                 ))
                 .bind(failed_retention_secs)
                 .bind(state.0)
                 .bind(current_generation)
-                .execute(tx.as_mut())
+                .fetch_all(tx.as_mut())
                 .await
-                .map_err(map_sqlx_error)?
-                .rows_affected();
+                .map_err(map_sqlx_error)?;
 
-                if carried > 0 {
-                    // This slot's live counter rows and delta segment are
-                    // wiped below, so the carried rows' exact-count
-                    // evidence moves with them: re-append positive deltas
-                    // under the current slot, grouped exactly like the
-                    // completion path's delta append.
-                    sqlx::query(&format!(
-                        r#"
-                        INSERT INTO {schema}.queue_terminal_count_deltas (
-                            ready_slot,
-                            ready_generation,
-                            queue,
-                            priority,
-                            enqueue_shard,
-                            counter_bucket,
-                            terminal_delta
-                        )
-                        SELECT
-                            $2,
-                            $3,
-                            queue,
-                            priority,
-                            enqueue_shard,
-                            mod(
-                                mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                                    + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                                {TERMINAL_COUNTER_BUCKETS}::bigint
-                            )::smallint AS counter_bucket,
-                            count(*)::bigint
-                        FROM {done_child}
-                        WHERE state = 'failed'
-                          AND finalized_at >= now() - make_interval(secs => $1::bigint)
-                        GROUP BY queue, priority, enqueue_shard, counter_bucket
-                        ORDER BY queue, priority, enqueue_shard, counter_bucket
-                        "#
-                    ))
-                    .bind(failed_retention_secs)
-                    .bind(state.0)
-                    .bind(current_generation)
-                    .execute(tx.as_mut())
-                    .await
-                    .map_err(map_sqlx_error)?;
-                }
+                // The replacement delta uses each inserted row's recovered
+                // priority. The old slot's counter evidence is truncated below.
+                let carried: u64 = groups.iter().map(|(_, _, _, _, count)| *count as u64).sum();
+                let deltas = groups
+                    .into_iter()
+                    .map(|(queue, priority, shard, bucket, count)| {
+                        ((state.0, current_generation, queue, priority, shard, bucket), count)
+                    })
+                    .collect();
+                self.append_terminal_count_deltas_tx(&mut tx, deltas).await?;
                 carried
             } else {
                 0
