@@ -3309,6 +3309,7 @@ struct LeaseTransitionRow {
     unique_states: Option<String>,
     payload: serde_json::Value,
     progress: Option<serde_json::Value>,
+    self_contained_terminal: bool,
 }
 
 impl LeaseTransitionRow {
@@ -3332,7 +3333,13 @@ impl LeaseTransitionRow {
             attempt: self.attempt,
             run_lease: self.run_lease,
             max_attempts: self.max_attempts,
-            lane_seq: self.lane_seq,
+            // A competing live copy must not replace this recovered body
+            // when later terminal reads resolve retained ready rows.
+            lane_seq: if self.self_contained_terminal {
+                -self.job_id
+            } else {
+                self.lane_seq
+            },
             enqueue_shard: self.enqueue_shard,
             run_at: self.run_at,
             attempted_at: self.attempted_at,
@@ -12577,13 +12584,13 @@ impl QueueStorage {
         let mut claimed_lanes: BTreeSet<ReadyBodyLaneKey> = BTreeSet::new();
         let ambiguous: Vec<&ReadySnapshotRow> = ready_map
             .values()
-            .filter(|rows| rows.len() > 1 && !rows.iter().any(|row| row.live_body))
+            .filter(|rows| rows.len() > 1)
             .flatten()
             .collect();
-        if self.lease_claim_receipts() && !ambiguous.is_empty() {
-            // Normal live bodies and unique retained bodies need no extra
-            // relation lookup. Only ambiguous tombstoned receipt bodies need
-            // the emitted physical-lane evidence, scoped to their ready slots.
+        if !ambiguous.is_empty() {
+            // A unique body needs no extra relation lookup. Multiple bodies
+            // need the emitted physical lane even if a replacement is live;
+            // scope that evidence to the referenced ready slots.
             let attempt_sources = ambiguous
                 .iter()
                 .map(|row| row.ready_slot)
@@ -12802,25 +12809,28 @@ impl QueueStorage {
                         deleted_row.job_id, deleted_row.run_lease
                     ))
                 })?;
-            // Prefer a live exact-attempt body. A tombstoned body can still
-            // back an attempt claimed before physical aging moved the source;
-            // its emitted lane evidence outranks other retained moved bodies.
-            // Legacy ambiguous bodies have no authoritative physical priority:
-            // fail instead of silently choosing an unordered source payload.
+            // Emitted physical-lane evidence wins over a live replacement.
+            // Without it, retain the live-body compatibility fallback; it
+            // cannot identify a legacy claim's original colliding lane.
+            let emitted = |row: &ReadySnapshotRow| {
+                claimed_lanes.contains(&(
+                    row.ready_slot,
+                    row.ready_generation,
+                    row.queue.clone(),
+                    row.enqueue_shard,
+                    row.lane_seq,
+                    row.job_id,
+                    row.run_lease + 1,
+                    row.priority,
+                ))
+            };
+            let has_emitted = candidates.iter().any(&emitted);
             let rank = |row: &ReadySnapshotRow| {
-                (
-                    row.live_body,
-                    claimed_lanes.contains(&(
-                        row.ready_slot,
-                        row.ready_generation,
-                        row.queue.clone(),
-                        row.enqueue_shard,
-                        row.lane_seq,
-                        row.job_id,
-                        row.run_lease + 1,
-                        row.priority,
-                    )),
-                )
+                if has_emitted {
+                    emitted(row)
+                } else {
+                    row.live_body
+                }
             };
             let strongest = candidates
                 .iter()
@@ -12884,6 +12894,9 @@ impl QueueStorage {
                 unique_states: ready.unique_states.clone(),
                 payload,
                 progress: attempt.and_then(|row| row.progress.clone()),
+                self_contained_terminal: has_emitted
+                    && !ready.live_body
+                    && candidates.iter().any(|row| row.live_body),
             });
         }
 

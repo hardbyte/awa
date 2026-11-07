@@ -9,7 +9,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - Keep committed claims out of physical priority aging, even before their
   cursor advances. Recovery and cancellation can hydrate an exact retained
   claimed body after older aging tombstoned it, preserving original-priority
-  metadata and rejecting ambiguous historical bodies.
+  metadata and rejecting ambiguous historical bodies. Emitted-lane evidence
+  takes precedence over colliding live replacements, and their recovered
+  terminal bodies remain self-contained through retry. Historical receipt
+  evidence remains usable after reopening a custom store in legacy mode.
+  Without that evidence, legacy or backfilled claims retain a compatibility
+  fallback that cannot reliably identify the original physical lane in this
+  historical collision.
 
 - Preserve recovered bodies and physical lane priority when manually moving
   historical aged terminal failures to the DLQ, so later DLQ retry retains
