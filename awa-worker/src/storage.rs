@@ -83,7 +83,7 @@ pub(crate) fn prune_lock_timeout_risks(
     deadlock_timeout_ms: Option<u64>,
     statement_timeout_ms: Option<u64>,
 ) -> Vec<PruneLockTimeoutRisk> {
-    let timeout_ms = timeout.as_millis();
+    let timeout_ms = timeout.as_millis().max(1);
     let mut risks = Vec::new();
     if let Some(limit_ms) = deadlock_timeout_ms.filter(|limit| *limit > 0) {
         if timeout_ms >= u128::from(limit_ms) {
@@ -144,5 +144,12 @@ mod tests {
             ]
         );
         assert!(prune_lock_timeout_risks(Duration::from_secs(30), None, None).is_empty());
+        assert_eq!(
+            prune_lock_timeout_risks(Duration::from_nanos(1), Some(1), Some(1)),
+            vec![
+                PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 1 },
+                PruneLockTimeoutRisk::StatementTimeout { limit_ms: 1 },
+            ]
+        );
     }
 }

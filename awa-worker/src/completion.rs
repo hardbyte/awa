@@ -4,8 +4,10 @@ use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::env;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -92,6 +94,144 @@ struct CompletionRequest {
     response: oneshot::Sender<Result<bool, AwaError>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct FinalizationBudget {
+    inner: Arc<BudgetClock>,
+}
+
+struct BudgetClock {
+    state: Mutex<BudgetState>,
+    changed: Notify,
+}
+
+struct BudgetState {
+    deadline: Instant,
+    paused_at: Option<Instant>,
+    acknowledgement_waits: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct FinalizationBudgetElapsed;
+
+impl From<Duration> for FinalizationBudget {
+    fn from(window: Duration) -> Self {
+        Self {
+            inner: Arc::new(BudgetClock {
+                state: Mutex::new(BudgetState {
+                    deadline: Instant::now() + window,
+                    paused_at: None,
+                    acknowledgement_waits: 0,
+                }),
+                changed: Notify::new(),
+            }),
+        }
+    }
+}
+
+impl FinalizationBudget {
+    pub(crate) fn is_elapsed(&self) -> bool {
+        self.deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        let state = self.inner.state.lock().unwrap();
+        state.paused_at.is_none().then_some(state.deadline)
+    }
+
+    fn wait_for_acknowledgement(&self) -> AcknowledgementWait {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.acknowledgement_waits == 0 {
+            state.paused_at = Some(Instant::now());
+        }
+        state.acknowledgement_waits += 1;
+        drop(state);
+        self.inner.changed.notify_waiters();
+        AcknowledgementWait {
+            budget: self.clone(),
+        }
+    }
+
+    pub(crate) async fn timeout<F>(&self, future: F) -> Result<F::Output, FinalizationBudgetElapsed>
+    where
+        F: std::future::Future,
+    {
+        tokio::pin!(future);
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.deadline() {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => {
+                            if self.deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+                                return Err(FinalizationBudgetElapsed);
+                            }
+                        }
+                        outcome = &mut future => return Ok(outcome),
+                        _ = &mut changed => {},
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        biased;
+                        outcome = &mut future => return Ok(outcome),
+                        _ = &mut changed => {},
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn timeout_unpaused<F>(
+        &self,
+        future: F,
+    ) -> Result<F::Output, FinalizationBudgetElapsed>
+    where
+        F: std::future::Future,
+    {
+        let deadline = self.deadline().expect("unpaused finalization budget");
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| FinalizationBudgetElapsed)
+    }
+}
+
+struct AcknowledgementWait {
+    budget: FinalizationBudget,
+}
+
+impl Drop for AcknowledgementWait {
+    fn drop(&mut self) {
+        let mut state = self.budget.inner.state.lock().unwrap();
+        state.acknowledgement_waits -= 1;
+        if state.acknowledgement_waits == 0 {
+            let paused_at = state.paused_at.take().unwrap();
+            state.deadline += Instant::now() - paused_at;
+        }
+        drop(state);
+        self.budget.inner.changed.notify_waiters();
+    }
+}
+
+struct CompletionReceipt {
+    response: oneshot::Receiver<Result<bool, AwaError>>,
+    acknowledgement_wait: Option<AcknowledgementWait>,
+}
+
+impl CompletionReceipt {
+    async fn acknowledge(self) -> Result<bool, AwaError> {
+        let result = self
+            .response
+            .await
+            .map_err(|_| AwaError::Validation("completion batcher dropped response".into()))?;
+        drop(self.acknowledgement_wait);
+        result
+    }
+}
+
 fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
     let claim_slot = request
         .runtime_job
@@ -106,9 +246,25 @@ fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
 pub(crate) struct CompletionBatcherHandle {
     shards: Vec<mpsc::Sender<CompletionRequest>>,
     pipeline_capacity: usize,
+    acknowledgement_budget: Option<FinalizationBudget>,
 }
 
 impl CompletionBatcherHandle {
+    pub(crate) fn with_acknowledgement_budget(&self, budget: FinalizationBudget) -> Self {
+        Self {
+            acknowledgement_budget: Some(budget),
+            ..self.clone()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_request_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.max_capacity() - shard.capacity())
+            .sum()
+    }
+
     pub fn finalizer_capacity(&self, runtime_worker_capacity: u32) -> usize {
         self.pipeline_capacity
             .max(runtime_worker_capacity.max(1) as usize)
@@ -139,22 +295,41 @@ impl CompletionBatcherHandle {
         claim: Option<ClaimedEntry>,
         runtime_job: Option<ClaimedRuntimeJob>,
     ) -> Result<bool, AwaError> {
+        self.submit(job_id, run_lease, claim, runtime_job)
+            .await?
+            .acknowledge()
+            .await
+    }
+
+    async fn submit(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+        claim: Option<ClaimedEntry>,
+        runtime_job: Option<ClaimedRuntimeJob>,
+    ) -> Result<CompletionReceipt, AwaError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
-        self.shards[shard]
-            .send(CompletionRequest {
-                job_id,
-                run_lease,
-                claim,
-                runtime_job,
-                response: response_tx,
-            })
+        let permit = self.shards[shard]
+            .reserve()
             .await
             .map_err(|_| AwaError::Validation("completion batcher stopped".into()))?;
+        let acknowledgement_wait = self
+            .acknowledgement_budget
+            .as_ref()
+            .map(FinalizationBudget::wait_for_acknowledgement);
+        permit.send(CompletionRequest {
+            job_id,
+            run_lease,
+            claim,
+            runtime_job,
+            response: response_tx,
+        });
 
-        response_rx
-            .await
-            .map_err(|_| AwaError::Validation("completion batcher dropped response".into()))?
+        Ok(CompletionReceipt {
+            response: response_rx,
+            acknowledgement_wait,
+        })
     }
 }
 
@@ -218,6 +393,7 @@ impl CompletionBatcher {
                 shards,
                 // Each shard needs an in-flight batch and a queued batch.
                 pipeline_capacity: batch_size.saturating_mul(shard_count).saturating_mul(2),
+                acknowledgement_budget: None,
             },
         )
     }
@@ -412,16 +588,64 @@ impl CompletionWorker {
                 );
             }
             Err(err) => {
-                self.metrics.record_completion_flush(
-                    self.shard_id,
-                    job_ids.len() as u64,
-                    flush_start.elapsed(),
-                );
                 warn!(
                     error = %err,
                     shard = self.shard_id,
                     batch_size = job_ids.len(),
                     "Failed to flush completed job batch"
+                );
+                if matches!(
+                    &err,
+                    AwaError::Database(sqlx::Error::Database(error))
+                        if error.code().as_deref() == Some("55P03")
+                ) {
+                    if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
+                        for request in batch {
+                            let pair = (request.job_id, request.run_lease);
+                            let response = if committed_pairs.contains(&pair) {
+                                Ok(true)
+                            } else {
+                                let updated = if let Some(runtime_job) = &request.runtime_job {
+                                    runtime
+                                        .store
+                                        .complete_runtime_batch(
+                                            &self.pool,
+                                            std::slice::from_ref(runtime_job),
+                                        )
+                                        .await
+                                } else if let Some(claim) = &request.claim {
+                                    runtime
+                                        .store
+                                        .complete_claimed_batch(
+                                            &self.pool,
+                                            std::slice::from_ref(claim),
+                                        )
+                                        .await
+                                } else {
+                                    runtime
+                                        .store
+                                        .complete_job_batch_by_id(&self.pool, &[pair])
+                                        .await
+                                };
+                                updated.map(|updated| updated.contains(&pair))
+                            };
+                            if matches!(&response, Ok(true)) {
+                                committed_pairs.insert(pair);
+                            }
+                            let _ = request.response.send(response);
+                        }
+                        self.metrics.record_completion_flush(
+                            self.shard_id,
+                            job_ids.len() as u64,
+                            flush_start.elapsed(),
+                        );
+                        return;
+                    }
+                }
+                self.metrics.record_completion_flush(
+                    self.shard_id,
+                    job_ids.len() as u64,
+                    flush_start.elapsed(),
                 );
                 let message = format!("completion batch flush failed: {err}");
                 for request in batch {
@@ -444,6 +668,178 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn controlled_completions(
+        capacity: usize,
+    ) -> (CompletionBatcherHandle, mpsc::Receiver<CompletionRequest>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            CompletionBatcherHandle {
+                shards: vec![sender],
+                pipeline_capacity: capacity,
+                acknowledgement_budget: None,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_completion_keeps_its_acknowledgement_after_the_budget() {
+        use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let events = Arc::new(AtomicU32::new(0));
+        let observed = events.clone();
+        let handler: BoxedUntypedEventHandler = Arc::new(move |event| {
+            assert!(matches!(event, UntypedJobEvent::Completed { job, .. }
+                if job.id == 1 && job.run_lease == 2));
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        });
+        let handlers = HashMap::from([("accepted_parent".into(), vec![handler])]);
+        let task = tokio::spawn(async move {
+            let updated = budget
+                .timeout(handle.complete(1, 2))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(updated);
+            let now = chrono::Utc::now();
+            let job = serde_json::from_value(serde_json::json!({
+                "id":1,"kind":"accepted_parent","queue":"test","args":{},
+                "state":"completed","priority":2,"attempt":1,"run_lease":2,
+                "max_attempts":5,"run_at":now,"attempted_at":now,"created_at":now,
+                "finalized_at":now,"metadata":{},"tags":[],
+            }))
+            .unwrap();
+            crate::executor::dispatch_lifecycle_event(
+                &handlers,
+                "accepted_parent",
+                UntypedJobEvent::Completed {
+                    job,
+                    duration: Duration::ZERO,
+                },
+            )
+            .await;
+        });
+        let request = requests.recv().await.unwrap();
+        assert_eq!((request.job_id, request.run_lease), (1, 2));
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "accepted work must keep its waiter");
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert!(request.response.send(Ok(true)).is_ok());
+        task.await.unwrap();
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+        assert!(requests.try_recv().is_err(), "one accepted request only");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_admission_still_expires_when_the_channel_is_full() {
+        let (handle, mut requests) = controlled_completions(1);
+        assert!(handle.shards[0]
+            .send(completion_request_with_claim_slot(1, 1, 0))
+            .await
+            .is_ok());
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let started = tokio::time::Instant::now();
+        assert!(budget.timeout(handle.complete(2, 1)).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(requests.recv().await.unwrap().job_id, 1);
+        assert!(
+            requests.try_recv().is_err(),
+            "expired admission cannot send"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_budget_cannot_admit_work_to_a_ready_channel() {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(budget.timeout(handle.complete(1, 2)).await.is_err());
+        assert!(requests.try_recv().is_err());
+    }
+
+    async fn assert_remaining_budget_after_acknowledgement(response: Result<bool, AwaError>) {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            budget
+                .timeout(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let outcome = handle.complete(1, 2).await;
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    outcome
+                })
+                .await
+        });
+        let request = requests.recv().await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_millis(30));
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert!(request.response.send(response).is_ok());
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(300),
+            "30ms before admission leaves 70ms after the 200ms acknowledgement wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_acknowledgement_work_uses_only_the_remaining_budget() {
+        assert_remaining_budget_after_acknowledgement(Ok(true)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_acknowledgement_does_not_exempt_direct_fallback() {
+        assert_remaining_budget_after_acknowledgement(Err(AwaError::Validation(
+            "completion flush failed".into(),
+        )))
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_accepted_receipt_resumes_its_budget() {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let receipt = handle.submit(1, 2, None, None).await.unwrap();
+        let request = requests.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        drop(receipt);
+        assert!(request.response.send(Ok(true)).is_err());
+        assert!(budget
+            .timeout(tokio::time::sleep(Duration::from_millis(80)))
+            .await
+            .is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unscoped_batch_acknowledgement_retains_the_original_timeout() {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let started = tokio::time::Instant::now();
+        let task =
+            tokio::spawn(async move { budget.timeout_unpaused(handle.complete(1, 2)).await });
+        let request = requests.recv().await.unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert!(request.response.send(Ok(true)).is_err());
+    }
 
     fn base_database_url() -> String {
         std::env::var("DATABASE_URL")
@@ -1072,5 +1468,218 @@ mod tests {
             elapsed.as_secs_f64(),
             jobs.len() as f64 / elapsed.as_secs_f64()
         );
+    }
+    async fn queue_storage_busy_completion_responses(with_claim: bool) {
+        let pool = setup(6).await;
+        let schema = format!("awa_complete_busy_{}", uuid::Uuid::new_v4().simple());
+        let runtime = crate::storage::QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig {
+                schema: schema.clone(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: false,
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let store = runtime.store.clone();
+        store.prepare_schema(&pool).await.unwrap();
+        let mut jobs = Vec::new();
+        for queue in ["busy", "ordinary", "stale", "carried"] {
+            store.enqueue_batch(&pool, queue, 4, 1).await.unwrap();
+            let mut claimed = store
+                .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 1);
+            jobs.push(claimed.remove(0));
+        }
+        let historical = jobs.remove(0);
+        let ordinary = jobs.remove(0);
+        let stale = jobs.remove(0);
+        let mut carried = jobs.remove(0);
+        carried.job.output = Some(serde_json::json!({"result":"preserved"}));
+        assert_eq!(
+            store
+                .complete_runtime_batch(&pool, std::slice::from_ref(&stale))
+                .await
+                .unwrap(),
+            vec![(stale.job.id, stale.job.run_lease)]
+        );
+        store.enqueue_batch(&pool, "busy", 3, 1).await.unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "INSERT INTO {schema}.ready_tombstones
+             (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
+             SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id
+             FROM {schema}.ready_entries WHERE job_id=$1;"
+        )))
+        .bind(historical.job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "INSERT INTO {schema}.ready_entries
+             (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+              lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+             SELECT ready_slot,ready_generation,job_id,kind,queue,args,3::smallint,attempt,run_lease,max_attempts,
+              {schema}.reserve_enqueue_seq(queue,3::smallint,enqueue_shard,1::bigint),enqueue_shard,
+              run_at,attempted_at,created_at,unique_key,unique_states,payload
+             FROM {schema}.ready_entries WHERE job_id=$1"
+        )))
+        .bind(historical.job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "SELECT 1 FROM {schema}.queue_claim_heads
+             WHERE queue='busy' AND priority=3 AND enqueue_shard=0 FOR UPDATE"
+        )))
+        .fetch_one(blocker.as_mut())
+        .await
+        .unwrap();
+        let pairs = [
+            (historical.job.id, historical.job.run_lease),
+            (ordinary.job.id, ordinary.job.run_lease),
+        ];
+        let strict = if with_claim {
+            store
+                .complete_claimed_batch(&pool, &[historical.claim.clone(), ordinary.claim.clone()])
+                .await
+        } else {
+            store.complete_job_batch_by_id(&pool, &pairs).await
+        };
+        assert!(matches!(strict, Err(AwaError::Database(ref error))
+            if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))));
+        let mut caller_tx = pool.begin().await.unwrap();
+        let strict = store
+            .complete_job_batch_by_id_in_tx(&mut caller_tx, &pairs)
+            .await;
+        assert!(matches!(strict, Err(AwaError::Database(ref error))
+            if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))));
+        caller_tx.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .load_job(&pool, ordinary.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            awa_model::JobState::Running
+        );
+
+        let (mut batcher, _) = CompletionBatcher::with_batching(
+            pool.clone(),
+            CancellationToken::new(),
+            crate::metrics::AwaMetrics::from_global(),
+            RuntimeStorage::QueueStorage(runtime),
+            1,
+            4,
+            Duration::from_millis(1),
+        );
+        let worker = batcher.workers.pop().unwrap();
+        let mut batch = Vec::new();
+        let mut responses = Vec::new();
+        for job in [&historical, &ordinary, &stale, &carried] {
+            let (response, rx) = oneshot::channel();
+            batch.push(CompletionRequest {
+                job_id: job.job.id,
+                run_lease: job.job.run_lease,
+                claim: with_claim.then(|| job.claim.clone()),
+                runtime_job: (job.job.id == carried.job.id).then(|| job.clone()),
+                response,
+            });
+            responses.push(rx);
+        }
+        tokio::time::timeout(Duration::from_secs(5), worker.flush(&mut batch))
+            .await
+            .expect("contended batch isolates singleton errors without waiting");
+        let busy = responses.remove(0).await.unwrap();
+        assert!(
+            matches!(busy, Err(AwaError::Database(ref error))
+            if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))),
+            "busy attempt must report its real error, never stale: {busy:?}"
+        );
+        assert!(responses.remove(0).await.unwrap().unwrap());
+        assert!(!responses.remove(0).await.unwrap().unwrap());
+        assert!(responses.remove(0).await.unwrap().unwrap());
+        assert_eq!(
+            store
+                .load_job(&pool, historical.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            awa_model::JobState::Running
+        );
+        assert_eq!(
+            store
+                .load_job(&pool, ordinary.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            awa_model::JobState::Completed
+        );
+        assert_eq!(
+            store
+                .load_job(&pool, carried.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .output,
+            carried.job.output
+        );
+        blocker.rollback().await.unwrap();
+        let (response, rx) = oneshot::channel();
+        worker
+            .flush(&mut vec![CompletionRequest {
+                job_id: historical.job.id,
+                run_lease: historical.job.run_lease,
+                claim: with_claim.then(|| historical.claim.clone()),
+                runtime_job: None,
+                response,
+            }])
+            .await;
+        assert!(rx.await.unwrap().unwrap());
+        let terminals: Vec<(i64, i64, i64)> = sqlx::query_as(awa_model::audited_sql(format!(
+            "SELECT job_id,run_lease,count(*) FROM {schema}.done_entries
+             WHERE job_id=ANY($1) GROUP BY job_id,run_lease ORDER BY job_id"
+        )))
+        .bind(vec![
+            historical.job.id,
+            ordinary.job.id,
+            stale.job.id,
+            carried.job.id,
+        ])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut expected: Vec<_> = [&historical, &ordinary, &stale, &carried]
+            .into_iter()
+            .map(|job| (job.job.id, job.job.run_lease, 1_i64))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(terminals, expected);
+        sqlx::query(awa_model::audited_sql(format!(
+            "DROP SCHEMA {schema} CASCADE"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn queue_storage_id_completion_contention_isolates_responses() {
+        queue_storage_busy_completion_responses(false).await;
+    }
+
+    #[tokio::test]
+    async fn queue_storage_claim_completion_contention_isolates_responses() {
+        queue_storage_busy_completion_responses(true).await;
     }
 }
