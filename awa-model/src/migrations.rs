@@ -307,7 +307,10 @@ macro_rules! definer_lane_provisioning_pending_sql {
          WHERE to_regprocedure('awa.lane_sequence_problems(text,text)') IS NULL \
          UNION ALL \
          SELECT 'awa.repair_lane_sequence' \
-         WHERE to_regprocedure('awa.repair_lane_sequence(text,text)') IS NULL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.oid = to_regprocedure('awa.repair_lane_sequence(text,text)') \
+               AND p.prosrc LIKE '%set_config(''role'', v_original_role, true)%') \
          UNION ALL \
          SELECT 'awa.refresh_lane_sequence_helpers' \
          WHERE EXISTS ( \

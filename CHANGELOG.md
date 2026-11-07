@@ -13,6 +13,7 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 
 ### Fixed
 
+- Lane-sequence repair completes missing runtime grants when the migration role can `SET ROLE` to the schema owner without inheriting its privileges, and restores its prior role afterward. `awa migrate` refreshes an older installed repair helper even when the versionless provisioning patch was already applied.
 - Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
 - New queue lanes and their sequences belong to the schema owner and receive
   the head table's grants, regardless of which runtime creates them. Migration
