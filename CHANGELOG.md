@@ -16,16 +16,27 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 - New queue lanes and their sequences belong to the schema owner and receive
   the head table's grants, regardless of which runtime creates them. Migration
   also repairs existing lanes where permitted and reports busy or unauthorized
-  sequences for a later repair.
+  sequences for a later repair. `awa storage lane-sequences [--repair]` checks
+  or repairs them and exits with code 2 while problems remain.
 - Promotion isolates contended queue/priority lanes so they cannot stall other
   queues or maintenance. Lock timeouts anywhere in prune or terminal rollup
   roll back the attempt and report `Blocked`.
 - Graceful shutdown waits for pending finalization before stopping heartbeat
   and maintenance, subject to the existing drain timeout.
 - Reads and callbacks identify priority-aged and moved attempts by job ID and
-  run lease, excluding tombstoned source rows. Admin lists and kind counts also
-  include running receipt claims that have not materialized into leases.
-- Failed terminal writes preserve the live ready body's arguments, attempt limit and
+  run lease, preferring live ready bodies over moved source copies. Admin lists
+  and kind counts also include running receipt claims that have not materialized
+  into leases.
+- Physical priority aging excludes claimed rows before its batch limit, waits
+  for in-flight claims and rechecks claim evidence before moving a ready row,
+  including claims committed before their cursor advances. Active point and
+  callback reads recover retained tombstoned bodies left by older aging.
+  Rescue, cancellation and completion by ID recover those bodies and retire
+  unclaimed copies of the same attempt. Emitted claim-lane evidence takes
+  precedence over colliding live replacements; those recovered terminal bodies
+  remain self-contained through retry. Cancellation prefers an active attempt
+  over its historical available replacement.
+- Failed terminal writes preserve the ready body's arguments, attempt limit and
   physical lane. Rust retry and retention carry recover older narrow terminal
   bodies while their backing remains retained. Stored terminal metadata wins
   over ready defaults, and counters use the correct stored and replacement
@@ -43,9 +54,13 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 
 ### Added
 
-- Configurable prune lock timeout in Rust and Python, with prune outcome
-  counters. The timeout applies to each acquisition; queue prune can wait on
-  up to eight partition locks. The default remains 10 ms.
+- `ClientBuilder::prune_lock_timeout` in Rust and
+  `queue_storage_prune_lock_timeout_ms` in Python configure prune's lock wait.
+  The timeout applies to each acquisition; queue prune can wait on up to eight
+  partition locks. The default remains 10 ms. `awa.maintenance.prune.attempts`
+  includes the outcomes `backed_off` and `error`.
+- `awa.maintenance.promote.lane_contention` records promotion lane contention
+  and waiter outcomes by queue.
 - Multi-runtime soak coverage for killed workers, shard changes, mixed Rust and
   Python workloads, durable recovery evidence and ring-lock diagnostics.
 
@@ -65,6 +80,19 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 - The installed `terminal_jobs` SQL view and creation-time bucket joins still
   use the stored priority for older mismatched rows. Retention carry can widen
   surviving failed rows, but already-pruned backing bodies cannot be rebuilt.
+- Legacy or backfilled claims can lack unique emitted claim-lane evidence.
+  Recovery then prefers a unique live body, which cannot reliably identify the
+  original physical lane if an old aging race left a colliding live replacement.
+  Multiple equally supported bodies cause an explicit ambiguity error and
+  transaction rollback.
+- Repair of an old aging replacement runs when a transition hydrates a retained
+  tombstoned body. Worker completion using its already carried job body does not
+  perform that repair, and can leave an old replacement claimable. The aging
+  fence prevents new replacements from updated callers; it cannot fence an
+  older process explicitly calling physical aging during a rolling upgrade.
+  Repair takes claim-head row locks without waiting and rolls back on contention;
+  the operation must retry. It adds weak relation locks and tombstone writes
+  only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
 
 ## [0.6.13] — 2026-11-06
 

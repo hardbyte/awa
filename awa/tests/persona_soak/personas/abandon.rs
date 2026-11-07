@@ -124,6 +124,7 @@ pub async fn run_child() {
     ) else {
         return;
     };
+    super::super::worker_errors::install(true).expect("child worker error tracing");
     let generation: u32 = generation.parse().expect("generation");
     let workers: u32 = workers.parse().expect("workers");
     let pool_size: u32 = std::env::var(ENV_POOL)
@@ -317,10 +318,22 @@ fn spawn_child(
     .flatten()
     {
         let shared = shared.clone();
+        let output_guard = super::super::worker_errors::child_output_guard();
         tokio::spawn(async move {
+            let _output_guard = output_guard;
             let mut lines = BufReader::new(stream).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                absorb_output(&shared, &line);
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => absorb_output(&shared, &line),
+                    Ok(None) => break,
+                    Err(error) => {
+                        shared.incomplete(
+                            format!("claiming-child output read failed: {error}"),
+                            vec![],
+                        );
+                        break;
+                    }
+                }
             }
         });
     }
@@ -328,6 +341,9 @@ fn spawn_child(
 }
 
 fn absorb_output(shared: &Shared, line: &str) {
+    if super::super::worker_errors::absorb_child_marker(line) {
+        return;
+    }
     let stats = shared.stats(Persona::ClaimAbandon);
     let field = |name: &str| {
         line.split_whitespace()

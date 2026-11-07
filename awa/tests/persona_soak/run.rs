@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 const HEADROOM: u32 = 14;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
+    let worker_errors = super::worker_errors::install(false)?;
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -239,6 +240,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
         server.stop();
     }
+    super::worker_errors::reconcile(&shared, &worker_errors).await;
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
