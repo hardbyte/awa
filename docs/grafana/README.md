@@ -157,6 +157,7 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.maintenance.promote_batch_size` | Histogram | state | Jobs promoted |
 | `awa.maintenance.promote_duration` | Histogram (s) | state | Promotion time |
 | `awa.maintenance.promote.lane_contention` | Counter | state, queue, outcome | Promotion lanes whose lock was busy: `handed_off` to a dedicated waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out` when a waiter's 30 s wait ran out |
+| `awa.maintenance.promote.commit_lock_timeouts` | Counter | state | Promotion transactions whose `COMMIT` ran out of the connection's `lock_timeout`; their rows stay deferred until the next tick |
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
 
 ### Heartbeat

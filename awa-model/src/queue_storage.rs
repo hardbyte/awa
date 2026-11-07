@@ -380,8 +380,8 @@ pub struct PromoteOutcome {
     /// contended lane. A batch that selected its full size may have left
     /// further due rows behind.
     pub selected: usize,
-    /// Lanes whose promotion transaction hit `lock_timeout` and rolled back.
-    /// Their rows stay deferred.
+    /// Lanes whose locks were held past `lock_timeout`, so their promotion
+    /// transaction rolled back. Their rows stay deferred.
     pub contended: Vec<PromotionLane>,
 }
 
@@ -449,6 +449,27 @@ async fn set_lock_timeout_tx(
 ) -> Result<(), AwaError> {
     let millis = timeout.as_millis().max(1).min(i64::MAX as u128);
     let timeout = format!("{millis}ms");
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(timeout)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
+/// The transaction's current `lock_timeout`, in a form
+/// [`restore_lock_timeout_tx`] accepts.
+async fn lock_timeout_tx(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<String, AwaError> {
+    sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+}
+
+async fn restore_lock_timeout_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    timeout: &str,
+) -> Result<(), AwaError> {
     sqlx::query("SELECT set_config('lock_timeout', $1, true)")
         .bind(timeout)
         .execute(tx.as_mut())
@@ -15844,8 +15865,9 @@ impl QueueStorage {
         )
     }
 
-    /// One lane's promotion transaction. `None` when it hit `lock_timeout`
-    /// and rolled back.
+    /// One lane's promotion transaction. `None` when its lane locks hit
+    /// `lock_timeout` and it rolled back. A lock timeout at `COMMIT` is not
+    /// lane contention and is returned as an error.
     async fn promote_lane(
         &self,
         pool: &PgPool,
@@ -15861,8 +15883,17 @@ impl QueueStorage {
         {
             Ok(promoted) => match tx.commit().await {
                 Ok(()) => Ok(Some(promoted)),
-                Err(err) if is_lock_contention_error(&err) => Ok(None),
-                Err(err) => Err(map_sqlx_error(err)),
+                Err(err) => {
+                    if is_lock_contention_error(&err) {
+                        tracing::warn!(
+                            queue = %lane.queue,
+                            priority = lane.priority,
+                            state = state.as_str(),
+                            "Promotion commit timed out waiting for a lock; its rows stay deferred"
+                        );
+                    }
+                    Err(map_sqlx_error(err))
+                }
             },
             Err(AwaError::Database(err)) if is_lock_contention_error(&err) => {
                 tx.rollback().await.map_err(map_sqlx_error)?;
@@ -15880,9 +15911,14 @@ impl QueueStorage {
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
     ) -> Result<usize, AwaError> {
-        if let Some(timeout) = lock_timeout {
-            set_lock_timeout_tx(tx, timeout).await?;
-        }
+        let caller_lock_timeout = match lock_timeout {
+            Some(timeout) => {
+                let caller_lock_timeout = lock_timeout_tx(tx).await?;
+                set_lock_timeout_tx(tx, timeout).await?;
+                Some(caller_lock_timeout)
+            }
+            None => None,
+        };
 
         let schema = self.schema();
         let (row_filter, limit) = match rows {
@@ -15964,6 +16000,12 @@ impl QueueStorage {
             .collect();
         self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
             .await?;
+        // The bound covers the lane's locks only. The NOTIFY takes
+        // PostgreSQL's notify-queue lock at COMMIT, which every notifying
+        // transaction in the cluster serialises on.
+        if let Some(caller_lock_timeout) = caller_lock_timeout {
+            restore_lock_timeout_tx(tx, &caller_lock_timeout).await?;
+        }
         self.notify_queues_tx(tx, vec![lane.queue.clone()]).await?;
         Ok(promoted)
     }

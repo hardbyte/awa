@@ -4,6 +4,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- Promotion's 50 ms lock wait now covers only the lane's locks. It no longer
+  applies at `COMMIT`, where every transaction that issued NOTIFY waits its
+  turn for PostgreSQL's notify-queue lock. Under concurrent enqueues, that wait
+  rolled back whole promotion batches as contended lanes and delayed scheduled
+  and retryable jobs. A `COMMIT` that runs out of the caller's own
+  `lock_timeout` is now counted by
+  `awa.maintenance.promote.commit_lock_timeouts` rather than reported as lane
+  contention.
+
 ## [0.6.14-alpha.1] — 2026-11-07
 
 Prerelease of the 0.6.14 queue-storage fixes. The schema remains v40. Apply the
