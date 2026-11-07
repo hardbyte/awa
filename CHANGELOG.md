@@ -30,7 +30,9 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 - Physical priority aging waits for in-flight claims and rechecks claim evidence
   before moving a ready row, including claims committed before their cursor
   advances. Rescue, cancellation and completion can recover retained tombstoned
-  bodies left by older aging, preserving claim-time priority metadata.
+  bodies left by older aging, preserving claim-time priority metadata. Emitted
+  claim-lane evidence takes precedence over colliding live replacements; those
+  recovered terminal bodies remain self-contained through retry.
 - Failed terminal writes preserve the ready body's arguments, attempt limit and
   physical lane. Rust retry and retention carry recover older narrow terminal
   bodies while their backing remains retained. Stored terminal metadata wins
@@ -75,9 +77,11 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 - The installed `terminal_jobs` SQL view and creation-time bucket joins still
   use the stored priority for older mismatched rows. Retention carry can widen
   surviving failed rows, but already-pruned backing bodies cannot be rebuilt.
-- Multiple historical tombstoned bodies can remain ambiguous without unique
-  emitted claim-lane evidence. Hydration reports that ambiguity and rolls back
-  rather than choosing a body with potentially different arguments or priority.
+- Legacy or backfilled claims can lack unique emitted claim-lane evidence.
+  Recovery then prefers a unique live body, which cannot reliably identify the
+  original physical lane if an old aging race left a colliding live replacement.
+  Multiple equally supported bodies cause an explicit ambiguity error and
+  transaction rollback.
 
 ## [0.6.13] — 2026-11-06
 
