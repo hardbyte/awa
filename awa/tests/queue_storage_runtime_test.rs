@@ -19748,15 +19748,13 @@ async fn historical_recovery_head_contention_rolls_back(receipts: bool, deadline
     .await
     .unwrap();
     let result = tokio::time::timeout(
-        scaled_timeout(Duration::from_secs(2)),
+        ci_timing::scaled_timeout(Duration::from_secs(2)),
         store.rescue_stale_heartbeats(&pool, Duration::ZERO),
     )
     .await
-    .expect("contended recovery head fails without waiting");
-    assert!(
-        matches!(result, Err(AwaError::Database(ref error)) if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some("55P03"))),
-        "recovery must fail with lock_not_available: {result:?}"
-    );
+    .expect("contended recovery head is skipped without waiting")
+    .expect("busy historical attempt is deferred");
+    assert!(result.is_empty(), "busy attempt remains open");
     let done: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {schema}.done_entries WHERE job_id=$1"
     ))
@@ -19836,4 +19834,340 @@ async fn test_historical_tombstoned_deadline_claim_completes_and_retires_copy() 
 #[tokio::test]
 async fn test_historical_tombstoned_legacy_claim_completes_and_retires_copy() {
     historical_tombstoned_claim_completes(false, Duration::from_secs(300)).await;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedBatchTransition {
+    Heartbeat,
+    Deadline,
+    Callback,
+}
+
+async fn retained_batch_transition(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    transition: RetainedBatchTransition,
+) -> Vec<(i64, i64)> {
+    tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(2)), async {
+        match transition {
+            RetainedBatchTransition::Heartbeat => store
+                .rescue_stale_heartbeats(pool, Duration::ZERO)
+                .await
+                .expect("rescue unblocked stale attempts")
+                .into_iter()
+                .map(|job| (job.id, job.run_lease))
+                .collect(),
+            RetainedBatchTransition::Deadline => store
+                .rescue_expired_deadlines(pool)
+                .await
+                .expect("rescue unblocked expired attempts")
+                .into_iter()
+                .map(|job| (job.id, job.run_lease))
+                .collect(),
+            RetainedBatchTransition::Callback => store
+                .rescue_expired_callbacks(pool)
+                .await
+                .expect("rescue unblocked expired callbacks")
+                .into_iter()
+                .map(|job| (job.id, job.run_lease))
+                .collect(),
+        }
+    })
+    .await
+    .expect("busy historical head cannot delay ordinary transitions")
+}
+
+async fn retained_receipt_cursor(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    slot: i32,
+) -> serde_json::Value {
+    sqlx::query_scalar(&format!(
+        "SELECT jsonb_build_array(rescue_cursor_claimed_at, rescue_cursor_job_id,
+             rescue_cursor_run_lease, deadline_cursor_deadline_at, deadline_cursor_job_id,
+             deadline_cursor_run_lease)
+         FROM {}.claim_ring_slots WHERE slot=$1",
+        store.schema()
+    ))
+    .bind(slot)
+    .fetch_one(pool)
+    .await
+    .expect("read receipt rescue cursors")
+}
+
+async fn retained_closed_receipts(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    pair: (i64, i64),
+) -> i64 {
+    let schema = store.schema();
+    sqlx::query_scalar(&format!(
+        "SELECT
+          (SELECT count(*) FROM {schema}.lease_claim_closures WHERE job_id=$1 AND run_lease=$2)
+          + (SELECT count(*) FROM {schema}.lease_claim_closure_batches AS closures
+             WHERE EXISTS (
+                 SELECT 1 FROM {schema}.lease_claim_batches AS claims
+                 CROSS JOIN LATERAL unnest(claims.job_ids,claims.run_leases,claims.receipt_ids)
+                     AS members(job_id,run_lease,receipt_id)
+                 WHERE members.job_id=$1 AND members.run_lease=$2
+                   AND closures.receipt_ranges @> members.receipt_id))
+          + (SELECT count(*) FROM {schema}.lease_claims
+             WHERE job_id=$1 AND run_lease=$2 AND closed_at IS NOT NULL)"
+    ))
+    .bind(pair.0)
+    .bind(pair.1)
+    .fetch_one(pool)
+    .await
+    .expect("count exact receipt closure evidence")
+}
+
+async fn historical_busy_attempt_does_not_block_batch(
+    transition: RetainedBatchTransition,
+    materialized: bool,
+) {
+    let deadline = if transition == RetainedBatchTransition::Heartbeat {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(300)
+    };
+    let (_guard, pool, store, historical) =
+        historical_tombstoned_claim_fixture(true, deadline, false).await;
+    let queue = "qs_unblocked_batch";
+    let ordinary_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9042 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, deadline)
+        .await
+        .expect("claim ordinary batch member");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, ordinary_id);
+    let historical_pair = (historical.job_id, historical.run_lease);
+    let ordinary_pair = (ordinary_id, claimed[0].job.run_lease);
+    let pairs = [historical_pair, ordinary_pair];
+    if materialized || transition == RetainedBatchTransition::Callback {
+        for &(job_id, run_lease) in &pairs {
+            let callback = store
+                .register_callback(&pool, job_id, run_lease, Duration::from_secs(300))
+                .await
+                .expect("materialize attempt");
+            if transition == RetainedBatchTransition::Callback {
+                assert!(store
+                    .enter_callback_wait(&pool, job_id, run_lease, callback)
+                    .await
+                    .expect("park callback attempt"));
+            }
+        }
+    }
+    let schema = store.schema();
+    let progress = serde_json::json!({"phase":"before-retained-head"});
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.attempt_state (job_id,run_lease,progress,heartbeat_at,updated_at)
+         VALUES ($1,$2,$3,clock_timestamp()-interval '1 hour',clock_timestamp())
+         ON CONFLICT (job_id,run_lease) DO UPDATE SET progress=EXCLUDED.progress,
+             heartbeat_at=EXCLUDED.heartbeat_at"
+    ))
+    .bind(historical_pair.0)
+    .bind(historical_pair.1)
+    .bind(&progress)
+    .execute(&pool)
+    .await
+    .expect("seed mutable attempt state");
+    if transition == RetainedBatchTransition::Deadline {
+        for table in ["leases", "lease_claims"] {
+            sqlx::query(&format!(
+                "UPDATE {schema}.{table} SET deadline_at=clock_timestamp()-interval '1 hour'
+                 WHERE deadline_at IS NOT NULL"
+            ))
+            .execute(&pool)
+            .await
+            .expect("expire test deadlines");
+        }
+    }
+    if transition == RetainedBatchTransition::Callback {
+        sqlx::query(&format!(
+            "UPDATE {schema}.leases SET callback_timeout_at=clock_timestamp()-interval '1 hour'
+             WHERE state='waiting_external'"
+        ))
+        .execute(&pool)
+        .await
+        .expect("expire test callbacks");
+    }
+    let cursor_before = retained_receipt_cursor(&pool, &store, historical.claim_slot).await;
+    assert_eq!(
+        retained_closed_receipts(&pool, &store, historical_pair).await,
+        0
+    );
+    let mut blocker = pool.begin().await.expect("begin retained lane blocker");
+    sqlx::query(&format!(
+        "SELECT 1 FROM {schema}.queue_claim_heads
+         WHERE queue='qs_claimed_aging_body' AND priority=3 AND enqueue_shard=0 FOR UPDATE"
+    ))
+    .fetch_one(blocker.as_mut())
+    .await
+    .expect("hold one required historical head");
+
+    assert_eq!(
+        retained_batch_transition(&pool, &store, transition).await,
+        vec![ordinary_pair]
+    );
+    let active = store
+        .load_job(&pool, historical.job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_state = if transition == RetainedBatchTransition::Callback {
+        JobState::WaitingExternal
+    } else {
+        JobState::Running
+    };
+    assert_historical_active_body(&active, &historical, expected_state);
+    assert_eq!(active.progress, Some(progress.clone()));
+    let stored_progress: serde_json::Value = sqlx::query_scalar(&format!(
+        "SELECT progress FROM {schema}.attempt_state WHERE job_id=$1 AND run_lease=$2"
+    ))
+    .bind(historical_pair.0)
+    .bind(historical_pair.1)
+    .fetch_one(&pool)
+    .await
+    .expect("blocked attempt state survives rollback");
+    assert_eq!(stored_progress, progress);
+    assert_eq!(
+        retained_closed_receipts(&pool, &store, historical_pair).await,
+        0
+    );
+    if !materialized {
+        assert_eq!(
+            retained_receipt_cursor(&pool, &store, historical.claim_slot).await,
+            cursor_before,
+            "an open first receipt remains eligible at its original cursor"
+        );
+    }
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 1);
+    assert!(
+        terminal_counts_by_priority(&pool, schema, "qs_claimed_aging_body")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, queue).await,
+        vec![(4, 1)]
+    );
+    blocker.rollback().await.expect("release retained head");
+    assert_eq!(
+        retained_batch_transition(&pool, &store, transition).await,
+        vec![historical_pair]
+    );
+    assert!(retained_batch_transition(&pool, &store, transition)
+        .await
+        .is_empty());
+    let terminals: Vec<(i64, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT job_id,run_lease,count(*) FROM {schema}.done_entries
+         WHERE job_id=ANY($1) GROUP BY job_id,run_lease ORDER BY job_id"
+    ))
+    .bind(vec![historical.job_id, ordinary_id])
+    .fetch_all(&pool)
+    .await
+    .expect("read terminal attempt uniqueness");
+    let mut expected = vec![
+        (historical_pair.0, historical_pair.1, 1),
+        (ordinary_pair.0, ordinary_pair.1, 1),
+    ];
+    expected.sort_unstable();
+    assert_eq!(terminals, expected);
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, "qs_claimed_aging_body").await,
+        vec![(4, 1)]
+    );
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, queue).await,
+        vec![(4, 1)]
+    );
+    for _ in 0..8 {
+        assert!(store
+            .claim_runtime_batch(&pool, "qs_claimed_aging_body", 10, deadline)
+            .await
+            .expect("retired old replacement stays unclaimable")
+            .iter()
+            .all(|row| row.job.id != historical.job_id));
+    }
+}
+
+#[tokio::test]
+async fn test_busy_retained_head_does_not_block_compact_heartbeat_rescue() {
+    historical_busy_attempt_does_not_block_batch(RetainedBatchTransition::Heartbeat, false).await;
+}
+
+#[tokio::test]
+async fn test_busy_retained_head_does_not_block_receipt_deadline_rescue() {
+    historical_busy_attempt_does_not_block_batch(RetainedBatchTransition::Deadline, false).await;
+}
+
+#[tokio::test]
+async fn test_busy_retained_head_does_not_block_materialized_deadline_rescue() {
+    historical_busy_attempt_does_not_block_batch(RetainedBatchTransition::Deadline, true).await;
+}
+
+#[tokio::test]
+async fn test_busy_retained_head_does_not_block_callback_rescue() {
+    historical_busy_attempt_does_not_block_batch(RetainedBatchTransition::Callback, true).await;
+}
+
+#[tokio::test]
+async fn test_busy_retained_head_cancel_preserves_lock_not_available() {
+    let (_guard, pool, store, claim) =
+        historical_tombstoned_claim_fixture(true, Duration::ZERO, false).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(&format!(
+        "SELECT 1 FROM {}.queue_claim_heads
+         WHERE queue='qs_claimed_aging_body' AND priority=3 AND enqueue_shard=0 FOR UPDATE",
+        store.schema()
+    ))
+    .fetch_one(blocker.as_mut())
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(2)),
+        store.cancel_running(
+            &pool,
+            claim.job_id,
+            claim.run_lease,
+            "test cancellation",
+            None,
+        ),
+    )
+    .await
+    .expect("single attempt cancellation fails without waiting");
+    assert!(
+        matches!(result, Err(AwaError::Database(ref error)) if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some("55P03"))),
+        "single attempt preserves lock_not_available: {result:?}"
+    );
+    assert_eq!(
+        retained_closed_receipts(&pool, &store, (claim.job_id, claim.run_lease)).await,
+        0
+    );
+    assert_eq!(
+        store
+            .load_job(&pool, claim.job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Running
+    );
+    blocker.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_busy_retained_head_does_not_block_materialized_heartbeat_rescue() {
+    historical_busy_attempt_does_not_block_batch(RetainedBatchTransition::Heartbeat, true).await;
 }
