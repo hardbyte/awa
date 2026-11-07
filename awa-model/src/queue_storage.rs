@@ -796,8 +796,34 @@ pub(crate) fn open_receipt_running_claims_sql(schema: &str) -> String {
 /// retained batch header is read, but only batches holding one of the jobs
 /// are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
-    let closure_rel = format!("{schema}.lease_claim_closures");
-    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+    open_receipt_running_claims_sql_from(schema, job_ids, None)
+}
+
+/// The same open-claim projection, scoped to one validated physical claim slot.
+/// Ready and terminal history are deliberately not restricted to that slot.
+pub(crate) fn open_receipt_running_claims_sql_in_slot(schema: &str, slot: usize) -> String {
+    open_receipt_running_claims_sql_from(schema, None, Some(slot))
+}
+
+fn open_receipt_running_claims_sql_from(
+    schema: &str,
+    job_ids: Option<&str>,
+    slot: Option<usize>,
+) -> String {
+    let (claims_rel, batches_rel, closure_rel, closure_batch_rel) = match slot {
+        Some(slot) => (
+            claim_child_name(schema, slot),
+            claim_batch_child_name(schema, slot),
+            closure_child_name(schema, slot),
+            claim_closure_batch_child_name(schema, slot),
+        ),
+        None => (
+            format!("{schema}.lease_claims"),
+            format!("{schema}.lease_claim_batches"),
+            format!("{schema}.lease_claim_closures"),
+            format!("{schema}.lease_claim_closure_batches"),
+        ),
+    };
     let row_open = receipt_evidence_sql(
         schema,
         &closure_rel,
@@ -815,7 +841,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
     format!(
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
-        FROM {schema}.lease_claims AS claims
+        FROM {claims_rel} AS claims
         WHERE {row_filter}{row_open}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
@@ -824,7 +850,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
           )
         UNION ALL
         SELECT items.job_id, items.run_lease, batches.queue
-        FROM {schema}.lease_claim_batches AS batches
+        FROM {batches_rel} AS batches
         CROSS JOIN LATERAL unnest(
             batches.job_ids,
             batches.run_leases,
@@ -12006,6 +12032,8 @@ impl QueueStorage {
         // A job moves between these relations as it is promoted, claimed,
         // completed or dead-lettered. Read them all from one snapshot so a
         // move between two reads cannot hide the job or surface a stale row.
+        // Keep the located ready-body partitions locked until commit; later
+        // read savepoints release unrelated relation locks after each leg.
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
             .await
             .map_err(map_sqlx_error)?;
@@ -12017,6 +12045,52 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
         begin_guard.begin_pending = false;
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let ready_slots: Vec<i32> = sqlx::query_scalar(&format!(
+            "SELECT DISTINCT ready_slot FROM {schema}.ready_entries WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        let ready_slots = ready_slots
+            .into_iter()
+            .map(|slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let child_sources = |tombstones: bool| {
+            if ready_slots.is_empty() {
+                let table = if tombstones {
+                    "ready_tombstones"
+                } else {
+                    "ready_entries"
+                };
+                format!("SELECT * FROM ONLY {schema}.{table} WHERE FALSE")
+            } else {
+                ready_slots
+                    .iter()
+                    .map(|&slot| {
+                        let child = if tombstones {
+                            ready_tombstone_child_name(schema, slot)
+                        } else {
+                            ready_child_name(schema, slot)
+                        };
+                        format!("SELECT * FROM {child}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL ")
+            }
+        };
+        let ready_sources = child_sources(false);
+        let tombstone_sources = child_sources(true);
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12034,10 +12108,10 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
+            FROM ({ready_sources}) AS ready
             WHERE ready.job_id = $1
               AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  SELECT 1 FROM ({tombstone_sources}) AS tomb
                   WHERE tomb.ready_slot = ready.ready_slot
                     AND tomb.ready_generation = ready.ready_generation
                     AND tomb.queue = ready.queue
@@ -12056,6 +12130,10 @@ impl QueueStorage {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let deferred_rows: Vec<DeferredJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12083,10 +12161,20 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         for row in deferred_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let lease_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12120,7 +12208,7 @@ impl QueueStorage {
                 attempt.progress,
                 attempt.callback_result
             FROM {schema}.leases AS lease
-            JOIN {schema}.ready_entries AS ready
+            JOIN ({ready_sources}) AS ready
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
@@ -12131,7 +12219,7 @@ impl QueueStorage {
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
              AND NOT EXISTS (
-                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 SELECT 1 FROM ({tombstone_sources}) AS tomb
                  WHERE tomb.ready_slot = ready.ready_slot
                    AND tomb.ready_generation = ready.ready_generation
                    AND tomb.queue = ready.queue
@@ -12150,12 +12238,22 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         for row in lease_rows {
             candidates.push(row.into_job_row()?);
         }
 
         // Report receipt-backed attempts as running by anti-joining
         // lease_claims against every durable closure evidence shape.
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let lease_claim_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12189,7 +12287,7 @@ impl QueueStorage {
                 attempt.progress,
                 attempt.callback_result
             FROM {schema}.lease_claims AS claims
-            JOIN {schema}.ready_entries AS ready
+            JOIN ({ready_sources}) AS ready
               ON ready.ready_slot = claims.ready_slot
              AND ready.ready_generation = claims.ready_generation
              AND ready.queue = claims.queue
@@ -12200,7 +12298,7 @@ impl QueueStorage {
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
              AND NOT EXISTS (
-                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 SELECT 1 FROM ({tombstone_sources}) AS tomb
                  WHERE tomb.ready_slot = ready.ready_slot
                    AND tomb.ready_generation = ready.ready_generation
                    AND tomb.queue = ready.queue
@@ -12228,6 +12326,12 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         for row in lease_claim_rows {
             candidates.push(row.into_job_row()?);
         }
@@ -12236,6 +12340,10 @@ impl QueueStorage {
         // them only for this admin read, and report still-open items as
         // running until durable closure, terminal, or materialized-lease
         // evidence supersedes the claim.
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let lease_claim_batch_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12277,7 +12385,7 @@ impl QueueStorage {
                 claim_batches.attempts,
                 claim_batches.max_attempts
             ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-            JOIN {schema}.ready_entries AS ready
+            JOIN ({ready_sources}) AS ready
               ON ready.ready_slot = claim_batches.ready_slot
              AND ready.ready_generation = claim_batches.ready_generation
              AND ready.queue = claim_batches.queue
@@ -12286,7 +12394,7 @@ impl QueueStorage {
              AND ready.job_id = items.job_id
              AND ready.run_lease + 1 = items.run_lease
              AND NOT EXISTS (
-                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 SELECT 1 FROM ({tombstone_sources}) AS tomb
                  WHERE tomb.ready_slot = ready.ready_slot
                    AND tomb.ready_generation = ready.ready_generation
                    AND tomb.queue = ready.queue
@@ -12339,10 +12447,20 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         for row in lease_claim_batch_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let done_rows: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12375,10 +12493,20 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         for row in done_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let dlq_rows: Vec<DlqJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12408,6 +12536,12 @@ impl QueueStorage {
         ))
         .bind(job_id)
         .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in dlq_rows {
