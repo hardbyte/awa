@@ -6,6 +6,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Retry queue-storage worker finalization after transient lock contention within
+  its existing 120-second deadline, preserving the saved handler outcome. Keep
+  attempt heartbeats active until finalization settles while releasing handler
+  capacity. Direct store APIs still return contention errors for caller retries.
+
 - Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
 - Keep committed claims out of physical priority aging before its batch limit,
   even before their cursor advances. Active point and callback reads recover
@@ -26,8 +31,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   Repair takes claim-head row locks without waiting. Rescue batches defer
   busy historical attempts while progressing other attempts; receipt rescue
   cursors keep deferred attempts eligible. Worker completion batches isolate
-  lock contention to the affected requests. Direct completion and
-  single-attempt mutations still fail on contention and must retry. It adds
+  lock contention to the affected requests. Direct store completion and
+  single-attempt store mutations still fail on contention and must retry. It adds
   weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ
   COMMITTED isolation.
 
