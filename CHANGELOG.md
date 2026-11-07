@@ -6,14 +6,20 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- Promotion's 50 ms lock wait now covers only the lane's locks. It no longer
-  applies at `COMMIT`, where every transaction that issued NOTIFY waits its
-  turn for PostgreSQL's notify-queue lock. Under concurrent enqueues, that wait
-  rolled back whole promotion batches as contended lanes and delayed scheduled
-  and retryable jobs. A `COMMIT` that runs out of the caller's own
-  `lock_timeout` is now counted by
-  `awa.maintenance.promote.commit_lock_timeouts` rather than reported as lane
-  contention.
+- Promotion no longer issues NOTIFY inside its per-lane transactions. A
+  notifying transaction takes PostgreSQL's notify-queue lock at `COMMIT`, and
+  every notifying transaction in the cluster waits its turn for it. Each lane
+  transaction waited there while still holding its lane's locks and its 50 ms
+  lock timeout, so under concurrent enqueues the commit timed out, the batch
+  rolled back as a contended lane, and due scheduled and retryable jobs were
+  delayed. Promotion now wakes claimers once, after its lanes commit. The wakeup
+  is a hint that claimers also poll for, so if it fails it is logged and the
+  promotion stands.
+- Heartbeat, deadline and receipt rescue skip an attempt whose retained ready
+  bodies are ambiguous, logging an error on each pass, instead of rolling back
+  the whole rescue. Before, one such attempt stopped rescue of every other
+  stale attempt in the schema. The skipped attempt stays running until its
+  bodies are repaired.
 
 ## [0.6.14-alpha.1] — 2026-11-07
 

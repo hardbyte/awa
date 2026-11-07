@@ -8409,13 +8409,12 @@ async fn hold_notify_commit_lock(
     }
 }
 
-/// Promotion's short lock timeout bounds its wait for the lane's locks, not
-/// the notify-queue lock its COMMIT takes. A promotion that commits while
-/// another notifying transaction holds that lock waits and succeeds, and a
-/// commit that runs out of the caller's own `lock_timeout` is an error, not a
-/// contended lane.
+/// Promotion's lane transactions do not wait for the notify-queue lock: a lane
+/// promotes under its short lock timeout while another notifying transaction
+/// holds that lock, and a wakeup that cannot get it, under the connection's own
+/// `lock_timeout`, does not undo or fail the promotion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_promotion_lock_timeout_does_not_cover_its_commit() {
+async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_lanes() {
     const PRIORITY: i16 = 2;
     let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_promote_notify_commit";
@@ -8484,12 +8483,9 @@ async fn test_queue_storage_promotion_lock_timeout_does_not_cover_its_commit() {
         .await;
     holder.await.expect("notify holder");
     caller_lock_timeout_pool.close().await;
-    match result {
-        Err(AwaError::Database(sqlx::Error::Database(error))) => {
-            assert_eq!(error.code().as_deref(), Some("55P03"), "{error}");
-        }
-        other => panic!("expected the commit to hit the caller's lock_timeout, got {other:?}"),
-    }
+    let outcome = result.expect("a failed wakeup does not fail the promotion");
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert!(outcome.contended.is_empty(), "{outcome:?}");
     let deferred: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {}.deferred_jobs WHERE queue = $1",
         store.schema()
@@ -8498,13 +8494,19 @@ async fn test_queue_storage_promotion_lock_timeout_does_not_cover_its_commit() {
     .fetch_one(&pool)
     .await
     .expect("count deferred rows");
-    assert_eq!(deferred, 1, "the timed-out promotion rolled back");
+    assert_eq!(deferred, 0);
 
-    let outcome = store
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(60))
+        .await
+        .expect("claim promoted rows");
+    assert_eq!(claimed.len(), 4);
+    assert!(store
         .promote_due_lane(&pool, JobState::Scheduled, &lane, 100, None)
         .await
-        .expect("promote after the notify lock is free");
-    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+        .expect("nothing left to promote")
+        .contended
+        .is_empty());
 }
 
 /// The maintenance leader must not wait on a lane whose enqueue lock never

@@ -728,12 +728,6 @@ const PROMOTE_LANE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 /// waiters in arrival order, so a waiter is served after the producers queued
 /// ahead of it, however busy the lane stays.
 const PROMOTE_LANE_WAITER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn is_lock_timeout(error: &AwaError) -> bool {
-    matches!(error, AwaError::Database(sqlx::Error::Database(database))
-        if database.code().as_deref() == Some("55P03"))
-}
-
 /// Most lanes with a dedicated waiter at once. A waiter holds a pool
 /// connection while it waits, so smaller pools get fewer: one per eight
 /// connections, and always one so a busy lane is still promoted.
@@ -798,7 +792,7 @@ impl QueueStoragePromoter {
             let mut skip = self.waiting_lanes(state);
             skip.extend(contended.iter().cloned());
             let batch_started = Instant::now();
-            let outcome = match self
+            let outcome = self
                 .store
                 .promote_due_lanes(
                     &self.pool,
@@ -807,16 +801,7 @@ impl QueueStoragePromoter {
                     Some(PROMOTE_LANE_LOCK_TIMEOUT),
                     &skip,
                 )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) if is_lock_timeout(&err) => {
-                    self.metrics
-                        .record_promotion_commit_lock_timeout(state.as_str());
-                    break;
-                }
-                Err(err) => return Err(err),
-            };
+                .await?;
             self.metrics.record_promotion_batch(
                 state.as_str(),
                 outcome.promoted as u64,
@@ -940,10 +925,6 @@ async fn promote_waiting_lane(
                 if (outcome.selected as i64) < PROMOTE_BATCH_SIZE {
                     return;
                 }
-            }
-            Err(err) if is_lock_timeout(&err) => {
-                metrics.record_promotion_commit_lock_timeout(state.as_str());
-                return;
             }
             Err(err) => {
                 error!(

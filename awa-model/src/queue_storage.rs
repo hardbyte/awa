@@ -457,27 +457,6 @@ async fn set_lock_timeout_tx(
     Ok(())
 }
 
-/// The transaction's current `lock_timeout`, in a form
-/// [`restore_lock_timeout_tx`] accepts.
-async fn lock_timeout_tx(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<String, AwaError> {
-    sqlx::query_scalar("SELECT current_setting('lock_timeout')")
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)
-}
-
-async fn restore_lock_timeout_tx(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    timeout: &str,
-) -> Result<(), AwaError> {
-    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-        .bind(timeout)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-    Ok(())
-}
-
 /// Commit or roll back a maintenance transaction that has set the prune
 /// `lock_timeout`.
 ///
@@ -15849,8 +15828,9 @@ impl QueueStorage {
                 .or_default()
                 .push(job_id);
         }
+        let mut promoted_queues = BTreeSet::new();
         for (lane, job_ids) in lanes {
-            match self
+            let promoted = self
                 .promote_lane(
                     pool,
                     state,
@@ -15858,12 +15838,22 @@ impl QueueStorage {
                     DueLaneRows::Selected(&job_ids),
                     lane_lock_timeout,
                 )
-                .await?
-            {
-                Some(promoted) => outcome.promoted += promoted,
-                None => outcome.contended.push(lane),
+                .await;
+            match promoted {
+                Ok(Some(promoted)) => {
+                    outcome.promoted += promoted;
+                    if promoted > 0 {
+                        promoted_queues.insert(lane.queue);
+                    }
+                }
+                Ok(None) => outcome.contended.push(lane),
+                Err(err) => {
+                    self.notify_promoted_queues(pool, promoted_queues).await;
+                    return Err(err);
+                }
             }
         }
+        self.notify_promoted_queues(pool, promoted_queues).await;
         Ok(outcome)
     }
 
@@ -15882,33 +15872,34 @@ impl QueueStorage {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
             return Ok(PromoteOutcome::default());
         }
-        Ok(
-            match self
-                .promote_lane(
-                    pool,
-                    state,
-                    lane,
-                    DueLaneRows::Oldest(batch_size),
-                    lane_lock_timeout,
-                )
-                .await?
-            {
-                Some(promoted) => PromoteOutcome {
-                    promoted,
-                    selected: promoted,
-                    contended: Vec::new(),
-                },
-                None => PromoteOutcome {
-                    contended: vec![lane.clone()],
-                    ..PromoteOutcome::default()
-                },
+        let promoted = self
+            .promote_lane(
+                pool,
+                state,
+                lane,
+                DueLaneRows::Oldest(batch_size),
+                lane_lock_timeout,
+            )
+            .await?;
+        if promoted.is_some_and(|promoted| promoted > 0) {
+            self.notify_promoted_queues(pool, [lane.queue.clone()])
+                .await;
+        }
+        Ok(match promoted {
+            Some(promoted) => PromoteOutcome {
+                promoted,
+                selected: promoted,
+                contended: Vec::new(),
             },
-        )
+            None => PromoteOutcome {
+                contended: vec![lane.clone()],
+                ..PromoteOutcome::default()
+            },
+        })
     }
 
-    /// One lane's promotion transaction. `None` when its lane locks hit
-    /// `lock_timeout` and it rolled back. A lock timeout at `COMMIT` is not
-    /// lane contention and is returned as an error.
+    /// One lane's promotion transaction. `None` when its locks hit
+    /// `lock_timeout` and it rolled back.
     async fn promote_lane(
         &self,
         pool: &PgPool,
@@ -15922,20 +15913,10 @@ impl QueueStorage {
             .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
             .await
         {
-            Ok(promoted) => match tx.commit().await {
-                Ok(()) => Ok(Some(promoted)),
-                Err(err) => {
-                    if is_lock_contention_error(&err) {
-                        tracing::warn!(
-                            queue = %lane.queue,
-                            priority = lane.priority,
-                            state = state.as_str(),
-                            "Promotion commit timed out waiting for a lock; its rows stay deferred"
-                        );
-                    }
-                    Err(map_sqlx_error(err))
-                }
-            },
+            Ok(promoted) => {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(Some(promoted))
+            }
             Err(AwaError::Database(err)) if is_lock_contention_error(&err) => {
                 tx.rollback().await.map_err(map_sqlx_error)?;
                 Ok(None)
@@ -15952,14 +15933,9 @@ impl QueueStorage {
         rows: DueLaneRows<'_>,
         lock_timeout: Option<Duration>,
     ) -> Result<usize, AwaError> {
-        let caller_lock_timeout = match lock_timeout {
-            Some(timeout) => {
-                let caller_lock_timeout = lock_timeout_tx(tx).await?;
-                set_lock_timeout_tx(tx, timeout).await?;
-                Some(caller_lock_timeout)
-            }
-            None => None,
-        };
+        if let Some(timeout) = lock_timeout {
+            set_lock_timeout_tx(tx, timeout).await?;
+        }
 
         let schema = self.schema();
         let (row_filter, limit) = match rows {
@@ -16041,14 +16017,43 @@ impl QueueStorage {
             .collect();
         self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
             .await?;
-        // The bound covers the lane's locks only. The NOTIFY takes
-        // PostgreSQL's notify-queue lock at COMMIT, which every notifying
-        // transaction in the cluster serialises on.
-        if let Some(caller_lock_timeout) = caller_lock_timeout {
-            restore_lock_timeout_tx(tx, &caller_lock_timeout).await?;
-        }
-        self.notify_queues_tx(tx, vec![lane.queue.clone()]).await?;
         Ok(promoted)
+    }
+
+    /// Wake claimers of queues whose promotion has committed.
+    ///
+    /// Promotion notifies after its lane transactions instead of inside them.
+    /// A notifying transaction takes PostgreSQL's notify-queue lock at
+    /// `COMMIT`, which every notifying transaction in the cluster waits its
+    /// turn for, and a lane transaction would hold its lane's locks, and run
+    /// under its lock timeout, while it waited. The wakeup is a hint that
+    /// claimers also poll for, so a failure is logged and not returned.
+    async fn notify_promoted_queues(
+        &self,
+        pool: &PgPool,
+        queues: impl IntoIterator<Item = String>,
+    ) {
+        let channels: Vec<String> = queues
+            .into_iter()
+            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        if channels.is_empty() {
+            return;
+        }
+        if let Err(err) =
+            sqlx::query("SELECT pg_notify(channel, '') FROM unnest($1::text[]) AS channel")
+                .bind(&channels)
+                .execute(pool)
+                .await
+        {
+            tracing::warn!(
+                error = %err,
+                channels = channels.len(),
+                "Failed to wake claimers after promotion; they pick the rows up on their next poll"
+            );
+        }
     }
 
     async fn relation_has_rows_tx(

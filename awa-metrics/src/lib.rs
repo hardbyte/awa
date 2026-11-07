@@ -65,8 +65,6 @@ pub mod names {
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
     pub const MAINTENANCE_PROMOTE_LANE_CONTENTION: &str = "awa.maintenance.promote.lane_contention";
-    pub const MAINTENANCE_PROMOTE_COMMIT_LOCK_TIMEOUTS: &str =
-        "awa.maintenance.promote.commit_lock_timeouts";
     pub const MAINTENANCE_BRANCH_DURATION: &str = "awa.maintenance.branch.duration";
     pub const MAINTENANCE_BRANCH_OVERRUN: &str = "awa.maintenance.branch.overrun";
     pub const MAINTENANCE_ROTATE_ATTEMPTS: &str = "awa.maintenance.rotate.attempts";
@@ -170,8 +168,6 @@ pub struct AwaMetrics {
     /// waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out`
     /// when a waiter's own budget ran out.
     pub promotion_lane_contention: Counter<u64>,
-    /// Promotion transactions whose `COMMIT` hit `lock_timeout`, by state.
-    pub promotion_commit_lock_timeouts: Counter<u64>,
     /// Current in-flight jobs (can go up and down).
     pub jobs_in_flight: UpDownCounter<i64>,
     /// Total heartbeat batches sent.
@@ -421,11 +417,6 @@ impl AwaMetrics {
                 .u64_counter(names::MAINTENANCE_PROMOTE_LANE_CONTENTION)
                 .with_description("Promotion lanes whose locks were busy, by state/queue/outcome")
                 .with_unit("{lane}")
-                .build(),
-            promotion_commit_lock_timeouts: meter
-                .u64_counter(names::MAINTENANCE_PROMOTE_COMMIT_LOCK_TIMEOUTS)
-                .with_description("Promotion transactions whose COMMIT hit lock_timeout, by state")
-                .with_unit("{transaction}")
                 .build(),
             jobs_in_flight: meter
                 .i64_up_down_counter(names::JOB_IN_FLIGHT)
@@ -787,15 +778,6 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.promote.outcome", outcome),
         ];
         self.promotion_lane_contention.add(1, &attrs);
-    }
-
-    /// Record a promotion transaction whose `COMMIT` hit `lock_timeout`.
-    pub fn record_promotion_commit_lock_timeout(&self, state: &str) {
-        let attrs = [opentelemetry::KeyValue::new(
-            "awa.job.state",
-            state.to_string(),
-        )];
-        self.promotion_commit_lock_timeouts.add(1, &attrs);
     }
 
     /// Record in-flight change.
