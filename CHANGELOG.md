@@ -24,6 +24,9 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   roll back the attempt and report `Blocked`.
 - Graceful shutdown waits for pending finalization before stopping heartbeat
   and maintenance, subject to the existing drain timeout.
+- Queue-storage workers keep the attempt heartbeating while finalizing a saved
+  handler result and retry lock contention for up to 120 seconds. Handler
+  capacity is released immediately; lifecycle hooks run after finalization.
 - Reads and callbacks identify priority-aged and moved attempts by job ID and
   run lease, preferring live ready bodies over moved source copies. Admin lists
   and kind counts also include running receipt claims that have not materialized
@@ -95,7 +98,8 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   busy historical attempts while progressing other attempts; receipt rescue
   cursors keep deferred attempts eligible. Worker completion batches isolate
   lock contention to the affected requests. Direct completion and
-  single-attempt mutations still fail on contention and must retry. It adds
+  single-attempt mutations still fail on contention and callers must retry.
+  Workers retry those mutations within their bounded finalization window. It adds
   weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
 
 ## [0.6.13] — 2026-11-06
