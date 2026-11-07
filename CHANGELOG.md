@@ -37,7 +37,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   Rust terminal retry and failed-row carry also recover retained bodies written
   by older workers with an effective priority in the terminal key. Manual
   terminal retry restarts aging from the physical lane; automatic retryable
-  rescue and DLQ retain the effective priority. The installed `terminal_jobs`
+  rescue and automatic DLQ routing retain the effective priority. Manual
+  terminal-to-DLQ moves preserve the recovered body and physical priority for
+  later DLQ retry, while decrementing the original terminal counter key. The installed `terminal_jobs`
   SQL view still cannot hydrate those older mismatched-priority rows before
   carry widens them; this change does not update that view or repair bodies
   whose ready backing has already been pruned.
