@@ -22626,7 +22626,16 @@ async fn terminal_counts_by_priority(
     .expect("read per-priority terminal accounting")
 }
 
-async fn legacy_aged_failure_recovers_body(moved: bool, carry: bool) {
+#[derive(Clone, Copy, Debug)]
+enum LegacyFailedConsumer {
+    Retry,
+    Carry,
+    SingleDlq,
+    BulkDlq,
+    Discard,
+}
+
+async fn legacy_aged_failure_recovers_body(moved: bool, consumer: LegacyFailedConsumer) {
     let (_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_legacy_aged_body";
     let queue = "qs_legacy_aged_body";
@@ -22743,7 +22752,7 @@ async fn legacy_aged_failure_recovers_body(moved: bool, carry: bool) {
     );
     assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
 
-    if carry {
+    if matches!(consumer, LegacyFailedConsumer::Carry) {
         let remaining = store
             .claim_runtime_batch(&pool, queue, 10, Duration::ZERO)
             .await
@@ -22792,11 +22801,90 @@ async fn legacy_aged_failure_recovers_body(moved: bool, carry: bool) {
         );
         assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
     }
-    let retry = store
-        .retry_job(&pool, job_id)
-        .await
-        .expect("retry legacy failure")
-        .expect("legacy failed row retries");
+    let retry = match consumer {
+        LegacyFailedConsumer::Retry | LegacyFailedConsumer::Carry => store
+            .retry_job(&pool, job_id)
+            .await
+            .expect("retry legacy failure")
+            .expect("legacy failed row retries"),
+        LegacyFailedConsumer::SingleDlq | LegacyFailedConsumer::BulkDlq => {
+            if matches!(consumer, LegacyFailedConsumer::SingleDlq) {
+                let moved = store
+                    .move_failed_to_dlq(&pool, job_id, "manual-legacy-test")
+                    .await
+                    .expect("move old failed row to DLQ")
+                    .expect("one row moves");
+                assert_eq!(moved.id, job_id);
+                assert_eq!(moved.args, original.args);
+                assert_eq!(moved.max_attempts, original.max_attempts);
+            } else {
+                assert_eq!(
+                    store
+                        .bulk_move_failed_to_dlq(
+                            &pool,
+                            Some(CompleteJob::kind()),
+                            Some(queue),
+                            "manual-legacy-test",
+                        )
+                        .await
+                        .expect("bulk move old failed row to DLQ"),
+                    1,
+                    "one terminal row must not multiply through moved ready bodies"
+                );
+            }
+            let dlq_rows: Vec<(i16, serde_json::Value, i16, serde_json::Value)> =
+                sqlx::query_as(audited_sql(format!(
+                    "SELECT priority,args,max_attempts,COALESCE(payload,'{{}}'::jsonb) FROM {schema}.dlq_entries WHERE job_id=$1"
+                ))).bind(job_id).fetch_all(&pool).await.expect("read actual stored DLQ row");
+            assert_eq!(dlq_rows.len(), 1);
+            assert_eq!(dlq_rows[0].0, physical_priority);
+            assert_eq!(dlq_rows[0].1, original.args);
+            assert_eq!(dlq_rows[0].2, original.max_attempts);
+            assert_eq!(dlq_rows[0].3["metadata"]["_awa_original_priority"], 4);
+            assert_eq!(dlq_rows[0].3["metadata"]["shared"], "terminal");
+            assert_eq!(dlq_rows[0].3["errors"], terminal_payload["errors"]);
+            assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+            assert!(
+                terminal_counts_by_priority(&pool, schema, queue)
+                    .await
+                    .is_empty(),
+                "DLQ move must decrement the stored priority-1 terminal key"
+            );
+            assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+            store
+                .retry_from_dlq(&pool, job_id, &awa::model::RetryFromDlqOpts::default())
+                .await
+                .expect("retry recovered DLQ row")
+                .expect("DLQ row retries")
+        }
+        LegacyFailedConsumer::Discard => {
+            assert_eq!(
+                store
+                    .discard_failed_by_kind(&pool, CompleteJob::kind())
+                    .await
+                    .expect("discard old failed row"),
+                1,
+                "one terminal row must not multiply through moved ready bodies"
+            );
+            assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+            let dlq_count: i64 = sqlx::query_scalar(audited_sql(format!(
+                "SELECT count(*) FROM {schema}.dlq_entries WHERE job_id=$1"
+            )))
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(dlq_count, 0);
+            assert!(
+                terminal_counts_by_priority(&pool, schema, queue)
+                    .await
+                    .is_empty(),
+                "discard must decrement exactly its stored terminal lane"
+            );
+            assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+            return;
+        }
+    };
     assert_eq!(retry.args, original.args);
     assert_eq!(retry.max_attempts, original.max_attempts);
     assert_eq!(retry.created_at, original.created_at);
@@ -22819,7 +22907,15 @@ async fn legacy_aged_failure_recovers_body(moved: bool, carry: bool) {
         serde_json::to_value(&retry.errors).unwrap(),
         terminal_payload["errors"]
     );
-    assert_eq!(retry.progress, Some(serde_json::json!({"terminal": true})));
+    let expected_progress = if matches!(
+        consumer,
+        LegacyFailedConsumer::SingleDlq | LegacyFailedConsumer::BulkDlq
+    ) {
+        None // Existing DLQ retry clears progress before making the job ready.
+    } else {
+        Some(serde_json::json!({"terminal": true}))
+    };
+    assert_eq!(retry.progress, expected_progress);
     assert_eq!(retry.attempt, 0);
     assert_eq!(retry.state, JobState::Available);
     assert!(
@@ -22833,17 +22929,44 @@ async fn legacy_aged_failure_recovers_body(moved: bool, carry: bool) {
 
 #[tokio::test]
 async fn test_legacy_aged_failure_retry_recovers_body() {
-    legacy_aged_failure_recovers_body(false, false).await;
+    legacy_aged_failure_recovers_body(false, LegacyFailedConsumer::Retry).await;
 }
 
 #[tokio::test]
 async fn test_legacy_aged_moved_failure_retry_recovers_live_body() {
-    legacy_aged_failure_recovers_body(true, false).await;
+    legacy_aged_failure_recovers_body(true, LegacyFailedConsumer::Retry).await;
 }
 
 #[tokio::test]
 async fn test_legacy_aged_moved_failure_carry_recovers_body_and_counters() {
-    legacy_aged_failure_recovers_body(true, true).await;
+    legacy_aged_failure_recovers_body(true, LegacyFailedConsumer::Carry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_terminal_dlq_and_discard_consumers() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut failures = Vec::new();
+            for consumer in [
+                LegacyFailedConsumer::SingleDlq,
+                LegacyFailedConsumer::BulkDlq,
+                LegacyFailedConsumer::Discard,
+            ] {
+                // Exercise every parameter even after another panics. These
+                // database futures do not require Send on a local task.
+                if let Err(error) =
+                    tokio::task::spawn_local(legacy_aged_failure_recovers_body(true, consumer))
+                        .await
+                {
+                    failures.push(format!("{consumer:?}: {error}"));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "terminal consumer failures: {failures:?}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]

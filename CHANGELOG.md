@@ -6,6 +6,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Preserve recovered bodies and physical lane priority when manually moving
+  historical aged terminal failures to the DLQ, so later DLQ retry retains
+  arguments, attempt limits and priority provenance. Terminal counters are
+  decremented at their original stored priority; automatic rescue-to-DLQ
+  policy keeps the effective priority.
+
 - Recover retained terminal bodies from the exact prior attempt when older
   workers stored an aged effective priority in a narrow terminal key. Live
   moved-lane metadata supplies defaults without replacing stored terminal

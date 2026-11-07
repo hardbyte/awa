@@ -3029,12 +3029,12 @@ struct DoneJobRow {
 }
 
 // Keep the stored terminal priority for decrementing its old counter key.
-// Manual retry separately restores the physical lane from its retained body.
+// Manual retry and terminal-to-DLQ moves recover the retained physical lane.
 #[derive(Debug, sqlx::FromRow)]
-struct RetryTerminalRow {
+struct HydratedTerminalRow {
     #[sqlx(flatten)]
     terminal: DoneJobRow,
-    retry_priority: i16,
+    body_priority: i16,
 }
 
 impl DoneJobRow {
@@ -9437,7 +9437,7 @@ impl QueueStorage {
 
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let terminal: Option<RetryTerminalRow> = sqlx::query_as(audited_sql(format!(
+        let terminal: Option<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -9452,7 +9452,7 @@ impl QueueStorage {
             )
                 RETURNING *
             )
-            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS retry_priority
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -9463,7 +9463,7 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if let Some(hydrated) = terminal {
-            let retry_priority = hydrated.retry_priority;
+            let body_priority = hydrated.body_priority;
             let terminal = hydrated.terminal;
             self.ensure_terminal_removed_receipt_closures_tx(tx, std::slice::from_ref(&terminal))
                 .await?;
@@ -9479,7 +9479,7 @@ impl QueueStorage {
                 kind: terminal.kind,
                 queue: terminal.queue.clone(),
                 args: terminal.args,
-                priority: retry_priority,
+                priority: body_priority,
                 attempt: 0,
                 run_lease: terminal.run_lease,
                 max_attempts: terminal.max_attempts,
@@ -16805,7 +16805,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let moved: Option<DoneJobRow> = sqlx::query_as(audited_sql(format!(
+        let moved: Option<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -16820,7 +16820,7 @@ impl QueueStorage {
                 )
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -16830,10 +16830,11 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        let Some(hydrated) = moved else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
+        let mut moved = hydrated.terminal;
 
         self.ensure_terminal_removed_receipt_closures_tx(&mut tx, std::slice::from_ref(&moved))
             .await?;
@@ -16844,6 +16845,7 @@ impl QueueStorage {
             &Self::done_rows_to_counter_keys(std::slice::from_ref(&moved)),
         )
         .await?;
+        moved.priority = hydrated.body_priority;
         let dlq_row = moved
             .clone()
             .into_dlq_row(dlq_reason.to_string(), Utc::now());
@@ -16869,7 +16871,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let moved: Vec<DoneJobRow> = sqlx::query_as(audited_sql(format!(
+        let moved: Vec<HydratedTerminalRow> = sqlx::query_as(audited_sql(format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -16878,7 +16880,7 @@ impl QueueStorage {
                   AND ($2::text IS NULL OR queue = $2)
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -16894,6 +16896,10 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let (moved, body_priorities): (Vec<_>, Vec<_>) = moved
+            .into_iter()
+            .map(|row| (row.terminal, row.body_priority))
+            .unzip();
         self.ensure_terminal_removed_receipt_closures_tx(&mut tx, &moved)
             .await?;
         // Bulk DLQ move deletes from done_entries. Append negative deltas by
@@ -16903,7 +16909,11 @@ impl QueueStorage {
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
             .into_iter()
-            .map(|row| row.into_dlq_row(dlq_reason.to_string(), dlq_at))
+            .zip(body_priorities)
+            .map(|(mut row, priority)| {
+                row.priority = priority;
+                row.into_dlq_row(dlq_reason.to_string(), dlq_at)
+            })
             .collect();
         self.insert_dlq_rows_tx(&mut tx, &rows, Some(JobState::Failed))
             .await?;
