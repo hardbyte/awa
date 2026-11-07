@@ -37,4 +37,3 @@ def issuer(app):
     if 'proof' in app:return 'proof_python' if 'python' in app else 'proof_child' if 'child' in app else 'proof_parent'
     if app=='soak_ui_server':return 'ui_shared'
     return app or 'unassigned'
-
