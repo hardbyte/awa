@@ -18,6 +18,7 @@ const HEADROOM: u32 = 14;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
+    super::gate_metrics::install("parent")?;
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -56,6 +57,9 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         ));
     }
     let shared = Shared::new(config, info, budget);
+    if super::gate_proof::enabled_from_env()? {
+        super::gate_proof::GateProof::install(&shared).await?;
+    }
 
     // The UI personas talk to the real admin server, run as a child process.
     let ui_personas = [
@@ -241,6 +245,13 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         server.stop();
     }
     super::worker_errors::reconcile(&shared, &worker_errors).await;
+    super::gate_proof::reconcile(&shared).await;
+    if let Some(proof) = shared.gate_proof.get() {
+        if let Err(error) = proof.close().await {
+            shared.incomplete(error, vec![]);
+        }
+    }
+    super::gate_metrics::reconcile(&shared);
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),

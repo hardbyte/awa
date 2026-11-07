@@ -6,6 +6,8 @@ pub mod adminserver;
 pub mod config;
 pub mod db;
 pub mod fleet;
+pub mod gate_metrics;
+pub mod gate_proof;
 pub mod ledger;
 pub mod oracle;
 pub mod personas;

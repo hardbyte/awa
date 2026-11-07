@@ -201,6 +201,8 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "verdict": if violations.iter().any(|violation| violation.kind != "oracle_incomplete") { "fail" }
             else if shared.oracle_incomplete.load(std::sync::atomic::Ordering::Relaxed) { "inconclusive" } else { "pass" },
         "terminal_proof_sample_stride": super::ledger::TERMINAL_PROOF_STRIDE,
+        "gate_proof_enabled": shared.gate_proof.get().is_some(),
+        "gate_proof_policy": "when enabled: full unpruned committed completed-pair counts; per-job eventful/NO_EVENTS sample policy unchanged; handler returns are execution evidence; counts do not waive quiescence, caps or other violations",
         "oracle_complete": !shared.oracle_incomplete.load(std::sync::atomic::Ordering::Relaxed),
         "seed": shared.config.seed,
         "personas": shared.config.personas.iter().map(|p| p.name()).collect::<Vec<_>>(),

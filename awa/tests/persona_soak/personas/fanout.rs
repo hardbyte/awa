@@ -157,8 +157,8 @@ impl Worker for ParentWorker {
                 .await?;
         }
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Fanout, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }
@@ -177,8 +177,8 @@ impl Worker for ChildWorker {
         // No lifecycle hooks: a hook per child would add a read per job.
         let _guard = self.shared.begin_execution(Persona::Fanout, &ctx.job, true);
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Fanout, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }

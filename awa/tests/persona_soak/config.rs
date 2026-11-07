@@ -164,6 +164,19 @@ fn env_parse<T: FromStr>(name: &str) -> Option<T> {
     env_string(name).and_then(|value| value.trim().parse().ok())
 }
 
+pub fn pressure_rotation_interval() -> Result<Duration, String> {
+    match env_string("AWA_PRESSURE_ROTATE_MULTIPLIER")
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("1") => Ok(Duration::from_secs(1)),
+        Some("4") => Ok(Duration::from_secs(4)),
+        Some(value) => Err(format!(
+            "AWA_PRESSURE_ROTATE_MULTIPLIER must be 1 or 4, got {value:?}"
+        )),
+    }
+}
+
 impl SoakConfig {
     pub fn from_env() -> Result<Self, String> {
         let database_url = env_string("AWA_SOAK_DATABASE_URL").ok_or(
@@ -180,6 +193,7 @@ impl SoakConfig {
     }
 
     fn from_database_url(database_url: String) -> Result<Self, String> {
+        pressure_rotation_interval()?;
         let database_name = database_name(&database_url);
         if !database_name.starts_with("awa_soak")
             || !database_name

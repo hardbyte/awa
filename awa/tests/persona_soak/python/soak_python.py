@@ -69,6 +69,23 @@ max_active = 0
 started = 0
 enqueued = 0
 errors = 0
+proof_pool = None
+PROOF_ERROR_MARKER = "AWA_SOAK_GATE_PROOF_INCOMPLETE"
+PROOF_WRITE_TIMEOUT_SECONDS = 5.0
+
+
+async def record_completed_return(job):
+    if proof_pool is None:
+        return
+    try:
+        await asyncio.wait_for(proof_pool.execute(
+            "INSERT INTO public.awa_soak_handler_returns(job_id,run_lease,queue,persona,outcome) "
+            "VALUES($1,$2,$3,'python_child','completed')",
+            job.id, job.run_lease, job.queue,
+        ), timeout=PROOF_WRITE_TIMEOUT_SECONDS)
+    except Exception:
+        print(PROOF_ERROR_MARKER, file=sys.stderr, flush=True)
+
 
 
 async def handle(job):
@@ -119,6 +136,7 @@ async def handle(job):
             await asyncio.sleep(args.work_ms / 1000)
         else:
             await asyncio.sleep(args.work_ms / 1000)
+        await record_completed_return(job)
         return None
     except Exception:
         raise
@@ -302,11 +320,46 @@ async def exit_with_parent():
             os._exit(1)
 
 
+def init_gate_metrics():
+    endpoint = os.environ.get("AWA_SOAK_METRICS_ENDPOINT")
+    if endpoint is None:
+        return
+    service = f"awa-soak-python-{ROLE}-{os.getpid()}-{time.time_ns()}"
+    try:
+        if not awa.init_telemetry(endpoint, service, export_interval_ms=5000):
+            raise RuntimeError("telemetry provider already installed")
+    except Exception:
+        print("AWA_SOAK_METRICS_INCOMPLETE", file=sys.stderr, flush=True)
+        raise
+    print("AWA_SOAK_METRICS " + json.dumps({
+        "kind": "initialized", "process_role": f"python/{ROLE}", "pid": os.getpid(),
+        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "service_name": service, "application": os.environ.get("SOAK_PG_APPLICATION_NAME", "unassigned"),
+        "export_interval_ms": 5000, "delivery": "unverified", "final_flush": "not_attempted",
+        "tail": "potentially_incomplete", "baseline_prune_errors": "unavailable",
+    }, separators=(",", ":")), flush=True)
+
+
 async def main():
+    init_gate_metrics()
     asyncio.create_task(exit_with_parent())
     if ROLE == "migrate_probe":
         await migrate_probe_main()
         return
+    if os.environ.get("AWA_SOAK_GATE_PROOF", "0") == "1":
+        global proof_pool
+        try:
+            if not hasattr(awa.Job, "run_lease"):
+                raise RuntimeError("gate proof requires the common run_lease observation getter")
+            import asyncpg
+            proof_pool = await asyncio.wait_for(asyncpg.create_pool(
+                os.environ["AWA_SOAK_GATE_PROOF_URL"], min_size=1, max_size=1,
+                command_timeout=PROOF_WRITE_TIMEOUT_SECONDS,
+                server_settings={"application_name": "awa_gate_proof_python", "statement_timeout": str(int(PROOF_WRITE_TIMEOUT_SECONDS * 1000))},
+            ), timeout=2.0)
+        except Exception:
+            print(PROOF_ERROR_MARKER, file=sys.stderr, flush=True)
+            raise
     # A chaos restart can still be migrating when the load ends. Remember the
     # drain request before startup awaits, then start workers without producers.
     stop = asyncio.Event()
@@ -319,6 +372,14 @@ async def main():
     await migrate_and_probe(client, "startup")
     client.task(PyJob, kind="py_job", queue=QUEUE_WORK)(handle)
     client.task(PySharedJob, kind="py_shared_job", queue=QUEUE_SHARED)(handle)
+    rotation_factor = (os.environ.get("AWA_PRESSURE_ROTATE_MULTIPLIER", "1").strip() or "1")
+    if rotation_factor not in ("1", "4"):
+        raise ValueError("AWA_PRESSURE_ROTATE_MULTIPLIER must be 1 or 4")
+    rotation_kwargs = {} if rotation_factor == "1" else {
+        "queue_storage_queue_rotate_interval_ms": 4000,
+        "queue_storage_lease_rotate_interval_ms": 4000,
+        "queue_storage_claim_rotate_interval_ms": 4000,
+    }
     await client.start(
         [
             {"name": QUEUE_WORK, "max_workers": WORK_WORKERS},
@@ -330,6 +391,7 @@ async def main():
         heartbeat_rescue_interval_ms=3000,
         deadline_rescue_interval_ms=2000,
         promote_interval_ms=250,
+        **rotation_kwargs,
     )
     # The deadline queue serves a second kind through the same handler.
     print(f"READY pid={os.getpid()}", flush=True)

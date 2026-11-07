@@ -654,7 +654,7 @@ pub async fn run_impatient(shared: Arc<Shared>) -> Result<(), String> {
     let http = Arc::new(Http::new(&shared, persona));
     let sampler_pool = connect_pool(
         &shared.config.database_url,
-        "soak_ui_sampler",
+        "awa_ui_sampler",
         shared.budget.reserve("ui-sampler", 1, 1),
     )
     .await

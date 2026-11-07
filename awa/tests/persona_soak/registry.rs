@@ -78,13 +78,15 @@ impl QueueRegistry {
     /// Looks a queue up by its physical name; striped queues (`name#N`) resolve to
     /// their logical queue.
     pub fn get(&self, name: &str) -> Option<Arc<QueueInfo>> {
-        let by_name = self.by_name.read().expect("registry lock");
-        let index = by_name.get(name).or_else(|| {
-            let (logical, suffix) = name.rsplit_once('#')?;
-            suffix.parse::<u32>().ok()?;
-            by_name.get(logical)
-        })?;
-        Some(self.queues.read().expect("registry lock")[*index as usize].clone())
+        let index = {
+            let by_name = self.by_name.read().expect("registry lock");
+            *by_name.get(name).or_else(|| {
+                let (logical, suffix) = name.rsplit_once('#')?;
+                suffix.parse::<u32>().ok()?;
+                by_name.get(logical)
+            })?
+        };
+        Some(self.queues.read().expect("registry lock")[index as usize].clone())
     }
 
     pub fn by_index(&self, index: u32) -> Option<Arc<QueueInfo>> {
@@ -127,5 +129,77 @@ impl Drop for InFlightGuard {
         if let Some(queue) = &self.queue {
             queue.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ci_timing::scaled_timeout;
+    use std::sync::{mpsc, Barrier};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn concurrent_registration_and_striped_lookup_complete() {
+        let registry = Arc::new(QueueRegistry::default());
+        let seed = registry.register("seed", Persona::Mia, true);
+        assert!(Arc::ptr_eq(&seed, &registry.get("seed#7").unwrap()));
+        assert!(registry.get("seed#bad").is_none());
+        assert!(registry.get("missing").is_none());
+        let duplicate = registry.register("seed", Persona::Tom, false);
+        assert!(Arc::ptr_eq(&seed, &duplicate));
+        assert!(duplicate.persona == Persona::Mia && duplicate.rate_limited);
+        let barrier = Arc::new(Barrier::new(9));
+        let (done, completed) = mpsc::channel();
+        let mut threads = Vec::new();
+        for worker in 0..8 {
+            let registry = registry.clone();
+            let seed = seed.clone();
+            let barrier = barrier.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                if worker < 4 {
+                    for number in 0..2_000 {
+                        let name = format!("queue-{worker}-{number}");
+                        let queue = registry.register(&name, Persona::Tom, false);
+                        assert!(Arc::ptr_eq(&queue, &registry.get(&name).unwrap()));
+                        assert!(Arc::ptr_eq(
+                            &queue,
+                            &registry.get(&format!("{name}#2")).unwrap()
+                        ));
+                        assert!(Arc::ptr_eq(
+                            &queue,
+                            &registry.by_index(queue.index).unwrap()
+                        ));
+                    }
+                } else {
+                    for number in 0..20_000 {
+                        assert!(Arc::ptr_eq(&seed, &registry.get("seed#3").unwrap()));
+                        let name = format!("queue-{}-{}", number % 4, number % 2_000);
+                        if let Some(queue) = registry.get(&name) {
+                            assert_eq!(queue.name, name);
+                            assert!(Arc::ptr_eq(
+                                &queue,
+                                &registry.by_index(queue.index).unwrap()
+                            ));
+                        }
+                    }
+                }
+                done.send(()).unwrap();
+            }));
+        }
+        drop(done);
+        barrier.wait();
+        let deadline = Instant::now() + scaled_timeout(Duration::from_secs(2));
+        for _ in 0..8 {
+            completed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("concurrent register/get must complete before the deadline");
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(registry.all().len(), 8_001);
     }
 }

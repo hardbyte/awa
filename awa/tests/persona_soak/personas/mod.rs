@@ -16,6 +16,7 @@ pub mod ui;
 use super::config::Persona;
 use super::ledger::{expect, JobRecord};
 use super::shared::Shared;
+use awa::model::QueueStorageConfig;
 use awa::{ClientBuilder, JobRow, QueueConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +61,20 @@ pub fn tune(builder: ClientBuilder, shared: &Shared) -> ClientBuilder {
     }
 }
 
+pub fn pressure_rotation_timings(
+    builder: ClientBuilder,
+    storage: QueueStorageConfig,
+) -> ClientBuilder {
+    let interval =
+        super::config::pressure_rotation_interval().expect("valid AWA_PRESSURE_ROTATE_MULTIPLIER");
+    if interval == Duration::from_secs(1) {
+        return builder;
+    }
+    builder
+        .queue_storage(storage, interval, interval)
+        .claim_rotate_interval(interval)
+}
+
 /// The timings of [`tune`] that do not depend on the run, for runtimes that live in a
 /// process of their own.
 pub fn timings(
@@ -67,6 +82,7 @@ pub fn timings(
     heartbeat_interval: Duration,
     heartbeat_staleness: Duration,
 ) -> ClientBuilder {
+    let builder = pressure_rotation_timings(builder, QueueStorageConfig::default());
     builder
         .heartbeat_interval(heartbeat_interval)
         .heartbeat_staleness(heartbeat_staleness)

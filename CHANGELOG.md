@@ -61,6 +61,7 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 
 ### Added
 
+- Python `Job.run_lease` exposes the attempt's lease identifier for diagnostic correlation.
 - `ClientBuilder::prune_lock_timeout` in Rust and
   `queue_storage_prune_lock_timeout_ms` in Python configure prune's lock wait.
   The timeout applies to each acquisition; queue prune can wait on up to eight
