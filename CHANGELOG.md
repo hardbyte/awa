@@ -27,12 +27,15 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   run lease, preferring live ready bodies over moved source copies. Admin lists
   and kind counts also include running receipt claims that have not materialized
   into leases.
-- Physical priority aging waits for in-flight claims and rechecks claim evidence
-  before moving a ready row, including claims committed before their cursor
-  advances. Rescue, cancellation and completion can recover retained tombstoned
-  bodies left by older aging, preserving claim-time priority metadata. Emitted
-  claim-lane evidence takes precedence over colliding live replacements; those
-  recovered terminal bodies remain self-contained through retry.
+- Physical priority aging excludes claimed rows before its batch limit, waits
+  for in-flight claims and rechecks claim evidence before moving a ready row,
+  including claims committed before their cursor advances. Active point and
+  callback reads recover retained tombstoned bodies left by older aging.
+  Rescue, cancellation and completion by ID recover those bodies and retire
+  unclaimed copies of the same attempt. Emitted claim-lane evidence takes
+  precedence over colliding live replacements; those recovered terminal bodies
+  remain self-contained through retry. Cancellation prefers an active attempt
+  over its historical available replacement.
 - Failed terminal writes preserve the ready body's arguments, attempt limit and
   physical lane. Rust retry and retention carry recover older narrow terminal
   bodies while their backing remains retained. Stored terminal metadata wins
@@ -82,6 +85,14 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   original physical lane if an old aging race left a colliding live replacement.
   Multiple equally supported bodies cause an explicit ambiguity error and
   transaction rollback.
+- Repair of an old aging replacement runs when a transition hydrates a retained
+  tombstoned body. Worker completion using its already carried job body does not
+  perform that repair, and can leave an old replacement claimable. The aging
+  fence prevents new replacements from updated callers; it cannot fence an
+  older process explicitly calling physical aging during a rolling upgrade.
+  Repair takes claim-head row locks without waiting and rolls back on contention;
+  the operation must retry. It adds weak relation locks and tombstone writes
+  only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
 
 ## [0.6.13] — 2026-11-06
 
