@@ -7,9 +7,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Fixed
 
 - Retry queue-storage worker finalization after transient lock contention within
-  its existing 120-second deadline, preserving the saved handler outcome. Keep
-  attempt heartbeats active until finalization settles while releasing handler
-  capacity. Direct store APIs still return contention errors for caller retries.
+  its 120-second running-work budget, preserving the saved handler outcome.
+  Waiting for an accepted completion batch pauses that budget; admission,
+  direct writes, post-acknowledgement reads and retries use the remaining time.
+  Keep attempt heartbeats active until finalization settles while releasing
+  handler capacity. Runtime shutdown retains its existing drain limit. Direct
+  store APIs still return contention errors for caller retries.
 
 - Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
 - Keep committed claims out of physical priority aging before its batch limit,

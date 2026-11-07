@@ -4,8 +4,10 @@ use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::env;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -92,6 +94,144 @@ struct CompletionRequest {
     response: oneshot::Sender<Result<bool, AwaError>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct FinalizationBudget {
+    inner: Arc<BudgetClock>,
+}
+
+struct BudgetClock {
+    state: Mutex<BudgetState>,
+    changed: Notify,
+}
+
+struct BudgetState {
+    deadline: Instant,
+    paused_at: Option<Instant>,
+    acknowledgement_waits: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct FinalizationBudgetElapsed;
+
+impl From<Duration> for FinalizationBudget {
+    fn from(window: Duration) -> Self {
+        Self {
+            inner: Arc::new(BudgetClock {
+                state: Mutex::new(BudgetState {
+                    deadline: Instant::now() + window,
+                    paused_at: None,
+                    acknowledgement_waits: 0,
+                }),
+                changed: Notify::new(),
+            }),
+        }
+    }
+}
+
+impl FinalizationBudget {
+    pub(crate) fn is_elapsed(&self) -> bool {
+        self.deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        let state = self.inner.state.lock().unwrap();
+        state.paused_at.is_none().then_some(state.deadline)
+    }
+
+    fn wait_for_acknowledgement(&self) -> AcknowledgementWait {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.acknowledgement_waits == 0 {
+            state.paused_at = Some(Instant::now());
+        }
+        state.acknowledgement_waits += 1;
+        drop(state);
+        self.inner.changed.notify_waiters();
+        AcknowledgementWait {
+            budget: self.clone(),
+        }
+    }
+
+    pub(crate) async fn timeout<F>(&self, future: F) -> Result<F::Output, FinalizationBudgetElapsed>
+    where
+        F: std::future::Future,
+    {
+        tokio::pin!(future);
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.deadline() {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => {
+                            if self.deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+                                return Err(FinalizationBudgetElapsed);
+                            }
+                        }
+                        outcome = &mut future => return Ok(outcome),
+                        _ = &mut changed => {},
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        biased;
+                        outcome = &mut future => return Ok(outcome),
+                        _ = &mut changed => {},
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn timeout_unpaused<F>(
+        &self,
+        future: F,
+    ) -> Result<F::Output, FinalizationBudgetElapsed>
+    where
+        F: std::future::Future,
+    {
+        let deadline = self.deadline().expect("unpaused finalization budget");
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| FinalizationBudgetElapsed)
+    }
+}
+
+struct AcknowledgementWait {
+    budget: FinalizationBudget,
+}
+
+impl Drop for AcknowledgementWait {
+    fn drop(&mut self) {
+        let mut state = self.budget.inner.state.lock().unwrap();
+        state.acknowledgement_waits -= 1;
+        if state.acknowledgement_waits == 0 {
+            let paused_at = state.paused_at.take().unwrap();
+            state.deadline += Instant::now() - paused_at;
+        }
+        drop(state);
+        self.budget.inner.changed.notify_waiters();
+    }
+}
+
+struct CompletionReceipt {
+    response: oneshot::Receiver<Result<bool, AwaError>>,
+    acknowledgement_wait: Option<AcknowledgementWait>,
+}
+
+impl CompletionReceipt {
+    async fn acknowledge(self) -> Result<bool, AwaError> {
+        let result = self
+            .response
+            .await
+            .map_err(|_| AwaError::Validation("completion batcher dropped response".into()))?;
+        drop(self.acknowledgement_wait);
+        result
+    }
+}
+
 fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
     let claim_slot = request
         .runtime_job
@@ -106,9 +246,25 @@ fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
 pub(crate) struct CompletionBatcherHandle {
     shards: Vec<mpsc::Sender<CompletionRequest>>,
     pipeline_capacity: usize,
+    acknowledgement_budget: Option<FinalizationBudget>,
 }
 
 impl CompletionBatcherHandle {
+    pub(crate) fn with_acknowledgement_budget(&self, budget: FinalizationBudget) -> Self {
+        Self {
+            acknowledgement_budget: Some(budget),
+            ..self.clone()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_request_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.max_capacity() - shard.capacity())
+            .sum()
+    }
+
     pub fn finalizer_capacity(&self, runtime_worker_capacity: u32) -> usize {
         self.pipeline_capacity
             .max(runtime_worker_capacity.max(1) as usize)
@@ -139,22 +295,41 @@ impl CompletionBatcherHandle {
         claim: Option<ClaimedEntry>,
         runtime_job: Option<ClaimedRuntimeJob>,
     ) -> Result<bool, AwaError> {
+        self.submit(job_id, run_lease, claim, runtime_job)
+            .await?
+            .acknowledge()
+            .await
+    }
+
+    async fn submit(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+        claim: Option<ClaimedEntry>,
+        runtime_job: Option<ClaimedRuntimeJob>,
+    ) -> Result<CompletionReceipt, AwaError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
-        self.shards[shard]
-            .send(CompletionRequest {
-                job_id,
-                run_lease,
-                claim,
-                runtime_job,
-                response: response_tx,
-            })
+        let permit = self.shards[shard]
+            .reserve()
             .await
             .map_err(|_| AwaError::Validation("completion batcher stopped".into()))?;
+        let acknowledgement_wait = self
+            .acknowledgement_budget
+            .as_ref()
+            .map(FinalizationBudget::wait_for_acknowledgement);
+        permit.send(CompletionRequest {
+            job_id,
+            run_lease,
+            claim,
+            runtime_job,
+            response: response_tx,
+        });
 
-        response_rx
-            .await
-            .map_err(|_| AwaError::Validation("completion batcher dropped response".into()))?
+        Ok(CompletionReceipt {
+            response: response_rx,
+            acknowledgement_wait,
+        })
     }
 }
 
@@ -218,6 +393,7 @@ impl CompletionBatcher {
                 shards,
                 // Each shard needs an in-flight batch and a queued batch.
                 pipeline_capacity: batch_size.saturating_mul(shard_count).saturating_mul(2),
+                acknowledgement_budget: None,
             },
         )
     }
@@ -492,6 +668,178 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn controlled_completions(
+        capacity: usize,
+    ) -> (CompletionBatcherHandle, mpsc::Receiver<CompletionRequest>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            CompletionBatcherHandle {
+                shards: vec![sender],
+                pipeline_capacity: capacity,
+                acknowledgement_budget: None,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_completion_keeps_its_acknowledgement_after_the_budget() {
+        use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let events = Arc::new(AtomicU32::new(0));
+        let observed = events.clone();
+        let handler: BoxedUntypedEventHandler = Arc::new(move |event| {
+            assert!(matches!(event, UntypedJobEvent::Completed { job, .. }
+                if job.id == 1 && job.run_lease == 2));
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        });
+        let handlers = HashMap::from([("accepted_parent".into(), vec![handler])]);
+        let task = tokio::spawn(async move {
+            let updated = budget
+                .timeout(handle.complete(1, 2))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(updated);
+            let now = chrono::Utc::now();
+            let job = serde_json::from_value(serde_json::json!({
+                "id":1,"kind":"accepted_parent","queue":"test","args":{},
+                "state":"completed","priority":2,"attempt":1,"run_lease":2,
+                "max_attempts":5,"run_at":now,"attempted_at":now,"created_at":now,
+                "finalized_at":now,"metadata":{},"tags":[],
+            }))
+            .unwrap();
+            crate::executor::dispatch_lifecycle_event(
+                &handlers,
+                "accepted_parent",
+                UntypedJobEvent::Completed {
+                    job,
+                    duration: Duration::ZERO,
+                },
+            )
+            .await;
+        });
+        let request = requests.recv().await.unwrap();
+        assert_eq!((request.job_id, request.run_lease), (1, 2));
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "accepted work must keep its waiter");
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert!(request.response.send(Ok(true)).is_ok());
+        task.await.unwrap();
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+        assert!(requests.try_recv().is_err(), "one accepted request only");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_admission_still_expires_when_the_channel_is_full() {
+        let (handle, mut requests) = controlled_completions(1);
+        assert!(handle.shards[0]
+            .send(completion_request_with_claim_slot(1, 1, 0))
+            .await
+            .is_ok());
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let started = tokio::time::Instant::now();
+        assert!(budget.timeout(handle.complete(2, 1)).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(requests.recv().await.unwrap().job_id, 1);
+        assert!(
+            requests.try_recv().is_err(),
+            "expired admission cannot send"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_budget_cannot_admit_work_to_a_ready_channel() {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(budget.timeout(handle.complete(1, 2)).await.is_err());
+        assert!(requests.try_recv().is_err());
+    }
+
+    async fn assert_remaining_budget_after_acknowledgement(response: Result<bool, AwaError>) {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            budget
+                .timeout(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let outcome = handle.complete(1, 2).await;
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    outcome
+                })
+                .await
+        });
+        let request = requests.recv().await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_millis(30));
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert!(request.response.send(response).is_ok());
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(300),
+            "30ms before admission leaves 70ms after the 200ms acknowledgement wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_acknowledgement_work_uses_only_the_remaining_budget() {
+        assert_remaining_budget_after_acknowledgement(Ok(true)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_acknowledgement_does_not_exempt_direct_fallback() {
+        assert_remaining_budget_after_acknowledgement(Err(AwaError::Validation(
+            "completion flush failed".into(),
+        )))
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_accepted_receipt_resumes_its_budget() {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let handle = handle.with_acknowledgement_budget(budget.clone());
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let receipt = handle.submit(1, 2, None, None).await.unwrap();
+        let request = requests.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        drop(receipt);
+        assert!(request.response.send(Ok(true)).is_err());
+        assert!(budget
+            .timeout(tokio::time::sleep(Duration::from_millis(80)))
+            .await
+            .is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unscoped_batch_acknowledgement_retains_the_original_timeout() {
+        let (handle, mut requests) = controlled_completions(1);
+        let budget = FinalizationBudget::from(Duration::from_millis(100));
+        let started = tokio::time::Instant::now();
+        let task =
+            tokio::spawn(async move { budget.timeout_unpaused(handle.complete(1, 2)).await });
+        let request = requests.recv().await.unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert!(request.response.send(Ok(true)).is_err());
+    }
 
     fn base_database_url() -> String {
         std::env::var("DATABASE_URL")

@@ -1,4 +1,4 @@
-use crate::completion::CompletionBatcherHandle;
+use crate::completion::{CompletionBatcherHandle, FinalizationBudget};
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
@@ -581,6 +581,12 @@ impl JobExecutor {
                         });
                         let output_kept = AtomicBool::new(true);
                         let outcome = {
+                            let budget = FinalizationBudget::from(COMPLETION_RECONNECT_WINDOW);
+                            let completion_batcher = if storage.queue_storage().is_some() {
+                                completion_batcher.with_acknowledgement_budget(budget.clone())
+                            } else {
+                                completion_batcher.clone()
+                            };
                             let (job, stripped_job, output_kept) = (&job, &stripped_job, &output_kept);
                             let (pool, result, storage) = (&pool, &result, &storage);
                             let (staged_follow_ups, completion_batcher) =
@@ -637,7 +643,7 @@ impl JobExecutor {
                                 job_id,
                                 &job_kind,
                                 &job_queue,
-                                COMPLETION_RECONNECT_WINDOW,
+                                budget,
 
 storage.queue_storage().is_some(),
 )
@@ -829,7 +835,7 @@ async fn finalize_with_retry<T, F, Fut>(
     job_id: i64,
     kind: &str,
     queue: &str,
-    window: Duration,
+    window: impl Into<FinalizationBudget>,
     retry_lock_contention: bool,
 ) -> Result<FinalizeAck<T>, FinalizeError>
 where
@@ -837,7 +843,7 @@ where
     Fut: std::future::Future<Output = Result<T, AwaError>>,
 {
     let started = tokio::time::Instant::now();
-    let deadline = started + window;
+    let budget = window.into();
     let mut deadlock_retries = 0;
     let mut reconnect_retries = 0;
     let mut lock_retries = 0;
@@ -845,9 +851,16 @@ where
     let mut schema_retried = false;
     let mut completion_path = CompletionPath::Batched;
     loop {
-        let outcome = tokio::time::timeout_at(deadline, finalize(completion_path))
-            .await
-            .map_err(|_| FinalizeError::Deadline)?;
+        if retry_lock_contention && budget.is_elapsed() {
+            return Err(FinalizeError::Deadline);
+        }
+        let attempt = finalize(completion_path);
+        let outcome = if retry_lock_contention {
+            budget.timeout(attempt).await
+        } else {
+            budget.timeout_unpaused(attempt).await
+        }
+        .map_err(|_| FinalizeError::Deadline)?;
         let error = match outcome {
             Ok(outcome) => {
                 return Ok(FinalizeAck {
@@ -881,9 +894,13 @@ where
         } else {
             debug!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
         }
-        tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
-            .await
-            .map_err(|_| FinalizeError::Deadline)?;
+        let backoff = tokio::time::sleep(delay);
+        if retry_lock_contention {
+            budget.timeout(backoff).await
+        } else {
+            budget.timeout_unpaused(backoff).await
+        }
+        .map_err(|_| FinalizeError::Deadline)?;
         if error.is_connection_lost() {
             metrics.record_completion_reconnect_retry(kind, queue);
         } else if error.is_deadlock() {
@@ -3657,7 +3674,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queue_finalization_retains_heartbeat_without_holding_worker_capacity() {
         let metrics = test_metrics();
         let now = chrono::Utc::now();
@@ -3693,6 +3710,7 @@ mod tests {
                 storage.clone(),
                 1,
             );
+            let pending_completions = handle.clone();
             let executor = JobExecutor::new(
                 pool,
                 Arc::new(HashMap::from([(
@@ -3748,6 +3766,23 @@ mod tests {
                 queue_storage,
                 "queue-store heartbeats remain registered until finalization settles"
             );
+            if queue_storage {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while pending_completions.pending_request_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the completion must be accepted before advancing the clock");
+                tokio::time::advance(COMPLETION_RECONNECT_WINDOW + Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert_eq!(count.load(Ordering::SeqCst), 0);
+                assert_eq!(finalizers.len(), 1);
+                assert!(
+                    in_flight.get_cancel(key).is_some(),
+                    "an accepted completion must retain its lease past the running-work budget"
+                );
+            }
             cancel.cancel();
             finalizers.close();
             tokio::time::timeout(Duration::from_secs(2), finalizers.wait())
