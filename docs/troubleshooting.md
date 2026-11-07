@@ -87,11 +87,14 @@ Interpretation:
 
 ### Transient Admin Reads During Partition Pruning
 
-In 0.6, a job-detail read, including list-item hydration, uses several queries.
-If prune truncates a partition during the read, a completed job can briefly
+In 0.6, a job-detail read, including list-item hydration, uses several queries
+within one snapshot. It retains read locks on the located ready body, but does
+not lock all ring partitions before establishing that snapshot. Prune can
+truncate a ready partition before its body is located, or a lease or claim
+partition before that read phase reaches it. A completed job can then briefly
 appear available or missing. Retry with a fresh read before treating that result
 as missing durable work. Filtering tombstoned source rows after a queue or
-priority move does not close this separate window.
+priority move does not close these separate windows.
 
 ### Inspect Runtime Health
 

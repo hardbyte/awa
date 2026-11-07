@@ -30,6 +30,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Reduce accumulated partition locks during job-detail reads, receipt-backed
+  lists and kind counts by releasing completed read phases within the same
+  snapshot. Job-detail reads retain the located ready body until they finish;
+  receipt lists and kind counts process retained claim slots separately. Kind
+  counts capture lane cursors before processing receipts.
 - Preserve the original job body when manually retrying a priority-aged attempt
   that exhausted its retries during rescue. Retained failed reads and failed-row
   carry through pruning now use the physical ready-lane identity.

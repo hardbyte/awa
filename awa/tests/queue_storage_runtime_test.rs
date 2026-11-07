@@ -17197,6 +17197,15 @@ async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool, row_
         .claim_runtime_batch(&pool, queue, 3, deadline)
         .await
         .unwrap();
+    if receipts {
+        assert!(matches!(
+            store
+                .rotate_claims(&pool)
+                .await
+                .expect("rotate between queues"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+    }
     claims.extend(
         store
             .claim_runtime_batch(&pool, other_queue, 1, deadline)
@@ -18305,4 +18314,416 @@ async fn test_legacy_narrow_available_cancel_retry_keeps_tombstoned_body() {
         .await
         .is_empty());
     assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+}
+
+#[tokio::test]
+async fn test_receipt_list_refills_pages_past_closed_and_other_kind_claims() {
+    let (_guard, pool) = setup_pool(6).await;
+    let queue = "receipt_candidate_refill";
+    let store = create_store_with_config(
+        &pool,
+        unique_cancel_store_config("awa_qs_receipt_candidate_refill"),
+    )
+    .await;
+    let mut targets = Vec::new();
+    for id in 0..3 {
+        targets.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    tags: vec!["selected".into()],
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let targets_claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("claim older targets");
+    assert_eq!(targets_claimed.len(), 3);
+    let first_target = targets_claimed
+        .iter()
+        .find(|claim| claim.job.id == targets[0])
+        .expect("first target was claimed");
+    // The same job appears in both the lease and raw-receipt candidate sources.
+    store
+        .register_callback(
+            &pool,
+            targets[0],
+            first_target.job.run_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("materialize one target");
+
+    let mut all_ids = targets.clone();
+    for id in 10..22 {
+        all_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 12, Duration::ZERO)
+        .await
+        .expect("claim newer completed candidates");
+    assert_eq!(finished.len(), 12);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &finished)
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+    for id in 30..42 {
+        all_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &DlqJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        store
+            .claim_runtime_batch(&pool, queue, 12, Duration::ZERO)
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+
+    let filter = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        kind: Some(CompleteJob::kind().into()),
+        queue: Some(queue.into()),
+        limit: Some(2),
+        ..Default::default()
+    };
+    targets.sort_unstable_by(|a, b| b.cmp(a));
+    let first = receipt_admin_ids(&pool, filter.clone()).await;
+    assert_eq!(first, targets[..2]);
+    let second = receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: first.last().copied(),
+            ..filter.clone()
+        },
+    )
+    .await;
+    assert_eq!(second, targets[2..]);
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                tag: Some("selected".into()),
+                limit: Some(100),
+                ..filter
+            },
+        )
+        .await,
+        targets
+    );
+    all_ids.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                queue: Some(queue.into()),
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await,
+        all_ids,
+        "closed receipts and materialized claims must not duplicate results"
+    );
+}
+
+struct PointReadControl {
+    _guard: TestDbGuard,
+    pool: sqlx::PgPool,
+    reads: sqlx::PgPool,
+    store: Arc<QueueStorage>,
+    original: JobRow,
+    reader_pid: i32,
+}
+
+impl PointReadControl {
+    async fn new(schema: &str) -> Self {
+        let (guard, pool) = setup_pool(6).await;
+        let store = Arc::new(
+            create_store_with_config(
+                &pool,
+                QueueStorageConfig {
+                    schema: schema.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 9030 },
+            InsertOpts {
+                queue: "qs_point_read_control".into(),
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let reads = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .application_name("awa_point_read_control"),
+            )
+            .await
+            .expect("point reader pool");
+        let original = store
+            .load_job(&reads, job_id)
+            .await
+            .expect("warm cached point queries")
+            .expect("available job");
+        let reader_pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&reads)
+            .await
+            .expect("point reader identity");
+        Self {
+            _guard: guard,
+            pool,
+            reads,
+            store,
+            original,
+            reader_pid,
+        }
+    }
+
+    async fn block_deferred(&self) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut locker = self.pool.begin().await.expect("point read blocker");
+        sqlx::query(&format!(
+            "LOCK TABLE {}.deferred_jobs IN ACCESS EXCLUSIVE MODE",
+            self.store.schema()
+        ))
+        .execute(locker.as_mut())
+        .await
+        .expect("hold point reader between ready and deferred legs");
+        locker
+    }
+
+    fn start_read(&self) -> tokio::task::JoinHandle<Result<Option<JobRow>, AwaError>> {
+        let store = self.store.clone();
+        let reads = self.reads.clone();
+        let job_id = self.original.id;
+        tokio::spawn(async move { store.load_job(&reads, job_id).await })
+    }
+
+    async fn wait_until_blocked(&self) {
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)",
+            )
+            .bind(self.reader_pid)
+            .fetch_one(&self.pool)
+            .await
+            .expect("observe point read barrier");
+            if waiting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "point read did not reach barrier"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn assert_pool_has_no_read_transaction(&self) {
+        let settings: (String, bool) = sqlx::query_as(
+            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')::boolean",
+        )
+        .fetch_one(&self.reads)
+        .await
+        .expect("reuse point reader after interruption");
+        assert_eq!(settings, ("read committed".into(), false));
+        sqlx::query("CREATE TEMP TABLE point_read_write_control (value int)")
+            .execute(&self.reads)
+            .await
+            .expect("next caller can write outside the read-only transaction");
+    }
+}
+
+#[tokio::test]
+async fn test_point_read_releases_earlier_locks_but_keeps_its_snapshot() {
+    let control = PointReadControl::new("awa_qs_point_snapshot").await;
+    let mut locker = control.block_deferred().await;
+    let reading = control.start_read();
+    control.wait_until_blocked().await;
+    let held: Vec<String> = sqlx::query_scalar(
+        "SELECT relation.relname FROM pg_locks AS locks JOIN pg_class AS relation ON relation.oid=locks.relation JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace WHERE locks.pid=$1 AND locks.granted AND namespace.nspname=$2 AND relation.relkind IN ('r','p') AND relation.relname LIKE 'ready_entries%' ORDER BY relation.relname",
+    )
+    .bind(control.reader_pid)
+    .bind(control.store.schema())
+    .fetch_all(&control.pool)
+    .await
+    .expect("inspect retained ready relation locks");
+    assert_eq!(
+        held,
+        vec!["ready_entries_0"],
+        "retain the located body without pinning every ready partition"
+    );
+    let schema = control.store.schema();
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.deferred_jobs (job_id,kind,queue,args,state,priority,attempt,run_lease,max_attempts,run_at,created_at,payload) SELECT job_id,kind,queue,args,'scheduled'::awa.job_state,priority,attempt,run_lease+1,max_attempts,clock_timestamp()+interval '1 hour',created_at,payload FROM {schema}.ready_entries WHERE job_id=$1"
+    ))
+    .bind(control.original.id)
+    .execute(locker.as_mut())
+    .await
+    .expect("move the row after the reader's first leg");
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.ready_entries WHERE job_id=$1"
+    ))
+    .bind(control.original.id)
+    .execute(locker.as_mut())
+    .await
+    .expect("remove old ready row in the same transaction");
+    locker.commit().await.expect("commit concurrent move");
+    let old = reading
+        .await
+        .expect("point read task")
+        .expect("point read")
+        .expect("snapshot retained the old row");
+    assert_eq!(old.state, JobState::Available);
+    assert_eq!(old.run_lease, control.original.run_lease);
+    let new = control
+        .store
+        .load_job(&control.reads, control.original.id)
+        .await
+        .expect("reuse cached point statements")
+        .expect("next snapshot sees the successor");
+    assert_eq!(new.state, JobState::Scheduled);
+    assert_eq!(new.run_lease, control.original.run_lease + 1);
+    assert_eq!(new.args, control.original.args);
+    assert_eq!(new.max_attempts, control.original.max_attempts);
+    control.reads.close().await;
+}
+
+#[tokio::test]
+async fn test_point_read_cancellation_rolls_back_its_outer_transaction() {
+    let control = PointReadControl::new("awa_qs_point_cancel").await;
+    let locker = control.block_deferred().await;
+    let reading = control.start_read();
+    control.wait_until_blocked().await;
+    reading.abort();
+    assert!(reading.await.expect_err("read was aborted").is_cancelled());
+    locker.rollback().await.expect("release point read barrier");
+    control.assert_pool_has_no_read_transaction().await;
+    control.reads.close().await;
+}
+
+#[tokio::test]
+async fn test_point_read_query_error_rolls_back_its_outer_transaction() {
+    let control = PointReadControl::new("awa_qs_point_error").await;
+    sqlx::query("SET lock_timeout='100ms'")
+        .execute(&control.reads)
+        .await
+        .expect("bound blocked point read");
+    let locker = control.block_deferred().await;
+    let result = control
+        .store
+        .load_job(&control.reads, control.original.id)
+        .await;
+    assert!(
+        matches!(result, Err(AwaError::Database(ref error)) if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some("55P03")))
+    );
+    locker.rollback().await.expect("release point read barrier");
+    control.assert_pool_has_no_read_transaction().await;
+    control.reads.close().await;
+}
+
+#[tokio::test]
+async fn test_point_read_keeps_located_body_until_failed_carry_can_finish() {
+    let control = PointReadControl::new("awa_qs_point_carry").await;
+    let claimed = control
+        .store
+        .claim_runtime_batch(&control.pool, &control.original.queue, 1, Duration::ZERO)
+        .await
+        .expect("claim carry fixture");
+    assert_eq!(claimed.len(), 1);
+    let failed = control
+        .store
+        .rescue_stale_heartbeats(&control.pool, Duration::ZERO)
+        .await
+        .expect("exhaust carry fixture");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].state, JobState::Failed);
+    assert!(matches!(
+        control.store.rotate(&control.pool).await.expect("rotate"),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let locker = control.block_deferred().await;
+    let reading = control.start_read();
+    control.wait_until_blocked().await;
+    assert!(matches!(
+        control
+            .store
+            .prune_oldest(&control.pool, Duration::from_secs(3600))
+            .await
+            .expect("prune while located body is in use"),
+        PruneOutcome::Blocked { slot: 0 }
+    ));
+    locker.rollback().await.expect("release read barrier");
+    let before = reading
+        .await
+        .expect("point read task")
+        .expect("read before carry")
+        .expect("retained failure");
+    assert_eq!(before.state, JobState::Failed);
+    assert_eq!(before.args, control.original.args);
+    assert_eq!(before.max_attempts, 1);
+    assert_eq!(before.errors, failed[0].errors);
+    assert!(matches!(
+        control
+            .store
+            .prune_oldest(&control.pool, Duration::from_secs(3600))
+            .await
+            .expect("carry after point read releases its body"),
+        PruneOutcome::Pruned {
+            slot: 0,
+            carried_failed_rows: 1
+        }
+    ));
+    let after = control
+        .store
+        .load_job(&control.reads, control.original.id)
+        .await
+        .expect("read carried failure")
+        .expect("carried failure remains visible");
+    assert_eq!(after.state, JobState::Failed);
+    assert_eq!(after.args, before.args);
+    assert_eq!(after.max_attempts, before.max_attempts);
+    assert_eq!(after.errors, before.errors);
+    control.reads.close().await;
 }
