@@ -350,16 +350,65 @@ impl CompletionWorker {
                 );
             }
             Err(err) => {
-                self.metrics.record_completion_flush(
-                    self.shard_id,
-                    job_ids.len() as u64,
-                    flush_start.elapsed(),
-                );
                 warn!(
                     error = %err,
                     shard = self.shard_id,
                     batch_size = job_ids.len(),
                     "Failed to flush completed job batch"
+                );
+                if matches!(
+                    &err,
+                    AwaError::Database(sqlx::Error::Database(error))
+                        if error.code().as_deref() == Some("55P03")
+                ) {
+                    if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
+                        let mut committed_pairs = HashSet::new();
+                        for request in batch {
+                            let pair = (request.job_id, request.run_lease);
+                            let response = if committed_pairs.contains(&pair) {
+                                Ok(true)
+                            } else {
+                                let updated = if let Some(runtime_job) = &request.runtime_job {
+                                    runtime
+                                        .store
+                                        .complete_runtime_batch(
+                                            &self.pool,
+                                            std::slice::from_ref(runtime_job),
+                                        )
+                                        .await
+                                } else if let Some(claim) = &request.claim {
+                                    runtime
+                                        .store
+                                        .complete_claimed_batch(
+                                            &self.pool,
+                                            std::slice::from_ref(claim),
+                                        )
+                                        .await
+                                } else {
+                                    runtime
+                                        .store
+                                        .complete_job_batch_by_id(&self.pool, &[pair])
+                                        .await
+                                };
+                                updated.map(|updated| updated.contains(&pair))
+                            };
+                            if matches!(&response, Ok(true)) {
+                                committed_pairs.insert(pair);
+                            }
+                            let _ = request.response.send(response);
+                        }
+                        self.metrics.record_completion_flush(
+                            self.shard_id,
+                            job_ids.len() as u64,
+                            flush_start.elapsed(),
+                        );
+                        return;
+                    }
+                }
+                self.metrics.record_completion_flush(
+                    self.shard_id,
+                    job_ids.len() as u64,
+                    flush_start.elapsed(),
                 );
                 let message = format!("completion batch flush failed: {err}");
                 for request in batch {
@@ -1004,5 +1053,204 @@ mod tests {
             elapsed.as_secs_f64(),
             jobs.len() as f64 / elapsed.as_secs_f64()
         );
+    }
+    async fn queue_storage_busy_completion_responses(with_claim: bool) {
+        let pool = setup(6).await;
+        let schema = format!("awa_complete_busy_{}", uuid::Uuid::new_v4().simple());
+        let runtime = crate::storage::QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig {
+                schema: schema.clone(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: false,
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let store = runtime.store.clone();
+        store.install(&pool).await.unwrap();
+        let mut jobs = Vec::new();
+        for queue in ["busy", "ordinary", "stale", "carried"] {
+            store.enqueue_batch(&pool, queue, 4, 1).await.unwrap();
+            let mut claimed = store
+                .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 1);
+            jobs.push(claimed.remove(0));
+        }
+        let historical = jobs.remove(0);
+        let ordinary = jobs.remove(0);
+        let stale = jobs.remove(0);
+        let carried = jobs.remove(0);
+        assert_eq!(
+            store
+                .complete_runtime_batch(&pool, std::slice::from_ref(&stale))
+                .await
+                .unwrap(),
+            vec![(stale.job.id, stale.job.run_lease)]
+        );
+        store.enqueue_batch(&pool, "busy", 3, 1).await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.ready_tombstones
+             (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
+             SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id
+             FROM {schema}.ready_entries WHERE job_id=$1;"
+        ))
+        .bind(historical.job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.ready_entries
+             (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+              lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+             SELECT ready_slot,ready_generation,job_id,kind,queue,args,3::smallint,attempt,run_lease,max_attempts,
+              {schema}.reserve_enqueue_seq(queue,3::smallint,enqueue_shard,1::bigint),enqueue_shard,
+              run_at,attempted_at,created_at,unique_key,unique_states,payload
+             FROM {schema}.ready_entries WHERE job_id=$1"
+        ))
+        .bind(historical.job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(&format!(
+            "SELECT 1 FROM {schema}.queue_claim_heads
+             WHERE queue='busy' AND priority=3 AND enqueue_shard=0 FOR UPDATE"
+        ))
+        .fetch_one(blocker.as_mut())
+        .await
+        .unwrap();
+        let pairs = [
+            (historical.job.id, historical.job.run_lease),
+            (ordinary.job.id, ordinary.job.run_lease),
+        ];
+        let strict = if with_claim {
+            store
+                .complete_claimed_batch(&pool, &[historical.claim.clone(), ordinary.claim.clone()])
+                .await
+        } else {
+            store.complete_job_batch_by_id(&pool, &pairs).await
+        };
+        assert!(matches!(strict, Err(AwaError::Database(ref error))
+            if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))));
+        let mut caller_tx = pool.begin().await.unwrap();
+        let strict = store
+            .complete_job_batch_by_id_in_tx(&mut caller_tx, &pairs)
+            .await;
+        assert!(matches!(strict, Err(AwaError::Database(ref error))
+            if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))));
+        caller_tx.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .load_job(&pool, ordinary.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            awa_model::JobState::Running
+        );
+
+        let (mut batcher, _) = CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            crate::metrics::AwaMetrics::from_global(),
+            RuntimeStorage::QueueStorage(runtime),
+            1,
+        );
+        let worker = batcher.workers.pop().unwrap();
+        let mut batch = Vec::new();
+        let mut responses = Vec::new();
+        for job in [&historical, &ordinary, &stale, &carried] {
+            let (response, rx) = oneshot::channel();
+            batch.push(CompletionRequest {
+                job_id: job.job.id,
+                run_lease: job.job.run_lease,
+                claim: with_claim.then(|| job.claim.clone()),
+                runtime_job: (job.job.id == carried.job.id).then(|| job.clone()),
+                response,
+            });
+            responses.push(rx);
+        }
+        tokio::time::timeout(Duration::from_secs(5), worker.flush(&mut batch))
+            .await
+            .expect("contended batch isolates singleton errors without waiting");
+        let busy = responses.remove(0).await.unwrap();
+        assert!(
+            matches!(busy, Err(AwaError::Database(ref error))
+            if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))),
+            "busy attempt must report its real error, never stale: {busy:?}"
+        );
+        assert!(responses.remove(0).await.unwrap().unwrap());
+        assert!(!responses.remove(0).await.unwrap().unwrap());
+        assert!(responses.remove(0).await.unwrap().unwrap());
+        assert_eq!(
+            store
+                .load_job(&pool, historical.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            awa_model::JobState::Running
+        );
+        assert_eq!(
+            store
+                .load_job(&pool, ordinary.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            awa_model::JobState::Completed
+        );
+        blocker.rollback().await.unwrap();
+        let (response, rx) = oneshot::channel();
+        worker
+            .flush(&mut vec![CompletionRequest {
+                job_id: historical.job.id,
+                run_lease: historical.job.run_lease,
+                claim: with_claim.then(|| historical.claim.clone()),
+                runtime_job: None,
+                response,
+            }])
+            .await;
+        assert!(rx.await.unwrap().unwrap());
+        let terminals: Vec<(i64, i64, i64)> = sqlx::query_as(&format!(
+            "SELECT job_id,run_lease,count(*) FROM {schema}.done_entries
+             WHERE job_id=ANY($1) GROUP BY job_id,run_lease ORDER BY job_id"
+        ))
+        .bind(vec![
+            historical.job.id,
+            ordinary.job.id,
+            stale.job.id,
+            carried.job.id,
+        ])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut expected: Vec<_> = [&historical, &ordinary, &stale, &carried]
+            .into_iter()
+            .map(|job| (job.job.id, job.job.run_lease, 1_i64))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(terminals, expected);
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn queue_storage_id_completion_contention_isolates_responses() {
+        queue_storage_busy_completion_responses(false).await;
+    }
+
+    #[tokio::test]
+    async fn queue_storage_claim_completion_contention_isolates_responses() {
+        queue_storage_busy_completion_responses(true).await;
     }
 }

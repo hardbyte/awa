@@ -91,9 +91,12 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   perform that repair, and can leave an old replacement claimable. The aging
   fence prevents new replacements from updated callers; it cannot fence an
   older process explicitly calling physical aging during a rolling upgrade.
-  Repair takes claim-head row locks without waiting and rolls back on contention;
-  the operation must retry. It adds weak relation locks and tombstone writes
-  only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
+  Repair takes claim-head row locks without waiting. Rescue batches defer
+  busy historical attempts while progressing other attempts; receipt rescue
+  cursors keep deferred attempts eligible. Worker completion batches isolate
+  lock contention to the affected requests. Direct completion and
+  single-attempt mutations still fail on contention and must retry. It adds
+  weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
 
 ## [0.6.13] — 2026-11-06
 
