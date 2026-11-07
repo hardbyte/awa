@@ -613,6 +613,7 @@ class Client:
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 250,
         queue_storage_claim_rotate_interval_ms: int | None = None,
+        queue_storage_prune_lock_timeout_ms: int | None = None,
         queue_storage_rotate_min_slot_age_ms: int | None = None,
         queue_storage_rotate_target_slot_bytes: int | None = None,
         queue_storage_rotate_min_slot_rows: int | None = None,

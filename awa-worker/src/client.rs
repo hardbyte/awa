@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Errors returned when building a worker client.
@@ -179,6 +179,7 @@ pub struct ClientBuilder {
     storage: RuntimeStorage,
     ring_rotation_cadence: RingRotationCadence,
     claim_rotate_interval: Option<Duration>,
+    prune_lock_timeout: Option<Duration>,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
     health_addr: Option<SocketAddr>,
@@ -242,6 +243,7 @@ impl ClientBuilder {
             storage,
             ring_rotation_cadence: RingRotationCadence::DEFAULT,
             claim_rotate_interval: None,
+            prune_lock_timeout: None,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
             health_addr: None,
@@ -978,6 +980,35 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the PostgreSQL `lock_timeout` the maintenance leader applies to
+    /// the exclusive-lock steps of queue, lease and claim ring prune and of
+    /// terminal-delta rollup (default 10 ms).
+    ///
+    /// Queue ring prune waits only on its `ready_segments` lock; its other
+    /// partition locks use `NOWAIT`, so a reader holding one of them makes it
+    /// `blocked` immediately whatever the timeout.
+    ///
+    /// Each lock acquisition gets its own timeout; this does not bound the
+    /// whole prune. A lock timeout rolls back the prune and records `blocked`
+    /// in `awa.maintenance.prune.attempts`; the maintenance loop retries on a
+    /// later tick. The short default keeps the pending `ACCESS EXCLUSIVE`
+    /// request from stalling claims and enqueues behind it.
+    /// Raise it when `blocked` outcomes persist and the rings stop recycling
+    /// because short-lived readers (admin queries, dashboards) repeatedly hold
+    /// the ring partitions at the moment prune tries. Keep it well below
+    /// PostgreSQL's `deadlock_timeout` (default 1 s), so that a waiting prune
+    /// is abandoned before deadlock detection can pick a claim as the victim,
+    /// and below any `statement_timeout`; [`Self::start`] logs a warning when
+    /// it is not. A zero timeout, or one above
+    /// PostgreSQL's `lock_timeout` maximum (`i32::MAX` ms), makes
+    /// [`Self::build`] fail. Only takes effect when queue storage is active.
+    /// May be set before or after [`Self::queue_storage`]; retained across
+    /// storage configuration changes.
+    pub fn prune_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.prune_lock_timeout = Some(timeout);
+        self
+    }
+
     /// Override when a maintenance tick may seal the current slot of the
     /// queue, lease and claim rings (default
     /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling
@@ -1090,6 +1121,11 @@ impl ClientBuilder {
             runtime.rotation_cadence = cadence;
             if let Some(interval) = self.claim_rotate_interval {
                 runtime.claim_rotate_interval = interval;
+            }
+            if let Some(timeout) = self.prune_lock_timeout {
+                runtime
+                    .set_prune_lock_timeout(timeout)
+                    .map_err(|err| BuildError::InvalidQueueStorage(err.to_string()))?;
             }
         }
 
@@ -1680,6 +1716,38 @@ impl Client {
         reporter.publish_snapshot().await;
     }
 
+    async fn warn_on_unsafe_prune_lock_timeout(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+        let timeout = runtime.store.prune_lock_timeout();
+        let timeout_ms = timeout.as_millis().max(1) as u64;
+        let risks = match crate::storage::check_prune_lock_timeout(&self.pool, timeout).await {
+            Ok(risks) => risks,
+            Err(err) => {
+                debug!(error = %err, "Could not read lock settings to check the prune lock timeout");
+                return;
+            }
+        };
+        for risk in risks {
+            match risk {
+                crate::storage::PruneLockTimeoutRisk::DeadlockTimeout { limit_ms } => warn!(
+                    prune_lock_timeout_ms = timeout_ms,
+                    deadlock_timeout_ms = limit_ms,
+                    "Prune lock timeout is at or above deadlock_timeout; a waiting prune can \
+                     make PostgreSQL run deadlock detection and cancel a concurrent claim. \
+                     Keep the timeout well below deadlock_timeout"
+                ),
+                crate::storage::PruneLockTimeoutRisk::StatementTimeout { limit_ms } => warn!(
+                    prune_lock_timeout_ms = timeout_ms,
+                    statement_timeout_ms = limit_ms,
+                    "Prune lock timeout is at or above statement_timeout; prune is cancelled \
+                     by the statement timeout and fails instead of reporting blocked"
+                ),
+            }
+        }
+    }
+
     async fn log_transition_startup_status(
         &self,
         effective_storage: &RuntimeStorage,
@@ -1753,6 +1821,7 @@ impl Client {
 
         self.log_transition_startup_status(&effective_storage)
             .await?;
+        self.warn_on_unsafe_prune_lock_timeout().await;
 
         admin::sync_queue_descriptors(
             &self.pool,
@@ -2969,6 +3038,115 @@ mod tests {
             .build()
             .unwrap();
         assert!(client.storage.queue_storage().is_none());
+    }
+
+    #[tokio::test]
+    async fn prune_lock_timeout_reaches_the_store_in_either_builder_order() {
+        let timeout = Duration::from_millis(750);
+        for configure_first in [true, false] {
+            let mut builder = Client::builder(lazy_pool()).queue("q", QueueConfig::default());
+            if configure_first {
+                builder = builder.prune_lock_timeout(timeout);
+            }
+            builder = builder.queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            );
+            if !configure_first {
+                builder = builder.prune_lock_timeout(timeout);
+            }
+            let client = builder.build().unwrap();
+            let store = client.storage.queue_storage_store().unwrap();
+            assert_eq!(store.prune_lock_timeout(), timeout);
+        }
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage_store()
+                .unwrap()
+                .prune_lock_timeout(),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_lock_timeout_check_reads_the_session_limits() {
+        use crate::storage::{check_prune_lock_timeout, PruneLockTimeoutRisk};
+
+        let url = database_url();
+        ensure_database_exists(&url).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET deadlock_timeout = '200ms'")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("SET statement_timeout = '3s'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect with session limits");
+
+        assert!(check_prune_lock_timeout(&pool, Duration::from_millis(100))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            check_prune_lock_timeout(&pool, Duration::from_millis(300))
+                .await
+                .unwrap(),
+            vec![PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 }]
+        );
+        assert_eq!(
+            check_prune_lock_timeout(&pool, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            vec![
+                PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 },
+                PruneLockTimeoutRisk::StatementTimeout { limit_ms: 3000 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_range_prune_lock_timeout_is_rejected_at_build() {
+        for timeout in [Duration::ZERO, Duration::from_millis(i32::MAX as u64 + 1)] {
+            let result = Client::builder(lazy_pool())
+                .queue("q", QueueConfig::default())
+                .prune_lock_timeout(timeout)
+                .build();
+            assert!(
+                matches!(result, Err(BuildError::InvalidQueueStorage(ref message)) if message.contains("prune lock timeout")),
+                "{timeout:?}: {:?}",
+                result.err()
+            );
+        }
+
+        let at_maximum = Duration::from_millis(i32::MAX as u64);
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .prune_lock_timeout(at_maximum)
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage_store()
+                .unwrap()
+                .prune_lock_timeout(),
+            at_maximum
+        );
     }
 
     #[tokio::test]

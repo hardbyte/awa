@@ -251,9 +251,12 @@ pub struct AwaMetrics {
     /// pinned by handfuls of stragglers or by mountains of unfinished work.
     pub maintenance_rotate_skipped_rows: Histogram<u64>,
     /// Maintenance ring prune attempts, attributed to (ring, outcome, reason).
-    /// reason="none" for Pruned/Noop/Blocked; otherwise carries the
-    /// SkipReason discriminator (e.g. "queue.active_leases",
-    /// "queue.pending_ready", "claim.open").
+    /// Outcomes: `pruned`, `noop`, `blocked` (the exclusive locks were not
+    /// available within the prune lock timeout), `skipped_active`,
+    /// `already_pruned`, `backed_off` (the tick skipped prune after repeated
+    /// `skipped_active` results) and `error`. reason="none" except for
+    /// `skipped_active`, which carries the SkipReason discriminator (e.g.
+    /// "queue.active_leases", "queue.pending_ready", "claim.open").
     pub maintenance_prune_attempts: Counter<u64>,
     /// Magnitude of the reason count when prune returns SkippedActive.
     pub maintenance_prune_skipped_rows: Histogram<u64>,
@@ -1315,15 +1318,31 @@ impl AwaMetrics {
         }
     }
 
-    /// Record an idle maintenance tick that skipped destructive prune because
-    /// the exact sealed generation was already reclaimed by this leader.
-    pub fn record_prune_already_pruned(&self, ring: &'static str) {
+    /// Record a maintenance tick that skipped prune because the ring's
+    /// backoff after repeated `skipped_active` results had not yet elapsed.
+    pub fn record_prune_backed_off(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "backed_off");
+    }
+
+    /// Record a prune attempt that failed with a database error rather than
+    /// returning an outcome.
+    pub fn record_prune_error(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "error");
+    }
+
+    fn record_prune_attempt_without_reason(&self, ring: &'static str, outcome: &'static str) {
         let attrs = [
             opentelemetry::KeyValue::new("awa.ring", ring),
-            opentelemetry::KeyValue::new("awa.ring.outcome", "already_pruned"),
+            opentelemetry::KeyValue::new("awa.ring.outcome", outcome),
             opentelemetry::KeyValue::new("awa.ring.reason", "none"),
         ];
         self.maintenance_prune_attempts.add(1, &attrs);
+    }
+
+    /// Record an idle maintenance tick that skipped destructive prune because
+    /// the exact sealed generation was already reclaimed by this leader.
+    pub fn record_prune_already_pruned(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "already_pruned");
     }
 }
 
@@ -1441,6 +1460,97 @@ mod tests {
             BTreeSet::from(["commit".into(), "lock".into(), "truncate".into()])
         );
         assert!(saw_already_pruned);
+    }
+
+    #[test]
+    fn prune_attempts_count_every_outcome_per_ring() {
+        use awa_model::{PruneDurations, PruneOutcome, SkipReason};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        for ring in ["queue", "lease", "claim"] {
+            metrics.record_prune_outcome(
+                ring,
+                &PruneOutcome::Pruned {
+                    slot: 0,
+                    generation: 1,
+                    carried_failed_rows: 0,
+                    durations: PruneDurations::default(),
+                },
+            );
+            metrics.record_prune_outcome(ring, &PruneOutcome::Blocked { slot: 0 });
+            metrics.record_prune_outcome(ring, &PruneOutcome::Noop);
+            metrics.record_prune_already_pruned(ring);
+            metrics.record_prune_backed_off(ring);
+            metrics.record_prune_error(ring);
+        }
+        metrics.record_prune_outcome("claim", &PruneOutcome::Blocked { slot: 1 });
+        metrics.record_prune_outcome(
+            "claim",
+            &PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::ClaimOpen,
+                count: 3,
+            },
+        );
+        provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+
+        let mut counts: std::collections::BTreeMap<(String, String, String), u64> =
+            std::collections::BTreeMap::new();
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let (
+                        names::MAINTENANCE_PRUNE_ATTEMPTS,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    else {
+                        continue;
+                    };
+                    for point in sum.data_points() {
+                        let label = |key: &str| {
+                            point
+                                .attributes()
+                                .find(|attribute| attribute.key.as_str() == key)
+                                .map(|attribute| attribute.value.as_str().into_owned())
+                                .unwrap_or_default()
+                        };
+                        counts.insert(
+                            (
+                                label("awa.ring"),
+                                label("awa.ring.outcome"),
+                                label("awa.ring.reason"),
+                            ),
+                            point.value(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let count = |ring: &str, outcome: &str, reason: &str| {
+            counts
+                .get(&(ring.to_string(), outcome.to_string(), reason.to_string()))
+                .copied()
+        };
+        for ring in ["queue", "lease", "claim"] {
+            for outcome in ["pruned", "noop", "already_pruned", "backed_off", "error"] {
+                assert_eq!(count(ring, outcome, "none"), Some(1), "{ring} {outcome}");
+            }
+            let expected_blocked = if ring == "claim" { 2 } else { 1 };
+            assert_eq!(
+                count(ring, "blocked", "none"),
+                Some(expected_blocked),
+                "{ring} blocked"
+            );
+        }
+        assert_eq!(count("claim", "skipped_active", "claim.open"), Some(1));
+        assert_eq!(count("queue", "skipped_active", "claim.open"), None);
     }
 
     /// A second-scale observation must not fall in the SDK's default
