@@ -2618,6 +2618,7 @@
 <li>monitor <code>pg_stat_activity</code> for long transactions</li>
 <li>monitor <code>pg_stat_user_tables</code> on the active queue-storage schema; ready, tombstone, done, and terminal-delta segments should stay near zero dead tuples, lease segments may spike within the rotation window but should collapse after prune, and <code>attempt_state</code> should roughly track live long-running attempts</li>
 <li>tune autovacuum for the database if the lease tables churn heavily</li>
+<li>monitor <code>increase(awa_maintenance_prune_attempts_total{awa_ring_outcome=~"blocked|error"}[15m])</code> for contention or failures, alongside successful <code>pruned</code> outcomes, ring generations and accumulated rows. A positive increase can persist while recycling succeeds. If recycling has stalled, inspect long transactions and conflicting locks; for short readers, consider <a href="../configuration/#what-the-knobs-mean"><code>prune_lock_timeout</code></a> and its effect on waiting queries</li>
 </ul>
 <p>Queue-storage depth metrics are designed for high-cadence monitoring. The worker records <code>available</code> from lane-head cursor differences and probes queue lag from the next claimable row per lane, instead of running the exact <code>queue_counts</code> ready-row scan on every metrics tick. Use the admin API or CLI when you need exact queue counts for an operator action.</p>
 <p>The nightly MVCC benchmark exists to catch changes that make this failure mode worse, but it is not a substitute for keeping the primary free of stale snapshots.</p>

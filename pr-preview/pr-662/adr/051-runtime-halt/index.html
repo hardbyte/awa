@@ -2140,8 +2140,69 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Decision">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#phase-1-reclamation-gate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1: reclamation gate
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Phase 1: reclamation gate">
       <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#permanent-reclamation-cap" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Permanent reclamation cap
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#exhaustive-branch-map" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exhaustive branch map
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#full-design-proposed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Full design (Proposed)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Full design (Proposed)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#scope-policies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scope policies
+      
+    </span>
+  </a>
+  
+</li>
         
           <li class="md-nav__item">
   <a href="#state-and-enforcement" class="md-nav__link">
@@ -2233,96 +2294,256 @@
 
 <h1 id="adr-051-scoped-runtime-controls">ADR-051: Scoped runtime controls<a class="headerlink" href="#adr-051-scoped-runtime-controls" title="Permanent link">&para;</a></h1>
 <h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>Proposed. The defaults below are design choices requiring contention and failure testing before acceptance; no runtime behavior is implemented by this record.</p>
+<p>Proposed. Phase 1 can be accepted independently. Timing defaults require rehearsal and measurement.</p>
 <h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
-<p>Queue pause stops claims but leaves maintenance running. Containing reclamation lock pressure should leave dispatch, promotion and rescue available. Awa needs durable live controls shared by all runtimes in a database, including restarted clients and successor maintenance leaders, without making enqueue depend on those controls.</p>
-<p>The <a href="../../design/runtime-control-source-audit/">source audit</a> identifies claim paths, reclamation paths and observation limits on main and 0.6.</p>
+<p>Queue pause stops claims but leaves maintenance running. Containing reclamation lock pressure should leave dispatch, promotion and rescue available. Durable controls must survive runtime restart and leadership handoff without making application enqueue depend on them. The <a href="../../design/runtime-control-source-audit/">source audit</a> records the claim and maintenance paths on main and 0.6.</p>
 <h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
-<p>Use five fixed database-wide scopes. A full halt sets all five atomically; enqueue remains available in application transactions.</p>
+<p>Use five fixed database-wide scopes: <code>dispatch</code>, <code>cron</code>, <code>maintenance.prune</code>, <code>maintenance.promote</code> and <code>maintenance.rescue</code>. A full halt sets all installed scopes atomically; it is available only when all five are supported. Application enqueue remains unchanged. Drain is the default, and a local stop remains independent of database access.</p>
+<h2 id="phase-1-reclamation-gate">Phase 1: reclamation gate<a class="headerlink" href="#phase-1-reclamation-gate" title="Permanent link">&para;</a></h2>
+<h3 id="permanent-reclamation-cap">Permanent reclamation cap<a class="headerlink" href="#permanent-reclamation-cap" title="Permanent link">&para;</a></h3>
+<p>Always allow at most one strong-relation-lock transaction admission per second per leader, with concurrency one across all rings and substrates. Strong means potentially requesting <code>SHARE</code>, <code>SHARE ROW EXCLUSIVE</code>, <code>EXCLUSIVE</code> or <code>ACCESS EXCLUSIVE</code>; ordinary <code>ROW EXCLUSIVE</code> writes do not qualify. The map identifies capped operations. Each nested transaction needs its own admission before its first possible strong-lock request; one permit cannot cover an entire multi-transaction timer callback.</p>
+<p>Wait at least one monotonic second after a capped transaction settles before admitting the next; store no catch-up credit. Apply the cap during normal operation, startup, leadership changes and resume, preserving ordinary cadences and backoff. A locally cancelled task cannot release an unresolved SQL operation's slot. Keep the existing 10 ms prune lock timeout; it does not bound an entire operation.</p>
+<p>This cap is independent of the control schema and can ship in a budget-only build before any control table exists.</p>
+<p>Install one <code>maintenance.prune</code> row in ordinary table <code>awa.runtime_controls</code>, with revision, halt ID, mode, reason, actor and update time. Support drain-only halt and halt-ID-checked resume through operator-only functions. Gate rotation, pruning, retention, terminal rollups, ledger folds, automatic storage-authority changes and the housekeeping assigned to this scope below. Other duties continue normally; unsupported scope or cancel requests fail explicitly.</p>
+<p>Use the existing leader session in an independently scheduled observer: read every 1 s with ±20% jitter and a 1 s query deadline. Require an initial read before gated work; stop new admissions when permission is 5 s old. Control-read failure is distinct from loss of the leader session. Keep observation and truthful requested/observed/draining status active while halted, with no extra observer connection.</p>
+<p>The control capability is enabled only after its additive migration. Before enablement the budget-only build performs no control reads; after enablement a missing or malformed row denies gated work. On 0.6, deliver only Phase 1: an additive repeatable table/function patch and compatible runtime changes, without refreshing claim functions or reinstalling substrates. All possible leaders must support it or be fenced before fleet coverage is claimed.</p>
+<p>The closed enum and complete branch classification below are Phase 1 requirements. Phase 1 enforces only <code>maintenance.prune</code>; the other scopes remain unrestricted until their controls are implemented.</p>
+<details>
+<summary>Shared branch map required for Phase 1</summary>
+<h3 id="exhaustive-branch-map">Exhaustive branch map<a class="headerlink" href="#exhaustive-branch-map" title="Permanent link">&para;</a></h3>
+<p>Schedule leader work through a closed <code>MaintenanceBranch</code> enum with an exhaustive scope-and-budget match and no wildcard/default-allow arm. A new branch cannot be registered without explicit classifications. Split mixed callbacks and reporter side effects into classified operations; CI checks the branch inventory, startup paths and nested operations against this table. Control-only exemptions are explicit variants; cap flags follow the audited SQL definitions and must be rechecked when those definitions change.</p>
+<table>
+<thead>
+<tr>
+<th>Leader branch, nested operation or shared entry</th>
+<th>Scope</th>
+<th>Capped transaction</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial and periodic <code>sync_periodic_jobs_to_db</code></td>
+<td><code>cron</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Independent cron evaluator</td>
+<td><code>cron</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>rescue_stale_heartbeats</code></td>
+<td><code>maintenance.rescue</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>rescue_expired_deadlines</code></td>
+<td><code>maintenance.rescue</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>rescue_expired_callbacks</code></td>
+<td><code>maintenance.rescue</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>promote_scheduled</code></td>
+<td><code>maintenance.promote</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>age_waiting_priorities</code></td>
+<td><code>maintenance.promote</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Cleanup: completed/failed jobs and DLQ retention</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>cleanup_batch_operations</code></td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>cleanup_stale_runtime_snapshots</code></td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>cleanup_stale_descriptors</code></td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Queue-health metrics, both storage engines</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>recompute_dirty_admin_metadata</code></td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Canonical <code>refresh_admin_metadata</code></td>
+<td><code>maintenance.prune</code></td>
+<td>Yes on 0.6; no on main</td>
+</tr>
+<tr>
+<td><code>process_batch_operation</code></td>
+<td><code>dispatch</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Queue rotation</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Queue pruning</td>
+<td><code>maintenance.prune</code></td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Lease rotation</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Lease pruning</td>
+<td><code>maintenance.prune</code></td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Claim rotation</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Claim pruning</td>
+<td><code>maintenance.prune</code></td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Terminal-delta rollup</td>
+<td><code>maintenance.prune</code></td>
+<td>Yes, per slot transaction</td>
+</tr>
+<tr>
+<td>Prune-delta fold</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Rotation-ledger fold</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Storage-authority flip</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Startup/reporter descriptor publication</td>
+<td><code>maintenance.prune</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Startup/reporter cron manifest/reconciliation evidence</td>
+<td><code>cron</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Election, control/liveness checks, unlock and shutdown</td>
+<td>Control-only</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Runtime/attempt liveness and admitted-work completion</td>
+<td>Control-only</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Registration validation and bounded-claimer lease bookkeeping</td>
+<td>Control-only</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>Dirty keys here maintain dashboard metadata, not execution readiness. Housekeeping can pause with prune while recovery continues; control and liveness reporting must remain separate from those side effects. Preserve liveness-triggered safety fencing of cron evidence while suppressing new declarations. There is no aggregate rule that silently reopens side tasks when another scope resumes.</p>
+</details>
+<p>Acceptance is a pass/fail PostgreSQL 17 and 18 rehearsal, with retained admission/lock traces and exact job accounting:</p>
+<ul>
+<li>The exhaustive branch map above is implemented, and every strong-relation-lock transaction passes through the shared cap. Normal operation, backlog, resume and leadership changes respect its spacing and concurrency without catch-up.</li>
+<li>With healthy established leader/operator sessions, denying new connections or separately exhausting the worker pool does not stop observation: apply a readable halt revision within 3 s. Failed reads stop new gated admissions after 5 s. Admitted SQL remains reported as draining until settled.</li>
+<li>Halt suppresses every listed reclamation path while enqueue, dispatch, promotion and rescue continue in a separate mixed-workload run. A stale resume cannot clear a newer halt; drain-mode resume succeeds without waiting for a missing runtime or reconciliation.</li>
+<li>Repeat the additive patch safely; verify operator access and producer/runtime mutation denial. The cap also works without the schema in budget-only mode. Claims and substrate installers are unchanged on 0.6.</li>
+</ul>
+<p>Phase 1 requires no dispatch fencing, cancel-participant registry or cancellation-reconciliation machinery.</p>
+<h2 id="full-design-proposed">Full design (Proposed)<a class="headerlink" href="#full-design-proposed" title="Permanent link">&para;</a></h2>
+<p>Prune and cron stop stale admission; promotion and rescue retain their last observed state while the leader session remains held. The full design adds the other scopes and cancellation accounting independently of Phase 1.</p>
+<details>
+<summary>Other scope policies, dispatch enforcement and cancellation contract</summary>
+<h3 id="scope-policies">Scope policies<a class="headerlink" href="#scope-policies" title="Permanent link">&para;</a></h3>
+<p>After an initial successful read, apply these policies to control-read failures. A known halt remains until its matching explicit resume is observed.</p>
 <table>
 <thead>
 <tr>
 <th>Scope</th>
 <th>Controlled work</th>
+<th>Failed control reads</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>dispatch</code></td>
-<td>New claims; admitted attempts drain normally.</td>
+<td>Claims and administrative batch execution</td>
+<td>Read SQL state at each admission.</td>
 </tr>
 <tr>
 <td><code>cron</code></td>
-<td>Cron declaration sync and due-job enqueue.</td>
+<td>Declaration reconciliation and due-job enqueue</td>
+<td>Stop new work after 5 s stale.</td>
 </tr>
 <tr>
 <td><code>maintenance.prune</code></td>
-<td>Rotation, reclamation, retention, terminal rollups and storage-authority changes.</td>
+<td>Reclamation and non-recovery housekeeping</td>
+<td>Stop new work after 5 s stale.</td>
 </tr>
 <tr>
 <td><code>maintenance.promote</code></td>
-<td>Scheduled/retry promotion and priority/key readiness work.</td>
+<td>Scheduled/retry promotion and priority aging</td>
+<td>Keep last observed state.</td>
 </tr>
 <tr>
 <td><code>maintenance.rescue</code></td>
-<td>Heartbeat, deadline and callback rescue.</td>
+<td>Heartbeat, deadline and callback recovery</td>
+<td>Keep last observed state.</td>
 </tr>
 </tbody>
 </table>
-<p>Auxiliary metadata refresh, descriptor publication and administrative batch work stop whenever all three maintenance scopes are halted. Resuming dispatch or cron alone leaves them stopped; resuming a maintenance scope permits them, except reclamation still requires <code>maintenance.prune</code>. Control observation, liveness reporting and completion of admitted work continue. A local stop handle remains independent of database access.</p>
+<p>Promotion and rescue keep recovery available through a control-read outage while the leader session remains held. Cron conservatively pauses new scheduled production; skipping reclamation and housekeeping is also preferable to operating on stale permission. Losing the session stops all leader work until re-election and a successful initial read, regardless of scope policy. A read timeout alone does not establish session loss. Expired observations are reported as unknown even where work continues.</p>
 <h3 id="state-and-enforcement">State and enforcement<a class="headerlink" href="#state-and-enforcement" title="Permanent link">&para;</a></h3>
-<p>Store one row per scope in ordinary table <code>awa.runtime_controls</code>, containing its revision, current halt ID, mode, reason, actor and update time. An explicit resume must name the current halt ID; stale resumes fail and cannot remove queue pauses or local restrictions.</p>
-<p>Enforce dispatch in every claim-producing SQL path without locking the control row, covering canonical claims, slot functions, custom substrates and reinstalls. Require Read Committed claim transactions and reject other isolation levels at guarded entry points; evaluate permission and claim together. Overlapping evaluations may finish after halt commits, and admitted jobs may launch later. This avoids client polling delay without promising instantaneous cessation.</p>
-<p>Reuse the existing leader session in an independently scheduled observer that serializes control reads, liveness checks and unlocks. Maintenance must not block that observer. Read controls before initial work and leadership handoff; add no control-observer connections. Other runtimes observe controls and signal cancellation through their existing snapshot cycle and pool; pool starvation can delay that observation.</p>
-<table>
-<thead>
-<tr>
-<th>Proposed default</th>
-<th>Value</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Leader control observation</td>
-<td>Every 1 s, with ±20% jitter</td>
-</tr>
-<tr>
-<td>Control-read deadline</td>
-<td>1 s</td>
-</tr>
-<tr>
-<td>Maintenance/cron permission freshness</td>
-<td>5 s, measured monotonically</td>
-</tr>
-<tr>
-<td>Runtime control reporting</td>
-<td>Every 10 s; unknown after 30 s without observation</td>
-</tr>
-<tr>
-<td>Drain wait</td>
-<td>30 s, then return pending without escalating</td>
-</tr>
-<tr>
-<td>Reclamation resume budget</td>
-<td>One potentially exclusive-lock transaction admission/s per leader; concurrency 1</td>
-</tr>
-</tbody>
-</table>
-<p>On read failure, retain the last observation. Maintenance and cron admit no new work once permission is 5 s old; a known halt remains until explicit resume. Dispatch has no observer-freshness lease: each claim reads authoritative state in SQL. A stale reporting cache becomes unknown, without stopping dispatch. Unreadable claim state remains an ordinary claim error; enqueue is unaffected.</p>
+<p>Extend the Phase 1 table to one row per installed scope. Resume compare-and-swaps the current halt ID and cannot remove queue pauses or local restrictions. Halt, resume and reconciliation use hardened <code>SECURITY DEFINER</code> functions granted only to a control-operator role; revoke public execution and direct control writes from producers and runtime roles.</p>
+<p>On main, enforce dispatch in every claim-producing SQL path and administrative batch-chunk admission without locking the control row, covering canonical claims, slot functions, custom substrates and reinstalls. Awa-owned admission transactions explicitly begin at Read Committed before any query, irrespective of database/role defaults. External callers must provide that isolation level or be rejected; never silently change a caller-owned transaction. Evaluate permission and admission together. Overlapping evaluations may finish after halt commits, and admitted jobs may launch later.</p>
+<p>The control read adds an <code>ACCESS SHARE</code> relation lock, eligible for PostgreSQL's fast path when available. This ordinary, unpartitioned table is never truncated and is outside prune's partition-lock set; claim-path overhead still needs measurement.</p>
+<p>The leader observer exclusively owns its existing session and serializes control reads, liveness checks and unlocks independently of maintenance. Other runtimes observe through their existing snapshot cycle and pool, which may delay cancellation. Report observed revisions, scope states, observation times and outstanding work in <code>awa.runtime_instances</code> every 10 s by default; after 30 s without observation show unknown, not stopped. Dispatch has no observer-freshness lease: an unreadable SQL control row is an ordinary claim error, while application enqueue is unaffected.</p>
 <h3 id="drain-cancellation-and-recovery">Drain, cancellation and recovery<a class="headerlink" href="#drain-cancellation-and-recovery" title="Permanent link">&para;</a></h3>
-<p><code>drain</code> is the default: stop new admissions and let admitted work finish. <code>cancel</code> additionally requests cooperative cancellation; handlers, external effects and server-side SQL may continue.</p>
-<p>Results distinguish <code>committed</code> intent, a runtime's <code>observed</code> revision, and <code>drained</code> admitted work. Fleet drain succeeds only when every relevant durable participant confirms no outstanding work, including in-flight claim evaluations and SQL; after 30 s, missing evidence returns pending/unknown. Observation alone never certifies cessation.</p>
-<p>Runtimes register durably before admitting work, serialized with halt changes. The cancel transaction records pending evidence for affected participants in <code>awa.runtime_control_participants</code>, outside expiring snapshots. Missing observation, timeout or heartbeat expiry cannot clear it. Resuming a scope requires positive reconciliation or audited independent fencing evidence for every unresolved owner, including earlier halts. The proposed command <code>awa control reconcile --halt &lt;id&gt; --runtime &lt;id&gt; --fence-evidence &lt;reference&gt;</code> records that assertion when an owner cannot report back; it does not itself fence a host or undo effects.</p>
-<p>On reclamation resume, wait a random 0–1 s, preserve ordinary cadences and backoff, and apply the shared budget across rings and substrates without catch-up bursts. Preserve the existing 10 ms prune lock timeout; it does not bound an entire operation.</p>
-<p>Halt, resume and reconciliation use hardened <code>SECURITY DEFINER</code> functions granted only to a control-operator role; revoke public execution and direct control writes from producer/runtime roles. Publish each runtime's observed revisions, scope states, observation times and outstanding work in <code>awa.runtime_instances</code>; report expired observations as unknown rather than stopped.</p>
+<p>Drain stops new admissions and lets admitted work finish. <strong>Drain-mode resume never waits for runtime acknowledgments, drain completion or reconciliation.</strong> A missing or dead runtime cannot block it; the halt ID and independent local/queue restrictions still apply.</p>
+<p>Results distinguish committed intent, an observed revision and drained work. Reporting fleet drain requires every relevant durable participant to confirm no outstanding work, including in-flight claims and SQL. After a 30 s wait, absent evidence returns pending/unknown, not cessation; this reporting wait is not a prerequisite for drain-mode resume.</p>
+<p>Only cancel mode creates reconciliation obligations. Runtimes register durably before admission, serialized with halt changes; cancel records pending owners in <code>awa.runtime_control_participants</code>, outside expiring snapshots. Missing observation, timeout and heartbeat expiry cannot clear that evidence. A cancel-mode resume requires positive reconciliation or audited independent fencing evidence. Superseding a cancel retains unresolved evidence; downgrading an unresolved cancel to drain is rejected so it cannot bypass that obligation.</p>
+<p>The proposed <code>awa control reconcile --halt &lt;id&gt; --runtime &lt;id&gt; --fence-evidence &lt;reference&gt;</code> records a fencing assertion for an owner that cannot report back. It does not itself fence a host or undo effects. Cooperative cancellation can leave handlers, external effects or server-side SQL running.</p>
+</details>
 <h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
-<p><strong>A single all-work halt</strong> couples reclamation containment to loss of dispatch and recovery. <strong>Queue pause or startup settings</strong> leave maintenance uncontrolled live. <strong>A mandatory external flag provider or extra observer connections</strong> adds dependencies where existing database paths suffice.</p>
+<p>An all-work switch unnecessarily stops recovery during reclamation incidents. Queue pause/startup settings do not provide live maintenance control. Mandatory external flags or extra observer connections add dependencies. One stale-state rule for every scope sacrifices recovery availability; a resume-only limiter leaves normal-operation lock pressure uncontrolled.</p>
 <h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
-<p>Operators can stop reclamation while useful work continues. A <code>maintenance.prune</code> drain-only subset is independently useful; it need not wait for complete dispatch fencing or cancellation/reconciliation machinery. Unsupported scopes must be refused, and coverage must include rotation and terminal-rollup reclamation.</p>
-<p>Halting maintenance accumulates storage or delayed jobs. Freshness expiry deliberately trades maintenance availability for containment; SQL gates add claim-path read cost that requires measurement. Unpersisted local stops protect only that runtime's lifetime.</p>
-<p>Older binaries are covered only where patched database entry points constrain their actual paths. Canonical inline callers and maintenance leaders otherwise need an upgrade or enforced fence. A 0.6 repeatable patch is a delivery option requiring verification, not established coverage. Follow <a href="../041-rolling-upgrade-policy/">ADR-041</a>; align privilege separation with proposed <a href="../043-postgresql-capability-functions/">ADR-043</a>.</p>
+<p>The permanent cap may increase reclamation backlog, and a prune halt also pauses housekeeping. Promotion and rescue can continue on stale observed permission; their explicit halt can therefore be delayed by a control-read outage. Unpersisted local stops protect only that runtime's lifetime.</p>
+<p>Full dispatch control is main-only work. A wrapper patch cannot cover canonical inline callers or unpatched slot functions, and older maintenance leaders need an upgrade or enforced fence. Follow <a href="../041-rolling-upgrade-policy/">ADR-041</a>; align privilege separation with proposed <a href="../043-postgresql-capability-functions/">ADR-043</a>.</p>
 <h2 id="relationship-to-adr-028">Relationship to ADR-028<a class="headerlink" href="#relationship-to-adr-028" title="Permanent link">&para;</a></h2>
-<p><a href="../028-maintenance-only-runtime-role/">ADR-028</a> proposes running maintenance without executing jobs. Its standalone and embedded runtimes obey the same applicable maintenance and cron scopes. Local leadership handoff cannot remove a database restriction. The control observer and reporting remain active while maintenance is halted.</p>
+<p><a href="../028-maintenance-only-runtime-role/">ADR-028</a> proposes running maintenance without executing jobs. Its standalone and embedded runtimes use the same branch mapping, scope policies and permanent cap. Leadership handoff cannot lift a database restriction; control observation and reporting continue while work is halted.</p>
 
 
 
