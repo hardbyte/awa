@@ -6,6 +6,39 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Retry queue-storage worker finalization after transient lock contention within
+  its 120-second running-work budget, preserving the saved handler outcome.
+  Waiting for an accepted completion batch pauses that budget; admission,
+  direct writes, post-acknowledgement reads and retries use the remaining time.
+  Keep attempt heartbeats active until finalization settles while releasing
+  handler capacity. Runtime shutdown retains its existing drain limit. Direct
+  store APIs still return contention errors for caller retries.
+
+- Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
+- Keep committed claims out of physical priority aging before its batch limit,
+  even before their cursor advances. Active point and callback reads recover
+  retained tombstoned bodies left by older aging. Recovery, cancellation and
+  completion by ID hydrate those bodies and retire unclaimed copies of the same
+  attempt, preserving original-priority metadata and rejecting ambiguous
+  historical bodies. Emitted-lane evidence takes precedence over colliding live
+  replacements, and their recovered terminal bodies remain self-contained
+  through retry. Cancellation prefers an active attempt over its historical
+  available replacement. Historical receipt evidence remains usable after
+  reopening a custom store in legacy mode. Without that evidence, legacy or
+  backfilled claims retain a compatibility fallback that cannot reliably
+  identify the original physical lane in this historical collision.
+  Repair runs only when a transition hydrates a retained tombstoned body;
+  worker completion using its carried job body can leave an old replacement
+  claimable. Updated aging callers prevent new replacements, but cannot fence
+  an older process explicitly calling physical aging during a rolling upgrade.
+  Repair takes claim-head row locks without waiting. Rescue batches defer
+  busy historical attempts while progressing other attempts; receipt rescue
+  cursors keep deferred attempts eligible. Worker completion batches isolate
+  lock contention to the affected requests. Direct store completion and
+  single-attempt store mutations still fail on contention and must retry. It adds
+  weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ
+  COMMITTED isolation.
+
 - Preserve recovered bodies and physical lane priority when manually moving
   historical aged terminal failures to the DLQ, so later DLQ retry retains
   arguments, attempt limits and priority provenance. Terminal counters are
