@@ -1739,6 +1739,18 @@ impl ReadyJobRow {
     }
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct ReadyAgingCandidate {
+    ready_slot: i32,
+    ready_generation: i64,
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    lane_seq: i64,
+    job_id: i64,
+    run_lease: i64,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReadyTransitionRow {
     ready_slot: i32,
@@ -2357,6 +2369,8 @@ struct ReadySnapshotRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+    run_lease: i64,
+    live_body: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -9821,11 +9835,67 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
+        // Claims commit before their cursor advance. Select only a bounded
+        // set of identities before taking heads, without locking ready rows in
+        // the reverse order to a claimer. A later statement rechecks these same
+        // identities after every in-flight claim on their lanes has committed.
+        let candidates: Vec<ReadyAgingCandidate> = sqlx::query_as(&format!(
+            r#"
+            SELECT ready.ready_slot, ready.ready_generation, ready.queue,
+                   ready.priority, ready.enqueue_shard, ready.lane_seq,
+                   ready.job_id, ready.run_lease
+            FROM {schema}.ready_entries AS ready
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = ready.queue
+             AND claims.priority = ready.priority
+             AND claims.enqueue_shard = ready.enqueue_shard
+            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+              AND ready.priority > 1
+              AND ready.run_at <= $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+                    AND tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+              )
+            ORDER BY ready.run_at ASC, ready.lane_seq ASC
+            LIMIT $2
+            "#
+        ))
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if candidates.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Vec::new());
+        }
+        let job_ids: Vec<i64> = candidates.iter().map(|row| row.job_id).collect();
+        self.lock_claim_heads_of_jobs_tx(&mut tx, &job_ids).await?;
+        let claimed = self.ready_row_claimed_sql("ready");
+
         let moved: Vec<ReadyTransitionRow> = sqlx::query_as(&format!(
             r#"
-            WITH target AS (
+            WITH candidates(ready_slot, ready_generation, queue, priority,
+                            enqueue_shard, lane_seq, job_id, run_lease) AS (
+                SELECT * FROM unnest($3::int[], $4::bigint[], $5::text[], $6::smallint[],
+                                    $7::smallint[], $8::bigint[], $9::bigint[], $10::bigint[])
+            ), target AS (
                 SELECT ready.*
-                FROM {schema}.ready_entries AS ready
+                FROM candidates
+                JOIN {schema}.ready_entries AS ready
+                  ON ready.ready_slot = candidates.ready_slot
+                 AND ready.ready_generation = candidates.ready_generation
+                 AND ready.queue = candidates.queue
+                 AND ready.priority = candidates.priority
+                 AND ready.enqueue_shard = candidates.enqueue_shard
+                 AND ready.lane_seq = candidates.lane_seq
+                 AND ready.job_id = candidates.job_id
+                 AND ready.run_lease = candidates.run_lease
                 JOIN {schema}.queue_claim_heads AS claims
                   ON claims.queue = ready.queue
                  AND claims.priority = ready.priority
@@ -9833,6 +9903,7 @@ impl QueueStorage {
                 WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
                   AND ready.priority > 1
                   AND ready.run_at <= $1
+                  AND NOT ({claimed})
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.ready_tombstones AS tomb
                       WHERE tomb.queue = ready.queue
@@ -9878,6 +9949,14 @@ impl QueueStorage {
         ))
         .bind(cutoff)
         .bind(limit)
+        .bind(candidates.iter().map(|row| row.ready_slot).collect::<Vec<_>>())
+        .bind(candidates.iter().map(|row| row.ready_generation).collect::<Vec<_>>())
+        .bind(candidates.iter().map(|row| row.queue.clone()).collect::<Vec<_>>())
+        .bind(candidates.iter().map(|row| row.priority).collect::<Vec<_>>())
+        .bind(candidates.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+        .bind(candidates.iter().map(|row| row.lane_seq).collect::<Vec<_>>())
+        .bind(&job_ids)
+        .bind(candidates.iter().map(|row| row.run_lease).collect::<Vec<_>>())
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10620,12 +10699,13 @@ impl QueueStorage {
 
         // Resolve moved ready bodies without opening the whole tombstone ring.
         // Empty input returned above; every remaining slot is validated here.
-        let tombstone_sources = ready_slots
+        let slots = ready_slots
             .iter()
             .map(|&slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
-            .collect::<Result<BTreeSet<_>, _>>()?
-            .into_iter()
-            .map(|slot| format!("SELECT * FROM {}", ready_tombstone_child_name(schema, slot)))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let tombstone_sources = slots
+            .iter()
+            .map(|&slot| format!("SELECT * FROM {}", ready_tombstone_child_name(schema, slot)))
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
 
@@ -10648,7 +10728,18 @@ impl QueueStorage {
                 ready.created_at,
                 ready.unique_key,
                 ready.unique_states,
-                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
+                ready.run_lease,
+                NOT EXISTS (
+                    SELECT 1 FROM ({tombstone_sources}) AS tomb
+                    WHERE tomb.ready_slot = ready.ready_slot
+                      AND tomb.ready_generation = ready.ready_generation
+                      AND tomb.queue = ready.queue
+                      AND tomb.priority = ready.priority
+                      AND tomb.enqueue_shard = ready.enqueue_shard
+                      AND tomb.lane_seq = ready.lane_seq
+                      AND tomb.job_id = ready.job_id
+                ) AS live_body
             FROM refs
             JOIN {schema}.ready_entries AS ready
               ON ready.ready_slot = refs.ready_slot
@@ -10658,16 +10749,6 @@ impl QueueStorage {
              AND ready.lane_seq = refs.lane_seq
              AND ready.job_id = refs.job_id
              AND ready.run_lease + 1 = refs.run_lease
-            WHERE NOT EXISTS (
-                SELECT 1 FROM ({tombstone_sources}) AS tomb
-                WHERE tomb.ready_slot = ready.ready_slot
-                  AND tomb.ready_generation = ready.ready_generation
-                  AND tomb.queue = ready.queue
-                  AND tomb.priority = ready.priority
-                  AND tomb.enqueue_shard = ready.enqueue_shard
-                  AND tomb.lane_seq = ready.lane_seq
-                  AND tomb.job_id = ready.job_id
-            )
             "#
         ))
         .bind(&ready_slots)
@@ -10680,6 +10761,83 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
+        type ReadyBodyKey = (i32, i64, String, i16, i64, i64, i64);
+        let mut ready_map: BTreeMap<ReadyBodyKey, Vec<ReadySnapshotRow>> = BTreeMap::new();
+        for row in ready_rows {
+            ready_map
+                .entry((
+                    row.ready_slot,
+                    row.ready_generation,
+                    row.queue.clone(),
+                    row.enqueue_shard,
+                    row.lane_seq,
+                    row.job_id,
+                    row.run_lease + 1,
+                ))
+                .or_default()
+                .push(row);
+        }
+
+        type ReadyBodyLaneKey = (i32, i64, String, i16, i64, i64, i64, i16);
+        let mut claimed_lanes: BTreeSet<ReadyBodyLaneKey> = BTreeSet::new();
+        let ambiguous: Vec<&ReadySnapshotRow> = ready_map
+            .values()
+            .filter(|rows| rows.len() > 1 && !rows.iter().any(|row| row.live_body))
+            .flatten()
+            .collect();
+        if self.lease_claim_receipts() && !ambiguous.is_empty() {
+            // Normal live bodies and unique retained bodies need no extra
+            // relation lookup. Only ambiguous tombstoned receipt bodies need
+            // the emitted physical-lane evidence, scoped to their ready slots.
+            let attempt_sources = ambiguous
+                .iter()
+                .map(|row| row.ready_slot)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|slot| {
+                    format!(
+                        "SELECT * FROM {}",
+                        ready_claim_attempt_batch_child_name(schema, slot)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
+            let lanes: Vec<ReadyBodyLaneKey> = sqlx::query_as(&format!(
+                r#"
+                WITH refs(ready_slot,ready_generation,queue,enqueue_shard,lane_seq,job_id,run_lease,priority) AS (
+                    SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[],
+                                        $5::bigint[], $6::bigint[], $7::bigint[], $8::smallint[])
+                )
+                SELECT ready_slot,ready_generation,queue,enqueue_shard,lane_seq,job_id,run_lease,priority
+                FROM refs
+                WHERE EXISTS (
+                    SELECT 1 FROM ({attempt_sources}) AS attempts
+                    WHERE attempts.ready_slot = refs.ready_slot
+                      AND attempts.ready_generation = refs.ready_generation
+                      AND attempts.queue = refs.queue
+                      AND attempts.priority = refs.priority
+                      AND attempts.enqueue_shard = refs.enqueue_shard
+                      AND attempts.first_lane_seq <= refs.lane_seq
+                      AND attempts.next_lane_seq > refs.lane_seq
+                      AND attempts.lane_ranges @> int8range(refs.lane_seq,refs.lane_seq + 1,'[)')
+                )
+                "#
+            ))
+            .bind(ambiguous.iter().map(|row| row.ready_slot).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.ready_generation).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.queue.clone()).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.lane_seq).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.job_id).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.run_lease + 1).collect::<Vec<_>>())
+            .bind(ambiguous.iter().map(|row| row.priority).collect::<Vec<_>>())
+            .fetch_all(tx.as_mut()).await.map_err(map_sqlx_error)?;
+            claimed_lanes.extend(lanes);
+        }
 
         let attempt_rows: Vec<AttemptStateRow> = sqlx::query_as(&format!(
             r#"
@@ -10825,23 +10983,6 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let ready_map: BTreeMap<(i32, i64, String, i16, i64, i64), ReadySnapshotRow> = ready_rows
-            .into_iter()
-            .map(|row| {
-                (
-                    (
-                        row.ready_slot,
-                        row.ready_generation,
-                        row.queue.clone(),
-                        row.enqueue_shard,
-                        row.lane_seq,
-                        row.job_id,
-                    ),
-                    row,
-                )
-            })
-            .collect();
-
         let attempt_map: BTreeMap<(i64, i64), AttemptStateRow> = attempt_rows
             .into_iter()
             .map(|row| ((row.job_id, row.run_lease), row))
@@ -10849,7 +10990,7 @@ impl QueueStorage {
 
         let mut hydrated = Vec::with_capacity(deleted.len());
         for deleted_row in deleted {
-            let ready = ready_map
+            let candidates = ready_map
                 .get(&(
                     deleted_row.ready_slot,
                     deleted_row.ready_generation,
@@ -10857,6 +10998,7 @@ impl QueueStorage {
                     deleted_row.enqueue_shard,
                     deleted_row.lane_seq,
                     deleted_row.job_id,
+                    deleted_row.run_lease,
                 ))
                 .ok_or_else(|| {
                     AwaError::Validation(format!(
@@ -10864,6 +11006,64 @@ impl QueueStorage {
                         deleted_row.job_id, deleted_row.run_lease
                     ))
                 })?;
+            // Prefer a live exact-attempt body. A tombstoned body can still
+            // back an attempt claimed before physical aging moved the source;
+            // its emitted lane evidence outranks other retained moved bodies.
+            // Legacy ambiguous bodies have no authoritative physical priority:
+            // fail instead of silently choosing an unordered source payload.
+            let rank = |row: &ReadySnapshotRow| {
+                (
+                    row.live_body,
+                    claimed_lanes.contains(&(
+                        row.ready_slot,
+                        row.ready_generation,
+                        row.queue.clone(),
+                        row.enqueue_shard,
+                        row.lane_seq,
+                        row.job_id,
+                        row.run_lease + 1,
+                        row.priority,
+                    )),
+                )
+            };
+            let strongest = candidates
+                .iter()
+                .map(&rank)
+                .max()
+                .expect("ready body group is nonempty");
+            let mut best = candidates.iter().filter(|row| rank(row) == strongest);
+            let ready = best.next().expect("ready body rank has a candidate");
+            if best.next().is_some() {
+                return Err(AwaError::Validation(format!(
+                    "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
+                    deleted_row.job_id, deleted_row.run_lease
+                )));
+            }
+            // Claim-time aging adds this provenance to the returned JobRow,
+            // not the immutable ready payload. Recovery must reconstruct the
+            // same default when it reads that retained body after the claim.
+            // Mutate the cloned JSON so unrelated payload fields survive.
+            let mut payload = ready.payload.clone();
+            if deleted_row.priority < ready.priority {
+                let metadata = payload
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        AwaError::Validation(
+                            "queue storage payload must be a JSON object".to_string(),
+                        )
+                    })?
+                    .entry("metadata")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        AwaError::Validation(
+                            "queue storage payload metadata must be a JSON object".to_string(),
+                        )
+                    })?;
+                metadata
+                    .entry("_awa_original_priority")
+                    .or_insert_with(|| serde_json::Value::from(i64::from(ready.priority)));
+            }
             let attempt = attempt_map.get(&(deleted_row.job_id, deleted_row.run_lease));
 
             hydrated.push(LeaseTransitionRow {
@@ -10886,7 +11086,7 @@ impl QueueStorage {
                 created_at: ready.created_at,
                 unique_key: ready.unique_key.clone(),
                 unique_states: ready.unique_states.clone(),
-                payload: ready.payload.clone(),
+                payload,
                 progress: attempt.and_then(|row| row.progress.clone()),
             });
         }

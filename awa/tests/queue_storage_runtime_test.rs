@@ -18727,3 +18727,448 @@ async fn test_point_read_keeps_located_body_until_failed_carry_can_finish() {
     assert_eq!(after.errors, before.errors);
     control.reads.close().await;
 }
+
+/// Commit the same installed claim function used by the runtime, deliberately
+/// leaving its separate post-commit cursor update unsent.
+async fn claim_before_aging_cursor_advance_in_tx(
+    receipts: bool,
+    deadline: Duration,
+) -> (
+    TestDbGuard,
+    sqlx::PgPool,
+    QueueStorage,
+    RawReceiptClaimRow,
+    sqlx::Transaction<'static, sqlx::Postgres>,
+) {
+    let (guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_claimed_aging_body";
+    let queue = "qs_claimed_aging_body";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: receipts,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9041 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts: 1,
+            metadata: serde_json::json!({"retained":"claimed-before-aging"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    // Occupy the replacement lane's first position. Old physical aging must
+    // append this job at seq2, not accidentally leave a live seq1 body that
+    // matches the already committed claim's original reference.
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9042 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 3,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut tx = pool.begin().await.expect("begin exact runtime claim stage");
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot,ready_generation,job_id,priority,attempt,run_lease,lane_seq,claim_slot
+         FROM {schema}.claim_ready_runtime($1,1,$2,60::float8)"
+    ))
+    .bind(queue)
+    .bind(deadline.as_secs_f64())
+    .fetch_all(tx.as_mut())
+    .await
+    .expect("claim old ready row");
+    assert_eq!(claimed.len(), 1);
+    let original = claimed.into_iter().next().unwrap();
+    assert_eq!(original.job_id, job_id);
+    assert_eq!(
+        original.priority, 1,
+        "claim-time effective aging remains enabled"
+    );
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, 4, 0).await,
+        original.lane_seq
+    );
+    (guard, pool, store, original, tx)
+}
+
+async fn claim_before_aging_cursor_advance(
+    receipts: bool,
+    deadline: Duration,
+) -> (TestDbGuard, sqlx::PgPool, QueueStorage, RawReceiptClaimRow) {
+    let (guard, pool, store, claim, tx) =
+        claim_before_aging_cursor_advance_in_tx(receipts, deadline).await;
+    tx.commit()
+        .await
+        .expect("commit claim before advancing cursor");
+    (guard, pool, store, claim)
+}
+
+async fn assert_claimed_aging_rescue_body(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    claim: &RawReceiptClaimRow,
+) {
+    let rescued = store
+        .rescue_stale_heartbeats(pool, Duration::ZERO)
+        .await
+        .expect("hydrate retained claimed body");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, claim.job_id);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    assert_eq!(rescued[0].args, serde_json::json!({"id":9041}));
+    assert_eq!(rescued[0].max_attempts, 1);
+    assert_eq!(
+        rescued[0].priority, 4,
+        "terminal body keeps its physical lane"
+    );
+    assert_eq!(rescued[0].metadata["retained"], "claimed-before-aging");
+    assert_eq!(rescued[0].metadata["_awa_original_priority"], 4);
+    let retried = store
+        .retry_job(pool, claim.job_id)
+        .await
+        .expect("retry rescued body")
+        .expect("failed attempt retries");
+    assert_eq!(retried.args, rescued[0].args);
+    assert_eq!(retried.max_attempts, 1);
+    assert_eq!(retried.priority, 4);
+    assert_eq!(retried.metadata["_awa_original_priority"], 4);
+}
+
+async fn aging_skips_committed_claim_before_cursor(receipts: bool, deadline: Duration) {
+    let (_guard, pool, store, claim) = claim_before_aging_cursor_advance(receipts, deadline).await;
+    let aged = store
+        .age_waiting_priorities(&pool, Duration::from_secs(60), 1)
+        .await
+        .expect("age with lagging claim cursor");
+    assert!(
+        aged.is_empty(),
+        "a committed claim is not waiting, even before cursor advancement: {aged:?}"
+    );
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 0);
+    assert_claimed_aging_rescue_body(&pool, &store, &claim).await;
+}
+
+async fn historical_tombstoned_claim_hydrates(receipts: bool, deadline: Duration) {
+    let (_guard, pool, store, claim) = claim_before_aging_cursor_advance(receipts, deadline).await;
+    // Reproduce the retained source state written by pre-fix physical aging.
+    // Its replacement ready row has a different lane_seq and therefore cannot
+    // back this exact claim. Keep that unrelated body rather than deleting it.
+    let schema = store.schema();
+    let mut tx = pool.begin().await.expect("begin historical aging shape");
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.ready_tombstones
+         (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
+         SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id
+         FROM {schema}.ready_entries WHERE job_id=$1"
+    ))
+    .bind(claim.job_id)
+    .execute(tx.as_mut())
+    .await
+    .expect("historical source tombstone");
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.ready_entries
+         (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+          lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+         SELECT ready_slot,ready_generation,job_id,kind,queue,args,priority-1,attempt,run_lease,max_attempts,
+          {schema}.reserve_enqueue_seq(queue,(priority-1)::smallint,enqueue_shard,1::bigint),enqueue_shard,
+          run_at,attempted_at,created_at,unique_key,unique_states,
+          jsonb_set(COALESCE(payload,'{{}}'::jsonb),'{{metadata}}',
+              COALESCE(payload->'metadata','{{}}'::jsonb)
+                  || jsonb_build_object('_awa_original_priority',priority))
+         FROM {schema}.ready_entries WHERE job_id=$1"
+    )).bind(claim.job_id).execute(tx.as_mut()).await.expect("historical replacement at different position");
+    tx.commit()
+        .await
+        .expect("commit historical source and replacement");
+    let positions: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT lane_seq FROM {schema}.ready_entries WHERE job_id=$1 ORDER BY priority DESC"
+    ))
+    .bind(claim.job_id)
+    .fetch_all(&pool)
+    .await
+    .expect("source/replacement positions");
+    assert_eq!(positions, vec![1, 2]);
+    let provenance: Vec<(i16, Option<i64>)> = sqlx::query_as(&format!(
+        "SELECT priority,(payload->'metadata'->>'_awa_original_priority')::bigint
+         FROM {schema}.ready_entries WHERE job_id=$1 ORDER BY priority DESC"
+    ))
+    .bind(claim.job_id)
+    .fetch_all(&pool)
+    .await
+    .expect("old writer provenance placement");
+    assert_eq!(
+        provenance,
+        vec![(4, None), (3, Some(4))],
+        "old physical aging adds provenance only to its replacement body"
+    );
+    assert_claimed_aging_rescue_body(&pool, &store, &claim).await;
+}
+
+#[tokio::test]
+async fn test_physical_aging_skips_committed_compact_claim_before_cursor() {
+    aging_skips_committed_claim_before_cursor(true, Duration::ZERO).await;
+}
+#[tokio::test]
+async fn test_physical_aging_skips_committed_deadline_claim_before_cursor() {
+    aging_skips_committed_claim_before_cursor(true, Duration::from_secs(300)).await;
+}
+#[tokio::test]
+async fn test_physical_aging_skips_committed_legacy_claim_before_cursor() {
+    aging_skips_committed_claim_before_cursor(false, Duration::from_secs(300)).await;
+}
+#[tokio::test]
+async fn test_historical_aged_tombstoned_compact_claim_rescues_body() {
+    historical_tombstoned_claim_hydrates(true, Duration::ZERO).await;
+}
+#[tokio::test]
+async fn test_historical_aged_tombstoned_deadline_claim_rescues_body() {
+    historical_tombstoned_claim_hydrates(true, Duration::from_secs(300)).await;
+}
+#[tokio::test]
+async fn test_historical_aged_tombstoned_legacy_claim_rescues_body() {
+    historical_tombstoned_claim_hydrates(false, Duration::from_secs(300)).await;
+}
+async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool) {
+    let (_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_moved_tomb_claim";
+    let queue = "qs_moved_tomb_claim";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: receipts,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let id = enqueue_job(&pool, &store, &CompleteJob { id: 9043 }, InsertOpts {
+        queue: queue.into(), priority: from, max_attempts: 1,
+        metadata: serde_json::json!({"retained":"moved-tomb-claim", "_awa_original_priority":from}),
+        ..Default::default()
+    }).await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    assert!(store
+        .set_priority(&pool, id, to)
+        .await
+        .expect("move before claim"));
+    let body_positions: Vec<(i16, i64)> = sqlx::query_as(&format!(
+        "SELECT priority,lane_seq FROM {schema}.ready_entries WHERE job_id=$1 ORDER BY priority"
+    ))
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .expect("shared moved positions");
+    assert_eq!(body_positions.len(), 2);
+    assert!(body_positions.iter().all(|row| row.1 == 1));
+    let mut claims = Vec::new();
+    for _ in 0..3 {
+        claims = sqlx::query_as::<_, RawReceiptClaimRow>(&format!(
+            "SELECT ready_slot,ready_generation,job_id,priority,attempt,run_lease,lane_seq,claim_slot
+             FROM {schema}.claim_ready_runtime($1,1,300::float8,60::float8)"
+        )).bind(queue).fetch_all(&pool).await.expect("claim moved body before cursor update");
+        if !claims.is_empty() {
+            break;
+        }
+        // A higher-priority tombstoned source may first consume its spent
+        // cursor prefix; the actual target claim still omits cursor advance.
+    }
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].job_id, id);
+    assert_eq!(
+        claims[0].priority, 1,
+        "effective priority cannot identify either physical lane"
+    );
+    // The old source was tombstoned by the real move. Model old physical aging
+    // tombstoning the claimed source as well; both exact-ref bodies now remain.
+    tombstone_ready_job(&pool, &store, id).await;
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 2);
+    if !receipts {
+        let err = store
+            .rescue_stale_heartbeats(&pool, Duration::ZERO)
+            .await
+            .expect_err("legacy ambiguous physical lanes must not be selected arbitrarily");
+        assert!(err.to_string().contains("ready body ambiguous"), "{err}");
+        assert_eq!(
+            lease_count(&pool, &store).await,
+            1,
+            "ambiguous mutation rolls back"
+        );
+        return;
+    }
+    let emitted: Vec<i16> = sqlx::query_scalar(&format!(
+        "SELECT priority FROM {schema}.ready_claim_attempt_batches WHERE queue=$1"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("physical emitted lane proof");
+    assert_eq!(emitted, vec![to]);
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("use emitted physical lane for retained tombstoned body");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].priority, to);
+    assert_eq!(rescued[0].args, serde_json::json!({"id":9043}));
+    assert_eq!(rescued[0].max_attempts, 1);
+    assert_eq!(rescued[0].metadata["_awa_original_priority"], from);
+    let retried = store
+        .retry_job(&pool, id)
+        .await
+        .expect("retry selected moved body")
+        .unwrap();
+    assert_eq!(retried.priority, to);
+    assert_eq!(retried.args, rescued[0].args);
+    assert_eq!(retried.max_attempts, 1);
+    assert_eq!(retried.metadata["_awa_original_priority"], from);
+}
+
+#[tokio::test]
+async fn test_historical_tombstoned_claim_uses_emitted_lane_low_to_high() {
+    moved_tombstoned_claim_lane(2, 4, true).await;
+}
+#[tokio::test]
+async fn test_historical_tombstoned_claim_uses_emitted_lane_high_to_low() {
+    moved_tombstoned_claim_lane(4, 2, true).await;
+}
+#[tokio::test]
+async fn test_historical_tombstoned_legacy_ambiguous_lanes_roll_back() {
+    moved_tombstoned_claim_lane(2, 4, false).await;
+}
+
+#[tokio::test]
+async fn test_historical_tombstoned_legacy_claim_completes_body() {
+    let (_guard, pool, store, claim) =
+        claim_before_aging_cursor_advance(false, Duration::from_secs(300)).await;
+    tombstone_ready_job(&pool, &store, claim.job_id).await;
+    let updated = store
+        .complete_job_batch_by_id(&pool, &[(claim.job_id, claim.run_lease)])
+        .await
+        .expect("complete an already tombstoned claimed body");
+    assert_eq!(updated, vec![(claim.job_id, claim.run_lease)]);
+    let done = store
+        .load_job(&pool, claim.job_id)
+        .await
+        .expect("read completion")
+        .unwrap();
+    assert_eq!(done.state, JobState::Completed);
+    assert_eq!(done.args, serde_json::json!({"id":9041}));
+    assert_eq!(done.max_attempts, 1);
+    assert_eq!(done.priority, 4);
+    assert_eq!(done.metadata["retained"], "claimed-before-aging");
+    assert_eq!(done.metadata["_awa_original_priority"], 4);
+}
+
+async fn tombstoned_claim_cancels_body(receipts: bool, deadline: Duration) {
+    let (_guard, pool, store, claim) = claim_before_aging_cursor_advance(receipts, deadline).await;
+    tombstone_ready_job(&pool, &store, claim.job_id).await;
+    let done = store
+        .cancel_running(
+            &pool,
+            claim.job_id,
+            claim.run_lease,
+            "cancel retained body",
+            None,
+        )
+        .await
+        .expect("cancel an already tombstoned claimed body")
+        .unwrap();
+    assert_eq!(done.state, JobState::Cancelled);
+    assert_eq!(done.args, serde_json::json!({"id":9041}));
+    assert_eq!(done.max_attempts, 1);
+    assert_eq!(done.priority, 4);
+    assert_eq!(done.metadata["retained"], "claimed-before-aging");
+    assert_eq!(done.metadata["_awa_original_priority"], 4);
+}
+#[tokio::test]
+async fn test_historical_tombstoned_compact_claim_cancels_body() {
+    tombstoned_claim_cancels_body(true, Duration::ZERO).await;
+}
+#[tokio::test]
+async fn test_historical_tombstoned_deadline_claim_cancels_body() {
+    tombstoned_claim_cancels_body(true, Duration::from_secs(300)).await;
+}
+#[tokio::test]
+async fn test_historical_tombstoned_legacy_claim_cancels_body() {
+    tombstoned_claim_cancels_body(false, Duration::from_secs(300)).await;
+}
+
+#[tokio::test]
+async fn test_physical_aging_waits_for_claim_head_then_uses_fresh_snapshot() {
+    let (_guard, pool, store, claim, mut claim_tx) =
+        claim_before_aging_cursor_advance_in_tx(true, Duration::ZERO).await;
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(claim_tx.as_mut())
+        .await
+        .expect("actual claim holder PID");
+    let aging_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .application_name("awa_aging_head_wait_control"),
+        )
+        .await
+        .expect("separate aging connection");
+    let age = store.age_waiting_priorities(&aging_pool, Duration::from_secs(60), 1);
+    let release = async {
+        tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(5)), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                     WHERE application_name='awa_aging_head_wait_control'
+                       AND wait_event_type='Lock' AND $1=ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(holder)
+                .fetch_one(&pool)
+                .await
+                .expect("observe actual claim-head wait");
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("aging must wait for the actual uncommitted claim head");
+        claim_tx
+            .commit()
+            .await
+            .expect("publish claim while aging waits");
+    };
+    let (aged, ()) = tokio::join!(age, release);
+    assert!(
+        aged.expect("age after committed claim").is_empty(),
+        "the statement after the head lock must see the committed claim"
+    );
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 0);
+    assert_claimed_aging_rescue_body(&pool, &store, &claim).await;
+    aging_pool.close().await;
+}
