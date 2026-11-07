@@ -2350,6 +2350,8 @@
       
         
       
+        
+      
     
     
     
@@ -2531,6 +2533,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -3926,7 +3956,8 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 </span><span id="__span-17-12"><a id="__codelineno-17-12" name="__codelineno-17-12" href="#__codelineno-17-12"></a><span class="w">        </span><span class="n">Duration</span><span class="p">::</span><span class="n">from_millis</span><span class="p">(</span><span class="mi">1_000</span><span class="p">),</span>
 </span><span id="__span-17-13"><a id="__codelineno-17-13" name="__codelineno-17-13" href="#__codelineno-17-13"></a><span class="w">    </span><span class="p">)</span>
 </span><span id="__span-17-14"><a id="__codelineno-17-14" name="__codelineno-17-14" href="#__codelineno-17-14"></a><span class="w">    </span><span class="p">.</span><span class="n">claim_rotate_interval</span><span class="p">(</span><span class="n">Duration</span><span class="p">::</span><span class="n">from_millis</span><span class="p">(</span><span class="mi">1_000</span><span class="p">))</span>
-</span><span id="__span-17-15"><a id="__codelineno-17-15" name="__codelineno-17-15" href="#__codelineno-17-15"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-17-15"><a id="__codelineno-17-15" name="__codelineno-17-15" href="#__codelineno-17-15"></a><span class="w">    </span><span class="p">.</span><span class="n">prune_lock_timeout</span><span class="p">(</span><span class="n">Duration</span><span class="p">::</span><span class="n">from_millis</span><span class="p">(</span><span class="mi">10</span><span class="p">))</span>
+</span><span id="__span-17-16"><a id="__codelineno-17-16" name="__codelineno-17-16" href="#__codelineno-17-16"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
 </span></code></pre></div>
 <h3 id="python_2">Python<a class="headerlink" href="#python_2" title="Permanent link">&para;</a></h3>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
@@ -3939,7 +3970,8 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 </span><span id="__span-18-8"><a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a>    <span class="n">queue_storage_queue_rotate_interval_ms</span><span class="o">=</span><span class="mi">1000</span><span class="p">,</span>
 </span><span id="__span-18-9"><a id="__codelineno-18-9" name="__codelineno-18-9" href="#__codelineno-18-9"></a>    <span class="n">queue_storage_lease_rotate_interval_ms</span><span class="o">=</span><span class="mi">1000</span><span class="p">,</span>
 </span><span id="__span-18-10"><a id="__codelineno-18-10" name="__codelineno-18-10" href="#__codelineno-18-10"></a>    <span class="n">queue_storage_claim_rotate_interval_ms</span><span class="o">=</span><span class="mi">1000</span><span class="p">,</span>
-</span><span id="__span-18-11"><a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a><span class="p">)</span>
+</span><span id="__span-18-11"><a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a>    <span class="n">queue_storage_prune_lock_timeout_ms</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
+</span><span id="__span-18-12"><a id="__codelineno-18-12" name="__codelineno-18-12" href="#__codelineno-18-12"></a><span class="p">)</span>
 </span></code></pre></div>
 <h3 id="what-the-knobs-mean">What the knobs mean<a class="headerlink" href="#what-the-knobs-mean" title="Permanent link">&para;</a></h3>
 <table>
@@ -3992,6 +4024,11 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 <td>How often the ADR-023 claim-ring rotates. Set with <code>ClientBuilder::claim_rotate_interval</code> (Rust) or <code>queue_storage_claim_rotate_interval_ms</code> (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions.</td>
 </tr>
 <tr>
+<td><code>prune_lock_timeout</code></td>
+<td><code>10ms</code></td>
+<td>The PostgreSQL <code>lock_timeout</code> the maintenance leader applies when it takes the exclusive locks to reclaim a queue, lease or claim ring partition (and when it folds terminal-count deltas); among queue prune's initial partition locks, only <code>ready_segments</code> waits under it; later reads and writes also run under it. The timeout applies separately to each lock acquisition, not to the whole prune. A lock timeout rolls the prune back, is counted as <code>blocked</code>, and is retried on a later maintenance tick. Set with <code>ClientBuilder::prune_lock_timeout</code> (Rust) or <code>queue_storage_prune_lock_timeout_ms</code> (Python). Must be greater than zero and at most <code>2147483647</code> ms; keep it well below <code>deadlock_timeout</code> and <code>statement_timeout</code>. The short default keeps prune's pending <code>ACCESS EXCLUSIVE</code> request from stalling claims and enqueues queued behind it. See below for when to raise it.</td>
+</tr>
+<tr>
 <td><code>ring_rotation_cadence</code></td>
 <td>5 s / 2 MiB target / 256 rows / 60 s</td>
 <td>A non-empty slot becomes eligible after <code>min_slot_age</code> since the first non-empty observation once it holds <code>min_slot_rows</code>, when <code>target_slot_bytes</code> is reached, or after <code>max_slot_age</code> regardless of rows (so a trickle of writes neither seals a nearly empty slot every window nor keeps one open indefinitely). Python: <code>queue_storage_rotate_min_slot_rows</code>, <code>queue_storage_rotate_max_slot_age_ms</code>. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. The minimum age uses a monotonic clock and resets on an empty observation or leader change; <code>max_slot_age</code> also counts from when the slot opened on the database clock, so a leader change does not restart it, except under compat (pre-flip) authority when an older rotator left no ledger row for the slot. <code>max_slot_age</code> makes a slot eligible to seal; the busy and reuse checks still decide when it is reclaimed. Configure with <code>ClientBuilder::ring_rotation_cadence</code> (Rust) or <code>queue_storage_rotate_min_slot_age_ms</code> / <code>queue_storage_rotate_target_slot_bytes</code> (Python). A zero byte target disables the size trigger, a zero <code>min_slot_rows</code> disables the row floor, and a zero <code>max_slot_age</code> disables the ceiling. A row floor needs a size target or a ceiling, and a queue-storage client refuses to build without one, because lease rows are deleted as attempts finish and a lease slot may never reach the floor. A zero <code>min_slot_age</code>, or <code>RingRotationCadence::EAGER</code>, permits sealing on every tick whatever the other settings. The target is sampled and does not bound retained storage.</td>
@@ -3999,7 +4036,7 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 </tbody>
 </table>
 <p>The benchmark harness in <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">postgresql-job-queue-benchmarking</a> reads <code>QUEUE_SLOT_COUNT</code>, <code>LEASE_SLOT_COUNT</code>, <code>CLAIM_SLOT_COUNT</code>, <code>QUEUE_STRIPE_COUNT</code>, and <code>LEASE_CLAIM_RECEIPTS</code> from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.</p>
-<p>Rust builder overrides for cadence and claim rotation interval may be set before
+<p>Rust builder overrides for cadence, claim rotation interval and prune lock timeout may be set before
 or after <code>queue_storage</code>; reconfiguring storage preserves those overrides. With
 no claim interval override, the claim ring uses the queue decision interval.</p>
 <p>Use the defaults unless you have a reason not to:</p>
@@ -4008,6 +4045,7 @@ no claim interval override, the claim ring uses the queue decision interval.</p>
 <li>Increase <code>lease_slot_count</code> if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.</li>
 <li>Increase <code>claim_slot_count</code> if the rotation cadence (<code>claim_rotate_interval</code>) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces <code>rotate_claims</code> to return <code>SkippedBusy</code> and the receipt-plane churn falls back onto a smaller working set of partitions.</li>
 <li>Increase <code>queue_stripe_count</code> only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue <code>QueueConfig</code> field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over <code>queue#N</code> physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. For single hot-queue workloads, benchmark <code>2</code> stripes first; higher values should be treated as workload-specific tuning rather than a general default.</li>
+<li>Increase <code>prune_lock_timeout</code> when <code>increase(awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}[15m])</code> stays above zero and the rings stop recycling, typically because frequent short reads of the ring partitions (admin or dashboard queries over the queue-storage tables) hold a conflicting lock at the instant prune tries. A stalled ring grows its current slot, which makes those queries slower and the contention worse. Among its initial partition locks, queue ring prune waits under the timeout only on <code>ready_segments</code> and takes the others with <code>NOWAIT</code>, so a longer timeout does not help when readers hold those. Later reads and writes also run under the timeout. Raise it in small steps (for example <code>50ms</code>, then <code>100ms</code>, then <code>250ms</code>) and keep it well below PostgreSQL's <code>deadlock_timeout</code> (default <code>1s</code>) and below any <code>statement_timeout</code> on the pool's connections. A single lock wait that reaches <code>deadlock_timeout</code> makes PostgreSQL run its deadlock detector, and if claims or enqueues are part of a lock cycle with it, the detector can cancel them rather than the prune; a short <code>lock_timeout</code> abandons the prune first, so the prune is always the one that gives way. A <code>statement_timeout</code> at or below the lock timeout cancels the prune statement before the lock timeout fires, so it fails with an error instead of reporting <code>blocked</code>. Startup logs a warning when the configured timeout is at or above either setting. While prune waits, new accesses to the same partition also queue behind its lock request, so a longer timeout trades claim latency for reclamation. Shortening the readers is the more durable fix when they run longer than a few hundred milliseconds. Watch <code>awa_maintenance_prune_attempts_total</code> by <code>awa_ring</code> and <code>awa_ring_outcome</code>: <code>pruned</code> should advance steadily, <code>blocked</code> means the lock timeout expired, <code>skipped_active</code> (with <code>awa_ring_reason</code>) means live rows kept the slot, <code>backed_off</code> means prune was skipped for a few ticks after repeated <code>skipped_active</code>, and <code>error</code> is a database failure.</li>
 <li>Increase rotation intervals to reduce partition churn and metadata activity.</li>
 <li>Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.</li>
 </ul>

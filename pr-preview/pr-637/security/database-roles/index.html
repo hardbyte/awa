@@ -1743,17 +1743,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#custom-queue-storage-schemas_1" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Custom queue-storage schemas
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#why-the-grants-are-broad" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1858,6 +1847,8 @@
       
         
           
+        
+      
         
       
         
@@ -2051,6 +2042,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2293,17 +2312,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#custom-queue-storage-schemas_1" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Custom queue-storage schemas
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#why-the-grants-are-broad" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2418,17 +2426,24 @@
 <li>Adding its grants needs the current owner's privileges.</li>
 </ul>
 <p>The schema owner holds neither the migration role's nor an application role's privileges, so a repair running as <code>awa_owner</code> cannot reassign sequences those roles created. That includes the migration role connected with <code>PGOPTIONS='-c role=awa_owner'</code>. Run the repair as the migration role itself, without <code>PGOPTIONS</code>, as above. <code>awa migrate</code> and <code>--repair</code> retry each sequence the effective role could not repair as the login role, so <code>awa migrate</code> run with <code>PGOPTIONS='-c role=awa_owner'</code>, as documented, still repairs the migration role's sequences.</p>
+<p>For a migrator with SET-only membership in <code>awa_owner</code>, grant schema access and helper execution explicitly before running the repair. Run as the schema owner:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_migrator</span><span class="p">;</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">FUNCTION</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="nb">TEXT</span><span class="p">,</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">),</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span><span class="n">awa</span><span class="p">.</span><span class="n">repair_lane_sequence</span><span class="p">(</span><span class="nb">TEXT</span><span class="p">,</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">)</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">  </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_migrator</span><span class="p">;</span>
+</span></code></pre></div>
+<p>For a custom queue-storage schema, also grant <code>USAGE</code> on that schema. The migrator must still hold the old sequence owner's privileges and be allowed to <code>SET ROLE</code> to the schema owner; inherited privileges from the schema owner are not required.</p>
 <p>For each sequence that remains, the output lists <code>repair_roles</code>, the login roles other than superusers that can repair it, and the statements to run. A busy sequence only needs another <code>--repair</code>. When <code>repair_roles</code> is empty, which is usual for a sequence an application role created on managed PostgreSQL, either:</p>
 <ul>
 <li>run <code>missing_grants</code> as the current owner. Every runtime role can then use the lane, although the owner stays unchanged; or</li>
 <li>give the migration role the owner's privileges, for example <code>GRANT app_role TO awa_migrator</code> from a role with <code>ADMIN</code> on <code>app_role</code>, rerun <code>--repair</code> as the migration role, then revoke the membership.</li>
 </ul>
 <p>Without the CLI, repair one sequence per transaction from <code>psql</code> in autocommit mode, connected as the migration role:</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">format</span><span class="p">(</span><span class="s1">'SELECT * FROM awa.repair_lane_sequence(%L, %L)'</span><span class="p">,</span><span class="w"> </span><span class="s1">'awa'</span><span class="p">,</span><span class="w"> </span><span class="n">sequence_name</span><span class="p">)</span>
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">)</span><span class="w"> </span><span class="err">\</span><span class="n">gexec</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">format</span><span class="p">(</span><span class="s1">'SELECT * FROM awa.repair_lane_sequence(%L, %L)'</span><span class="p">,</span><span class="w"> </span><span class="s1">'awa'</span><span class="p">,</span><span class="w"> </span><span class="n">sequence_name</span><span class="p">)</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">)</span><span class="w"> </span><span class="err">\</span><span class="n">gexec</span>
 </span></code></pre></div>
 <h2 id="custom-queue-storage-schemas">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas" title="Permanent link">&para;</a></h2>
-<h2 id="custom-queue-storage-schemas_1">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas_1" title="Permanent link">&para;</a></h2>
 <p>Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and <code>TRUNCATE</code>, but never DDL. Check lanes in a custom schema with <code>awa storage lane-sequences --schema &lt;name&gt;</code>. See <a href="../../queue-storage-substrate/">Queue storage</a>.</p>
 <h2 id="why-the-grants-are-broad">Why the grants are broad<a class="headerlink" href="#why-the-grants-are-broad" title="Permanent link">&para;</a></h2>
 <p>Runtime triggers maintain queue counts, descriptors, uniqueness claims, and other metadata as the invoking role. The elected maintenance task promotes and rescues jobs, refreshes metadata, and reclaims eligible ring slots. Consequently a login holding <code>awa_runtime</code> is trusted Awa infrastructure: do not grant it to a producer-only application or a public callback service.</p>

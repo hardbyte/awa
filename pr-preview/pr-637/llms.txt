@@ -61,6 +61,7 @@ These links are curated for agents. Each target is the Markdown representation o
 - [Python API](reference/python/index.md): Install awa-pg for the Python clients and worker runtime.
 - [Stability policy](stability/index.md): Awa is consumed through several distinct surfaces. This document states, per surface, what is covered by a compatibility promise, what is explicitly internal, and what each release type may change. Anything not listed here is internal and.
 - [Architecture decisions](adr/index.md): Each file in this directory captures a single architectural decision — its context, the decision itself, the alternatives considered, and the consequences. ADRs are written when a decision has a non-obvious rationale, trades off across.
+- [Incident reports](incidents/index.md): Public incident reports record what happened, its impact, causes, and follow-up work. Architecture decisions record design choices and their alternatives.
 
 ## Contributing
 

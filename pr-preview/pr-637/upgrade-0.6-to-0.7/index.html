@@ -2041,6 +2041,8 @@
       
         
       
+        
+      
     
     
     
@@ -2222,6 +2224,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2722,10 +2752,10 @@ v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
 detects that <code>provision_lane</code> is missing and creates lanes as before.</p>
 <p>To adopt it:</p>
 <ol>
-<li>Check the current state: <code>awa storage lane-sequences</code> (read-only, exits 2
-   while lanes need repair).</li>
 <li>Run <code>awa migrate</code> with the schema owner as the effective role, as described
    in <a href="../security/database-roles/">Database roles</a>.</li>
+<li>Check the remaining state: <code>awa storage lane-sequences</code> (read-only, exits 2
+   while lanes need repair). This command requires v053 to be installed.</li>
 <li>Read the migrate output. Any lane sequence it could not repair is listed in
    a warning. A busy one needs another run of
    <code>awa storage lane-sequences --repair</code> as the migration role (without
