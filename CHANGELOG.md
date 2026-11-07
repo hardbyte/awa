@@ -23,9 +23,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
   worker completion using its carried job body can leave an old replacement
   claimable. Updated aging callers prevent new replacements, but cannot fence
   an older process explicitly calling physical aging during a rolling upgrade.
-  Repair takes claim-head row locks without waiting and rolls back on
-  contention; the operation must retry. It adds weak relation locks and
-  tombstone writes only on this recovery path. Fresh rechecks rely on READ
+  Repair takes claim-head row locks without waiting. Rescue batches defer
+  busy historical attempts while progressing other attempts; receipt rescue
+  cursors keep deferred attempts eligible. Worker completion batches isolate
+  lock contention to the affected requests. Direct completion and
+  single-attempt mutations still fail on contention and must retry. It adds
+  weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ
   COMMITTED isolation.
 
 - Preserve recovered bodies and physical lane priority when manually moving
