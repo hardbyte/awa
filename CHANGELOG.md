@@ -6,6 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
 - Keep committed claims out of physical priority aging before its batch limit,
   even before their cursor advances. Active point and callback reads recover
   retained tombstoned bodies left by older aging. Recovery, cancellation and

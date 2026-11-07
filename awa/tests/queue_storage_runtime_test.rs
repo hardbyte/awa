@@ -23356,7 +23356,13 @@ async fn test_historical_colliding_live_replacement_deadline_rescues_claimed_bod
     historical_tombstoned_claim_hydrates(true, Duration::from_secs(300), true).await;
 }
 
-async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool, reopen_as_legacy: bool) {
+async fn moved_tombstoned_claim_lane(
+    from: i16,
+    to: i16,
+    receipts: bool,
+    reopen_as_legacy: bool,
+    discovered_wide: bool,
+) {
     let (_guard, pool) = setup_pool(6).await;
     let schema = "awa_qs_moved_tomb_claim";
     let queue = "qs_moved_tomb_claim";
@@ -23365,11 +23371,34 @@ async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool, reopen_
         QueueStorageConfig {
             schema: schema.into(),
             lease_claim_receipts: receipts,
+            queue_slot_count: if discovered_wide {
+                20
+            } else {
+                QueueStorageConfig::default().queue_slot_count
+            },
             queue_stripe_count: 1,
             ..Default::default()
         },
     )
     .await;
+    if discovered_wide {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 9044 },
+            InsertOpts {
+                queue: "qs_wide_anchor".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        for _ in 0..16 {
+            assert!(matches!(
+                store.rotate(&pool).await.unwrap(),
+                RotateOutcome::Rotated { .. }
+            ));
+        }
+    }
     let id = enqueue_job(&pool, &store, &CompleteJob { id: 9043 }, InsertOpts {
         queue: queue.into(), priority: from, max_attempts: 1,
         metadata: serde_json::json!({"retained":"moved-tomb-claim", "_awa_original_priority":from}),
@@ -23409,6 +23438,9 @@ async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool, reopen_
     }
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].job_id, id);
+    if discovered_wide {
+        assert_eq!(claims[0].ready_slot, 16);
+    }
     assert_eq!(
         claims[0].priority, 1,
         "effective priority cannot identify either physical lane"
@@ -23426,6 +23458,12 @@ async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool, reopen_
             ..Default::default()
         })
         .expect("reopen existing custom store in legacy mode")
+    } else if discovered_wide {
+        QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            ..Default::default()
+        })
+        .expect("open installed schema without its writer configuration")
     } else {
         store
     };
@@ -23433,6 +23471,16 @@ async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool, reopen_
     // tombstoning the claimed source as well; both exact-ref bodies now remain.
     tombstone_ready_job(&pool, &store, id).await;
     assert_eq!(ready_tombstone_count(&pool, &store).await, 2);
+    if discovered_wide {
+        let loaded = store
+            .load_job(&pool, id)
+            .await
+            .expect("read retained body in installed slot")
+            .unwrap();
+        assert_eq!(loaded.state, JobState::Running);
+        assert_eq!(loaded.args, serde_json::json!({"id":9043}));
+        assert_eq!(loaded.max_attempts, 1);
+    }
     if !receipts {
         let err = store
             .rescue_stale_heartbeats(&pool, Duration::ZERO)
@@ -23476,20 +23524,25 @@ async fn moved_tombstoned_claim_lane(from: i16, to: i16, receipts: bool, reopen_
 
 #[tokio::test]
 async fn test_historical_tombstoned_claim_uses_emitted_lane_low_to_high() {
-    moved_tombstoned_claim_lane(2, 4, true, false).await;
+    moved_tombstoned_claim_lane(2, 4, true, false, false).await;
 }
 #[tokio::test]
 async fn test_historical_tombstoned_claim_uses_emitted_lane_high_to_low() {
-    moved_tombstoned_claim_lane(4, 2, true, false).await;
+    moved_tombstoned_claim_lane(4, 2, true, false, false).await;
 }
 #[tokio::test]
 async fn test_historical_tombstoned_legacy_ambiguous_lanes_roll_back() {
-    moved_tombstoned_claim_lane(2, 4, false, false).await;
+    moved_tombstoned_claim_lane(2, 4, false, false, false).await;
 }
 
 #[tokio::test]
 async fn test_historical_tombstoned_receipt_materialized_then_reopened_legacy_uses_evidence() {
-    moved_tombstoned_claim_lane(2, 4, true, true).await;
+    moved_tombstoned_claim_lane(2, 4, true, true, false).await;
+}
+
+#[tokio::test]
+async fn test_schema_only_store_recovers_retained_body_in_installed_slot() {
+    moved_tombstoned_claim_lane(2, 4, true, false, true).await;
 }
 
 #[tokio::test]

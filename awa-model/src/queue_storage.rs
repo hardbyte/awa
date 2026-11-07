@@ -941,12 +941,16 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
-fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, AwaError> {
-    let index = usize::try_from(slot).map_err(|_| {
+fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
+    usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
             "invalid {ring} ring slot {slot}: slot must be non-negative"
         ))
-    })?;
+    })
+}
+
+fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, AwaError> {
+    let index = ring_slot_number(slot, ring)?;
     if index >= slot_count {
         return Err(AwaError::Validation(format!(
             "invalid {ring} ring slot {slot}: configured slot count is {slot_count}"
@@ -12417,10 +12421,9 @@ impl QueueStorage {
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
 
         // Resolve moved ready bodies without opening the whole tombstone ring.
-        // Empty input returned above; every remaining slot is validated here.
         let slots = ready_slots
             .iter()
-            .map(|&slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+            .map(|&slot| ring_slot_number(slot, "queue"))
             .collect::<Result<BTreeSet<_>, _>>()?;
         let tombstone_sources = slots
             .iter()
@@ -12512,7 +12515,7 @@ impl QueueStorage {
                 .map(|row| row.ready_slot)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .map(|slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+                .map(|slot| ring_slot_number(slot, "queue"))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|slot| {
@@ -12867,7 +12870,7 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
         let attempt_sources = copies
             .iter()
-            .map(|row| ring_slot_index(row.ready_slot, self.queue_slot_count(), "queue"))
+            .map(|row| ring_slot_number(row.ready_slot, "queue"))
             .collect::<Result<BTreeSet<_>, _>>()?
             .into_iter()
             .map(|slot| {
