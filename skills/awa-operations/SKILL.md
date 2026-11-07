@@ -91,11 +91,14 @@ Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
 ## Restricted Database Roles
 
-When deploying a runtime without schema CREATE, apply v049 and provision every
-queue with `awa storage prepare-queue` as the migrator before starting producers
-or workers. Match shard/stripe counts; provision additional lanes before changing
-routing. Use the sequence grants and owner defaults in
-[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+From v053 any runtime role creates lanes through the schema owner's
+`SECURITY DEFINER` provisioning functions, so runtimes need neither schema
+CREATE nor sequence default privileges, and `awa storage prepare-queue` is
+optional. Run migrations with the schema owner as the effective role. Check
+lane ownership with `awa storage lane-sequences` (exits 2 while lanes need
+repair) and fix it with `--repair`, connected as the migration role itself
+rather than as the schema owner, or with the statements it prints; see
+[Database roles](../../docs/security/database-roles.md#check-and-repair-lane-ownership).
 
 ## Rolling Upgrades
 
@@ -139,9 +142,14 @@ rotation and prune, DLQ and descriptor cleanup, and cron evaluation. During an
 unfinalized transition it promotes both planes' deferred backlogs, so drain and
 post-flip execution do not depend on which runtime holds leadership.
 Promotion gives each queue lane its own short transaction and hands a lane
-whose enqueue lock stays busy to a dedicated waiter, so a hot queue delays
-neither other queues' promotion nor rescue
-(`awa_maintenance_promote_lane_contention_total` counts the hand-offs). Every
+whose enqueue lock stays busy to one waiter shared by scheduled and retryable
+rows. The waiter alternates states within a total 32-batch budget while the
+leader skips that lane in both states and continues other promotion and rescue.
+A 30 s lock wait can expire behind several finite producer transactions; the
+waiter releases its queue position and a later tick retries. Sustained
+contention can still prevent promotion.
+`awa_maintenance_promote_lane_contention_total` counts the hand-offs and timed-out
+waits. Every
 worker dispatches and heartbeats its own attempts. There is no `pg_cron` or
 external scheduler.
 
@@ -293,6 +301,25 @@ While the transition is unfinalized, a canonical attempt that re-schedules itsel
 Rings rotate only when active — a frozen generation on an idle queue is healthy.
 The condition to alert on is a frozen generation *with* accumulating rows
 (`skipped_busy`): a pinned ring, almost always caused by a long-held snapshot.
+
+## Prune Lock Timeout
+
+Ring prune installs its `lock_timeout` after the initial slot-row locks and
+pre-lock checks. From then on, each lock acquisition has its own timeout of
+10 ms by default; this does not bound the whole prune. A lock timeout rolls it
+back and counts `blocked` in
+`awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. Sustained
+`increase()` of `blocked` (or `error`) warrants checking `pruned` outcomes,
+ring generations and accumulating rows; successful prunes can occur between
+blocked attempts. Raise
+`ClientBuilder::prune_lock_timeout` (Python
+`queue_storage_prune_lock_timeout_ms`) in small steps (`50ms`, `100ms`, `250ms`) when short readers of the ring
+partitions are the cause, and keep it well below `deadlock_timeout` (default 1 s)
+and any enabled `statement_timeout`. Startup warns when it is at or above either
+enabled limit. Of its initial partition locks, queue-ring prune waits under the
+timeout only on `ready_segments` and takes its other partitions with `NOWAIT`.
+`backed_off` means prune was skipped for a few ticks
+after repeated `skipped_active`.
 
 ## Ring Rotation Cadence
 

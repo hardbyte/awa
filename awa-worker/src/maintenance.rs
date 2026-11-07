@@ -768,13 +768,12 @@ type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<
 /// How long a promotion transaction waits on one lane's locks before the
 /// leader hands the lane to a dedicated waiter and goes on without it.
 const PROMOTE_LANE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
-/// Lock wait of a dedicated lane waiter. PostgreSQL grants a lock to its
-/// waiters in arrival order, so a waiter is served after the producers queued
-/// ahead of it, however busy the lane stays.
+/// Lock wait of a dedicated lane waiter. The combined wait behind several
+/// transactions can exhaust this budget; a later retry gets a new queue position.
 const PROMOTE_LANE_WAITER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most lanes with a dedicated waiter at once. A waiter holds a pool
 /// connection while it waits, so smaller pools get fewer: one per eight
-/// connections, and always one so a busy lane is still promoted.
+/// connections, with at least one available for contended lanes.
 const PROMOTE_MAX_LANE_WAITERS: usize = 4;
 
 fn lane_waiter_limit(pool_max_connections: u32) -> usize {
@@ -787,15 +786,17 @@ fn lane_waiter_limit(pool_max_connections: u32) -> usize {
 /// Each lane's share of a batch is promoted in its own transaction under a
 /// short `lock_timeout`, so a lane whose enqueue lock is busy delays only its
 /// own rows. A lane that times out keeps its rows deferred and is handed to a
-/// dedicated waiter task, which promotes it under a long lock timeout while
-/// the leader carries on with other lanes and other maintenance branches.
+/// dedicated waiter task, which alternates scheduled and retryable batches
+/// under a bounded lock timeout while the leader carries on with other lanes
+/// and other maintenance branches. Exhausting that timeout leaves the lane
+/// deferred for a later retry; sustained contention can prevent progress.
 /// Dropping the promoter aborts its waiters.
 #[doc(hidden)]
 pub struct QueueStoragePromoter {
     pool: PgPool,
     store: Arc<QueueStorage>,
     metrics: AwaMetrics,
-    waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
+    waiting: Arc<std::sync::Mutex<HashSet<PromotionLane>>>,
     waiters: std::sync::Mutex<JoinSet<()>>,
     max_waiters: usize,
 }
@@ -824,7 +825,11 @@ impl QueueStoragePromoter {
     ) -> Result<usize, AwaError> {
         {
             let mut waiters = self.waiters.lock().expect("lane waiters poisoned");
-            while waiters.try_join_next().is_some() {}
+            while let Some(result) = waiters.try_join_next() {
+                if let Err(error) = result {
+                    error!(%error, "Promotion lane waiter task failed");
+                }
+            }
         }
 
         let mut contended: Vec<PromotionLane> = Vec::new();
@@ -833,7 +838,7 @@ impl QueueStoragePromoter {
             if cancel.is_cancelled() {
                 break;
             }
-            let mut skip = self.waiting_lanes(state);
+            let mut skip = self.waiting_lanes();
             skip.extend(contended.iter().cloned());
             let batch_started = Instant::now();
             let outcome = self
@@ -863,42 +868,41 @@ impl QueueStoragePromoter {
         Ok(promoted)
     }
 
-    fn waiting_lanes(&self, state: JobState) -> Vec<PromotionLane> {
+    fn waiting_lanes(&self) -> Vec<PromotionLane> {
         self.waiting
             .lock()
             .expect("waiting lanes poisoned")
             .iter()
-            .filter(|(waiting_state, _)| *waiting_state == state)
-            .map(|(_, lane)| lane.clone())
+            .cloned()
             .collect()
     }
 
     fn hand_off(&self, state: JobState, lane: PromotionLane) {
-        let key = (state, lane);
         {
             let mut waiting = self.waiting.lock().expect("waiting lanes poisoned");
+            if waiting.contains(&lane) {
+                return;
+            }
             if waiting.len() >= self.max_waiters {
                 self.metrics.record_promotion_lane_contention(
                     state.as_str(),
-                    &key.1.queue,
+                    &lane.queue,
                     "waiter_limit",
                 );
                 debug!(
-                    queue = %key.1.queue,
-                    priority = key.1.priority,
+                    queue = %lane.queue,
+                    priority = lane.priority,
                     "Promotion lane contended with every lane waiter busy; retrying next tick"
                 );
                 return;
             }
-            if !waiting.insert(key.clone()) {
-                return;
-            }
+            waiting.insert(lane.clone());
         }
         self.metrics
-            .record_promotion_lane_contention(state.as_str(), &key.1.queue, "handed_off");
+            .record_promotion_lane_contention(state.as_str(), &lane.queue, "handed_off");
         let guard = WaitingLane {
             waiting: Arc::clone(&self.waiting),
-            key,
+            lane,
         };
         let pool = self.pool.clone();
         let store = Arc::clone(&self.store);
@@ -907,7 +911,7 @@ impl QueueStoragePromoter {
             .lock()
             .expect("lane waiters poisoned")
             .spawn(async move {
-                promote_waiting_lane(&pool, &store, &metrics, &guard.key).await;
+                promote_waiting_lane(&pool, &store, &metrics, state, &guard.lane).await;
                 drop(guard);
             });
     }
@@ -916,14 +920,14 @@ impl QueueStoragePromoter {
 /// Holds a lane in [`QueueStoragePromoter`]'s waiting set until its waiter
 /// finishes, panics or is aborted.
 struct WaitingLane {
-    waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
-    key: (JobState, PromotionLane),
+    waiting: Arc<std::sync::Mutex<HashSet<PromotionLane>>>,
+    lane: PromotionLane,
 }
 
 impl Drop for WaitingLane {
     fn drop(&mut self) {
         if let Ok(mut waiting) = self.waiting.lock() {
-            waiting.remove(&self.key);
+            waiting.remove(&self.lane);
         }
     }
 }
@@ -932,14 +936,23 @@ async fn promote_waiting_lane(
     pool: &PgPool,
     store: &QueueStorage,
     metrics: &AwaMetrics,
-    (state, lane): &(JobState, PromotionLane),
+    initial_state: JobState,
+    lane: &PromotionLane,
 ) {
-    for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+    let states = match initial_state {
+        JobState::Scheduled => [JobState::Scheduled, JobState::Retryable],
+        JobState::Retryable => [JobState::Retryable, JobState::Scheduled],
+        _ => return,
+    };
+    let mut short_batches = [false; 2];
+    for batch in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+        let state_index = batch % states.len();
+        let state = states[state_index];
         let batch_started = Instant::now();
         match store
             .promote_due_lane(
                 pool,
-                *state,
+                state,
                 lane,
                 PROMOTE_BATCH_SIZE,
                 Some(PROMOTE_LANE_WAITER_LOCK_TIMEOUT),
@@ -966,7 +979,8 @@ async fn promote_waiting_lane(
                     outcome.promoted as u64,
                     batch_started.elapsed(),
                 );
-                if (outcome.selected as i64) < PROMOTE_BATCH_SIZE {
+                short_batches[state_index] = (outcome.selected as i64) < PROMOTE_BATCH_SIZE;
+                if short_batches.iter().all(|short| *short) {
                     return;
                 }
             }
@@ -3066,6 +3080,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
             debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("queue");
             return;
         }
 
@@ -3113,6 +3128,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("queue");
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
         }
@@ -3181,6 +3197,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_LEASE) {
             debug!(branch = PRUNE_BRANCH_LEASE, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("lease");
             return;
         }
 
@@ -3211,6 +3228,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("lease");
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
         }
@@ -3284,6 +3302,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_CLAIM) {
             debug!(branch = PRUNE_BRANCH_CLAIM, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("claim");
             return;
         }
 
@@ -3314,6 +3333,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("claim");
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }
