@@ -6,6 +6,75 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Preserve recovered bodies and physical lane priority when manually moving
+  historical aged terminal failures to the DLQ, so later DLQ retry retains
+  arguments, attempt limits and priority provenance. Terminal counters are
+  decremented at their original stored priority; automatic rescue-to-DLQ
+  policy keeps the effective priority.
+
+- Recover retained terminal bodies from the exact prior attempt when older
+  workers stored an aged effective priority in a narrow terminal key. Live
+  moved-lane metadata supplies defaults without replacing stored terminal
+  metadata, errors, tags or progress. Manual terminal retry restarts aging from
+  the physical lane; counter removal keeps the stored terminal key and failed
+  carry derives replacement counters from its inserted rows. The installed
+  `terminal_jobs` SQL view is unchanged for older mismatched-priority rows;
+  bodies whose ready backing was already pruned cannot be reconstructed.
+- Exclude tombstoned source lanes and require the prior run lease when
+  hydrating rescued attempts, retaining physical priority only for terminal
+  identity. Deferred retry and DLQ policy keep effective priority. The lookup
+  reads only validated referenced tombstone children; this adds read locks.
+
+- Preserve the original job body when manually retrying a priority-aged attempt
+  that exhausted its retries during rescue. Retained failed reads and failed-row
+  carry through pruning now use the physical ready-lane identity.
+
+- Close read connections if their transaction start is cancelled or fails before
+  SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
+
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
+- **Callback completion, `get_job` and lifecycle events find running jobs
+  that priority aging promoted** (the Rust side of
+  [#569](https://github.com/hardbyte/awa/issues/569)). Claims and leases
+  record a job's aged effective priority while its ready row keeps the lane
+  priority, and the job and admin reads joined them on priority. With aging on (the
+  default, every 60 s), a job that waited past a minute before it was claimed
+  could not be completed by callback with an expected kind, failed the
+  mixed-transition callback routing check, and read back from `get_job` in
+  the wrong state. Admin job lists, kind counts and cancellation by unique
+  key also missed those running jobs. They now match the attempt (`job_id` and `run_lease`),
+  skipping the tombstoned source row a lane move leaves behind.
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing; the weekly mixed-version rehearsal hit this on
+  2026-11-01. It now reads all of them from one read-only snapshot, after
+  locking the ready, lease and claim rings so prune cannot truncate a partition the
+  snapshot still needs.
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only those `LOCK TABLE` statements and the final `TRUNCATE` turned a
+  timeout into `PruneOutcome::Blocked`. The timeout covers every later
+  statement in the transaction too: the post-lock liveness checks read the
+  lease and claim partitions, the failed-row carry inserts into the current
+  slot's `done_entries` and terminal-count deltas, and the fold appends
+  `queue_terminal_rollup_deltas` and deletes `queue_terminal_live_counts`
+  rows. When one of those waited out the timeout, for example behind
+  autovacuum truncating a relation or a hosted Postgres's own background
+  workers, prune failed with a `lock_not_available` (`55P03`) database error,
+  was logged as an error and skipped the prune backoff. A lock timeout in any
+  statement after a queue, lease or claim prune, or a terminal-count rollup
+  slot, sets its `lock_timeout` now rolls the whole transaction back and
+  reports `Blocked`
+  (`blocked_slots` for rollup), so maintenance backs off and retries; nothing
+  the attempt wrote survives the rollback. A rollup pass stops at its first
+  blocked slot rather than waiting out the timeout again on each remaining
+  one.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
