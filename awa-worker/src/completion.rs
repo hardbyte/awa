@@ -1071,7 +1071,7 @@ mod tests {
         )
         .unwrap();
         let store = runtime.store.clone();
-        store.install(&pool).await.unwrap();
+        store.prepare_schema(&pool).await.unwrap();
         let mut jobs = Vec::new();
         for queue in ["busy", "ordinary", "stale", "carried"] {
             store.enqueue_batch(&pool, queue, 4, 1).await.unwrap();
