@@ -2164,6 +2164,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#relationship-to-adr-028" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to ADR-028
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2211,6 +2222,8 @@
 <p>Requested halt and observed cessation are distinct. Cancellation cannot guarantee that handlers, external effects or server-side SQL have stopped. Unresolved work must remain durably visible after heartbeat expiry and block resumption, including automatic recovery, until reconciled or independently fenced.</p>
 <p>A local stop that cannot be persisted protects only that runtime's lifetime; restart protection requires a durable halt or external restriction.</p>
 <p>Fleet containment requires compatible clients. Obsolete binaries need an enforced database or deployment boundary; without it, the guarantee covers cooperating runtimes only. Compatibility must follow <a href="../041-rolling-upgrade-policy/">ADR-041</a>, and control privileges must preserve producer access. This proposal defines the contract; integrated fleet behavior remains unverified.</p>
+<h2 id="relationship-to-adr-028">Relationship to ADR-028<a class="headerlink" href="#relationship-to-adr-028" title="Permanent link">&para;</a></h2>
+<p><a href="../028-maintenance-only-runtime-role/">ADR-028</a> proposes a runtime role that runs maintenance without executing jobs. That role, whether standalone or embedded, must obey the same database halt, fresh-permission and local-stop contract as job-executing runtimes. Stopping one maintenance instance locally can hand leadership to another eligible runtime; the database halt must constrain successor leaders too.</p>
 
 
 

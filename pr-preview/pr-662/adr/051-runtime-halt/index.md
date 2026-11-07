@@ -37,3 +37,7 @@ Requested halt and observed cessation are distinct. Cancellation cannot guarante
 A local stop that cannot be persisted protects only that runtime's lifetime; restart protection requires a durable halt or external restriction.
 
 Fleet containment requires compatible clients. Obsolete binaries need an enforced database or deployment boundary; without it, the guarantee covers cooperating runtimes only. Compatibility must follow [ADR-041](../041-rolling-upgrade-policy/index.md), and control privileges must preserve producer access. This proposal defines the contract; integrated fleet behavior remains unverified.
+
+## Relationship to ADR-028
+
+[ADR-028](../028-maintenance-only-runtime-role/index.md) proposes a runtime role that runs maintenance without executing jobs. That role, whether standalone or embedded, must obey the same database halt, fresh-permission and local-stop contract as job-executing runtimes. Stopping one maintenance instance locally can hand leadership to another eligible runtime; the database halt must constrain successor leaders too.
