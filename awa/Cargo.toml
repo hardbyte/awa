@@ -20,11 +20,12 @@ awa-macros.workspace = true
 awa-worker.workspace = true
 
 [dev-dependencies]
-awa-testing = { path = "../awa-testing", version = "0.6.13-alpha.1" }
+awa-testing = { path = "../awa-testing", version = "0.6.13" }
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 uuid.workspace = true

@@ -4,6 +4,218 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **The queue-storage prune `lock_timeout` is configurable, and prune
+  attempts are counted by outcome for every ring.** Prune (queue, lease and
+  claim rings) and terminal-delta rollup take their exclusive locks under a
+  10 ms `lock_timeout` that could only be changed through the hidden
+  `QueueStorage::with_prune_lock_timeout`. When short readers of the ring
+  partitions held a conflicting lock at that instant, prune reported
+  `blocked` every tick and the rings stopped recycling. Set it with
+  `ClientBuilder::prune_lock_timeout` (Rust) or
+  `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
+  timeout applies separately to each lock acquisition, not to the whole prune;
+  queue prune can wait on up to eight partition locks. The default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
+  maximum is rejected. Start logs a warning when the value is at or above the
+  connection's `deadlock_timeout` (prune waiting that long can make deadlock
+  detection cancel a claim instead) or `statement_timeout`. `with_prune_lock_timeout` is now
+  public, with `set_prune_lock_timeout` and `prune_lock_timeout()`.
+  `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
+  gains `backed_off` (prune skipped by the backoff that follows consecutive
+  `skipped_active` or `blocked` results) and
+  `error` (prune failed with a database error) alongside the existing
+  `pruned`, `noop`, `blocked` and `skipped_active`. See
+  [Configuration](docs/configuration.md#what-the-knobs-mean).
+
+### Fixed
+
+- Reduce accumulated partition locks during job-detail reads, receipt-backed
+  lists and kind counts by releasing completed read phases within the same
+  snapshot. Job-detail reads retain the located ready body until they finish;
+  receipt lists and kind counts process retained claim slots separately. Kind
+  counts capture lane cursors before processing receipts.
+- Preserve the original job body when manually retrying a priority-aged attempt
+  that exhausted its retries during rescue. Retained failed reads and failed-row
+  carry through pruning now use the physical ready-lane identity.
+  Hydration excludes tombstoned source lanes and verifies the prior run lease.
+  Rust terminal retry and failed-row carry also recover retained bodies written
+  by older workers with an effective priority in the terminal key. Manual
+  terminal retry restarts aging from the physical lane; automatic retryable
+  rescue and automatic DLQ routing retain the effective priority. Manual
+  terminal-to-DLQ moves preserve the recovered body and physical priority for
+  later DLQ retry, while decrementing the original terminal counter key. The installed `terminal_jobs`
+  SQL view still cannot hydrate those older mismatched-priority rows before
+  carry widens them; this change does not update that view or repair bodies
+  whose ready backing has already been pruned.
+
+- Admin job lists and kind counts include running receipt claims before
+  they materialize into leases, including compact and legacy row-local claims.
+- Exclude tombstoned source rows when hydrating moved running jobs, including
+  compact receipts. Point reads retain the [concurrent-prune limitation](docs/troubleshooting.md#transient-admin-reads-during-partition-pruning).
+- Close read connections if their transaction start is cancelled or fails before
+  SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
+
+- Avoid repeated terminal-ledger probes when counting open deadline-backed
+  receipts, while preserving all closure and materialization exclusions.
+- Reduce running-count query work by keeping compact closure membership
+  correlated and limiting row-local closure lookups to their claim partition.
+- Hydrate completed job-kind counts through each member's full ready-row key,
+  avoiding repeated scans of other retained rows in the same enqueue lane.
+
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only that `LOCK TABLE` and the final `TRUNCATE` turned a timeout into
+  `PruneOutcome::Blocked`. The timeout covers every later statement in the
+  transaction too: the post-lock liveness checks read the lease and claim
+  partitions, the failed-row carry inserts into the current slot's
+  `done_entries` and terminal-count deltas, and the fold writes
+  `queue_terminal_rollups` and deletes `queue_terminal_live_counts` rows. When
+  one of those waited out the timeout, for example behind autovacuum
+  truncating a relation or a hosted Postgres's own background workers, prune
+  failed with a `lock_not_available` (`55P03`) database error, was logged as
+  an error and skipped the prune backoff. A lock timeout anywhere in a queue,
+  lease or claim prune, or in a terminal-count rollup slot, now rolls the
+  whole transaction back and reports `Blocked` (`blocked_slots` for rollup),
+  so maintenance backs off and retries; nothing the attempt wrote survives
+  the rollback. A rollup pass stops at its first blocked slot rather than
+  waiting out the timeout again on each remaining one.
+- **On queue storage, a queue whose enqueue lane is busy no longer holds
+  back promotion of other queues, nor the maintenance leader's rescue,
+  rotation and prune.** Promotion re-enqueues due scheduled and retryable
+  rows into their lane, which takes the lane's reservation lock that
+  producers hold until they commit. A promotion batch was one transaction
+  across every queue it touched, and the leader runs its branches one after
+  another, so a lane kept busy by producers delayed due jobs of unrelated
+  queues in the same batch, and rescue started seconds late. Promotion now
+  gives each `(queue, priority)` lane its own transaction under a 50 ms
+  `lock_timeout`. A lane that times out keeps its rows deferred and is
+  handed to a dedicated task that waits up to 30 s for the lock, queued
+  behind the producers already waiting, so the lane is still promoted in
+  turn however busy it stays; the leader skips it meanwhile. Each waiter
+  holds a pool connection, so the leader runs one per eight pool
+  connections, at least one and at most four; a further contended lane is
+  retried on the next tick. Batch selection skips rows another transaction
+  has locked, so locked due rows cannot fill every batch of a tick. `awa.maintenance.promote.lane_contention`
+  (`awa_maintenance_promote_lane_contention_total{awa_job_state,awa_job_queue,awa_promote_outcome}`)
+  counts `handed_off`, `waiter_limit` and `waiter_timed_out`. Promoted rows
+  now take lane sequence numbers in due order within their lane.
+  `QueueStorage::promote_due` keeps its signature and promotes lane by lane
+  without a lock timeout; `promote_due_lanes` and `promote_due_lane` expose
+  the per-lane form.
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first.** A lane's enqueue and claim sequences belonged to the role that
+  first enqueued into, claimed from or promoted into it, so with several
+  runtime roles sharing a group role, any role other than the creator whose
+  default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. The new schema patch
+  `definer_lane_provisioning` creates lanes through two `SECURITY DEFINER`
+  functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. Once the patch commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence
+  per transaction with a 300 ms lock wait, and only where it is allowed to,
+  trying the effective role and then the login role. A sequence an open
+  transaction holds is skipped and reported as busy; one it may not change is
+  reported with the roles that can repair it. Neither fails the run. The new read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the
+  statements to run and the roles to run them as, and exits 2 while any
+  remain; `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per
+  sequence) repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running before the patch detects that `provision_lane` is missing and
+  creates lanes as before, and older binaries create correctly owned lanes once
+  the patch has refreshed the helpers they call. `awa migrate` applies the
+  patch on any v040 database; external runners apply the exported
+  `R__definer_lane_provisioning.sql` after `V40`. See
+  [`docs/upgrade-0.6.13-to-0.6.14.md`](docs/upgrade-0.6.13-to-0.6.14.md).
+- **A graceful shutdown no longer leaves a finished attempt for stale-heartbeat
+  rescue to run again.** Once a handler returned, its finalize (completion,
+  retry, cancel or failure, and any ADR-029 follow-up inserts) ran in a task
+  that `Client::shutdown` did not wait for. When the last handler returned
+  just as the drain ended, shutdown stopped the completion batcher before
+  that finalize reached it, and the direct fallback raced the process exit.
+  The attempt had already left the heartbeat set, so it went stale and was
+  rescued and executed again `heartbeat_staleness` later; a deploy could
+  re-run a few jobs on every rolling restart. Shutdown now waits for
+  pending finalization, within the same drain timeout, before it stops the
+  completion batcher, heartbeat and maintenance services. A finalize that
+  outlives the timeout is still left to rescue, as before.
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
+- **Callback completion, `get_job`, lifecycle events and the admin reads
+  find running jobs that priority aging promoted on queue storage** (backport
+  of #600). Claims and leases record a job's aged effective priority while its
+  ready row keeps the lane priority, and eight reads joined the two on
+  priority. With aging on (the default, every 60 s), a job that waited past a
+  minute before it was claimed could not be completed by callback with an
+  expected kind, failed the mixed-transition callback routing check, read back
+  from `get_job` in the wrong state, was missing from the job list, the kinds
+  page and the dashboard's recent-jobs counts, and was not found by
+  `cancel_by_unique_key`. They now match the attempt (`job_id` and `run_lease`). No
+  migration.
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing. It now reads all of them from one read-only snapshot.
+- **`admin::job_kind_overviews` on queue storage no longer depends on the
+  planner's row estimates.** Behind the admin UI's kinds page, it counted
+  every job through the `current_jobs` view. Two nodes of that view are
+  estimated at one row whatever the statistics say: the join from completion
+  batches to `ready_entries`, and the `UNION ALL` over every place a job can
+  live. Postgres therefore chose nested loops that visit each retained row,
+  and the join on `queue_claim_heads` was only as good as that table's
+  estimate, which autovacuum never refreshes. It now aggregates each place to
+  `(kind, queue)` on its own and combines the results: available jobs are
+  found per lane from the claim cursor, and a completion batch's members are
+  unnested and probed along the ready primary key. The rows are identical,
+  and a test compares them with the former definition across every job
+  state. With 2.6 million retained ready rows (1.8 million of them available)
+  and 860,000 retained completions it takes about 6 to 8 s instead of 20 s on
+  PostgreSQL 17 and 18. It still reads each available job and each retained
+  completion's ready row, because a job's kind lives there. JIT is off for
+  the read.
+- **`admin::list_jobs` on queue storage reads only the places that can hold
+  the requested state.** It selected candidate ids from the `current_jobs`
+  view, so every listing, whatever its filter, planned around the same
+  single-row estimates and joined each retained completion to a scan of the
+  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
+  timeout. Each place a job can live is now read and limited on its own,
+  only those that can hold the state asked for, with a predicate for each
+  filter that is set rather than `$n IS NULL OR` terms, which a prepared
+  statement's generic plan can't drop. Completion batches are ordered by job
+  id before their ready rows are probed, so a page probes only as many as it
+  returns. The ids are identical, and a test compares them with the former
+  definition for every state, kind, queue, limit and page. On the dataset
+  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
+  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
+  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
+  from more than four minutes). Available jobs and completions are still read
+  in full when the state allows them. JIT is off for the read.
+
+## [0.6.13] — 2026-11-06
+
+Ships everything in 0.6.13-alpha.1, which soaked without regressions, plus the batch-enqueue deadlock fix.
+
+### Added
+
+- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
+  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
+  take a per-queue predicate and dead-letter exhausted attempts in the rescue
+  transaction. The existing methods keep their behaviour and fail exhausted
+  attempts into `done_entries`.
+
+### Changed
+
+- **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
+
 ### Fixed
 
 - **Batch enqueues take their lane locks in one order, so they no longer
@@ -22,22 +234,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
   transaction that enqueues with separate statements still takes locks in
   statement order; see "`deadlock detected` while enqueueing" in the
   troubleshooting guide.
-
-## [0.6.13-alpha.1] — 2026-11-05
-
-### Added
-
-- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
-  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
-  take a per-queue predicate and dead-letter exhausted attempts in the rescue
-  transaction. The existing methods keep their behaviour and fail exhausted
-  attempts into `done_entries`.
-
-### Changed
-
-- **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore (`ClientBuilder::max_concurrent_claims`). Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
-
-### Fixed
 
 - **Scheduled, snoozed and retry-after jobs are no longer held back while
   the maintenance leader is overloaded.** The leader backs a maintenance

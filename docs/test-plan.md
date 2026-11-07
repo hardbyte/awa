@@ -32,6 +32,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | B5 | Deadline rescue signals ctx.is_cancelled() | ✓ |  |
 | B6 | UniqueConflict.constraint field | ✓ |  |
 | B7 | Admin cancel signals in-flight handler cancellation | ✓ | ✓ |
+| B8 | Shutdown finalizes attempts whose handler returned during the drain, so a process exit cannot leave them for rescue | ✓ |  |
 | T75 | Priority aging maintenance task promotes long-waiting low-priority jobs | ✓ |  |
 
 ### Uniqueness (Python)
@@ -306,7 +307,7 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 
 ## Persona soak
 
-Durable loss detection covers every lifecycle-observed job and a deterministic `job_id % 64 = 0` sample of `NO_EVENTS` workloads. The other 63/64 returned `NO_EVENTS` jobs remain in enqueue/execution accounting, but their terminal commits are not proven. A bulk observer polls sampled terminal rows once per second (2 s query timeout, 100,000-row cap) and keeps the run lease in the client ledger, so captured proof survives pruning. A handler return is never terminal proof. Missing sampled proof after pruning or a failed invariant query makes the report `INCONCLUSIVE` and fails the test; it does not assert job loss or establish a pass. Reports include sampled, confirmed and excluded counts.
+Durable loss detection covers every lifecycle-observed job and a deterministic `job_id % 64 = 0` sample of `NO_EVENTS` workloads. The other 63/64 returned `NO_EVENTS` jobs remain in enqueue/execution accounting, but their terminal commits are not proven. A bulk observer polls sampled terminal rows and eventful attempts whose handlers returned without terminal proof once per second (2 s query timeout, 100,000-row cap) and keeps the run lease in the client ledger, so captured proof survives pruning. A handler return is never terminal proof. Missing sampled proof after pruning or a failed invariant query makes the report `INCONCLUSIVE` and fails the test; it does not assert job loss or establish a pass. Reports include sampled, confirmed and excluded counts.
 
 On CI, assertion waits and heartbeat staleness use `ci_timing.rs` scaling; load durations, kill schedules and measurement windows retain their configured values.
 
@@ -362,6 +363,7 @@ Environment:
 | `AWA_SOAK_HEARTBEAT_SECONDS`, `AWA_SOAK_STALENESS_SECONDS` | heartbeat interval (default 2) and heartbeat staleness after which a claim may be rescued (default 12) of every runtime, including the claim-and-abandon process; the library's own defaults are 30 and 90. The claim-and-abandon persona also records the duration of each heartbeat pass of its process against the number of handlers running, read from the timestamps the heartbeats write (`abandon-heartbeat-passes.csv`, and percentiles by handler count in the report) |
 | `AWA_SOAK_RESCUE_INTERVAL_SECONDS` | heartbeat and deadline rescue interval of every runtime; unset keeps the harness's 3 s and 2 s, the library default for heartbeat rescue is 30 s |
 | `AWA_SOAK_SHARDOPS_SCALE`, `AWA_SOAK_SHARDOPS_SCHEMA_CREATE` | the shard operator's rate multiplier, independent of `AWA_SOAK_SCALE` (default 1), and whether its application roles may create objects in the schema (default 1: lanes are created on the fly; 0 withholds schema `CREATE` and the operator provisions every lane before raising a count) |
+| `AWA_SOAK_SHARED_CREATOR_GRANTS` | default `0`; `1` shares application-created objects for comparisons with older binaries and requires schema `CREATE`. Keep it off when checking application-role privileges. |
 | `AWA_SOAK_UI_POOL_MAX`, `AWA_SOAK_ADMIN_READ_SECONDS` | the admin server's database pool size (default 10) and the seconds between the operator persona's admin read queries (default 2); lower the load on a slow server by shrinking the pool and stretching the interval |
 | `AWA_SOAK_AWA_BIN` | the `awa` binary for the UI personas (`cargo build --release -p awa-cli`); defaults to the one next to the test binary |
 | `AWA_SOAK_PYTHON` | interpreter of a virtualenv with `awa-python` installed (`uv venv awa-python/.venv`, `uv pip install maturin`, `maturin develop --release` in `awa-python/`); required by the `python` persona |
@@ -380,6 +382,11 @@ with the seed, personas and duration, the violating rows, the timeline around ea
 violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the
 engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18
 image) in private containers on separate ports and removes them afterwards.
+
+After-exit retained-session findings require a successful `CLOSED`
+acknowledgement and a valid final session observation. Forced or unproven exits
+remain incomplete evidence. Pool-budget and idle-transaction checks after
+readiness remain independent.
 
 ## Running Tests
 

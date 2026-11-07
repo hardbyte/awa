@@ -10,7 +10,7 @@ use sqlx::{PgPool, Postgres};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
@@ -362,6 +362,29 @@ enum TerminalDeltaSlotRollup {
     Blocked,
 }
 
+/// A `(queue, priority)` enqueue lane as promotion addresses it. Promotion
+/// picks the shard when it re-enqueues a row, so the shard is not part of it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PromotionLane {
+    pub queue: String,
+    pub priority: i16,
+}
+
+/// Outcome of [`QueueStorage::promote_due_lanes`] and
+/// [`QueueStorage::promote_due_lane`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromoteOutcome {
+    /// Rows moved into the ready ring.
+    pub promoted: usize,
+    /// Due rows the batch selected, including those left deferred on a
+    /// contended lane. A batch that selected its full size may have left
+    /// further due rows behind.
+    pub selected: usize,
+    /// Lanes whose promotion transaction hit `lock_timeout` and rolled back.
+    /// Their rows stay deferred.
+    pub contended: Vec<PromotionLane>,
+}
+
 /// Discriminator for [`PruneOutcome::SkippedActive`].
 ///
 /// Multiple gates can fire `SkippedActive` for the same ring (e.g. queue
@@ -420,7 +443,7 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
-async fn set_prune_lock_timeout_tx(
+async fn set_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     timeout: Duration,
 ) -> Result<(), AwaError> {
@@ -432,6 +455,35 @@ async fn set_prune_lock_timeout_tx(
         .await
         .map_err(map_sqlx_error)?;
     Ok(())
+}
+
+/// Commit or roll back a maintenance transaction that has set the prune
+/// `lock_timeout`.
+///
+/// The timeout applies to every later statement in the transaction, not only
+/// the explicit `LOCK TABLE`: an insert, update or read of another relation can
+/// also queue behind a conflicting lock (autovacuum's heap truncation takes
+/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere therefore rolls the
+/// whole transaction back and reports `blocked`, so the caller backs off and
+/// retries instead of surfacing an error.
+async fn settle_prune_tx<T>(
+    tx: sqlx::Transaction<'_, Postgres>,
+    result: Result<T, AwaError>,
+    blocked: T,
+) -> Result<T, AwaError> {
+    match result {
+        Ok(outcome) => {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            Ok(outcome)
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            match err {
+                AwaError::Database(ref db_err) if is_lock_contention_error(db_err) => Ok(blocked),
+                err => Err(err),
+            }
+        }
+    }
 }
 
 fn validate_ident(ident: &str) -> Result<(), AwaError> {
@@ -487,20 +539,84 @@ fn terminal_delta_child_name(schema: &str, slot: usize) -> String {
 }
 
 fn done_ready_join(schema: &str, done_alias: &str, ready_alias: &str) -> String {
+    done_ready_join_from(
+        done_alias,
+        ready_alias,
+        &format!("{schema}.ready_entries"),
+        &format!("{schema}.ready_tombstones"),
+    )
+}
+
+// Old writers could store effective priority in a narrow terminal row. Prefer
+// the live body of that exact claimed attempt, while retaining same-lease,
+// exact-lane bodies tombstoned by an available-job cancellation. Choose one
+// body so moved source rows cannot multiply terminal mutations or counters.
+fn done_ready_join_from(
+    done_alias: &str,
+    ready_alias: &str,
+    ready_relation: &str,
+    tombstone_relation: &str,
+) -> String {
     format!(
         r#"
-            LEFT JOIN {schema}.ready_entries AS {ready_alias}
-              ON {ready_alias}.ready_slot = {done_alias}.ready_slot
-             AND {ready_alias}.ready_generation = {done_alias}.ready_generation
-             AND {ready_alias}.queue = {done_alias}.queue
-             AND {ready_alias}.priority = {done_alias}.priority
-             AND {ready_alias}.enqueue_shard = {done_alias}.enqueue_shard
-             AND {ready_alias}.lane_seq = {done_alias}.lane_seq
+            LEFT JOIN LATERAL (
+                SELECT candidate.*
+                FROM (
+                    SELECT body.*,
+                        (
+                            body.run_lease + 1 = {done_alias}.run_lease
+                            AND NOT EXISTS (
+                                SELECT 1 FROM {tombstone_relation} AS tomb
+                                WHERE tomb.ready_slot = body.ready_slot
+                                  AND tomb.ready_generation = body.ready_generation
+                                  AND tomb.queue = body.queue
+                                  AND tomb.priority = body.priority
+                                  AND tomb.enqueue_shard = body.enqueue_shard
+                                  AND tomb.lane_seq = body.lane_seq
+                                  AND tomb.job_id = body.job_id
+                            )
+                        ) AS live_attempt_body
+                    FROM {ready_relation} AS body
+                    WHERE body.ready_slot = {done_alias}.ready_slot
+                      AND body.ready_generation = {done_alias}.ready_generation
+                      AND body.queue = {done_alias}.queue
+                      AND body.enqueue_shard = {done_alias}.enqueue_shard
+                      AND body.lane_seq = {done_alias}.lane_seq
+                      AND body.job_id = {done_alias}.job_id
+                      AND (body.run_lease = {done_alias}.run_lease
+                           OR body.run_lease + 1 = {done_alias}.run_lease)
+                ) AS candidate
+                WHERE candidate.priority = {done_alias}.priority
+                   OR candidate.live_attempt_body
+                ORDER BY candidate.live_attempt_body DESC,
+                         (candidate.priority = {done_alias}.priority) DESC,
+                         candidate.priority
+                LIMIT 1
+            ) AS {ready_alias} ON TRUE
         "#
     )
 }
 
+fn done_payload_projection(done_alias: &str, ready_alias: &str) -> String {
+    // A narrow old terminal payload can lack metadata from its live moved
+    // body. Supply only metadata defaults; terminal errors/tags/progress and
+    // explicit metadata overrides remain authoritative. Keep default {} elision.
+    format!(
+        r#"CASE
+            WHEN {done_alias}.args IS NULL
+             AND {ready_alias}.live_attempt_body
+             AND COALESCE({ready_alias}.payload -> 'metadata', '{{}}'::jsonb) <> '{{}}'::jsonb
+            THEN COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb)
+                || jsonb_build_object('metadata',
+                    COALESCE({ready_alias}.payload -> 'metadata', '{{}}'::jsonb)
+                    || COALESCE({done_alias}.payload -> 'metadata', '{{}}'::jsonb))
+            ELSE COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb)
+        END"#
+    )
+}
+
 fn done_row_projection(done_alias: &str, ready_alias: &str) -> String {
+    let payload = done_payload_projection(done_alias, ready_alias);
     format!(
         r#"
                 {done_alias}.ready_slot,
@@ -522,7 +638,7 @@ fn done_row_projection(done_alias: &str, ready_alias: &str) -> String {
                 COALESCE({done_alias}.created_at, {ready_alias}.created_at, {done_alias}.finalized_at) AS created_at,
                 COALESCE({done_alias}.unique_key, {ready_alias}.unique_key) AS unique_key,
                 COALESCE({done_alias}.unique_states, {ready_alias}.unique_states) AS unique_states,
-                COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb) AS payload
+                {payload} AS payload
         "#
     )
 }
@@ -571,42 +687,76 @@ fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, Aw
     Ok(index)
 }
 
+enum ReceiptEvidence {
+    Closed,
+    Open,
+}
+
 fn receipt_closed_evidence_sql(
     schema: &str,
     closure_rel: &str,
     closure_batch_rel: &str,
     claims_alias: &str,
 ) -> String {
-    // `receipt_id` is allocated from a global sequence, so it identifies a
-    // claim without a `claim_slot` predicate. Compact closure batches retain
-    // the raw receipt array for audit/debugging, but hot membership checks use
-    // the per-child GiST index on the derived multirange.
+    receipt_evidence_sql(
+        schema,
+        closure_rel,
+        closure_batch_rel,
+        claims_alias,
+        ReceiptEvidence::Closed,
+    )
+}
+
+fn receipt_evidence_sql(
+    schema: &str,
+    closure_rel: &str,
+    closure_batch_rel: &str,
+    claims_alias: &str,
+    evidence: ReceiptEvidence,
+) -> String {
+    let (null_test, join, exists, range_fence) = match evidence {
+        ReceiptEvidence::Closed => ("NOT NULL", "OR", "EXISTS", ""),
+        ReceiptEvidence::Open => (
+            "NULL",
+            "AND",
+            "NOT EXISTS",
+            "
+                -- Keep receipt membership correlated while the other closure
+                -- exclusions can use full-identity anti joins.
+                OFFSET 0",
+        ),
+    };
+    // `receipt_id` is allocated from a global sequence and identifies a claim.
+    // Closures retain that claim's slot; match it to prune unrelated partitions.
+    // Compact closure batches retain the raw receipt array for audit/debugging,
+    // but hot membership checks use the per-child GiST index on the multirange.
     format!(
         r#"
         (
-            {claims_alias}.closed_at IS NOT NULL
-            OR EXISTS (
+            {claims_alias}.closed_at IS {null_test}
+            {join} {exists} (
                 SELECT 1 FROM {closure_rel} AS closures
                 WHERE closures.claim_slot = {claims_alias}.claim_slot
                   AND closures.job_id = {claims_alias}.job_id
                   AND closures.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1
                 FROM {closure_batch_rel} AS closure_batches
-                WHERE closure_batches.receipt_ranges @> {claims_alias}.receipt_id
+                WHERE closure_batches.claim_slot = {claims_alias}.claim_slot
+                  AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id{range_fence}
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.done_entries AS done
                 WHERE done.job_id = {claims_alias}.job_id
                   AND done.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.deferred_jobs AS deferred
                 WHERE deferred.job_id = {claims_alias}.job_id
                   AND deferred.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.dlq_entries AS dlq
                 WHERE dlq.job_id = {claims_alias}.job_id
                   AND dlq.run_lease = {claims_alias}.run_lease
@@ -618,12 +768,11 @@ fn receipt_closed_evidence_sql(
 
 /// A subquery that yields the identity `(job_id, run_lease, queue)` of every
 /// receipt claim currently open (i.e. `running`) but not yet materialised
-/// into `leases`. Since #246 receipt claims — zero-deadline and
-/// deadline-backed alike — are written as compact `lease_claim_batches` rows
-/// rather than one `lease_claims` row per job, so the "open receipt claims"
-/// set is the union of legacy row-local `lease_claims` and the unnested
-/// members of `lease_claim_batches`, each anti-joined against every durable
-/// closure/terminal/materialised-lease evidence shape.
+/// into `leases`. Zero-deadline receipts use compact `lease_claim_batches`;
+/// deadline-backed receipts retain row-local `lease_claims` for indexed
+/// deadline rescue. The open set unions those row-local claims with the
+/// unnested compact members, excluding every durable closure, terminal, and
+/// materialised-lease evidence shape.
 ///
 /// This is the canonical open-receipt-claim shape (mirrors `queue_counts`'s
 /// `live_running` derivation). Compose it wherever a running enumeration must
@@ -647,10 +796,41 @@ pub(crate) fn open_receipt_running_claims_sql(schema: &str) -> String {
 /// retained batch header is read, but only batches holding one of the jobs
 /// are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
-    let closure_rel = format!("{schema}.lease_claim_closures");
-    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-    let row_closed =
-        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    open_receipt_running_claims_sql_from(schema, job_ids, None)
+}
+
+/// The same open-claim projection, scoped to one validated physical claim slot.
+/// Ready and terminal history are deliberately not restricted to that slot.
+pub(crate) fn open_receipt_running_claims_sql_in_slot(schema: &str, slot: usize) -> String {
+    open_receipt_running_claims_sql_from(schema, None, Some(slot))
+}
+
+fn open_receipt_running_claims_sql_from(
+    schema: &str,
+    job_ids: Option<&str>,
+    slot: Option<usize>,
+) -> String {
+    let (claims_rel, batches_rel, closure_rel, closure_batch_rel) = match slot {
+        Some(slot) => (
+            claim_child_name(schema, slot),
+            claim_batch_child_name(schema, slot),
+            closure_child_name(schema, slot),
+            claim_closure_batch_child_name(schema, slot),
+        ),
+        None => (
+            format!("{schema}.lease_claims"),
+            format!("{schema}.lease_claim_batches"),
+            format!("{schema}.lease_claim_closures"),
+            format!("{schema}.lease_claim_closure_batches"),
+        ),
+    };
+    let row_open = receipt_evidence_sql(
+        schema,
+        &closure_rel,
+        &closure_batch_rel,
+        "claims",
+        ReceiptEvidence::Open,
+    );
     let (row_filter, batch_filter) = match job_ids {
         Some(ids) => (
             format!("claims.job_id = ANY({ids}) AND "),
@@ -661,8 +841,8 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
     format!(
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
-        FROM {schema}.lease_claims AS claims
-        WHERE {row_filter}NOT {row_closed}
+        FROM {claims_rel} AS claims
+        WHERE {row_filter}{row_open}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
               WHERE lease.job_id = claims.job_id
@@ -670,7 +850,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
           )
         UNION ALL
         SELECT items.job_id, items.run_lease, batches.queue
-        FROM {schema}.lease_claim_batches AS batches
+        FROM {batches_rel} AS batches
         CROSS JOIN LATERAL unnest(
             batches.job_ids,
             batches.run_leases,
@@ -697,6 +877,9 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
                   SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
+                  -- Keep the range lookup correlated: joining on claim_slot can
+                  -- multiply receipt members by retained closure batches.
+                  OFFSET 0
               )
           AND NOT EXISTS (
                   SELECT 1 FROM {schema}.leases AS lease
@@ -1937,6 +2120,15 @@ struct DoneJobRow {
     payload: serde_json::Value,
 }
 
+// Keep the stored terminal priority for decrementing its old counter key.
+// Manual retry and terminal-to-DLQ moves recover the retained physical lane.
+#[derive(Debug, sqlx::FromRow)]
+struct HydratedTerminalRow {
+    #[sqlx(flatten)]
+    terminal: DoneJobRow,
+    body_priority: i16,
+}
+
 impl DoneJobRow {
     fn into_job_row(self) -> Result<JobRow, AwaError> {
         let payload = RuntimePayload::from_json(self.payload)?;
@@ -2124,6 +2316,15 @@ struct ExistingReadyRow {
     payload: serde_json::Value,
 }
 
+/// Which of a lane's due rows one promotion transaction takes.
+#[derive(Debug, Clone, Copy)]
+enum DueLaneRows<'a> {
+    /// These rows, picked by a batch across lanes, where still due.
+    Selected(&'a [i64]),
+    /// The oldest due rows, up to this many.
+    Oldest(i64),
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DeletedLeaseRow {
     ready_slot: i32,
@@ -2148,6 +2349,7 @@ struct ReadySnapshotRow {
     kind: String,
     queue: String,
     args: serde_json::Value,
+    priority: i16,
     lane_seq: i64,
     enqueue_shard: i16,
     run_at: DateTime<Utc>,
@@ -2179,6 +2381,7 @@ struct LeaseTransitionRow {
     args: serde_json::Value,
     state: JobState,
     priority: i16,
+    ready_priority: i16,
     attempt: i16,
     run_lease: i64,
     max_attempts: i16,
@@ -2208,7 +2411,9 @@ impl LeaseTransitionRow {
             queue: self.queue,
             args: self.args,
             state,
-            priority: self.priority,
+            // Terminal rows retain their ready-lane identity for body hydration.
+            // The effective attempt priority is still used by deferred/DLQ rows.
+            priority: self.ready_priority,
             attempt: self.attempt,
             run_lease: self.run_lease,
             max_attempts: self.max_attempts,
@@ -2455,6 +2660,13 @@ pub struct QueueStorage {
     /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
     /// (head row gone after a rolled-back ensure_lane).
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
+    /// Whether `{schema}.provision_lane` (the `definer_lane_provisioning`
+    /// schema patch) was callable the last time a lane was created. Only a
+    /// positive answer is kept: lane creation is rare, and the probe rides on
+    /// the lane-lock round trip.
+    lane_provisioner_present: AtomicBool,
+    /// Set once a provisioner failure has been logged.
+    lane_provisioner_warned: AtomicBool,
     prune_lock_timeout: Duration,
 }
 
@@ -2499,19 +2711,59 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
+            lane_provisioner_present: AtomicBool::new(false),
+            lane_provisioner_warned: AtomicBool::new(false),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
     }
 
-    #[doc(hidden)]
+    /// Set the PostgreSQL `lock_timeout` applied to the exclusive-lock steps of
+    /// ring prune (queue, lease and claim rings) and terminal-delta rollup.
+    ///
+    /// Each lock acquisition gets its own timeout; this does not bound the
+    /// whole prune. Queue prune locks up to eight partitions, so its
+    /// partition-lock
+    /// waits alone can approach eight times this value. A lock timeout rolls
+    /// back
+    /// the prune and reports [`PruneOutcome::Blocked`]; the maintenance loop
+    /// retries on a later tick. The default is 10 ms, which keeps prune from
+    /// queueing behind readers and so from stalling claims and enqueues behind
+    /// its pending
+    /// `ACCESS EXCLUSIVE` request. Raise it when prune is persistently
+    /// `Blocked` by short-lived readers of the ring partitions. Keep it well
+    /// below `deadlock_timeout` (default 1 s) and any `statement_timeout`: a
+    /// prune that waits as long as `deadlock_timeout` triggers deadlock
+    /// detection, which may cancel a concurrent claim instead of the prune.
+    /// The
+    /// timeout is applied at millisecond granularity.
+    ///
+    /// Returns a validation error for a zero timeout or one above PostgreSQL's
+    /// `lock_timeout` maximum (`i32::MAX` milliseconds, about 24.8 days).
     pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
+        self.set_prune_lock_timeout(timeout)?;
+        Ok(self)
+    }
+
+    /// In-place form of [`Self::with_prune_lock_timeout`].
+    pub fn set_prune_lock_timeout(&mut self, timeout: Duration) -> Result<(), AwaError> {
         if timeout.is_zero() {
             return Err(AwaError::Validation(
                 "queue storage prune lock timeout must be greater than zero".into(),
             ));
         }
+        if timeout.as_millis() > i32::MAX as u128 {
+            return Err(AwaError::Validation(format!(
+                "queue storage prune lock timeout must not exceed {} ms",
+                i32::MAX
+            )));
+        }
         self.prune_lock_timeout = timeout;
-        Ok(self)
+        Ok(())
+    }
+
+    /// The `lock_timeout` applied to prune's exclusive-lock steps.
+    pub fn prune_lock_timeout(&self) -> Duration {
+        self.prune_lock_timeout
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
@@ -3458,9 +3710,10 @@ impl QueueStorage {
             .await
     }
 
-    /// Provision every priority and shard of a queue before deploying a runtime
-    /// role without schema CREATE. Run as the schema owner/migrator. This does
-    /// not change enqueue routing or the configured shard count.
+    /// Provision every priority and shard of a queue ahead of its first
+    /// enqueue. Once the `definer_lane_provisioning` schema patch is applied,
+    /// any runtime role may run it: the lanes are created as the schema owner.
+    /// This does not change enqueue routing or the configured shard count.
     pub async fn prepare_queue(
         &self,
         pool: &PgPool,
@@ -3499,11 +3752,35 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         let schema = self.schema();
         let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(lane_lock_key)
-            .execute(tx.as_mut())
+        let provisioner_callable = if self.lane_provisioner_present.load(Ordering::Relaxed) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&lane_lock_key)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            true
+        } else {
+            sqlx::query_scalar(
+                r#"
+                SELECT COALESCE(has_function_privilege(to_regprocedure($2), 'EXECUTE'), false)
+                FROM (SELECT pg_advisory_xact_lock(hashtextextended($1, 0))) AS lane_lock
+                "#,
+            )
+            .bind(&lane_lock_key)
+            .bind(format!("{schema}.provision_lane(text,smallint,smallint)"))
+            .fetch_one(tx.as_mut())
             .await
-            .map_err(map_sqlx_error)?;
+            .map_err(map_sqlx_error)?
+        };
+
+        if provisioner_callable
+            && self
+                .provision_lane(tx, queue, priority, enqueue_shard)
+                .await?
+        {
+            self.mark_lane_ensured(queue, priority, enqueue_shard);
+            return Ok(());
+        }
 
         sqlx::query(&format!(
             r#"
@@ -3572,6 +3849,61 @@ impl QueueStorage {
 
         self.mark_lane_ensured(queue, priority, enqueue_shard);
         Ok(())
+    }
+
+    /// Create the lane through `{schema}.provision_lane`, which runs as the
+    /// schema owner, inside a savepoint. Returns false, with the transaction
+    /// as it was, when the function has gone (`42883`) or the schema owner
+    /// may not write the lane (`42501`); the caller then writes the rows
+    /// itself, which is what a binary that predates the function does.
+    async fn provision_lane<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+    ) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        sqlx::query("SAVEPOINT awa_provision_lane")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let provisioned = sqlx::query(&format!("SELECT {schema}.provision_lane($1, $2, $3)"))
+            .bind(queue)
+            .bind(priority)
+            .bind(enqueue_shard)
+            .execute(tx.as_mut())
+            .await;
+        match provisioned {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT awa_provision_lane")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                self.lane_provisioner_present.store(true, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(sqlx::Error::Database(db_err))
+                if matches!(db_err.code().as_deref(), Some("42883" | "42501")) =>
+            {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_provision_lane")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                self.lane_provisioner_present
+                    .store(false, Ordering::Relaxed);
+                if !self.lane_provisioner_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        schema,
+                        code = db_err.code().as_deref().unwrap_or_default(),
+                        error = %db_err.message(),
+                        "Lane provisioning function failed; creating lane rows as the connected role"
+                    );
+                }
+                Ok(false)
+            }
+            Err(err) => Err(map_sqlx_error(err)),
+        }
     }
 
     /// Pick the enqueue shard for a row on `queue`.
@@ -7545,7 +7877,7 @@ impl QueueStorage {
 
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let terminal: Option<DoneJobRow> = sqlx::query_as(&format!(
+        let terminal: Option<HydratedTerminalRow> = sqlx::query_as(&format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -7560,7 +7892,7 @@ impl QueueStorage {
             )
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -7570,7 +7902,9 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if let Some(terminal) = terminal {
+        if let Some(hydrated) = terminal {
+            let body_priority = hydrated.body_priority;
+            let terminal = hydrated.terminal;
             self.ensure_terminal_removed_receipt_closures_tx(tx, std::slice::from_ref(&terminal))
                 .await?;
             // The DELETE FROM done_entries above removes one terminal row;
@@ -7585,7 +7919,7 @@ impl QueueStorage {
                 kind: terminal.kind,
                 queue: terminal.queue.clone(),
                 args: terminal.args,
-                priority: terminal.priority,
+                priority: body_priority,
                 attempt: 0,
                 run_lease: terminal.run_lease,
                 max_attempts: terminal.max_attempts,
@@ -10284,10 +10618,21 @@ impl QueueStorage {
         let job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
 
+        // Resolve moved ready bodies without opening the whole tombstone ring.
+        // Empty input returned above; every remaining slot is validated here.
+        let tombstone_sources = ready_slots
+            .iter()
+            .map(|&slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .map(|slot| format!("SELECT * FROM {}", ready_tombstone_child_name(schema, slot)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+
         let ready_rows: Vec<ReadySnapshotRow> = sqlx::query_as(&format!(
             r#"
-            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id) AS (
-                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[])
+            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id, run_lease) AS (
+                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[], $7::bigint[])
             )
             SELECT
                 ready.ready_slot,
@@ -10296,6 +10641,7 @@ impl QueueStorage {
                 ready.kind,
                 ready.queue,
                 ready.args,
+                ready.priority,
                 ready.lane_seq,
                 ready.enqueue_shard,
                 ready.run_at,
@@ -10311,6 +10657,17 @@ impl QueueStorage {
              AND ready.enqueue_shard = refs.enqueue_shard
              AND ready.lane_seq = refs.lane_seq
              AND ready.job_id = refs.job_id
+             AND ready.run_lease + 1 = refs.run_lease
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ({tombstone_sources}) AS tomb
+                WHERE tomb.ready_slot = ready.ready_slot
+                  AND tomb.ready_generation = ready.ready_generation
+                  AND tomb.queue = ready.queue
+                  AND tomb.priority = ready.priority
+                  AND tomb.enqueue_shard = ready.enqueue_shard
+                  AND tomb.lane_seq = ready.lane_seq
+                  AND tomb.job_id = ready.job_id
+            )
             "#
         ))
         .bind(&ready_slots)
@@ -10319,6 +10676,7 @@ impl QueueStorage {
         .bind(&enqueue_shards)
         .bind(&lane_seqs)
         .bind(&job_ids)
+        .bind(&run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10517,6 +10875,7 @@ impl QueueStorage {
                 args: ready.args.clone(),
                 state: deleted_row.state,
                 priority: deleted_row.priority,
+                ready_priority: ready.priority,
                 attempt: deleted_row.attempt,
                 run_lease: deleted_row.run_lease,
                 max_attempts: deleted_row.max_attempts,
@@ -11670,7 +12029,68 @@ impl QueueStorage {
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let mut candidates = Vec::new();
+        // A job moves between these relations as it is promoted, claimed,
+        // completed or dead-lettered. Read them all from one snapshot so a
+        // move between two reads cannot hide the job or surface a stale row.
+        // Keep the located ready-body partitions locked until commit; later
+        // read savepoints release unrelated relation locks after each leg.
+        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        begin_guard.begin_pending = false;
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let ready_slots: Vec<i32> = sqlx::query_scalar(&format!(
+            "SELECT DISTINCT ready_slot FROM {schema}.ready_entries WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        let ready_slots = ready_slots
+            .into_iter()
+            .map(|slot| ring_slot_index(slot, self.queue_slot_count(), "queue"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let child_sources = |tombstones: bool| {
+            if ready_slots.is_empty() {
+                let table = if tombstones {
+                    "ready_tombstones"
+                } else {
+                    "ready_entries"
+                };
+                format!("SELECT * FROM ONLY {schema}.{table} WHERE FALSE")
+            } else {
+                ready_slots
+                    .iter()
+                    .map(|&slot| {
+                        let child = if tombstones {
+                            ready_tombstone_child_name(schema, slot)
+                        } else {
+                            ready_child_name(schema, slot)
+                        };
+                        format!("SELECT * FROM {child}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL ")
+            }
+        };
+        let ready_sources = child_sources(false);
+        let tombstone_sources = child_sources(true);
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11688,19 +12108,32 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries
-            WHERE job_id = $1
+            FROM ({ready_sources}) AS ready
+            WHERE ready.job_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM ({tombstone_sources}) AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+              )
             ORDER BY run_lease DESC, attempted_at DESC NULLS LAST, run_at DESC
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in ready_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let deferred_rows: Vec<DeferredJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11725,13 +12158,23 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in deferred_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let lease_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11765,13 +12208,25 @@ impl QueueStorage {
                 attempt.progress,
                 attempt.callback_result
             FROM {schema}.leases AS lease
-            JOIN {schema}.ready_entries AS ready
+            JOIN ({ready_sources}) AS ready
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
-             AND ready.priority = lease.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = lease.job_id
+             AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM ({tombstone_sources}) AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -11780,7 +12235,13 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_rows {
@@ -11789,6 +12250,10 @@ impl QueueStorage {
 
         // Report receipt-backed attempts as running by anti-joining
         // lease_claims against every durable closure evidence shape.
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let lease_claim_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11822,13 +12287,25 @@ impl QueueStorage {
                 attempt.progress,
                 attempt.callback_result
             FROM {schema}.lease_claims AS claims
-            JOIN {schema}.ready_entries AS ready
+            JOIN ({ready_sources}) AS ready
               ON ready.ready_slot = claims.ready_slot
              AND ready.ready_generation = claims.ready_generation
              AND ready.queue = claims.queue
-             AND ready.priority = claims.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = claims.job_id
+             AND ready.run_lease + 1 = claims.run_lease
              AND ready.enqueue_shard = claims.enqueue_shard
              AND ready.lane_seq = claims.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM ({tombstone_sources}) AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
@@ -11846,7 +12323,13 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_rows {
@@ -11857,6 +12340,10 @@ impl QueueStorage {
         // them only for this admin read, and report still-open items as
         // running until durable closure, terminal, or materialized-lease
         // evidence supersedes the claim.
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let lease_claim_batch_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11898,13 +12385,23 @@ impl QueueStorage {
                 claim_batches.attempts,
                 claim_batches.max_attempts
             ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-            JOIN {schema}.ready_entries AS ready
+            JOIN ({ready_sources}) AS ready
               ON ready.ready_slot = claim_batches.ready_slot
              AND ready.ready_generation = claim_batches.ready_generation
              AND ready.queue = claim_batches.queue
              AND ready.enqueue_shard = claim_batches.enqueue_shard
              AND ready.lane_seq = items.lane_seq
              AND ready.job_id = items.job_id
+             AND ready.run_lease + 1 = items.run_lease
+             AND NOT EXISTS (
+                 SELECT 1 FROM ({tombstone_sources}) AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
@@ -11947,13 +12444,23 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_batch_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let done_rows: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -11983,13 +12490,23 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in done_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        sqlx::query("SAVEPOINT awa_read_leg")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         let dlq_rows: Vec<DlqJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -12018,13 +12535,21 @@ impl QueueStorage {
             "#,
         ))
         .bind(job_id)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        sqlx::Executor::execute(
+            tx.as_mut(),
+            "ROLLBACK TO SAVEPOINT awa_read_leg; RELEASE SAVEPOINT awa_read_leg",
+        )
         .await
         .map_err(map_sqlx_error)?;
         for row in dlq_rows {
             candidates.push(row.into_job_row()?);
         }
 
+        tx.commit().await.map_err(map_sqlx_error)?;
+        drop(begin_guard);
         Ok(candidates.into_iter().max_by_key(|job| {
             (
                 job.run_lease,
@@ -12350,9 +12875,21 @@ impl QueueStorage {
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
-             AND ready.priority = lease.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = lease.job_id
+             AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -12546,9 +13083,21 @@ impl QueueStorage {
               ON ready.ready_slot = lease.ready_slot
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
-             AND ready.priority = lease.priority
+             -- Claims and leases record the aged effective priority while the
+             -- ready row keeps its lane priority, so match the attempt instead.
+             AND ready.job_id = lease.job_id
+             AND ready.run_lease + 1 = lease.run_lease
              AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
+             AND NOT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                 WHERE tomb.ready_slot = ready.ready_slot
+                   AND tomb.ready_generation = ready.ready_generation
+                   AND tomb.queue = ready.queue
+                   AND tomb.priority = ready.priority
+                   AND tomb.enqueue_shard = ready.enqueue_shard
+                   AND tomb.lane_seq = ready.lane_seq
+             )
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
@@ -13690,7 +14239,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let moved: Option<DoneJobRow> = sqlx::query_as(&format!(
+        let moved: Option<HydratedTerminalRow> = sqlx::query_as(&format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -13705,7 +14254,7 @@ impl QueueStorage {
                 )
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -13715,10 +14264,11 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        let Some(hydrated) = moved else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
+        let mut moved = hydrated.terminal;
 
         self.ensure_terminal_removed_receipt_closures_tx(&mut tx, std::slice::from_ref(&moved))
             .await?;
@@ -13729,6 +14279,7 @@ impl QueueStorage {
             &Self::done_rows_to_counter_keys(std::slice::from_ref(&moved)),
         )
         .await?;
+        moved.priority = hydrated.body_priority;
         let dlq_row = moved
             .clone()
             .into_dlq_row(dlq_reason.to_string(), Utc::now());
@@ -13754,7 +14305,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
-        let moved: Vec<DoneJobRow> = sqlx::query_as(&format!(
+        let moved: Vec<HydratedTerminalRow> = sqlx::query_as(&format!(
             r#"
             WITH deleted AS (
                 DELETE FROM {schema}.done_entries
@@ -13763,7 +14314,7 @@ impl QueueStorage {
                   AND ($2::text IS NULL OR queue = $2)
                 RETURNING *
             )
-            SELECT {done_projection}
+            SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
             FROM deleted AS done
             {ready_join}
             "#
@@ -13779,6 +14330,10 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let (moved, body_priorities): (Vec<_>, Vec<_>) = moved
+            .into_iter()
+            .map(|row| (row.terminal, row.body_priority))
+            .unzip();
         self.ensure_terminal_removed_receipt_closures_tx(&mut tx, &moved)
             .await?;
         // Bulk DLQ move deletes from done_entries. Append negative deltas by
@@ -13788,7 +14343,11 @@ impl QueueStorage {
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
             .into_iter()
-            .map(|row| row.into_dlq_row(dlq_reason.to_string(), dlq_at))
+            .zip(body_priorities)
+            .map(|(mut row, priority)| {
+                row.priority = priority;
+                row.into_dlq_row(dlq_reason.to_string(), dlq_at)
+            })
             .collect();
         self.insert_dlq_rows_tx(&mut tx, &rows, Some(JobState::Failed))
             .await?;
@@ -14433,32 +14992,212 @@ impl QueueStorage {
         Ok(rescued)
     }
 
+    /// Promote up to `batch_size` due `state` rows into the ready ring.
+    /// Equivalent to [`Self::promote_due_lanes`] with no lock timeout and no
+    /// skipped lanes, returning the number of rows promoted.
     pub async fn promote_due(
         &self,
         pool: &PgPool,
         state: JobState,
         batch_size: i64,
     ) -> Result<usize, AwaError> {
+        Ok(self
+            .promote_due_lanes(pool, state, batch_size, None, &[])
+            .await?
+            .promoted)
+    }
+
+    /// Select up to `batch_size` due `state` rows, oldest `run_at` first,
+    /// outside the lanes in `skip`, and promote each lane's share in its own
+    /// transaction.
+    ///
+    /// The selection skips rows another transaction has locked, such as a
+    /// lane promotion still waiting for its lane, so they cannot fill every
+    /// batch of a tick. It runs as its own statement, so its row locks end
+    /// with it; `deferred_jobs` is not partitioned, so no run-time pruning
+    /// meets those locks.
+    ///
+    /// Re-enqueueing a row takes its lane's enqueue reservation lock, which
+    /// producers hold until they commit, so a lane under heavy enqueue load
+    /// can keep its promotion waiting. A transaction per lane confines that
+    /// wait to the lane's own rows. With `lane_lock_timeout`, each lane's
+    /// transaction runs under that `lock_timeout`; a lane that hits it rolls
+    /// back, keeps its rows deferred and is reported in
+    /// [`PromoteOutcome::contended`], and the remaining lanes go ahead.
+    pub async fn promote_due_lanes(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        skip: &[PromotionLane],
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(0);
+            return Ok(PromoteOutcome::default());
         }
 
         let schema = self.schema();
+        let due: Vec<(i64, String, i16)> = sqlx::query_as(&format!(
+            r#"
+            SELECT job_id, queue, priority
+            FROM {schema}.deferred_jobs AS deferred
+            WHERE state = $1
+              AND run_at <= clock_timestamp()
+              AND NOT EXISTS (
+                  SELECT 1 FROM awa.queue_meta
+                  WHERE queue = deferred.queue AND paused = TRUE
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unnest($3::text[], $4::smallint[]) AS skip (queue, priority)
+                  WHERE skip.queue = deferred.queue AND skip.priority = deferred.priority
+              )
+            ORDER BY run_at ASC, priority ASC, job_id ASC
+            LIMIT $2
+            FOR UPDATE OF deferred SKIP LOCKED
+            "#
+        ))
+        .bind(state)
+        .bind(batch_size)
+        .bind(
+            skip.iter()
+                .map(|lane| lane.queue.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(skip.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut outcome = PromoteOutcome {
+            selected: due.len(),
+            ..PromoteOutcome::default()
+        };
+        let mut lanes: BTreeMap<PromotionLane, Vec<i64>> = BTreeMap::new();
+        for (job_id, queue, priority) in due {
+            lanes
+                .entry(PromotionLane { queue, priority })
+                .or_default()
+                .push(job_id);
+        }
+        for (lane, job_ids) in lanes {
+            match self
+                .promote_lane(
+                    pool,
+                    state,
+                    &lane,
+                    DueLaneRows::Selected(&job_ids),
+                    lane_lock_timeout,
+                )
+                .await?
+            {
+                Some(promoted) => outcome.promoted += promoted,
+                None => outcome.contended.push(lane),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Promote up to `batch_size` due `state` rows of one lane, oldest
+    /// `run_at` first, in one transaction. With `lane_lock_timeout`, a
+    /// transaction that hits it rolls back and the lane is returned in
+    /// [`PromoteOutcome::contended`] with nothing selected.
+    pub async fn promote_due_lane(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+    ) -> Result<PromoteOutcome, AwaError> {
+        if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
+            return Ok(PromoteOutcome::default());
+        }
+        Ok(
+            match self
+                .promote_lane(
+                    pool,
+                    state,
+                    lane,
+                    DueLaneRows::Oldest(batch_size),
+                    lane_lock_timeout,
+                )
+                .await?
+            {
+                Some(promoted) => PromoteOutcome {
+                    promoted,
+                    selected: promoted,
+                    contended: Vec::new(),
+                },
+                None => PromoteOutcome {
+                    contended: vec![lane.clone()],
+                    ..PromoteOutcome::default()
+                },
+            },
+        )
+    }
+
+    /// One lane's promotion transaction. `None` when it hit `lock_timeout`
+    /// and rolled back.
+    async fn promote_lane(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        rows: DueLaneRows<'_>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<Option<usize>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Vec<DeferredJobRow> = sqlx::query_as(&format!(
+        match self
+            .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
+            .await
+        {
+            Ok(promoted) => match tx.commit().await {
+                Ok(()) => Ok(Some(promoted)),
+                Err(err) if is_lock_contention_error(&err) => Ok(None),
+                Err(err) => Err(map_sqlx_error(err)),
+            },
+            Err(AwaError::Database(err)) if is_lock_contention_error(&err) => {
+                tx.rollback().await.map_err(map_sqlx_error)?;
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn promote_lane_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        state: JobState,
+        lane: &PromotionLane,
+        rows: DueLaneRows<'_>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<usize, AwaError> {
+        if let Some(timeout) = lock_timeout {
+            set_lock_timeout_tx(tx, timeout).await?;
+        }
+
+        let schema = self.schema();
+        let (row_filter, limit) = match rows {
+            DueLaneRows::Selected(_) => ("AND job_id = ANY($4)", ""),
+            DueLaneRows::Oldest(_) => ("", "ORDER BY run_at ASC, job_id ASC LIMIT $4"),
+        };
+        let sql = format!(
             r#"
             DELETE FROM {schema}.deferred_jobs
             WHERE job_id IN (
                 SELECT job_id
-                FROM {schema}.deferred_jobs
+                FROM {schema}.deferred_jobs AS deferred
                 WHERE state = $1
+                  AND queue = $2
+                  AND priority = $3
+                  {row_filter}
                   AND run_at <= clock_timestamp()
                   AND NOT EXISTS (
                       SELECT 1 FROM awa.queue_meta
-                      WHERE queue = {schema}.deferred_jobs.queue AND paused = TRUE
+                      WHERE queue = deferred.queue AND paused = TRUE
                   )
-                ORDER BY run_at ASC, priority ASC, job_id ASC
-                LIMIT $2
+                {limit}
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING
@@ -14479,21 +15218,26 @@ impl QueueStorage {
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
-        ))
-        .bind(state)
-        .bind(batch_size)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
+        );
+        let query = sqlx::query_as::<_, DeferredJobRow>(&sql)
+            .bind(state)
+            .bind(&lane.queue)
+            .bind(lane.priority);
+        let query = match rows {
+            DueLaneRows::Selected(job_ids) => query.bind(job_ids),
+            DueLaneRows::Oldest(batch_size) => query.bind(batch_size),
+        };
+        let mut moved: Vec<DeferredJobRow> =
+            query.fetch_all(tx.as_mut()).await.map_err(map_sqlx_error)?;
         if moved.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(0);
         }
+        // DELETE ... RETURNING has no order; lane sequence follows due order.
+        moved.sort_unstable_by_key(|row| (row.run_at, row.job_id));
 
+        let promoted = moved.len();
         let ready_rows: Vec<ExistingReadyRow> = moved
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|row| ExistingReadyRow {
                 job_id: row.job_id,
                 kind: row.kind,
@@ -14511,15 +15255,10 @@ impl QueueStorage {
                 payload: row.payload,
             })
             .collect();
-        let queues = ready_rows
-            .iter()
-            .map(|row| row.queue.clone())
-            .collect::<Vec<_>>();
-        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(state))
+        self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(moved.len())
+        self.notify_queues_tx(tx, vec![lane.queue.clone()]).await?;
+        Ok(promoted)
     }
 
     async fn relation_has_rows_tx(
@@ -14937,7 +15676,10 @@ impl QueueStorage {
                     break;
                 }
                 TerminalDeltaSlotRollup::Blocked => {
+                    // The next slot would most likely wait out the same lock
+                    // timeout, and the leader loop is blocked while it does.
                     outcome.blocked_slots += 1;
+                    break;
                 }
             }
         }
@@ -15113,152 +15855,130 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        let locked: Result<TerminalDeltaSlotRollup, AwaError> = async {
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
-        let lock_delta = sqlx::query(&format!(
-            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
-        ))
-        .execute(tx.as_mut())
-        .await;
+            sqlx::query(&format!(
+                "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
+            ))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        match lock_delta {
-            Ok(_) => {}
-            Err(err) if is_lock_contention_error(&err) => {
-                let _ = tx.rollback().await;
-                return Ok(TerminalDeltaSlotRollup::Blocked);
+            let active_leases =
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+
+            if active_leases {
+                return Ok(TerminalDeltaSlotRollup::SkippedActive);
             }
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(map_sqlx_error(err));
+
+            let unclosed_claim_refs =
+                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+
+            if unclosed_claim_refs {
+                return Ok(TerminalDeltaSlotRollup::SkippedActive);
             }
-        }
 
-        let active_leases =
-            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
-
-        if active_leases {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(TerminalDeltaSlotRollup::SkippedActive);
-        }
-
-        let unclosed_claim_refs =
-            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
-
-        if unclosed_claim_refs {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(TerminalDeltaSlotRollup::SkippedActive);
-        }
-
-        let delta_rows: i64 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT count(*)::bigint
-            FROM {delta_child}
-            WHERE ready_generation = $1
-            "#
-        ))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if delta_rows == 0 {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(TerminalDeltaSlotRollup::Empty);
-        }
-
-        let grouped_keys: i64 = sqlx::query_scalar(&format!(
-            r#"
-            WITH grouped AS MATERIALIZED (
-                SELECT
-                    ready_slot,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    counter_bucket,
-                    SUM(terminal_delta)::bigint AS delta
+            let delta_rows: i64 = sqlx::query_scalar(&format!(
+                r#"
+                SELECT count(*)::bigint
                 FROM {delta_child}
                 WHERE ready_generation = $1
-                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
-                HAVING SUM(terminal_delta) <> 0
-            ),
-            updated AS (
-                UPDATE {schema}.queue_terminal_live_counts AS counts
-                SET live_terminal_count = GREATEST(0, counts.live_terminal_count + grouped.delta)
-                FROM grouped
-                WHERE counts.ready_slot = grouped.ready_slot
-                  AND counts.queue = grouped.queue
-                  AND counts.priority = grouped.priority
-                  AND counts.enqueue_shard = grouped.enqueue_shard
-                  AND counts.counter_bucket = grouped.counter_bucket
-                RETURNING
-                    counts.ready_slot,
-                    counts.queue,
-                    counts.priority,
-                    counts.enqueue_shard,
-                    counts.counter_bucket
-            ),
-            inserted AS (
-                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                    ready_slot,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    counter_bucket,
-                    live_terminal_count
+                "#
+            ))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if delta_rows == 0 {
+                return Ok(TerminalDeltaSlotRollup::Empty);
+            }
+
+            let grouped_keys: i64 = sqlx::query_scalar(&format!(
+                r#"
+                WITH grouped AS MATERIALIZED (
+                    SELECT
+                        ready_slot,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        counter_bucket,
+                        SUM(terminal_delta)::bigint AS delta
+                    FROM {delta_child}
+                    WHERE ready_generation = $1
+                    GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                    HAVING SUM(terminal_delta) <> 0
+                ),
+                updated AS (
+                    UPDATE {schema}.queue_terminal_live_counts AS counts
+                    SET live_terminal_count = GREATEST(0, counts.live_terminal_count + grouped.delta)
+                    FROM grouped
+                    WHERE counts.ready_slot = grouped.ready_slot
+                      AND counts.queue = grouped.queue
+                      AND counts.priority = grouped.priority
+                      AND counts.enqueue_shard = grouped.enqueue_shard
+                      AND counts.counter_bucket = grouped.counter_bucket
+                    RETURNING
+                        counts.ready_slot,
+                        counts.queue,
+                        counts.priority,
+                        counts.enqueue_shard,
+                        counts.counter_bucket
+                ),
+                inserted AS (
+                    INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                        ready_slot,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        counter_bucket,
+                        live_terminal_count
+                    )
+                    SELECT
+                        grouped.ready_slot,
+                        grouped.queue,
+                        grouped.priority,
+                        grouped.enqueue_shard,
+                        grouped.counter_bucket,
+                        grouped.delta
+                    FROM grouped
+                    WHERE grouped.delta > 0
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM updated
+                          WHERE updated.ready_slot = grouped.ready_slot
+                            AND updated.queue = grouped.queue
+                            AND updated.priority = grouped.priority
+                            AND updated.enqueue_shard = grouped.enqueue_shard
+                            AND updated.counter_bucket = grouped.counter_bucket
+                      )
+                    ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                    ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
+                    SET live_terminal_count =
+                        GREATEST(0, counts.live_terminal_count + EXCLUDED.live_terminal_count)
+                    RETURNING 1
                 )
-                SELECT
-                    grouped.ready_slot,
-                    grouped.queue,
-                    grouped.priority,
-                    grouped.enqueue_shard,
-                    grouped.counter_bucket,
-                    grouped.delta
-                FROM grouped
-                WHERE grouped.delta > 0
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM updated
-                      WHERE updated.ready_slot = grouped.ready_slot
-                        AND updated.queue = grouped.queue
-                        AND updated.priority = grouped.priority
-                        AND updated.enqueue_shard = grouped.enqueue_shard
-                        AND updated.counter_bucket = grouped.counter_bucket
-                  )
-                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
-                ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
-                SET live_terminal_count =
-                    GREATEST(0, counts.live_terminal_count + EXCLUDED.live_terminal_count)
-                RETURNING 1
-            )
-            SELECT count(*)::bigint FROM grouped
-            "#
-        ))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                SELECT count(*)::bigint FROM grouped
+                "#
+            ))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        let truncate_delta = sqlx::query(&format!("TRUNCATE TABLE {delta_child}"))
-            .execute(tx.as_mut())
-            .await;
-
-        match truncate_delta {
-            Ok(_) => {
-                tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(TerminalDeltaSlotRollup::Rolled {
-                    delta_rows,
-                    grouped_keys,
-                })
-            }
-            Err(err) if is_lock_contention_error(&err) => {
-                let _ = tx.rollback().await;
-                Ok(TerminalDeltaSlotRollup::Blocked)
-            }
-            Err(err) => {
-                let _ = tx.rollback().await;
-                Err(map_sqlx_error(err))
-            }
+            sqlx::query(&format!("TRUNCATE TABLE {delta_child}"))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            Ok(TerminalDeltaSlotRollup::Rolled {
+                delta_rows,
+                grouped_keys,
+            })
         }
+        .await;
+
+        settle_prune_tx(tx, locked, TerminalDeltaSlotRollup::Blocked).await
     }
 
     /// Prune the oldest sealed queue ring slot.
@@ -15411,153 +16131,115 @@ impl QueueStorage {
             });
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        let locked: Result<PruneOutcome, AwaError> = async {
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
-        let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
-        ))
-        .execute(tx.as_mut())
-        .await;
-
-        if let Err(err) = lock_tables {
-            let _ = tx.rollback().await;
-            if is_lock_contention_error(&err) {
-                return Ok(PruneOutcome::Blocked { slot });
-            }
-            return Err(map_sqlx_error(err));
-        }
-
-        // The pre-lock gates are only an MVCC snapshot. If an in-flight
-        // producer or claimer committed while the exclusive partition
-        // lock waited, these post-lock gates see it before TRUNCATE.
-        let active_leases =
-            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
-        if active_leases {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueueActiveLeases,
-                count: busy_indicator(active_leases),
-            });
-        }
-
-        let pending =
-            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
-        if pending {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueuePendingReady,
-                count: busy_indicator(pending),
-            });
-        }
-
-        let unclosed_claim_refs =
-            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
-        if unclosed_claim_refs {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueueUnclosedClaimRefs,
-                count: busy_indicator(unclosed_claim_refs),
-            });
-        }
-
-        let failed_retention_secs = i64::try_from(failed_retention.as_secs()).unwrap_or(i64::MAX);
-        let retention_floor = failed_retention_secs > 0;
-
-        // #337: failed terminal rows still inside the retention floor
-        // are re-homed into the live done segment before the TRUNCATE
-        // so they stay retryable. The queue_ring_state row is held FOR
-        // UPDATE above, which serializes against rotate — the current
-        // slot cannot move while carried rows are re-inserted into it.
-        let carried_failed_rows = if retention_floor {
-            let (current_generation,): (i64,) = sqlx::query_as(&format!(
-                "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = $1"
+            sqlx::query(&format!(
+                "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
             ))
-            .bind(state.0)
-            .fetch_one(tx.as_mut())
+            .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
-            // Carried rows are widened to the self-contained synthetic
-            // done-row shape (the COALESCE chain mirrors
-            // `done_row_projection`) because the ready rows they would
-            // otherwise hydrate from are truncated with this slot.
-            // Deliberately no ON CONFLICT: lane_seq comes from
-            // never-resetting sequences, so a PK collision means
-            // corrupted terminal state and must abort the prune loudly
-            // rather than silently drop a terminal fact.
-            let carried = sqlx::query(&format!(
-                r#"
-                INSERT INTO {schema}.done_entries (
-                    ready_slot, ready_generation, job_id, kind, queue,
-                    args, state, priority, attempt, run_lease,
-                    max_attempts, lane_seq, enqueue_shard, run_at,
-                    attempted_at, finalized_at, created_at, unique_key,
-                    unique_states, payload
-                )
-                SELECT
-                    $2,
-                    $3,
-                    done.job_id,
-                    done.kind,
-                    done.queue,
-                    COALESCE(done.args, ready.args, '{{}}'::jsonb),
-                    done.state,
-                    done.priority,
-                    done.attempt,
-                    done.run_lease,
-                    COALESCE(done.max_attempts, ready.max_attempts, 25::smallint),
-                    done.lane_seq,
-                    done.enqueue_shard,
-                    COALESCE(done.run_at, ready.run_at, done.finalized_at),
-                    COALESCE(done.attempted_at, ready.attempted_at),
-                    done.finalized_at,
-                    COALESCE(done.created_at, ready.created_at, done.finalized_at),
-                    COALESCE(done.unique_key, ready.unique_key),
-                    COALESCE(done.unique_states, ready.unique_states),
-                    COALESCE(done.payload, ready.payload, '{{}}'::jsonb)
-                FROM {done_child} AS done
-                LEFT JOIN {ready_child} AS ready
-                  ON ready.ready_slot = done.ready_slot
-                 AND ready.ready_generation = done.ready_generation
-                 AND ready.queue = done.queue
-                 AND ready.priority = done.priority
-                 AND ready.enqueue_shard = done.enqueue_shard
-                 AND ready.lane_seq = done.lane_seq
-                WHERE done.state = 'failed'
-                  AND done.finalized_at >= now() - make_interval(secs => $1::bigint)
-                "#
-            ))
-            .bind(failed_retention_secs)
-            .bind(state.0)
-            .bind(current_generation)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?
-            .rows_affected();
+            // The pre-lock gates are only an MVCC snapshot. If an in-flight
+            // producer or claimer committed while the exclusive partition
+            // lock waited, these post-lock gates see it before TRUNCATE.
+            let active_leases =
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+            if active_leases {
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: SkipReason::QueueActiveLeases,
+                    count: busy_indicator(active_leases),
+                });
+            }
 
-            if carried > 0 {
-                // This slot's live counter rows and delta segment are
-                // wiped below, so the carried rows' exact-count
-                // evidence moves with them: re-append positive deltas
-                // under the current slot, grouped exactly like the
-                // completion path's delta append.
-                sqlx::query(&format!(
+            let pending =
+                queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
+            if pending {
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: SkipReason::QueuePendingReady,
+                    count: busy_indicator(pending),
+                });
+            }
+
+            let unclosed_claim_refs =
+                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+            if unclosed_claim_refs {
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: SkipReason::QueueUnclosedClaimRefs,
+                    count: busy_indicator(unclosed_claim_refs),
+                });
+            }
+
+            let failed_retention_secs = i64::try_from(failed_retention.as_secs()).unwrap_or(i64::MAX);
+            let retention_floor = failed_retention_secs > 0;
+
+            // #337: failed terminal rows still inside the retention floor
+            // are re-homed into the live done segment before the TRUNCATE
+            // so they stay retryable. The queue_ring_state row is held FOR
+            // UPDATE above, which serializes against rotate — the current
+            // slot cannot move while carried rows are re-inserted into it.
+            let carried_failed_rows = if retention_floor {
+                let (current_generation,): (i64,) = sqlx::query_as(&format!(
+                    "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = $1"
+                ))
+                .bind(state.0)
+                .fetch_one(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                // Carried rows are widened to the self-contained synthetic
+                // done-row shape (the COALESCE chain mirrors
+                // `done_row_projection`) because the ready rows they would
+                // otherwise hydrate from are truncated with this slot.
+                // Deliberately no ON CONFLICT: lane_seq comes from
+                // never-resetting sequences, so a PK collision means
+                // corrupted terminal state and must abort the prune loudly
+                // rather than silently drop a terminal fact.
+                let carry_ready_join =
+                    done_ready_join_from("done", "ready", &ready_child, &tomb_child);
+                let carry_payload = done_payload_projection("done", "ready");
+                let groups: Vec<(String, i16, i16, i16, i64)> = sqlx::query_as(&format!(
                     r#"
-                    INSERT INTO {schema}.queue_terminal_count_deltas (
-                        ready_slot,
-                        ready_generation,
-                        queue,
-                        priority,
-                        enqueue_shard,
-                        counter_bucket,
-                        terminal_delta
+                    WITH carried AS (
+                    INSERT INTO {schema}.done_entries (
+                        ready_slot, ready_generation, job_id, kind, queue,
+                        args, state, priority, attempt, run_lease,
+                        max_attempts, lane_seq, enqueue_shard, run_at,
+                        attempted_at, finalized_at, created_at, unique_key,
+                        unique_states, payload
                     )
                     SELECT
                         $2,
                         $3,
+                        done.job_id,
+                        done.kind,
+                        done.queue,
+                        COALESCE(done.args, ready.args, '{{}}'::jsonb),
+                        done.state,
+                        COALESCE(ready.priority, done.priority),
+                        done.attempt,
+                        done.run_lease,
+                        COALESCE(done.max_attempts, ready.max_attempts, 25::smallint),
+                        done.lane_seq,
+                        done.enqueue_shard,
+                        COALESCE(done.run_at, ready.run_at, done.finalized_at),
+                        COALESCE(done.attempted_at, ready.attempted_at),
+                        done.finalized_at,
+                        COALESCE(done.created_at, ready.created_at, done.finalized_at),
+                        COALESCE(done.unique_key, ready.unique_key),
+                        COALESCE(done.unique_states, ready.unique_states),
+                        {carry_payload}
+                    FROM {done_child} AS done
+                    {carry_ready_join}
+                    WHERE done.state = 'failed'
+                      AND done.finalized_at >= now() - make_interval(secs => $1::bigint)
+                    RETURNING queue, priority, enqueue_shard, job_id
+                    )
+                    SELECT
                         queue,
                         priority,
                         enqueue_shard,
@@ -15567,9 +16249,7 @@ impl QueueStorage {
                             {TERMINAL_COUNTER_BUCKETS}::bigint
                         )::smallint AS counter_bucket,
                         count(*)::bigint
-                    FROM {done_child}
-                    WHERE state = 'failed'
-                      AND finalized_at >= now() - make_interval(secs => $1::bigint)
+                    FROM carried
                     GROUP BY queue, priority, enqueue_shard, counter_bucket
                     ORDER BY queue, priority, enqueue_shard, counter_bucket
                     "#
@@ -15577,157 +16257,166 @@ impl QueueStorage {
                 .bind(failed_retention_secs)
                 .bind(state.0)
                 .bind(current_generation)
-                .execute(tx.as_mut())
+                .fetch_all(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-            }
-            carried
-        } else {
-            0
-        };
 
-        // #290: scan the about-to-be-truncated partition for the rollup
-        // fold. The rollup column is *permanent* state, so we MUST fold
-        // from ground truth (the `{done_child}` partition itself), not
-        // from `queue_terminal_live_counts` — the counter can drift
-        // briefly during a rolling upgrade from a pre-counter binary
-        // and folding drift into the rollup would bake it in forever.
-        // The counter rows for this slot are still cleaned up after the
-        // truncate; reads from the counter (queue_counts_exact in #305)
-        // may transiently disagree with the rollup until the operator
-        // runs `awa storage rebuild-terminal-counters`, but the rollup
-        // itself stays authoritative. See PR #304 reviewer finding
-        // "High: A1 can persist stale counter state before the
-        // read-switch PR" for the trade-off.
-        //
-        // Carried failed rows are excluded from both columns: they are
-        // still live in `done_entries`, so folding them into the
-        // permanent rollup would double-count them.
-        let pruned_terminal_counts: Vec<(String, i16, i64, i64)> = sqlx::query_as(&format!(
-            r#"
-            WITH done_counts AS (
-                SELECT
-                    queue,
-                    priority,
-                    (count(*) FILTER (WHERE state <> 'failed'))::bigint AS completed,
-                    (count(*) FILTER (
-                        WHERE state = 'failed'
-                          AND (
-                              $2::boolean IS FALSE
-                              OR finalized_at < now() - make_interval(secs => $1::bigint)
-                          )
-                    ))::bigint AS failed
-                FROM {done_child}
-                GROUP BY queue, priority
-            ),
-            -- Scan the entire partition being truncated (all generations),
-            -- mirroring done_counts' whole-child scan above. The rotate guard
-            -- keeps a partition to one generation at prune time, so this is the
-            -- same set today; counting the whole child keeps the rollup fold
-            -- conservative even if that invariant is ever weakened (a stray
-            -- generation's batches would otherwise be truncated without being
-            -- folded into the rollup -> terminal-count undercount).
-            batch_rows AS (
-                SELECT
-                    batch.ready_generation,
-                    batch.queue,
-                    batch.priority,
-                    item.job_id,
-                    item.run_lease
-                FROM {receipt_batch_child} AS batch
-                CROSS JOIN LATERAL unnest(
-                    batch.job_ids,
-                    batch.run_leases
-                ) AS item(job_id, run_lease)
-            ),
-            batch_counts AS (
-                SELECT
-                    batch_rows.queue,
-                    batch_rows.priority,
-                    count(*)::bigint AS completed
-                FROM batch_rows
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM {receipt_tomb_child} AS tomb
-                    WHERE tomb.ready_generation = batch_rows.ready_generation
-                      AND tomb.job_id = batch_rows.job_id
-                      AND tomb.run_lease = batch_rows.run_lease
+                // The replacement delta uses each inserted row's recovered
+                // priority. The old slot's counter evidence is truncated below.
+                let carried: u64 = groups.iter().map(|(_, _, _, _, count)| *count as u64).sum();
+                let deltas = groups
+                    .into_iter()
+                    .map(|(queue, priority, shard, bucket, count)| {
+                        ((state.0, current_generation, queue, priority, shard, bucket), count)
+                    })
+                    .collect();
+                self.append_terminal_count_deltas_tx(&mut tx, deltas).await?;
+                carried
+            } else {
+                0
+            };
+
+            // #290: scan the about-to-be-truncated partition for the rollup
+            // fold. The rollup column is *permanent* state, so we MUST fold
+            // from ground truth (the `{done_child}` partition itself), not
+            // from `queue_terminal_live_counts` — the counter can drift
+            // briefly during a rolling upgrade from a pre-counter binary
+            // and folding drift into the rollup would bake it in forever.
+            // The counter rows for this slot are still cleaned up after the
+            // truncate; reads from the counter (queue_counts_exact in #305)
+            // may transiently disagree with the rollup until the operator
+            // runs `awa storage rebuild-terminal-counters`, but the rollup
+            // itself stays authoritative. See PR #304 reviewer finding
+            // "High: A1 can persist stale counter state before the
+            // read-switch PR" for the trade-off.
+            //
+            // Carried failed rows are excluded from both columns: they are
+            // still live in `done_entries`, so folding them into the
+            // permanent rollup would double-count them.
+            let pruned_terminal_counts: Vec<(String, i16, i64, i64)> = sqlx::query_as(&format!(
+                r#"
+                WITH done_counts AS (
+                    SELECT
+                        queue,
+                        priority,
+                        (count(*) FILTER (WHERE state <> 'failed'))::bigint AS completed,
+                        (count(*) FILTER (
+                            WHERE state = 'failed'
+                              AND (
+                                  $2::boolean IS FALSE
+                                  OR finalized_at < now() - make_interval(secs => $1::bigint)
+                              )
+                        ))::bigint AS failed
+                    FROM {done_child}
+                    GROUP BY queue, priority
+                ),
+                -- Scan the entire partition being truncated (all generations),
+                -- mirroring done_counts' whole-child scan above. The rotate guard
+                -- keeps a partition to one generation at prune time, so this is the
+                -- same set today; counting the whole child keeps the rollup fold
+                -- conservative even if that invariant is ever weakened (a stray
+                -- generation's batches would otherwise be truncated without being
+                -- folded into the rollup -> terminal-count undercount).
+                batch_rows AS (
+                    SELECT
+                        batch.ready_generation,
+                        batch.queue,
+                        batch.priority,
+                        item.job_id,
+                        item.run_lease
+                    FROM {receipt_batch_child} AS batch
+                    CROSS JOIN LATERAL unnest(
+                        batch.job_ids,
+                        batch.run_leases
+                    ) AS item(job_id, run_lease)
+                ),
+                batch_counts AS (
+                    SELECT
+                        batch_rows.queue,
+                        batch_rows.priority,
+                        count(*)::bigint AS completed
+                    FROM batch_rows
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM {receipt_tomb_child} AS tomb
+                        WHERE tomb.ready_generation = batch_rows.ready_generation
+                          AND tomb.job_id = batch_rows.job_id
+                          AND tomb.run_lease = batch_rows.run_lease
+                    )
+                    GROUP BY batch_rows.queue, batch_rows.priority
+                ),
+                keys AS (
+                    SELECT queue, priority FROM done_counts
+                    UNION
+                    SELECT queue, priority FROM batch_counts
                 )
-                GROUP BY batch_rows.queue, batch_rows.priority
-            ),
-            keys AS (
-                SELECT queue, priority FROM done_counts
-                UNION
-                SELECT queue, priority FROM batch_counts
-            )
-            SELECT
-                keys.queue,
-                keys.priority,
-                (
-                    COALESCE(done_counts.completed, 0)
-                    + COALESCE(batch_counts.completed, 0)
-                )::bigint AS pruned_completed_count,
-                COALESCE(done_counts.failed, 0)::bigint AS pruned_failed_count
-            FROM keys
-            LEFT JOIN done_counts USING (queue, priority)
-            LEFT JOIN batch_counts USING (queue, priority)
-            "#
-        ))
-        .bind(failed_retention_secs)
-        .bind(retention_floor)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                SELECT
+                    keys.queue,
+                    keys.priority,
+                    (
+                        COALESCE(done_counts.completed, 0)
+                        + COALESCE(batch_counts.completed, 0)
+                    )::bigint AS pruned_completed_count,
+                    COALESCE(done_counts.failed, 0)::bigint AS pruned_failed_count
+                FROM keys
+                LEFT JOIN done_counts USING (queue, priority)
+                LEFT JOIN batch_counts USING (queue, priority)
+                "#
+            ))
+            .bind(failed_retention_secs)
+            .bind(retention_floor)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
-        ))
-        .execute(tx.as_mut())
+            sqlx::query(&format!(
+                "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
+            ))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if !pruned_terminal_counts.is_empty() {
+                self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
+                    .await?;
+            }
+
+            // #290: the live counter rows for this slot are about to
+            // be orphans (their underlying done_entries rows just got
+            // truncated). Delete them in the same transaction. The
+            // rollup fold above already captured ground-truth from
+            // the partition scan; this just cleans up the counter
+            // index entries so a future insert into a re-rotated
+            // slot starts from zero.
+            sqlx::query(&format!(
+                "DELETE FROM {schema}.queue_terminal_live_counts WHERE ready_slot = $1"
+            ))
+            .bind(slot)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            Ok(PruneOutcome::Pruned {
+                slot,
+                carried_failed_rows,
+            })
+        }
         .await;
 
-        match truncate {
-            Ok(_) => {
-                if !pruned_terminal_counts.is_empty() {
-                    self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
-                        .await?;
-                }
-
-                // #290: the live counter rows for this slot are about to
-                // be orphans (their underlying done_entries rows just got
-                // truncated). Delete them in the same transaction. The
-                // rollup fold above already captured ground-truth from
-                // the partition scan; this just cleans up the counter
-                // index entries so a future insert into a re-rotated
-                // slot starts from zero.
-                sqlx::query(&format!(
-                    "DELETE FROM {schema}.queue_terminal_live_counts WHERE ready_slot = $1"
-                ))
-                .bind(slot)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-                tx.commit().await.map_err(map_sqlx_error)?;
-                if carried_failed_rows > 0 {
-                    tracing::info!(
-                        slot,
-                        carried_failed_rows,
-                        "Carried failed terminal rows inside the retention floor to the live done segment"
-                    );
-                }
-                Ok(PruneOutcome::Pruned {
+        let outcome = settle_prune_tx(tx, locked, PruneOutcome::Blocked { slot }).await?;
+        if let PruneOutcome::Pruned {
+            slot,
+            carried_failed_rows,
+        } = outcome
+        {
+            if carried_failed_rows > 0 {
+                tracing::info!(
                     slot,
                     carried_failed_rows,
-                })
-            }
-            Err(err) if is_lock_contention_error(&err) => {
-                let _ = tx.rollback().await;
-                Ok(PruneOutcome::Blocked { slot })
-            }
-            Err(err) => {
-                let _ = tx.rollback().await;
-                Err(map_sqlx_error(err))
+                    "Carried failed terminal rows inside the retention floor to the live done segment"
+                );
             }
         }
+        Ok(outcome)
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_leases")]
@@ -15796,74 +16485,57 @@ impl QueueStorage {
             return Ok(PruneOutcome::Noop);
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        let locked: Result<PruneOutcome, AwaError> = async {
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
-        let lock_table = sqlx::query(&format!(
-            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
-        ))
-        .execute(tx.as_mut())
+            sqlx::query(&format!(
+                "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
+            ))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let current_slot: i32 = sqlx::query_scalar(&format!(
+                r#"
+                SELECT current_slot
+                FROM {schema}.lease_ring_state
+                WHERE singleton = TRUE
+                "#
+            ))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if current_slot == slot {
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: SkipReason::LeaseCurrent,
+                    count: 0,
+                });
+            }
+
+            let active_leases = Self::relation_has_rows_tx(&mut tx, &lease_child).await?;
+
+            if active_leases {
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: SkipReason::LeaseActive,
+                    count: busy_indicator(active_leases),
+                });
+            }
+
+            sqlx::query(&format!("TRUNCATE TABLE {lease_child}"))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            Ok(PruneOutcome::Pruned {
+                slot,
+                carried_failed_rows: 0,
+            })
+        }
         .await;
 
-        if let Err(err) = lock_table {
-            let _ = tx.rollback().await;
-            if is_lock_contention_error(&err) {
-                return Ok(PruneOutcome::Blocked { slot });
-            }
-            return Err(map_sqlx_error(err));
-        }
-
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot
-            FROM {schema}.lease_ring_state
-            WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if current_slot == slot {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::LeaseCurrent,
-                count: 0,
-            });
-        }
-
-        let active_leases = Self::relation_has_rows_tx(&mut tx, &lease_child).await?;
-
-        if active_leases {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::LeaseActive,
-                count: busy_indicator(active_leases),
-            });
-        }
-
-        let truncate = sqlx::query(&format!("TRUNCATE TABLE {lease_child}"))
-            .execute(tx.as_mut())
-            .await;
-
-        match truncate {
-            Ok(_) => {
-                tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(PruneOutcome::Pruned {
-                    slot,
-                    carried_failed_rows: 0,
-                })
-            }
-            Err(err) if is_lock_contention_error(&err) => {
-                let _ = tx.rollback().await;
-                Ok(PruneOutcome::Blocked { slot })
-            }
-            Err(err) => {
-                let _ = tx.rollback().await;
-                Err(map_sqlx_error(err))
-            }
-        }
+        settle_prune_tx(tx, locked, PruneOutcome::Blocked { slot }).await
     }
 
     pub async fn vacuum_leases(&self, pool: &PgPool) -> Result<(), AwaError> {
@@ -16101,101 +16773,84 @@ impl QueueStorage {
             });
         }
 
-        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+        let locked: Result<PruneOutcome, AwaError> = async {
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
-        let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
-        ))
-        .execute(tx.as_mut())
-        .await;
+            sqlx::query(&format!(
+                "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
+            ))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        if let Err(err) = lock_tables {
-            let _ = tx.rollback().await;
-            if is_lock_contention_error(&err) {
-                return Ok(PruneOutcome::Blocked { slot });
-            }
-            return Err(map_sqlx_error(err));
-        }
+            // After taking ACCESS EXCLUSIVE, recheck that the slot is still
+            // not the current one. The ring-state lock should already make
+            // this stable, but keeping the explicit gate documents the
+            // truncate precondition.
+            let current_slot: i32 = sqlx::query_scalar(&format!(
+                r#"
+                SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
+                "#
+            ))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        // After taking ACCESS EXCLUSIVE, recheck that the slot is still
-        // not the current one. The ring-state lock should already make
-        // this stable, but keeping the explicit gate documents the
-        // truncate precondition.
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if current_slot == slot {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::ClaimCurrent,
-                count: 0,
-            });
-        }
-
-        let open_claims = claim_prune_has_open_claims_tx(
-            &mut tx,
-            schema,
-            &claim_child,
-            &claim_batch_child,
-            &closure_child,
-            &closure_batch_child,
-        )
-        .await?;
-        if open_claims {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::ClaimOpen,
-                count: busy_indicator(open_claims),
-            });
-        }
-
-        let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
-        ))
-        .execute(tx.as_mut())
-        .await;
-
-        match truncate {
-            Ok(_) => {
-                sqlx::query(&format!(
-                    r#"
-                    UPDATE {schema}.claim_ring_slots
-                    SET rescue_cursor_claimed_at = '-infinity'::timestamptz,
-                        rescue_cursor_job_id = 0,
-                        rescue_cursor_run_lease = 0,
-                        deadline_cursor_deadline_at = '-infinity'::timestamptz,
-                        deadline_cursor_job_id = 0,
-                        deadline_cursor_run_lease = 0
-                    WHERE slot = $1
-                    "#
-                ))
-                .bind(slot)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-                tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(PruneOutcome::Pruned {
+            if current_slot == slot {
+                return Ok(PruneOutcome::SkippedActive {
                     slot,
-                    carried_failed_rows: 0,
-                })
+                    reason: SkipReason::ClaimCurrent,
+                    count: 0,
+                });
             }
-            Err(err) if is_lock_contention_error(&err) => {
-                let _ = tx.rollback().await;
-                Ok(PruneOutcome::Blocked { slot })
+
+            let open_claims = claim_prune_has_open_claims_tx(
+                &mut tx,
+                schema,
+                &claim_child,
+                &claim_batch_child,
+                &closure_child,
+                &closure_batch_child,
+            )
+            .await?;
+            if open_claims {
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: SkipReason::ClaimOpen,
+                    count: busy_indicator(open_claims),
+                });
             }
-            Err(err) => {
-                let _ = tx.rollback().await;
-                Err(map_sqlx_error(err))
-            }
+
+            sqlx::query(&format!(
+                "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
+            ))
+            .execute(tx.as_mut())
+            .await
+                .map_err(map_sqlx_error)?;
+            sqlx::query(&format!(
+                r#"
+                UPDATE {schema}.claim_ring_slots
+                SET rescue_cursor_claimed_at = '-infinity'::timestamptz,
+                    rescue_cursor_job_id = 0,
+                    rescue_cursor_run_lease = 0,
+                    deadline_cursor_deadline_at = '-infinity'::timestamptz,
+                    deadline_cursor_job_id = 0,
+                    deadline_cursor_run_lease = 0
+                WHERE slot = $1
+                "#
+            ))
+            .bind(slot)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            Ok(PruneOutcome::Pruned {
+                slot,
+                carried_failed_rows: 0,
+            })
         }
+        .await;
+
+        settle_prune_tx(tx, locked, PruneOutcome::Blocked { slot }).await
     }
 
     fn job_id_sequence(&self) -> String {

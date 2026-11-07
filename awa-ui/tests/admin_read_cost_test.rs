@@ -63,11 +63,6 @@ const KNOWN_HISTORY_READS: &[(&str, &str)] = &[
         "/api/stats/queues",
         "distinct queues are read from current_jobs, including terminal_jobs",
     ),
-    (
-        "/api/jobs?state=failed&limit=10",
-        "the listing reads current_jobs; ADR-049's filter compiler (#572) \
-         replaces it",
-    ),
 ];
 
 /// Tables whose rows are retained terminal headers: a read may pass over

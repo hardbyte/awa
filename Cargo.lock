@@ -383,7 +383,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "awa"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -400,6 +400,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -408,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "assert_cmd",
  "awa-model",
@@ -430,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -440,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "awa-metrics"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "awa-model",
  "opentelemetry",
@@ -449,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -470,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "awa-seaorm"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "awa",
  "awa-testing",
@@ -483,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -498,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "awa-ui"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "awa-metrics",
  "awa-model",
@@ -521,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.6.13-alpha.1"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4187,6 +4188,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

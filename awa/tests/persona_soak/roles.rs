@@ -5,7 +5,8 @@
 //! * `MIGRATOR` is a migration-like role that is a member of `OWNER` and has default
 //!   privileges for the objects it creates.
 //! * `APP_A` and `APP_B` are members of the `RUNTIME_GROUP` role and have no default
-//!   privileges of their own. They run producers and the maintenance leader.
+//!   privileges of their own by default. An explicit comparison profile can share
+//!   their newly created objects too. They run producers and the maintenance leader.
 //!
 //! Grants follow the restricted-runtime section of `docs/security.md`.
 
@@ -67,6 +68,17 @@ pub async fn grant_runtime(
     schema_create: bool,
     mixed_personas: bool,
 ) -> Result<(), String> {
+    // Comparison-only setup profile for older binaries whose application roles
+    // create their own lane sequences. Default off preserves regression coverage.
+    let shared_creator_grants = match std::env::var("AWA_SOAK_SHARED_CREATOR_GRANTS") {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("AWA_SOAK_SHARED_CREATOR_GRANTS must be 0 or 1".into()),
+    };
+    if shared_creator_grants && !schema_create {
+        return Err("shared creator grants require schema CREATE for the runtime group".into());
+    }
     let mut statements = vec![
         format!("GRANT USAGE ON SCHEMA awa TO {RUNTIME_GROUP}"),
         format!("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {RUNTIME_GROUP}"),
@@ -82,12 +94,17 @@ pub async fn grant_runtime(
     if mixed_personas {
         // The other personas keep their superuser runtimes and producers. Their objects
         // must stay usable by the application roles, which now lead maintenance for every
-        // queue, without covering anything the application roles create themselves.
+        // queue. Application-role defaults remain absent unless the explicit
+        // shared-creator comparison profile below enables them.
         let superuser: String = sqlx::query_scalar("SELECT current_user::text")
             .fetch_one(superuser_pool)
             .await
             .map_err(|error| format!("current_user: {error}"))?;
         creators.push(superuser);
+    }
+    if shared_creator_grants {
+        creators.extend([APP_A.to_string(), APP_B.to_string()]);
+        eprintln!("SOAK_SETUP shared_creator_grants=1 schema_create=1 application_creators={APP_A},{APP_B}");
     }
     for creator in &creators {
         statements.push(format!(

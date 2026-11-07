@@ -85,6 +85,17 @@ Interpretation:
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 
+### Transient Admin Reads During Partition Pruning
+
+In 0.6, a job-detail read, including list-item hydration, uses several queries
+within one snapshot. It retains read locks on the located ready body, but does
+not lock all ring partitions before establishing that snapshot. Prune can
+truncate a ready partition before its body is located, or a lease or claim
+partition before that read phase reaches it. A completed job can then briefly
+appear available or missing. Retry with a fresh read before treating that result
+as missing durable work. Filtering tombstoned source rows after a queue or
+priority move does not close these separate windows.
+
 ### Inspect Runtime Health
 
 ```sql

@@ -3,10 +3,12 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+mod ci_timing;
+
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
-    BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
-    SubmitBatchOperation,
+    BatchOperationSpec, PromotionLane, PruneOutcome, QueueStorage, QueueStorageConfig,
+    RotateOutcome, SkipReason, SubmitBatchOperation,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -35,6 +37,10 @@ struct RawReceiptClaimRow {
     lane_seq: i64,
     claim_slot: i32,
 }
+
+/// `AwaMetrics::from_global` reads the process-wide meter provider when a
+/// client starts, so tests that install their own provider must not overlap.
+static GLOBAL_METRICS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn install_in_memory_metrics() -> (InMemoryMetricExporter, SdkMeterProvider) {
     let exporter = InMemoryMetricExporter::default();
@@ -2007,6 +2013,231 @@ impl Worker for MultiClientTrackingWorker {
         tokio::time::sleep(Duration::from_millis(10)).await;
         Ok(JobResult::Completed)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct GracefulRestartJob {
+    id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct GracefulRestartFollowUp {
+    id: i64,
+}
+
+/// The first execution reports its attempt and returns `Completed` once
+/// shutdown signals cancellation; later executions complete at once.
+#[derive(Clone, Default)]
+struct GracefulRestartWorker {
+    executions: Arc<AtomicU32>,
+    first_attempt: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+    entered: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Worker for GracefulRestartWorker {
+    fn kind(&self) -> &'static str {
+        "graceful_restart_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if self.executions.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(JobResult::Completed);
+        }
+        *self.first_attempt.lock().expect("first attempt") = Some((ctx.job.id, ctx.job.run_lease));
+        self.entered.notify_one();
+        while !ctx.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(JobResult::Completed)
+    }
+}
+
+/// A runtime on its own tokio runtime and pool, so stopping it after a
+/// graceful shutdown drops whatever the client left running, as a process
+/// exit does.
+struct ProcessHost {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+}
+
+impl ProcessHost {
+    async fn start(
+        options: sqlx::postgres::PgConnectOptions,
+        build: impl FnOnce(sqlx::PgPool) -> Client + Send + 'static,
+    ) -> Self {
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build process runtime");
+            let client = runtime.block_on(async move {
+                let pool = PgPoolOptions::new()
+                    .max_connections(6)
+                    .connect_with(options)
+                    .await
+                    .expect("connect process pool");
+                let client = build(pool);
+                client.start().await.expect("start process client");
+                client
+            });
+            Self {
+                runtime,
+                client: Arc::new(client),
+            }
+        })
+        .await
+        .expect("start process host")
+    }
+
+    async fn exit_gracefully(self, timeout: Duration) {
+        let client = self.client.clone();
+        self.runtime
+            .spawn(async move { client.shutdown(timeout).await })
+            .await
+            .expect("graceful shutdown");
+        tokio::task::spawn_blocking(move || self.runtime.shutdown_background())
+            .await
+            .expect("stop process runtime");
+    }
+}
+
+/// A graceful shutdown must finalize every attempt whose handler returned
+/// during the drain. Finalization used to run detached from the drain, so a
+/// process that exited after `shutdown` returned could drop it: the attempt
+/// stayed open with no heartbeat and stale-heartbeat rescue ran the completed
+/// job again. A held receipt-attempt lock keeps this attempt's finalize in
+/// flight while shutdown drains, which the detached version did not wait for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_graceful_shutdown_finalizes_returned_attempts() {
+    // Each host below opens its own pool of 6, and only one runs at a time.
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_graceful_restart";
+    let store_config = QueueStorageConfig {
+        schema: "awa_qs_graceful_restart".to_string(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &GracefulRestartJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let worker = GracefulRestartWorker::default();
+    let options = (*pool.connect_options()).clone();
+    let build = |worker: GracefulRestartWorker, store_config: QueueStorageConfig| {
+        move |pool: sqlx::PgPool| {
+            Client::builder(pool)
+                .queue(
+                    queue,
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        deadline_duration: Duration::ZERO,
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config,
+                    Duration::from_secs(60),
+                    Duration::from_millis(50),
+                )
+                .claim_rotate_interval(Duration::from_secs(60))
+                .register_worker(worker)
+                // The follow-up's queue is not served; it only routes the
+                // completion through a transaction of its own.
+                .on_completed_enqueue::<GracefulRestartJob, GracefulRestartFollowUp, _>(
+                    |args, _job| GracefulRestartFollowUp { id: args.id },
+                )
+                .heartbeat_interval(Duration::from_millis(100))
+                .heartbeat_staleness(ci_timing::scaled_staleness(Duration::from_secs(1)))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .build()
+                .expect("build graceful restart client")
+        }
+    };
+
+    let host =
+        ProcessHost::start(options.clone(), build(worker.clone(), store_config.clone())).await;
+    tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(10)),
+        worker.entered.notified(),
+    )
+    .await
+    .expect("the job should start");
+    let (attempt_job_id, run_lease) = worker
+        .first_attempt
+        .lock()
+        .expect("first attempt")
+        .expect("first attempt recorded");
+    assert_eq!(attempt_job_id, job_id);
+
+    let mut lock_holder = pool.acquire().await.expect("lock connection");
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("hold the attempt's finalize lock");
+
+    let exit =
+        tokio::spawn(host.exit_gracefully(ci_timing::scaled_timeout(Duration::from_secs(10))));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended(
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&mut *lock_holder)
+    .await
+    .expect("release the attempt's finalize lock");
+    drop(lock_holder);
+    exit.await.expect("graceful exit");
+
+    let after_exit = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load job")
+        .expect("job row");
+
+    // A later runtime rescues anything the exit left open.
+    let rescuer = ProcessHost::start(options, build(worker.clone(), store_config)).await;
+    let finished = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        ci_timing::scaled_timeout(Duration::from_secs(15)),
+    )
+    .await;
+    rescuer
+        .exit_gracefully(ci_timing::scaled_timeout(Duration::from_secs(10)))
+        .await;
+
+    assert_eq!(
+        (after_exit.state, after_exit.run_lease),
+        (JobState::Completed, run_lease),
+        "graceful shutdown returned before the completed attempt was finalized"
+    );
+    assert_eq!(
+        (worker.executions.load(Ordering::SeqCst), finished.run_lease),
+        (1, run_lease),
+        "the job ran again after a graceful shutdown"
+    );
 }
 
 /// ADR-023 claim-ring control-plane smoke test. Exercises
@@ -5234,6 +5465,7 @@ async fn test_queue_storage_cancelled_compact_claim_closes_via_batch_and_queue_p
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_capacity_wake_drains_after_partial_drain() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
     let (exporter, meter_provider) = install_in_memory_metrics();
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_capacity_wake_partial_drain";
@@ -7802,9 +8034,10 @@ fn branch_overruns() -> Arc<std::sync::Mutex<Vec<BranchOverrun>>> {
 /// snoozed and retry-after jobs runnable, so overrunning promotion bodies must
 /// never arm a cooldown on it.
 ///
-/// The first three promotion bodies (two `DELETE`s each) take 1.2s against a
-/// 25ms promote interval, so the maintenance branch tracker flags promotion as
-/// overrunning. The test asserts on that overrun warning rather than on job
+/// Every promotion body runs the canonical-plane promotion `DELETE` once per
+/// state, even with nothing due. A statement trigger slows the first six, so
+/// the first three bodies take 1.2s against a 25ms promote interval and the
+/// maintenance branch tracker flags promotion as overrunning. The test asserts on that overrun warning rather than on job
 /// latency: the promotion warning must report no cooldown, while another
 /// branch in the same run (cleanup, whose bodies exceed its 1ms interval)
 /// does report one, so the check cannot pass vacuously. Jobs that fall due
@@ -7831,7 +8064,7 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
              END $$"
         ),
         format!(
-            "CREATE TRIGGER slow_first_promote_deletes BEFORE DELETE ON {schema}.deferred_jobs \
+            "CREATE TRIGGER slow_first_promote_deletes BEFORE DELETE ON awa.scheduled_jobs \
              FOR EACH STATEMENT EXECUTE FUNCTION {schema}.slow_first_promote_deletes()"
         ),
     ] {
@@ -7961,6 +8194,436 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
         }),
         "a cooldown-bearing branch should have armed a cooldown in this run: {overruns:?}"
     );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// Advisory lock key of a lane's enqueue reservation, as
+/// `reserve_enqueue_seq` takes it. The lane must already exist.
+async fn enqueue_lane_lock_key(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT hashtextextended(format('%I.%I', $1::text, seq_name), 0) \
+         FROM {}.queue_enqueue_heads \
+         WHERE queue = $2 AND priority = $3 AND enqueue_shard = 0",
+        store.schema()
+    ))
+    .bind(store.schema())
+    .bind(queue)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .expect("derive enqueue lane lock key")
+}
+
+/// A promotion batch that meets a lane whose enqueue lock is held promotes
+/// the other lanes, reports the held lane as contended after its lock timeout
+/// and leaves its rows deferred. Promoted later, the lane's rows take lane
+/// sequence numbers in due order and are all claimable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_order() {
+    const PRIORITY: i16 = 2;
+    let (_db_guard, pool) = setup_pool(6).await;
+    let hot = "qs_promote_contended_hot";
+    let other = "qs_promote_contended_other";
+    let store = create_store(&pool, "awa_qs_promote_contended_lane").await;
+    let opts = |queue: &str, run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        priority: PRIORITY,
+        run_at,
+        ..Default::default()
+    };
+
+    let warm_job_id = enqueue_job(&pool, &store, &CompleteJob { id: 0 }, opts(hot, None)).await;
+    // Later job ids fall due earlier, so due order differs from id order.
+    let due_base = Utc::now() - chrono::Duration::seconds(60);
+    let mut hot_due = Vec::new();
+    for n in 0..6 {
+        let run_at = due_base - chrono::Duration::seconds(n);
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: n },
+            opts(hot, Some(run_at)),
+        )
+        .await;
+        hot_due.push((run_at, job_id));
+    }
+    hot_due.sort();
+    let hot_in_due_order: Vec<i64> = hot_due.iter().map(|(_, job_id)| *job_id).collect();
+    let other_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 100 },
+        opts(other, Some(due_base)),
+    )
+    .await;
+
+    let hot_lane = PromotionLane {
+        queue: hot.to_string(),
+        priority: PRIORITY,
+    };
+    let lock_key = enqueue_lane_lock_key(&pool, &store, hot, PRIORITY).await;
+    let mut holder = pool.begin().await.expect("begin lane holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(holder.as_mut())
+        .await
+        .expect("hold the hot lane's enqueue lock");
+
+    let lock_timeout = Duration::from_millis(100);
+    let started = Instant::now();
+    let outcome = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, Some(lock_timeout), &[])
+        .await
+        .expect("promote with the hot lane held");
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert_eq!(outcome.selected, 7, "{outcome:?}");
+    assert_eq!(outcome.contended, vec![hot_lane.clone()]);
+    assert!(
+        elapsed >= lock_timeout && elapsed < scaled_timeout(Duration::from_secs(1)),
+        "the held lane should cost one lock timeout, took {elapsed:?}"
+    );
+    let other_job = store
+        .load_job(&pool, other_job_id)
+        .await
+        .expect("load other job")
+        .expect("other job exists");
+    assert_eq!(other_job.state, JobState::Available);
+    for job_id in &hot_in_due_order {
+        let job = store
+            .load_job(&pool, *job_id)
+            .await
+            .expect("load hot job")
+            .expect("hot job exists");
+        assert_eq!(job.state, JobState::Scheduled, "job {job_id}");
+    }
+
+    let skipped = store
+        .promote_due_lanes(
+            &pool,
+            JobState::Scheduled,
+            100,
+            Some(lock_timeout),
+            std::slice::from_ref(&hot_lane),
+        )
+        .await
+        .expect("promote with the hot lane skipped");
+    assert_eq!(skipped, Default::default());
+
+    holder.commit().await.expect("release the hot lane");
+    let mut batches = 0;
+    loop {
+        let outcome = store
+            .promote_due_lane(&pool, JobState::Scheduled, &hot_lane, 4, None)
+            .await
+            .expect("promote the hot lane");
+        assert!(outcome.contended.is_empty(), "{outcome:?}");
+        if outcome.promoted == 0 {
+            break;
+        }
+        batches += 1;
+    }
+    assert_eq!(batches, 2);
+
+    let in_lane_order: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {}.ready_entries WHERE job_id = ANY($1) ORDER BY lane_seq",
+        store.schema()
+    ))
+    .bind(&hot_in_due_order)
+    .fetch_all(&pool)
+    .await
+    .expect("read hot lane order");
+    assert_eq!(in_lane_order, hot_in_due_order);
+
+    let mut claimed: Vec<i64> = store
+        .claim_runtime_batch(&pool, hot, 100, Duration::from_secs(60))
+        .await
+        .expect("claim the hot lane")
+        .into_iter()
+        .map(|claimed| claimed.job.id)
+        .collect();
+    claimed.sort_unstable();
+    let mut expected = hot_in_due_order.clone();
+    expected.push(warm_job_id);
+    expected.sort_unstable();
+    assert_eq!(claimed, expected);
+}
+
+/// The maintenance leader must not wait on a lane whose enqueue lock never
+/// comes free. Two sessions take turns holding the hot lane's lock for
+/// `HOLD` each, so a lock request queued behind them waits up to two holds.
+/// A due job on another queue must still run, and an abandoned attempt must
+/// still be rescued, well within one hold; the hot queue's due jobs must
+/// still be promoted while the lane stays busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_busy_lane_holds_back_neither_promotion_nor_rescue() {
+    const HOLD: Duration = Duration::from_secs(5);
+    const PRIORITY: i16 = 2;
+    let (_db_guard, pool) = setup_pool(12).await;
+    let hot = "qs_busy_lane_hot";
+    let other = "qs_busy_lane_other";
+    let abandoned = "qs_busy_lane_abandoned";
+    let schema = "awa_qs_busy_lane_leader";
+    let store = create_store(&pool, schema).await;
+    let opts = |queue: &str, run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        priority: PRIORITY,
+        run_at,
+        ..Default::default()
+    };
+
+    enqueue_job(&pool, &store, &CompleteJob { id: 0 }, opts(hot, None)).await;
+    let lock_key = enqueue_lane_lock_key(&pool, &store, hot, PRIORITY).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut holders = Vec::new();
+    for _ in 0..2 {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let pool = pool.clone();
+        let stop = Arc::clone(&stop);
+        holders.push(tokio::spawn(async move {
+            let mut held_tx = Some(held_tx);
+            let mut holds = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let mut tx = pool.begin().await.expect("begin lane holder");
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(lock_key)
+                    .execute(tx.as_mut())
+                    .await
+                    .expect("hold the hot lane's enqueue lock");
+                holds += 1;
+                if let Some(held_tx) = held_tx.take() {
+                    let _ = held_tx.send(());
+                }
+                tokio::time::sleep(HOLD).await;
+                tx.commit().await.expect("release the hot lane");
+            }
+            holds
+        }));
+        // The first holder takes the lock; wait for it so the second queues
+        // behind it rather than racing it.
+        if holders.len() == 1 {
+            held_rx.await.expect("first holder took the lane");
+        }
+    }
+
+    let due = Utc::now() - chrono::Duration::seconds(1);
+    let mut hot_jobs = Vec::new();
+    for n in 1..=3 {
+        hot_jobs
+            .push(enqueue_job(&pool, &store, &CompleteJob { id: n }, opts(hot, Some(due))).await);
+    }
+    let other_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 10 },
+        opts(other, Some(due)),
+    )
+    .await;
+    let abandoned_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 20 },
+        opts(abandoned, None),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, abandoned, 1, Duration::from_secs(3_600))
+        .await
+        .expect("claim the abandoned attempt");
+    assert_eq!(claimed.len(), 1);
+
+    let heartbeat_staleness = Duration::from_millis(500);
+    let worker_queue = || QueueConfig {
+        max_workers: 4,
+        poll_interval: Duration::from_millis(25),
+        ..QueueConfig::default()
+    };
+    let client = Client::builder(pool.clone())
+        .queue(hot, worker_queue())
+        .queue(other, worker_queue())
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .heartbeat_staleness(heartbeat_staleness)
+        .deadline_rescue_interval(Duration::from_secs(10))
+        .callback_rescue_interval(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build busy-lane client");
+    client
+        .start()
+        .await
+        .expect("Failed to start busy-lane client");
+
+    let bound = scaled_timeout(Duration::from_secs(2));
+    wait_for_job_state(&store, &pool, other_job, &[JobState::Completed], bound).await;
+    wait_for_job_state(
+        &store,
+        &pool,
+        abandoned_job,
+        &[JobState::Retryable, JobState::Available],
+        bound + heartbeat_staleness,
+    )
+    .await;
+
+    for job_id in &hot_jobs {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            scaled_timeout(HOLD * 3),
+        )
+        .await;
+    }
+    assert!(
+        holders.iter().all(|holder| !holder.is_finished()),
+        "the hot lane must stay busy until its jobs are promoted"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    for holder in holders {
+        assert!(holder.await.expect("lane holder") >= 1);
+    }
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// Rows another transaction holds locked, as a lane promotion still waiting
+/// under a former leader does, must not fill every batch of a promotion tick.
+/// With more of the oldest due rows locked than one batch selects, a due job
+/// on another queue must still be promoted and run promptly, and the locked
+/// rows must be promoted once released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_locked_due_rows_do_not_starve_promotion() {
+    const LOCKED: usize = 4_096 + 64;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let locked_queue = "qs_locked_due_rows";
+    let other = "qs_locked_due_other";
+    let schema = "awa_qs_locked_due_rows";
+    let store = create_store(&pool, schema).await;
+
+    let oldest = Utc::now() - chrono::Duration::seconds(120);
+    let params: Vec<_> = (0..LOCKED)
+        .map(|n| {
+            insert::params_with(
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: locked_queue.to_string(),
+                    run_at: Some(oldest),
+                    ..Default::default()
+                },
+            )
+            .expect("build locked-row params")
+        })
+        .collect();
+    for chunk in params.chunks(2_000) {
+        store
+            .enqueue_params_batch(&pool, chunk)
+            .await
+            .expect("enqueue rows to lock");
+    }
+    let mut holder = pool.begin().await.expect("begin row holder");
+    let locked: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {schema}.deferred_jobs WHERE queue = $1 FOR UPDATE"
+    ))
+    .bind(locked_queue)
+    .fetch_all(holder.as_mut())
+    .await
+    .expect("lock the oldest due rows");
+    assert_eq!(locked.len(), LOCKED);
+
+    let other_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: -1 },
+        InsertOpts {
+            queue: other.to_string(),
+            run_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            other,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("Failed to build locked-rows client");
+    client
+        .start()
+        .await
+        .expect("Failed to start locked-rows client");
+
+    wait_for_job_state(
+        &store,
+        &pool,
+        other_job,
+        &[JobState::Completed],
+        scaled_timeout(Duration::from_secs(2)),
+    )
+    .await;
+
+    holder.rollback().await.expect("release the locked rows");
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(10));
+    loop {
+        let remaining: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.deferred_jobs WHERE queue = $1"
+        ))
+        .bind(locked_queue)
+        .fetch_one(&pool)
+        .await
+        .expect("count deferred rows");
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{remaining} released rows were never promoted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -8175,6 +8838,109 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     gate.wait_until_entered(Duration::from_secs(5)).await;
     gate.release();
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn test_row_local_receipt_admin_counts_follow_durable_dispositions() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_row_receipt_dispositions";
+    let schema = "awa_qs_row_receipt_dispositions";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    async fn counts(pool: &sqlx::PgPool, queue: &str) -> (i64, i64, i64) {
+        let overview = admin::queue_overview(pool, queue)
+            .await
+            .expect("read receipt disposition counts")
+            .expect("receipt queue exists");
+        (
+            overview.running,
+            overview.retryable,
+            overview.completed_last_hour,
+        )
+    }
+
+    store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+        .await
+        .expect("claim three deadline-backed receipts");
+    assert_eq!(claimed.len(), 3);
+    assert_eq!(lease_claim_count(&pool, &store).await, 3);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(counts(&pool, queue).await, (3, 0, 0));
+
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        completed,
+        vec![(claimed[0].job.id, claimed[0].job.run_lease)]
+    );
+    let null_fences: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2 AND closed_at IS NULL"))
+        .bind(claimed[0].job.id)
+        .bind(claimed[0].job.run_lease)
+        .fetch_one(&pool)
+        .await
+        .expect("completed row-local claim remains behind compact closure evidence");
+    assert_eq!(null_fences, 1);
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+    assert_eq!(counts(&pool, queue).await, (2, 0, 1));
+
+    let retried = store
+        .fail_retryable(
+            &pool,
+            claimed[1].job.id,
+            claimed[1].job.run_lease,
+            "retry",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("second attempt moves to retryable");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(counts(&pool, queue).await, (1, 1, 1));
+
+    let callback = store
+        .register_callback(
+            &pool,
+            claimed[2].job.id,
+            claimed[2].job.run_lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease_count(&pool, &store).await, 1);
+    assert_eq!(
+        counts(&pool, queue).await,
+        (1, 1, 1),
+        "materialization counts the attempt once"
+    );
+    let finished = store
+        .complete_external(&pool, callback, None, Some(claimed[2].job.run_lease), false)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, JobState::Completed);
+    assert_eq!(counts(&pool, queue).await, (0, 1, 2));
+    for (claim, expected) in claimed.iter().zip([
+        JobState::Completed,
+        JobState::Retryable,
+        JobState::Completed,
+    ]) {
+        let job = store.load_job(&pool, claim.job.id).await.unwrap().unwrap();
+        assert_eq!(
+            job.state, expected,
+            "point reads and aggregate counts agree"
+        );
+    }
 }
 
 /// With lease-claim receipts on, a running job is an open receipt claim and
@@ -10037,16 +10803,25 @@ async fn test_queue_storage_retry_failed_outcome_surfaces_pruned_rows() {
         RotateOutcome::Rotated { .. } => {}
         other => panic!("expected Rotated, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
-        PruneOutcome::Pruned {
-            carried_failed_rows: 1,
-            ..
-        } => {}
-        other => panic!("expected Pruned with one carried row, got {other:?}"),
+    // A background session on a relation prune touches (autovacuum, or a
+    // hosted Postgres's own workers) can time out its lock wait and report
+    // Blocked; retry as the maintenance loop would.
+    let prune_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match store
+            .prune_oldest(&pool, Duration::from_secs(3600))
+            .await
+            .expect("prune_oldest")
+        {
+            PruneOutcome::Pruned {
+                carried_failed_rows: 1,
+                ..
+            } => break,
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("expected Pruned with one carried row, got {other:?}"),
+        }
     }
 
     let outcome = admin::retry_failed_by_queue(&pool, queue)
@@ -11782,6 +12557,350 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_runtime_counts_blocked_then_pruned_queue_prune_attempts() {
+    let (_db_guard, pool) = setup_pool(20).await;
+    let queue = "qs_prune_attempt_metric";
+    let schema = "awa_qs_prune_attempt_metric";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    // Enqueue before the client starts so the job's rows are in slot 0, the
+    // slot the ring prunes first, whatever the maintenance timing.
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4001 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut reader_tx = pool.begin().await.expect("begin reader tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.ready_segments_0 IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("reader lock");
+
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .prune_lock_timeout(Duration::from_millis(20))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("build prune metric client");
+    client.start().await.expect("start prune metric client");
+
+    wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let attempts_by_outcome = || {
+        meter_provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+        let mut totals: std::collections::BTreeMap<String, u64> = Default::default();
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != "awa.maintenance.prune.attempts" {
+                        continue;
+                    }
+                    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                        continue;
+                    };
+                    for point in sum.data_points() {
+                        let attribute = |key: &str| {
+                            point
+                                .attributes()
+                                .find(|kv| kv.key.as_str() == key)
+                                .map(|kv| kv.value.as_str().into_owned())
+                                .unwrap_or_default()
+                        };
+                        *totals
+                            .entry(format!(
+                                "{}/{}",
+                                attribute("awa.ring"),
+                                attribute("awa.ring.outcome")
+                            ))
+                            .or_default() += point.value();
+                    }
+                }
+            }
+        }
+        totals
+    };
+    let queue_attempts = |outcome: &str| {
+        attempts_by_outcome()
+            .get(&format!("queue/{outcome}"))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while queue_attempts("blocked") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "queue prune never reported blocked while a reader held the queue segment; \
+             attempts so far: {:?}",
+            attempts_by_outcome()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(queue_attempts("pruned"), 0);
+
+    reader_tx.rollback().await.expect("release reader lock");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while queue_attempts("pruned") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "queue prune never completed after the reader released; attempts so far: {:?}",
+            attempts_by_outcome()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PruneRing {
+    Queue,
+    Lease,
+    Claim,
+}
+
+async fn prune_ring(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    ring: PruneRing,
+) -> Result<PruneOutcome, AwaError> {
+    match ring {
+        PruneRing::Queue => store.prune_oldest(pool, Duration::ZERO).await,
+        PruneRing::Lease => store.prune_oldest_leases(pool).await,
+        PruneRing::Claim => store.prune_oldest_claims(pool).await,
+    }
+}
+
+/// A reader holds `locked_relation` so prune must wait for its exclusive lock.
+/// With a short timeout prune gives up as `Blocked` only after that timeout;
+/// with a long timeout it waits out a reader that releases part-way and then
+/// completes.
+async fn assert_prune_waits_for_configured_lock_timeout(
+    pool: &sqlx::PgPool,
+    config: &QueueStorageConfig,
+    ring: PruneRing,
+    locked_relation: &str,
+    expected_after_release: fn(&PruneOutcome) -> bool,
+) {
+    let short_timeout = Duration::from_millis(300);
+    let short_store = QueueStorage::new(config.clone())
+        .expect("short-timeout store")
+        .with_prune_lock_timeout(short_timeout)
+        .expect("short prune lock timeout");
+    assert_eq!(short_store.prune_lock_timeout(), short_timeout);
+
+    let mut reader_tx = pool.begin().await.expect("begin reader tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {locked_relation} IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("reader lock");
+
+    let started = Instant::now();
+    let blocked = prune_ring(&short_store, pool, ring)
+        .await
+        .expect("prune under reader lock");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(blocked, PruneOutcome::Blocked { .. }),
+        "{ring:?} prune must report Blocked while the reader holds its lock, got {blocked:?}"
+    );
+    assert!(
+        elapsed >= short_timeout,
+        "{ring:?} prune gave up after {elapsed:?}, before the {short_timeout:?} lock timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "{ring:?} prune waited {elapsed:?} for a {short_timeout:?} lock timeout"
+    );
+
+    let long_store = QueueStorage::new(config.clone())
+        .expect("long-timeout store")
+        .with_prune_lock_timeout(Duration::from_secs(60))
+        .expect("long prune lock timeout");
+    let reader_hold = Duration::from_millis(600);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(reader_hold).await;
+        reader_tx.rollback().await.expect("release reader lock");
+    });
+    let started = Instant::now();
+    let outcome = prune_ring(&long_store, pool, ring)
+        .await
+        .expect("prune after reader release");
+    let elapsed = started.elapsed();
+    release.await.expect("release task");
+    assert!(
+        expected_after_release(&outcome),
+        "{ring:?} prune with a long lock timeout must outwait the reader and finish, got {outcome:?}"
+    );
+    assert!(
+        elapsed >= short_timeout,
+        "{ring:?} prune returned after {elapsed:?} instead of waiting for the reader"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_prune_lock_timeout_is_configurable() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_lt_queue";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claims = store.claim_batch(&pool, "q", 1).await.unwrap();
+    assert_eq!(store.complete_batch(&pool, &claims).await.unwrap(), 1);
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    };
+    assert_prune_waits_for_configured_lock_timeout(
+        &pool,
+        &config,
+        PruneRing::Queue,
+        &format!("{schema}.ready_segments_0"),
+        |outcome| matches!(outcome, PruneOutcome::Pruned { .. }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_lease_prune_lock_timeout_is_configurable() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_lt_lease";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 2).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "q", 2, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    };
+    assert_prune_waits_for_configured_lock_timeout(
+        &pool,
+        &config,
+        PruneRing::Lease,
+        &format!("{schema}.leases_0"),
+        |outcome| {
+            matches!(
+                outcome,
+                PruneOutcome::SkippedActive {
+                    reason: SkipReason::LeaseActive,
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_claim_prune_lock_timeout_is_configurable() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_lt_claim";
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 4,
+        lease_claim_receipts: true,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.lease_claims (
+            claim_slot, job_id, run_lease, ready_slot, ready_generation,
+            queue, priority, attempt, max_attempts, lane_seq
+        ) VALUES (0, 1001, 1, 0, 0, 'synthetic', 2, 1, 25, 1001)
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed claim");
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome) \
+         VALUES (0, 1001, 1, 'completed')"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed closure");
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    assert_prune_waits_for_configured_lock_timeout(
+        &pool,
+        &config,
+        PruneRing::Claim,
+        &format!("{schema}.lease_claims_0"),
+        |outcome| matches!(outcome, PruneOutcome::Pruned { .. }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_prune_reader_lock";
@@ -11842,6 +12961,180 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
     );
+}
+
+/// The prune `lock_timeout` covers every statement after it is set, not
+/// only the `LOCK TABLE` on the slot's children. A statement that waits on
+/// another table's lock — here the failed-row carry, its count deltas, the
+/// rollup fold and the live-counter cleanup — must roll the whole prune back
+/// and report `Blocked`, leaving the slot to the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_lock_timeout_after_child_locks_reports_blocked() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_late_lock_timeout";
+    let schema = "awa_qs_prune_late_lock_timeout";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue completed job");
+    let claimed = store
+        .claim_batch(&pool, queue, 1)
+        .await
+        .expect("claim completed job");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete job");
+
+    let failed_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim failing job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    store
+        .fail_terminal(&pool, failed_job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail job")
+        .expect("running job should fail");
+
+    let rotated = store.rotate(&pool).await.expect("rotate");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let retention = Duration::from_secs(3600);
+    for held in [
+        format!("{schema}.done_entries_1"),
+        format!("{schema}.queue_terminal_count_deltas_1"),
+        format!("{schema}.queue_terminal_rollups"),
+        format!("{schema}.queue_terminal_live_counts"),
+    ] {
+        let mut holder = pool.begin().await.expect("begin lock holder");
+        sqlx::query(&format!("LOCK TABLE {held} IN SHARE MODE"))
+            .execute(holder.as_mut())
+            .await
+            .expect("hold share lock");
+
+        let outcome = store.prune_oldest(&pool, retention).await;
+        assert!(
+            matches!(outcome, Ok(PruneOutcome::Blocked { slot: 0 })),
+            "prune waiting on {held} should report Blocked, got {outcome:?}"
+        );
+
+        holder.rollback().await.expect("release share lock");
+
+        assert_eq!(
+            done_entries_count(&pool, schema, queue).await,
+            2,
+            "blocked prune on {held} must not truncate or carry rows"
+        );
+        let rollup_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {schema}.queue_terminal_rollups"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("count rollups");
+        assert_eq!(
+            rollup_rows, 0,
+            "blocked prune on {held} must not fold rollups"
+        );
+        assert_invariant_holds(
+            &pool,
+            schema,
+            queue,
+            &format!("after prune blocked on {held}"),
+        )
+        .await;
+    }
+
+    let pruned = store
+        .prune_oldest(&pool, retention)
+        .await
+        .expect("prune after locks released");
+    assert!(
+        matches!(
+            pruned,
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 1
+            }
+        ),
+        "unexpected prune outcome after locks released: {pruned:?}"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after prune").await;
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.terminal, 2, "rollup (1) + carried live row (1)");
+}
+
+/// Terminal-delta rollup shares prune's lock timeout. A timeout on the
+/// live-counter fold, after the delta child is locked, must report a blocked
+/// slot rather than fail the rollup pass, and the pass stops there instead of
+/// waiting out the same timeout on every remaining slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_lock_timeout_after_child_lock_reports_blocked() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_late_lock";
+    let schema = "awa_qs_terminal_delta_rollup_late_lock";
+    let store = create_store(&pool, schema).await;
+
+    for _ in 0..2 {
+        store
+            .enqueue_batch(&pool, queue, 1, 3)
+            .await
+            .expect("enqueue");
+        let claimed = store.claim_batch(&pool, queue, 3).await.expect("claim");
+        store
+            .complete_batch(&pool, &claimed)
+            .await
+            .expect("complete");
+        match store.rotate(&pool).await.expect("rotate") {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("expected Rotated, got {other:?}"),
+        }
+    }
+
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.queue_terminal_live_counts IN SHARE MODE"
+    ))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold share lock");
+
+    let outcome = store.rollup_terminal_count_deltas(&pool, 4).await;
+    holder.rollback().await.expect("release share lock");
+    let outcome = outcome.expect("rollup waiting on live counts should not error");
+    assert_eq!(outcome.rolled_slots, 0);
+    assert_eq!(
+        outcome.blocked_slots, 1,
+        "the pass stops at the first blocked slot"
+    );
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup after lock released");
+    assert_eq!(outcome.rolled_slots, 2);
+    assert_eq!(outcome.blocked_slots, 0);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -13427,6 +14720,17 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     assert_eq!(overview.available, 2, "the cancelled job is not available");
     assert_eq!(overview.total_queued, 2);
     assert_eq!(overview.running, 0);
+
+    let kind = admin::job_kind_overview(&pool, "complete_job")
+        .await
+        .expect("read kind overview after reusing the retained lane")
+        .expect("the completed and newly enqueued jobs have a kind");
+    assert_eq!(
+        kind.job_count,
+        (completed.len() + waiting.len() - 1) as i64,
+        "retained completions and later jobs in the same lane count once"
+    );
+    assert_eq!(kind.completed_last_hour, (completed.len() - 1) as i64);
 
     // The dashboard's other two reads, over the same jobs.
     let counts = admin::state_counts(&pool)
@@ -15366,4 +16670,2060 @@ async fn test_queue_storage_receipt_claims_are_locked_before_the_heartbeat_state
         .await
         .expect("join heartbeat")
         .expect("heartbeat after the rewrite");
+}
+
+/// Claims and leases record a job's aged effective priority while its ready
+/// row keeps the lane priority. Reads that join the two must still find the
+/// running attempt: `load_job` (behind `get_job` and lifecycle events) and
+/// the callback lookup behind external completion.
+async fn aged_claim_is_visible_to_job_and_callback_reads(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_aged_claim_reads";
+    let schema = if receipts {
+        "awa_qs_aged_claim_reads_receipts"
+    } else {
+        "awa_qs_aged_claim_reads_leases"
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 902 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim with aging");
+    assert_eq!(claimed.len(), 1);
+    let run_lease = claimed[0].job.run_lease;
+    assert!(
+        claimed[0].job.priority < 4,
+        "the claim must have aged the job for this test to mean anything"
+    );
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load aged job")
+        .expect("aged job exists");
+    assert_eq!(loaded.state, JobState::Running);
+    assert_eq!(loaded.run_lease, run_lease);
+
+    let callback_id = store
+        .register_callback(&pool, job_id, run_lease, Duration::from_secs(300))
+        .await
+        .expect("register callback on aged job");
+    let mut tx = pool.begin().await.unwrap();
+    let by_callback = store
+        .callback_job_in_tx(&mut tx, callback_id, Some(run_lease), false)
+        .await
+        .expect("callback lookup")
+        .expect("callback lookup finds the aged job");
+    tx.rollback().await.unwrap();
+    assert_eq!(by_callback.id, job_id);
+    assert_eq!(by_callback.run_lease, run_lease);
+}
+
+#[tokio::test]
+async fn test_aged_receipt_claim_is_visible_to_job_and_callback_reads() {
+    aged_claim_is_visible_to_job_and_callback_reads(true).await;
+}
+
+#[tokio::test]
+async fn test_aged_materialized_lease_is_visible_to_job_and_callback_reads() {
+    aged_claim_is_visible_to_job_and_callback_reads(false).await;
+}
+
+/// The admin reads join a materialized lease to its ready row. A lease records
+/// the aged effective priority, so joining on priority hid a job that aged
+/// before its claim from the job list, the kinds page and unique-key cancel.
+#[tokio::test]
+async fn test_aged_materialized_lease_is_visible_to_admin_reads() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_aged_lease_admin_reads";
+    let schema = "awa_qs_aged_lease_admin_reads";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: false,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("aged"),
+        InsertOpts {
+            priority: 4,
+            ..unique_cancel_opts(queue, None)
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim with aging");
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        claimed[0].job.priority < 4,
+        "the claim must have aged the job for this test to mean anything"
+    );
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id],
+        "the aged running job must be listed"
+    );
+
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .expect("job kind overviews");
+    let kind = overview
+        .iter()
+        .find(|row| row.kind == UniqueCancelJob::kind())
+        .expect("the aged job's kind is listed");
+    assert_eq!(kind.job_count, 1, "the aged running job must be counted");
+
+    let cancelled = cancel_unique(&pool, Some(queue), "aged")
+        .await
+        .expect("cancel by unique key finds the aged running job");
+    assert_eq!(cancelled.id, job_id);
+}
+
+/// A lane move leaves immutable source rows behind. Wrap the ring so the
+/// destination is in an earlier partition: point reads must use live evidence,
+/// rather than depending on which equal-timestamp ready row the plan emits last.
+async fn ready_point_read_wrap_fixture() -> (TestDbGuard, sqlx::PgPool, QueueStorage, i64) {
+    let (guard, pool) = setup_pool(4).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_point_read_wrap".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // A fresh empty ring can be positioned just before wrap without retaining
+    // unrelated jobs. This is the state reached after three rotations/prunes.
+    let schema = store.schema();
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 3 WHERE singleton"
+    ))
+    .execute(&pool)
+    .await
+    .expect("position empty ring before wrap");
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_slots SET generation = 3 WHERE slot = 3"
+    ))
+    .execute(&pool)
+    .await
+    .expect("set current slot generation");
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: "point_read_source".to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        store.rotate(&pool).await.expect("wrap to slot zero"),
+        RotateOutcome::Rotated { slot: 0, .. }
+    ));
+    (guard, pool, store, job_id)
+}
+
+async fn assert_live_ready_row(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+    expected_queue: &str,
+    expected_priority: i16,
+) {
+    let schema = store.schema();
+    let live: Vec<(String, i16, i32)> = sqlx::query_as(&format!(
+        "SELECT ready.queue, ready.priority, ready.ready_slot
+         FROM {schema}.ready_entries AS ready
+         WHERE ready.job_id = $1
+           AND NOT EXISTS (
+               SELECT 1 FROM {schema}.ready_tombstones AS tomb
+               WHERE tomb.ready_slot = ready.ready_slot
+                 AND tomb.ready_generation = ready.ready_generation
+                 AND tomb.queue = ready.queue
+                 AND tomb.priority = ready.priority
+                 AND tomb.enqueue_shard = ready.enqueue_shard
+                 AND tomb.lane_seq = ready.lane_seq
+           )"
+    ))
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .expect("read live ready evidence");
+    assert_eq!(
+        live,
+        vec![(expected_queue.to_string(), expected_priority, 0)]
+    );
+}
+
+#[tokio::test]
+async fn test_point_read_uses_live_ready_priority_after_ring_wrap() {
+    let (_guard, pool, store, job_id) = ready_point_read_wrap_fixture().await;
+    assert!(store
+        .set_priority(&pool, job_id, 1)
+        .await
+        .expect("set priority"));
+    assert_live_ready_row(&pool, &store, job_id, "point_read_source", 1).await;
+    let job = admin::get_job(&pool, job_id).await.expect("read moved job");
+    assert_eq!(
+        job.priority, 1,
+        "point read must ignore the tombstoned source"
+    );
+}
+
+#[tokio::test]
+async fn test_point_read_uses_live_ready_queue_after_ring_wrap() {
+    let (_guard, pool, store, job_id) = ready_point_read_wrap_fixture().await;
+    assert!(store
+        .move_queue(&pool, job_id, "point_read_destination", None)
+        .await
+        .expect("move queue"));
+    assert_live_ready_row(&pool, &store, job_id, "point_read_destination", 4).await;
+    let job = admin::get_job(&pool, job_id).await.expect("read moved job");
+    assert_eq!(
+        job.queue, "point_read_destination",
+        "point read must ignore the tombstoned source"
+    );
+}
+
+/// Aging moves a waiting job by tombstoning its ready row and re-inserting the
+/// same attempt on the next lane. In a quiet queue the new lane hands out the
+/// same `lane_seq`, so a lease joined to its ready row by attempt alone matched
+/// both rows and the admin reads counted the running job twice.
+async fn moved_ready_row_is_joined_once_by_attempt_reads(receipts: bool, row_local: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_moved_ready_lease_reads";
+    let schema = if row_local {
+        "awa_qs_moved_ready_row_claim_reads"
+    } else if receipts {
+        "awa_qs_moved_ready_compact_reads"
+    } else {
+        "awa_qs_moved_ready_lease_reads"
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: receipts,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &unique_cancel_job("moved"),
+        InsertOpts {
+            priority: 2,
+            ..unique_cancel_opts(queue, None)
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let aged = store
+        .age_waiting_priorities(&pool, Duration::from_secs(60), 10)
+        .await
+        .expect("age waiting priorities");
+    assert_eq!(aged, vec![job_id]);
+
+    let same_position: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(DISTINCT priority)::bigint
+         FROM {schema}.ready_entries
+         WHERE job_id = $1
+         GROUP BY ready_slot, ready_generation, enqueue_shard, lane_seq"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ready rows for the moved job");
+    assert_eq!(
+        same_position, 2,
+        "the source and destination rows must share a position for this test to mean anything"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(
+            &pool,
+            queue,
+            1,
+            if receipts && !row_local {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(30)
+            },
+        )
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert_eq!(claimed[0].claim.lease_claim_receipt, receipts);
+    assert_eq!(
+        claimed[0].claim.claim_batch_id.is_some(),
+        receipts && !row_local
+    );
+    let legacy_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claims WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify the claim representation");
+    assert_eq!(legacy_rows, i64::from(row_local));
+
+    // This is the production CTE used by current-job projections, not only
+    // the point-read candidate list. Every attempt must hydrate exactly once.
+    let projected: Vec<i64> = sqlx::query_scalar(&format!(
+        "{} SELECT job_id FROM current_jobs WHERE queue = $1 AND state = 'running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("project current running jobs");
+    assert_eq!(projected, vec![job_id], "hydrate only the live ready row");
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id],
+        "the moved running job is listed once"
+    );
+
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .expect("job kind overviews");
+    let kind = overview
+        .iter()
+        .find(|row| row.kind == UniqueCancelJob::kind())
+        .expect("the moved job's kind is listed");
+    assert_eq!(kind.job_count, 1, "the moved running job is counted once");
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load moved job")
+        .expect("moved job exists");
+    assert_eq!(loaded.state, JobState::Running);
+    assert_eq!(loaded.priority, 1, "reads the live destination row");
+    assert_eq!(
+        loaded.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(2)),
+        "payload comes from the aged destination, not its tombstoned source"
+    );
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_lease_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(false, false).await;
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_compact_receipt_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(true, false).await;
+}
+
+#[tokio::test]
+async fn test_moved_ready_row_is_joined_once_by_row_local_receipt_reads() {
+    moved_ready_row_is_joined_once_by_attempt_reads(true, true).await;
+}
+
+async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -> Vec<i64> {
+    admin::list_jobs(pool, &filter)
+        .await
+        .expect("list receipt-held jobs")
+        .into_iter()
+        .map(|job| job.id)
+        .collect()
+}
+
+async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool, row_local: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = match (receipts, row_local) {
+        (false, _) => "awa_qs_admin_scope_leases",
+        (true, false) => "awa_qs_admin_scope_compact",
+        (true, true) => "awa_qs_admin_scope_row_claims",
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: receipts,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let queue = "receipt_admin_scope";
+    let other_queue = "receipt_admin_other";
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let other_kind = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 3 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let other = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4 },
+        InsertOpts {
+            queue: other_queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let deadline = if receipts && !row_local {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(30)
+    };
+    let mut claims = store
+        .claim_runtime_batch(&pool, queue, 3, deadline)
+        .await
+        .unwrap();
+    if receipts {
+        assert!(matches!(
+            store
+                .rotate_claims(&pool)
+                .await
+                .expect("rotate between queues"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+    }
+    claims.extend(
+        store
+            .claim_runtime_batch(&pool, other_queue, 1, deadline)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(claims.len(), 4);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.lease_claim_receipt == receipts));
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.claim_batch_id.is_some() == (receipts && !row_local)));
+    let row_claims: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_claims, if row_local { 4 } else { 0 });
+
+    let scoped = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        kind: Some(CompleteJob::kind().into()),
+        queue: Some(queue.into()),
+        tag: Some("selected".into()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(receipt_admin_ids(&pool, scoped.clone()).await, vec![second]);
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                before_id: Some(second),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![first]
+    );
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: Some(first),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            tag: Some("absent".into()),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            state: Some(JobState::WaitingExternal),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                state: None,
+                limit: Some(10),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![second, first]
+    );
+
+    let projected: Vec<i64> = sqlx::query_scalar(&format!(
+        "{} SELECT job_id FROM current_jobs WHERE state='running' ORDER BY job_id DESC",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projected, vec![other, other_kind, second, first]);
+    let kinds = admin::job_kind_overviews(&pool).await.unwrap();
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!((complete.job_count, complete.queue_count), (3, 2));
+    let alternate = kinds
+        .iter()
+        .find(|kind| kind.kind == DlqJob::kind())
+        .unwrap();
+    assert_eq!((alternate.job_count, alternate.queue_count), (1, 1));
+
+    // Materialization keeps the same attempt running. The receipt leg must
+    // yield to the lease leg rather than report both representations.
+    let first_claim = claims.iter().find(|claim| claim.job.id == first).unwrap();
+    store
+        .register_callback(
+            &pool,
+            first,
+            first_claim.job.run_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("materialize one running attempt");
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                limit: Some(10),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![second, first]
+    );
+    let running: i64 = sqlx::query_scalar(&format!(
+        "{} SELECT count(*) FROM current_jobs WHERE state='running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 4, "materialization does not duplicate the claim");
+
+    let closed = claims
+        .iter()
+        .find(|claim| claim.job.id == second)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &[closed])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                limit: Some(10),
+                ..scoped
+            }
+        )
+        .await,
+        vec![first],
+        "closed receipts leave running enumeration"
+    );
+    let running: i64 = sqlx::query_scalar(&format!(
+        "{} SELECT count(*) FROM current_jobs WHERE state='running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 3);
+    let kinds = admin::job_kind_overviews(&pool).await.unwrap();
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!(
+        (complete.job_count, complete.queue_count),
+        (3, 2),
+        "the completed job is counted once, not as both running and terminal"
+    );
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_compact() {
+    receipt_admin_reads_preserve_scope_and_disposition(true, false).await;
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_row_local() {
+    receipt_admin_reads_preserve_scope_and_disposition(true, true).await;
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_materialized_control() {
+    receipt_admin_reads_preserve_scope_and_disposition(false, false).await;
+}
+
+async fn claim_aged_rescue_body_job(
+    schema: &str,
+    receipts: bool,
+    deadline: Duration,
+    max_attempts: i16,
+) -> (
+    TestDbGuard,
+    sqlx::PgPool,
+    QueueStorage,
+    awa::model::ClaimedRuntimeJob,
+) {
+    let (guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: receipts,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_aged_rescue_body";
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9027 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts,
+            metadata: serde_json::json!({"retained": "aged-rescue-body"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Control elapsed queue age without waiting five minutes; all claim,
+    // rescue, terminal and retry transitions below use their real APIs.
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    let mut claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, deadline, Duration::from_secs(60))
+        .await
+        .expect("claim aged job");
+    assert_eq!(claimed.len(), 1);
+    let original = claimed.remove(0);
+    assert_eq!(original.job.id, job_id);
+    assert_eq!(original.claim.priority, 4, "physical ready lane");
+    assert_eq!(original.job.priority, 1, "aged effective priority");
+    (guard, pool, store, original)
+}
+
+#[derive(Clone, Copy)]
+enum AgedFailedConsumer {
+    Retry,
+    Carry,
+    View,
+}
+
+async fn aged_rescued_failure_keeps_body(
+    schema: &str,
+    receipts: bool,
+    deadline: Duration,
+    consumer: AgedFailedConsumer,
+) {
+    let (_guard, pool, store, original) =
+        claim_aged_rescue_body_job(schema, receipts, deadline, 1).await;
+    let job_id = original.job.id;
+    // Zero staleness makes this committed attempt eligible without sleeps
+    // or rewriting receipt timestamps. No worker is running in this test.
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("rescue exhausted aged attempt");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    assert_eq!(rescued[0].args, original.job.args);
+    assert_eq!(rescued[0].max_attempts, 1);
+    let raw_body = done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        raw_body.0.is_none() && raw_body.1.is_none(),
+        "ready-backed failure stays narrow"
+    );
+
+    if matches!(consumer, AgedFailedConsumer::Carry) {
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry failed row")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected carry prune outcome: {other:?}"),
+            }
+        }
+        let carried = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(
+            carried.0,
+            Some(original.job.args.clone()),
+            "carry must hydrate before truncating ready backing"
+        );
+        assert_eq!(carried.1, Some(original.job.max_attempts));
+        assert_eq!(carried.3, Some(original.job.created_at));
+        let ready_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.ready_entries WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pruned ready body");
+        assert_eq!(
+            ready_count, 0,
+            "carried body must survive without ready backing"
+        );
+    }
+
+    // This is the installed SQL view, independent of the Rust hydration helper.
+    let view = terminal_view_body_columns(&pool, &store, job_id).await;
+    if matches!(consumer, AgedFailedConsumer::View) {
+        assert_eq!(
+            view.0, original.job.args,
+            "terminal_jobs must hydrate the aged failure"
+        );
+        assert_eq!(view.1, original.job.max_attempts);
+    }
+    let retained = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load retained failure")
+        .expect("retained failure");
+    let retry = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry aged failure")
+        .expect("failed job retries");
+    assert_eq!(
+        retry.args, original.job.args,
+        "manual retry must retain original arguments"
+    );
+    assert_eq!(
+        retry.max_attempts, original.job.max_attempts,
+        "manual retry must not default to25"
+    );
+    assert_eq!(retry.created_at, original.job.created_at);
+    assert_eq!(retry.metadata["retained"], "aged-rescue-body");
+    assert_eq!(retry.state, JobState::Available);
+    assert_eq!(retry.attempt, 0);
+    assert_eq!(view.0, original.job.args);
+    assert_eq!(view.1, original.job.max_attempts);
+    assert_eq!(view.3, original.job.created_at);
+    assert_eq!(retained.args, original.job.args);
+    assert_eq!(retained.max_attempts, original.job.max_attempts);
+    let rerun = store
+        .claim_runtime_batch(&pool, &original.job.queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim manual retry");
+    assert_eq!(rerun.len(), 1);
+    assert_eq!(rerun[0].job.args, original.job.args);
+    assert_eq!(rerun[0].job.max_attempts, original.job.max_attempts);
+    assert_eq!(rerun[0].job.run_lease, original.job.run_lease + 1);
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_compact_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_compact",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_deadline_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_deadline",
+        true,
+        Duration::from_secs(300),
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_legacy_retry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_legacy",
+        false,
+        Duration::from_secs(300),
+        AgedFailedConsumer::Retry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_carry_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_carry",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::Carry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_terminal_view_preserves_body() {
+    aged_rescued_failure_keeps_body(
+        "awa_qs_aged_rescue_view",
+        true,
+        Duration::ZERO,
+        AgedFailedConsumer::View,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_expired_deadline_retry_preserves_body() {
+    let (_guard, pool, store, original) = claim_aged_rescue_body_job(
+        "awa_qs_aged_rescue_expired_deadline",
+        true,
+        Duration::from_micros(1),
+        1,
+    )
+    .await;
+    // The real positive deadline has expired by the time its claim commits.
+    // This exercises deadline rescue itself, separately from heartbeat rescue.
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue expired aged attempt");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, original.job.id);
+    assert_eq!(rescued[0].state, JobState::Failed);
+    let view = terminal_view_body_columns(&pool, &store, original.job.id).await;
+    let retry = store
+        .retry_job(&pool, original.job.id)
+        .await
+        .expect("retry expired aged failure")
+        .expect("failed job retries");
+    assert_eq!(retry.args, original.job.args);
+    assert_eq!(retry.max_attempts, original.job.max_attempts);
+    assert_eq!(retry.created_at, original.job.created_at);
+    assert_eq!(view.0, original.job.args);
+    assert_eq!(view.1, original.job.max_attempts);
+}
+
+async fn aged_rescue_keeps_effective_policy_priority(dlq: bool) {
+    let schema = if dlq {
+        "awa_qs_aged_rescue_dlq"
+    } else {
+        "awa_qs_aged_rescue_retryable"
+    };
+    let max_attempts = if dlq { 1 } else { 3 };
+    let (_guard, pool, store, original) =
+        claim_aged_rescue_body_job(schema, true, Duration::ZERO, max_attempts).await;
+    let rescued = store
+        .rescue_stale_heartbeats_with_dlq(&pool, Duration::ZERO, &|_| dlq)
+        .await
+        .expect("rescue aged policy job");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(
+        rescued[0].priority, 1,
+        "deferred/DLQ policy keeps effective priority"
+    );
+    assert_eq!(rescued[0].args, original.job.args);
+    assert_eq!(rescued[0].max_attempts, max_attempts);
+    let table = if dlq { "dlq_entries" } else { "deferred_jobs" };
+    let stored: (i16, serde_json::Value, i16) = sqlx::query_as(&format!(
+        "SELECT priority, args, max_attempts FROM {schema}.{table} WHERE job_id = $1"
+    ))
+    .bind(original.job.id)
+    .fetch_one(&pool)
+    .await
+    .expect("load self-contained policy row");
+    assert_eq!(stored, (1, original.job.args, max_attempts));
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_dlq_keeps_effective_priority() {
+    aged_rescue_keeps_effective_policy_priority(true).await;
+}
+
+#[tokio::test]
+async fn test_aged_rescued_failure_retryable_keeps_effective_priority() {
+    aged_rescue_keeps_effective_policy_priority(false).await;
+}
+
+async fn moved_rescued_failure_keeps_live_lane(
+    initial_priority: i16,
+    runtime_aging: Duration,
+    consumer: AgedFailedConsumer,
+) {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_moved_rescue_identity";
+    let queue = "qs_moved_rescue_identity";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9028 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: initial_priority,
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    assert_eq!(
+        store
+            .age_waiting_priorities(&pool, Duration::from_secs(60), 1)
+            .await
+            .expect("move queued job"),
+        vec![job_id]
+    );
+    let claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, runtime_aging)
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    let physical_priority = initial_priority - 1;
+    assert_eq!(claimed[0].claim.priority, physical_priority);
+    assert_eq!(claimed[0].job.priority, 1);
+    // A physical reorder of the disposable fixture preserves all logical
+    // tuples while exposing both legal fetch orders of the retained body.
+    sqlx::raw_sql(&format!(
+        "CLUSTER {schema}.ready_entries_0 USING idx_{schema}_ready_0_lane_shard"
+    ))
+    .execute(&pool)
+    .await
+    .expect("order retained fixture rows by physical lane");
+    let physical_order: Vec<i16> = sqlx::query_scalar(&format!(
+        "SELECT priority FROM {schema}.ready_entries_0 WHERE job_id = $1 ORDER BY ctid"
+    ))
+    .bind(job_id)
+    .fetch_all(&pool)
+    .await
+    .expect("verify fixture row order");
+    assert_eq!(physical_order, vec![physical_priority, initial_priority]);
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("rescue moved job");
+    assert_eq!(rescued.len(), 1);
+    if matches!(consumer, AgedFailedConsumer::Carry) {
+        // Queued aging leaves its tombstoned source lane's cursor behind.
+        // A real empty claim consumes it before that queue slot can prune.
+        let remaining = store
+            .claim_runtime_batch(&pool, queue, 10, Duration::ZERO)
+            .await
+            .expect("advance tombstoned source lane");
+        assert!(
+            remaining.is_empty(),
+            "closed moved attempt must not run again"
+        );
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry moved failure")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                other => panic!("unexpected moved-failure prune outcome: {other:?}"),
+            }
+        }
+        let body = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(body.0, Some(claimed[0].job.args.clone()));
+        assert_eq!(body.1, Some(1));
+    }
+    let terminal: (i16, serde_json::Value, i16) = sqlx::query_as(&format!(
+        "SELECT priority,args,max_attempts FROM {schema}.terminal_jobs WHERE job_id=$1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read moved terminal view");
+    if matches!(consumer, AgedFailedConsumer::View) {
+        assert_eq!(
+            terminal.0, physical_priority,
+            "terminal view must retain the live lane"
+        );
+        assert_eq!(terminal.1, claimed[0].job.args);
+        assert_eq!(terminal.2, 1);
+    }
+    let retried = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry moved failure")
+        .expect("failed job retries");
+    assert_eq!(
+        retried.priority, claimed[0].claim.priority,
+        "retry must not select the tombstoned source lane"
+    );
+    assert_eq!(retried.args, claimed[0].job.args);
+    assert_eq!(retried.max_attempts, 1);
+    assert_eq!(terminal.0, physical_priority);
+    assert_eq!(terminal.1, claimed[0].job.args);
+    assert_eq!(
+        retried.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(initial_priority))
+    );
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_retry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(2, Duration::ZERO, AgedFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_retry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::Retry)
+        .await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_carry_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::Carry)
+        .await;
+}
+
+#[tokio::test]
+async fn test_moved_rescued_failure_aged_view_keeps_live_lane() {
+    moved_rescued_failure_keeps_live_lane(4, Duration::from_secs(60), AgedFailedConsumer::View)
+        .await;
+}
+
+async fn terminal_counts_by_priority(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+) -> Vec<(i16, i64)> {
+    sqlx::query_as(&format!(
+        r#"
+        SELECT priority, sum(n)::bigint
+        FROM (
+            SELECT priority, live_terminal_count AS n
+            FROM {schema}.queue_terminal_live_counts WHERE queue = $1
+            UNION ALL
+            SELECT priority, terminal_delta AS n
+            FROM {schema}.queue_terminal_count_deltas WHERE queue = $1
+        ) AS counters
+        GROUP BY priority HAVING sum(n) <> 0 ORDER BY priority
+        "#
+    ))
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("read per-priority terminal accounting")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyFailedConsumer {
+    Retry,
+    Carry,
+    SingleDlq,
+    BulkDlq,
+    Discard,
+}
+
+async fn legacy_aged_failure_recovers_body(moved: bool, consumer: LegacyFailedConsumer) {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_legacy_aged_body";
+    let queue = "qs_legacy_aged_body";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9029 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            max_attempts: 1,
+            metadata: serde_json::json!({"retained": "legacy-aged-body", "ready_only": true, "shared": "ready"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    if moved {
+        assert_eq!(
+            store
+                .age_waiting_priorities(&pool, Duration::from_secs(60), 1)
+                .await
+                .expect("move queued job"),
+            vec![job_id]
+        );
+    }
+    let claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, Duration::from_secs(60))
+        .await
+        .expect("claim aged legacy-shape fixture");
+    assert_eq!(claimed.len(), 1);
+    let original = &claimed[0].job;
+    let physical_priority = if moved { 3 } else { 4 };
+    assert_eq!(claimed[0].claim.priority, physical_priority);
+    assert_eq!(original.priority, 1);
+    assert_eq!(
+        store
+            .rescue_stale_heartbeats(&pool, Duration::ZERO)
+            .await
+            .expect("rescue aged fixture")
+            .len(),
+        1
+    );
+
+    // Reproduce the persisted shape of an older writer: its narrow failed
+    // row and positive terminal delta used the effective attempt priority.
+    // The ready body and all real claim/closure evidence remain intact.
+    assert_eq!(
+        sqlx::query(&format!(
+            "UPDATE {schema}.done_entries SET priority = $2 WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .bind(original.priority)
+        .execute(&pool)
+        .await
+        .expect("seed old terminal priority")
+        .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query(&format!(
+            "UPDATE {schema}.queue_terminal_count_deltas SET priority = $2 WHERE queue = $1"
+        ))
+        .bind(queue)
+        .bind(original.priority)
+        .execute(&pool)
+        .await
+        .expect("seed matching old terminal delta")
+        .rows_affected(),
+        1
+    );
+    // An old moved-body lookup could retain the source payload, losing
+    // live-lane provenance. Keep terminal errors/custom overrides authoritative.
+    let terminal_payload: serde_json::Value = sqlx::query_scalar(&format!(
+        r#"UPDATE {schema}.done_entries
+        SET payload = jsonb_set(
+            COALESCE(payload, '{{}}'::jsonb), '{{metadata}}',
+            (COALESCE(payload -> 'metadata', '{{}}'::jsonb) - '_awa_original_priority' - 'ready_only')
+                || '{{"terminal_only":true,"shared":"terminal"}}'::jsonb
+        ) || '{{"tags":["terminal-tag"],"progress":{{"terminal":true}}}}'::jsonb
+        WHERE job_id = $1 RETURNING payload"#
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed old terminal payload without live provenance");
+    assert!(terminal_payload["metadata"]
+        .get("_awa_original_priority")
+        .is_none());
+    assert!(!terminal_payload["errors"].as_array().unwrap().is_empty());
+    let body = done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        body.0.is_none() && body.1.is_none(),
+        "old row requires its ready body"
+    );
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, queue).await,
+        vec![(1, 1)]
+    );
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
+
+    if matches!(consumer, LegacyFailedConsumer::Carry) {
+        let remaining = store
+            .claim_runtime_batch(&pool, queue, 10, Duration::ZERO)
+            .await
+            .expect("advance any tombstoned source cursor");
+        assert!(remaining.is_empty());
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            match store
+                .prune_oldest(&pool, Duration::from_secs(3600))
+                .await
+                .expect("carry old failed row")
+            {
+                PruneOutcome::Pruned {
+                    slot: 0,
+                    carried_failed_rows: 1,
+                } => break,
+                PruneOutcome::Blocked { slot: 0 } if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected legacy carry outcome: {other:?}"),
+            }
+        }
+        let body = done_body_columns(&pool, &store, job_id).await;
+        assert_eq!(body.0, Some(original.args.clone()));
+        assert_eq!(body.1, Some(original.max_attempts));
+        let ready_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.ready_entries WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ready_count, 0,
+            "carry must preserve the body before its backing is pruned"
+        );
+        assert_eq!(
+            terminal_counts_by_priority(&pool, schema, queue).await,
+            vec![(physical_priority, 1)],
+            "carried delta must match its replacement lane"
+        );
+        assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 1);
+    }
+    let retry = match consumer {
+        LegacyFailedConsumer::Retry | LegacyFailedConsumer::Carry => store
+            .retry_job(&pool, job_id)
+            .await
+            .expect("retry legacy failure")
+            .expect("legacy failed row retries"),
+        LegacyFailedConsumer::SingleDlq | LegacyFailedConsumer::BulkDlq => {
+            if matches!(consumer, LegacyFailedConsumer::SingleDlq) {
+                let moved = store
+                    .move_failed_to_dlq(&pool, job_id, "manual-legacy-test")
+                    .await
+                    .expect("move old failed row to DLQ")
+                    .expect("one row moves");
+                assert_eq!(moved.id, job_id);
+                assert_eq!(moved.args, original.args);
+                assert_eq!(moved.max_attempts, original.max_attempts);
+            } else {
+                assert_eq!(
+                    store
+                        .bulk_move_failed_to_dlq(
+                            &pool,
+                            Some(CompleteJob::kind()),
+                            Some(queue),
+                            "manual-legacy-test",
+                        )
+                        .await
+                        .expect("bulk move old failed row to DLQ"),
+                    1,
+                    "one terminal row must not multiply through moved ready bodies"
+                );
+            }
+            let dlq_rows: Vec<(i16, serde_json::Value, i16, serde_json::Value)> =
+                sqlx::query_as(&format!(
+                    "SELECT priority,args,max_attempts,COALESCE(payload,'{{}}'::jsonb) FROM {schema}.dlq_entries WHERE job_id=$1"
+                )).bind(job_id).fetch_all(&pool).await.expect("read actual stored DLQ row");
+            assert_eq!(dlq_rows.len(), 1);
+            assert_eq!(dlq_rows[0].0, physical_priority);
+            assert_eq!(dlq_rows[0].1, original.args);
+            assert_eq!(dlq_rows[0].2, original.max_attempts);
+            assert_eq!(dlq_rows[0].3["metadata"]["_awa_original_priority"], 4);
+            assert_eq!(dlq_rows[0].3["metadata"]["shared"], "terminal");
+            assert_eq!(dlq_rows[0].3["errors"], terminal_payload["errors"]);
+            assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+            assert!(
+                terminal_counts_by_priority(&pool, schema, queue)
+                    .await
+                    .is_empty(),
+                "DLQ move must decrement the stored priority-1 terminal key"
+            );
+            assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+            store
+                .retry_from_dlq(&pool, job_id, &awa::model::RetryFromDlqOpts::default())
+                .await
+                .expect("retry recovered DLQ row")
+                .expect("DLQ row retries")
+        }
+        LegacyFailedConsumer::Discard => {
+            assert_eq!(
+                store
+                    .discard_failed_by_kind(&pool, CompleteJob::kind())
+                    .await
+                    .expect("discard old failed row"),
+                1,
+                "one terminal row must not multiply through moved ready bodies"
+            );
+            assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+            let dlq_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {schema}.dlq_entries WHERE job_id=$1"
+            ))
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(dlq_count, 0);
+            assert!(
+                terminal_counts_by_priority(&pool, schema, queue)
+                    .await
+                    .is_empty(),
+                "discard must decrement exactly its stored terminal lane"
+            );
+            assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+            return;
+        }
+    };
+    assert_eq!(retry.args, original.args);
+    assert_eq!(retry.max_attempts, original.max_attempts);
+    assert_eq!(retry.created_at, original.created_at);
+    assert_eq!(
+        retry.priority, physical_priority,
+        "manual retry restarts aging from its live lane"
+    );
+    assert_eq!(retry.metadata["retained"], "legacy-aged-body");
+    assert_eq!(
+        retry.metadata["ready_only"], true,
+        "recover ready metadata defaults"
+    );
+    assert_eq!(retry.metadata["shared"], "terminal", "stored metadata wins");
+    assert_eq!(retry.metadata["terminal_only"], true);
+    if moved {
+        assert_eq!(retry.metadata["_awa_original_priority"], 4);
+    }
+    assert_eq!(retry.tags, vec!["terminal-tag"]);
+    assert_eq!(
+        serde_json::to_value(&retry.errors).unwrap(),
+        terminal_payload["errors"]
+    );
+    let expected_progress = if matches!(
+        consumer,
+        LegacyFailedConsumer::SingleDlq | LegacyFailedConsumer::BulkDlq
+    ) {
+        None // Existing DLQ retry clears progress before making the job ready.
+    } else {
+        Some(serde_json::json!({"terminal": true}))
+    };
+    assert_eq!(retry.progress, expected_progress);
+    assert_eq!(retry.attempt, 0);
+    assert_eq!(retry.state, JobState::Available);
+    assert!(
+        terminal_counts_by_priority(&pool, schema, queue)
+            .await
+            .is_empty(),
+        "remove the stored terminal lane, not the recovered retry lane"
+    );
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+}
+
+#[tokio::test]
+async fn test_legacy_aged_failure_retry_recovers_body() {
+    legacy_aged_failure_recovers_body(false, LegacyFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_failure_retry_recovers_live_body() {
+    legacy_aged_failure_recovers_body(true, LegacyFailedConsumer::Retry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_failure_carry_recovers_body_and_counters() {
+    legacy_aged_failure_recovers_body(true, LegacyFailedConsumer::Carry).await;
+}
+
+#[tokio::test]
+async fn test_legacy_aged_moved_terminal_dlq_and_discard_consumers() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut failures = Vec::new();
+            for consumer in [
+                LegacyFailedConsumer::SingleDlq,
+                LegacyFailedConsumer::BulkDlq,
+                LegacyFailedConsumer::Discard,
+            ] {
+                // Exercise every parameter even after another panics. These
+                // database futures do not require Send on a local task.
+                if let Err(error) =
+                    tokio::task::spawn_local(legacy_aged_failure_recovers_body(true, consumer))
+                        .await
+                {
+                    failures.push(format!("{consumer:?}: {error}"));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "terminal consumer failures: {failures:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_legacy_narrow_available_cancel_retry_keeps_tombstoned_body() {
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_legacy_cancel_body";
+    let queue = "qs_legacy_cancel_body";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9030 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 3,
+            max_attempts: 7,
+            metadata: serde_json::json!({"retained": "legacy-cancel-body"}),
+            ..Default::default()
+        },
+    )
+    .await;
+    let cancelled = store
+        .cancel_job(&pool, job_id)
+        .await
+        .expect("cancel available job")
+        .expect("available job cancels");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    let backing: (i64, i64, bool) = sqlx::query_as(&format!(
+        r#"
+        SELECT done.run_lease, ready.run_lease, EXISTS (
+            SELECT 1 FROM {schema}.ready_tombstones tomb
+            WHERE tomb.ready_slot = ready.ready_slot
+              AND tomb.ready_generation = ready.ready_generation
+              AND tomb.queue = ready.queue AND tomb.priority = ready.priority
+              AND tomb.enqueue_shard = ready.enqueue_shard
+              AND tomb.lane_seq = ready.lane_seq AND tomb.job_id = ready.job_id
+        )
+        FROM {schema}.done_entries done JOIN {schema}.ready_entries ready
+        ON ready.job_id = done.job_id AND ready.priority = done.priority
+        WHERE done.job_id = $1
+    "#
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cancelled body identity");
+    assert_eq!(
+        backing.0, backing.1,
+        "unclaimed cancellation keeps the same run lease"
+    );
+    assert!(backing.2, "cancellation tombstones its retained body");
+    // Older narrow cancellations legitimately hydrate a same-lease body
+    // even though cancellation has already tombstoned that exact lane.
+    assert_eq!(sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET args=NULL, max_attempts=NULL, run_at=NULL, created_at=NULL WHERE job_id=$1"
+    )).bind(job_id).execute(&pool).await.unwrap().rows_affected(), 1);
+    assert_eq!(
+        terminal_counts_by_priority(&pool, schema, queue).await,
+        vec![(3, 1)]
+    );
+    let retry = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry narrow cancellation")
+        .expect("cancelled job retries");
+    assert_eq!(retry.args, cancelled.args);
+    assert_eq!(retry.max_attempts, 7);
+    assert_eq!(retry.priority, 3);
+    assert_eq!(retry.created_at, cancelled.created_at);
+    assert_eq!(retry.metadata["retained"], "legacy-cancel-body");
+    assert!(terminal_counts_by_priority(&pool, schema, queue)
+        .await
+        .is_empty());
+    assert_eq!(store.queue_counts(&pool, queue).await.unwrap().terminal, 0);
+}
+
+#[tokio::test]
+async fn test_receipt_list_refills_pages_past_closed_and_other_kind_claims() {
+    let (_guard, pool) = setup_pool(6).await;
+    let queue = "receipt_candidate_refill";
+    let store = create_store_with_config(
+        &pool,
+        unique_cancel_store_config("awa_qs_receipt_candidate_refill"),
+    )
+    .await;
+    let mut targets = Vec::new();
+    for id in 0..3 {
+        targets.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    tags: vec!["selected".into()],
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let targets_claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("claim older targets");
+    assert_eq!(targets_claimed.len(), 3);
+    let first_target = targets_claimed
+        .iter()
+        .find(|claim| claim.job.id == targets[0])
+        .expect("first target was claimed");
+    // The same job appears in both the lease and raw-receipt candidate sources.
+    store
+        .register_callback(
+            &pool,
+            targets[0],
+            first_target.job.run_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("materialize one target");
+
+    let mut all_ids = targets.clone();
+    for id in 10..22 {
+        all_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 12, Duration::ZERO)
+        .await
+        .expect("claim newer completed candidates");
+    assert_eq!(finished.len(), 12);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &finished)
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+    for id in 30..42 {
+        all_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &DlqJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        store
+            .claim_runtime_batch(&pool, queue, 12, Duration::ZERO)
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+
+    let filter = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        kind: Some(CompleteJob::kind().into()),
+        queue: Some(queue.into()),
+        limit: Some(2),
+        ..Default::default()
+    };
+    targets.sort_unstable_by(|a, b| b.cmp(a));
+    let first = receipt_admin_ids(&pool, filter.clone()).await;
+    assert_eq!(first, targets[..2]);
+    let second = receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: first.last().copied(),
+            ..filter.clone()
+        },
+    )
+    .await;
+    assert_eq!(second, targets[2..]);
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                tag: Some("selected".into()),
+                limit: Some(100),
+                ..filter
+            },
+        )
+        .await,
+        targets
+    );
+    all_ids.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                queue: Some(queue.into()),
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await,
+        all_ids,
+        "closed receipts and materialized claims must not duplicate results"
+    );
+}
+
+struct PointReadControl {
+    _guard: TestDbGuard,
+    pool: sqlx::PgPool,
+    reads: sqlx::PgPool,
+    store: Arc<QueueStorage>,
+    original: JobRow,
+    reader_pid: i32,
+}
+
+impl PointReadControl {
+    async fn new(schema: &str) -> Self {
+        let (guard, pool) = setup_pool(6).await;
+        let store = Arc::new(
+            create_store_with_config(
+                &pool,
+                QueueStorageConfig {
+                    schema: schema.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 9030 },
+            InsertOpts {
+                queue: "qs_point_read_control".into(),
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let reads = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .application_name("awa_point_read_control"),
+            )
+            .await
+            .expect("point reader pool");
+        let original = store
+            .load_job(&reads, job_id)
+            .await
+            .expect("warm cached point queries")
+            .expect("available job");
+        let reader_pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&reads)
+            .await
+            .expect("point reader identity");
+        Self {
+            _guard: guard,
+            pool,
+            reads,
+            store,
+            original,
+            reader_pid,
+        }
+    }
+
+    async fn block_deferred(&self) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut locker = self.pool.begin().await.expect("point read blocker");
+        sqlx::query(&format!(
+            "LOCK TABLE {}.deferred_jobs IN ACCESS EXCLUSIVE MODE",
+            self.store.schema()
+        ))
+        .execute(locker.as_mut())
+        .await
+        .expect("hold point reader between ready and deferred legs");
+        locker
+    }
+
+    fn start_read(&self) -> tokio::task::JoinHandle<Result<Option<JobRow>, AwaError>> {
+        let store = self.store.clone();
+        let reads = self.reads.clone();
+        let job_id = self.original.id;
+        tokio::spawn(async move { store.load_job(&reads, job_id).await })
+    }
+
+    async fn wait_until_blocked(&self) {
+        let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)",
+            )
+            .bind(self.reader_pid)
+            .fetch_one(&self.pool)
+            .await
+            .expect("observe point read barrier");
+            if waiting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "point read did not reach barrier"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn assert_pool_has_no_read_transaction(&self) {
+        let settings: (String, bool) = sqlx::query_as(
+            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')::boolean",
+        )
+        .fetch_one(&self.reads)
+        .await
+        .expect("reuse point reader after interruption");
+        assert_eq!(settings, ("read committed".into(), false));
+        sqlx::query("CREATE TEMP TABLE point_read_write_control (value int)")
+            .execute(&self.reads)
+            .await
+            .expect("next caller can write outside the read-only transaction");
+    }
+}
+
+#[tokio::test]
+async fn test_point_read_releases_earlier_locks_but_keeps_its_snapshot() {
+    let control = PointReadControl::new("awa_qs_point_snapshot").await;
+    let mut locker = control.block_deferred().await;
+    let reading = control.start_read();
+    control.wait_until_blocked().await;
+    let held: Vec<String> = sqlx::query_scalar(
+        "SELECT relation.relname FROM pg_locks AS locks JOIN pg_class AS relation ON relation.oid=locks.relation JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace WHERE locks.pid=$1 AND locks.granted AND namespace.nspname=$2 AND relation.relkind IN ('r','p') AND relation.relname LIKE 'ready_entries%' ORDER BY relation.relname",
+    )
+    .bind(control.reader_pid)
+    .bind(control.store.schema())
+    .fetch_all(&control.pool)
+    .await
+    .expect("inspect retained ready relation locks");
+    assert_eq!(
+        held,
+        vec!["ready_entries_0"],
+        "retain the located body without pinning every ready partition"
+    );
+    let schema = control.store.schema();
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.deferred_jobs (job_id,kind,queue,args,state,priority,attempt,run_lease,max_attempts,run_at,created_at,payload) SELECT job_id,kind,queue,args,'scheduled'::awa.job_state,priority,attempt,run_lease+1,max_attempts,clock_timestamp()+interval '1 hour',created_at,payload FROM {schema}.ready_entries WHERE job_id=$1"
+    ))
+    .bind(control.original.id)
+    .execute(locker.as_mut())
+    .await
+    .expect("move the row after the reader's first leg");
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.ready_entries WHERE job_id=$1"
+    ))
+    .bind(control.original.id)
+    .execute(locker.as_mut())
+    .await
+    .expect("remove old ready row in the same transaction");
+    locker.commit().await.expect("commit concurrent move");
+    let old = reading
+        .await
+        .expect("point read task")
+        .expect("point read")
+        .expect("snapshot retained the old row");
+    assert_eq!(old.state, JobState::Available);
+    assert_eq!(old.run_lease, control.original.run_lease);
+    let new = control
+        .store
+        .load_job(&control.reads, control.original.id)
+        .await
+        .expect("reuse cached point statements")
+        .expect("next snapshot sees the successor");
+    assert_eq!(new.state, JobState::Scheduled);
+    assert_eq!(new.run_lease, control.original.run_lease + 1);
+    assert_eq!(new.args, control.original.args);
+    assert_eq!(new.max_attempts, control.original.max_attempts);
+    control.reads.close().await;
+}
+
+#[tokio::test]
+async fn test_point_read_cancellation_rolls_back_its_outer_transaction() {
+    let control = PointReadControl::new("awa_qs_point_cancel").await;
+    let locker = control.block_deferred().await;
+    let reading = control.start_read();
+    control.wait_until_blocked().await;
+    reading.abort();
+    assert!(reading.await.expect_err("read was aborted").is_cancelled());
+    locker.rollback().await.expect("release point read barrier");
+    control.assert_pool_has_no_read_transaction().await;
+    control.reads.close().await;
+}
+
+#[tokio::test]
+async fn test_point_read_query_error_rolls_back_its_outer_transaction() {
+    let control = PointReadControl::new("awa_qs_point_error").await;
+    sqlx::query("SET lock_timeout='100ms'")
+        .execute(&control.reads)
+        .await
+        .expect("bound blocked point read");
+    let locker = control.block_deferred().await;
+    let result = control
+        .store
+        .load_job(&control.reads, control.original.id)
+        .await;
+    assert!(
+        matches!(result, Err(AwaError::Database(ref error)) if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some("55P03")))
+    );
+    locker.rollback().await.expect("release point read barrier");
+    control.assert_pool_has_no_read_transaction().await;
+    control.reads.close().await;
+}
+
+#[tokio::test]
+async fn test_point_read_keeps_located_body_until_failed_carry_can_finish() {
+    let control = PointReadControl::new("awa_qs_point_carry").await;
+    let claimed = control
+        .store
+        .claim_runtime_batch(&control.pool, &control.original.queue, 1, Duration::ZERO)
+        .await
+        .expect("claim carry fixture");
+    assert_eq!(claimed.len(), 1);
+    let failed = control
+        .store
+        .rescue_stale_heartbeats(&control.pool, Duration::ZERO)
+        .await
+        .expect("exhaust carry fixture");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].state, JobState::Failed);
+    assert!(matches!(
+        control.store.rotate(&control.pool).await.expect("rotate"),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let locker = control.block_deferred().await;
+    let reading = control.start_read();
+    control.wait_until_blocked().await;
+    assert!(matches!(
+        control
+            .store
+            .prune_oldest(&control.pool, Duration::from_secs(3600))
+            .await
+            .expect("prune while located body is in use"),
+        PruneOutcome::Blocked { slot: 0 }
+    ));
+    locker.rollback().await.expect("release read barrier");
+    let before = reading
+        .await
+        .expect("point read task")
+        .expect("read before carry")
+        .expect("retained failure");
+    assert_eq!(before.state, JobState::Failed);
+    assert_eq!(before.args, control.original.args);
+    assert_eq!(before.max_attempts, 1);
+    assert_eq!(before.errors, failed[0].errors);
+    assert!(matches!(
+        control
+            .store
+            .prune_oldest(&control.pool, Duration::from_secs(3600))
+            .await
+            .expect("carry after point read releases its body"),
+        PruneOutcome::Pruned {
+            slot: 0,
+            carried_failed_rows: 1
+        }
+    ));
+    let after = control
+        .store
+        .load_job(&control.reads, control.original.id)
+        .await
+        .expect("read carried failure")
+        .expect("carried failure remains visible");
+    assert_eq!(after.state, JobState::Failed);
+    assert_eq!(after.args, before.args);
+    assert_eq!(after.max_attempts, before.max_attempts);
+    assert_eq!(after.errors, before.errors);
+    control.reads.close().await;
 }
