@@ -6,16 +6,26 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- Keep committed claims out of physical priority aging, even before their
-  cursor advances. Recovery and cancellation can hydrate an exact retained
-  claimed body after older aging tombstoned it, preserving original-priority
-  metadata and rejecting ambiguous historical bodies. Emitted-lane evidence
-  takes precedence over colliding live replacements, and their recovered
-  terminal bodies remain self-contained through retry. Historical receipt
-  evidence remains usable after reopening a custom store in legacy mode.
-  Without that evidence, legacy or backfilled claims retain a compatibility
-  fallback that cannot reliably identify the original physical lane in this
-  historical collision.
+- Keep committed claims out of physical priority aging before its batch limit,
+  even before their cursor advances. Active point and callback reads recover
+  retained tombstoned bodies left by older aging. Recovery, cancellation and
+  completion by ID hydrate those bodies and retire unclaimed copies of the same
+  attempt, preserving original-priority metadata and rejecting ambiguous
+  historical bodies. Emitted-lane evidence takes precedence over colliding live
+  replacements, and their recovered terminal bodies remain self-contained
+  through retry. Cancellation prefers an active attempt over its historical
+  available replacement. Historical receipt evidence remains usable after
+  reopening a custom store in legacy mode. Without that evidence, legacy or
+  backfilled claims retain a compatibility fallback that cannot reliably
+  identify the original physical lane in this historical collision.
+  Repair runs only when a transition hydrates a retained tombstoned body;
+  worker completion using its carried job body can leave an old replacement
+  claimable. Updated aging callers prevent new replacements, but cannot fence
+  an older process explicitly calling physical aging during a rolling upgrade.
+  Repair takes claim-head row locks without waiting and rolls back on
+  contention; the operation must retry. It adds weak relation locks and
+  tombstone writes only on this recovery path. Fresh rechecks rely on READ
+  COMMITTED isolation.
 
 - Preserve recovered bodies and physical lane priority when manually moving
   historical aged terminal failures to the DLQ, so later DLQ retry retains
