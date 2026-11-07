@@ -305,6 +305,89 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V28 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
 | V29 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
 
+## Persona soak
+
+Durable loss detection covers every lifecycle-observed job and a deterministic `job_id % 64 = 0` sample of `NO_EVENTS` workloads. The other 63/64 returned `NO_EVENTS` jobs remain in enqueue/execution accounting, but their terminal commits are not proven. A bulk observer polls sampled terminal rows and eventful attempts whose handlers returned without terminal proof once per second (2 s query timeout, 100,000-row cap) and keeps the run lease in the client ledger, so captured proof survives pruning. A handler return is never terminal proof. Missing sampled proof after pruning or a failed invariant query makes the report `INCONCLUSIVE` and fails the test; it does not assert job loss or establish a pass. Reports include sampled, confirmed and excluded counts.
+
+On CI, assertion waits and heartbeat staleness use `ci_timing.rs` scaling; load durations, kill schedules and measurement windows retain their configured values.
+
+
+`awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`, Python side in `awa/tests/persona_soak/python/`) runs several
+application-shaped workloads concurrently against one database, the way different
+applications share an `awa` schema, and fails the run on any invariant violation.
+
+| Persona | Workload | Stresses |
+| --- | --- | --- |
+| Mia, ML pipeline | jobs of 0.1-60 s with per-job deadlines, progress updates, retries into the DLQ, handler cancels, latency spikes | deadline and stale-heartbeat rescues racing heartbeats and completions, DLQ |
+| Tom, multi-tenant | 100 queues at a low rate each, unique jobs, scheduled jobs, cron every 10 s on two runtimes, mixed priorities with aging | lane and queue cardinality, per-queue maintenance, cron fencing |
+| Priya, firehose | one hot queue, 100k-row `insert_many` bursts, COPY batches, steady small batches, tiny jobs, three runtimes | bind-parameter limit, ring rotation and prune, claim contention |
+| Sam, ordered streams | a queue with 4 enqueue shards and 64 ordering keys, a 4-stripe queue (`queue_stripe_count`), scheduled jobs, a rate-limited queue | routing, promotion, fairness |
+| Alex, operator | pause/resume, drain, cancel and bulk cancel, move and reprioritise batch operations, DLQ retry and purge, the admin read queries, rolling restarts of other personas' runtimes | admin paths under live load |
+| Chaos | kills a runtime or the Python process without a shutdown handshake, terminates the maintenance leader's connection and random runtime connections, exhausts a runtime's pool, holds an idle-in-transaction session | recovery paths |
+| Watchers | six dashboard tabs polling overview, queues, counts, timeseries, runtime and storage at the UI's refresh interval, some also the kinds, queue-runtime and cron pages | admin read queries under load, through the real `awa serve` HTTP server |
+| Support engineer | searches jobs by kind, queue, state and tag, pages through large result sets with `before_id`, opens job detail and follows a job at the detail page's poll rate, pages the DLQ, opens runtime, cron and kind pages | search and paging cost against retained history and backlog |
+| UI operator | the UI's mutations over HTTP: pause and resume queues and cron schedules, cancel and bulk-cancel, DLQ retry and purge (single and by filter), batch operation preview and submit | mutation endpoints racing live work |
+| Impatient user | requests abandoned after a few milliseconds, bursts of refreshes, while sampling the server's database sessions | an abandoned request must not keep a pool connection past the statement timeout |
+| Fanout, replay fan-out | parent jobs whose handlers batch-insert 100-185 unique child jobs (`insert_many`, unique by queue and args) into their own queue from many concurrent handlers; some parents replay a batch with an already-claimed key, hit the unique violation and fall back to row-by-row inserts | concurrent batch enqueue into one lane, unique claims, inserting from inside a handler |
+| Shard operator | an operator changes `enqueue_shards` on two hot queues while producers, promotion and claimers run: 1 → 4 → 8, down to 2 and back to 1, sometimes after `prepare_queue` and sometimes not, restarting some runtimes and producer `QueueStorage` handles before others so cached shard counts disagree. Producers use `insert_many`, `insert_many_copy` and `QueueStorage::enqueue_params_batch`, with scheduled jobs, retries (promotion into shards) and `ordering_key` jobs. The actors run as non-superuser roles: a schema owner that migrates and runs `prepare_queue`, a migrator role with default privileges, and two application roles in a runtime group role with no default privileges, granted as in `docs/security.md`. For some raises the producers are held until the maintenance leader's runtime has created the new lanes, so a different role is the next to use them | live shard-count changes (ADR-025), lane provisioning by different roles, stale per-process shard counts, promotion into new shards |
+| Claim and abandon | a separate process (the harness binary started again with one test selected) that claims as much as it can: `max_workers` equal to the target on two queues, one with zero deadlines (compact claim batches) and one with a deadline (one claim row per job), jobs held until the process dies, heartbeats running. It is killed with SIGKILL, repeatedly, and replaced after a few seconds by a process that claims the rescued jobs again; some jobs have `max_attempts` 2 so repeated kills dead-letter them. A surviving in-process runtime leads maintenance and serves a canary queue of short jobs, and the other personas keep working; after the last kill an in-process runtime finishes the rescued jobs | rescue of a large abandoned-claim backlog, claim-ring rotation while slots hold abandoned claims, false rescues of live owners, `max_attempts` and the DLQ under repeated rescue |
+| Python users | a separate process using `awa-python`: single inserts, a 6,500-row `insert_many` in one transaction and a COPY batch, enqueues in transactions that sometimes roll back; async workers that complete, raise, `RetryAfter`, `Snooze`, report progress, overrun a queue deadline and ignore their deadline; a queue shared with a Rust runtime; a periodic migrate-then-query probe | Python bindings against live load, mixed Rust and Python runtimes on one lane, the documented slot behaviour of an ignored deadline, connections stranded after `migrate()` |
+
+The oracle checks, while the load runs and again after it stops:
+
+- a job attempt with more than one terminal row (`done_entries`, `dlq_entries`, compact receipt completions), a job reported completed twice, and a job that is terminal and still available, deferred or leased
+- a cancelled job nobody asked to cancel, an operator cancel that overwrote a completion, and a handler that started after its operator cancel committed
+- a queue with claimable jobs and idle workers whose claim cursor stops advancing (stall), and scheduled jobs overdue beyond a threshold (promotion stall)
+- a lost job: enqueued, never terminal after the system quiesces, and not removed by an operator action; a cron fire that produced more than one job
+- shard operations: every job enqueued before, during and after a shard-count change runs and completes exactly once (a repeat is allowed only after a stale-heartbeat rescue and is reported as a finding), every shard drains including those above a lowered count, claim cursors keep advancing on every shard that has backlog while workers are idle (the per-shard lag query from ADR-025), `ordering_key` jobs start in order per key within a window in which every runtime had observed the shard count, and no role raises a permission-denied or missing-lane error (found in the server log, with the role, lane, sequence owner and statement; needs `AWA_SOAK_PG_CONTAINER` or `AWA_SOAK_PG_LOG`, and `log_line_prefix` containing `%u@%a`, as `scripts/persona-soak.sh` sets)
+- claim and abandon: after each SIGKILL the rescue backlog (open claims whose last heartbeat or claim time is older than the staleness window, or whose deadline passed, counted every few seconds from the claim tables and leases) clears within `AWA_SOAK_ABANDON_BOUND_SECONDS`, with the age and count of the oldest unrescued expired claim sampled into `abandon-backlog.csv` and the time to clear reported per kill; the claim ring does not stay still for longer than the bound once the slot it must enter next holds no claim whose owner is alive (a ring pinned by a live process is expected); no job is run again while the process that held it is alive (every start is recorded with the process that ran it, and a repeat is allowed only after that process was killed); no attempt exceeds `max_attempts`, no job is dead-lettered early, and a job abandoned on its last attempt ends in the DLQ
+- a transaction the Python application rolled back that left a job in the store, and database sessions left stranded by the Python `migrate()` path
+- an admin-server query that outlives its statement timeout, and sessions still running a query after every UI client has stopped
+- a server crash: `pg_postmaster_start_time()` changing, or `terminated by signal`, `TRAP:`, `server process (PID` and similar lines in the Postgres log
+
+Slow or failing admin endpoints, latency that grows with retained history or backlog, and admin queries cancelled by the statement timeout are reported as non-fatal findings in the report, next to the violations.
+
+Terminal rows are pruned by ring rotation within seconds, so the oracle keeps a
+client-side ledger (job ids per persona, executions per job, lifecycle events,
+operator actions) and reconciles it with the database. Time-based checks are widened
+while a chaos action is recovering.
+
+Environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `AWA_SOAK_DATABASE_URL` | required; database name must match `awa_soak[A-Za-z0-9_]*` and is dropped and recreated |
+| `AWA_SOAK_PERSONAS` | comma list of `mia,tom,priya,sam,alex,chaos,watchers,support,uiops,impatient,python,fanout,shardops,abandon`, default all |
+| `AWA_SOAK_ABANDON_CLAIMS`, `AWA_SOAK_ABANDON_KILL_SECONDS`, `AWA_SOAK_ABANDON_KILLS` | the claim-and-abandon persona's scale, independent of `AWA_SOAK_SCALE`: claims each killed process holds (default 4000; 25,000 to 70,000 reproduces a large backlog), seconds between kills (default 180, long enough for the process to claim everything and heartbeat for a while) and how many processes are killed (default 4; the last kill is the end of the load phase if that comes first) |
+| `AWA_SOAK_ABANDON_BOUND_SECONDS`, `AWA_SOAK_ABANDON_RESTART_SECONDS` | the bound after a kill within which the rescue backlog must clear and the claim ring must be free to rotate (default 120), and the pause before the replacement process starts (default 3) |
+| `AWA_SOAK_HEARTBEAT_SECONDS`, `AWA_SOAK_STALENESS_SECONDS` | heartbeat interval (default 2) and heartbeat staleness after which a claim may be rescued (default 12) of every runtime, including the claim-and-abandon process; the library's own defaults are 30 and 90. The claim-and-abandon persona also records the duration of each heartbeat pass of its process against the number of handlers running, read from the timestamps the heartbeats write (`abandon-heartbeat-passes.csv`, and percentiles by handler count in the report) |
+| `AWA_SOAK_RESCUE_INTERVAL_SECONDS` | heartbeat and deadline rescue interval of every runtime; unset keeps the harness's 3 s and 2 s, the library default for heartbeat rescue is 30 s |
+| `AWA_SOAK_SHARDOPS_SCALE`, `AWA_SOAK_SHARDOPS_SCHEMA_CREATE` | the shard operator's rate multiplier, independent of `AWA_SOAK_SCALE` (default 1), and whether its application roles may create objects in the schema (default 1: lanes are created on the fly; 0 withholds schema `CREATE` and the operator provisions every lane before raising a count) |
+| `AWA_SOAK_SHARED_CREATOR_GRANTS` | default `0`; `1` shares application-created objects for comparisons with older binaries and requires schema `CREATE`. Keep it off when checking application-role privileges. |
+| `AWA_SOAK_UI_POOL_MAX`, `AWA_SOAK_ADMIN_READ_SECONDS` | the admin server's database pool size (default 10) and the seconds between the operator persona's admin read queries (default 2); lower the load on a slow server by shrinking the pool and stretching the interval |
+| `AWA_SOAK_AWA_BIN` | the `awa` binary for the UI personas (`cargo build --release -p awa-cli`); defaults to the one next to the test binary |
+| `AWA_SOAK_PYTHON` | interpreter of a virtualenv with `awa-python` installed (`uv venv awa-python/.venv`, `uv pip install maturin`, `maturin develop --release` in `awa-python/`); required by the `python` persona |
+| `AWA_SOAK_UI_STATEMENT_TIMEOUT_SECONDS`, `AWA_SOAK_UI_CLIENT_TIMEOUT_SECONDS` | the admin server's statement timeout (default 30) and the UI personas' request timeout (default 45); a request that hits either is reported as a finding |
+| `AWA_SOAK_SECONDS` | load phase length, default 900 |
+| `AWA_SOAK_SEED` | fixes the workload mix and chaos schedule; printed at start |
+| `AWA_SOAK_SCALE` | multiplies rates, burst sizes and queue counts, default 1 |
+| `AWA_SOAK_DRAIN_GRACE_SECONDS` | how long to wait for the system to quiesce after load stops, default 120 |
+| `AWA_SOAK_PG_LOG` / `AWA_SOAK_PG_CONTAINER` / `AWA_SOAK_PG_CONTAINER_LOG` | where to read the server log for the crash scan: a file on this host, or a Docker container (with an optional log path inside it, otherwise `docker logs`) |
+| `AWA_SOAK_REPORT_DIR` | where `report.md`, `report.json` and, for a failed run, `reproducer.md` are written |
+| `AWA_SOAK_STALL_SECONDS`, `AWA_SOAK_PROMOTION_OVERDUE_SECONDS`, `AWA_SOAK_CHAOS_SLACK_SECONDS` | oracle thresholds |
+
+The report records the engine, server version, `max_connections`, connections at
+start and the per-persona connection budget. A failed run leaves `reproducer.md`
+with the seed, personas and duration, the violating rows, the timeline around each
+violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the
+engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18
+image) in private containers on separate ports and removes them afterwards.
+
+After-exit retained-session findings require a successful `CLOSED`
+acknowledgement and a valid final session observation. Forced or unproven exits
+remain incomplete evidence. Pool-budget and idle-transaction checks after
+readiness remain independent.
+
 ## Running Tests
 
 ```bash
@@ -328,6 +411,26 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python" \
   cargo test --package awa --test chaos_suite_test \
   -- --ignored --test-threads=1 --nocapture
+
+# Persona soak: Mia (ML pipeline), Tom (multi-tenant fan-out), Priya (firehose),
+# Sam (ordered streams), Alex (operator) and a chaos agent run together against one
+# disposable database on the queue-storage engine, checked by an invariant oracle.
+# The database name must start with `awa_soak`; it is dropped and recreated.
+AWA_SOAK_DATABASE_URL=postgres://postgres:test@localhost:15432/awa_soak_run \
+  AWA_SOAK_SECONDS=900 \
+  cargo test --release -p awa --test persona_soak_test -- --ignored --nocapture
+
+# The same soak against throwaway PostgreSQL 17, 18 and assert-enabled 18 containers
+scripts/persona-soak.sh            # or: scripts/persona-soak.sh pg17
+
+# Only the claim-and-abandon persona, with 25,000 claims abandoned by each of four kills;
+# the Python bindings and the admin server binary are not needed
+SOAK_SKIP_PREPARE=1 AWA_SOAK_PERSONAS=abandon AWA_SOAK_ABANDON_CLAIMS=25000 \
+  AWA_SOAK_SECONDS=1500 AWA_SOAK_DRAIN_GRACE_SECONDS=600 scripts/persona-soak.sh pg17
+
+# The same harness against another revision of awa (a release tag or a candidate branch):
+# a detached worktree of that revision gets this checkout's harness files copied over it
+scripts/persona-soak-against.sh v0.6.13 pg17
 
 # Postgres hot-standby promotion smoke (boots primary + replica + stable proxy endpoint via Docker Compose)
 cargo test --package awa --test postgres_failover_smoke_test -- --ignored --nocapture
