@@ -96,6 +96,21 @@ appear available or missing. Retry with a fresh read before treating that result
 as missing durable work. Filtering tombstoned source rows after a queue or
 priority move does not close these separate windows.
 
+### Failed Jobs Rescued After Priority Aging
+
+0.6.14 preserves the physical ready-lane identity when rescue writes a failed
+terminal row, so manual retry, failed-row carry and `terminal_jobs` retain its
+original arguments and retry limit. Rust reads, manual retry and failed-row
+carry also recover older narrow terminal rows by attempt identity while their
+ready backing remains retained. These paths preserve terminal metadata and
+fill missing defaults from the live ready row. The installed `terminal_jobs`
+SQL view and creation-time bucket joins remain unchanged for older rows whose
+stored priority differs from their ready lane. Already-pruned backing data
+cannot be recovered by this fix. Manual terminal retry restarts aging from the
+physical lane. Manual terminal-to-DLQ moves retain that lane for later DLQ
+retry; automatic retryable rescue and automatic DLQ routing retain effective
+priority.
+
 ### Inspect Runtime Health
 
 ```sql
