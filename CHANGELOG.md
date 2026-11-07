@@ -13,6 +13,7 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
 
 ### Fixed
 
+- Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
 - New queue lanes and their sequences belong to the schema owner and receive
   the head table's grants, regardless of which runtime creates them. Migration
   also repairs existing lanes where permitted and reports busy or unauthorized
