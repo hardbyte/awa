@@ -582,7 +582,7 @@ fn completion_contention_backoff(retry: u32) -> Duration {
 enum FinalizeError {
     #[error(transparent)]
     Operation(#[from] AwaError),
-    #[error("durable finalization was not acknowledged before its retry deadline")]
+    #[error("durable finalization lock-retry window expired")]
     Deadline,
 }
 
@@ -604,12 +604,10 @@ where
     let mut deadlock_retries = 0;
     let mut lock_retries = 0;
     loop {
-        let outcome = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, finalize())
-                .await
-                .map_err(|_| FinalizeError::Deadline)?,
-            None => finalize().await,
-        };
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(FinalizeError::Deadline);
+        }
+        let outcome = finalize().await;
         let error = match outcome {
             Ok(outcome) => return Ok(outcome),
             Err(error) => error,
@@ -3227,6 +3225,83 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn accepted_finalization_observes_its_acknowledgement_after_the_retry_window() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let events = Arc::new(AtomicU32::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (acknowledge, response) = tokio::sync::oneshot::channel::<UntypedJobEvent>();
+        let observed = events.clone();
+        let handler: BoxedUntypedEventHandler = Arc::new(move |event| {
+            assert!(matches!(event, UntypedJobEvent::Completed { job, .. }
+                if job.id == 1 && job.run_lease == 1));
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        });
+        let handlers = Arc::new(HashMap::from([("finalize_parent".into(), vec![handler])]));
+        let attempts = calls.clone();
+        let notification = started.clone();
+        let task = tokio::spawn(async move {
+            let mut response = Some(response);
+            let outcome = finalize_with_retry(
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let response = response.take().expect("accepted work is never restarted");
+                    let notification = notification.clone();
+                    async move {
+                        notification.notify_one();
+                        let event = response.await.map_err(|_| {
+                            AwaError::Validation("completion acknowledgement dropped".into())
+                        })?;
+                        Ok(CompletionOutcome::Applied {
+                            event: Some(event),
+                            terminal: false,
+                        })
+                    }
+                },
+                &test_metrics(),
+                1,
+                "finalize_parent",
+                "test",
+                Duration::from_millis(100),
+                true,
+            )
+            .await?;
+            let CompletionOutcome::Applied {
+                event: Some(event), ..
+            } = outcome
+            else {
+                panic!("accepted completion must retain its lifecycle event")
+            };
+            dispatch_lifecycle_event(&handlers, "finalize_parent", event).await;
+            Ok::<(), FinalizeError>(())
+        });
+        started.notified().await;
+        tokio::time::advance(Duration::from_millis(110)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the retry window must not cancel accepted work"
+        );
+        let now = chrono::Utc::now();
+        let job = serde_json::from_value(serde_json::json!({
+            "id": 1, "kind": "finalize_parent", "queue": "test", "args": {},
+            "state": "completed", "priority": 2, "attempt": 1, "run_lease": 1,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "finalized_at": now, "metadata": {}, "tags": [],
+        }))
+        .unwrap();
+        assert!(acknowledge
+            .send(UntypedJobEvent::Completed {
+                job,
+                duration: Duration::ZERO
+            })
+            .is_ok());
+        task.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn finalize_lock_contention_does_not_retry_unrelated_statement_errors() {
         for code in ["57014", "23505", "55P04"] {
             let calls = AtomicU32::new(0);
@@ -3331,7 +3406,7 @@ mod tests {
         let finalizers = TaskTracker::new();
         let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
         let count = Arc::new(AtomicU32::new(0));
-        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+        let (unstarted, handle) = crate::completion::CompletionBatcher::new(
             pool.clone(),
             CancellationToken::new(),
             metrics.clone(),
@@ -3339,7 +3414,7 @@ mod tests {
             1,
         );
         let executor = JobExecutor::new(
-            pool,
+            pool.clone(),
             Arc::new(HashMap::from([(
                 "finalize_parent".into(),
                 Box::new(FinalizeWorker) as BoxedWorker,
@@ -3395,16 +3470,23 @@ mod tests {
             in_flight.get_cancel(key).is_some(),
             "pending acknowledgement must retain the lease"
         );
+        tokio::time::advance(COMPLETION_LOCK_WINDOW + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(finalizers.len(), 1);
+        assert!(
+            in_flight.get_cancel(key).is_some(),
+            "accepted completion must retain heartbeat ownership beyond the retry window"
+        );
+        pool.close().await;
+        drop(unstarted);
         finalizers.close();
-        tokio::time::timeout(
-            COMPLETION_LOCK_WINDOW + Duration::from_secs(1),
-            finalizers.wait(),
-        )
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), finalizers.wait())
+            .await
+            .unwrap();
         assert!(
             in_flight.get_cancel(key).is_none(),
-            "deadline must unregister the exact lease"
+            "settlement must unregister the exact lease"
         );
     }
 
