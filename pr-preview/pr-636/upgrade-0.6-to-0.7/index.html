@@ -1509,6 +1509,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lane-ownership-and-v053" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lane ownership and v053
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-schema-discovery-during-migration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2030,6 +2041,8 @@
       
         
       
+        
+      
     
     
     
@@ -2224,6 +2237,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2396,6 +2437,17 @@
     <span class="md-ellipsis">
       
         Restricted runtime roles and v049
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#lane-ownership-and-v053" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lane ownership and v053
       
     </span>
   </a>
@@ -2679,14 +2731,40 @@ lazy creation. The migration adds no runtime version gate or authority flip.</p>
 <p>A <a href="https://github.com/hardbyte/awa/pull/501#compatibility-evidence">migrate-first rehearsal with released <code>awa-pg==0.6.7</code></a>
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.</p>
-<p>For a runtime without DDL privileges, apply v049 as the migrator, run
-<code>awa storage prepare-queue --queue &lt;name&gt;</code> for every physical queue, and grant
-sequence <code>USAGE, SELECT, UPDATE</code> before starting producers or workers. Match
-shard and stripe counts and provision extra lanes before increasing them.
-External migration runners must apply the complete generated
+<p>External migration runners must apply the complete generated
 <code>awa migrate --sql --from 48 --to 49</code> bundle: it refreshes the installer
-definition before replacing lane helpers in the installed schemas.
-See <a href="../security/database-roles/#provision-queues-before-starting-restricted-runtimes">Database roles</a>.</p>
+definition before replacing lane helpers in the installed schemas. From v053,
+runtimes without DDL privileges create lanes themselves through the schema
+owner's provisioning functions, so <code>awa storage prepare-queue</code> is optional.</p>
+<h2 id="lane-ownership-and-v053">Lane ownership and v053<a class="headerlink" href="#lane-ownership-and-v053" title="Permanent link">&para;</a></h2>
+<p>Before v053 a lane's sequences belonged to the role that first enqueued into,
+claimed from or promoted into it. With several runtime roles, only roles whose
+default privileges covered that role could use the lane; any other role failed
+with <code>permission denied for sequence</code>. v053 installs <code>SECURITY DEFINER</code>
+<code>provision_lane</code> and <code>provision_lane_sequences</code> functions, owned by the schema
+owner, in each queue-storage schema. The lane helpers create sequences through
+them, with grants that mirror the lane's head table. Once v053 commits,
+<code>awa migrate</code> gives every existing lane sequence to the schema owner and adds
+its missing grants, as far as it is allowed to, one sequence per short
+transaction with a bounded lock wait.</p>
+<p>0.6 and earlier 0.7 binaries call the same helpers, so lanes they create after
+v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
+detects that <code>provision_lane</code> is missing and creates lanes as before.</p>
+<p>To adopt it:</p>
+<ol>
+<li>Run <code>awa migrate</code> with the schema owner as the effective role, as described
+   in <a href="../security/database-roles/">Database roles</a>.</li>
+<li>Check the remaining state: <code>awa storage lane-sequences</code> (read-only, exits 2
+   while lanes need repair). This command requires v053 to be installed.</li>
+<li>Read the migrate output. Any lane sequence it could not repair is listed in
+   a warning. A busy one needs another run of
+   <code>awa storage lane-sequences --repair</code> as the migration role (without
+   <code>PGOPTIONS</code>); the others name the roles that can repair them. See
+   <a href="../security/database-roles/#check-and-repair-lane-ownership">Check and repair lane ownership</a>.</li>
+</ol>
+<p>External migration runners apply the generated <code>awa migrate --sql --from 52
+--to 53</code> bundle, which does not repair existing lane sequences, then run
+<code>awa storage lane-sequences --repair</code> as the migration role itself.</p>
 <h2 id="custom-schema-discovery-during-migration">Custom-schema discovery during migration<a class="headerlink" href="#custom-schema-discovery-during-migration" title="Permanent link">&para;</a></h2>
 <p>Migration bundles discover custom substrates using catalog metadata without
 evaluating their views or functions. Schemas, relations, routines and types

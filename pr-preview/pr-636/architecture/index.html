@@ -1969,6 +1969,8 @@
       
         
       
+        
+      
     
     
     
@@ -2150,6 +2152,34 @@
     
   
     Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../incidents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Incident reports
   
 
     
@@ -2874,7 +2904,7 @@
 </span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>    D-&gt;&gt;E: execute handlers
 </span></code></pre></div>
 <p>Enqueue is transactional: if the producer's outer transaction rolls back, the job never becomes visible. Immediate jobs reserve a lane sequence range under a transaction-scoped lane lock, append to <code>ready_entries_*</code>, and append a compact <code>ready_segments</code> range for the committed lane sequence range; future scheduled or retryable jobs append to <code>deferred_jobs</code>. The lane lock is held until commit or rollback so a later producer cannot make lane <code>N+1</code> visible while lane <code>N</code> can still commit.</p>
-<p><code>deferred_jobs</code> is deliberately outside the claim path. The maintenance leader promotes due <code>scheduled</code> and <code>retryable</code> rows into <code>ready_entries_*</code> in batches and notifies the target queues. Re-enqueueing a row takes its lane lock, which producers hold until they commit, so each <code>(queue, priority)</code> lane's share of a batch is promoted in its own transaction under a short <code>lock_timeout</code>. A lane that times out is handed to a dedicated waiter task, which queues for the lock behind the producers already waiting, so a busy lane is still promoted in turn without holding up other lanes or the leader's rescue, rotation and prune. Cron schedules are just producers for ordinary jobs: when a schedule fires, the cron transaction records the fire and enqueues the job atomically, using <code>ready_entries_*</code> for immediate fires or <code>deferred_jobs</code> when the enqueue carries a future <code>run_at</code>.</p>
+<p><code>deferred_jobs</code> is deliberately outside the claim path. The maintenance leader promotes due <code>scheduled</code> and <code>retryable</code> rows into <code>ready_entries_*</code> in batches and notifies the target queues. Re-enqueueing a row takes its lane lock, which producers hold until they commit, so each <code>(queue, priority)</code> lane's share of a batch is promoted in its own transaction under a short <code>lock_timeout</code>. A lane that times out is handed to one dedicated waiter task shared by scheduled and retryable rows; the leader skips both states for that lane. The waiter alternates states within a total 32-batch budget while other lanes and the leader's rescue, rotation and prune continue. Each lock acquisition has a 30 s timeout. The combined wait behind several finite producer transactions can exhaust it, releasing the waiter's queue position; later ticks retry, but sustained contention can still prevent promotion. Cron schedules are just producers for ordinary jobs: when a schedule fires, the cron transaction records the fire and enqueues the job atomically, using <code>ready_entries_*</code> for immediate fires or <code>deferred_jobs</code> when the enqueue carries a future <code>run_at</code>.</p>
 <p>There are two COPY-shaped producer paths:</p>
 <ul>
 <li>Direct queue-storage COPY is the high-throughput path: Rust producers use a configured <code>QueueStorage::enqueue_params_copy()</code>, and Python producers use <code>enqueue_many_copy()</code>. Each ready or deferred write group uses array-backed INSERT below 2,048 rows and CSV COPY for larger groups. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially <code>queue_stripe_count</code> / <code>queue_storage_queue_stripe_count</code>.</li>
