@@ -2474,7 +2474,7 @@
 <li>ADR-021 relies on expired callback rescue. This ADR gives deployments a way to run that rescue without also executing handlers in the same process.</li>
 <li>ADR-019 owns queue-storage maintenance concerns such as rotation and pruning. Maintenance-only runs those existing storage tasks; it does not redefine the storage engine.</li>
 <li>ADR-029 defines transactional follow-up jobs. Maintenance-only uses that mechanism to dispatch durable lifecycle effects for rescues (expired callback, stale heartbeat, exceeded deadline). The dispatch is best-effort (in a separate transaction after the rescue UPDATE commits — see ADR-029's atomicity matrix); once the follow-up <code>INSERT</code> lands, the row is a regular Awa job. This closes the rescue/timeout event gap without requiring a handler registry in the maintenance process.</li>
-<li><a href="../051-runtime-halt/">ADR-051</a> proposes the shared halt contract for job-executing and maintenance-only runtimes, including leadership handoff after a local stop.</li>
+<li><a href="../051-runtime-halt/">ADR-051</a> proposes database-wide scoped controls shared by job-executing and maintenance-only runtimes. Maintenance and cron restrictions survive leadership handoff; observation and reporting continue while those duties are halted.</li>
 </ul>
 
 
