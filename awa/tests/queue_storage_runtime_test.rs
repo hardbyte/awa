@@ -2250,15 +2250,40 @@ struct FinalizeBacklogJob {
 /// every job completes once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_stops_claiming_while_finalization_is_stalled() {
+    assert_claiming_stops_while_finalization_is_stalled(
+        "qs_finalize_backlog",
+        "awa_qs_finalize_backlog",
+        true,
+    )
+    .await;
+}
+
+/// The same bound holds when completion deletes materialized leases and
+/// writes terminal rows instead of closing receipt claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_lease_runtime_stops_claiming_while_finalization_is_stalled() {
+    assert_claiming_stops_while_finalization_is_stalled(
+        "qs_finalize_backlog_leases",
+        "awa_qs_finalize_backlog_leases",
+        false,
+    )
+    .await;
+}
+
+async fn assert_claiming_stops_while_finalization_is_stalled(
+    queue: &str,
+    schema: &str,
+    lease_claim_receipts: bool,
+) {
     // The default completion pipeline: one shard of 512-job batches, one
     // batch in flight and one queued.
     const FINALIZER_CAPACITY: usize = 1_024;
     const WORKERS: u32 = 64;
     const JOBS: i64 = 1_600;
     let (_db_guard, pool) = setup_pool(10).await;
-    let queue = "qs_finalize_backlog";
     let store_config = QueueStorageConfig {
-        schema: "awa_qs_finalize_backlog".to_string(),
+        schema: schema.to_string(),
+        lease_claim_receipts,
         ..Default::default()
     };
     let store = create_store_with_config(&pool, store_config.clone()).await;
@@ -2281,25 +2306,35 @@ async fn test_queue_storage_runtime_stops_claiming_while_finalization_is_stalled
             .expect("enqueue backlog");
     }
 
-    let first_jobs: Vec<i64> = sqlx::query_scalar(&format!(
-        "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT $2",
-        store.schema()
-    ))
-    .bind(queue)
-    .bind(i64::from(WORKERS) * 2)
-    .fetch_all(&pool)
-    .await
-    .expect("first jobs");
-    let mut lock_holder = pool.acquire().await.expect("lock connection");
-    sqlx::query(
-        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended(
-             format('awa.receipt.complete:%s:%s', job_id, 1), 0))
-         FROM unnest($1::bigint[]) AS job_id",
-    )
-    .bind(&first_jobs)
-    .execute(&mut *lock_holder)
-    .await
-    .expect("stall the first jobs' finalization");
+    let mut stall = pool.begin().await.expect("begin stall transaction");
+    if lease_claim_receipts {
+        let first_jobs: Vec<i64> = sqlx::query_scalar(&format!(
+            "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT $2",
+            store.schema()
+        ))
+        .bind(queue)
+        .bind(i64::from(WORKERS) * 2)
+        .fetch_all(&pool)
+        .await
+        .expect("first jobs");
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+                 format('awa.receipt.complete:%s:%s', job_id, 1), 0))
+             FROM unnest($1::bigint[]) AS job_id",
+        )
+        .bind(&first_jobs)
+        .execute(stall.as_mut())
+        .await
+        .expect("stall the first jobs' finalization");
+    } else {
+        sqlx::query(&format!(
+            "LOCK TABLE {}.done_entries IN SHARE MODE",
+            store.schema()
+        ))
+        .execute(stall.as_mut())
+        .await
+        .expect("stall terminal writes");
+    }
 
     let runs: Arc<std::sync::Mutex<HashMap<i64, u32>>> = Arc::default();
     let recorded = runs.clone();
@@ -2357,11 +2392,10 @@ async fn test_queue_storage_runtime_stops_claiming_while_finalization_is_stalled
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    sqlx::query("SELECT pg_catalog.pg_advisory_unlock_all()")
-        .execute(&mut *lock_holder)
+    stall
+        .rollback()
         .await
         .expect("release the stalled finalization");
-    drop(lock_holder);
     let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(60));
     while completed_terminal_count(&pool, &store, queue).await < JOBS {
         assert!(Instant::now() < deadline, "the backlog did not drain");
