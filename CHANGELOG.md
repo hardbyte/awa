@@ -4,6 +4,32 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- Promotion no longer issues NOTIFY inside its per-lane transactions. A
+  notifying transaction takes PostgreSQL's notify-queue lock at `COMMIT`, and
+  every notifying transaction in the cluster waits its turn for it. Each lane
+  transaction waited there while still holding its lane's locks and its 50 ms
+  lock timeout, so under concurrent enqueues the commit timed out, the batch
+  rolled back as a contended lane, and due scheduled and retryable jobs were
+  delayed. Promotion now wakes claimers once, after its lanes commit. The wakeup
+  is a hint that claimers also poll for, so if it fails it is logged and the
+  promotion stands.
+- Heartbeat, deadline and receipt rescue skip an attempt whose retained ready
+  bodies are ambiguous, logging an error on each pass, instead of rolling back
+  the whole rescue. Before, one such attempt stopped rescue of every other
+  stale attempt in the schema. The skipped attempt stays running until its
+  bodies are repaired.
+- A worker whose completion or callback wait has committed no longer reports
+  it as failed when re-reading the job for its lifecycle event fails. It logs
+  a warning and builds the event from its own copy, so the event and the
+  completion metrics are kept, and a retry no longer re-runs the transition.
+- With a lifecycle hook registered, a completion no longer re-reads the job to
+  build its Completed event. That read added about 24 round trips per
+  completion; the event is now built from the job the worker holds.
+- `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql`
+  silently won and nothing was extracted.
+
 ## [0.6.14-alpha.1] — 2026-11-07
 
 Prerelease of the 0.6.14 queue-storage fixes. The schema remains v40. Apply the

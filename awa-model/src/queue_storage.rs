@@ -380,8 +380,8 @@ pub struct PromoteOutcome {
     /// contended lane. A batch that selected its full size may have left
     /// further due rows behind.
     pub selected: usize,
-    /// Lanes whose promotion transaction hit `lock_timeout` and rolled back.
-    /// Their rows stay deferred.
+    /// Lanes whose locks were held past `lock_timeout`, so their promotion
+    /// transaction rolled back. Their rows stay deferred.
     pub contended: Vec<PromotionLane>,
 }
 
@@ -1755,6 +1755,7 @@ struct ReadyRowIdentity {
     run_lease: i64,
 }
 
+/// Attempts a rescue pass leaves for a later pass, as `(job_id, run_lease)`.
 struct BusyRetained(Vec<(i64, i64)>);
 
 impl BusyRetained {
@@ -1767,6 +1768,30 @@ impl BusyRetained {
             ));
         }
         Ok(())
+    }
+}
+
+/// A failure hydrating a deleted lease. `Ambiguous` names an attempt whose
+/// retained ready bodies rank equally, so none can be chosen for it.
+enum HydrateError {
+    Ambiguous { job_id: i64, run_lease: i64 },
+    Awa(AwaError),
+}
+
+impl From<AwaError> for HydrateError {
+    fn from(err: AwaError) -> Self {
+        Self::Awa(err)
+    }
+}
+
+impl From<HydrateError> for AwaError {
+    fn from(err: HydrateError) -> Self {
+        match err {
+            HydrateError::Ambiguous { job_id, run_lease } => AwaError::Validation(format!(
+                "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
+            )),
+            HydrateError::Awa(err) => err,
+        }
     }
 }
 
@@ -2399,7 +2424,7 @@ fn select_claimed_ready_body<'a>(
     candidates: &'a [ReadySnapshotRow],
     claimed_lanes: &BTreeSet<ReadyBodyLaneKey>,
     reference: &DeletedLeaseRow,
-) -> Result<(&'a ReadySnapshotRow, bool), AwaError> {
+) -> Result<(&'a ReadySnapshotRow, bool), HydrateError> {
     // Emitted physical-lane evidence wins over a live replacement.
     // Without it, retain the live-body compatibility fallback; it
     // cannot identify a legacy claim's original colliding lane.
@@ -2431,10 +2456,10 @@ fn select_claimed_ready_body<'a>(
     let mut best = candidates.iter().filter(|row| rank(row) == strongest);
     let ready = best.next().expect("ready body rank has a candidate");
     if best.next().is_some() {
-        return Err(AwaError::Validation(format!(
-            "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
-            reference.job_id, reference.run_lease
-        )));
+        return Err(HydrateError::Ambiguous {
+            job_id: reference.job_id,
+            run_lease: reference.run_lease,
+        });
     }
     Ok((ready, has_emitted))
 }
@@ -10805,26 +10830,43 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'_, Postgres>,
         deleted: Vec<DeletedLeaseRow>,
     ) -> Result<Result<Vec<LeaseTransitionRow>, BusyRetained>, AwaError> {
-        let (hydrated, sources) = self
-            .hydrate_deleted_leases_with_sources_tx(tx, deleted)
-            .await?;
-        if sources.is_empty() {
-            return Ok(Ok(hydrated));
+        let hydrated = async {
+            let (hydrated, sources) = self
+                .hydrate_deleted_leases_with_sources_tx(tx, deleted)
+                .await?;
+            if sources.is_empty() {
+                return Ok(Ok(hydrated));
+            }
+            if let Some(busy) = self
+                .retire_retained_attempt_copies_tx(tx, &sources, true)
+                .await?
+            {
+                return Ok(Err(busy));
+            }
+            Ok(Ok(hydrated))
         }
-        if let Some(busy) = self
-            .retire_retained_attempt_copies_tx(tx, &sources, true)
-            .await?
-        {
-            return Ok(Err(busy));
+        .await;
+        match hydrated {
+            Ok(hydrated) => Ok(hydrated),
+            // One unresolvable attempt must not stop the rescue of the others.
+            Err(HydrateError::Ambiguous { job_id, run_lease }) => {
+                tracing::error!(
+                    schema = self.schema(),
+                    job_id,
+                    run_lease,
+                    "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
+                );
+                Ok(Err(BusyRetained(vec![(job_id, run_lease)])))
+            }
+            Err(HydrateError::Awa(err)) => Err(err),
         }
-        Ok(Ok(hydrated))
     }
 
     async fn hydrate_deleted_leases_with_sources_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         deleted: Vec<DeletedLeaseRow>,
-    ) -> Result<(Vec<LeaseTransitionRow>, Vec<ReadyRowIdentity>), AwaError> {
+    ) -> Result<(Vec<LeaseTransitionRow>, Vec<ReadyRowIdentity>), HydrateError> {
         if deleted.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -11080,7 +11122,7 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'_, Postgres>,
         sources: &[ReadyRowIdentity],
         skip_busy: bool,
-    ) -> Result<Option<BusyRetained>, AwaError> {
+    ) -> Result<Option<BusyRetained>, HydrateError> {
         let schema = self.schema();
         let mut expected = BTreeMap::new();
         for source in sources {
@@ -11088,11 +11130,10 @@ impl QueueStorage {
                 .insert((source.job_id, source.run_lease), source)
                 .is_some()
             {
-                return Err(AwaError::Validation(format!(
-                    "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
-                    source.job_id,
-                    source.run_lease + 1
-                )));
+                return Err(HydrateError::Ambiguous {
+                    job_id: source.job_id,
+                    run_lease: source.run_lease + 1,
+                });
             }
         }
         let job_ids: Vec<i64> = sources.iter().map(|row| row.job_id).collect();
@@ -11179,7 +11220,8 @@ impl QueueStorage {
         if copies.is_empty() {
             return Err(AwaError::Validation(
                 "queue storage ready row missing for deleted lease during retirement".to_string(),
-            ));
+            )
+            .into());
         }
         let slots: Vec<i32> = copies.iter().map(|row| row.ready_slot).collect();
         let generations: Vec<i64> = copies.iter().map(|row| row.ready_generation).collect();
@@ -11224,11 +11266,10 @@ impl QueueStorage {
         for row in &emitted {
             let key = (row.job_id, row.run_lease);
             if !seen.insert(key) || expected.get(&key).copied() != Some(row) {
-                return Err(AwaError::Validation(format!(
-                    "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
-                    row.job_id,
-                    row.run_lease + 1
-                )));
+                return Err(HydrateError::Ambiguous {
+                    job_id: row.job_id,
+                    run_lease: row.run_lease + 1,
+                });
             }
         }
         sqlx::query(&format!(
@@ -15787,8 +15828,9 @@ impl QueueStorage {
                 .or_default()
                 .push(job_id);
         }
+        let mut promoted_queues = BTreeSet::new();
         for (lane, job_ids) in lanes {
-            match self
+            let promoted = self
                 .promote_lane(
                     pool,
                     state,
@@ -15796,12 +15838,22 @@ impl QueueStorage {
                     DueLaneRows::Selected(&job_ids),
                     lane_lock_timeout,
                 )
-                .await?
-            {
-                Some(promoted) => outcome.promoted += promoted,
-                None => outcome.contended.push(lane),
+                .await;
+            match promoted {
+                Ok(Some(promoted)) => {
+                    outcome.promoted += promoted;
+                    if promoted > 0 {
+                        promoted_queues.insert(lane.queue);
+                    }
+                }
+                Ok(None) => outcome.contended.push(lane),
+                Err(err) => {
+                    self.notify_promoted_queues(pool, promoted_queues).await;
+                    return Err(err);
+                }
             }
         }
+        self.notify_promoted_queues(pool, promoted_queues).await;
         Ok(outcome)
     }
 
@@ -15820,32 +15872,34 @@ impl QueueStorage {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
             return Ok(PromoteOutcome::default());
         }
-        Ok(
-            match self
-                .promote_lane(
-                    pool,
-                    state,
-                    lane,
-                    DueLaneRows::Oldest(batch_size),
-                    lane_lock_timeout,
-                )
-                .await?
-            {
-                Some(promoted) => PromoteOutcome {
-                    promoted,
-                    selected: promoted,
-                    contended: Vec::new(),
-                },
-                None => PromoteOutcome {
-                    contended: vec![lane.clone()],
-                    ..PromoteOutcome::default()
-                },
+        let promoted = self
+            .promote_lane(
+                pool,
+                state,
+                lane,
+                DueLaneRows::Oldest(batch_size),
+                lane_lock_timeout,
+            )
+            .await?;
+        if promoted.is_some_and(|promoted| promoted > 0) {
+            self.notify_promoted_queues(pool, [lane.queue.clone()])
+                .await;
+        }
+        Ok(match promoted {
+            Some(promoted) => PromoteOutcome {
+                promoted,
+                selected: promoted,
+                contended: Vec::new(),
             },
-        )
+            None => PromoteOutcome {
+                contended: vec![lane.clone()],
+                ..PromoteOutcome::default()
+            },
+        })
     }
 
-    /// One lane's promotion transaction. `None` when it hit `lock_timeout`
-    /// and rolled back.
+    /// One lane's promotion transaction. `None` when its locks hit
+    /// `lock_timeout` and it rolled back.
     async fn promote_lane(
         &self,
         pool: &PgPool,
@@ -15859,11 +15913,10 @@ impl QueueStorage {
             .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
             .await
         {
-            Ok(promoted) => match tx.commit().await {
-                Ok(()) => Ok(Some(promoted)),
-                Err(err) if is_lock_contention_error(&err) => Ok(None),
-                Err(err) => Err(map_sqlx_error(err)),
-            },
+            Ok(promoted) => {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(Some(promoted))
+            }
             Err(AwaError::Database(err)) if is_lock_contention_error(&err) => {
                 tx.rollback().await.map_err(map_sqlx_error)?;
                 Ok(None)
@@ -15964,8 +16017,43 @@ impl QueueStorage {
             .collect();
         self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
             .await?;
-        self.notify_queues_tx(tx, vec![lane.queue.clone()]).await?;
         Ok(promoted)
+    }
+
+    /// Wake claimers of queues whose promotion has committed.
+    ///
+    /// Promotion notifies after its lane transactions instead of inside them.
+    /// A notifying transaction takes PostgreSQL's notify-queue lock at
+    /// `COMMIT`, which every notifying transaction in the cluster waits its
+    /// turn for, and a lane transaction would hold its lane's locks, and run
+    /// under its lock timeout, while it waited. The wakeup is a hint that
+    /// claimers also poll for, so a failure is logged and not returned.
+    async fn notify_promoted_queues(
+        &self,
+        pool: &PgPool,
+        queues: impl IntoIterator<Item = String>,
+    ) {
+        let channels: Vec<String> = queues
+            .into_iter()
+            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        if channels.is_empty() {
+            return;
+        }
+        if let Err(err) =
+            sqlx::query("SELECT pg_notify(channel, '') FROM unnest($1::text[]) AS channel")
+                .bind(&channels)
+                .execute(pool)
+                .await
+        {
+            tracing::warn!(
+                error = %err,
+                channels = channels.len(),
+                "Failed to wake claimers after promotion; they pick the rows up on their next poll"
+            );
+        }
     }
 
     async fn relation_has_rows_tx(

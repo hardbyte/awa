@@ -8355,6 +8355,160 @@ async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_or
     assert_eq!(claimed, expected);
 }
 
+/// Holds PostgreSQL's cluster-wide notify-queue lock for about `commits` ×
+/// 100 ms. A transaction that issued NOTIFY takes that lock at COMMIT and
+/// keeps it until its commit record is flushed, which `commit_delay` stretches.
+/// Returns once the lock is held.
+async fn hold_notify_commit_lock(
+    pool: &sqlx::PgPool,
+    commits: usize,
+) -> tokio::task::JoinHandle<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS notify_lock_holder (id bigint)")
+        .execute(pool)
+        .await
+        .expect("create notify holder table");
+    let holder = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .options([("commit_delay", "100000"), ("commit_siblings", "0")]),
+        )
+        .await
+        .expect("connect the notify holder");
+    let holder_task = tokio::spawn(async move {
+        for _ in 0..commits {
+            sqlx::raw_sql(
+                "BEGIN; INSERT INTO notify_lock_holder VALUES (1); \
+                 SELECT pg_notify('awa_test_notify_holder', ''); COMMIT;",
+            )
+            .execute(&holder)
+            .await
+            .expect("notify holder commit");
+        }
+        holder.close().await;
+    });
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(5));
+    loop {
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'object' \
+             AND classid = 'pg_database'::regclass AND objid = 0 AND granted)",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read notify lock");
+        if held {
+            return holder_task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notify holder never took the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Promotion's lane transactions do not wait for the notify-queue lock: a lane
+/// promotes under its short lock timeout while another notifying transaction
+/// holds that lock, and a wakeup that cannot get it, under the connection's own
+/// `lock_timeout`, does not undo or fail the promotion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_lanes() {
+    const PRIORITY: i16 = 2;
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_promote_notify_commit";
+    let store = create_store(&pool, "awa_qs_promote_notify_commit").await;
+    let lane = PromotionLane {
+        queue: queue.to_string(),
+        priority: PRIORITY,
+    };
+    let enqueue_due = |id: i64| {
+        let pool = pool.clone();
+        let store = &store;
+        async move {
+            enqueue_job(
+                &pool,
+                store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    priority: PRIORITY,
+                    run_at: Some(Utc::now() - chrono::Duration::seconds(60)),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+    };
+    for id in 0..3 {
+        enqueue_due(id).await;
+    }
+
+    let holder = hold_notify_commit_lock(&pool, 3).await;
+    let outcome = store
+        .promote_due_lanes(
+            &pool,
+            JobState::Scheduled,
+            100,
+            Some(Duration::from_millis(50)),
+            &[],
+        )
+        .await
+        .expect("promote while the notify lock is held");
+    holder.await.expect("notify holder");
+    assert_eq!(outcome.promoted, 3, "{outcome:?}");
+    assert!(outcome.contended.is_empty(), "{outcome:?}");
+
+    let caller_lock_timeout_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .options([("lock_timeout", "20ms")]),
+        )
+        .await
+        .expect("connect with a session lock_timeout");
+    enqueue_due(3).await;
+    let holder = hold_notify_commit_lock(&pool, 3).await;
+    let result = store
+        .promote_due_lanes(
+            &caller_lock_timeout_pool,
+            JobState::Scheduled,
+            100,
+            Some(Duration::from_millis(50)),
+            &[],
+        )
+        .await;
+    holder.await.expect("notify holder");
+    caller_lock_timeout_pool.close().await;
+    let outcome = result.expect("a failed wakeup does not fail the promotion");
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert!(outcome.contended.is_empty(), "{outcome:?}");
+    let deferred: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count deferred rows");
+    assert_eq!(deferred, 0);
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(60))
+        .await
+        .expect("claim promoted rows");
+    assert_eq!(claimed.len(), 4);
+    assert!(store
+        .promote_due_lane(&pool, JobState::Scheduled, &lane, 100, None)
+        .await
+        .expect("nothing left to promote")
+        .contended
+        .is_empty());
+}
+
 /// The maintenance leader must not wait on a lane whose enqueue lock never
 /// comes free. Two sessions take turns holding the hot lane's lock for
 /// `HOLD` each, so a lock request queued behind them waits up to two holds.
@@ -19159,15 +19313,36 @@ async fn moved_tombstoned_claim_lane(
         assert_eq!(loaded.max_attempts, 1);
     }
     if !receipts {
-        let err = store
+        let other_queue = "qs_moved_tomb_claim_other";
+        let other_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 9044 },
+            InsertOpts {
+                queue: other_queue.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let other_claims = store
+            .claim_runtime_batch(&pool, other_queue, 1, Duration::from_secs(300))
+            .await
+            .expect("claim an unrelated job");
+        assert_eq!(other_claims.len(), 1);
+        assert_eq!(lease_count(&pool, &store).await, 2);
+
+        let rescued = store
             .rescue_stale_heartbeats(&pool, Duration::ZERO)
             .await
-            .expect_err("legacy ambiguous physical lanes must not be selected arbitrarily");
-        assert!(err.to_string().contains("ready body ambiguous"), "{err}");
+            .expect("an ambiguous attempt does not stop rescue of the others");
+        assert_eq!(
+            rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![other_id]
+        );
         assert_eq!(
             lease_count(&pool, &store).await,
             1,
-            "ambiguous mutation rolls back"
+            "the ambiguous attempt's mutation rolls back and it stays running"
         );
         return;
     }
@@ -19208,7 +19383,7 @@ async fn test_historical_tombstoned_claim_uses_emitted_lane_high_to_low() {
     moved_tombstoned_claim_lane(4, 2, true, false, false).await;
 }
 #[tokio::test]
-async fn test_historical_tombstoned_legacy_ambiguous_lanes_roll_back() {
+async fn test_historical_tombstoned_legacy_ambiguous_lane_is_skipped_by_rescue() {
     moved_tombstoned_claim_lane(2, 4, false, false, false).await;
 }
 

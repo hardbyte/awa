@@ -31,7 +31,7 @@ If an earlier build already applied the patch, run `awa migrate` again with the 
 
 The patch:
 
-- only replaces functions; it takes no sequence or table locks;
+- only replaces functions, gives the two provisioning functions to the schema owner and grants `EXECUTE` on them to `PUBLIC`; it takes no sequence or table locks;
 - keeps every lane's sequence position;
 - leaves storage routing unchanged;
 - applies as one transaction, so an interrupted run leaves nothing applied; run it again.
@@ -40,7 +40,13 @@ The patch:
 
 ### External migration runners
 
-`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database; with `--extract-to`, apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the schema owner. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
+`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database. To write it as a file instead, run `awa migrate --extract-to <dir> --pending` (without `--sql`, which can't be combined with it) and apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the role that owns the existing `awa` functions, normally the schema owner; `CREATE OR REPLACE` fails with `must be owner of function` otherwise, and nothing is applied. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
+
+Each `R__` patch carries the full lane-helper definitions, so an older patch file applied after this one reinstalls the 0.6.13 helpers:
+
+- Replace every `R__` file with the set the 0.6.14 CLI extracts, together, rather than adding `R__definer_lane_provisioning.sql` beside older ones.
+- Don't roll the runner's SQL files back to 0.6.13 when rolling binaries back. Leave the patch in place, as above.
+- Keep the `V` files exactly as originally applied. Extract with `--pending`; a full `--extract-to` rewrites `V23`, which fails a checksum-validating runner.
 
 ## Roll back
 
