@@ -258,6 +258,18 @@ prints the statements bare for runners that open the transaction themselves.
 render; `awa migrate` refuses them when applying, since it always migrates to
 the current version and its patches.
 
+`R__claim_batch_job_index.sql` indexes compact claim batches by job id. It
+installs `<schema>.ensure_claim_batch_job_index(slot)` in every queue-storage
+schema and builds the GIN index on `lease_claim_batches.job_ids` only in claim
+partitions that are empty when it runs; it skips a populated or locked
+partition without waiting. Claim prune indexes each remaining partition right
+after truncating it, so the index covers the ring within one claim-ring cycle.
+Do not build the index yourself on a populated partition: the build holds a
+`SHARE` lock, which blocks claim inserts into that partition, for about half a
+minute per 100k batches. Run the script as the owner of the queue-storage
+tables. Released 0.6 binaries are unaffected by it, and binaries that use the
+index read the same rows, by scan, from a schema without it.
+
 `awa migrate` reports the schema version, each patch and what it updated, and
 storage routing before and after. It exits 1 if a patch is still missing
 somewhere, such as a queue-storage schema the migrating role cannot use, and

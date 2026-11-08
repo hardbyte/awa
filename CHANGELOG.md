@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- Point lookups of zero-deadline (compact) receipt claims by job ID — heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job` — use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. Under load those scans could pick parallel plans and exhaust dynamic shared memory. The repeatable `claim_batch_job_index` schema patch installs the index function; the index is only ever built on an empty claim partition, so each partition gains it within one claim-ring cycle after the patch and live claims are never blocked behind a build. The schema remains v40.
+
 ## [0.6.14] — 2026-11-08
 
 Recommended for everyone on 0.6.13 using queue storage. A busy queue no longer stalls promotion of the others, prune backs off cleanly under lock contention, new queue lanes are usable by every runtime role, and jobs no longer stay running, run again or get misreported after priority aging.
