@@ -1543,20 +1543,20 @@ fn open_receipt_running_claims_sql_from(
         WHERE {batch_filter}NOT (
                   batches.receipt_ranges <@ COALESCE((
                       SELECT range_agg(closed)
-                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      FROM {closure_batch_rel} AS closure_batches
                       CROSS JOIN LATERAL unnest(closure_batches.receipt_ranges) AS closed
                       WHERE closure_batches.claim_slot = batches.claim_slot
                         AND closure_batches.receipt_ranges && batches.receipt_ranges
                   ), '{{}}'::int8multirange)
               )
           AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  SELECT 1 FROM {closure_rel} AS closures
                   WHERE closures.claim_slot = batches.claim_slot
                     AND closures.job_id = items.job_id
                     AND closures.run_lease = items.run_lease
               )
           AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  SELECT 1 FROM {closure_batch_rel} AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
                   -- Keep the range lookup correlated: joining on claim_slot can

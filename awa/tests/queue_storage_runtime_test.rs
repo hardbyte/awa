@@ -22951,6 +22951,55 @@ async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -
         .collect()
 }
 
+/// A per-slot receipt read touches only that slot's claim-ring partitions, so a
+/// lock held on another slot's closure evidence, as claim-ring prune takes, does
+/// not hold it up.
+#[tokio::test]
+async fn test_slot_scoped_receipt_reads_do_not_wait_on_other_slots_closures() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_slot_scoped_closures";
+    let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    let queue = "slot_scoped_closures";
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim into a compact batch");
+    assert_eq!(claimed.len(), 1);
+    let other_slot = (claimed[0].claim.claim_slot + 1) % 2;
+
+    let mut prune = pool.begin().await.expect("begin prune stand-in");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.lease_claim_closures_{other_slot}, \
+         {schema}.lease_claim_closure_batches_{other_slot} IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .expect("lock the other slot's closure evidence");
+    let kinds = tokio::time::timeout(
+        scaled_timeout(Duration::from_secs(5)),
+        admin::job_kind_overviews(&pool),
+    )
+    .await
+    .expect("the read does not wait on another slot's closure locks")
+    .expect("read kind overviews");
+    prune.rollback().await.expect("release the closure locks");
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .expect("the running job's kind");
+    assert_eq!(complete.job_count, 1);
+}
+
 async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool, row_local: bool) {
     let (_db_guard, pool) = setup_pool(6).await;
     let schema = match (receipts, row_local) {
