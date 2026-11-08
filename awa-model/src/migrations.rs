@@ -356,9 +356,9 @@ macro_rules! definer_lane_provisioning_pending_sql {
 /// Rows naming what still lacks the `claim_batch_job_index` patch: the
 /// function that installs the per-schema index function, the installer, and
 /// each queue-storage schema with partitioned `lease_claim_batches` but no
-/// SECURITY DEFINER `ensure_claim_batch_job_index`. The indexes themselves do
-/// not keep the patch pending: they appear on populated partitions only once
-/// claim prune empties them.
+/// SECURITY DEFINER `ensure_claim_batch_job_index`. The indexes do not keep
+/// the patch pending: the patch builds none, and claim prune adds each one as
+/// it empties a partition.
 macro_rules! claim_batch_job_index_pending_sql {
     () => {
         "SELECT 'awa.refresh_claim_batch_job_index_helper'::text AS target \
@@ -472,7 +472,7 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         description: "Index compact claim batches by job id",
         // The v023 definitions first, so the installer and its index helper
         // carry the job_ids index; the patch then installs the index function
-        // in each schema and indexes the claim partitions that are empty.
+        // in each schema. Claim prune builds the indexes.
         sql: concat!(
             include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
             "\n",
@@ -1126,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_batch_job_index_patch_does_not_rerun_the_installer() {
+    fn claim_batch_job_index_patch_only_installs_the_helper() {
         let patch = include_str!("../migrations/patches/claim_batch_job_index.sql");
         let code: String = patch
             .lines()
@@ -1134,6 +1134,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!code.contains("install_queue_storage_substrate"));
+        assert!(!code.contains("ensure_claim_batch_job_index"));
         assert!(code.contains("PERFORM awa.refresh_claim_batch_job_index_helper(v_schema)"));
     }
 

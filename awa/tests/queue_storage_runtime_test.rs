@@ -20663,11 +20663,12 @@ async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
     assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![0, 1]);
 }
 
-/// The `claim_batch_job_index` patch is versionless and idempotent, indexes
-/// only the claim partitions that are empty, and a schema without it keeps
-/// working with unindexed lookups.
+/// The `claim_batch_job_index` patch is versionless and idempotent, installs
+/// the index function without building any index, and claim prune then
+/// indexes each slot it truncates. A schema without the patch keeps working
+/// with unindexed lookups.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_claim_batch_job_index_patch_skips_populated_partitions() {
+async fn test_claim_batch_job_index_patch_leaves_indexing_to_claim_prune() {
     let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_claim_batch_job_index_patch";
     let schema = "awa_qs_cbji_patch";
@@ -20827,8 +20828,8 @@ async fn test_claim_batch_job_index_patch_skips_populated_partitions() {
     assert!(patch.still_needs_repair.is_empty(), "{patch:?}");
     assert_eq!(
         claim_batch_job_index_slots(&pool, schema).await,
-        vec![0],
-        "the patch indexes the empty slot and skips the populated one"
+        Vec::<i32>::new(),
+        "the patch builds no index, even on the empty slot"
     );
 
     let report = migrations::run_with_report(&pool).await.unwrap();
@@ -20847,7 +20848,10 @@ async fn test_claim_batch_job_index_patch_skips_populated_partitions() {
         .execute(&pool)
         .await
         .expect("the patch re-applies cleanly");
-    assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![0]);
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        Vec::<i32>::new()
+    );
     assert_eq!(
         schema_versions().await,
         versions_before,
@@ -20864,6 +20868,30 @@ async fn test_claim_batch_job_index_patch_skips_populated_partitions() {
         .complete_runtime_batch(&pool, &second)
         .await
         .expect("complete the claim in the unindexed slot");
+    match store.rotate_claims(&pool).await.expect("rotate claim ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("expected claim ring rotation to slot 0, got {other:?}"),
+    }
+    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        match store
+            .prune_oldest_claims(&pool)
+            .await
+            .expect("prune with the patched index function")
+        {
+            PruneOutcome::Pruned { slot, .. } => {
+                assert_eq!(slot, 1);
+                break;
+            }
+            PruneOutcome::Blocked { slot: 1 } if Instant::now() < prune_deadline => {}
+            other => panic!("unexpected claim prune outcome: {other:?}"),
+        }
+    }
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        vec![1],
+        "claim prune indexes the slot it truncates"
+    );
     for job_id in job_ids {
         let job = store.load_job(&pool, job_id).await.unwrap().unwrap();
         assert_eq!(job.state, JobState::Completed);

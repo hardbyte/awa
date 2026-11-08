@@ -646,8 +646,8 @@ REVOKE EXECUTE ON FUNCTION awa.repair_lane_sequence(TEXT, TEXT) FROM PUBLIC;
 -- is empty and its lock is free, and otherwise does nothing. Building the
 -- index on a populated partition holds SHARE, which blocks claim inserts, for
 -- the whole build (minutes per million batches), so the index is only ever
--- created on an empty partition: by the installer, by claim prune right after
--- it truncates a slot, or by the claim_batch_job_index schema patch.
+-- created on an empty partition: by the installer, or by claim prune right
+-- after it truncates a slot.
 --
 -- fastupdate is off: job ids arrive in ascending order, so direct inserts
 -- append to the right edge of the entry tree and cost no more than the
