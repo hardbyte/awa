@@ -3173,6 +3173,12 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Promotion time</td>
 </tr>
 <tr>
+<td><code>awa.maintenance.promote.lane_contention</code></td>
+<td>Counter</td>
+<td>state, queue, outcome</td>
+<td>Promotion lanes whose lock was busy: <code>handed_off</code> to a dedicated waiter, <code>waiter_limit</code> when every waiter was busy, <code>waiter_timed_out</code> when a waiter's 30 s wait ran out</td>
+</tr>
+<tr>
 <td><code>awa.maintenance.rescues</code></td>
 <td>Counter</td>
 <td>rescue_kind</td>
