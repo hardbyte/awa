@@ -34,6 +34,7 @@ What is intentionally not modeled:
 - Python bridge details
 - real-time token bucket math for rate limiting
 - unbounded retry histories; `AwaExtended` caps attempts so TLC can close the state graph
+- ready-body identity. Job bodies are abstract, so the rescue liveness property `RecoverableAbandoned(j) ~> jobState[j] # "running"` does not cover an attempt that an older release's aging race left with two equally plausible bodies; rescue skips such an attempt and logs it on every pass.
 - full advisory-lock mechanics; leadership is an abstract exclusive token
 - exact permit identity per task attempt; the model is job-centric and approximates task-held capacity closely enough to check the protocol invariants
 - **general priority fairness and starvation.** The focused `AwaClaimLaneScheduling` check covers one high/low lane-selection trace, not general scheduling fairness. Priority is a scheduling heuristic, not a safety invariant — all formal invariants (NoDuplicateClaim, TaskLeaseBounded, RunningHasPermit, etc.) are independent of dispatch order. Cross-priority fairness is enforced by the maintenance leader's priority aging task (see ADR-005)
