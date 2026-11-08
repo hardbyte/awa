@@ -20702,6 +20702,56 @@ async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
     assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
     assert!(!public_execute, "PUBLIC must not execute {function}");
 
+    let grantee = "awa_qs_cbji_truncate_holder";
+    let grantee_executes = |pool: sqlx::PgPool, function: String| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT has_function_privilege($1, $2::regprocedure, 'EXECUTE')",
+        )
+        .bind(grantee)
+        .bind(&function)
+        .fetch_one(&pool)
+        .await
+        .expect("read grantee EXECUTE")
+    };
+    let refresh_helper = |pool: sqlx::PgPool| async move {
+        sqlx::query("SELECT awa.refresh_claim_batch_job_index_helper($1)")
+            .bind(schema)
+            .execute(&pool)
+            .await
+            .expect("refresh the claim batch job index helper");
+    };
+    sqlx::raw_sql(&format!(
+        "DROP OWNED BY {grantee}; DROP ROLE IF EXISTS {grantee}"
+    ))
+    .execute(&pool)
+    .await
+    .ok();
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {grantee}; GRANT USAGE ON SCHEMA {schema} TO {grantee}; \
+         GRANT TRUNCATE ON {schema}.lease_claim_batches TO {grantee}"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create a TRUNCATE holder");
+    refresh_helper(pool.clone()).await;
+    assert!(grantee_executes(pool.clone(), function.clone()).await);
+    sqlx::raw_sql(&format!(
+        "REVOKE TRUNCATE ON {schema}.lease_claim_batches FROM {grantee}"
+    ))
+    .execute(&pool)
+    .await
+    .expect("revoke TRUNCATE");
+    refresh_helper(pool.clone()).await;
+    let still_executes = grantee_executes(pool.clone(), function.clone()).await;
+    sqlx::raw_sql(&format!("DROP OWNED BY {grantee}; DROP ROLE {grantee}"))
+        .execute(&pool)
+        .await
+        .expect("drop the TRUNCATE holder");
+    assert!(
+        !still_executes,
+        "a role that lost TRUNCATE must lose EXECUTE on {function} when the helper is refreshed"
+    );
+
     enqueue_job(
         &pool,
         &store,

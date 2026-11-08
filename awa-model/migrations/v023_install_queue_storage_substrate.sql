@@ -787,7 +787,17 @@ BEGIN
         END IF;
     END IF;
 
-    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', v_function);
+    FOR v_grantee IN
+        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+        FROM pg_proc AS routine
+        CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+        WHERE routine.oid = v_function
+          AND acl.privilege_type = 'EXECUTE'
+          AND acl.grantee <> routine.proowner
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', v_function, v_grantee);
+    END LOOP;
     FOR v_grantee IN
         SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
                              ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
