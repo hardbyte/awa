@@ -673,7 +673,7 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
-fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
+pub(crate) fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
     usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
             "invalid {ring} ring slot {slot}: slot must be non-negative"
