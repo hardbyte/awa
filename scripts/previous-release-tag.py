@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Choose the greatest strictly earlier SemVer tag in the same minor release."""
+"""Choose the greatest strictly earlier SemVer tag in the same minor release.
+
+A final release compares with the final release before it; a prerelease
+compares with whatever tag precedes it.
+"""
 
 import re
 import sys
@@ -31,8 +35,11 @@ def previous_release_tag(current_tag: str, tags: list[str]) -> str:
     candidates = []
     for tag in tags:
         key = version_key(tag)
-        if key is not None and key[:2] == current[:2] and key < current:
-            candidates.append((key, "+" not in tag, tag))
+        if key is None or key[:2] != current[:2] or key >= current:
+            continue
+        if current[3] and not key[3]:
+            continue
+        candidates.append((key, "+" not in tag, tag))
     return max(candidates)[2] if candidates else ""
 
 

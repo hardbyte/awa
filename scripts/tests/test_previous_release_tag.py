@@ -34,11 +34,23 @@ class PreviousReleaseTagTests(unittest.TestCase):
         tags = [
             "v1.0.0-alpha", "v1.0.0-alpha.1", "v1.0.0-alpha.beta",
             "v1.0.0-beta", "v1.0.0-beta.2", "v1.0.0-beta.11",
-            "v1.0.0-rc.1", "v1.0.0-rc.2", "v1.0.0-rc.10", "v1.0.0",
+            "v1.0.0-rc.1", "v1.0.0-rc.2", "v1.0.0-rc.10",
         ]
         for previous, current in zip(tags, tags[1:]):
             with self.subTest(current=current):
                 self.assertEqual(previous_release_tag(current, list(reversed(tags))), previous)
+
+    def test_release_skips_its_own_prereleases(self):
+        self.assertEqual(
+            previous_release_tag(
+                "v0.6.14",
+                ["v0.6.13-alpha.1", "v0.6.13", "v0.6.14-rc.1", "v0.6.14"],
+            ),
+            "v0.6.13",
+        )
+
+    def test_first_release_in_minor_has_no_predecessor_after_prereleases(self):
+        self.assertEqual(previous_release_tag("v1.0.0", ["v1.0.0-rc.1", "v0.9.9"]), "")
 
     def test_build_metadata_does_not_change_precedence(self):
         self.assertEqual(
