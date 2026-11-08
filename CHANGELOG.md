@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.15] — 2026-11-09
 
-Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
+Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
 
 ### Upgrading
 
@@ -19,6 +19,7 @@ Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose
 **Worker memory**
 
 - Worker finalization is bounded to the larger of the runtime's worker capacity and twice the completion batch size times the completion shard count (1,024 attempts with the queue-storage defaults). A finished handler keeps its worker slot while it waits for finalizer capacity, so when durable completion falls behind the runtime stops claiming instead of holding an unbounded backlog of finished attempts and their payloads in memory. Before, a 120-second completion stall could leave about 77,000 finished attempts and 1 GB in one worker. Attempt heartbeats continue until finalization settles. Lowering `AWA_COMPLETION_BATCH_SIZE` lowers the bound in proportion, for jobs with large payloads.
+- Lifecycle hooks (`on_event`, `on_event_kind`) no longer accumulate without bound when they are slower than job throughput. Each attempt's `Started` and outcome hooks now hold its finalizer slot until they return, so slow hooks slow claiming instead of growing worker memory, and a worker-finalized outcome hook runs after that attempt's `Started` hook has returned. Maintenance's `Rescued` and duplicate `Cancelled` events allow 1,024 outstanding hook tasks per worker and drop further events with a warning.
 
 **Claim lookups**
 

@@ -79,6 +79,8 @@ What changes in practice:
 - A worker whose completions stall shows its workers busy and its claim rate dropping to its completion rate, instead of its memory climbing. Attempts keep heartbeating while they wait, so they are not rescued as stale.
 - Jobs with large payloads hold more memory per waiting attempt. Lower `AWA_COMPLETION_BATCH_SIZE` to lower the bound in proportion.
 - If you reduced worker counts to keep 0.6.14 workers below their completion rate, you can restore them.
+- Lifecycle hooks (`on_event`, `on_event_kind`) run under the same bound: each attempt's `Started` and outcome hooks hold its slot until they return. A hook slower than job throughput now slows claiming, where 0.6.14 kept claiming and accumulated hook tasks in memory. Check that hooks return quickly, and move slow work into a job or follow-up.
+- Maintenance's `Rescued` and duplicate `Cancelled` hooks still run detached so they cannot hold up rescue, with at most 1,024 outstanding per worker; further events are dropped with a warning.
 
 ## Roll back
 
