@@ -392,20 +392,21 @@ impl JobExecutor {
                 progress_state.clone(),
             );
 
+            let mut started_event = None;
             let result = match workers.get(&job.kind) {
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
                         let started_job = job.clone();
-                        tokio::spawn(async move {
+                        started_event = Some(tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
                                 &started_kind,
                                 UntypedJobEvent::Started { job: started_job },
                             )
                             .await;
-                        });
+                        }));
                     }
                     let perform = CatchUnwind(worker.perform(&ctx));
                     let outcome = match abandon_after {
@@ -574,13 +575,19 @@ impl JobExecutor {
                 }
 
                 drop(heartbeat_guard);
-                drop(finalize_permit);
+                // Lifecycle hooks run under the finalizer permit, so a hook slower
+                // than job throughput holds back claiming instead of accumulating
+                // tasks that each retain a copy of the job.
+                if let Some(started_event) = started_event {
+                    let _ = started_event.await;
+                }
                 if let Ok(CompletionOutcome::Applied {
                     event: Some(event), ..
                 }) = outcome
                 {
                     dispatch_lifecycle_event(&lifecycle_handlers, &job_kind, event).await;
                 }
+                drop(finalize_permit);
             });
         }
         .instrument(span)

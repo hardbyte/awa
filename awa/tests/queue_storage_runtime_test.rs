@@ -20,7 +20,7 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
@@ -2268,6 +2268,113 @@ async fn test_queue_storage_lease_runtime_stops_claiming_while_finalization_is_s
         false,
     )
     .await;
+}
+
+/// Lifecycle hooks run under the finalizer bound: while a hook does not
+/// return, claiming stops at that bound instead of accumulating hook tasks,
+/// and every job completes once the hooks return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_slow_lifecycle_hook_holds_back_claiming() {
+    const FINALIZER_CAPACITY: usize = 1_024;
+    const WORKERS: u32 = 64;
+    const JOBS: i64 = 1_600;
+    let queue = "qs_slow_lifecycle_hook";
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store_config = QueueStorageConfig {
+        schema: "awa_qs_slow_lifecycle_hook".to_string(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    for first in (0..JOBS).step_by(500) {
+        let params: Vec<_> = (first..(first + 500).min(JOBS))
+            .map(|n| {
+                insert::params_with(
+                    &FinalizeBacklogJob { n },
+                    InsertOpts {
+                        queue: queue.to_string(),
+                        ..Default::default()
+                    },
+                )
+                .expect("params")
+            })
+            .collect();
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("enqueue backlog");
+    }
+
+    let (open_hooks, hooks_open) = tokio::sync::watch::channel(false);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let recorded = runs.clone();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: WORKERS,
+                poll_interval: Duration::from_millis(10),
+                deadline_duration: Duration::ZERO,
+                claim_batch_size: WORKERS as usize,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register::<FinalizeBacklogJob, _, _>(move |_, _| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            async { Ok(JobResult::Completed) }
+        })
+        .on_event::<FinalizeBacklogJob, _, _>(move |_| {
+            let mut hooks_open = hooks_open.clone();
+            async move {
+                let _ = hooks_open.wait_for(|open| *open).await;
+            }
+        })
+        .heartbeat_staleness(Duration::from_secs(300))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("build slow hook client");
+    client.start().await.expect("start slow hook client");
+
+    let limit = FINALIZER_CAPACITY + WORKERS as usize;
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    let mut last = (0, Instant::now());
+    let started_while_blocked = loop {
+        let started = runs.load(Ordering::SeqCst);
+        if started > limit {
+            break started;
+        }
+        if started != last.0 {
+            last = (started, Instant::now());
+        } else if started > 0 && last.1.elapsed() >= Duration::from_secs(5) {
+            break started;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "claiming neither stopped nor passed {limit}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    open_hooks.send(true).expect("open the hooks");
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(60));
+    while completed_terminal_count(&pool, &store, queue).await < JOBS {
+        assert!(Instant::now() < deadline, "the backlog did not drain");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client.shutdown(Duration::from_secs(10)).await;
+
+    assert!(
+        started_while_blocked <= limit,
+        "{started_while_blocked} jobs started while lifecycle hooks were blocked; \
+         at most {limit} may occupy finalizer slots or hold a worker"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst) as i64, JOBS);
 }
 
 async fn assert_claiming_stops_while_finalization_is_stalled(

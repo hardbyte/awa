@@ -30,6 +30,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - A `Completed` lifecycle event, and the job a `Completed` follow-up enqueue spec receives, no longer carry the finished attempt's `heartbeat_at` and `deadline_at`; both are `None`, as a read of the completed job returns them.
 - Worker finalization is bounded to the larger of the runtime's worker capacity and twice the completion batch size times the completion shard count. A finished handler keeps its worker slot while it waits for finalizer capacity, so when durable completion falls behind the runtime stops claiming instead of holding an unbounded backlog of finished attempts and their payloads in memory. Attempt heartbeats continue until finalization settles.
 - Retried queue-storage jobs and jobs carrying metadata complete by their compact claim batch and item index, instead of reading every retained claim batch.
+- Lifecycle hooks (`on_event`, `on_event_kind`) no longer accumulate without bound when they are slower than job throughput. Each attempt's `Started` and outcome hooks now hold its finalizer slot until they return, so slow hooks slow claiming instead of growing worker memory, and a worker-finalized outcome hook runs after that attempt's `Started` hook has returned. Maintenance's `Rescued` and duplicate `Cancelled` events allow 1,024 outstanding hook tasks per worker and drop further events with a warning.
 
 ## [0.6.14] — 2026-11-08
 
