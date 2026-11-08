@@ -6,81 +6,92 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.14] — 2026-11-08
 
-Queue-storage fixes for 0.6.13. The schema remains v40. Apply the repeatable
-`definer_lane_provisioning` patch once, then roll processes in any order;
-binaries can roll back to 0.6.13 with the patch retained. See the
-[upgrade guide](docs/upgrade-0.6.13-to-0.6.14.md).
+Recommended for everyone on 0.6.13 using queue storage. A busy queue no longer
+stalls promotion of the others, prune backs off cleanly under lock contention,
+new queue lanes are usable by every runtime role, and jobs no longer stay
+running, run again or get misreported after priority aging.
+
+### Upgrading
+
+- The schema stays at v40. Run `awa migrate` once as the schema owner while
+  workers keep running. It applies the repeatable `definer_lane_provisioning`
+  patch and repairs existing lane sequences. Then roll workers, producers and
+  admin processes in any order. Binaries can roll back to 0.6.13 with the patch
+  left in place.
+- `awa storage lane-sequences` checks lane-sequence ownership and grants and
+  exits with code 2 while problems remain; `--repair` fixes what the connected
+  role may.
+- External migration runners: apply `R__definer_lane_provisioning.sql` after
+  `V40` (`awa migrate --extract-to <dir> --pending`), replacing all `R__` files
+  together, then run `awa storage lane-sequences --repair` as the migration
+  role. See the [upgrade guide](docs/upgrade-0.6.13-to-0.6.14.md).
 
 ### Fixed
 
-- Promotion no longer issues NOTIFY inside its per-lane transactions. A
-  notifying transaction takes PostgreSQL's notify-queue lock at `COMMIT`, and
-  every notifying transaction in the cluster waits its turn for it. Each lane
-  transaction waited there while still holding its lane's locks and its 50 ms
-  lock timeout, so under concurrent enqueues the commit timed out, the batch
-  rolled back as a contended lane, and due scheduled and retryable jobs were
-  delayed. Promotion now wakes claimers once, after its lanes commit. The wakeup
-  is a hint that claimers also poll for, so if it fails it is logged and the
-  promotion stands.
-- Heartbeat, deadline and receipt rescue skip an attempt whose retained ready
-  bodies are ambiguous, logging an error on each pass, instead of rolling back
-  the whole rescue. Before, one such attempt stopped rescue of every other
-  stale attempt in the schema. The skipped attempt stays running until its
-  bodies are repaired.
-- A worker whose completion or callback wait has committed no longer reports
-  it as failed when re-reading the job for its lifecycle event fails. It logs
-  a warning and builds the event from its own copy, so the event and the
-  completion metrics are kept, and a retry no longer re-runs the transition.
-- With a lifecycle hook registered, a completion no longer re-reads the job to
-  build its Completed event. That read added about 24 round trips per
-  completion; the event is now built from the job the worker holds.
+**Lane ownership**
+
+- A queue lane created by one runtime role is usable by every other runtime
+  role. Before, its sequences belonged to whichever role created it, so other
+  roles could fail with `permission denied for sequence`, for example after
+  `enqueue_shards` was raised. New lanes now belong to the schema owner with the
+  head table's grants, and migration repairs existing ones, including when the
+  migration role can only `SET ROLE` to the schema owner.
+
+**Promotion, prune and lock contention**
+
+- A busy queue lane no longer delays promotion of other queues or maintenance.
+  Promotion waits 50 ms for a lane's locks and hands a busy lane to a dedicated
+  waiter.
+- A lock timeout anywhere in prune or terminal rollup rolls the attempt back and
+  reports `Blocked` instead of an error, and prune backs off.
+- Admin job details, lists and kind counts release partition locks between read
+  phases, so they block prune less, and lists of retained history do less
+  repeated work.
+- A read cancelled while starting its transaction closes its connection, so the
+  next caller cannot inherit an open transaction and its partition locks.
+
+**Job correctness after priority aging and recovery**
+
+- Physical priority aging no longer moves a ready row that is being claimed.
+  Before, it could tombstone the body of a just-claimed job, after which
+  completion, cancellation and rescue failed and the claim ring stayed pinned.
+  Bodies left tombstoned by older releases are recovered when the job is read,
+  completed, cancelled or rescued.
+- Reads and callbacks find attempts that priority aging or a priority change
+  moved, and admin lists and kind counts include running jobs whose claims have
+  not yet become leases.
+- Failed jobs keep their arguments, attempt limit and lane in terminal history;
+  manual retries and DLQ moves keep the correct priority and lane.
+- Schema-only admin clients work with ready rings larger than the default.
+
+**Workers**
+
+- Workers retry lock contention during finalization for up to 120 s with the
+  handler's saved result, keeping the job's heartbeat until the outcome
+  settles.
+- Graceful shutdown waits for pending finalization before stopping heartbeat and
+  maintenance, within the existing drain timeout.
+- A completion or callback wait that has committed is no longer reported as
+  failed if re-reading the job for its lifecycle event fails.
+
+**CLI**
+
 - `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql`
   silently won and nothing was extracted.
-- Lane-sequence repair completes missing runtime grants when the migration role can `SET ROLE` to the schema owner without inheriting its privileges, and restores its prior role afterward. `awa migrate` refreshes an older installed repair helper even when the versionless provisioning patch was already applied.
-- Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
-- New queue lanes and their sequences belong to the schema owner and receive
-  the head table's grants, regardless of which runtime creates them. Migration
-  also repairs existing lanes where permitted and reports busy or unauthorized
-  sequences for a later repair. `awa storage lane-sequences [--repair]` checks
-  or repairs them and exits with code 2 while problems remain.
-- Promotion isolates contended queue/priority lanes so they cannot stall other
-  queues or maintenance. Lock timeouts anywhere in prune or terminal rollup
-  roll back the attempt and report `Blocked`.
-- Graceful shutdown waits for pending finalization before stopping heartbeat
-  and maintenance, subject to the existing drain timeout.
-- Queue-storage workers retry lock contention within a 120-second lock-retry
-  window, preserving the saved handler result. Accepted finalization
-  work retains heartbeat ownership until its acknowledgement or error arrives,
-  including work queued before the window expires. Handler capacity is released
-  immediately; lifecycle hooks run after finalization.
-- Reads and callbacks identify priority-aged and moved attempts by job ID and
-  run lease, preferring live ready bodies over moved source copies. Admin lists
-  and kind counts also include running receipt claims that have not materialized
-  into leases.
-- Physical priority aging excludes claimed rows before its batch limit, waits
-  for in-flight claims and rechecks claim evidence before moving a ready row,
-  including claims committed before their cursor advances. Active point and
-  callback reads recover retained tombstoned bodies left by older aging.
-  Rescue, cancellation and completion by ID recover those bodies and retire
-  unclaimed copies of the same attempt. Emitted claim-lane evidence takes
-  precedence over colliding live replacements; those recovered terminal bodies
-  remain self-contained through retry. Cancellation prefers an active attempt
-  over its historical available replacement.
-- Failed terminal writes preserve the ready body's arguments, attempt limit and
-  physical lane. Rust retry and retention carry recover older narrow terminal
-  bodies while their backing remains retained. Stored terminal metadata wins
-  over ready defaults, and counters use the correct stored and replacement
-  priorities.
-- Manual terminal retry restarts aging from the physical lane. Manual
-  terminal-to-DLQ moves preserve that lane for a later DLQ retry. Automatic
-  retryable rescue and automatic DLQ routing retain effective aged priority.
-- Read connections close if BEGIN is cancelled before acknowledgement, so later
-  callers cannot inherit an open transaction and its partition locks.
-- Job details, receipt-backed lists and kind counts release completed read
-  phases within one snapshot, reducing retained partition locks. Job details
-  retain the located ready body until the read finishes.
-- Admin list and kind queries reduce repeated work when reading retained history and retain
-  their state, queue, kind and pagination semantics.
+
+### Since 0.6.14-alpha.1
+
+For testers of the prerelease, these fix behaviour that alpha.1 introduced:
+
+- Promotion no longer holds a lane's locks while waiting for PostgreSQL's
+  cluster-wide NOTIFY lock at commit, where under concurrent enqueues the
+  50 ms lane timeout could expire and roll the batch back. Claimers are woken
+  once after the lanes commit.
+- With lifecycle hooks registered, a completion builds its event from the job
+  the worker holds instead of re-reading it, which cost about 24 round trips
+  per completion.
+- Rescue skips an attempt with ambiguous retained bodies and logs an error on
+  each pass, instead of failing the whole rescue.
 
 ### Added
 
@@ -103,31 +114,20 @@ binaries can roll back to 0.6.13 with the patch retained. See the
 
 ### Known limitations
 
-- Prune can truncate a ready partition before a job-detail read locates its
-  body, or truncate a lease/claim partition before that read phase reaches it.
-  A completed job can briefly appear available or missing; a fresh read can
-  recover the current result.
-- The installed `terminal_jobs` SQL view and creation-time bucket joins still
-  use the stored priority for older mismatched rows. Retention carry can widen
-  surviving failed rows, but already-pruned backing bodies cannot be rebuilt.
-- Legacy or backfilled claims can lack unique emitted claim-lane evidence.
-  Recovery then prefers a unique live body, which cannot reliably identify the
-  original physical lane if an old aging race left a colliding live replacement.
-  Multiple equally supported bodies cause an explicit ambiguity error and
-  transaction rollback; rescue instead skips that attempt and logs an error on
-  each pass, so it stays running until its bodies are repaired.
-- Repair of an old aging replacement runs when a transition hydrates a retained
-  tombstoned body. Worker completion using its already carried job body does not
-  perform that repair, and can leave an old replacement claimable. The aging
-  fence prevents new replacements from updated callers; it cannot fence an
-  older process explicitly calling physical aging during a rolling upgrade.
-  Repair takes claim-head row locks without waiting. Rescue batches defer
-  busy historical attempts while progressing other attempts; receipt rescue
-  cursors keep deferred attempts eligible. Worker completion batches isolate
-  lock contention to the affected requests. Direct completion and
-  single-attempt mutations still fail on contention and callers must retry.
-  Workers retry those mutations within their bounded lock-retry window. It adds
-  weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
+- A job-detail read can race prune and briefly show a completed job as
+  available or missing; reading again returns the current state.
+- If an older release's aging race left two equally plausible bodies for one
+  running attempt, reads and direct transitions of that attempt fail with an
+  ambiguity error, and rescue skips it until the bodies are repaired.
+- A worker completing a job with the body it already holds does not retire an
+  unclaimed copy left by older aging, so that copy can run again
+  (at-least-once).
+- Direct API calls that recover a body left by older aging (external callback
+  complete, fail and retry; admin cancel and retry; completion by ID) can fail
+  with SQLSTATE 55P03 under contention and must be retried. Workers retry
+  automatically.
+- The installed `terminal_jobs` SQL view still reports the stored priority for
+  older rows whose priority changed.
 
 ## [0.6.14-alpha.1] — 2026-11-07
 
