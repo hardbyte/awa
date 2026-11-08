@@ -1296,16 +1296,9 @@ fn queue_storage_job_id_candidates_sql(
     if let JobCandidateSource::Receipts(slot) = source {
         let open_running =
             crate::queue_storage::open_receipt_running_claims_sql_in_slot(schema, slot);
-        let predicates = predicates(
-            None,
-            Some("created.kind"),
-            "open_claims.queue",
-            "open_claims.job_id",
-        );
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT open_claims.job_id
-                FROM ({open_running}) AS open_claims
+        let kind_join = if kind.is_some() {
+            format!(
+                r#"
                 CROSS JOIN LATERAL (
                     SELECT ready.kind
                     FROM {schema}.ready_entries AS ready
@@ -1323,6 +1316,22 @@ fn queue_storage_job_id_candidates_sql(
                       )
                     LIMIT 1
                 ) AS created
+                "#
+            )
+        } else {
+            String::new()
+        };
+        let predicates = predicates(
+            None,
+            Some("created.kind"),
+            "open_claims.queue",
+            "open_claims.job_id",
+        );
+        legs.push(format!(
+            r#"(
+                SELECT DISTINCT open_claims.job_id
+                FROM ({open_running}) AS open_claims
+                {kind_join}
                 WHERE TRUE{predicates}
                 ORDER BY open_claims.job_id DESC
                 LIMIT {limit}

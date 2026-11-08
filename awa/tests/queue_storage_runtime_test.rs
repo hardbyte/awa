@@ -18672,6 +18672,75 @@ async fn test_receipt_list_refills_pages_past_closed_and_other_kind_claims() {
         all_ids,
         "closed receipts and materialized claims must not duplicate results"
     );
+
+    let missing_ids: Vec<i64> = (1..=13).map(|offset| all_ids[0] + offset).collect();
+    let claim_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT current_slot FROM {}.claim_ring_state WHERE singleton",
+        store.schema()
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read current receipt slot");
+    sqlx::query(&format!(
+        "INSERT INTO {}.lease_claims (claim_slot, job_id, run_lease, ready_slot, \
+         ready_generation, queue, priority, attempt, max_attempts, lane_seq) \
+         SELECT $1, job_id, 1, 0, 0, $2, 2, 1, 25, job_id \
+         FROM unnest($3::bigint[]) AS missing(job_id)",
+        store.schema()
+    ))
+    .bind(claim_slot)
+    .bind(queue)
+    .bind(&missing_ids)
+    .execute(&pool)
+    .await
+    .expect("seed newer receipts without any job body");
+    for job_id in &missing_ids {
+        assert!(
+            store
+                .load_job(&pool, *job_id)
+                .await
+                .expect("missing-body receipt must not suppress a hydration error")
+                .is_none(),
+            "synthetic receipt {job_id} unexpectedly has a job body"
+        );
+    }
+    let expected_running: Vec<i64> = all_ids
+        .iter()
+        .copied()
+        .filter(|job_id| !finished.iter().any(|claim| claim.job.id == *job_id))
+        .collect();
+    let no_kind = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        queue: Some(queue.into()),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let first = receipt_admin_ids(&pool, no_kind.clone()).await;
+    assert_eq!(first, expected_running[..2]);
+    let second = receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: first.last().copied(),
+            ..no_kind
+        },
+    )
+    .await;
+    assert_eq!(second, expected_running[2..4]);
+    assert!(first.iter().all(|id| !second.contains(id)));
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                state: Some(JobState::Running),
+                kind: Some(CompleteJob::kind().into()),
+                queue: Some(queue.into()),
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .await,
+        targets[..2]
+    );
 }
 
 struct PointReadControl {
