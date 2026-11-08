@@ -16,13 +16,16 @@ use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Detached lifecycle hook tasks maintenance may have outstanding at once.
+const MAINTENANCE_LIFECYCLE_EVENT_CAPACITY: usize = 1024;
 
 /// The canonical unique-claim conflict raised by `awa.sync_job_unique_claims`
 /// (SQLSTATE 23505, constraint reported as `idx_awa_jobs_unique`). See #388.
@@ -675,6 +678,10 @@ pub struct MaintenanceService {
     /// In-process `Rescued` lifecycle hooks (ADR-015), shared with the
     /// executor. Best-effort fire-and-forget per rescued job.
     lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
+    /// Bounds the detached lifecycle hook tasks maintenance has outstanding;
+    /// events beyond it are dropped and counted.
+    lifecycle_event_capacity: Arc<tokio::sync::Semaphore>,
+    dropped_lifecycle_events: Arc<AtomicU64>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
@@ -978,6 +985,10 @@ impl MaintenanceService {
             standby_queue_storage: None,
             enqueue_specs,
             lifecycle_handlers,
+            lifecycle_event_capacity: Arc::new(tokio::sync::Semaphore::new(
+                MAINTENANCE_LIFECYCLE_EVENT_CAPACITY,
+            )),
+            dropped_lifecycle_events: Arc::new(AtomicU64::new(0)),
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: DEFAULT_DEADLINE_RESCUE_INTERVAL,
             callback_rescue_interval: Duration::from_secs(30),
@@ -2412,9 +2423,7 @@ impl MaintenanceService {
                 job: job.clone(),
                 reason,
             };
-            tokio::spawn(async move {
-                crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
-            });
+            self.spawn_lifecycle_event(handlers, kind, event);
         }
     }
 
@@ -2501,8 +2510,41 @@ impl MaintenanceService {
             job: job.clone(),
             reason,
         };
+        self.spawn_lifecycle_event(handlers, kind, event);
+    }
+
+    /// Runs `kind`'s lifecycle hooks for `event` on a detached task, so a slow
+    /// hook does not hold up maintenance. At most
+    /// [`MAINTENANCE_LIFECYCLE_EVENT_CAPACITY`] such tasks are outstanding; an
+    /// event beyond that is dropped rather than retaining its job until the
+    /// hooks catch up.
+    fn spawn_lifecycle_event(
+        &self,
+        handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
+        kind: String,
+        event: crate::events::UntypedJobEvent,
+    ) {
+        if !handlers.contains_key(&kind) {
+            return;
+        }
+        let Ok(permit) = self.lifecycle_event_capacity.clone().try_acquire_owned() else {
+            let dropped = self
+                .dropped_lifecycle_events
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if dropped % 1000 == 1 {
+                warn!(
+                    kind,
+                    dropped,
+                    capacity = MAINTENANCE_LIFECYCLE_EVENT_CAPACITY,
+                    "Dropped a maintenance lifecycle event: earlier hooks have not returned"
+                );
+            }
+            return;
+        };
         tokio::spawn(async move {
             crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
+            drop(permit);
         });
     }
 

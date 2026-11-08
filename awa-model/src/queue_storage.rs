@@ -2150,6 +2150,62 @@ mod ready_segment_tests {
         }
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
+        use super::{QueueStorageConfig, RuntimeReadyRow};
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: "awa_qs_segment_bind_limit".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store.install(&pool).await.unwrap();
+
+        // Distinct microsecond timestamps guarantee one segment per row.
+        // Reading the clock for every row can coalesce adjacent timestamps
+        // and fail to exercise the old 8,191-segment bind limit.
+        const JOBS: i64 = 9_000;
+        let first_run_at = Utc::now() - Duration::seconds(1);
+        let rows = (0..JOBS)
+            .map(|seq| RuntimeReadyRow {
+                kind: "segment_test".into(),
+                queue: "segment-q".into(),
+                args: serde_json::json!({"seq": seq}),
+                priority: 2,
+                attempt: 0,
+                run_lease: 0,
+                max_attempts: 25,
+                run_at: first_run_at + Duration::microseconds(seq),
+                attempted_at: None,
+                created_at: first_run_at,
+                unique_key: None,
+                unique_states: None,
+                payload: serde_json::json!({}),
+                ordering_key: None,
+            })
+            .collect();
+        assert_eq!(
+            store.enqueue_runtime_rows(&pool, rows).await.unwrap(),
+            JOBS as usize
+        );
+        let counts: (i64, i64) = sqlx::query_as(&format!(
+            "SELECT (SELECT count(*) FROM {}.ready_entries), \
+                    (SELECT count(*) FROM {}.ready_segments)",
+            store.schema(),
+            store.schema()
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (JOBS, JOBS));
+        let claimed = store
+            .claim_runtime_batch(&pool, "segment-q", 100, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 100);
+    }
+
     #[test]
     fn ready_segments_split_on_run_at_boundaries() {
         let first = Utc
@@ -7010,14 +7066,22 @@ impl QueueStorage {
                             .expect("receipt-backed slow completion requires receipt_id")
                     })
                     .collect();
+                let receipt_claim_batch_ids: Vec<Option<i64>> = receipt_claimed
+                    .iter()
+                    .map(|entry| entry.claim.claim_batch_id)
+                    .collect();
+                let receipt_claim_batch_indices: Vec<Option<i32>> = receipt_claimed
+                    .iter()
+                    .map(|entry| entry.claim.claim_batch_index)
+                    .collect();
                 let closure_rel = format!("{schema}.lease_claim_closures");
                 let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
                 let closed_evidence =
                     receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
                 let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
                     r#"
-                    WITH completed(claim_slot, job_id, run_lease, receipt_id) AS (
-                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bigint[])
+                    WITH completed(claim_slot, job_id, run_lease, receipt_id, claim_batch_id, claim_batch_index) AS (
+                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::int[])
                     ),
                     locked_row_claims AS (
                         SELECT claims.claim_slot, claims.job_id, claims.run_lease
@@ -7044,18 +7108,22 @@ impl QueueStorage {
                             items.job_id,
                             items.run_lease,
                             items.receipt_id
-                        FROM {schema}.lease_claim_batches AS claim_batches
-                        CROSS JOIN LATERAL unnest(
-                            claim_batches.job_ids,
-                            claim_batches.run_leases,
-                            claim_batches.receipt_ids
-                        ) AS items(job_id, run_lease, receipt_id)
-                        JOIN completed
-                          ON completed.claim_slot = claim_batches.claim_slot
-                         AND completed.job_id = items.job_id
-                         AND completed.run_lease = items.run_lease
-                         AND completed.receipt_id = items.receipt_id
-                        WHERE claim_batches.job_ids && $2::bigint[]
+                        FROM completed
+                        JOIN {schema}.lease_claim_batches AS claim_batches
+                          ON claim_batches.claim_slot = completed.claim_slot
+                         AND claim_batches.batch_id = completed.claim_batch_id
+                        CROSS JOIN LATERAL (
+                            SELECT
+                                claim_batches.job_ids[completed.claim_batch_index] AS job_id,
+                                claim_batches.run_leases[completed.claim_batch_index] AS run_lease,
+                                claim_batches.receipt_ids[completed.claim_batch_index] AS receipt_id
+                        ) AS items
+                        WHERE completed.claim_batch_id IS NOT NULL
+                          AND completed.claim_batch_index IS NOT NULL
+                          AND completed.claim_batch_index BETWEEN 1 AND claim_batches.claimed_count
+                          AND completed.job_id = items.job_id
+                          AND completed.run_lease = items.run_lease
+                          AND completed.receipt_id = items.receipt_id
                           AND NOT EXISTS (
                               SELECT 1
                               FROM {schema}.lease_claim_closures AS closures
@@ -7093,7 +7161,6 @@ impl QueueStorage {
                               WHERE dlq.job_id = items.job_id
                                 AND dlq.run_lease = items.run_lease
                           )
-                        FOR UPDATE OF claim_batches
                     ),
                     locked_claims AS (
                         SELECT claim_slot, job_id, run_lease FROM locked_row_claims
@@ -7185,6 +7252,8 @@ impl QueueStorage {
                 .bind(&receipt_job_ids)
                 .bind(&receipt_run_leases)
                 .bind(&receipt_receipt_ids)
+                .bind(&receipt_claim_batch_ids)
+                .bind(&receipt_claim_batch_indices)
                 .fetch_all(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
