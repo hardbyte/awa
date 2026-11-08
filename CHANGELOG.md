@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- `admin::get_job` and the other queue-storage point reads of one job no longer return `JobNotFound` for a failed job while queue prune moves its row out of the slot being pruned. Since 0.6.14 the read used one snapshot, and a prune that committed after that snapshot was taken left the old slot empty and the moved row invisible to it. Prune moves each retained failed row once per ring cycle, and on a new schema prunes slot 0 right after the first rotation, so a read polling for `failed` could hit it within a second of a worker starting. A read that finds nothing now reads once more in a new snapshot.
+
 ## [0.6.15] — 2026-11-09
 
 Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
