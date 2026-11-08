@@ -24,6 +24,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   it as failed when re-reading the job for its lifecycle event fails. It logs
   a warning and builds the event from its own copy, so the event and the
   completion metrics are kept, and a retry no longer re-runs the transition.
+- With a lifecycle hook registered, a completion no longer re-reads the job to
+  build its Completed event. That read added about 24 round trips per
+  completion; the event is now built from the job the worker holds.
 - `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql`
   silently won and nothing was extracted.
 
