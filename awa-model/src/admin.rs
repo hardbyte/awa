@@ -4076,7 +4076,7 @@ async fn queue_storage_base_kind_counts(
     Ok(counts)
 }
 
-// The result is bounded by the configured claim-ring slot count, not by
+// The result is bounded by the installed claim-ring slot count, not by
 // retained job volume. Include all populated slots, including old generations.
 async fn queue_storage_populated_claim_slots(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -4098,14 +4098,11 @@ async fn queue_storage_populated_claim_slots(
     sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
         .execute(tx.as_mut())
         .await?;
+    // A schema-only admin store carries the default slot count, so take the
+    // installed slot numbers as they are rather than bounding them by it.
     slots
         .into_iter()
-        .map(|slot| {
-            usize::try_from(slot)
-                .ok()
-                .filter(|slot| *slot < store.claim_slot_count())
-                .ok_or_else(|| AwaError::Validation(format!("invalid physical claim slot {slot}")))
-        })
+        .map(|slot| crate::queue_storage::ring_slot_number(slot, "claim"))
         .collect()
 }
 

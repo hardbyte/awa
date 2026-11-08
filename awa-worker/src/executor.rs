@@ -1750,6 +1750,17 @@ fn rescheduled_event_row(
     row
 }
 
+/// The job as a read returns it after this attempt completes.
+fn completed_event_row(job: &JobRow) -> JobRow {
+    let mut row = job.clone();
+    row.state = JobState::Completed;
+    row.finalized_at = Some(chrono::Utc::now());
+    row.progress = None;
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_job_queue_storage(
     runtime: &QueueStorageRuntime,
@@ -1860,15 +1871,11 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                // A completed attempt changes only these fields, so the event is
-                // built from the worker's copy rather than re-reading the job.
-                let mut updated_job = job.clone();
-                updated_job.state = JobState::Completed;
-                updated_job.finalized_at = Some(chrono::Utc::now());
-                updated_job.progress = None;
+                // The event is built from the worker's copy rather than
+                // re-reading the job.
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
-                        job: updated_job,
+                        job: completed_event_row(job),
                         duration,
                     }),
                     terminal: false,
@@ -2486,12 +2493,7 @@ async fn complete_queue_storage_with_followups(
 
     // Synthesise the post-completion snapshot — the store has just moved the
     // lease into `done_entries` so a live SELECT would race with rotation.
-    // The happy-path fields are exactly those `complete_job_queue_storage`
-    // reconstructs when `load_job` returns None.
-    let mut updated_job = job.clone();
-    updated_job.state = JobState::Completed;
-    updated_job.finalized_at = Some(chrono::Utc::now());
-    updated_job.progress = None;
+    let updated_job = completed_event_row(job);
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
 

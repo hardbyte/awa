@@ -189,6 +189,17 @@ jobs:
           cargo test --release --package awa --test concurrent_lifecycle_test \
             test_concurrent_queue_sweep -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-queue-sweep.txt
+      - name: Run per-lane enqueue contention benchmark
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          # Many producers batch-inserting into one queue lane. Gates the
+          # per-lane rate and p99 through benchmarks/baseline.json, and the
+          # lane-lock hold time relative to the per-row insert function.
+          cargo test --release --package awa --test enqueue_lane_contention_test \
+            test_enqueue_lane_contention_gate -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-enqueue-lane.txt
       - name: Run MVCC horizon overlap benchmark
         if: always()
         timeout-minutes: 10

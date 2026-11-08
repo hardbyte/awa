@@ -155,7 +155,9 @@ Enqueue is transactional: if the producer's outer transaction rolls back, the jo
 There are two COPY-shaped producer paths:
 
 - Direct queue-storage COPY is the high-throughput path: Rust producers use a configured `QueueStorage::enqueue_params_copy()`, and Python producers use `enqueue_many_copy()`. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially `queue_stripe_count` / `queue_storage_queue_stripe_count`.
-- `insert_many_copy()` is the compatibility path. It stages rows with COPY but then routes each row through `awa.insert_job_compat()`, so it preserves the public compatibility surface rather than bypassing to the direct producer path.
+- `insert_many_copy()` is the compatibility path. It stages rows with COPY, then inserts them through `awa.insert_jobs_compat_batch()` (the `insert_jobs_compat_batch` schema patch), which reserves each lane once, in canonical lane order, after the batch's lane-independent work, and skips unique conflicts in the same statement. It probes its own connection on every call; on a schema without the patch, or for a role without `EXECUTE` on the function, it routes each row through `awa.insert_job_compat()`. Either way it preserves the public compatibility surface rather than bypassing to the direct producer path.
+
+Generic `insert_many` always uses one statement that calls `awa.insert_job_compat()` per row in canonical lane order: its `PgExecutor` is consumed by that statement, so it cannot probe the schema first. `insert_many_skip_unique_conflicts` requires the batch function.
 
 Claim is cursor-based rather than heap-scan based:
 
