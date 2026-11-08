@@ -23227,6 +23227,69 @@ async fn test_receipt_admin_scope_materialized_control() {
 }
 
 #[tokio::test]
+async fn test_schema_only_admin_reads_claims_in_installed_slot() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_admin_wide_claims";
+    let queue = "admin_wide_claims";
+    let default_claim_slots = QueueStorageConfig::default().claim_slot_count;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            claim_slot_count: default_claim_slots + 2,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    // An empty ring idle-skips rotation, so append the cursor move directly.
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.claim_ring_rotations (generation, slot) VALUES (1, $1)"
+    )))
+    .bind(default_claim_slots as i32)
+    .execute(&pool)
+    .await
+    .expect("move the claim ring cursor past the default slot count");
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claims = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].claim.claim_slot, default_claim_slots as i32);
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs through a schema-only store");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    let kinds = admin::job_kind_overviews(&pool)
+        .await
+        .expect("count kinds through a schema-only store");
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!((complete.job_count, complete.queue_count), (1, 1));
+}
+
+#[tokio::test]
 async fn test_receipt_list_refills_pages_past_closed_and_other_kind_claims() {
     let (_guard, pool) = setup_pool(6).await;
     let queue = "receipt_candidate_refill";
