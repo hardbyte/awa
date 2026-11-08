@@ -24402,15 +24402,36 @@ async fn moved_tombstoned_claim_lane(
         assert_eq!(loaded.max_attempts, 1);
     }
     if !receipts {
-        let err = store
+        let other_queue = "qs_moved_tomb_claim_other";
+        let other_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: 9044 },
+            InsertOpts {
+                queue: other_queue.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let other_claims = store
+            .claim_runtime_batch(&pool, other_queue, 1, Duration::from_secs(300))
+            .await
+            .expect("claim an unrelated job");
+        assert_eq!(other_claims.len(), 1);
+        assert_eq!(lease_count(&pool, &store).await, 2);
+
+        let rescued = store
             .rescue_stale_heartbeats(&pool, Duration::ZERO)
             .await
-            .expect_err("legacy ambiguous physical lanes must not be selected arbitrarily");
-        assert!(err.to_string().contains("ready body ambiguous"), "{err}");
+            .expect("an ambiguous attempt does not stop rescue of the others");
+        assert_eq!(
+            rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![other_id]
+        );
         assert_eq!(
             lease_count(&pool, &store).await,
             1,
-            "ambiguous mutation rolls back"
+            "the ambiguous attempt's mutation rolls back and it stays running"
         );
         return;
     }
@@ -24451,7 +24472,7 @@ async fn test_historical_tombstoned_claim_uses_emitted_lane_high_to_low() {
     moved_tombstoned_claim_lane(4, 2, true, false, false).await;
 }
 #[tokio::test]
-async fn test_historical_tombstoned_legacy_ambiguous_lanes_roll_back() {
+async fn test_historical_tombstoned_legacy_ambiguous_lane_is_skipped_by_rescue() {
     moved_tombstoned_claim_lane(2, 4, false, false, false).await;
 }
 
