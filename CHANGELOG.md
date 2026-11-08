@@ -21,6 +21,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - `insert_many_skip_unique_conflicts` (Rust) inserts a batch through `awa.insert_jobs_compat_batch`, skipping jobs whose unique key is already claimed, and returns the inserted rows in input order. Use it instead of retrying a failed `insert_many` one job at a time, which takes the lane lock once per job. It needs the `insert_jobs_compat_batch` patch. Generic `insert_many` is unchanged.
 - `enqueue_lane_contention_test` benchmarks many producers on one lane, with a nightly gate on per-lane throughput and lock hold time.
 
+### Fixed
+
+- Admin job lists and kind counts work on a queue-storage schema installed with more claim slots than the default, instead of failing with `invalid physical claim slot`.
+
 ## [0.6.14] — 2026-11-08
 
 Recommended for everyone on 0.6.13 using queue storage. A busy queue no longer stalls promotion of the others, prune backs off cleanly under lock contention, new queue lanes are usable by every runtime role, and jobs no longer stay running, run again or get misreported after priority aging.
