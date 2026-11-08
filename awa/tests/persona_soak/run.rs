@@ -134,6 +134,12 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         format!("load phase started: {}s", shared.config.load.as_secs()),
     );
     shared.started_load(Instant::now());
+    let load_started_ms = shared.now_ms();
+    let memory_sampler = tokio::spawn(super::memory::sample(
+        shared.clone(),
+        shared.drain_stop.clone(),
+    ));
+    let completion_stall = tokio::spawn(super::memory::stall_completions(shared.clone()));
 
     let load_deadline = Instant::now() + shared.config.load;
     let mut next_progress = Instant::now() + Duration::from_secs(30);
@@ -200,6 +206,13 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     }
 
     shared.drain_stop.trigger();
+    completion_stall
+        .await
+        .map_err(|error| format!("completion stall task: {error}"))?;
+    memory_sampler
+        .await
+        .map_err(|error| format!("memory sampler task: {error}"))?;
+    super::memory::evaluate(&shared, load_started_ms);
     for (persona, task) in tasks {
         match tokio::time::timeout(
             crate::ci_timing::scaled_timeout(Duration::from_secs(180)),

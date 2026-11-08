@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod fleet;
 pub mod ledger;
+pub mod memory;
 pub mod oracle;
 pub mod personas;
 pub mod pgserver;

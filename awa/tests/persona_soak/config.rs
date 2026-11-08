@@ -152,6 +152,18 @@ pub struct SoakConfig {
     /// for every runtime. The library's own defaults are 30 s and 90 s.
     pub heartbeat_interval: Duration,
     pub heartbeat_staleness: Duration,
+    /// How often the resident memory of the soak process is sampled.
+    pub memory_sample_every: Duration,
+    /// Load time excluded from the memory growth gate while caches and pools fill.
+    pub memory_warmup: Duration,
+    /// Executions after the warm-up below which the memory growth gate is not evaluated.
+    pub memory_min_executions: i64,
+    /// Largest accepted growth of resident memory, in MiB per 100k executions.
+    pub memory_slope_limit_mib_per_100k: f64,
+    /// How long completions are held back halfway through the load; zero skips it.
+    pub completion_stall: Duration,
+    /// Largest accepted rise of resident memory, in MiB, during and after that stall.
+    pub completion_stall_memory_limit_mib: f64,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -267,6 +279,20 @@ impl SoakConfig {
             heartbeat_staleness: scaled_staleness(Duration::from_secs(
                 env_parse("AWA_SOAK_STALENESS_SECONDS").unwrap_or(DEFAULT_STALENESS_SECONDS),
             )),
+            memory_sample_every: Duration::from_secs(
+                env_parse("AWA_SOAK_MEMORY_SAMPLE_SECONDS").unwrap_or(5),
+            ),
+            memory_warmup: Duration::from_secs(
+                env_parse("AWA_SOAK_MEMORY_WARMUP_SECONDS").unwrap_or(120),
+            ),
+            memory_min_executions: env_parse("AWA_SOAK_MEMORY_MIN_EXECUTIONS").unwrap_or(20_000),
+            memory_slope_limit_mib_per_100k: env_parse("AWA_SOAK_MEMORY_SLOPE_MIB_PER_100K")
+                .unwrap_or(64.0),
+            completion_stall: Duration::from_secs(
+                env_parse("AWA_SOAK_COMPLETION_STALL_SECONDS").unwrap_or(0),
+            ),
+            completion_stall_memory_limit_mib: env_parse("AWA_SOAK_COMPLETION_STALL_MEMORY_MIB")
+                .unwrap_or(128.0),
         })
     }
 
