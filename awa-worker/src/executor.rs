@@ -457,10 +457,11 @@ impl JobExecutor {
             // set of tasks retaining job payloads while completion is stalled.
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
+                    biased;
+                    _ = finalize_cancel.cancelled() => None,
                     permit = finalize_capacity.acquire_owned() => {
                         Some(permit.expect("finalizer capacity is never closed"))
                     }
-                    _ = finalize_cancel.cancelled() => None,
                 },
                 None => None,
             };
