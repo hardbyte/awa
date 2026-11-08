@@ -19561,6 +19561,83 @@ async fn test_historical_tombstoned_claim_uses_emitted_lane_low_to_high() {
 async fn test_historical_tombstoned_claim_uses_emitted_lane_high_to_low() {
     moved_tombstoned_claim_lane(4, 2, true, false, false).await;
 }
+/// An attempt whose retained ready bodies are ambiguous stays running. A batch's
+/// worth of them, which every pass meets first, must not keep rescue from the stale
+/// attempts behind them.
+#[tokio::test]
+async fn test_ambiguous_attempts_filling_a_batch_do_not_starve_rescue() {
+    const AMBIGUOUS: i64 = 500;
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_ambiguous_backlog";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: false,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_ambiguous_backlog";
+    store
+        .enqueue_batch(&pool, queue, 2, AMBIGUOUS)
+        .await
+        .expect("enqueue the ambiguous backlog");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, AMBIGUOUS, Duration::from_secs(300))
+        .await
+        .expect("claim the ambiguous backlog");
+    assert_eq!(claimed.len(), AMBIGUOUS as usize);
+    // A second body at the same lane position under another priority, as older
+    // physical aging could leave, leaves no way to choose each attempt's body.
+    let duplicated = sqlx::query(&format!(
+        "INSERT INTO {schema}.ready_entries
+         (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+          lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+         SELECT ready_slot,ready_generation,job_id,kind,queue,args,priority-1,attempt,run_lease,
+          max_attempts,lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,
+          unique_states,payload
+         FROM {schema}.ready_entries WHERE queue=$1"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("duplicate the retained bodies");
+    assert_eq!(duplicated.rows_affected(), AMBIGUOUS as u64);
+
+    let other_queue = "qs_ambiguous_backlog_other";
+    let other_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9045 },
+        InsertOpts {
+            queue: other_queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let other_claims = store
+        .claim_runtime_batch(&pool, other_queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim a recoverable job after the backlog");
+    assert_eq!(other_claims.len(), 1);
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("ambiguous attempts do not stop rescue of the others");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![other_id]
+    );
+    assert_eq!(
+        lease_count(&pool, &store).await,
+        AMBIGUOUS,
+        "the ambiguous attempts stay running"
+    );
+}
+
 #[tokio::test]
 async fn test_historical_tombstoned_legacy_ambiguous_lane_is_skipped_by_rescue() {
     moved_tombstoned_claim_lane(2, 4, false, false, false).await;

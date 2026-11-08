@@ -1756,25 +1756,49 @@ struct ReadyRowIdentity {
 }
 
 /// Attempts a rescue pass leaves for a later pass, as `(job_id, run_lease)`.
-struct BusyRetained(Vec<(i64, i64)>);
+struct BusyRetained {
+    attempts: Vec<(i64, i64)>,
+    /// The attempts stay unresolvable until their retained bodies are
+    /// repaired, rather than until a lock is released.
+    unresolvable: bool,
+}
 
 impl BusyRetained {
-    fn exclude(self, excluded: &mut BTreeSet<(i64, i64)>) -> Result<(), AwaError> {
+    fn busy(attempts: Vec<(i64, i64)>) -> Self {
+        Self {
+            attempts,
+            unresolvable: false,
+        }
+    }
+
+    /// Leaves the attempts out of the rest of the pass. Busy attempts shrink
+    /// the pass's selection. Unresolvable attempts are replaced in it, so a
+    /// backlog of them, which every pass meets first, cannot fill each batch
+    /// and keep rescue from the attempts behind it.
+    fn exclude(
+        self,
+        excluded: &mut BTreeSet<(i64, i64)>,
+        selected: &mut Option<BTreeSet<(i64, i64)>>,
+    ) -> Result<(), AwaError> {
         let previous = excluded.len();
-        excluded.extend(self.0);
+        excluded.extend(self.attempts);
         if excluded.len() == previous {
             return Err(AwaError::Validation(
                 "queue storage retained attempt retry made no progress".to_string(),
             ));
         }
+        if self.unresolvable {
+            *selected = None;
+        }
         Ok(())
     }
 }
 
-/// A failure hydrating a deleted lease. `Ambiguous` names an attempt whose
-/// retained ready bodies rank equally, so none can be chosen for it.
+/// A failure hydrating deleted leases. `Ambiguous` names the attempts, as
+/// `(job_id, run_lease)`, whose retained ready bodies rank equally, so none
+/// can be chosen for them.
 enum HydrateError {
-    Ambiguous { job_id: i64, run_lease: i64 },
+    Ambiguous(Vec<(i64, i64)>),
     Awa(AwaError),
 }
 
@@ -1787,9 +1811,12 @@ impl From<AwaError> for HydrateError {
 impl From<HydrateError> for AwaError {
     fn from(err: HydrateError) -> Self {
         match err {
-            HydrateError::Ambiguous { job_id, run_lease } => AwaError::Validation(format!(
-                "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
-            )),
+            HydrateError::Ambiguous(attempts) => {
+                let (job_id, run_lease) = attempts.first().copied().unwrap_or_default();
+                AwaError::Validation(format!(
+                    "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
+                ))
+            }
             HydrateError::Awa(err) => err,
         }
     }
@@ -2456,10 +2483,10 @@ fn select_claimed_ready_body<'a>(
     let mut best = candidates.iter().filter(|row| rank(row) == strongest);
     let ready = best.next().expect("ready body rank has a candidate");
     if best.next().is_some() {
-        return Err(HydrateError::Ambiguous {
-            job_id: reference.job_id,
-            run_lease: reference.run_lease,
-        });
+        return Err(HydrateError::Ambiguous(vec![(
+            reference.job_id,
+            reference.run_lease,
+        )]));
     }
     Ok((ready, has_emitted))
 }
@@ -10849,14 +10876,19 @@ impl QueueStorage {
         match hydrated {
             Ok(hydrated) => Ok(hydrated),
             // One unresolvable attempt must not stop the rescue of the others.
-            Err(HydrateError::Ambiguous { job_id, run_lease }) => {
-                tracing::error!(
-                    schema = self.schema(),
-                    job_id,
-                    run_lease,
-                    "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
-                );
-                Ok(Err(BusyRetained(vec![(job_id, run_lease)])))
+            Err(HydrateError::Ambiguous(attempts)) => {
+                for (job_id, run_lease) in &attempts {
+                    tracing::error!(
+                        schema = self.schema(),
+                        job_id,
+                        run_lease,
+                        "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
+                    );
+                }
+                Ok(Err(BusyRetained {
+                    attempts,
+                    unresolvable: true,
+                }))
             }
             Err(HydrateError::Awa(err)) => Err(err),
         }
@@ -10876,6 +10908,33 @@ impl QueueStorage {
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
         let (ready_map, claimed_lanes) =
             self.load_ready_snapshot_candidates_tx(tx, &deleted).await?;
+        // Report every ambiguous attempt at once, before any write, so a
+        // caller that sets them aside needs one retry for all of them.
+        let ambiguous: Vec<(i64, i64)> = deleted
+            .iter()
+            .filter(|row| {
+                ready_map
+                    .get(&(
+                        row.ready_slot,
+                        row.ready_generation,
+                        row.queue.clone(),
+                        row.enqueue_shard,
+                        row.lane_seq,
+                        row.job_id,
+                        row.run_lease,
+                    ))
+                    .is_some_and(|candidates| {
+                        matches!(
+                            select_claimed_ready_body(candidates, &claimed_lanes, row),
+                            Err(HydrateError::Ambiguous(_))
+                        )
+                    })
+            })
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        if !ambiguous.is_empty() {
+            return Err(HydrateError::Ambiguous(ambiguous));
+        }
 
         let attempt_rows: Vec<AttemptStateRow> = sqlx::query_as(&format!(
             r#"
@@ -11130,10 +11189,10 @@ impl QueueStorage {
                 .insert((source.job_id, source.run_lease), source)
                 .is_some()
             {
-                return Err(HydrateError::Ambiguous {
-                    job_id: source.job_id,
-                    run_lease: source.run_lease + 1,
-                });
+                return Err(HydrateError::Ambiguous(vec![(
+                    source.job_id,
+                    source.run_lease + 1,
+                )]));
             }
         }
         let job_ids: Vec<i64> = sources.iter().map(|row| row.job_id).collect();
@@ -11181,7 +11240,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
             if !busy.is_empty() {
-                return Ok(Some(BusyRetained(busy)));
+                return Ok(Some(BusyRetained::busy(busy)));
             }
         } else {
             self.lock_claim_heads_of_jobs_with_wait_tx(tx, &job_ids, true)
@@ -11266,10 +11325,10 @@ impl QueueStorage {
         for row in &emitted {
             let key = (row.job_id, row.run_lease);
             if !seen.insert(key) || expected.get(&key).copied() != Some(row) {
-                return Err(HydrateError::Ambiguous {
-                    job_id: row.job_id,
-                    run_lease: row.run_lease + 1,
-                });
+                return Err(HydrateError::Ambiguous(vec![(
+                    row.job_id,
+                    row.run_lease + 1,
+                )]));
             }
         }
         sqlx::query(&format!(
@@ -15408,7 +15467,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -15419,7 +15478,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -15578,7 +15637,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -15590,7 +15649,7 @@ impl QueueStorage {
                     Ok(moved) => moved,
                     Err(busy) => {
                         attempt.rollback().await.map_err(map_sqlx_error)?;
-                        busy.exclude(&mut excluded)?;
+                        busy.exclude(&mut excluded, &mut selected)?;
                         continue;
                     }
                 },
@@ -15716,7 +15775,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
