@@ -17552,6 +17552,67 @@ async fn test_receipt_admin_scope_materialized_control() {
     receipt_admin_reads_preserve_scope_and_disposition(false, false).await;
 }
 
+#[tokio::test]
+async fn test_schema_only_admin_reads_claims_in_installed_slot() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_admin_wide_claims";
+    let queue = "admin_wide_claims";
+    let default_claim_slots = QueueStorageConfig::default().claim_slot_count;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            claim_slot_count: default_claim_slots + 2,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    for _ in 0..default_claim_slots {
+        assert!(matches!(
+            store.rotate_claims(&pool).await.unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claims = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].claim.claim_slot, default_claim_slots as i32);
+
+    let running = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list running jobs through a schema-only store");
+    assert_eq!(
+        running.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    let kinds = admin::job_kind_overviews(&pool)
+        .await
+        .expect("count kinds through a schema-only store");
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!((complete.job_count, complete.queue_count), (1, 1));
+}
+
 async fn claim_aged_rescue_body_job(
     schema: &str,
     receipts: bool,
