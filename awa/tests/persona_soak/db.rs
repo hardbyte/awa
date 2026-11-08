@@ -177,12 +177,17 @@ impl Budget {
         }
     }
 
-    /// Reserves up to `want` connections under `label`, never fewer than `min`.
-    /// Returns the amount granted; panics when even `min` does not fit, because the
-    /// run would exhaust the server before it tested anything.
+    /// Reserves up to `want` connections under `label`, never fewer than `min`,
+    /// replacing any earlier reservation under the same label. Returns the amount
+    /// granted; panics when even `min` does not fit, because the run would exhaust
+    /// the server before it tested anything.
     pub fn reserve(&self, label: &str, want: u32, min: u32) -> u32 {
         let mut allocations = self.allocations.lock().expect("budget lock");
-        let used: u32 = allocations.values().sum();
+        let used: u32 = allocations
+            .iter()
+            .filter(|(held_by, _)| held_by.as_str() != label)
+            .map(|(_, count)| count)
+            .sum();
         let available = self.usable.saturating_sub(used);
         assert!(
             available >= min,
@@ -221,7 +226,8 @@ pub type ClientFactory = Arc<dyn Fn(PgPool) -> Client + Send + Sync>;
 /// shutdown handshake and the connections drop.
 pub struct ClientHost {
     pub label: String,
-    runtime: tokio::runtime::Runtime,
+    /// Always `Some` until the host is stopped or dropped.
+    runtime: Option<tokio::runtime::Runtime>,
     client: Arc<Client>,
     pool: PgPool,
 }
@@ -255,7 +261,7 @@ impl ClientHost {
             })?;
             Ok(Self {
                 label: thread_label,
-                runtime,
+                runtime: Some(runtime),
                 client: Arc::new(client),
                 pool,
             })
@@ -273,26 +279,95 @@ impl ClientHost {
     }
 
     /// Graceful stop: stop claiming, drain in-flight jobs, then close the pool.
-    pub async fn shutdown(self, timeout: Duration) {
+    pub async fn shutdown(mut self, timeout: Duration) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
         let client = self.client.clone();
         let pool = self.pool.clone();
-        let _ = self
-            .runtime
+        let _ = runtime
             .handle()
             .spawn(async move {
                 client.shutdown(timeout).await;
                 pool.close().await;
             })
             .await;
-        self.runtime.shutdown_background();
+        runtime.shutdown_background();
     }
 
     /// Abrupt stop: no shutdown handshake, as when a process is killed.
     pub fn kill(self) {
-        self.runtime.shutdown_background();
+        drop(self);
+    }
+}
+
+/// Dropping a host kills it. A tokio runtime dropped the ordinary way blocks
+/// until its tasks finish, which panics inside another runtime.
+impl Drop for ClientHost {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
 pub fn url_for_database(config: &SoakConfig, name: &str) -> String {
     replace_database_name(&config.database_url, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Budget, ClientHost, ServerInfo};
+    use awa::{Client, QueueConfig};
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    fn budget(usable: u32) -> Budget {
+        Budget::new(
+            &ServerInfo {
+                max_connections: usable,
+                ..ServerInfo::default()
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn replacing_a_reservation_reuses_its_own_connections() {
+        let budget = budget(20);
+        budget.reserve("other", 10, 1);
+        assert_eq!(budget.reserve("earmark", 10, 2), 10);
+        assert_eq!(
+            budget.reserve("earmark", 10, 10),
+            10,
+            "the earmark's own connections count as available to its replacement"
+        );
+        assert_eq!(
+            budget.table(),
+            vec![("earmark".to_string(), 10), ("other".to_string(), 10)]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_live_host_inside_another_runtime_does_not_panic() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost:1/awa_soak_unused")
+            .expect("lazy pool");
+        let client = Client::builder(pool.clone())
+            .queue("awa_soak_host_drop", QueueConfig::default())
+            .build()
+            .expect("build an unstarted client");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("host runtime");
+        let host = ClientHost {
+            label: "host_drop".to_string(),
+            runtime: Some(runtime),
+            client: Arc::new(client),
+            pool,
+        };
+        drop(host);
+    }
 }
