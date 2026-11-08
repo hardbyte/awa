@@ -9,7 +9,7 @@ use awa::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 
@@ -122,6 +122,11 @@ struct HookJob {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct HookFollowUp {
+    source_job_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct RawHookJob {
     value: String,
 }
@@ -187,6 +192,22 @@ async fn test_typed_completed_event_handler_runs() {
 /// finished attempt's heartbeat or deadline.
 #[tokio::test]
 async fn test_completed_event_of_a_deadline_job_matches_the_terminal_job() {
+    assert_completed_event_of_a_deadline_job_matches_the_terminal_job(false).await;
+}
+
+/// A kind with a Completed follow-up completes through its own transaction; the
+/// follow-up and the event see the same terminal job.
+#[tokio::test]
+async fn test_completed_event_with_a_follow_up_matches_the_terminal_job() {
+    assert_completed_event_of_a_deadline_job_matches_the_terminal_job(true).await;
+}
+
+type AttemptTimes = (
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+async fn assert_completed_event_of_a_deadline_job_matches_the_terminal_job(with_follow_up: bool) {
     let _permit = test_gate()
         .acquire_owned()
         .await
@@ -196,7 +217,8 @@ async fn test_completed_event_of_a_deadline_job_matches_the_terminal_job() {
     clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let follow_up_saw: Arc<Mutex<Vec<AttemptTimes>>> = Arc::default();
+    let builder = Client::builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -213,9 +235,22 @@ async fn test_completed_event_of_a_deadline_job_matches_the_terminal_job() {
                     tx.send(job).unwrap();
                 }
             }
+        });
+    let builder = if with_follow_up {
+        let follow_up_saw = follow_up_saw.clone();
+        builder.on_completed_enqueue::<HookJob, HookFollowUp, _>(move |_args, job| {
+            follow_up_saw
+                .lock()
+                .unwrap()
+                .push((job.heartbeat_at, job.deadline_at));
+            HookFollowUp {
+                source_job_id: job.id,
+            }
         })
-        .build()
-        .unwrap();
+    } else {
+        builder
+    };
+    let client = builder.build().unwrap();
 
     let inserted = awa::insert_with(
         &pool,
@@ -243,6 +278,12 @@ async fn test_completed_event_of_a_deadline_job_matches_the_terminal_job() {
         (stored.heartbeat_at, stored.deadline_at)
     );
     assert_eq!((stored.heartbeat_at, stored.deadline_at), (None, None));
+    let expected_follow_up_saw: Vec<AttemptTimes> = if with_follow_up {
+        vec![(None, None)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(*follow_up_saw.lock().unwrap(), expected_follow_up_saw);
 }
 
 #[tokio::test]
