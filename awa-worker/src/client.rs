@@ -351,10 +351,11 @@ impl ClientBuilder {
     /// `Started` dispatch is scheduled after the claim commits and before the
     /// worker handler is invoked. Outcome handlers run only after the
     /// corresponding DB state transition commits. Hooks are best-effort
-    /// in-process notifications, not a durable workflow mechanism; because
-    /// they run in detached tasks, a very short job can complete before a
-    /// `Started` handler finishes. Capture any shared dependencies you need in
-    /// the closure environment.
+    /// in-process notifications, not a durable workflow mechanism. `Started`
+    /// runs alongside the handler, so a very short job can complete before a
+    /// `Started` handler finishes. Each attempt's hooks hold a finalizer slot
+    /// until they return, so hooks slower than job throughput slow claiming.
+    /// Capture any shared dependencies you need in the closure environment.
     pub fn on_event<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,

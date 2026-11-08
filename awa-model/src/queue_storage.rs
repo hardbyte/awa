@@ -3145,6 +3145,64 @@ mod ready_segment_tests {
         }
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
+        use super::{QueueStorageConfig, RuntimeReadyRow};
+        use crate::audited_sql;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: "awa_qs_segment_bind_limit".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store.install(&pool).await.unwrap();
+
+        // Distinct microsecond timestamps guarantee one segment per row.
+        // Reading the clock for every row can coalesce adjacent timestamps
+        // and fail to exercise the old 8,191-segment bind limit.
+        const JOBS: i64 = 9_000;
+        let first_run_at = Utc::now() - Duration::seconds(1);
+        let rows = (0..JOBS)
+            .map(|seq| RuntimeReadyRow {
+                job_id: None,
+                kind: "segment_test".into(),
+                queue: "segment-q".into(),
+                args: serde_json::json!({"seq": seq}),
+                priority: 2,
+                attempt: 0,
+                run_lease: 0,
+                max_attempts: 25,
+                run_at: first_run_at + Duration::microseconds(seq),
+                attempted_at: None,
+                created_at: first_run_at,
+                unique_key: None,
+                unique_states: None,
+                payload: serde_json::json!({}),
+                ordering_key: None,
+            })
+            .collect();
+        assert_eq!(
+            store.enqueue_runtime_rows(&pool, rows).await.unwrap(),
+            JOBS as usize
+        );
+        let counts: (i64, i64) = sqlx::query_as(audited_sql(format!(
+            "SELECT (SELECT count(*) FROM {}.ready_entries), \
+                    (SELECT count(*) FROM {}.ready_segments)",
+            store.schema(),
+            store.schema()
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (JOBS, JOBS));
+        let claimed = store
+            .claim_runtime_batch(&pool, "segment-q", 100, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 100);
+    }
+
     #[test]
     fn ready_segments_split_on_run_at_boundaries() {
         let first = Utc
