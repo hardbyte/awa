@@ -11659,7 +11659,7 @@ async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_or
 /// Holds PostgreSQL's cluster-wide notify-queue lock for about `commits` ×
 /// 100 ms. A transaction that issued NOTIFY takes that lock at COMMIT and
 /// keeps it until its commit record is flushed, which `commit_delay` stretches.
-/// Returns once the lock is held.
+/// Returns once the holder's own backend holds the lock.
 async fn hold_notify_commit_lock(
     pool: &sqlx::PgPool,
     commits: usize,
@@ -11678,6 +11678,10 @@ async fn hold_notify_commit_lock(
         )
         .await
         .expect("connect the notify holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&holder)
+        .await
+        .expect("read the notify holder's backend");
     let holder_task = tokio::spawn(async move {
         for _ in 0..commits {
             sqlx::raw_sql(
@@ -11694,8 +11698,9 @@ async fn hold_notify_commit_lock(
     loop {
         let held: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'object' \
-             AND classid = 'pg_database'::regclass AND objid = 0 AND granted)",
+             AND classid = 'pg_database'::regclass AND objid = 0 AND granted AND pid = $1)",
         )
+        .bind(holder_pid)
         .fetch_one(pool)
         .await
         .expect("read notify lock");
@@ -11746,7 +11751,7 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
         enqueue_due(id).await;
     }
 
-    let holder = hold_notify_commit_lock(&pool, 3).await;
+    let holder = hold_notify_commit_lock(&pool, 10).await;
     let outcome = store
         .promote_due_lanes(
             &pool,
@@ -11757,6 +11762,10 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
         )
         .await
         .expect("promote while the notify lock is held");
+    assert!(
+        !holder.is_finished(),
+        "the notify holder outlasts the promotion"
+    );
     holder.await.expect("notify holder");
     assert_eq!(outcome.promoted, 3, "{outcome:?}");
     assert!(outcome.contended.is_empty(), "{outcome:?}");
@@ -11772,7 +11781,7 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
         .await
         .expect("connect with a session lock_timeout");
     enqueue_due(3).await;
-    let holder = hold_notify_commit_lock(&pool, 3).await;
+    let holder = hold_notify_commit_lock(&pool, 10).await;
     let result = store
         .promote_due_lanes(
             &caller_lock_timeout_pool,
@@ -11782,6 +11791,10 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
             &[],
         )
         .await;
+    assert!(
+        !holder.is_finished(),
+        "the notify holder outlasts the promotion"
+    );
     holder.await.expect("notify holder");
     caller_lock_timeout_pool.close().await;
     let outcome = result.expect("a failed wakeup does not fail the promotion");
