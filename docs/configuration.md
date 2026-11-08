@@ -582,24 +582,12 @@ Use the defaults unless you have a reason not to:
 - Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
 - Increase `queue_stripe_count` only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue `QueueConfig` field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. For single hot-queue workloads, benchmark `2` stripes first; higher values should be treated as workload-specific tuning rather than a general default.
 - Increase `prune_lock_timeout` when `increase(awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}[15m])` stays above zero and the rings stop recycling, typically because frequent short reads of the ring partitions (admin or dashboard queries over the queue-storage tables) hold a conflicting lock at the instant prune tries. A stalled ring grows its current slot, which makes those queries slower and the contention worse. Raise it in small steps (for example `50ms`, then `100ms`, then `250ms`) and keep it well below PostgreSQL's `deadlock_timeout` (default `1s`) and below any `statement_timeout` on the pool's connections. A single lock wait that reaches `deadlock_timeout` makes PostgreSQL run its deadlock detector, and if claims or enqueues are part of a lock cycle with it, the detector can cancel them rather than the prune; a short `lock_timeout` abandons the prune first, so the prune is always the one that gives way. A `statement_timeout` at or below the lock timeout cancels the prune statement before the lock timeout fires, so it fails with an error instead of reporting `blocked`. Startup logs a warning when the configured timeout is at or above either setting. While prune waits, new accesses to the same partition also queue behind its lock request, so a longer timeout trades claim latency for reclamation. Shortening the readers is the more durable fix when they run longer than a few hundred milliseconds. Watch `awa_maintenance_prune_attempts_total` by `awa_ring` and `awa_ring_outcome`: `pruned` should advance steadily, `blocked` means the lock timeout expired, `skipped_active` (with `awa_ring_reason`) means live rows kept the slot, `backed_off` means prune was skipped for up to 32 ticks after consecutive `skipped_active` or `blocked` results, so a persistently blocked ring is retried less often over time, and `error` is a database failure.
-- Consider increasing rotation intervals before raising `prune_lock_timeout`:
-  longer intervals can reduce how often prune requests exclusive locks, while
-  a longer timeout lets each request wait longer. Confirm the effect with
-  workload measurements.
+- Consider increasing rotation intervals before raising `prune_lock_timeout`: longer intervals can reduce how often prune requests exclusive locks, while a longer timeout lets each request wait longer. Confirm the effect with workload measurements.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 
-Longer rotation intervals accumulate more work in each slot. At a steady enqueue
-rate, ready rows per queue slot are roughly the enqueue rate multiplied by
-`queue_rotate_interval`; retries and blocked recycling can increase the retained
-footprint. Budget for larger partitions and indexes. Queue-ring history becomes
-coarser and generally spans about `queue_slot_count × queue_rotate_interval`;
-active or blocked slots can retain it longer. The independent
-`claim_rotate_interval` changes claim-evidence retention, not completed-job
-history in the ready/terminal ring.
+Longer rotation intervals accumulate more work in each slot. At a steady enqueue rate, ready rows per queue slot are roughly the enqueue rate multiplied by `queue_rotate_interval`; retries and blocked recycling can increase the retained footprint. Budget for larger partitions and indexes. Queue-ring history becomes coarser and generally spans about `queue_slot_count × queue_rotate_interval`; active or blocked slots can retain it longer. The independent `claim_rotate_interval` changes claim-evidence retention, not completed-job history in the ready/terminal ring.
 
-A longer interval does not remove the locks required by each prune.
-`prune_lock_timeout` still applies separately to each acquisition; queue prune
-can lock up to eight partitions before its later reads and writes.
+A longer interval does not remove the locks required by each prune. `prune_lock_timeout` still applies separately to each acquisition; queue prune can lock up to eight partitions before its later reads and writes.
 
 ### Sharding the enqueue head per queue
 
