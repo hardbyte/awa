@@ -22,7 +22,10 @@ use sqlx::{PgExecutor, PgPool};
 // patch), which does the lane-independent work first (job ids, unique claims,
 // payloads) and then registers and reserves its lanes one at a time in
 // canonical order, so a lane is held only across its registration,
-// reservation, the ready-row writes and the commit.
+// reservation, the ready-row writes and the commit. While it holds claims or
+// lanes it waits at most half of `deadlock_timeout` for another; a longer wait
+// releases them all and retries, so a per-row producer that holds a lane and
+// waits for one of the batch's keys proceeds instead of deadlocking with it.
 //
 // Generic `insert_many` always uses the per-row path, as does
 // `insert_many_copy` on a schema without the patch: rows are sorted by the
@@ -533,14 +536,15 @@ const INSERT_MANY_BATCH_SQL: &str = r#"
 
 /// TRUE when `awa.insert_jobs_compat_batch` exists with the body the
 /// `insert_jobs_compat_batch` schema patch installs, whoever may call it: the
-/// patch's probe. The body check matches the per-lane registration inside the
-/// reservation loop, so `awa migrate` replaces an earlier body that registered
-/// every new lane before reserving any. Catalog lookup only.
+/// patch's probe. The body check matches the lock wait budget taken from
+/// `deadlock_timeout`, so `awa migrate` replaces an earlier body that waited
+/// for a lane without bound while holding its claims, or that registered every
+/// new lane before reserving any. Catalog lookup only.
 pub(crate) const BATCH_FUNCTION_PATCH_APPLIED_SQL: &str = "SELECT EXISTS (\
     SELECT 1 FROM pg_proc AS p WHERE p.oid = to_regprocedure(\
     'awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],\
     timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)') \
-    AND p.prosrc ~ 'INSERT INTO queue_lanes \\(queue, priority\\)\\s+SELECT v_lane\\.queue')";
+    AND p.prosrc ~ 'v_wait_budget := current_setting\\(''deadlock_timeout''\\)')";
 
 /// TRUE when the connected role may call `awa.insert_jobs_compat_batch`.
 const BATCH_FUNCTION_USABLE_SQL: &str = "SELECT COALESCE(has_function_privilege(to_regprocedure(\

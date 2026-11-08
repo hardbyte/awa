@@ -446,28 +446,33 @@ async fn copy_without_execute_on_the_batch_function_stays_per_row() {
     }
 }
 
-/// A body from before the per-lane registration fix keeps the patch pending,
-/// and `awa migrate` replaces it.
+/// An earlier body keeps the patch pending, and `awa migrate` replaces it:
+/// the first one, which registered every new lane before reserving any, and
+/// the 0.6.15 one, which waited for a lane without bound while holding the
+/// batch's unique claims.
 #[tokio::test]
 async fn an_earlier_batch_function_body_keeps_the_patch_pending() {
-    let db = ScratchDatabase::create().await;
-    let pool = &db.pool;
-    sqlx::raw_sql(include_str!(
-        "fixtures/insert_jobs_compat_batch_registers_lanes_first.sql"
-    ))
-    .execute(pool)
-    .await
-    .expect("install the earlier body");
-    assert_eq!(pending_patches(pool).await, vec![PATCH_NAME]);
+    for earlier_body in [
+        include_str!("fixtures/insert_jobs_compat_batch_registers_lanes_first.sql"),
+        include_str!("fixtures/insert_jobs_compat_batch_unbounded_lane_wait.sql"),
+    ] {
+        let db = ScratchDatabase::create().await;
+        let pool = &db.pool;
+        sqlx::raw_sql(earlier_body)
+            .execute(pool)
+            .await
+            .expect("install the earlier body");
+        assert_eq!(pending_patches(pool).await, vec![PATCH_NAME]);
 
-    let report = migrations::run_with_report(pool).await.expect("migrate");
-    let patch = report
-        .patches
-        .iter()
-        .find(|patch| patch.name == PATCH_NAME)
-        .expect("patch report");
-    assert_eq!(patch.outcome, migrations::PatchOutcome::Applied);
-    assert!(pending_patches(pool).await.is_empty());
+        let report = migrations::run_with_report(pool).await.expect("migrate");
+        let patch = report
+            .patches
+            .iter()
+            .find(|patch| patch.name == PATCH_NAME)
+            .expect("patch report");
+        assert_eq!(patch.outcome, migrations::PatchOutcome::Applied);
+        assert!(pending_patches(pool).await.is_empty());
 
-    db.drop().await;
+        db.drop().await;
+    }
 }
