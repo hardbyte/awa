@@ -176,7 +176,7 @@ The default `awa` queue-storage substrate is migrated by `awa migrate`. Custom q
 
 ### Lane sequences
 
-Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. Once the `definer_lane_provisioning` schema patch is applied, they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime role therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard. Apply the patch with `awa migrate` as the schema owner (`PGOPTIONS='-c role=awa_owner'`), or run the exported `R__definer_lane_provisioning.sql` after `V40`.
+Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. Once the `definer_lane_provisioning` schema patch is applied, they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime role therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard. Their inserts into `queue_lanes`, `queue_enqueue_heads` and `queue_claim_heads` fire those tables' triggers as the schema owner, so don't grant `TRIGGER` on them to any other role. Apply the patch with `awa migrate` as the schema owner (`PGOPTIONS='-c role=awa_owner'`), or run the exported `R__definer_lane_provisioning.sql` after `V40`.
 
 A new lane sequence gets the privileges of the head table it backs. A role that may `INSERT` or `UPDATE` `queue_enqueue_heads` gets `USAGE, SELECT, UPDATE` on the enqueue sequences, and one that may only `SELECT` it gets `SELECT`; `queue_claim_heads` does the same for the claim sequences. The table grants above are enough.
 
@@ -208,6 +208,18 @@ Which role can repair a sequence:
 - Adding its grants needs the current owner's privileges.
 
 The schema owner holds neither the migration role's nor an application role's privileges, so a repair running as `awa_owner` cannot reassign sequences those roles created. That includes the migration role connected with `PGOPTIONS='-c role=awa_owner'`. Run the repair as the migration role itself, without `PGOPTIONS`, as above. `awa migrate` and `--repair` retry each sequence the effective role could not repair as the login role, so `awa migrate` run with `PGOPTIONS='-c role=awa_owner'`, as documented, still repairs the migration role's sequences.
+
+For a migrator with SET-only membership in `awa_owner`, grant schema access and helper execution explicitly before running the repair. Run as the schema owner:
+
+```sql
+GRANT USAGE ON SCHEMA awa TO awa_migrator;
+GRANT EXECUTE ON FUNCTION
+  awa.lane_sequence_problems(TEXT, TEXT),
+  awa.repair_lane_sequence(TEXT, TEXT)
+  TO awa_migrator;
+```
+
+For a custom queue-storage schema, also grant `USAGE` on that schema. The migrator must still hold the old sequence owner's privileges and be allowed to `SET ROLE` to the schema owner; inherited privileges from the schema owner are not required.
 
 For each sequence that remains, the output lists `repair_roles`, the login roles other than superusers that can repair it, and the statements to run. A busy sequence only needs another `--repair`. When `repair_roles` is empty, which is usual for a sequence an application role created on managed PostgreSQL, either:
 
@@ -325,7 +337,7 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. A future migration could convert the internal queue-storage helpers to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
+The lane provisioning functions `provision_lane` and `provision_lane_sequences` are `SECURITY DEFINER` since the `definer_lane_provisioning` patch (see [Lane sequences](#lane-sequences)). The rest of the model still requires broad table grants because the other compatibility triggers and helper functions use `SECURITY INVOKER`. A future migration could convert those to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
 
 ## Deployable roles
 

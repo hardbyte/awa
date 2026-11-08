@@ -81,9 +81,18 @@ ORDER BY heartbeat_at ASC;
 
 Interpretation:
 
-- low `heartbeat_age_s`: the worker is still alive
+- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying`
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
+- stale, but every rescue pass logs `Rescue skipped an attempt: queue storage ready body ambiguous`: an aging race in an older release left two equally plausible bodies for this attempt. Rescue leaves it running and moves on to other attempts. Reads and cancellation of the job fail with the same ambiguity error, so it needs manual repair; open an issue with the job id and run lease from the log
+
+### Transient Admin Reads During Partition Pruning
+
+In 0.6, a job-detail read, including list-item hydration, uses several queries within one snapshot. It retains read locks on the located ready body, but does not lock all ring partitions before establishing that snapshot. Prune can truncate a ready partition before its body is located, or a lease or claim partition before that read phase reaches it. A completed job can then briefly appear available or missing. Retry with a fresh read before treating that result as missing durable work. Filtering tombstoned source rows after a queue or priority move does not close these separate windows.
+
+### Failed Jobs Rescued After Priority Aging
+
+0.6.14 preserves the physical ready-lane identity when rescue writes a failed terminal row, so manual retry, failed-row carry and `terminal_jobs` retain its original arguments and retry limit. Rust reads, manual retry and failed-row carry also recover older narrow terminal rows by attempt identity while their ready backing remains retained. These paths preserve terminal metadata and fill missing defaults from the live ready row. The installed `terminal_jobs` SQL view and creation-time bucket joins remain unchanged for older rows whose stored priority differs from their ready lane. Already-pruned backing data cannot be recovered by this fix. Manual terminal retry restarts aging from the physical lane. Manual terminal-to-DLQ moves retain that lane for later DLQ retry; automatic retryable rescue and automatic DLQ routing retain effective priority.
 
 ### Inspect Runtime Health
 
@@ -139,8 +148,7 @@ In all cases the cancel itself is durable — only the early wake-up is lost. Lo
 
 ## Rescue Fails With `idx_awa_jobs_unique`
 
-Symptom: maintenance repeats, every tick (canonical engine — the queue-storage
-engine wedges identically but logs `error: unique conflict` instead):
+Symptom: maintenance repeats, every tick (canonical engine — the queue-storage engine wedges identically but logs `error: unique conflict` instead):
 
 ```text
 Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"

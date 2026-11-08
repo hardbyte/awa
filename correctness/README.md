@@ -35,6 +35,7 @@ What is intentionally not modeled:
 - real-time token bucket math for rate limiting
 - unbounded retry histories; `AwaExtended` caps attempts so TLC can close the state graph
 - full advisory-lock mechanics; leadership is an abstract exclusive token
+- ready-body identity. Job bodies are abstract, so the rescue liveness property `RecoverableAbandoned(j) ~> jobState[j] # "running"` does not cover an attempt that an older release's aging race left with two equally plausible bodies; rescue skips such an attempt and logs it on every pass.
 - exact permit identity per task attempt; the model is job-centric and approximates task-held capacity closely enough to check the protocol invariants
 - **priority ordering and starvation.** No model includes a `priority` variable. Priority is a scheduling heuristic, not a safety invariant — all formal invariants (NoDuplicateClaim, TaskLeaseBounded, RunningHasPermit, etc.) are independent of dispatch order. Cross-priority fairness is enforced by the maintenance leader's priority aging task (see ADR-005)
 - **MVCC, vacuum, and storage reclamation.** The models do not attempt to represent Postgres heap cleanup, autovacuum timing, or horizon pinning from long-lived snapshots. Those are operational/performance concerns rather than protocol-safety invariants, and are covered by runtime benchmarks instead
