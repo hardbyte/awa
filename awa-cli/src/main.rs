@@ -43,7 +43,7 @@ enum Commands {
         #[arg(long)]
         extract_to: Option<String>,
         /// Print migration SQL to stdout instead of applying
-        #[arg(long)]
+        #[arg(long, conflicts_with = "extract_to")]
         sql: bool,
         /// Only include migrations after this version (exclusive)
         #[arg(long)]
