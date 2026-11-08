@@ -7,6 +7,7 @@ use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, 
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
+use crate::runtime_control::{MaintenanceBranch, PruneControl};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
@@ -1154,6 +1155,7 @@ impl ClientBuilder {
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
             runtime_instance_id: Uuid::new_v4(),
+            runtime_control: Arc::new(PruneControl::default()),
             runtime_started_at: Utc::now(),
             runtime_hostname: std::env::var("HOSTNAME").ok(),
             runtime_pid: std::process::id() as i32,
@@ -1257,6 +1259,7 @@ pub struct Client {
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
     runtime_instance_id: Uuid,
+    runtime_control: Arc<PruneControl>,
     runtime_started_at: DateTime<Utc>,
     runtime_hostname: Option<String>,
     runtime_pid: i32,
@@ -1289,6 +1292,7 @@ struct RuntimeReporterState {
     queue_storage_capable: bool,
     transition_role: TransitionWorkerRole,
     metrics: crate::metrics::AwaMetrics,
+    runtime_control: Arc<PruneControl>,
 }
 
 /// Best-effort extraction of the most recent error message from a job's
@@ -1396,34 +1400,58 @@ impl Client {
                 // caller then falls back to the canonical-storage path
                 // and the staged transition is unaffected.
                 if status.state == "canonical" && status.prepared_engine.is_none() {
-                    let configured_schema = runtime.store.schema().to_string();
-                    if !transition::queue_storage_schema_ready(&self.pool, &configured_schema)
-                        .await?
-                    {
-                        runtime.store.prepare_schema(&self.pool).await?;
+                    let Some(admission) =
+                        self.runtime_control.admit(MaintenanceBranch::AuthorityFlip)
+                    else {
+                        // A concurrent runtime may have finalized since the
+                        // first read. Honor its routing without starting DDL.
+                        let current = transition::status(&self.pool).await?;
+                        if matches!(current.state.as_str(), "mixed_transition" | "active")
+                            && current.active_engine == "queue_storage"
+                        {
+                            return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
+                        }
+                        return Ok(RuntimeStorage::Canonical);
+                    };
+                    let resolved = admission
+                        .run_result(async {
+                            let configured_schema = runtime.store.schema().to_string();
+                            if !transition::queue_storage_schema_ready(
+                                &self.pool,
+                                &configured_schema,
+                            )
+                            .await?
+                            {
+                                runtime.store.prepare_schema(&self.pool).await?;
+                            }
+                            let promoted: bool =
+                                sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+                                    .bind(&configured_schema)
+                                    .fetch_one(&self.pool)
+                                    .await?;
+                            if promoted {
+                                return Ok(Some(RuntimeStorage::QueueStorage(runtime.clone())));
+                            }
+                            // Another worker promoted concurrently while we
+                            // were installing the schema — re-fetch and use
+                            // the now-current state.
+                            let refetched = transition::status(&self.pool).await?;
+                            if matches!(refetched.state.as_str(), "mixed_transition" | "active")
+                                && refetched.active_engine == "queue_storage"
+                            {
+                                return Ok(Some(RuntimeStorage::QueueStorage(runtime.clone())));
+                            }
+                            // Function returned FALSE because conditions weren't
+                            // met (canonical jobs exist, or another runtime is
+                            // live but in canonical-only mode). Fall through to
+                            // the canonical path; operators will need the
+                            // staged transition.
+                            Ok::<_, awa_model::AwaError>(None)
+                        })
+                        .await?;
+                    if let Some(storage) = resolved {
+                        return Ok(storage);
                     }
-                    let promoted: bool =
-                        sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-                            .bind(&configured_schema)
-                            .fetch_one(&self.pool)
-                            .await?;
-                    if promoted {
-                        return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
-                    }
-                    // Another worker promoted concurrently while we
-                    // were installing the schema — re-fetch and use
-                    // the now-current state.
-                    let refetched = transition::status(&self.pool).await?;
-                    if matches!(refetched.state.as_str(), "mixed_transition" | "active")
-                        && refetched.active_engine == "queue_storage"
-                    {
-                        return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
-                    }
-                    // Function returned FALSE because conditions weren't
-                    // met (canonical jobs exist, or another runtime is
-                    // live but in canonical-only mode). Fall through to
-                    // the canonical path; operators will need the
-                    // staged transition.
                 }
 
                 if matches!(status.state.as_str(), "mixed_transition" | "active")
@@ -1490,6 +1518,7 @@ impl Client {
             global_max_workers: self.global_max_workers,
             dlq_policy: self.dlq_policy.clone(),
             instance_id: self.runtime_instance_id,
+            runtime_control: self.runtime_control.clone(),
             started_at: self.runtime_started_at,
             hostname: self.runtime_hostname.clone(),
             pid: self.runtime_pid,
@@ -1588,6 +1617,9 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
+        if let Err(err) = self.runtime_control.observe_pool(&self.pool).await {
+            warn!(error = %err, "Initial prune control read unavailable; reclamation stays closed");
+        }
         let effective_storage = self.resolve_effective_storage().await?;
         {
             let mut guard = self.effective_storage.write().await;
@@ -1598,18 +1630,25 @@ impl Client {
             .await?;
         self.warn_on_unsafe_prune_lock_timeout().await;
 
-        admin::sync_queue_descriptors(
-            &self.pool,
-            &self.declared_queue_descriptors(),
-            self.runtime_snapshot_interval,
-        )
-        .await?;
-        admin::sync_job_kind_descriptors(
-            &self.pool,
-            &self.declared_job_kind_descriptors(),
-            self.runtime_snapshot_interval,
-        )
-        .await?;
+        if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
+            admission
+                .run_result(async {
+                    admin::sync_queue_descriptors(
+                        &self.pool,
+                        &self.declared_queue_descriptors(),
+                        self.runtime_snapshot_interval,
+                    )
+                    .await?;
+                    admin::sync_job_kind_descriptors(
+                        &self.pool,
+                        &self.declared_job_kind_descriptors(),
+                        self.runtime_snapshot_interval,
+                    )
+                    .await?;
+                    Ok::<(), awa_model::AwaError>(())
+                })
+                .await?;
+        }
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -1702,6 +1741,7 @@ impl Client {
                 _ => None,
             },
         )
+        .runtime_control(self.runtime_control.clone(), self.runtime_instance_id)
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);
@@ -2470,20 +2510,39 @@ impl RuntimeReporterState {
     }
 
     async fn publish_snapshot(&self) {
+        if !self.leader.load(Ordering::SeqCst) {
+            if let Err(err) = self.runtime_control.observe_pool(&self.pool).await {
+                warn!(error = %err, "Reporter control read failed");
+            }
+        }
         let queue_descriptors = self.declared_queue_descriptors();
         let kind_descriptors = self.declared_job_kind_descriptors();
 
-        if let Err(err) =
-            admin::sync_queue_descriptors(&self.pool, &queue_descriptors, self.snapshot_interval)
-                .await
-        {
-            warn!(error = %err, "Failed to sync queue descriptors");
-        }
-        if let Err(err) =
-            admin::sync_job_kind_descriptors(&self.pool, &kind_descriptors, self.snapshot_interval)
-                .await
-        {
-            warn!(error = %err, "Failed to sync job kind descriptors");
+        if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
+            admission
+                .run(async {
+                    if let Err(err) = admin::sync_queue_descriptors(
+                        &self.pool,
+                        &queue_descriptors,
+                        self.snapshot_interval,
+                    )
+                    .await
+                    {
+                        self.runtime_control.record_error(&err);
+                        warn!(error = %err, "Failed to sync queue descriptors");
+                    }
+                    if let Err(err) = admin::sync_job_kind_descriptors(
+                        &self.pool,
+                        &kind_descriptors,
+                        self.snapshot_interval,
+                    )
+                    .await
+                    {
+                        self.runtime_control.record_error(&err);
+                        warn!(error = %err, "Failed to sync job kind descriptors");
+                    }
+                })
+                .await;
         }
 
         // Emit OTel info gauges for every declared descriptor. One series per
@@ -2514,6 +2573,16 @@ impl RuntimeReporterState {
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
+        }
+
+        if !self.leader.load(Ordering::SeqCst) {
+            if let Err(err) = self
+                .runtime_control
+                .publish_pool(&self.pool, self.instance_id)
+                .await
+            {
+                warn!(error = %err, "Failed to publish prune control observation");
+            }
         }
 
         if self.queue_storage_capable {

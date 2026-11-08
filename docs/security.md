@@ -430,3 +430,7 @@ See [callback receivers](callback-receivers.md) for end-to-end custom-axum and F
 - [Deployment guide](deployment.md)
 - [Configuration](configuration.md)
 - [Troubleshooting](troubleshooting.md)
+
+## Runtime control privileges
+
+[Runtime controls](runtime-controls.md#install) use explicit operator EXECUTE grants for halt/resume. Producer and runtime roles can observe controls without receiving fleet mutation privileges.

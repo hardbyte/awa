@@ -412,6 +412,19 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
 
 pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
     SchemaPatch {
+        name: "prune_controls",
+        description: "Durable operator control for maintenance pruning",
+        // Ordinary awa objects only: do not embed or refresh v023. This patch
+        // is independent of substrate installer refreshes.
+        sql: include_str!("../migrations/patches/prune_controls.sql"),
+        applied_probe: "SELECT to_regclass('awa.runtime_controls') IS NOT NULL \
+            AND to_regprocedure('awa.halt_runtime_scope(text,text,text)') IS NOT NULL \
+            AND to_regprocedure('awa.resume_runtime_scope(text,uuid)') IS NOT NULL \
+            AND to_regprocedure('awa.prune_controls_protocol_version()') IS NOT NULL \
+            AND EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('awa.runtime_instances') \
+                        AND attname = 'runtime_control_observation' AND NOT attisdropped)",
+    },
+    SchemaPatch {
     name: "wait_free_dirty_marks",
     description: "Wait-free admin dirty-key marks (awa 0.7 migration v046)",
     sql: include_str!("../migrations/patches/wait_free_dirty_marks.sql"),
@@ -1100,7 +1113,12 @@ mod tests {
                 [before, _body, after] => format!("{before}{after}"),
                 _ => patch.sql.to_string(),
             };
-            let upper = top_level.to_uppercase();
+            // The controls patch adds one nullable metadata column in a
+            // replay-safe form. Keep every other ALTER TABLE forbidden.
+            let upper = top_level.to_uppercase().replace(
+                "ALTER TABLE AWA.RUNTIME_INSTANCES ADD COLUMN IF NOT EXISTS RUNTIME_CONTROL_OBSERVATION JSONB;",
+                "",
+            );
             assert!(
                 !upper.contains("INSERT INTO AWA.SCHEMA_VERSION"),
                 "patch {} must not record a schema version",

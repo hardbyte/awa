@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- Add a durable operator halt/resume for `maintenance.prune` through the repeatable `prune_controls` patch. Compatible leaders observe it on their existing session; dispatch, cron, promotion, rescue and enqueue continue. Schema stays v40; all possible leaders must be upgraded or fenced. See [runtime controls](docs/runtime-controls.md).
+
 ## [0.6.15] — 2026-11-09
 
 Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
