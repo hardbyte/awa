@@ -337,7 +337,7 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. A future migration could convert the internal queue-storage helpers to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
+The lane provisioning functions `provision_lane` and `provision_lane_sequences` are `SECURITY DEFINER` since the `definer_lane_provisioning` patch (see [Lane sequences](#lane-sequences)). The rest of the model still requires broad table grants because the other compatibility triggers and helper functions use `SECURITY INVOKER`. A future migration could convert those to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
 
 ## Deployable roles
 
