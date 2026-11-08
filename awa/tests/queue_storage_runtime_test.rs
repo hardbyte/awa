@@ -12070,6 +12070,104 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+/// Open receipt claims count as running until durable evidence closes them:
+/// a completion batch, a retryable transition, or materialization into a
+/// lease, which must be counted once.
+#[tokio::test]
+async fn test_receipt_admin_counts_follow_durable_dispositions() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_receipt_dispositions";
+    let schema = "awa_qs_receipt_dispositions";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    async fn counts(pool: &sqlx::PgPool, queue: &str) -> (i64, i64, i64) {
+        let overview = admin::queue_overview(pool, queue)
+            .await
+            .expect("read receipt disposition counts")
+            .expect("receipt queue exists");
+        (
+            overview.running,
+            overview.retryable,
+            overview.completed_last_hour,
+        )
+    }
+
+    store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+        .await
+        .expect("claim three deadline-backed receipts");
+    assert_eq!(claimed.len(), 3);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(counts(&pool, queue).await, (3, 0, 0));
+
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        completed,
+        vec![(claimed[0].job.id, claimed[0].job.run_lease)]
+    );
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+    assert_eq!(counts(&pool, queue).await, (2, 0, 1));
+
+    let retried = store
+        .fail_retryable(
+            &pool,
+            claimed[1].job.id,
+            claimed[1].job.run_lease,
+            "retry",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("second attempt moves to retryable");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(counts(&pool, queue).await, (1, 1, 1));
+
+    let callback = store
+        .register_callback(
+            &pool,
+            claimed[2].job.id,
+            claimed[2].job.run_lease,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease_count(&pool, &store).await, 1);
+    assert_eq!(
+        counts(&pool, queue).await,
+        (1, 1, 1),
+        "materialization counts the attempt once"
+    );
+    let finished = store
+        .complete_external(&pool, callback, None, Some(claimed[2].job.run_lease), false)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, JobState::Completed);
+    assert_eq!(counts(&pool, queue).await, (0, 1, 2));
+    for (claim, expected) in claimed.iter().zip([
+        JobState::Completed,
+        JobState::Retryable,
+        JobState::Completed,
+    ]) {
+        let job = store.load_job(&pool, claim.job.id).await.unwrap().unwrap();
+        assert_eq!(
+            job.state, expected,
+            "point reads and aggregate counts agree"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     let (_db_guard, pool) = setup_pool(10).await;

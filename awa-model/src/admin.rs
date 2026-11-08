@@ -797,14 +797,20 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
                 batch.run_leases,
                 batch.lane_seqs
             ) AS item(job_id, run_lease, lane_seq)
-            JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = batch.ready_slot
-             AND ready.ready_generation = batch.ready_generation
-             AND ready.queue = batch.queue
-             AND ready.priority = batch.priority
-             AND ready.enqueue_shard = batch.enqueue_shard
-             AND ready.lane_seq = item.lane_seq
-             AND ready.job_id = item.job_id
+            CROSS JOIN LATERAL (
+                SELECT ready.kind
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.ready_slot = batch.ready_slot
+                  AND ready.ready_generation = batch.ready_generation
+                  AND ready.queue = batch.queue
+                  AND ready.priority = batch.priority
+                  AND ready.enqueue_shard = batch.enqueue_shard
+                  AND ready.lane_seq = item.lane_seq
+                  AND ready.job_id = item.job_id
+                -- Keep the full member key in the parameterized lookup,
+                -- rather than scanning its retained lane for every member.
+                OFFSET 0
+            ) AS ready
             WHERE NOT EXISTS (
                 SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
                 WHERE tomb.ready_slot = batch.ready_slot
