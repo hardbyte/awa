@@ -8,6 +8,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - Queue-storage job lists without a kind filter select receipt candidate IDs before loading their ready bodies. Kind filters still apply before the limit.
 
+### Fixed
+
+- Bound outstanding worker finalization to the larger of runtime worker capacity
+  and twice the completion batch size times the shard count. Finished handlers
+  retain their worker slot while waiting for finalizer capacity, preventing an
+  unbounded backlog of tasks retaining job payloads when durable completion falls
+  behind. Attempt heartbeats remain active until finalization settles.
+- Complete retried queue-storage jobs and jobs carrying metadata by compact claim
+  batch identity and item index, avoiding a scan of every retained claim batch.
+
 ## [0.6.14] — 2026-11-08
 
 Recommended for everyone on 0.6.13 using queue storage. A busy queue no longer stalls promotion of the others, prune backs off cleanly under lock contention, new queue lanes are usable by every runtime role, and jobs no longer stay running, run again or get misreported after priority aging.

@@ -1640,6 +1640,8 @@ impl Client {
             effective_storage.clone(),
             self.dlq_policy.clone(),
             self.finalizers.clone(),
+            self.service_cancel.clone(),
+            runtime_worker_capacity,
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag

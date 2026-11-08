@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
@@ -269,6 +271,8 @@ pub struct JobExecutor {
     storage: RuntimeStorage,
     dlq_policy: DlqPolicy,
     finalizers: TaskTracker,
+    finalize_cancel: CancellationToken,
+    finalize_capacity: Arc<Semaphore>,
 }
 
 impl JobExecutor {
@@ -291,7 +295,12 @@ impl JobExecutor {
         storage: RuntimeStorage,
         dlq_policy: DlqPolicy,
         finalizers: TaskTracker,
+        finalize_cancel: CancellationToken,
+        runtime_worker_capacity: u32,
     ) -> Self {
+        let finalize_capacity = Arc::new(Semaphore::new(
+            completion_batcher.finalizer_capacity(runtime_worker_capacity),
+        ));
         Self {
             pool,
             workers,
@@ -305,6 +314,8 @@ impl JobExecutor {
             storage,
             dlq_policy,
             finalizers,
+            finalize_cancel,
+            finalize_capacity,
         }
     }
 
@@ -332,6 +343,8 @@ impl JobExecutor {
         let storage = self.storage.clone();
         let dlq_policy = self.dlq_policy.clone();
         let finalizers = self.finalizers.clone();
+        let finalize_cancel = self.finalize_cancel.clone();
+        let finalize_capacity = self.finalize_capacity.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -439,6 +452,19 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
+            // Keep worker capacity and heartbeats until a bounded finalizer slot
+            // is available. Otherwise returning handlers can create an unbounded
+            // set of tasks retaining job payloads while completion is stalled.
+            let finalize_permit = match result {
+                Some(_) => tokio::select! {
+                    permit = finalize_capacity.acquire_owned() => {
+                        Some(permit.expect("finalizer capacity is never closed"))
+                    }
+                    _ = finalize_cancel.cancelled() => None,
+                },
+                None => None,
+            };
+
             if heartbeat_guard.is_none() {
                 in_flight.remove((job_id, job_run_lease));
             }
@@ -447,7 +473,7 @@ impl JobExecutor {
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
-            let Some(result) = result else {
+            let (Some(result), Some(finalize_permit)) = (result, finalize_permit) else {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
@@ -547,6 +573,7 @@ impl JobExecutor {
                 }
 
                 drop(heartbeat_guard);
+                drop(finalize_permit);
                 if let Ok(CompletionOutcome::Applied {
                     event: Some(event), ..
                 }) = outcome
@@ -3442,6 +3469,8 @@ mod tests {
             storage,
             DlqPolicy::default(),
             finalizers.clone(),
+            CancellationToken::new(),
+            1,
         );
         executor
             .execute_task(
@@ -3501,6 +3530,99 @@ mod tests {
             in_flight.get_cancel(key).is_none(),
             "settlement must unregister the exact lease"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saturated_finalizer_capacity_retains_worker_until_shutdown() {
+        for storage in [
+            RuntimeStorage::Canonical,
+            RuntimeStorage::QueueStorage(
+                QueueStorageRuntime::new(
+                    awa_model::QueueStorageConfig::default(),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let job: JobRow = serde_json::from_value(serde_json::json!({
+                "id": 1, "kind": "finalize_parent", "queue": "test", "args": {},
+                "state": "running", "priority": 2, "attempt": 1, "run_lease": 1,
+                "max_attempts": 5, "run_at": now, "attempted_at": now,
+                "created_at": now, "metadata": {}, "tags": [],
+            }))
+            .unwrap();
+            let key = (job.id, job.run_lease);
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:test@localhost/awa_test")
+                .unwrap();
+            let metrics = test_metrics();
+            let finalizers = TaskTracker::new();
+            let finalize_cancel = CancellationToken::new();
+            let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+            let count = Arc::new(AtomicU32::new(0));
+            let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+                pool.clone(),
+                CancellationToken::new(),
+                metrics.clone(),
+                storage.clone(),
+                1,
+            );
+            let executor = JobExecutor::new(
+                pool.clone(),
+                Arc::new(HashMap::from([(
+                    "finalize_parent".into(),
+                    Box::new(FinalizeWorker) as BoxedWorker,
+                )])),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+                in_flight.clone(),
+                Arc::new(HashMap::from([("test".into(), count.clone())])),
+                Arc::new(HashMap::new()),
+                metrics,
+                handle,
+                storage,
+                DlqPolicy::default(),
+                finalizers.clone(),
+                finalize_cancel.clone(),
+                1,
+            );
+            // Occupy the entire budget without starting database work.
+            let capacity = executor.finalize_capacity.clone();
+            let held = capacity
+                .clone()
+                .acquire_many_owned(capacity.available_permits() as u32)
+                .await
+                .unwrap();
+            let task = tokio::spawn(executor.execute_task(
+                DispatchedJob {
+                    job,
+                    queue_storage_claim: None,
+                    queue_storage_unique_states: None,
+                    abandon_after: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+            ));
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(in_flight.get_cancel(key).is_some());
+            assert!(finalizers.is_empty());
+
+            // Cancelling background services at the drain deadline must release
+            // the capacity waiter without spawning another finalizer.
+            finalize_cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert!(in_flight.get_cancel(key).is_none());
+            assert!(finalizers.is_empty());
+            drop(held);
+            pool.close().await;
+        }
     }
 
     #[tokio::test]
