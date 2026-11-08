@@ -4,33 +4,44 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.15] — 2026-11-09
+
+Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
+
 ### Upgrading
 
-- The schema stays at v40. Run `awa migrate` as the schema owner, before or after rolling binaries, while traffic keeps running. It applies the repeatable `insert_jobs_compat_batch` patch, which adds one function and changes no existing object. Binaries can roll back to 0.6.14 with the patch left in place. See the [upgrade guide](docs/upgrade-0.6.14-to-0.6.15.md).
-- External migration runners: apply `R__insert_jobs_compat_batch.sql` after `V40` (`awa migrate --extract-to <dir> --pending`), replacing all `R__` files together.
+- The schema stays at v40. Run `awa migrate` once as the schema owner, before or after rolling binaries, while traffic keeps running. It applies two repeatable patches, `claim_batch_job_index` and `insert_jobs_compat_batch`, which add functions and take no table locks. Binaries can roll back to 0.6.14 with the patches left in place. See the [upgrade guide](docs/upgrade-0.6.14-to-0.6.15.md).
+- External migration runners: apply `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql` after `V40`. Replace all `R__` files together with the full set from `awa migrate --extract-to <dir> --from 40`; `--pending` lists only the patches a database lacks.
 - Deployments that revoke `EXECUTE` on new functions from `PUBLIC` should grant it on `awa.insert_jobs_compat_batch` to runtime roles; without it, `insert_many_copy` keeps its per-row path.
+
+### Fixed
+
+**Worker memory**
+
+- Worker finalization is bounded to the larger of the runtime's worker capacity and twice the completion batch size times the completion shard count (1,024 attempts with the queue-storage defaults). A finished handler keeps its worker slot while it waits for finalizer capacity, so when durable completion falls behind the runtime stops claiming instead of holding an unbounded backlog of finished attempts and their payloads in memory. Before, a 120-second completion stall could leave about 77,000 finished attempts and 1 GB in one worker. Attempt heartbeats continue until finalization settles. Lowering `AWA_COMPLETION_BATCH_SIZE` lowers the bound in proportion, for jobs with large payloads.
+- Lifecycle hooks (`on_event`, `on_event_kind`) no longer accumulate without bound when they are slower than job throughput. Each attempt's `Started` and outcome hooks now hold its finalizer slot until they return, so slow hooks slow claiming instead of growing worker memory, and a worker-finalized outcome hook runs after that attempt's `Started` hook has returned. Maintenance's `Rescued` and duplicate `Cancelled` events allow 1,024 outstanding hook tasks per worker and drop further events with a warning.
+
+**Claim lookups**
+
+- By-job lookups of zero-deadline (compact) receipt claims — heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job` — use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. Under load those scans could pick parallel plans and exhaust dynamic shared memory. The `claim_batch_job_index` patch installs the index function and takes no table locks; claim prune builds the index on each claim partition right after emptying it, so every partition gains it within one claim-ring cycle and live claims are never blocked behind a build.
+- Retried queue-storage jobs and jobs carrying metadata complete by their compact claim batch and item index, instead of reading every retained claim batch.
+
+**Rescue, events and admin reads**
+
+- Heartbeat, deadline and callback rescue of lease-backed attempts reach the stale attempts behind a full batch of attempts whose retained ready bodies are ambiguous. Before, every pass selected the same ambiguous attempts first, left them running, and rescued nothing else.
+- A `Completed` lifecycle event, and the job a `Completed` follow-up enqueue spec receives, no longer carry the finished attempt's `heartbeat_at` and `deadline_at`; both are `None`, as a read of the completed job returns them.
+- Admin job lists and kind counts work on a queue-storage schema installed with more claim slots than the default, instead of failing with `invalid physical claim slot`, and no longer read other claim slots' receipt closure partitions when they read one slot's open claims.
+- Queue-storage job lists without a kind filter select receipt candidate IDs before loading their ready bodies. Kind filters still apply before the limit.
 
 ### Changed
 
 - Compatibility COPY inserts (`insert_many_copy` in Rust and Python) hold a queue lane's enqueue lock only while they write that lane, instead of from the batch's first ready row until commit. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
 - A batch through `awa.insert_jobs_compat_batch` takes all its unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together, lane by lane. A per-row transaction that already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed now fails with `deadlock detected` (SQLSTATE `40P01`) instead of skipping the job or failing with a unique violation (`23505`). Retry the aborted transaction. Batches through the function do not deadlock with each other this way.
-- Queue-storage job lists without a kind filter select receipt candidate IDs before loading their ready bodies. Kind filters still apply before the limit.
 
 ### Added
 
 - `insert_many_skip_unique_conflicts` (Rust) inserts a batch through `awa.insert_jobs_compat_batch`, skipping jobs whose unique key is already claimed, and returns the inserted rows in input order. Use it instead of retrying a failed `insert_many` one job at a time, which takes the lane lock once per job. It needs the `insert_jobs_compat_batch` patch. Generic `insert_many` is unchanged.
 - `enqueue_lane_contention_test` benchmarks many producers on one lane, with a nightly gate on per-lane throughput and lock hold time.
-
-### Fixed
-
-- Point lookups of zero-deadline (compact) receipt claims by job ID — heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job` — use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. Under load those scans could pick parallel plans and exhaust dynamic shared memory. The repeatable `claim_batch_job_index` schema patch installs the index function and takes no table locks; claim prune builds the index on each claim partition right after emptying it, so every partition gains it within one claim-ring cycle after the patch and live claims are never blocked behind a build. The schema remains v40.
-- Admin job lists and kind counts work on a queue-storage schema installed with more claim slots than the default, instead of failing with `invalid physical claim slot`.
-- Heartbeat, deadline and callback rescue of lease-backed attempts reach the stale attempts behind a full batch of attempts whose retained ready bodies are ambiguous. Before, every pass selected the same ambiguous attempts first, left them running, and rescued nothing else. A pass now sets all of a batch's ambiguous attempts aside at once.
-- Admin job lists and kind counts no longer read other claim slots' receipt closure partitions when they read one slot's open claims.
-- A `Completed` lifecycle event, and the job a `Completed` follow-up enqueue spec receives, no longer carry the finished attempt's `heartbeat_at` and `deadline_at`; both are `None`, as a read of the completed job returns them.
-- Worker finalization is bounded to the larger of the runtime's worker capacity and twice the completion batch size times the completion shard count. A finished handler keeps its worker slot while it waits for finalizer capacity, so when durable completion falls behind the runtime stops claiming instead of holding an unbounded backlog of finished attempts and their payloads in memory. Attempt heartbeats continue until finalization settles.
-- Retried queue-storage jobs and jobs carrying metadata complete by their compact claim batch and item index, instead of reading every retained claim batch.
-- Lifecycle hooks (`on_event`, `on_event_kind`) no longer accumulate without bound when they are slower than job throughput. Each attempt's `Started` and outcome hooks now hold its finalizer slot until they return, so slow hooks slow claiming instead of growing worker memory, and a worker-finalized outcome hook runs after that attempt's `Started` hook has returned. Maintenance's `Rescued` and duplicate `Cancelled` events allow 1,024 outstanding hook tasks per worker and drop further events with a warning.
 
 ## [0.6.14] — 2026-11-08
 

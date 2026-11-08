@@ -146,6 +146,22 @@ To recover:
 
 In all cases the cancel itself is durable — only the early wake-up is lost. Long-running handlers that don't poll `ctx.is_cancelled()` between heartbeats won't notice the cancel until they finish or heartbeat-rescue fires.
 
+## Claiming Slows While Handlers Are Idle
+
+### What It Usually Means
+
+Durable completion, or lifecycle hooks, are behind the handlers. A runtime lets only a bounded number of finished attempts wait for their completion to commit (see [completion settings](configuration.md#hot-queue-claim-control)). Once that allowance is used up, finished handlers keep their worker slots, `awa_job_in_flight` sits at `max_workers` while handler CPU is idle, and the runtime claims only as fast as completions commit. Worker memory stays flat. Before 0.6.15 the runtime kept claiming instead, and its memory grew with every finished attempt until the process was killed.
+
+### What To Check
+
+- `awa_completion_flush_duration_seconds`: long flushes point at the database, usually lock waits on the completion or terminal tables. Look for long transactions and lock waits on the queue-storage schema, as in [Inspect Long Transactions](#inspect-long-transactions).
+- `awa_completion_deadlock_retry_total`: a steady rate means completions are re-running after deadlocks.
+- Lifecycle hooks (`on_event`, `on_event_kind`): a hook that waits on a slow service or on the same database holds its attempt's slot until it returns. Move slow work into a job or a follow-up.
+
+### Fixes
+
+Clear the lock contention or long transaction; claiming recovers as soon as completions commit again. Raising `max_workers` does not help while completion is the bottleneck. For jobs with large payloads, lowering `AWA_COMPLETION_BATCH_SIZE` reduces how much memory waiting attempts can hold.
+
 ## Rescue Fails With `idx_awa_jobs_unique`
 
 Symptom: maintenance repeats, every tick (canonical engine — the queue-storage engine wedges identically but logs `error: unique conflict` instead):
