@@ -123,6 +123,9 @@ REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, I
 -- Keep fleet control mutation operator-only after the broad grants above.
 REVOKE ALL ON awa.runtime_controls FROM awa_runtime;
 GRANT SELECT ON awa.runtime_controls TO awa_runtime;
+REVOKE ALL ON awa.runtime_control_observations FROM awa_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON awa.runtime_control_observations
+  TO awa_runtime;
 REVOKE EXECUTE ON FUNCTION awa.halt_runtime_scope(TEXT, TEXT, TEXT),
                           awa.resume_runtime_scope(TEXT, UUID)
   FROM awa_runtime;
@@ -441,4 +444,6 @@ See [callback receivers](callback-receivers.md) for end-to-end custom-axum and F
 
 ## Runtime control privileges
 
-[Runtime controls](runtime-controls.md#install) use explicit operator EXECUTE grants for halt/resume. Producer and runtime roles can observe controls without receiving fleet mutation privileges.
+[Runtime controls](runtime-controls.md#install) use explicit operator `EXECUTE` grants for halt/resume. Runtime roles need `SELECT` on `awa.runtime_controls` and `SELECT, INSERT, UPDATE, DELETE` on `awa.runtime_control_observations`. Operators need `SELECT` on both tables and `awa.runtime_instances`, plus `EXECUTE` on the halt/resume functions. Neither role should receive direct control-table writes.
+
+The patch removes mutation privileges from `PUBLIC` and runtime/producer roles, including broad defaults, while preserving explicit operator grants on replay. Reapply the exceptions after blanket table or function grants and remove inherited mutation privileges from the granting role. Schema owners and superusers retain administrative authority.

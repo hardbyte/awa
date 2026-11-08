@@ -129,15 +129,9 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
-  # ─── 0.6.9 → 0.6.10 → 0.6.9 patch upgrade rehearsal ──
-  # Released 0.6.9 artifacts (the awa-cli and awa-pg wheels from PyPI) install
-  # the schema and run traffic as a separate runtime role; the candidate
-  # `awa migrate` patches under that traffic; both versions run together; the
-  # fleet rolls back to 0.6.9 and then tightens privileges. A release tag
-  # requires this workflow to pass on the exact commit (release.yml), so this
-  # is the release gate for the patch upgrade guarantee.
+  # ─── Released → candidate → released patch upgrade rehearsal ──
   patch-upgrade-rehearsal:
-    name: Patch upgrade rehearsal (0.6.9, pg${{ matrix.postgres }})
+    name: Patch upgrade rehearsal (${{ matrix.released }}, pg${{ matrix.postgres }})
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
@@ -146,6 +140,7 @@ jobs:
       fail-fast: false
       matrix:
         postgres: ["17", "18"]
+        released: ["0.6.9", "0.6.15"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine
@@ -166,11 +161,11 @@ jobs:
         with:
           workspaces: ". -> target"
       - uses: astral-sh/setup-uv@v5
-      - name: Install released 0.6.9 artifacts
+      - name: Install released ${{ matrix.released }} artifacts
         run: |
-          uv venv --quiet --clear .released-0.6.9
-          uv pip install --quiet --python .released-0.6.9 "awa-pg==0.6.9" "awa-cli==0.6.9"
-          .released-0.6.9/bin/awa --version
+          uv venv --quiet --clear .released
+          uv pip install --quiet --python .released "awa-pg==${{ matrix.released }}" "awa-cli==${{ matrix.released }}"
+          .released/bin/awa --version
       - name: Build candidate CLI
         run: cargo build -p awa-cli
       - name: Wait for Postgres
@@ -182,8 +177,9 @@ jobs:
             | tee rehearsal-output.log
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-          AWA_RELEASED_CLI: .released-0.6.9/bin/awa
-          AWA_RELEASED_PYTHON: .released-0.6.9/bin/python
+          AWA_RELEASED_VERSION: ${{ matrix.released }}
+          AWA_RELEASED_CLI: .released/bin/awa
+          AWA_RELEASED_PYTHON: .released/bin/python
           AWA_CANDIDATE_CLI: target/debug/awa
           AWA_REHEARSAL_ARTIFACT_DIR: ${{ github.workspace }}/rehearsal-artifacts
       - name: Collect Postgres logs
@@ -193,7 +189,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: patch-upgrade-rehearsal-pg${{ matrix.postgres }}-${{ github.sha }}
+          name: patch-upgrade-rehearsal-${{ matrix.released }}-pg${{ matrix.postgres }}-${{ github.sha }}
           path: |
             rehearsal-artifacts/
             rehearsal-output.log

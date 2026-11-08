@@ -139,11 +139,11 @@ async fn prune_halt_survives_handoff_and_preserves_exact_job_accounting(pool: Pg
         .await
         .unwrap();
     assert_eq!(current.halt_id, halt.halt_id);
-    let observations: Vec<serde_json::Value> = sqlx::query_scalar("SELECT runtime_control_observation FROM awa.runtime_instances WHERE leader AND runtime_control_observation IS NOT NULL").fetch_all(&pool).await.unwrap();
+    let observations: Vec<serde_json::Value> = sqlx::query_scalar("SELECT observation FROM awa.runtime_instances JOIN awa.runtime_control_observations USING (instance_id) WHERE leader").fetch_all(&pool).await.unwrap();
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0]["observed_revision"], halt.revision);
     assert_eq!(observations[0]["state"], "halted");
-    let standby_observation: serde_json::Value = sqlx::query_scalar("SELECT runtime_control_observation FROM awa.runtime_instances WHERE NOT leader AND NOT shutting_down")
+    let standby_observation: serde_json::Value = sqlx::query_scalar("SELECT observation FROM awa.runtime_instances JOIN awa.runtime_control_observations USING (instance_id) WHERE NOT leader AND NOT shutting_down")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(standby_observation["observed_revision"], halt.revision);
     assert_eq!(standby_observation["state"], "halted");

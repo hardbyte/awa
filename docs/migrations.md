@@ -243,7 +243,7 @@ That writes one `V<n>__<description>.sql` file per migration, plus one `R__<name
 - Rust: `awa::migrations::migration_sql()` and `awa::migrations::schema_patch_sql(SCHEMA_PATCHES)`
 - Python: `awa.migrations()` and `awa.schema_patches()`
 
-`R__prune_controls.sql` installs the durable operator control for reclamation without refreshing substrate installers. See [runtime controls](runtime-controls.md) for grants, rollout requirements and halt/resume commands.
+`R__prune_controls.sql` runs after `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql`. It installs the durable `maintenance.prune` operator control: two new ordinary tables (`awa.runtime_controls` and `awa.runtime_control_observations`) and functions. It does not alter `awa.runtime_instances`, refresh `v023` or claim functions, or advance schema v40. Replay preserves an existing halt and explicit operator grants. Replace the runner's `R__` files together with the full set from `awa migrate --extract-to <dir> --from 40`; `--pending` only lists missing patches. See the [0.6.15 to 0.6.16 upgrade guide](upgrade-0.6.15-to-0.6.16.md) and [runtime controls](runtime-controls.md) for grants and rollout requirements.
 
 `awa migrate --sql` wraps its output in one transaction that takes the same advisory lock as `awa migrate`. Pipe it to `psql -v ON_ERROR_STOP=1`; without it psql exits 0 even when the transaction rolled back. `--no-transaction` prints the statements bare for runners that open the transaction themselves. `--from`, `--to` and `--version` choose what `--sql` and `--extract-to` render; `awa migrate` refuses them when applying, since it always migrates to the current version and its patches.
 

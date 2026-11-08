@@ -15,7 +15,10 @@ CREATE TABLE IF NOT EXISTS awa.runtime_controls (
 );
 INSERT INTO awa.runtime_controls(scope) VALUES ('maintenance.prune') ON CONFLICT DO NOTHING;
 
-ALTER TABLE awa.runtime_instances ADD COLUMN IF NOT EXISTS runtime_control_observation jsonb;
+CREATE TABLE IF NOT EXISTS awa.runtime_control_observations (
+    instance_id uuid PRIMARY KEY,
+    observation jsonb NOT NULL
+);
 
 -- Direct mutation is never part of the producer/runtime contract, including
 -- installations whose owner has broad ALTER DEFAULT PRIVILEGES grants.

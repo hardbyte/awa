@@ -100,6 +100,17 @@ impl PruneControl {
         .unwrap_or(Err(sqlx::Error::PoolTimedOut))
     }
 
+    pub(crate) async fn cleanup_orphan_reports(
+        &self,
+        pool: &sqlx::PgPool,
+    ) -> Result<(), sqlx::Error> {
+        if self.capability.load(Ordering::SeqCst) == 2 {
+            sqlx::query("DELETE FROM awa.runtime_control_observations WHERE instance_id IN (SELECT report.instance_id FROM awa.runtime_control_observations report WHERE NOT EXISTS (SELECT 1 FROM awa.runtime_instances runtime WHERE runtime.instance_id = report.instance_id) LIMIT 1000)")
+                .execute(pool).await?;
+        }
+        Ok(())
+    }
+
     fn allowed_observation(&self, observation: &Observation) -> bool {
         if self.capability.load(Ordering::SeqCst) == 1 {
             return observation
@@ -166,7 +177,7 @@ impl PruneControl {
             // Until installed, the existing reclamation policy stays in force.
             let started = Instant::now();
             let installed: bool =
-                sqlx::query_scalar("SELECT to_regclass('awa.runtime_controls') IS NOT NULL")
+                sqlx::query_scalar("SELECT to_regclass('awa.runtime_controls') IS NOT NULL AND to_regclass('awa.runtime_control_observations') IS NOT NULL AND to_regprocedure('awa.prune_controls_protocol_version()') IS NOT NULL")
                     .fetch_one(&mut *conn)
                     .await?;
             if installed {
@@ -260,7 +271,9 @@ impl PruneControl {
         let abandoned = self.abandoned.load(Ordering::SeqCst);
         let settlement_unknown = abandoned > 0;
         serde_json::json!({
-            "scope": runtime_control::PRUNE_SCOPE, "supported": self.capability.load(Ordering::SeqCst) == 2,
+            "scope": runtime_control::PRUNE_SCOPE,
+            "protocol_version": runtime_control::OBSERVATION_PROTOCOL_VERSION,
+            "supported": self.capability.load(Ordering::SeqCst) == 2,
             "observed_revision": observation.value.as_ref().map(|v| v.revision),
             "halt_id": observation.value.as_ref().and_then(|v| v.halt_id),
             "observed_at": observation.observed_at, "fresh": fresh, "admission_allowed": allowed,
@@ -279,7 +292,7 @@ async fn write_status(
 ) -> Result<(), sqlx::Error> {
     // Reporter and leader writes can overlap during election. An older
     // snapshot must not replace a newer observation or settlement report.
-    sqlx::query("UPDATE awa.runtime_instances SET runtime_control_observation = $2 || jsonb_build_object('received_at', clock_timestamp()) WHERE instance_id = $1 AND (runtime_control_observation->>'report_sequence' IS NULL OR (runtime_control_observation->>'report_sequence')::bigint < ($2->>'report_sequence')::bigint)")
+    sqlx::query("INSERT INTO awa.runtime_control_observations AS stored (instance_id, observation) VALUES ($1, $2 || jsonb_build_object('received_at', clock_timestamp())) ON CONFLICT (instance_id) DO UPDATE SET observation = EXCLUDED.observation WHERE stored.observation->>'report_sequence' IS NULL OR (stored.observation->>'report_sequence')::bigint < (EXCLUDED.observation->>'report_sequence')::bigint")
         .bind(instance).bind(status).execute(conn).await?;
     Ok(())
 }
@@ -511,7 +524,7 @@ mod tests {
         migrations::run(&admin).await.unwrap();
         let id = instance(&admin).await;
         let role = format!("prune_observer_{}", Uuid::new_v4().simple());
-        admin.execute(sqlx::raw_sql(&format!("CREATE ROLE {role} LOGIN PASSWORD 'phase1'; GRANT USAGE ON SCHEMA awa TO {role}; GRANT SELECT ON awa.runtime_controls TO {role}; GRANT UPDATE (runtime_control_observation) ON awa.runtime_instances TO {role}; GRANT SELECT (instance_id,runtime_control_observation) ON awa.runtime_instances TO {role};"))).await.unwrap();
+        admin.execute(sqlx::raw_sql(&format!("CREATE ROLE {role} LOGIN PASSWORD 'phase1'; GRANT USAGE ON SCHEMA awa TO {role}; GRANT SELECT ON awa.runtime_controls TO {role}; GRANT SELECT, INSERT, UPDATE ON awa.runtime_control_observations TO {role};"))).await.unwrap();
         let options = (*admin.connect_options())
             .clone()
             .username(&role)
@@ -571,11 +584,23 @@ mod tests {
         assert!(!control.allowed());
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let value: Option<serde_json::Value> = sqlx::query_scalar("SELECT runtime_control_observation FROM awa.runtime_instances WHERE instance_id=$1").bind(id).fetch_one(&admin).await.unwrap();
-                if value.is_some_and(|v| v["observed_revision"] == halt.revision && v["state"] == "halted") { break; }
+                let value: Option<serde_json::Value> = sqlx::query_scalar(
+                    "SELECT observation FROM awa.runtime_control_observations WHERE instance_id=$1",
+                )
+                .bind(id)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                if value.is_some_and(|v| {
+                    v["observed_revision"] == halt.revision && v["state"] == "halted"
+                }) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("publication uses the held session and column-specific grants");
+        })
+        .await
+        .expect("publication uses the held session and column-specific grants");
         let resumed =
             runtime_control::resume(&admin, runtime_control::PRUNE_SCOPE, halt.halt_id.unwrap())
                 .await
@@ -630,7 +655,7 @@ mod tests {
         control.observe_pool(&pool).await.unwrap();
         control.publish_pool(&pool, id).await.unwrap();
         let newest: serde_json::Value = sqlx::query_scalar(
-            "SELECT runtime_control_observation FROM awa.runtime_instances WHERE instance_id=$1",
+            "SELECT observation FROM awa.runtime_control_observations WHERE instance_id=$1",
         )
         .bind(id)
         .fetch_one(&pool)
@@ -646,7 +671,7 @@ mod tests {
             .await
             .unwrap();
         let retained: serde_json::Value = sqlx::query_scalar(
-            "SELECT runtime_control_observation FROM awa.runtime_instances WHERE instance_id=$1",
+            "SELECT observation FROM awa.runtime_control_observations WHERE instance_id=$1",
         )
         .bind(id)
         .fetch_one(&pool)
@@ -659,12 +684,35 @@ mod tests {
         write_status(&mut pool.acquire().await.unwrap(), id, skewed)
             .await
             .unwrap();
-        let recent: bool = sqlx::query_scalar("SELECT (runtime_control_observation->>'received_at')::timestamptz > clock_timestamp() - interval '5 seconds' FROM awa.runtime_instances WHERE instance_id=$1")
+        let recent: bool = sqlx::query_scalar("SELECT (observation->>'received_at')::timestamptz > clock_timestamp() - interval '5 seconds' FROM awa.runtime_control_observations WHERE instance_id=$1")
             .bind(id).fetch_one(&pool).await.unwrap();
         assert!(
             recent,
             "report recency uses the server receipt, not the runtime clock"
         );
+        control.cleanup_orphan_reports(&pool).await.unwrap();
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM awa.runtime_control_observations WHERE instance_id=$1)",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(retained);
+        sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        control.cleanup_orphan_reports(&pool).await.unwrap();
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM awa.runtime_control_observations WHERE instance_id=$1)",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!retained);
     }
 
     #[sqlx::test(migrations = false)]

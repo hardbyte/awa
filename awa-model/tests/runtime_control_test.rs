@@ -153,3 +153,89 @@ async fn controls_survive_installer_patch_replay_in_either_order(pool: PgPool) {
         assert_eq!(migrations::current_version(&pool).await.unwrap(), version);
     }
 }
+
+#[sqlx::test(migrations = false)]
+async fn patch_installs_without_waiting_for_runtime_heartbeats(pool: PgPool) {
+    for (_, _, sql) in migrations::migration_sql_range(0, migrations::CURRENT_VERSION) {
+        pool.execute(sqlx::raw_sql(&sql)).await.unwrap();
+    }
+    for patch in migrations::SCHEMA_PATCHES
+        .iter()
+        .filter(|patch| patch.name != "prune_controls")
+    {
+        pool.execute(sqlx::raw_sql(patch.sql)).await.unwrap();
+    }
+    let patch_names: Vec<_> = migrations::SCHEMA_PATCHES
+        .iter()
+        .map(|patch| patch.name)
+        .collect();
+    let control_index = patch_names
+        .iter()
+        .position(|name| *name == "prune_controls")
+        .unwrap();
+    for dependency in ["claim_batch_job_index", "insert_jobs_compat_batch"] {
+        assert!(
+            patch_names
+                .iter()
+                .position(|name| *name == dependency)
+                .unwrap()
+                < control_index
+        );
+    }
+    let columns_before: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid='awa.runtime_instances'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum")
+        .fetch_all(&pool).await.unwrap();
+    let mut heartbeat = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE awa.runtime_instances IN ROW EXCLUSIVE MODE")
+        .execute(heartbeat.as_mut())
+        .await
+        .unwrap();
+    let mut install = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(install.as_mut())
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::raw_sql(include_str!("../migrations/patches/prune_controls.sql"))
+            .execute(install.as_mut()),
+    )
+    .await
+    .expect("installation must not queue behind a heartbeat")
+    .unwrap();
+    let lock_query = "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.locktype='relation' AND n.nspname='awa'";
+    let locked: Vec<String> = sqlx::query_scalar(lock_query)
+        .bind(pid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        locked.is_empty(),
+        "patch locked pre-existing relations: {locked:?}"
+    );
+    sqlx::query("SELECT instance_id FROM awa.runtime_instances LIMIT 0")
+        .execute(install.as_mut())
+        .await
+        .unwrap();
+    let sentinel: Vec<String> = sqlx::query_scalar(lock_query)
+        .bind(pid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sentinel
+            .iter()
+            .any(|lock| lock == "awa.runtime_instances AccessShareLock"),
+        "the audit must detect even a read lock on an existing table"
+    );
+    install.commit().await.unwrap();
+    let columns_after: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid='awa.runtime_instances'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(columns_before, columns_after);
+    let observations_exist: bool =
+        sqlx::query_scalar("SELECT to_regclass('awa.runtime_control_observations') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(observations_exist);
+    heartbeat.rollback().await.unwrap();
+}

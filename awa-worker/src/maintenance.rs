@@ -3535,6 +3535,10 @@ impl MaintenanceService {
             self.control.record_error(&err);
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
         }
+        if let Err(err) = self.control.cleanup_orphan_reports(&self.pool).await {
+            self.control.record_error(&err);
+            tracing::warn!(error = %err, "Failed to clean up orphan control observations");
+        }
     }
 
     /// Delete catalog rows whose last_seen_at is older than
