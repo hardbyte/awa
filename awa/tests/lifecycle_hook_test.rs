@@ -9,7 +9,7 @@ use awa::{
 };
 use awa_testing::setup::TestDatabase;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -82,6 +82,11 @@ struct HookJob {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct HookFollowUp {
+    source_job_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct RawHookJob {
     value: String,
 }
@@ -137,6 +142,100 @@ async fn test_typed_completed_event_handler_runs() {
 
     let stored = admin::get_job(&pool, inserted.id).await.unwrap();
     assert_eq!(stored.state, JobState::Completed);
+}
+
+/// A completed event carries the job as a terminal read returns it, without the
+/// finished attempt's heartbeat or deadline.
+#[tokio::test]
+async fn test_completed_event_of_a_deadline_job_matches_the_terminal_job() {
+    assert_completed_event_of_a_deadline_job_matches_the_terminal_job(false).await;
+}
+
+/// A kind with a Completed follow-up completes through its own transaction; the
+/// follow-up and the event see the same terminal job.
+#[tokio::test]
+async fn test_completed_event_with_a_follow_up_matches_the_terminal_job() {
+    assert_completed_event_of_a_deadline_job_matches_the_terminal_job(true).await;
+}
+
+type AttemptTimes = (
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+async fn assert_completed_event_of_a_deadline_job_matches_the_terminal_job(with_follow_up: bool) {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let queue = "lifecycle_completed_deadline";
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let follow_up_saw: Arc<Mutex<Vec<AttemptTimes>>> = Arc::default();
+    let builder = lifecycle_client_builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .register::<HookJob, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                if let JobEvent::Completed { job, .. } = event {
+                    tx.send(job).unwrap();
+                }
+            }
+        });
+    let builder = if with_follow_up {
+        let follow_up_saw = follow_up_saw.clone();
+        builder.on_completed_enqueue::<HookJob, HookFollowUp, _>(move |_args, job| {
+            follow_up_saw
+                .lock()
+                .unwrap()
+                .push((job.heartbeat_at, job.deadline_at));
+            HookFollowUp {
+                source_job_id: job.id,
+            }
+        })
+    } else {
+        builder
+    };
+    let client = builder.build().unwrap();
+
+    let inserted = awa::insert_with(
+        &pool,
+        &HookJob {
+            action: "complete".into(),
+            value: "deadline".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let event_job = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let stored = admin::get_job(&pool, inserted.id).await.unwrap();
+    assert_eq!(event_job.id, stored.id);
+    assert_eq!(event_job.state, stored.state);
+    assert_eq!(
+        (event_job.heartbeat_at, event_job.deadline_at),
+        (stored.heartbeat_at, stored.deadline_at)
+    );
+    assert_eq!((stored.heartbeat_at, stored.deadline_at), (None, None));
+    let expected_follow_up_saw: Vec<AttemptTimes> = if with_follow_up {
+        vec![(None, None)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(*follow_up_saw.lock().unwrap(), expected_follow_up_saw);
 }
 
 #[tokio::test]
