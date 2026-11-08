@@ -278,7 +278,18 @@ jobs:
             exit 0
           fi
           git fetch --tags --quiet
-          previous=$(git tag --sort=-v:refname | grep -vx "$tag" | grep "^v${version%.*}\." | head -1 || true)
+          # Compare a release with the release before it in the same minor, and a
+          # prerelease with whatever tag precedes it; versionsort.suffix ranks
+          # prereleases below their release.
+          release="${version%%-*}"
+          if [[ "$tag" == *-* ]]; then
+            same_line="^v${release%.*}\\."
+          else
+            same_line="^v${release%.*}\\.[0-9]+$"
+          fi
+          previous=$(git -c versionsort.suffix=- tag --sort=-v:refname \
+            | grep -E "$same_line|^${tag}$" \
+            | awk -v t="$tag" 'found { print; exit } $0 == t { found = 1 }' || true)
           if [ -n "$previous" ]; then
             printf '\n**Full changelog**: https://github.com/%s/compare/%s...%s\n' \
               "$GITHUB_REPOSITORY" "$previous" "$tag" >> release-notes.md

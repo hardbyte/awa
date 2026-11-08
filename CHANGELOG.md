@@ -13,6 +13,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Changed
 
 - Compatibility COPY inserts (`insert_many_copy` in Rust and Python) hold a queue lane's enqueue lock only while they write that lane, instead of from the batch's first ready row until commit. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads before it reserves each lane once, in the same sorted lane order as before. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
+- Queue-storage job lists without a kind filter select receipt candidate IDs before loading their ready bodies. Kind filters still apply before the limit.
 
 ### Added
 
