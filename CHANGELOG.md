@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Forward-ported from 0.6.14
+
+- Everything [0.6.14](https://github.com/hardbyte/awa/releases/tag/v0.6.14) shipped that this branch did not already have; see its release notes for the details. Promotion runs each enqueue lane in its own transaction, hands a busy lane to a dedicated waiter, and wakes claimers after the lanes commit; `awa.maintenance.promote.lane_contention` counts the hand-offs. Rescue skips an attempt whose retained ready bodies are ambiguous instead of stopping rescue of every other attempt. Lifecycle events no longer re-read a completed job, and a failed re-read no longer fails a committed callback wait. Admin job lists and kind counts find their candidates in read phases that release partition locks between them, and probe receipt closures more cheaply; a job list still loads each candidate with a point read, which holds `ACCESS SHARE` on every ready, lease and claim partition for the length of that read. `awa migrate` rejects `--sql` combined with `--extract-to`. The persona soak suite (`awa/tests/persona_soak_test.rs`, `scripts/persona-soak.sh`) is added.
+
 ### Added
 
 - **The queue-storage prune `lock_timeout` is configurable, and prune

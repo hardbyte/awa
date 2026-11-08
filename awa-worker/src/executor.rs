@@ -910,6 +910,27 @@ where
     }
 }
 
+/// Re-read a job whose transition has committed, for its lifecycle event.
+/// The transition stands whatever the read returns, so a failed read is logged
+/// and the caller builds the event from the worker's copy instead.
+async fn reload_committed_job(
+    runtime: &QueueStorageRuntime,
+    pool: &PgPool,
+    job_id: i64,
+) -> Option<JobRow> {
+    match runtime.store.load_job(pool, job_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            warn!(
+                job_id,
+                error = %err,
+                "Could not re-read a committed job for its lifecycle event; using the worker's copy"
+            );
+            None
+        }
+    }
+}
+
 fn is_completion_lock_contention(error: &AwaError) -> bool {
     matches!(error, AwaError::Database(sqlx::Error::Database(database))
         if database.code().as_deref() == Some("55P03"))
@@ -2137,20 +2158,13 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                // The output is set from the sealed value rather than re-read,
-                // which would detoast its compact batch's whole output array.
-                let mut updated_job = runtime
-                    .store
-                    .load_job_without_output(pool, job.id)
-                    .await?
-                    .unwrap_or_else(|| {
-                        let mut completed_job = job.clone();
-                        completed_job.state = JobState::Completed;
-                        completed_job.finalized_at = Some(chrono::Utc::now());
-                        completed_job.progress = None;
-                        completed_job
-                    });
-                updated_job.output = job.output.clone();
+                // A completed attempt changes only these fields, so the event is
+                // built from the worker's copy, which carries the sealed output,
+                // rather than re-reading the job.
+                let mut updated_job = job.clone();
+                updated_job.state = JobState::Completed;
+                updated_job.finalized_at = Some(chrono::Utc::now());
+                updated_job.progress = None;
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
                         job: updated_job,
@@ -2430,10 +2444,8 @@ async fn complete_job_queue_storage(
                 }
             }
             let event = if needs_event {
-                let parked_job = runtime
-                    .store
-                    .load_job(pool, job.id)
-                    .await?
+                let parked_job = reload_committed_job(runtime, pool, job.id)
+                    .await
                     .unwrap_or_else(|| {
                         let mut parked = job.clone();
                         parked.state = JobState::WaitingExternal;

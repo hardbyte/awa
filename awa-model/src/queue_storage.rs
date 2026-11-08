@@ -641,6 +641,29 @@ pub struct RingLedgerFoldOutcome {
     pub skipped_mvcc_pinned: bool,
 }
 
+/// A `(queue, priority)` enqueue lane as promotion addresses it. Promotion
+/// picks the shard when it re-enqueues a row, so the shard is not part of it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PromotionLane {
+    pub queue: String,
+    pub priority: i16,
+}
+
+/// Outcome of [`QueueStorage::promote_due_lanes`] and
+/// [`QueueStorage::promote_due_lane`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromoteOutcome {
+    /// Rows moved into the ready ring.
+    pub promoted: usize,
+    /// Due rows the batch selected, including those left deferred on a
+    /// contended lane. A batch that selected its full size may have left
+    /// further due rows behind.
+    pub selected: usize,
+    /// Lanes whose locks were held past `lock_timeout`, so their promotion
+    /// transaction rolled back. Their rows stay deferred.
+    pub contended: Vec<PromotionLane>,
+}
+
 /// Discriminator for [`PruneOutcome::SkippedActive`].
 ///
 /// Multiple gates can fire `SkippedActive` for the same ring (e.g. queue
@@ -699,7 +722,7 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
-async fn set_prune_lock_timeout_tx(
+async fn set_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     timeout: Duration,
 ) -> Result<(), AwaError> {
@@ -941,7 +964,7 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
-fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
+pub(crate) fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
     usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
             "invalid {ring} ring slot {slot}: slot must be non-negative"
@@ -959,42 +982,76 @@ fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, Aw
     Ok(index)
 }
 
+enum ReceiptEvidence {
+    Closed,
+    Open,
+}
+
 fn receipt_closed_evidence_sql(
     schema: &str,
     closure_rel: &str,
     closure_batch_rel: &str,
     claims_alias: &str,
 ) -> String {
-    // `receipt_id` is allocated from a global sequence, so it identifies a
-    // claim without a `claim_slot` predicate. Compact closure batches retain
-    // the raw receipt array for audit/debugging, but hot membership checks use
-    // the per-child GiST index on the derived multirange.
+    receipt_evidence_sql(
+        schema,
+        closure_rel,
+        closure_batch_rel,
+        claims_alias,
+        ReceiptEvidence::Closed,
+    )
+}
+
+fn receipt_evidence_sql(
+    schema: &str,
+    closure_rel: &str,
+    closure_batch_rel: &str,
+    claims_alias: &str,
+    evidence: ReceiptEvidence,
+) -> String {
+    let (null_test, join, exists, range_fence) = match evidence {
+        ReceiptEvidence::Closed => ("NOT NULL", "OR", "EXISTS", ""),
+        ReceiptEvidence::Open => (
+            "NULL",
+            "AND",
+            "NOT EXISTS",
+            "
+                -- Keep receipt membership correlated while the other closure
+                -- exclusions can use full-identity anti joins.
+                OFFSET 0",
+        ),
+    };
+    // `receipt_id` is allocated from a global sequence and identifies a claim.
+    // Closures retain that claim's slot; match it to prune unrelated partitions.
+    // Compact closure batches retain the raw receipt array for audit/debugging,
+    // but hot membership checks use the per-child GiST index on the multirange.
     format!(
         r#"
         (
-            {claims_alias}.closed_at IS NOT NULL
-            OR EXISTS (
+            {claims_alias}.closed_at IS {null_test}
+            {join} {exists} (
                 SELECT 1 FROM {closure_rel} AS closures
                 WHERE closures.claim_slot = {claims_alias}.claim_slot
                   AND closures.job_id = {claims_alias}.job_id
                   AND closures.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1
                 FROM {closure_batch_rel} AS closure_batches
-                WHERE closure_batches.receipt_ranges @> {claims_alias}.receipt_id
+                WHERE closure_batches.claim_slot = {claims_alias}.claim_slot
+                  AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id{range_fence}
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.done_entries AS done
                 WHERE done.job_id = {claims_alias}.job_id
                   AND done.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.deferred_jobs AS deferred
                 WHERE deferred.job_id = {claims_alias}.job_id
                   AND deferred.run_lease = {claims_alias}.run_lease
             )
-            OR EXISTS (
+            {join} {exists} (
                 SELECT 1 FROM {schema}.dlq_entries AS dlq
                 WHERE dlq.job_id = {claims_alias}.job_id
                   AND dlq.run_lease = {claims_alias}.run_lease
@@ -1420,10 +1477,41 @@ pub fn open_receipt_running_claims_sql(schema: &str) -> String {
 /// retained batch header is read, but only batches holding one of the jobs
 /// are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
-    let closure_rel = format!("{schema}.lease_claim_closures");
-    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-    let row_closed =
-        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    open_receipt_running_claims_sql_from(schema, job_ids, None)
+}
+
+/// The same open-claim projection, scoped to one physical claim slot.
+/// Ready and terminal history are deliberately not restricted to that slot.
+pub(crate) fn open_receipt_running_claims_sql_in_slot(schema: &str, slot: usize) -> String {
+    open_receipt_running_claims_sql_from(schema, None, Some(slot))
+}
+
+fn open_receipt_running_claims_sql_from(
+    schema: &str,
+    job_ids: Option<&str>,
+    slot: Option<usize>,
+) -> String {
+    let (claims_rel, batches_rel, closure_rel, closure_batch_rel) = match slot {
+        Some(slot) => (
+            claim_child_name(schema, slot),
+            claim_batch_child_name(schema, slot),
+            closure_child_name(schema, slot),
+            claim_closure_batch_child_name(schema, slot),
+        ),
+        None => (
+            format!("{schema}.lease_claims"),
+            format!("{schema}.lease_claim_batches"),
+            format!("{schema}.lease_claim_closures"),
+            format!("{schema}.lease_claim_closure_batches"),
+        ),
+    };
+    let row_open = receipt_evidence_sql(
+        schema,
+        &closure_rel,
+        &closure_batch_rel,
+        "claims",
+        ReceiptEvidence::Open,
+    );
     let (row_filter, batch_filter) = match job_ids {
         Some(ids) => (
             format!("claims.job_id = ANY({ids}) AND "),
@@ -1434,8 +1522,8 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
     format!(
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
-        FROM {schema}.lease_claims AS claims
-        WHERE {row_filter}NOT {row_closed}
+        FROM {claims_rel} AS claims
+        WHERE {row_filter}{row_open}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
               WHERE lease.job_id = claims.job_id
@@ -1443,7 +1531,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
           )
         UNION ALL
         SELECT items.job_id, items.run_lease, batches.queue
-        FROM {schema}.lease_claim_batches AS batches
+        FROM {batches_rel} AS batches
         CROSS JOIN LATERAL unnest(
             batches.job_ids,
             batches.run_leases,
@@ -1470,6 +1558,9 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
                   SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
+                  -- Keep the range lookup correlated: joining on claim_slot can
+                  -- multiply receipt members by retained closure batches.
+                  OFFSET 0
               )
           AND NOT EXISTS (
                   SELECT 1 FROM {schema}.leases AS lease
@@ -2618,6 +2709,7 @@ struct ReadyRowIdentity {
     run_lease: i64,
 }
 
+/// Attempts a rescue pass leaves for a later pass, as `(job_id, run_lease)`.
 struct BusyRetained(Vec<(i64, i64)>);
 
 impl BusyRetained {
@@ -2630,6 +2722,30 @@ impl BusyRetained {
             ));
         }
         Ok(())
+    }
+}
+
+/// A failure hydrating a deleted lease. `Ambiguous` names an attempt whose
+/// retained ready bodies rank equally, so none can be chosen for it.
+enum HydrateError {
+    Ambiguous { job_id: i64, run_lease: i64 },
+    Awa(AwaError),
+}
+
+impl From<AwaError> for HydrateError {
+    fn from(err: AwaError) -> Self {
+        Self::Awa(err)
+    }
+}
+
+impl From<HydrateError> for AwaError {
+    fn from(err: HydrateError) -> Self {
+        match err {
+            HydrateError::Ambiguous { job_id, run_lease } => AwaError::Validation(format!(
+                "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
+            )),
+            HydrateError::Awa(err) => err,
+        }
     }
 }
 
@@ -3257,6 +3373,15 @@ struct ExistingReadyRow {
     payload: serde_json::Value,
 }
 
+/// Which of a lane's due rows one promotion transaction takes.
+#[derive(Debug, Clone, Copy)]
+enum DueLaneRows<'a> {
+    /// These rows, picked by a batch across lanes, where still due.
+    Selected(&'a [i64]),
+    /// The oldest due rows, up to this many.
+    Oldest(i64),
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DeletedLeaseRow {
     ready_slot: i32,
@@ -3300,7 +3425,7 @@ fn select_claimed_ready_body<'a>(
     candidates: &'a [ReadySnapshotRow],
     claimed_lanes: &BTreeSet<ReadyBodyLaneKey>,
     reference: &DeletedLeaseRow,
-) -> Result<(&'a ReadySnapshotRow, bool), AwaError> {
+) -> Result<(&'a ReadySnapshotRow, bool), HydrateError> {
     // Emitted physical-lane evidence wins over a live replacement.
     // Without it, retain the live-body compatibility fallback; it
     // cannot identify a legacy claim's original colliding lane.
@@ -3332,10 +3457,10 @@ fn select_claimed_ready_body<'a>(
     let mut best = candidates.iter().filter(|row| rank(row) == strongest);
     let ready = best.next().expect("ready body rank has a candidate");
     if best.next().is_some() {
-        return Err(AwaError::Validation(format!(
-            "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
-            reference.job_id, reference.run_lease
-        )));
+        return Err(HydrateError::Ambiguous {
+            job_id: reference.job_id,
+            run_lease: reference.run_lease,
+        });
     }
     Ok((ready, has_emitted))
 }
@@ -12730,19 +12855,36 @@ impl QueueStorage {
         deleted: Vec<DeletedLeaseRow>,
         write_receipt_closures: bool,
     ) -> Result<Result<Vec<LeaseTransitionRow>, BusyRetained>, AwaError> {
-        let (hydrated, sources) = self
-            .hydrate_deleted_leases_with_sources_tx(tx, deleted, write_receipt_closures)
-            .await?;
-        if sources.is_empty() {
-            return Ok(Ok(hydrated));
+        let hydrated = async {
+            let (hydrated, sources) = self
+                .hydrate_deleted_leases_with_sources_tx(tx, deleted, write_receipt_closures)
+                .await?;
+            if sources.is_empty() {
+                return Ok(Ok(hydrated));
+            }
+            if let Some(busy) = self
+                .retire_retained_attempt_copies_tx(tx, &sources, true)
+                .await?
+            {
+                return Ok(Err(busy));
+            }
+            Ok(Ok(hydrated))
         }
-        if let Some(busy) = self
-            .retire_retained_attempt_copies_tx(tx, &sources, true)
-            .await?
-        {
-            return Ok(Err(busy));
+        .await;
+        match hydrated {
+            Ok(hydrated) => Ok(hydrated),
+            // One unresolvable attempt must not stop the rescue of the others.
+            Err(HydrateError::Ambiguous { job_id, run_lease }) => {
+                tracing::error!(
+                    schema = self.schema(),
+                    job_id,
+                    run_lease,
+                    "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
+                );
+                Ok(Err(BusyRetained(vec![(job_id, run_lease)])))
+            }
+            Err(HydrateError::Awa(err)) => Err(err),
         }
-        Ok(Ok(hydrated))
     }
 
     async fn hydrate_deleted_leases_with_sources_tx<'a>(
@@ -12750,7 +12892,7 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         deleted: Vec<DeletedLeaseRow>,
         write_receipt_closures: bool,
-    ) -> Result<(Vec<LeaseTransitionRow>, Vec<ReadyRowIdentity>), AwaError> {
+    ) -> Result<(Vec<LeaseTransitionRow>, Vec<ReadyRowIdentity>), HydrateError> {
         if deleted.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -13008,7 +13150,7 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'_, Postgres>,
         sources: &[ReadyRowIdentity],
         skip_busy: bool,
-    ) -> Result<Option<BusyRetained>, AwaError> {
+    ) -> Result<Option<BusyRetained>, HydrateError> {
         let schema = self.schema();
         let mut expected = BTreeMap::new();
         for source in sources {
@@ -13016,11 +13158,10 @@ impl QueueStorage {
                 .insert((source.job_id, source.run_lease), source)
                 .is_some()
             {
-                return Err(AwaError::Validation(format!(
-                    "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
-                    source.job_id,
-                    source.run_lease + 1
-                )));
+                return Err(HydrateError::Ambiguous {
+                    job_id: source.job_id,
+                    run_lease: source.run_lease + 1,
+                });
             }
         }
         let job_ids: Vec<i64> = sources.iter().map(|row| row.job_id).collect();
@@ -13107,7 +13248,8 @@ impl QueueStorage {
         if copies.is_empty() {
             return Err(AwaError::Validation(
                 "queue storage ready row missing for deleted lease during retirement".to_string(),
-            ));
+            )
+            .into());
         }
         let slots: Vec<i32> = copies.iter().map(|row| row.ready_slot).collect();
         let generations: Vec<i64> = copies.iter().map(|row| row.ready_generation).collect();
@@ -13152,11 +13294,10 @@ impl QueueStorage {
         for row in &emitted {
             let key = (row.job_id, row.run_lease);
             if !seen.insert(key) || expected.get(&key).copied() != Some(row) {
-                return Err(AwaError::Validation(format!(
-                    "queue storage ready body ambiguous for deleted lease job {} run_lease {}",
-                    row.job_id,
-                    row.run_lease + 1
-                )));
+                return Err(HydrateError::Ambiguous {
+                    job_id: row.job_id,
+                    run_lease: row.run_lease + 1,
+                });
             }
         }
         sqlx::query(audited_sql(format!(
@@ -18510,32 +18651,224 @@ impl QueueStorage {
         }
     }
 
+    /// Promote up to `batch_size` due `state` rows into the ready ring.
+    /// Equivalent to [`Self::promote_due_lanes`] with no lock timeout and no
+    /// skipped lanes, returning the number of rows promoted.
     pub async fn promote_due(
         &self,
         pool: &PgPool,
         state: JobState,
         batch_size: i64,
     ) -> Result<usize, AwaError> {
+        Ok(self
+            .promote_due_lanes(pool, state, batch_size, None, &[])
+            .await?
+            .promoted)
+    }
+
+    /// Select up to `batch_size` due `state` rows, oldest `run_at` first,
+    /// outside the lanes in `skip`, and promote each lane's share in its own
+    /// transaction.
+    ///
+    /// The selection skips rows another transaction has locked, such as a
+    /// lane promotion still waiting for its lane, so they cannot fill every
+    /// batch of a tick. It runs as its own statement, so its row locks end
+    /// with it; `deferred_jobs` is not partitioned, so no run-time pruning
+    /// meets those locks.
+    ///
+    /// Re-enqueueing a row takes its lane's enqueue reservation lock, which
+    /// producers hold until they commit, so a lane under heavy enqueue load
+    /// can keep its promotion waiting. A transaction per lane confines that
+    /// wait to the lane's own rows. With `lane_lock_timeout`, each lane's
+    /// transaction runs under that `lock_timeout`; a lane that hits it rolls
+    /// back, keeps its rows deferred and is reported in
+    /// [`PromoteOutcome::contended`], and the remaining lanes go ahead.
+    pub async fn promote_due_lanes(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+        skip: &[PromotionLane],
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
-            return Ok(0);
+            return Ok(PromoteOutcome::default());
         }
 
         let schema = self.schema();
+        let due: Vec<(i64, String, i16)> = sqlx::query_as(audited_sql(format!(
+            r#"
+            SELECT job_id, queue, priority
+            FROM {schema}.deferred_jobs AS deferred
+            WHERE state = $1
+              AND run_at <= clock_timestamp()
+              AND NOT EXISTS (
+                  SELECT 1 FROM awa.queue_meta
+                  WHERE queue = deferred.queue AND paused = TRUE
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unnest($3::text[], $4::smallint[]) AS skip (queue, priority)
+                  WHERE skip.queue = deferred.queue AND skip.priority = deferred.priority
+              )
+            ORDER BY run_at ASC, priority ASC, job_id ASC
+            LIMIT $2
+            FOR UPDATE OF deferred SKIP LOCKED
+            "#
+        )))
+        .bind(state)
+        .bind(batch_size)
+        .bind(
+            skip.iter()
+                .map(|lane| lane.queue.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(skip.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut outcome = PromoteOutcome {
+            selected: due.len(),
+            ..PromoteOutcome::default()
+        };
+        let mut lanes: BTreeMap<PromotionLane, Vec<i64>> = BTreeMap::new();
+        for (job_id, queue, priority) in due {
+            lanes
+                .entry(PromotionLane { queue, priority })
+                .or_default()
+                .push(job_id);
+        }
+        let mut promoted_queues = BTreeSet::new();
+        for (lane, job_ids) in lanes {
+            let promoted = self
+                .promote_lane(
+                    pool,
+                    state,
+                    &lane,
+                    DueLaneRows::Selected(&job_ids),
+                    lane_lock_timeout,
+                )
+                .await;
+            match promoted {
+                Ok(Some(promoted)) => {
+                    outcome.promoted += promoted;
+                    if promoted > 0 {
+                        promoted_queues.insert(lane.queue);
+                    }
+                }
+                Ok(None) => outcome.contended.push(lane),
+                Err(err) => {
+                    self.notify_promoted_queues(pool, promoted_queues).await;
+                    return Err(err);
+                }
+            }
+        }
+        self.notify_promoted_queues(pool, promoted_queues).await;
+        Ok(outcome)
+    }
+
+    /// Promote up to `batch_size` due `state` rows of one lane, oldest
+    /// `run_at` first, in one transaction. With `lane_lock_timeout`, a
+    /// transaction that hits it rolls back and the lane is returned in
+    /// [`PromoteOutcome::contended`] with nothing selected.
+    pub async fn promote_due_lane(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        batch_size: i64,
+        lane_lock_timeout: Option<Duration>,
+    ) -> Result<PromoteOutcome, AwaError> {
+        if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
+            return Ok(PromoteOutcome::default());
+        }
+        let promoted = self
+            .promote_lane(
+                pool,
+                state,
+                lane,
+                DueLaneRows::Oldest(batch_size),
+                lane_lock_timeout,
+            )
+            .await?;
+        if promoted.is_some_and(|promoted| promoted > 0) {
+            self.notify_promoted_queues(pool, [lane.queue.clone()])
+                .await;
+        }
+        Ok(match promoted {
+            Some(promoted) => PromoteOutcome {
+                promoted,
+                selected: promoted,
+                contended: Vec::new(),
+            },
+            None => PromoteOutcome {
+                contended: vec![lane.clone()],
+                ..PromoteOutcome::default()
+            },
+        })
+    }
+
+    /// One lane's promotion transaction. `None` when its locks hit
+    /// `lock_timeout` and it rolled back.
+    async fn promote_lane(
+        &self,
+        pool: &PgPool,
+        state: JobState,
+        lane: &PromotionLane,
+        rows: DueLaneRows<'_>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<Option<usize>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Vec<DeferredJobRow> = sqlx::query_as(audited_sql(format!(
+        match self
+            .promote_lane_tx(&mut tx, state, lane, rows, lock_timeout)
+            .await
+        {
+            Ok(promoted) => {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(Some(promoted))
+            }
+            Err(AwaError::Database(err)) if is_lock_contention_error(&err) => {
+                tx.rollback().await.map_err(map_sqlx_error)?;
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn promote_lane_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        state: JobState,
+        lane: &PromotionLane,
+        rows: DueLaneRows<'_>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<usize, AwaError> {
+        if let Some(timeout) = lock_timeout {
+            set_lock_timeout_tx(tx, timeout).await?;
+        }
+
+        let schema = self.schema();
+        let (row_filter, limit) = match rows {
+            DueLaneRows::Selected(_) => ("AND job_id = ANY($4)", ""),
+            DueLaneRows::Oldest(_) => ("", "ORDER BY run_at ASC, job_id ASC LIMIT $4"),
+        };
+        let query = sqlx::query_as::<_, DeferredJobRow>(audited_sql(format!(
             r#"
             DELETE FROM {schema}.deferred_jobs
             WHERE job_id IN (
                 SELECT job_id
-                FROM {schema}.deferred_jobs
+                FROM {schema}.deferred_jobs AS deferred
                 WHERE state = $1
+                  AND queue = $2
+                  AND priority = $3
+                  {row_filter}
                   AND run_at <= clock_timestamp()
                   AND NOT EXISTS (
                       SELECT 1 FROM awa.queue_meta
-                      WHERE queue = {schema}.deferred_jobs.queue AND paused = TRUE
+                      WHERE queue = deferred.queue AND paused = TRUE
                   )
-                ORDER BY run_at ASC, priority ASC, job_id ASC
-                LIMIT $2
+                {limit}
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING
@@ -18558,19 +18891,23 @@ impl QueueStorage {
             "#
         )))
         .bind(state)
-        .bind(batch_size)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
+        .bind(&lane.queue)
+        .bind(lane.priority);
+        let query = match rows {
+            DueLaneRows::Selected(job_ids) => query.bind(job_ids),
+            DueLaneRows::Oldest(batch_size) => query.bind(batch_size),
+        };
+        let mut moved: Vec<DeferredJobRow> =
+            query.fetch_all(tx.as_mut()).await.map_err(map_sqlx_error)?;
         if moved.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(0);
         }
+        // DELETE ... RETURNING has no order; lane sequence follows due order.
+        moved.sort_unstable_by_key(|row| (row.run_at, row.job_id));
 
+        let promoted = moved.len();
         let ready_rows: Vec<ExistingReadyRow> = moved
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|row| ExistingReadyRow {
                 job_id: row.job_id,
                 kind: row.kind,
@@ -18588,15 +18925,45 @@ impl QueueStorage {
                 payload: row.payload,
             })
             .collect();
-        let queues = ready_rows
-            .iter()
-            .map(|row| row.queue.clone())
-            .collect::<Vec<_>>();
-        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(state))
+        self.insert_existing_ready_rows_tx(tx, ready_rows, Some(state))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(moved.len())
+        Ok(promoted)
+    }
+
+    /// Wake claimers of queues whose promotion has committed.
+    ///
+    /// Promotion notifies after its lane transactions instead of inside them.
+    /// A notifying transaction takes PostgreSQL's notify-queue lock at
+    /// `COMMIT`, which every notifying transaction in the cluster waits its
+    /// turn for, and a lane transaction would hold its lane's locks, and run
+    /// under its lock timeout, while it waited. The wakeup is a hint that
+    /// claimers also poll for, so a failure is logged and not returned.
+    async fn notify_promoted_queues(
+        &self,
+        pool: &PgPool,
+        queues: impl IntoIterator<Item = String>,
+    ) {
+        let channels: Vec<String> = queues
+            .into_iter()
+            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        if channels.is_empty() {
+            return;
+        }
+        if let Err(err) =
+            sqlx::query("SELECT pg_notify(channel, '') FROM unnest($1::text[]) AS channel")
+                .bind(&channels)
+                .execute(pool)
+                .await
+        {
+            tracing::warn!(
+                error = %err,
+                channels = channels.len(),
+                "Failed to wake claimers after promotion; they pick the rows up on their next poll"
+            );
+        }
     }
 
     async fn relation_has_rows_tx(
@@ -19458,7 +19825,7 @@ impl QueueStorage {
         }
 
         let locked: Result<TerminalDeltaSlotRollup, AwaError> = async {
-            set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
@@ -19916,7 +20283,7 @@ impl QueueStorage {
         }
 
         let locked: Result<PruneOutcome, AwaError> = async {
-            set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
             let lock_started = Instant::now();
             // Claims read segments before ready rows, while producers write in
@@ -20316,7 +20683,7 @@ impl QueueStorage {
         let lease_child = lease_child_name(schema, slot as usize);
 
         let locked: Result<PruneOutcome, AwaError> = async {
-            set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
             let lock_started = Instant::now();
             sqlx::query(audited_sql(format!(
@@ -20681,7 +21048,7 @@ impl QueueStorage {
         }
 
         let locked: Result<PruneOutcome, AwaError> = async {
-            set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
             let lock_started = Instant::now();
             sqlx::query(audited_sql(format!(
