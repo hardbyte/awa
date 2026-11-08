@@ -1045,6 +1045,13 @@ mod tests {
             .is_empty());
     }
 
+    /// Compact claims with and without a deadline, and a row-local claim with a deadline.
+    const CLAIM_SHAPES: [(Duration, bool); 3] = [
+        (Duration::ZERO, false),
+        (Duration::from_secs(3600), false),
+        (Duration::from_secs(3600), true),
+    ];
+
     struct SlotProbe {
         config: SoakConfig,
         pool: PgPool,
@@ -1072,17 +1079,57 @@ mod tests {
             }
         }
 
-        async fn claim(&self, deadline: Duration) -> ClaimedRuntimeJob {
+        /// Claims one job. This runtime writes compact claim batches whatever the
+        /// deadline; `row_local` rewrites the claim as the `lease_claims` row a 0.6
+        /// runtime writes for a deadline-backed claim, which this runtime still reads and
+        /// closes during a rolling upgrade.
+        async fn claim(&self, deadline: Duration, row_local: bool) -> ClaimedRuntimeJob {
             self.store
                 .enqueue_batch(&self.pool, "slot_probe", 2, 1)
                 .await
                 .expect("enqueue");
-            self.store
+            let mut claim = self
+                .store
                 .claim_runtime_batch(&self.pool, "slot_probe", 1, deadline)
                 .await
                 .expect("claim")
                 .pop()
-                .expect("one claim")
+                .expect("one claim");
+            assert!(claim.claim.claim_batch_id.is_some(), "claims are compact");
+            if row_local {
+                sqlx::query("DELETE FROM awa.lease_claim_batches WHERE batch_id = $1")
+                    .bind(claim.claim.claim_batch_id)
+                    .execute(&self.pool)
+                    .await
+                    .expect("remove the compact claim");
+                sqlx::query(
+                    "INSERT INTO awa.lease_claims (
+                        claim_slot, receipt_id, job_id, run_lease, ready_slot,
+                        ready_generation, queue, priority, attempt, max_attempts,
+                        lane_seq, enqueue_shard, deadline_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                              clock_timestamp() + make_interval(secs => $13))",
+                )
+                .bind(claim.claim.claim_slot)
+                .bind(claim.claim.receipt_id)
+                .bind(claim.job.id)
+                .bind(claim.job.run_lease)
+                .bind(claim.claim.ready_slot)
+                .bind(claim.claim.ready_generation)
+                .bind(&claim.claim.queue)
+                .bind(claim.claim.priority)
+                .bind(claim.job.attempt)
+                .bind(claim.job.max_attempts)
+                .bind(claim.claim.lane_seq)
+                .bind(claim.claim.enqueue_shard)
+                .bind(deadline.as_secs_f64())
+                .execute(&self.pool)
+                .await
+                .expect("write the row-local claim");
+                claim.claim.claim_batch_id = None;
+                claim.claim.claim_batch_index = None;
+            }
+            claim
         }
 
         async fn assert_counts(&self, slot: i32, open: i64, expired: i64) {
@@ -1135,9 +1182,8 @@ mod tests {
     #[tokio::test]
     async fn slot_probe_keeps_materialized_running_claims_until_durable_completion() {
         let run = SlotProbe::create().await;
-        // Zero-deadline receipts are compact; deadline receipts are row-local.
-        for deadline in [Duration::ZERO, Duration::from_secs(3600)] {
-            let claim = run.claim(deadline).await;
+        for (deadline, row_local) in CLAIM_SHAPES {
+            let claim = run.claim(deadline, row_local).await;
             run.store
                 .register_callback(
                     &run.pool,
@@ -1170,8 +1216,8 @@ mod tests {
     #[tokio::test]
     async fn slot_probe_uses_callback_timeout_for_waiting_materialized_claims() {
         let run = SlotProbe::create().await;
-        for deadline in [Duration::ZERO, Duration::from_secs(3600)] {
-            let claim = run.claim(deadline).await;
+        for (deadline, row_local) in CLAIM_SHAPES {
+            let claim = run.claim(deadline, row_local).await;
             let callback = run
                 .store
                 .register_callback(

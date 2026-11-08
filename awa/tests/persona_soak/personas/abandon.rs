@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-/// Zero-deadline claims: written as compact claim batches.
+/// Zero-deadline claims.
 pub const QUEUE_PLAIN: &str = "awa_soak_abandon_plain";
-/// Claims with a deadline: written as one claim row per job.
+/// Claims with a deadline. Both queues' claims are written as compact claim batches.
 pub const QUEUE_DEADLINE: &str = "awa_soak_abandon_deadline";
 /// Short jobs served by the survivors, to see claim latency while the backlog drains.
 pub const QUEUE_CANARY: &str = "awa_soak_abandon_canary";
@@ -64,6 +64,9 @@ const FINISHER_POOL: u32 = 16;
 /// Percentage of jobs that may only be attempted twice, so that repeated kills
 /// dead-letter them.
 const SHORT_RETRY_PERCENT: u64 = 25;
+/// Consecutive heartbeat samples that may find no open claim while the process reports
+/// running handlers. Covers a handler count read before the process's claims were visible.
+const EMPTY_SAMPLES_BEFORE_INCOMPLETE: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 pub struct AbandonJob {
@@ -552,37 +555,64 @@ async fn canary_producer(shared: Arc<Shared>, pool: sqlx::PgPool) {
 /// A pass updates every in-flight claim with the time of its own chunk, so once a pass has
 /// finished the oldest heartbeat is newer than anything the previous pass wrote, and the
 /// spread from oldest to newest is the pass's duration (to within the last chunk). Only
-/// claims taken since the process started are read, so the dead processes' open claims,
-/// whose heartbeats stopped, do not count. They are the deadline queue's, which are
-/// interleaved with the other queue's in the pass's job-id order and so span the whole pass.
+/// open claims on the persona's queues taken since the process started are read, so the
+/// dead processes' open claims, whose heartbeats stopped, do not count.
+///
+/// Returns false when the sample saw no open claim at all, which is only possible while the
+/// process holds jobs if the query does not read where claims are written.
 async fn sample_heartbeats(
     shared: &Arc<Shared>,
     pool: &sqlx::PgPool,
     schema: &str,
     since_epoch_ms: i64,
-) {
+) -> bool {
     let row: Result<(i64, Option<f64>, Option<f64>, f64), _> =
         sqlx::query_as(awa::audited_sql(format!(
-            "SELECT count(*)::bigint,
+            "WITH open_claims AS (
+                SELECT b.claim_slot, i.job_id, i.run_lease, i.receipt_id
+                FROM {schema}.lease_claim_batches b
+                CROSS JOIN LATERAL unnest(b.job_ids, b.run_leases, b.receipt_ids)
+                    AS i(job_id, run_lease, receipt_id)
+                WHERE b.queue = ANY($1)
+                  AND b.claimed_at >= to_timestamp($2::float8 / 1000.0)
+                  AND NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closures cl
+                                  WHERE cl.claim_slot = b.claim_slot
+                                    AND cl.job_id = i.job_id AND cl.run_lease = i.run_lease)
+                  AND NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closure_batches cb
+                                  WHERE cb.claim_slot = b.claim_slot
+                                    AND cb.receipt_ranges @> i.receipt_id
+                                  OFFSET 0)
+            )
+            SELECT count(*)::bigint,
                 EXTRACT(EPOCH FROM min(a.heartbeat_at))::float8,
                 EXTRACT(EPOCH FROM max(a.heartbeat_at))::float8,
                 EXTRACT(EPOCH FROM clock_timestamp())::float8
-         FROM {schema}.lease_claims c
-         JOIN {schema}.attempt_state a ON a.job_id = c.job_id AND a.run_lease = c.run_lease
-         WHERE c.queue = $1 AND c.closed_at IS NULL
-           AND c.claimed_at >= to_timestamp($2::float8 / 1000.0)"
+            FROM open_claims c
+            LEFT JOIN {schema}.attempt_state a ON a.job_id = c.job_id AND a.run_lease = c.run_lease"
         )))
-        .bind(QUEUE_DEADLINE)
+        .bind(vec![QUEUE_PLAIN, QUEUE_DEADLINE])
         .bind(since_epoch_ms as f64)
         .fetch_one(pool)
         .await;
-    let Ok((rows, Some(oldest), Some(newest), now)) = row else {
-        return;
+    let (rows, oldest, newest, now) = match row {
+        Ok(row) => row,
+        Err(error) => {
+            shared.incomplete(format!("heartbeat sample query failed: {error}"), vec![]);
+            return true;
+        }
+    };
+    if rows == 0 {
+        return false;
+    }
+    // Claimed, but not yet reached by a heartbeat pass.
+    let (Some(oldest), Some(newest)) = (oldest, newest) else {
+        return true;
     };
     let active = shared.abandon.child_active.load(Ordering::Relaxed);
     shared
         .abandon
         .note_heartbeat_sample(shared, rows, oldest, newest, now, active);
+    true
 }
 
 /// Probes the backlog every few seconds and the claim ring every second, until the
@@ -610,11 +640,25 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
     };
     let staleness_secs = shared.config.heartbeat_staleness.as_secs_f64();
     let mut tick = 0u64;
+    let mut empty_samples = 0u32;
     let mut lock_captures = super::super::ring_locks::CaptureBudget::default();
     while !shared.drain_stop.sleep(Duration::from_secs(1)).await {
         tick += 1;
+        // The cursor lives where `ring_cursor_authority` says: the latest ledger row, or
+        // the state singleton's columns before the authority flip.
         let ring: Result<(i32, i64, i32), _> = sqlx::query_as(awa::audited_sql(format!(
-            "SELECT current_slot, generation, slot_count FROM {schema}.claim_ring_state WHERE singleton"
+            "SELECT CASE WHEN authority.authority = 'ledger' THEN ledger.slot
+                         ELSE state.current_slot END,
+                    CASE WHEN authority.authority = 'ledger' THEN ledger.generation
+                         ELSE state.generation END,
+                    state.slot_count
+             FROM {schema}.claim_ring_state AS state
+             CROSS JOIN {schema}.ring_cursor_authority AS authority
+             LEFT JOIN LATERAL (
+                 SELECT slot, generation FROM {schema}.claim_ring_rotations
+                 ORDER BY generation DESC LIMIT 1
+             ) AS ledger ON TRUE
+             WHERE state.singleton AND authority.singleton"
         )))
         .fetch_one(&pool)
         .await;
@@ -625,8 +669,23 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
                 continue;
             }
         };
-        if let Some((_, spawned)) = shared.abandon.live() {
-            sample_heartbeats(&shared, &pool, &schema, spawned).await;
+        if let Some((generation, spawned)) = shared.abandon.live() {
+            let holding = shared.abandon.child_active.load(Ordering::Relaxed);
+            if sample_heartbeats(&shared, &pool, &schema, spawned).await || holding <= 0 {
+                empty_samples = 0;
+            } else {
+                empty_samples += 1;
+                if empty_samples == EMPTY_SAMPLES_BEFORE_INCOMPLETE {
+                    shared.incomplete(
+                        format!(
+                            "the heartbeat sample found no open claim of process {generation} in {empty_samples} consecutive samples while it reported {holding} running handler(s)"
+                        ),
+                        vec![],
+                    );
+                }
+            }
+        } else {
+            empty_samples = 0;
         }
         // While the ring is still, look at the slot it has to enter next: live claims
         // there explain the stall.
