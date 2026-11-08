@@ -4,7 +4,7 @@ The repeatable `prune_controls` patch adds a durable, database-wide `maintenance
 
 ## Install
 
-Run `awa migrate` as the schema owner. The schema stays at v40. External migration runners apply `R__prune_controls.sql` as a repeatable script after V40. Installation creates one ordinary control table, adds an observation column to `awa.runtime_instances`, and installs operator functions. It does not refresh queue-storage installers or claim functions. Replaying the patch preserves an existing halt and explicit operator grants.
+Run `awa migrate` as the schema owner. The schema stays at v40. External migration runners apply `R__prune_controls.sql` as a repeatable script after V40. Installation creates one ordinary control table, adds an observation column to `awa.runtime_instances`, and installs operator functions. Adding the nullable column holds `ACCESS EXCLUSIVE` on `awa.runtime_instances` until the migration transaction commits. It does not refresh queue-storage installers or claim functions. Replaying the patch preserves an existing halt and explicit operator grants.
 
 Upgrade or fence every process that can become maintenance leader before relying on the control. Older binaries ignore it; they can become leader and resume reclamation. A compatible binary discovers installation without a restart or leadership change. Before installation it retains the existing reclamation policy while catalog observations remain fresh. Once installation is observed, a missing or unreadable row cannot restore permission.
 
@@ -12,6 +12,10 @@ Grant control reads and observation writes to runtime roles, and mutation only t
 
 ```sql
 GRANT USAGE ON SCHEMA awa TO awa_runtime, awa_operator;
+REVOKE ALL ON awa.runtime_controls FROM awa_runtime, awa_operator;
+REVOKE EXECUTE ON FUNCTION awa.halt_runtime_scope(text, text, text),
+                          awa.resume_runtime_scope(text, uuid)
+    FROM awa_runtime;
 GRANT SELECT ON awa.runtime_controls TO awa_runtime, awa_operator;
 GRANT SELECT (instance_id, runtime_control_observation),
       UPDATE (runtime_control_observation)
@@ -22,7 +26,7 @@ GRANT EXECUTE ON FUNCTION awa.halt_runtime_scope(text, text, text),
     TO awa_operator;
 ```
 
-The mutators are `SECURITY DEFINER` functions with a pinned search path. PUBLIC, producer and runtime roles receive no mutation privilege from the patch, including through broad default grants. Schema owners and superusers retain their normal administrative authority. Do not grant operators direct writes to the control table. The stored actor is the database login (`session_user`).
+The mutators are `SECURITY DEFINER` functions with a pinned search path. PUBLIC, producer and runtime roles receive no mutation privilege from the patch, including through broad default grants. Apply the exceptions above after blanket table/function grants, and remove inherited mutation privileges from their granting role. Schema owners and superusers retain their normal administrative authority. Do not grant operators direct writes to the control table. The stored actor is the database login (`session_user`).
 
 ## Halt and resume
 

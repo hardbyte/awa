@@ -120,6 +120,12 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
 -- Keep the queue-storage installer helper migrator/operator-only.
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN)
   FROM awa_runtime;
+-- Keep fleet control mutation operator-only after the broad grants above.
+REVOKE ALL ON awa.runtime_controls FROM awa_runtime;
+GRANT SELECT ON awa.runtime_controls TO awa_runtime;
+REVOKE EXECUTE ON FUNCTION awa.halt_runtime_scope(TEXT, TEXT, TEXT),
+                          awa.resume_runtime_scope(TEXT, UUID)
+  FROM awa_runtime;
 
 -- Default privileges for future migrations.
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
@@ -138,6 +144,8 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
+
+Reapply the control exceptions after any later blanket grants. Inherited mutation privileges must be removed from the granting role as well. Grant halt/resume only to a separate operator role; see [runtime controls](runtime-controls.md#install).
 
 If you use the compatibility `insert_many_copy` path (Rust `InsertOpts::copy()`), also grant:
 

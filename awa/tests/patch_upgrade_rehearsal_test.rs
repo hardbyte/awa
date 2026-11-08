@@ -1,4 +1,4 @@
-//! Released-artifact rehearsal of the 0.6.9 -> 0.6.10 -> 0.6.9 patch upgrade.
+//! Released-artifact rehearsal of a 0.6.9 -> candidate -> 0.6.9 patch upgrade.
 //!
 //! The journey an operator follows, as a release gate:
 //!
@@ -7,8 +7,8 @@
 //!    producers as a separate runtime role with the grants a working 0.6.9
 //!    deployment needs (schema `CREATE` included), banking a backlog.
 //! 2. Run the candidate `awa migrate` as the owner while that traffic
-//!    continues. The patch takes no lock on any queue-storage or `awa` table,
-//!    keeps every lane sequence position, and leaves routing unchanged.
+//!    continues. Only prune-control metadata DDL may lock relations; job and
+//!    queue-storage relations remain untouched. Lane positions and routing stay unchanged.
 //! 3. Run candidate and released workers together, with retries, scheduled
 //!    jobs, slow jobs in flight and a hard-killed released worker.
 //! 4. Roll back to released binaries only, including a re-run of the released
@@ -601,6 +601,41 @@ async fn lane_positions(pool: &PgPool) -> BTreeMap<(String, i16, i16), (i64, i64
         .collect()
 }
 
+// The control patch creates one ordinary table/index and adds one nullable
+// runtime-observation column. Keep this list exact: no prefix or schema-wide
+// exception may hide locks on live jobs, queue substrates or other metadata.
+fn unexpected_patch_relation_locks(locks: &[String]) -> Vec<String> {
+    const PERMITTED: &[&str] = &[
+        "awa.runtime_controls_pkey AccessExclusiveLock",
+        "awa.runtime_controls AccessShareLock",
+        "awa.runtime_controls RowExclusiveLock",
+        "awa.runtime_controls ShareLock",
+        "awa.runtime_controls AccessExclusiveLock",
+        "awa.runtime_instances AccessExclusiveLock",
+    ];
+    locks
+        .iter()
+        .filter(|lock| !PERMITTED.contains(&lock.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn patch_metadata_lock_exception_keeps_job_and_substrate_locks_forbidden() {
+    let forbidden = vec![
+        "awa.jobs_hot AccessShareLock".to_string(),
+        format!("{SCHEMA}.ready_entries_0 AccessExclusiveLock"),
+        "awa.runtime_controls_archive AccessExclusiveLock".to_string(),
+    ];
+    let mut locks = vec![
+        "awa.runtime_controls_pkey AccessExclusiveLock".to_string(),
+        "awa.runtime_controls AccessShareLock".to_string(),
+        "awa.runtime_instances AccessExclusiveLock".to_string(),
+    ];
+    locks.extend(forbidden.iter().cloned());
+    assert_eq!(unexpected_patch_relation_locks(&locks), forbidden);
+}
+
 /// Relation locks stronger than `RowExclusiveLock` held by `role` on `awa` or
 /// queue-storage relations.
 async fn strong_locks_held_by(pool: &PgPool, role: &str) -> Vec<String> {
@@ -772,8 +807,8 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
     .await;
 
     // ── 2. candidate patch under traffic ───────────────────────────────
-    // Lock audit: the exported patch, in one owner transaction, holds no
-    // lock above RowExclusive on any awa or queue-storage relation.
+    // Audit the complete exported patch in one owner transaction. Only the
+    // declared prune-control metadata DDL may lock relations.
     let patch_sql = cli_ok(
         &candidate_cli,
         &fixture.owner_url,
@@ -808,9 +843,9 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         tx.rollback().await.unwrap();
         owner.close().await;
         assert_eq!(
-            locks,
+            unexpected_patch_relation_locks(&locks),
             Vec::<String>::new(),
-            "the patch must not lock awa or queue-storage relations"
+            "only declared prune-control metadata DDL may lock relations"
         );
     }
 
@@ -895,9 +930,9 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
          and {in_flight_count} jobs in flight when it started"
     );
     assert_eq!(
-        sampled_locks,
+        unexpected_patch_relation_locks(&sampled_locks),
         Vec::<String>::new(),
-        "awa migrate took strong relation locks"
+        "awa migrate locked relations outside the declared control metadata"
     );
     for expected in [
         "Schema: v40 (unchanged)".to_string(),
@@ -1289,6 +1324,7 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         "migrate_ms": migrate_elapsed.as_millis() as u64,
         "migrate_output": migrate_out,
         "strong_locks_sampled": sampled_locks.len(),
+        "unexpected_relation_locks_sampled": unexpected_patch_relation_locks(&sampled_locks).len(),
         "enqueued_during_migrate": enqueued_during,
         "completed_during_migrate": completed_during,
         "in_flight_at_migrate": in_flight_count,
