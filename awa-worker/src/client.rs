@@ -1388,69 +1388,26 @@ impl Client {
                     }
                 }
 
-                // Fresh-install auto-finalize: state=canonical with no
-                // operator commands run yet means a brand-new cluster
-                // shouldn't have to step through prepare → enter-mixed-
-                // transition → finalize manually. Install the queue-
-                // storage schema (idempotent — concurrent workers are
-                // safe), then ask the SQL gate to advance state directly
-                // to `active` if the fresh-install conditions hold (no
-                // canonical jobs, no live workers, prepared_engine
-                // still NULL). Returns FALSE on any non-fresh DB; the
-                // caller then falls back to the canonical-storage path
-                // and the staged transition is unaffected.
                 if status.state == "canonical" && status.prepared_engine.is_none() {
-                    let Some(admission) =
-                        self.runtime_control.admit(MaintenanceBranch::AuthorityFlip)
-                    else {
-                        // A concurrent runtime may have finalized since the
-                        // first read. Honor its routing without starting DDL.
-                        let current = transition::status(&self.pool).await?;
-                        if matches!(current.state.as_str(), "mixed_transition" | "active")
-                            && current.active_engine == "queue_storage"
-                        {
-                            return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
-                        }
-                        return Ok(RuntimeStorage::Canonical);
-                    };
-                    let resolved = admission
-                        .run_result(async {
-                            let configured_schema = runtime.store.schema().to_string();
-                            if !transition::queue_storage_schema_ready(
-                                &self.pool,
-                                &configured_schema,
-                            )
-                            .await?
-                            {
-                                runtime.store.prepare_schema(&self.pool).await?;
-                            }
-                            let promoted: bool =
-                                sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-                                    .bind(&configured_schema)
-                                    .fetch_one(&self.pool)
-                                    .await?;
-                            if promoted {
-                                return Ok(Some(RuntimeStorage::QueueStorage(runtime.clone())));
-                            }
-                            // Another worker promoted concurrently while we
-                            // were installing the schema — re-fetch and use
-                            // the now-current state.
-                            let refetched = transition::status(&self.pool).await?;
-                            if matches!(refetched.state.as_str(), "mixed_transition" | "active")
-                                && refetched.active_engine == "queue_storage"
-                            {
-                                return Ok(Some(RuntimeStorage::QueueStorage(runtime.clone())));
-                            }
-                            // Function returned FALSE because conditions weren't
-                            // met (canonical jobs exist, or another runtime is
-                            // live but in canonical-only mode). Fall through to
-                            // the canonical path; operators will need the
-                            // staged transition.
-                            Ok::<_, awa_model::AwaError>(None)
-                        })
-                        .await?;
-                    if let Some(storage) = resolved {
-                        return Ok(storage);
+                    let configured_schema = runtime.store.schema().to_string();
+                    if !transition::queue_storage_schema_ready(&self.pool, &configured_schema)
+                        .await?
+                    {
+                        runtime.store.prepare_schema(&self.pool).await?;
+                    }
+                    let promoted: bool =
+                        sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+                            .bind(&configured_schema)
+                            .fetch_one(&self.pool)
+                            .await?;
+                    if promoted {
+                        return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
+                    }
+                    let refetched = transition::status(&self.pool).await?;
+                    if matches!(refetched.state.as_str(), "mixed_transition" | "active")
+                        && refetched.active_engine == "queue_storage"
+                    {
+                        return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
                     }
                 }
 
@@ -2528,7 +2485,6 @@ impl RuntimeReporterState {
                     )
                     .await
                     {
-                        self.runtime_control.record_error(&err);
                         warn!(error = %err, "Failed to sync queue descriptors");
                     }
                     if let Err(err) = admin::sync_job_kind_descriptors(
@@ -2538,7 +2494,6 @@ impl RuntimeReporterState {
                     )
                     .await
                     {
-                        self.runtime_control.record_error(&err);
                         warn!(error = %err, "Failed to sync job kind descriptors");
                     }
                 })

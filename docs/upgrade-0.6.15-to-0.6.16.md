@@ -15,7 +15,7 @@
    The schema stays at v40. The repeatable `prune_controls` patch runs after `claim_batch_job_index` and `insert_jobs_compat_batch`.
 
 3. Apply the [runtime and operator grants](runtime-controls.md#install). Runtime roles need `SELECT` on `awa.runtime_controls` and `SELECT, INSERT, UPDATE, DELETE` on `awa.runtime_control_observations`. Operators need `SELECT` on both tables and `awa.runtime_instances`, plus explicit `EXECUTE` on `awa.halt_runtime_scope(text, text, text)` and `awa.resume_runtime_scope(text, uuid)`. Neither role should have direct control-table writes. Reapply these exceptions after blanket grants and remove inherited mutation privileges from the granting role.
-4. Roll workers, producers and admin processes to 0.6.16. Binaries and migration can run in either order: compatible runtimes discover the patch without a restart or leadership change. Until installation is observed, they retain the existing reclamation policy while catalog observations remain fresh.
+4. Roll workers, producers and admin processes to 0.6.16 after applying the grants. Compatible runtimes discover the patch without a restart or leadership change. They can also run before installation, retaining the existing reclamation policy while catalog observations remain fresh. Once they detect installation, missing read grants close prune admission when any existing permission expires, within five seconds; newly started runtimes have no permission to prune. Other scopes continue. If compatible runtimes are already deployed, expect this pause between migration and grants, and complete the grants before expecting pruning to resume.
 5. Upgrade or fence every remaining process that can become maintenance leader. Inspect `awa control status` using the operator connection before relying on halt. Every live runtime, including standbys, must have a supported, recent protocol report.
 
 The 0.6.15 lifecycle-hook and finalizer bounds remain in place. Ring defaults, startup capacity checks and reclamation rate limits are unchanged.
@@ -36,7 +36,7 @@ Replace all `R__` files together and keep previously applied `V` files unchanged
 
 ## Halt, inspect and resume
 
-Only `maintenance.prune` with mode `drain` is supported. It stops compatible runtimes from admitting reclamation and housekeeping; work admitted before observation may finish. Enqueue, dispatch, handlers, cron, promotion, rescue and admin batches continue.
+Only `maintenance.prune` with mode `drain` is supported. It stops compatible runtimes from admitting reclamation and housekeeping, including descriptor publication; work admitted before observation may finish. Enqueue, dispatch, handlers, cron, promotion, rescue, admin batches and queue health gauges continue. Fresh storage initialization, auto-finalization and storage selection proceed even during halt or an initial control-read failure.
 
 ```bash
 awa --database-url "$AWA_OPERATOR_DATABASE_URL" control halt \
@@ -53,9 +53,11 @@ SELECT * FROM awa.halt_runtime_scope('maintenance.prune', 'Investigating lock pr
 SELECT * FROM awa.resume_runtime_scope('maintenance.prune', '<current halt UUID>'::uuid);
 ```
 
-Status is asynchronous, best-effort evidence from runtime registrations and reports. It uses the database clock, the standard runtime liveness cutoff of `max(3 × snapshot_interval, 30 seconds)`, and a report recency window of `max(2 × snapshot_interval, 5 seconds)` (twenty seconds with default ten-second snapshots). Control permission still expires after five seconds. `unobserving_runtimes` identifies live runtimes with missing, unsupported, wrong-protocol or stale reports, or permission already stale at report creation, including their identity, version and leader flag. An active halt remains `unconfirmed` while any such runtime is live, or if none are live. A report for an earlier halt remains `pending`, and unknown settlement cannot produce `halted`.
+Status is asynchronous, best-effort evidence from runtime registrations and reports. It uses the database clock, the standard runtime liveness cutoff of `max(3 × snapshot_interval, 30 seconds)`, and a report recency window of `max(2 × snapshot_interval, 5 seconds)` (twenty seconds with default ten-second snapshots). Control permission still expires after five seconds. `unobserving_runtimes` identifies live runtimes with missing, unsupported, wrong-protocol or stale reports, or permission already stale at report creation, including their identity, version and leader flag. Without a halt request, any such runtime makes status `degraded`, including runtimes that keep prune admission closed because control reads fail. An active halt remains `unconfirmed` while any such runtime is live, or if none are live. A report for an earlier halt remains `pending`, and unknown settlement cannot produce `halted`.
 
-A `halted` status is not proof that PostgreSQL released every lock or that stale hosts are fenced. Inspect backend activity if immediate lock relief is required. See [runtime controls](runtime-controls.md#read-status) for the status fields and states.
+Potentially unsettled reclamation or admin metadata refresh sets `settlement_unknown` for thirty seconds after the latest uncertainty event. `settlement_uncertainty_remaining_ms` reports the remaining window; the cumulative `abandoned_callbacks` counter can stay nonzero after expiry. Status can return `halted` after expiry without backend reconciliation; expiry does not establish PostgreSQL backend settlement or lock release. Standby control reads and report writes use the shared pool with separate one-second budgets, so pool pressure can also make status `degraded` or `unconfirmed`.
+
+A `halted` status is not proof that PostgreSQL released every lock or that stale hosts are fenced. Runtime credentials can forge observations or delete runtime registrations, so confirmation also depends on trusting those credentials. The operator boundary protects the requested halt, not the reported proof. Inspect backend activity and cancel or fence lingering sessions if lock relief is required. See [runtime controls](runtime-controls.md#read-status) for the status fields and states and [runtime control privileges](security.md#runtime-control-privileges) for the trust boundary.
 
 ## Roll back
 

@@ -1,9 +1,3 @@
--- Repeatable prune_controls patch: operator maintenance.prune drain control.
--- ADR-051 / https://github.com/hardbyte/awa/pull/662, Phase 1.
--- Additive: N-1 binaries ignore the control. Upgrade or fence every possible
--- maintenance leader before relying on a fleet halt. No hot-table DDL or
--- substrate/claim-function refresh; installation cost is independent of job count.
-
 CREATE TABLE IF NOT EXISTS awa.runtime_controls (
     scope text PRIMARY KEY CHECK (scope = 'maintenance.prune'),
     revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),

@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 /// Detached lifecycle hook tasks maintenance may have outstanding at once.
 const MAINTENANCE_LIFECYCLE_EVENT_CAPACITY: usize = 1024;
+const MAINTENANCE_BRANCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// The canonical unique-claim conflict raised by `awa.sync_job_unique_claims`
 /// (SQLSTATE 23505, constraint reported as `idx_awa_jobs_unique`). See #388.
@@ -1235,7 +1236,11 @@ impl MaintenanceService {
                     continue;
                 }
             };
+            let leadership_lost = observer.lost.clone();
             let work = async {
+                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
+                    return;
+                }
                 // Run maintenance tasks as leader
                 let mut heartbeat_rescue_timer =
                     leader_loop_interval(self.heartbeat_rescue_interval);
@@ -1333,7 +1338,10 @@ impl MaintenanceService {
 
                 // Do an initial sync immediately on becoming leader
                 self.sync_periodic_jobs_to_db().await;
-                let cron_eval_cancel = self.cancel.child_token();
+                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
+                    return;
+                }
+                let cron_eval_cancel = leadership_lost.child_token();
                 let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
                     self.pool.clone(),
                     cron_eval_cancel.clone(),
@@ -1350,7 +1358,11 @@ impl MaintenanceService {
                     CronGuard(cron_eval_cancel.clone(), cron_eval_task.abort_handle());
 
                 loop {
+                    if leadership_lost.is_cancelled() {
+                        return;
+                    }
                     tokio::select! {
+                        _ = leadership_lost.cancelled() => return,
                         _ = self.cancel.cancelled() => {
                             debug!("Maintenance service shutting down");
                             self.leader.store(false, Ordering::SeqCst);
@@ -1359,6 +1371,7 @@ impl MaintenanceService {
                             return;
                         }
                         _ = heartbeat_rescue_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueHeartbeat.classification().0, self.heartbeat_rescue_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RescueHeartbeat) {
                                     admission.run(async {
@@ -1369,6 +1382,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = deadline_rescue_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueDeadline.classification().0, self.deadline_rescue_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RescueDeadline) {
                                     admission.run(async {
@@ -1379,6 +1393,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = callback_rescue_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueCallback.classification().0, self.callback_rescue_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RescueCallback) {
                                     admission.run(async {
@@ -1389,6 +1404,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = promote_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::Promote.classification().0, self.promote_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::Promote) {
                                     admission.run(async {
@@ -1399,6 +1415,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = cleanup_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Cleanup.classification().0, self.cleanup_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::Cleanup) {
                                     admission.run(async {
@@ -1413,6 +1430,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = cron_sync_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::CronSync.classification().0, self.cron_sync_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::CronSync) {
                                     admission.run(async {
@@ -1423,6 +1441,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = queue_stats_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::QueueHealth.classification().0, self.queue_stats_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::QueueHealth) {
                                     admission.run(async {
@@ -1433,6 +1452,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = dirty_key_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::DirtyMetadata.classification().0, self.dirty_key_recompute_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::DirtyMetadata) {
                                     admission.run(async {
@@ -1443,6 +1463,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = metadata_reconciliation_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RefreshMetadata.classification().0, self.metadata_reconciliation_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RefreshMetadata) {
                                     admission.run(async {
@@ -1453,6 +1474,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = priority_aging_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Aging.classification().0, self.priority_aging_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::Aging) {
                                     admission.run(async {
@@ -1463,6 +1485,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = batch_operations_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Batch.classification().0, self.batch_operations_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::Batch) {
                                     admission.run(async {
@@ -1473,6 +1496,7 @@ impl MaintenanceService {
                             }
                         }
                         _ = terminal_count_rollup_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::TerminalRollup.classification().0, self.terminal_count_rollup_interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::TerminalRollup) {
                                     admission.run(async {
@@ -1491,6 +1515,7 @@ impl MaintenanceService {
                         }, if vacuum_queue_timer.is_some() => {
                             let interval = vacuum_queue_interval
                                 .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateQueue.classification().0, interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RotateQueue) {
                                     admission.run(async {
@@ -1509,6 +1534,7 @@ impl MaintenanceService {
                         }, if vacuum_lease_timer.is_some() => {
                             let interval = vacuum_lease_interval
                                 .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateLease.classification().0, interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RotateLease) {
                                     admission.run(async {
@@ -1527,6 +1553,7 @@ impl MaintenanceService {
                         }, if vacuum_claim_timer.is_some() => {
                             let interval = vacuum_claim_interval
                                 .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                             if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateClaim.classification().0, interval, &self.metrics) {
                                 if let Some(admission) = self.control.admit(MaintenanceBranch::RotateClaim) {
                                     admission.run(async {
@@ -1540,13 +1567,7 @@ impl MaintenanceService {
                     }
                 }
             };
-            tokio::select! {
-                _ = observer.lost.cancelled() => {
-                    warn!("Leader session lost; interrupting maintenance work");
-                }
-                _ = work => {}
-            }
-            drop(observer);
+            run_leader_term(observer, &self.cancel, work).await;
             if self.cancel.is_cancelled() {
                 return;
             }
@@ -1640,7 +1661,7 @@ impl MaintenanceService {
             }
             Ok(_) => {}
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 warn!(error = %err, "failed to clean up expired batch operations");
             }
         }
@@ -1676,7 +1697,7 @@ impl MaintenanceService {
                 );
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 warn!(error = %err, "failed to roll up terminal count deltas");
             }
         }
@@ -2937,7 +2958,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to rotate queue storage queue segments");
                 return;
             }
@@ -2989,7 +3010,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("queue");
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
@@ -3018,7 +3039,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to rotate queue storage lease segments");
                 return;
             }
@@ -3060,7 +3081,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("lease");
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
@@ -3094,7 +3115,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to rotate queue storage claim segments");
                 return;
             }
@@ -3136,7 +3157,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("claim");
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
@@ -3210,7 +3231,7 @@ impl MaintenanceService {
                 total_deleted += result.rows_affected();
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to clean up old jobs (global pass)");
             }
             _ => {}
@@ -3250,7 +3271,7 @@ impl MaintenanceService {
                     );
                 }
                 Err(err) => {
-                    self.control.record_error(&err);
+                    self.control.record_reclamation_error(&err);
                     error!(
                         queue = %queue_name,
                         error = %err,
@@ -3320,7 +3341,7 @@ impl MaintenanceService {
                 self.metrics.record_dlq_purged(None, result.rows_affected());
             }
             Err(err) => {
-                self.control.record_error(&err);
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to clean up DLQ rows (global pass)");
             }
             _ => {}
@@ -3353,7 +3374,7 @@ impl MaintenanceService {
                         .record_dlq_purged(Some(queue), result.rows_affected());
                 }
                 Err(err) => {
-                    self.control.record_error(&err);
+                    self.control.record_reclamation_error(&err);
                     error!(queue, error = %err, "Failed to clean up DLQ rows");
                 }
                 _ => {}
@@ -3363,6 +3384,30 @@ impl MaintenanceService {
 }
 
 struct MaintenanceAliveGuard(Arc<AtomicBool>);
+
+async fn run_leader_term(
+    observer: LeaderObserver,
+    shutdown: &CancellationToken,
+    work: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(work);
+    tokio::select! {
+        _ = observer.lost.cancelled() => {
+            warn!("Leader session lost; draining current maintenance branch");
+        }
+        _ = shutdown.cancelled() => observer.lost.cancel(),
+        _ = &mut work => return,
+    }
+    drop(observer);
+    tokio::select! {
+        _ = &mut work => {},
+        _ = shutdown.cancelled() => {
+            if tokio::time::timeout(MAINTENANCE_BRANCH_SHUTDOWN_GRACE, work).await.is_err() {
+                warn!("Maintenance branch exceeded shutdown grace");
+            }
+        }
+    }
+}
 
 impl Drop for MaintenanceAliveGuard {
     fn drop(&mut self) {
@@ -3532,11 +3577,11 @@ impl MaintenanceService {
         )
         .await
         {
-            self.control.record_error(&err);
+            self.control.record_reclamation_error(&err);
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
         }
         if let Err(err) = self.control.cleanup_orphan_reports(&self.pool).await {
-            self.control.record_error(&err);
+            self.control.record_reclamation_error(&err);
             tracing::warn!(error = %err, "Failed to clean up orphan control observations");
         }
     }
@@ -3559,7 +3604,7 @@ impl MaintenanceService {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    self.control.record_error(&err);
+                    self.control.record_reclamation_error(&err);
                     tracing::warn!(table, error = %err, "Failed to clean up stale descriptors");
                 }
             }
@@ -3579,7 +3624,6 @@ impl MaintenanceService {
                 tracing::debug!(count, "Recomputed dirty admin metadata keys");
             }
             Err(err) => {
-                self.control.record_error(&err);
                 tracing::warn!(error = %err, "Failed to recompute dirty admin metadata");
             }
             _ => {}
@@ -3594,7 +3638,7 @@ impl MaintenanceService {
             return;
         }
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
-            self.control.record_error(&err);
+            self.control.record_reclamation_error(&err);
             tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
     }
@@ -3610,7 +3654,6 @@ impl MaintenanceService {
         let stats = match awa_model::admin::queue_overviews(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
-                self.control.record_error(&err);
                 tracing::warn!(error = %err, "Failed to query queue stats for metrics");
                 return;
             }
@@ -3784,7 +3827,6 @@ impl MaintenanceService {
         {
             Ok(rows) => rows,
             Err(err) => {
-                self.control.record_error(&err);
                 tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
                 return;
             }
@@ -3825,6 +3867,79 @@ impl MaintenanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[sqlx::test(migrations = false)]
+    async fn leadership_loss_finishes_committed_branch_and_releases_leader_lock(pool: PgPool) {
+        sqlx::query("CREATE TABLE committed_effects(id integer PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(42424242)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let observer = LeaderObserver::start(
+            conn,
+            Arc::new(PruneControl::default()),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let lost = observer.lost.clone();
+        let (committed, committed_rx) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel();
+        let worker = pool.clone();
+        let task = tokio::spawn(async move {
+            run_leader_term(observer, &CancellationToken::new(), async move {
+                sqlx::query("INSERT INTO committed_effects VALUES (1)")
+                    .execute(&worker)
+                    .await
+                    .unwrap();
+                committed.send(()).unwrap();
+                finish_rx.await.unwrap();
+                sqlx::query("INSERT INTO committed_effects VALUES (2)")
+                    .execute(&worker)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        });
+        committed_rx.await.unwrap();
+        lost.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "leadership loss must drain post-commit effects"
+        );
+        let mut next = pool.acquire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(42424242)")
+                    .fetch_one(&mut *next)
+                    .await
+                    .unwrap();
+                if acquired {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("old leadership session is released before its current branch drains");
+        sqlx::query("SELECT pg_advisory_unlock(42424242)")
+            .execute(&mut *next)
+            .await
+            .unwrap();
+        finish.send(()).unwrap();
+        task.await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM committed_effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
     use awa_model::{migrations, QueueStorage, QueueStorageConfig};
     use chrono::TimeZone;
     use sqlx::postgres::PgPoolOptions;

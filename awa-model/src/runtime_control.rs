@@ -1,4 +1,4 @@
-//! Durable Phase 1 control. Mutations require explicit operator EXECUTE grants.
+//! Durable controls and runtime observations for `maintenance.prune`.
 use crate::AwaError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -56,8 +56,11 @@ pub const OBSERVATION_PROTOCOL_VERSION: u64 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeControlState {
-    /// No halt is requested; runtime observations may still lag the resume.
+    /// No halt is requested and live observations are compatible and fresh.
+    /// Runtime observations may still lag the resume; an empty fleet is running.
     Running,
+    /// No halt is requested, but a live runtime cannot confirm control observation.
+    Degraded,
     /// No live runtimes, or at least one live runtime cannot confirm observation.
     Unconfirmed,
     /// A live runtime has not yet observed the current revision and halt.
@@ -242,7 +245,11 @@ fn aggregate_state(
     unobserving_runtimes: &[RuntimeControlRuntime],
 ) -> RuntimeControlState {
     if requested.halt_id.is_none() {
-        return RuntimeControlState::Running;
+        return if unobserving_runtimes.is_empty() {
+            RuntimeControlState::Running
+        } else {
+            RuntimeControlState::Degraded
+        };
     }
     let live: Vec<_> = runtimes.iter().filter(|runtime| runtime.live).collect();
     if live.is_empty() || !unobserving_runtimes.is_empty() {

@@ -10,6 +10,18 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const FRESHNESS: Duration = Duration::from_secs(5);
+const SETTLEMENT_UNCERTAINTY: Duration = Duration::from_secs(30);
+const MAX_LIVENESS_FAILURES: usize = 3;
+
+#[derive(Default)]
+struct LivenessFailures(usize);
+
+impl LivenessFailures {
+    fn record(&mut self, alive: bool) -> bool {
+        self.0 = if alive { 0 } else { self.0 + 1 };
+        self.0 >= MAX_LIVENESS_FAILURES
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
@@ -18,52 +30,58 @@ pub(crate) enum Scope {
     Prune,
     Promote,
     Rescue,
+    Ungated,
 }
 
 // Every scheduler branch names a scope; there is no default-allow arm.
 macro_rules! branches {
-    ($($variant:ident => ($name:literal, $scope:ident)),+ $(,)?) => {
+    ($($variant:ident => ($name:literal, $scope:ident, $settlement:literal)),+ $(,)?) => {
         #[derive(Debug, Clone, Copy)]
         pub(crate) enum MaintenanceBranch { $($variant),+ }
         impl MaintenanceBranch {
             pub(crate) fn classification(self) -> (&'static str, Scope) {
                 match self { $(Self::$variant => ($name, Scope::$scope)),+ }
             }
+            fn tracks_settlement(self) -> bool {
+                match self { $(Self::$variant => $settlement),+ }
+            }
         }
     };
 }
 branches! {
-    CronSync => ("cron_sync", Cron),
-    RescueHeartbeat => ("rescue_stale_heartbeats", Rescue),
-    RescueDeadline => ("rescue_expired_deadlines", Rescue),
-    RescueCallback => ("rescue_expired_callbacks", Rescue),
-    Promote => ("promote_scheduled", Promote),
-    Aging => ("priority_aging", Promote),
-    Cleanup => ("cleanup", Prune),
-    QueueHealth => ("queue_stats", Prune),
-    DirtyMetadata => ("recompute_dirty_admin_metadata", Prune),
-    RefreshMetadata => ("refresh_admin_metadata", Prune),
-    Batch => ("batch_operations", Dispatch),
-    RotateQueue => ("rotate_queue", Prune),
-    RotateLease => ("rotate_lease", Prune),
-    RotateClaim => ("rotate_claim", Prune),
-    TerminalRollup => ("terminal_count_rollup", Prune),
-    AuthorityFlip => ("storage_authority_flip", Prune),
-    Descriptors => ("publish_descriptors", Prune),
+    CronSync => ("cron_sync", Cron, false),
+    RescueHeartbeat => ("rescue_stale_heartbeats", Rescue, false),
+    RescueDeadline => ("rescue_expired_deadlines", Rescue, false),
+    RescueCallback => ("rescue_expired_callbacks", Rescue, false),
+    Promote => ("promote_scheduled", Promote, false),
+    Aging => ("priority_aging", Promote, false),
+    Cleanup => ("cleanup", Prune, true),
+    QueueHealth => ("queue_stats", Ungated, false),
+    DirtyMetadata => ("recompute_dirty_admin_metadata", Prune, false),
+    RefreshMetadata => ("refresh_admin_metadata", Prune, true),
+    Batch => ("batch_operations", Dispatch, false),
+    RotateQueue => ("rotate_queue", Prune, true),
+    RotateLease => ("rotate_lease", Prune, true),
+    RotateClaim => ("rotate_claim", Prune, true),
+    TerminalRollup => ("terminal_count_rollup", Prune, true),
+    Descriptors => ("publish_descriptors", Prune, false),
 }
 
 #[derive(Default)]
 struct Observation {
     value: Option<RuntimeControl>,
     read_started: Option<Instant>,
+    last_read_started: Option<Instant>,
     observed_at: Option<DateTime<Utc>>,
 }
 
 pub(crate) struct PruneControl {
     capability: AtomicU8,
+    read_lock: tokio::sync::Mutex<()>,
     observation: Mutex<Observation>,
     outstanding: AtomicUsize,
     abandoned: AtomicUsize,
+    uncertain_since: Mutex<Option<Instant>>,
     report_sequence: AtomicU64,
 }
 
@@ -71,9 +89,11 @@ impl Default for PruneControl {
     fn default() -> Self {
         Self {
             capability: AtomicU8::new(0),
+            read_lock: tokio::sync::Mutex::new(()),
             observation: Mutex::new(Observation::default()),
             outstanding: AtomicUsize::new(0),
             abandoned: AtomicUsize::new(0),
+            uncertain_since: Mutex::new(None),
             report_sequence: AtomicU64::new(0),
         }
     }
@@ -139,15 +159,23 @@ impl PruneControl {
                 return None;
             }
             self.outstanding.fetch_add(1, Ordering::SeqCst);
-            Some(Admission(Some(self.clone())))
+            Some(Admission {
+                control: Some(self.clone()),
+                tracks_settlement: branch.tracks_settlement(),
+            })
         } else {
-            Some(Admission(None))
+            Some(Admission {
+                control: None,
+                tracks_settlement: false,
+            })
         }
     }
 
     pub(crate) async fn observe_pool(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let read = async {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool
+                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .await?;
             sqlx::query("SET LOCAL statement_timeout = '1s'")
                 .execute(tx.as_mut())
                 .await?;
@@ -172,6 +200,9 @@ impl PruneControl {
     }
 
     pub(crate) async fn observe(&self, conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+        // Serialize reads across leader handoff so a delayed response cannot
+        // overwrite a newer snapshot, including a replaced row's revision.
+        let _read = self.read_lock.lock().await;
         if self.capability.load(Ordering::SeqCst) != 2 {
             // Catalog presence discovers versionless installation without re-election.
             // Until installed, the existing reclamation policy stays in force.
@@ -188,9 +219,12 @@ impl PruneControl {
                     .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
                 let mut observation = self.observation.lock().expect("control observation");
                 if self.capability.load(Ordering::SeqCst) == 1
-                    && observation.read_started.is_none_or(|last| started >= last)
+                    && observation
+                        .last_read_started
+                        .is_none_or(|last| started >= last)
                 {
                     observation.read_started = Some(started);
+                    observation.last_read_started = Some(started);
                     observation.observed_at = Some(Utc::now());
                 }
                 return Ok(());
@@ -200,15 +234,19 @@ impl PruneControl {
         let value = match runtime_control::read(conn).await {
             Ok(value) => value,
             Err(err) => {
-                if matches!(
-                    &err,
-                    sqlx::Error::RowNotFound | sqlx::Error::ColumnDecode { .. }
-                ) || matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+                let mut observation = self.observation.lock().expect("control observation");
+                if observation
+                    .last_read_started
+                    .is_none_or(|last| started >= last)
                 {
-                    self.observation
-                        .lock()
-                        .expect("control observation")
-                        .read_started = None;
+                    observation.last_read_started = Some(started);
+                    if matches!(
+                        &err,
+                        sqlx::Error::RowNotFound | sqlx::Error::ColumnDecode { .. }
+                    ) || matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+                    {
+                        observation.read_started = None;
+                    }
                 }
                 return Err(err);
             }
@@ -217,32 +255,35 @@ impl PruneControl {
             || value.mode != "drain"
             || value.revision < 0
         {
-            self.observation
-                .lock()
-                .expect("control observation")
-                .read_started = None;
+            let mut observation = self.observation.lock().expect("control observation");
+            if observation
+                .last_read_started
+                .is_none_or(|last| started >= last)
+            {
+                observation.last_read_started = Some(started);
+                observation.read_started = None;
+            }
             return Err(sqlx::Error::Decode(
                 "malformed maintenance.prune control".into(),
             ));
         }
         let mut observation = self.observation.lock().expect("control observation");
         // An earlier, slower read cannot renew permission or overwrite a halt.
-        if observation.read_started.is_none_or(|last| started >= last)
-            && observation
-                .value
-                .as_ref()
-                .is_none_or(|last| value.revision >= last.revision)
+        if observation
+            .last_read_started
+            .is_none_or(|last| started >= last)
         {
             *observation = Observation {
                 value: Some(value),
                 read_started: Some(started),
+                last_read_started: Some(started),
                 observed_at: Some(Utc::now()),
             };
         }
         Ok(())
     }
 
-    pub(crate) fn record_error(&self, error: &(dyn std::error::Error + 'static)) {
+    pub(crate) fn record_reclamation_error(&self, error: &(dyn std::error::Error + 'static)) {
         let mut source = Some(error);
         while let Some(error) = source {
             if let Some(error) = error.downcast_ref::<sqlx::Error>() {
@@ -251,14 +292,17 @@ impl PruneControl {
                     sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_)
                 ) || matches!(error, sqlx::Error::Database(db) if db.code().is_some_and(|c| c.starts_with("08")))
                 {
-                    // A transport error cannot establish whether submitted SQL
-                    // finished. Keep that uncertainty across re-election.
-                    self.abandoned.fetch_add(1, Ordering::SeqCst);
+                    self.record_uncertainty();
                     return;
                 }
             }
             source = error.source();
         }
+    }
+
+    fn record_uncertainty(&self) {
+        *self.uncertain_since.lock().expect("settlement uncertainty") = Some(Instant::now());
+        self.abandoned.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn status(&self) -> serde_json::Value {
@@ -269,7 +313,13 @@ impl PruneControl {
             .is_some_and(|time| time.elapsed() < FRESHNESS);
         let outstanding = self.outstanding.load(Ordering::SeqCst);
         let abandoned = self.abandoned.load(Ordering::SeqCst);
-        let settlement_unknown = abandoned > 0;
+        let remaining = self
+            .uncertain_since
+            .lock()
+            .expect("settlement uncertainty")
+            .and_then(|since| SETTLEMENT_UNCERTAINTY.checked_sub(since.elapsed()))
+            .filter(|remaining| !remaining.is_zero());
+        let settlement_unknown = remaining.is_some();
         serde_json::json!({
             "scope": runtime_control::PRUNE_SCOPE,
             "protocol_version": runtime_control::OBSERVATION_PROTOCOL_VERSION,
@@ -280,6 +330,7 @@ impl PruneControl {
             "reported_at": Utc::now(), "report_sequence": self.report_sequence.fetch_add(1, Ordering::SeqCst) + 1,
             "outstanding_callbacks": outstanding, "abandoned_callbacks": abandoned,
             "settlement_unknown": settlement_unknown,
+            "settlement_uncertainty_remaining_ms": remaining.map(|time| time.as_millis() as u64),
             "state": if settlement_unknown || !fresh { "unknown" } else if allowed { "running" } else if outstanding > 0 { "draining" } else { "halted" }
         })
     }
@@ -298,19 +349,22 @@ async fn write_status(
 }
 
 /// A locally dropped SQL future does not establish server-side settlement.
-/// Keep abandoned callbacks as unknown for this runtime's lifetime. This is
-/// evidence for operators, never a prerequisite for drain-mode resume.
-pub(crate) struct Admission(Option<Arc<PruneControl>>);
+/// Reclamation uncertainty expires locally; it does not prove backend settlement
+/// and never blocks drain-mode resume.
+pub(crate) struct Admission {
+    control: Option<Arc<PruneControl>>,
+    tracks_settlement: bool,
+}
 impl Admission {
     pub(crate) async fn run_result<T, E: std::error::Error + 'static>(
         self,
         work: impl std::future::Future<Output = Result<T, E>>,
     ) -> Result<T, E> {
-        let control = self.0.clone();
+        let control = self.control.clone().filter(|_| self.tracks_settlement);
         self.run(async {
             let result = work.await;
             if let (Some(control), Err(error)) = (&control, &result) {
-                control.record_error(error);
+                control.record_reclamation_error(error);
             }
             result
         })
@@ -319,7 +373,7 @@ impl Admission {
 
     pub(crate) async fn run<T>(mut self, work: impl std::future::Future<Output = T>) -> T {
         let result = work.await;
-        if let Some(control) = self.0.take() {
+        if let Some(control) = self.control.take() {
             control.outstanding.fetch_sub(1, Ordering::SeqCst);
         }
         result
@@ -327,8 +381,11 @@ impl Admission {
 }
 impl Drop for Admission {
     fn drop(&mut self) {
-        if let Some(control) = &self.0 {
-            control.abandoned.fetch_add(1, Ordering::SeqCst);
+        if let Some(control) = &self.control {
+            if self.tracks_settlement {
+                control.record_uncertainty();
+            }
+            control.outstanding.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -354,11 +411,9 @@ impl LeaderObserver {
         fallback_liveness_interval: Duration,
     ) -> Result<Self, sqlx::Error> {
         {
-            control
-                .observation
-                .lock()
-                .expect("control observation")
-                .read_started = None;
+            let mut observation = control.observation.lock().expect("control observation");
+            observation.read_started = None;
+            observation.last_read_started = Some(Instant::now());
         }
         // Never return a session-scoped leader lock to the pool, even if the
         // owning future is cancelled or unlock cannot be acknowledged.
@@ -396,6 +451,7 @@ impl LeaderObserver {
             }
             let _guard = LeaderGuard(leader, lost);
             let mut last_liveness = Instant::now();
+            let mut failures = LivenessFailures::default();
             loop {
                 // Stable per-tick entropy without a connection or shared RNG.
                 let jitter_ms = 800 + (Uuid::new_v4().as_u128() % 401) as u64;
@@ -408,12 +464,13 @@ impl LeaderObserver {
                     Err(_) => tracing::warn!("Prune control read deadline expired"),
                     Ok(Ok(())) => {
                         last_liveness = Instant::now();
+                        failures.record(true);
                     }
                 }
                 // Successful control/schema reads prove liveness. Probe separately
                 // only when failed reads have outlasted the configured interval.
                 if last_liveness.elapsed() >= fallback_liveness_interval {
-                    match tokio::time::timeout(
+                    let alive = match tokio::time::timeout(
                         Duration::from_secs(1),
                         sqlx::query("SELECT 1").execute(&mut *conn),
                     )
@@ -422,13 +479,19 @@ impl LeaderObserver {
                         Ok(Err(ref err)) if connection_lost(err) => break,
                         Ok(Err(err)) => {
                             tracing::warn!(error = %err, "Leader liveness read failed without session loss");
-                            continue;
+                            false
                         }
-                        Err(_) => continue,
-                        Ok(Ok(_)) => {
-                            last_liveness = Instant::now();
-                        }
+                        Err(_) => false,
+                        Ok(Ok(_)) => true,
+                    };
+                    if failures.record(alive) {
+                        tracing::warn!("Leader session failed three consecutive liveness probes; relinquishing leadership");
+                        break;
                     }
+                    if !alive {
+                        continue;
+                    }
+                    last_liveness = Instant::now();
                 }
                 if let Some(instance) =
                     instance.filter(|_| control.capability.load(Ordering::SeqCst) == 2)
@@ -461,6 +524,64 @@ mod tests {
     use super::*;
     use awa_model::migrations;
     use sqlx::{Executor, PgPool};
+
+    fn permissive_control() -> Arc<PruneControl> {
+        let control = Arc::new(PruneControl::default());
+        control.capability.store(1, Ordering::SeqCst);
+        control.observation.lock().unwrap().read_started = Some(Instant::now());
+        control
+    }
+
+    #[test]
+    fn consecutive_liveness_failures_demote_and_success_resets_the_count() {
+        let mut failures = LivenessFailures::default();
+        assert!(!failures.record(false));
+        assert!(!failures.record(false));
+        assert!(!failures.record(true));
+        assert!(!failures.record(false));
+        assert!(!failures.record(false));
+        assert!(failures.record(false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn descriptor_errors_and_cancellation_do_not_create_settlement_uncertainty() {
+        let control = permissive_control();
+        let result = control
+            .admit(MaintenanceBranch::Descriptors)
+            .unwrap()
+            .run_result(async {
+                Err::<(), _>(sqlx::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                )))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(control.status()["settlement_unknown"], false);
+        drop(control.admit(MaintenanceBranch::Descriptors).unwrap());
+        assert_eq!(control.status()["settlement_unknown"], false);
+        assert_eq!(control.status()["outstanding_callbacks"], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_reclamation_releases_callback_and_uncertainty_expires() {
+        let control = permissive_control();
+        drop(control.admit(MaintenanceBranch::Cleanup).unwrap());
+        assert_eq!(control.status()["outstanding_callbacks"], 0);
+        assert_eq!(control.status()["settlement_unknown"], true);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        control.observation.lock().unwrap().read_started = Some(Instant::now());
+        assert_eq!(control.status()["settlement_unknown"], false);
+        assert_eq!(control.status()["abandoned_callbacks"], 1);
+        assert_eq!(control.status()["state"], "running");
+    }
+
+    #[test]
+    fn queue_health_is_admitted_when_pruning_is_closed() {
+        let control = Arc::new(PruneControl::default());
+        assert!(!control.allowed());
+        assert!(control.admit(MaintenanceBranch::QueueHealth).is_some());
+        assert!(control.admit(MaintenanceBranch::Cleanup).is_none());
+    }
 
     async fn wait_for(mut predicate: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -516,7 +637,82 @@ mod tests {
             !control.allowed(),
             "an installed missing row must fail closed"
         );
+        pool.execute("INSERT INTO awa.runtime_controls(scope) VALUES ('maintenance.prune')")
+            .await
+            .unwrap();
+        wait_for(|| control.allowed()).await;
+        assert_eq!(control.status()["observed_revision"], 0);
         drop(observer);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn missing_control_grant_is_reported_as_degraded_and_recovers(admin: PgPool) {
+        migrations::run(&admin).await.unwrap();
+        let id = instance(&admin).await;
+        let role = format!("prune_denied_{}", Uuid::new_v4().simple());
+        admin.execute(sqlx::raw_sql(&format!("CREATE ROLE {role} LOGIN PASSWORD 'control-test'; GRANT USAGE ON SCHEMA awa TO {role}; GRANT SELECT, INSERT, UPDATE ON awa.runtime_control_observations TO {role};"))).await.unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                (*admin.connect_options())
+                    .clone()
+                    .username(&role)
+                    .password("control-test"),
+            )
+            .await
+            .unwrap();
+        let control = Arc::new(PruneControl::default());
+        let observer = LeaderObserver::start(
+            pool.acquire().await.unwrap(),
+            control.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Some(id),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(!control.allowed());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = runtime_control::status(&admin).await.unwrap();
+                if status.unobserving_runtimes[0].observation_status
+                    == runtime_control::RuntimeObservationStatus::StaleControl
+                {
+                    assert_eq!(status.state, runtime_control::RuntimeControlState::Degraded);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("denied control reads must not report a healthy resumed fleet");
+        admin
+            .execute(sqlx::raw_sql(&format!(
+                "GRANT SELECT ON awa.runtime_controls TO {role}"
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if runtime_control::status(&admin).await.unwrap().state
+                    == runtime_control::RuntimeControlState::Running
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("restoring the grant recovers without restarting");
+        assert!(control.allowed());
+        drop(observer);
+        pool.close().await;
+        admin
+            .execute(sqlx::raw_sql(&format!(
+                "DROP OWNED BY {role}; DROP ROLE {role}"
+            )))
+            .await
+            .unwrap();
     }
 
     #[sqlx::test(migrations = false)]
@@ -770,14 +966,14 @@ mod tests {
             .split("let work = async {")
             .nth(1)
             .unwrap()
-            .split("            tokio::select! {\n                _ = observer.lost")
+            .split("            run_leader_term(")
             .next()
             .unwrap();
         // Every select arm except cancellation must register and gate its work.
         let selected = leader.matches("\n                        _ = ").count();
         assert_eq!(
             selected,
-            leader.matches("branch_tracker.try_begin").count() + 1
+            leader.matches("branch_tracker.try_begin").count() + 2
         );
         assert!(!leader.contains("try_begin(\""));
         assert!(!leader.contains("try_begin_without_cooldown(\""));

@@ -1,4 +1,3 @@
-//! ADR-051 Phase 1: real enqueue/dispatch/promotion/rescue while reclamation is halted.
 use awa::model::{migrations, runtime_control, QueueStorage};
 use awa::{Client, InsertOpts, JobArgs, JobResult, QueueConfig, QueueStorageConfig};
 use serde::{Deserialize, Serialize};

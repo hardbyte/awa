@@ -1082,10 +1082,16 @@ async fn released_patch_upgrade_and_rollback() {
         .await
         .unwrap();
     assert!(resumed.halt_id.is_none());
+    let resumed_status = runtime_control::status(&fixture.admin).await.unwrap();
     assert_eq!(
-        runtime_control::status(&fixture.admin).await.unwrap().state,
-        runtime_control::RuntimeControlState::Running
+        resumed_status.state,
+        runtime_control::RuntimeControlState::Degraded
     );
+    assert!(resumed_status.requested.halt_id.is_none());
+    assert!(released_pids.iter().all(|pid| resumed_status
+        .unobserving_runtimes
+        .iter()
+        .any(|runtime| runtime.pid == *pid && runtime.live)));
     candidate_produce(
         &runtime,
         &log,

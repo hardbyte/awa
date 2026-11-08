@@ -294,6 +294,89 @@ async fn resume_reports_running_even_when_runtime_still_reports_previous_halt(po
 }
 
 #[sqlx::test(migrations = false)]
+async fn no_halt_with_unobserving_live_runtime_is_degraded_until_recovery(pool: PgPool) {
+    migrations::run(&pool).await.unwrap();
+    let requested = runtime_control::status(&pool).await.unwrap().requested;
+    assert!(requested.halt_id.is_none());
+    let leader = runtime(&pool, "0.6.16", true).await;
+    let standby = runtime(&pool, "0.6.16", false).await;
+    let mut running = halted_observation(&requested);
+    running["state"] = json!("running");
+    running["admission_allowed"] = json!(true);
+    report(&pool, standby, running.clone()).await;
+
+    let missing = runtime_control::status(&pool).await.unwrap();
+    assert_eq!(missing.state, RuntimeControlState::Degraded);
+    assert_eq!(missing.unobserving_runtimes.len(), 1);
+    assert_eq!(missing.unobserving_runtimes[0].instance_id, leader);
+
+    for (changes, expected) in [
+        (
+            json!({"fresh": false, "observed_revision": null, "state": "unknown", "admission_allowed": false}),
+            RuntimeObservationStatus::StaleControl,
+        ),
+        (
+            json!({"protocol_version": 2}),
+            RuntimeObservationStatus::IncompatibleProtocol,
+        ),
+        (
+            json!({"supported": false}),
+            RuntimeObservationStatus::Unsupported,
+        ),
+    ] {
+        let mut observation = running.clone();
+        observation
+            .as_object_mut()
+            .unwrap()
+            .extend(changes.as_object().unwrap().clone());
+        report(&pool, leader, observation).await;
+        let status = runtime_control::status(&pool).await.unwrap();
+        assert_eq!(
+            status.state,
+            RuntimeControlState::Degraded,
+            "changes: {changes}"
+        );
+        assert_eq!(status.unobserving_runtimes.len(), 1);
+        assert_eq!(status.unobserving_runtimes[0].instance_id, leader);
+        assert_eq!(status.unobserving_runtimes[0].observation_status, expected);
+    }
+
+    report(&pool, leader, running.clone()).await;
+    assert_eq!(
+        runtime_control::status(&pool).await.unwrap().state,
+        RuntimeControlState::Running
+    );
+    sqlx::query(
+        "UPDATE awa.runtime_control_observations
+         SET observation = jsonb_set(observation, '{received_at}',
+             to_jsonb(clock_timestamp() - interval '6 seconds'))
+         WHERE instance_id = $1",
+    )
+    .bind(leader)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale_report = runtime_control::status(&pool).await.unwrap();
+    assert_eq!(stale_report.state, RuntimeControlState::Degraded);
+    assert_eq!(
+        stale_report.unobserving_runtimes[0].observation_status,
+        RuntimeObservationStatus::StaleReport
+    );
+
+    sqlx::query(
+        "UPDATE awa.runtime_instances SET last_seen_at = clock_timestamp() - interval '1 minute'
+         WHERE instance_id = $1",
+    )
+    .bind(leader)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale_runtime = runtime_control::status(&pool).await.unwrap();
+    assert_eq!(stale_runtime.state, RuntimeControlState::Running);
+    assert!(stale_runtime.unobserving_runtimes.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
 async fn empty_or_entirely_stale_fleet_does_not_confirm_halted(pool: PgPool) {
     let halt = requested_halt(&pool).await;
     let empty = runtime_control::status(&pool).await.unwrap();
