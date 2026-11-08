@@ -394,35 +394,45 @@ async fn copy_without_execute_on_the_batch_function_stays_per_row() {
     .await
     .expect("create a role without EXECUTE on the batch function");
 
-    let mut tx = pool.begin().await.expect("begin");
-    sqlx::query(&format!("SET LOCAL ROLE {role}"))
-        .execute(&mut *tx)
-        .await
-        .expect("become the restricted role");
-    let copied = insert_many_copy(&mut tx, &jobs("no_execute", 1..4, true))
-        .await
-        .expect("COPY without EXECUTE on the batch function");
-    assert_eq!(seqs(&copied), vec![1, 2, 3]);
-    let skipped = insert_many_skip_unique_conflicts(&mut *tx, &jobs("no_execute", 4..5, true))
-        .await
-        .expect_err("the skip API calls the function directly");
-    assert!(
-        matches!(&skipped, AwaError::Database(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42501")),
-        "{skipped:?}"
-    );
-    tx.rollback().await.expect("roll back");
+    // The role is cluster-wide, so it is dropped even when an assertion fails.
+    let outcome = tokio::spawn({
+        let pool = db.pool.clone();
+        let role = role.clone();
+        async move {
+            let pool = &pool;
+            let mut tx = pool.begin().await.expect("begin");
+            sqlx::query(&format!("SET LOCAL ROLE {role}"))
+                .execute(&mut *tx)
+                .await
+                .expect("become the restricted role");
+            let copied = insert_many_copy(&mut tx, &jobs("no_execute", 1..4, true))
+                .await
+                .expect("COPY without EXECUTE on the batch function");
+            assert_eq!(seqs(&copied), vec![1, 2, 3]);
+            let skipped = insert_many_skip_unique_conflicts(&mut *tx, &jobs("no_execute", 4..5, true))
+                .await
+                .expect_err("the skip API calls the function directly");
+            assert!(
+                matches!(&skipped, AwaError::Database(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42501")),
+                "{skipped:?}"
+            );
+            tx.rollback().await.expect("roll back");
 
-    let mut tx = pool.begin().await.expect("begin");
-    sqlx::query(&format!("SET LOCAL ROLE {role}"))
-        .execute(&mut *tx)
-        .await
-        .expect("become the restricted role");
-    insert_many_copy(&mut tx, &jobs("no_execute", 1..4, true))
-        .await
-        .expect("COPY without EXECUTE on the batch function");
-    tx.commit().await.expect("commit");
-    assert_eq!(ready_seqs(pool, "no_execute").await, vec![0, 1, 2, 3]);
-    assert_eq!(segments(pool, "no_execute").await, 4, "per-row path");
+            let mut tx = pool.begin().await.expect("begin");
+            sqlx::query(&format!("SET LOCAL ROLE {role}"))
+                .execute(&mut *tx)
+                .await
+                .expect("become the restricted role");
+            insert_many_copy(&mut tx, &jobs("no_execute", 1..4, true))
+                .await
+                .expect("COPY without EXECUTE on the batch function");
+            tx.commit().await.expect("commit");
+            assert_eq!(ready_seqs(pool, "no_execute").await, vec![0, 1, 2, 3]);
+            assert_eq!(segments(pool, "no_execute").await, 4, "per-row path");
+
+        }
+    })
+    .await;
 
     db.drop().await;
     let admin = admin_pool().await;
@@ -431,4 +441,33 @@ async fn copy_without_execute_on_the_batch_function_stays_per_row() {
         .await
         .expect("drop role");
     admin.close().await;
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
+
+/// A body from before the per-lane registration fix keeps the patch pending,
+/// and `awa migrate` replaces it.
+#[tokio::test]
+async fn an_earlier_batch_function_body_keeps_the_patch_pending() {
+    let db = ScratchDatabase::create().await;
+    let pool = &db.pool;
+    sqlx::raw_sql(include_str!(
+        "fixtures/insert_jobs_compat_batch_registers_lanes_first.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("install the earlier body");
+    assert_eq!(pending_patches(pool).await, vec![PATCH_NAME]);
+
+    let report = migrations::run_with_report(pool).await.expect("migrate");
+    let patch = report
+        .patches
+        .iter()
+        .find(|patch| patch.name == PATCH_NAME)
+        .expect("patch report");
+    assert_eq!(patch.outcome, migrations::PatchOutcome::Applied);
+    assert!(pending_patches(pool).await.is_empty());
+
+    db.drop().await;
 }

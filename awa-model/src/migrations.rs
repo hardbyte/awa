@@ -431,7 +431,7 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         description:
             "Batch producer insert with a short enqueue lane lock window (awa 0.7 migration v055)",
         sql: include_str!("../migrations/patches/insert_jobs_compat_batch.sql"),
-        applied_probe: crate::insert::BATCH_FUNCTION_INSTALLED_SQL,
+        applied_probe: crate::insert::BATCH_FUNCTION_PATCH_APPLIED_SQL,
     },
 ];
 

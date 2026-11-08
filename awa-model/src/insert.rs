@@ -20,9 +20,9 @@ use sqlx::{PgExecutor, PgPool};
 // `insert_many_copy` and `insert_many_skip_unique_conflicts` use
 // `awa.insert_jobs_compat_batch` (the `insert_jobs_compat_batch` schema
 // patch), which does the lane-independent work first (job ids, unique claims,
-// lane registration, payloads) and then reserves its lanes in canonical order,
-// so a lane is held only across its reservation, the ready-row writes and the
-// commit.
+// payloads) and then registers and reserves its lanes one at a time in
+// canonical order, so a lane is held only across its registration,
+// reservation, the ready-row writes and the commit.
 //
 // Generic `insert_many` always uses the per-row path, as does
 // `insert_many_copy` on a schema without the patch: rows are sorted by the
@@ -531,11 +531,16 @@ const INSERT_MANY_BATCH_SQL: &str = r#"
     )
 "#;
 
-/// TRUE when `awa.insert_jobs_compat_batch` exists, whoever may call it: the
-/// `insert_jobs_compat_batch` schema patch's probe. Catalog lookup only.
-pub(crate) const BATCH_FUNCTION_INSTALLED_SQL: &str = "SELECT to_regprocedure(\
+/// TRUE when `awa.insert_jobs_compat_batch` exists with the body the
+/// `insert_jobs_compat_batch` schema patch installs, whoever may call it: the
+/// patch's probe. The body check matches the per-lane registration inside the
+/// reservation loop, so `awa migrate` replaces an earlier body that registered
+/// every new lane before reserving any. Catalog lookup only.
+pub(crate) const BATCH_FUNCTION_PATCH_APPLIED_SQL: &str = "SELECT EXISTS (\
+    SELECT 1 FROM pg_proc AS p WHERE p.oid = to_regprocedure(\
     'awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],\
-    timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)') IS NOT NULL";
+    timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)') \
+    AND p.prosrc ~ 'INSERT INTO queue_lanes \\(queue, priority\\)\\s+SELECT v_lane\\.queue')";
 
 /// TRUE when the connected role may call `awa.insert_jobs_compat_batch`.
 const BATCH_FUNCTION_USABLE_SQL: &str = "SELECT COALESCE(has_function_privilege(to_regprocedure(\

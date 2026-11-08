@@ -22,7 +22,7 @@ Steps 2 and 3 can also run the other way round. A 0.6.15 producer checks for the
 
 The schema stays at v40. The `insert_jobs_compat_batch` patch adds one function, `awa.insert_jobs_compat_batch`, and changes nothing else: no table DDL, no table or sequence locks, no change to `awa.insert_job_compat` or to storage routing. It applies as one transaction, so an interrupted run leaves nothing applied; run it again.
 
-The function inserts a whole batch the way `awa.insert_job_compat` inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, new lane rows, scheduled rows, the result rows), then reserves each lane's range of positions once, in `(queue, priority, shard)` order, and writes the ready rows. Each lane's enqueue lock is therefore held only for the reservation, the ready-row write and the commit, instead of from the batch's first ready row to the commit. Concurrent producers and promotion on the same lane wait for that much shorter window.
+The function inserts a whole batch the way `awa.insert_job_compat` inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, scheduled rows, the result rows). Then, in `(queue, priority, shard)` order, it registers each lane it is the first to use and reserves each lane's range of positions once, as every other producer registers and reserves lane by lane, and writes the ready rows. Each lane's enqueue lock is therefore held only for the reservation, the ready-row write and the commit, instead of from the batch's first ready row to the commit. Concurrent producers and promotion on the same lane wait for that much shorter window.
 
 What callers see:
 
@@ -32,6 +32,10 @@ What callers see:
 - A batch's rows in one lane occupy consecutive lane positions in input order, as before, and are described by one ready segment per run instead of one per row. A key repeated inside one batch keeps its first job in input order.
 
 0.6.14 and earlier binaries never call the new function. They keep calling `awa.insert_job_compat`, which takes the same lane lock, so old and new producers share a lane without reordering it.
+
+### Unique keys shared with per-row producers
+
+The batch function takes all of a batch's unique claims before any lane lock. Per-row inserts (generic `insert_many`, single-job inserts, and 0.6.14 and earlier binaries) take each job's claim and its lane together, lane by lane. When a per-row transaction already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not yet committed, each waits on the other. PostgreSQL aborts one of them with `deadlock detected` (SQLSTATE `40P01`), where before the per-row insert would have waited and then skipped the job or failed with a unique violation (`23505`). Retry the aborted transaction: by then the key is either committed, giving the old outcome, or free. Two batches through the function take claims in key order and lanes in lane order, so they do not deadlock with each other this way.
 
 ### Privileges
 

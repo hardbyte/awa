@@ -1,11 +1,11 @@
 //! Compatibility inserts and the batch insert function from the
 //! `insert_jobs_compat_batch` schema patch.
 //!
-//! A batch does its lane-independent work (job ids, unique claims, lane
-//! registration) before it reserves its lanes, and holds a lane lock only for
-//! the reservation, the ready-row writes and the commit. These tests cover that
-//! ordering, skip-on-conflict inserts, and the shape of what lands in the
-//! lanes.
+//! A batch does its lane-independent work (job ids, unique claims) before it
+//! registers and reserves its lanes one at a time in canonical order, and
+//! holds a lane lock only for the registration, the reservation, the ready-row
+//! writes and the commit. These tests cover that ordering, skip-on-conflict
+//! inserts, and the shape of what lands in the lanes.
 //!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test insert_many_batch_test -- --nocapture`
@@ -582,4 +582,76 @@ async fn insert_through_row_function(pool: &PgPool, jobs: &[InsertParams]) {
     .fetch_all(pool)
     .await
     .expect("per-row function insert");
+}
+
+/// A per-row producer (as generic `insert_many` and released 0.6 binaries
+/// insert) holds lane A and then enqueues into lane B, which nobody has used
+/// yet; a batch for A and B is waiting for A meanwhile. The batch must not
+/// have registered B before it holds A, or the two wait on each other.
+#[tokio::test]
+async fn batch_registers_a_new_lane_only_when_it_reaches_it() {
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    for path in [Path::SkipUniqueConflicts, Path::Copy] {
+        assert_batch_does_not_hold_a_new_lane_while_waiting(&pool, path).await;
+    }
+}
+
+async fn assert_batch_does_not_hold_a_new_lane_while_waiting(pool: &PgPool, path: Path) {
+    let suffix = &Uuid::new_v4().simple().to_string()[..12];
+    let lane_a = format!("batch_lane_a_{suffix}");
+    let lane_b = format!("batch_lane_b_{suffix}");
+    insert_many(pool, &[job(&lane_a, -1, false)])
+        .await
+        .expect("provision lane A");
+
+    // The per-row producer's transaction holds lane A's lock from here on.
+    let mut per_row = pool.begin().await.expect("begin per-row producer");
+    insert_many(&mut *per_row, &[job(&lane_a, 100, false)])
+        .await
+        .expect("per-row insert into lane A");
+
+    let batch_jobs = vec![job(&lane_a, 0, false), job(&lane_b, 0, false)];
+    let batch = {
+        let pool = pool.clone();
+        tokio::spawn(async move { path.insert(&pool, &batch_jobs).await })
+    };
+    let key_a = lane_lock_key(pool, &lane_a).await;
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+             WHERE locktype = 'advisory' AND NOT granted
+               AND ((classid::bigint << 32) | objid::bigint) = $1)",
+        )
+        .bind(key_a)
+        .fetch_one(pool)
+        .await
+        .expect("poll pg_locks");
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "{path:?}: batch never waited for lane A"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let second = tokio::time::timeout(
+        WAIT_DEADLINE,
+        insert_many(&mut *per_row, &[job(&lane_b, 100, false)]),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{path:?}: per-row producer blocked on lane B"));
+    second.unwrap_or_else(|err| panic!("{path:?}: per-row insert into lane B: {err:?}"));
+    per_row.commit().await.expect("commit per-row producer");
+
+    let inserted = tokio::time::timeout(WAIT_DEADLINE, batch)
+        .await
+        .expect("batch finished")
+        .expect("batch task");
+    assert_eq!(inserted.len(), 2, "{path:?}");
+    assert_eq!(ready_lane_seqs(pool, &lane_a).await.len(), 3, "{path:?}");
+    assert_eq!(ready_lane_seqs(pool, &lane_b).await.len(), 2, "{path:?}");
 }

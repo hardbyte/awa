@@ -7,10 +7,11 @@
 -- transaction-scoped, holds it while every remaining row is processed. Many
 -- concurrent producers on one lane therefore queue behind whole batches. This
 -- patch adds awa.insert_jobs_compat_batch, which does the lane-independent
--- work first (job ids, unique claims in key order, lane rows, payloads), then
--- reserves each lane's sequence range once, in (queue, priority, shard) order,
--- and writes the ready rows and segments in two statements. The lock is held
--- across the reservation, those two statements and the commit.
+-- work first (job ids, unique claims in key order, scheduled rows, result
+-- rows), then, in (queue, priority, shard) order, registers each new lane and
+-- reserves each lane's sequence range once, and writes the ready rows and
+-- segments in two statements. The lock is held across the reservation, those
+-- two statements and the commit.
 --
 -- The column arrays are parallel and must have equal length. Every element is
 -- required except run_at, unique_key, unique_states and ordering_hash;
@@ -302,62 +303,6 @@ BEGIN
         ORDER BY input.unique_key, input.ord;
     END IF;
 
-    -- Register lanes this batch is the first to use. The head tables carry a
-    -- row trigger that takes the lane lock before the conflict check, so only
-    -- missing lanes are proposed: a batch for an existing lane must not queue
-    -- behind that lane's producers before it has any work to show for it.
-    INSERT INTO queue_lanes (queue, priority)
-    SELECT lanes.queue, lanes.priority
-    FROM (
-        SELECT DISTINCT input.queue, input.priority
-        FROM unnest(p_queue, p_priority, p_state)
-            WITH ORDINALITY AS input(queue, priority, state, ord)
-        WHERE input.state = 'available'
-          AND v_job_ids[input.ord] <> ALL (v_skipped)
-    ) AS lanes
-    WHERE NOT EXISTS (
-        SELECT 1 FROM queue_lanes AS existing
-        WHERE existing.queue = lanes.queue AND existing.priority = lanes.priority
-    )
-    ORDER BY lanes.queue COLLATE "C", lanes.priority
-    ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
-
-    INSERT INTO queue_enqueue_heads (queue, priority, enqueue_shard)
-    SELECT lanes.queue, lanes.priority, lanes.shard
-    FROM (
-        SELECT DISTINCT input.queue, input.priority, v_shards[input.ord] AS shard
-        FROM unnest(p_queue, p_priority, p_state)
-            WITH ORDINALITY AS input(queue, priority, state, ord)
-        WHERE input.state = 'available'
-          AND v_job_ids[input.ord] <> ALL (v_skipped)
-    ) AS lanes
-    WHERE NOT EXISTS (
-        SELECT 1 FROM queue_enqueue_heads AS existing
-        WHERE existing.queue = lanes.queue
-          AND existing.priority = lanes.priority
-          AND existing.enqueue_shard = lanes.shard
-    )
-    ORDER BY lanes.queue COLLATE "C", lanes.priority, lanes.shard
-    ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
-
-    INSERT INTO queue_claim_heads (queue, priority, enqueue_shard)
-    SELECT lanes.queue, lanes.priority, lanes.shard
-    FROM (
-        SELECT DISTINCT input.queue, input.priority, v_shards[input.ord] AS shard
-        FROM unnest(p_queue, p_priority, p_state)
-            WITH ORDINALITY AS input(queue, priority, state, ord)
-        WHERE input.state = 'available'
-          AND v_job_ids[input.ord] <> ALL (v_skipped)
-    ) AS lanes
-    WHERE NOT EXISTS (
-        SELECT 1 FROM queue_claim_heads AS existing
-        WHERE existing.queue = lanes.queue
-          AND existing.priority = lanes.priority
-          AND existing.enqueue_shard = lanes.shard
-    )
-    ORDER BY lanes.queue COLLATE "C", lanes.priority, lanes.shard
-    ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
-
     -- Re-enqueues that are not yet due carry no lane.
     INSERT INTO deferred_jobs (
         job_id, kind, queue, args, state, priority, attempt, run_lease,
@@ -441,10 +386,17 @@ BEGIN
     WHERE v_job_ids[input.ord] <> ALL (v_skipped)
     ORDER BY input.ord;
 
-    -- Lane lock window: reserve each lane's sequence range once, in
-    -- (queue, priority, shard) order, then write the ready rows. The locks are
-    -- held to the end of the transaction, which keeps the rows of a lane
-    -- visible in lane_seq order.
+    -- Lane lock window: in (queue, priority, shard) order, register each lane
+    -- the batch is the first to use and reserve its sequence range once, then
+    -- write the ready rows. The locks are held to the end of the transaction,
+    -- which keeps the rows of a lane visible in lane_seq order.
+    --
+    -- A new lane is registered only when the loop reaches it, as every other
+    -- producer does: the head tables' row trigger provisions the lane under
+    -- its lock, and the uncommitted head row blocks other producers of that
+    -- lane, so registering a later lane before reserving an earlier one would
+    -- hold it out of order. Only missing rows are proposed, because the
+    -- trigger fires before the conflict check.
     FOR v_lane IN
         SELECT lanes.queue, lanes.priority, lanes.shard, lanes.row_count
         FROM (
@@ -458,6 +410,34 @@ BEGIN
         ) AS lanes
         ORDER BY lanes.queue COLLATE "C", lanes.priority, lanes.shard
     LOOP
+        INSERT INTO queue_lanes (queue, priority)
+        SELECT v_lane.queue, v_lane.priority
+        WHERE NOT EXISTS (
+            SELECT 1 FROM queue_lanes AS existing
+            WHERE existing.queue = v_lane.queue AND existing.priority = v_lane.priority
+        )
+        ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
+
+        INSERT INTO queue_enqueue_heads (queue, priority, enqueue_shard)
+        SELECT v_lane.queue, v_lane.priority, v_lane.shard
+        WHERE NOT EXISTS (
+            SELECT 1 FROM queue_enqueue_heads AS existing
+            WHERE existing.queue = v_lane.queue
+              AND existing.priority = v_lane.priority
+              AND existing.enqueue_shard = v_lane.shard
+        )
+        ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+
+        INSERT INTO queue_claim_heads (queue, priority, enqueue_shard)
+        SELECT v_lane.queue, v_lane.priority, v_lane.shard
+        WHERE NOT EXISTS (
+            SELECT 1 FROM queue_claim_heads AS existing
+            WHERE existing.queue = v_lane.queue
+              AND existing.priority = v_lane.priority
+              AND existing.enqueue_shard = v_lane.shard
+        )
+        ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+
         EXECUTE format('SELECT %I.reserve_enqueue_seq($1, $2, $3, $4)', v_schema)
         INTO v_start
         USING v_lane.queue, v_lane.priority, v_lane.shard, v_lane.row_count::BIGINT;
