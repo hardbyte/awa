@@ -295,7 +295,7 @@ tx.commit().await?;
 awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
 ```
 
-Lifecycle hooks receive `Started` after a claim commits as the worker handler is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`, `Cancelled`) after the corresponding state transition commits. Hooks run in detached tasks, so they do not block job execution.
+Lifecycle hooks receive `Started` after a claim commits as the worker handler is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`, `Cancelled`) after the corresponding state transition commits. Hooks run alongside job execution and never delay a job's state transition, but each attempt's hooks hold a finalizer slot until they return, so hooks slower than job throughput slow claiming.
 
 Cancellation is cooperative for running handlers:
 
