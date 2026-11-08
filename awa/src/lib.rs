@@ -12,13 +12,13 @@ pub use awa_model;
 // Re-export core model types (includes JobArgs derive macro via awa-model)
 pub use awa_model::{
     self as model, adapter, admin, audited_sql, bridge, callback_contract, insert, insert_many,
-    insert_many_copy, insert_many_copy_from_pool, insert_with, map_sqlx_error, migrations,
-    partition_for_ordering_key, partition_hash64, prepare_job_insert, prepare_raw_job_insert,
-    storage, AttemptError, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow,
-    ExternalCompletion, InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobOutput, JobRow,
-    JobState, ListDlqFilter, OutputDescriptor, PartitionedQueue, PartitionedQueueError,
-    PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig, ResolveOutcome,
-    RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
+    insert_many_copy, insert_many_copy_from_pool, insert_many_skip_unique_conflicts, insert_with,
+    map_sqlx_error, migrations, partition_for_ordering_key, partition_hash64, prepare_job_insert,
+    prepare_raw_job_insert, storage, AttemptError, AwaError, CallbackConfig, DefaultAction,
+    DlqMetadata, DlqRow, ExternalCompletion, InsertOpts, InsertParams, JobArgs, JobKindDescriptor,
+    JobOutput, JobRow, JobState, ListDlqFilter, OutputDescriptor, PartitionedQueue,
+    PartitionedQueueError, PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig,
+    ResolveOutcome, RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime

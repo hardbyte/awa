@@ -291,6 +291,34 @@ Do not build the index yourself on a populated partition: the build holds a `SHA
 
 Binaries before v054 neither use nor build the index, and binaries that use it read the same rows, by scan, from a partition without it. A database coming from 0.6.15 already has the function from the 0.6 `claim_batch_job_index` schema patch, and v054 replaces it in place. External migration runners apply the complete `awa migrate --sql --from 53 --to 54` bundle, which defines the helper before the tail installs the function.
 
+## v055: batch compatibility insert
+
+v055 adds one function, `awa.insert_jobs_compat_batch`, and changes nothing else: no table DDL, no table or sequence locks, no change to `awa.insert_job_compat` or to storage routing. It inserts a whole batch the way `awa.insert_job_compat` inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, scheduled rows, the result rows). Then, in `(queue, priority, shard)` order, it registers each lane it is the first to use, reserves each lane's range of positions once and writes the ready rows. Each lane's enqueue lock is therefore held only for the reservation, the ready-row write and the commit, instead of from the batch's first ready row to the commit, so concurrent producers and promotion on the same lane wait for that much shorter window.
+
+What callers see:
+
+- `insert_many_copy` (Rust) and `Client.insert_many_copy` (Python) use the function when it is installed and the connected role may execute it, otherwise the per-row path. They check on every call, so a running producer switches on its next call after the migration commits. Their results are unchanged: rows in input order, jobs whose unique key is already claimed skipped.
+- `insert_many_skip_unique_conflicts` (Rust) inserts a batch through the function and skips jobs whose unique key is already claimed, returning the inserted rows in input order. Use it instead of retrying a failed `insert_many` one job at a time. It returns a validation error on a schema before v055.
+- Generic `insert_many` is unchanged: one statement calling `awa.insert_job_compat` per row, on every schema, and a unique conflict still fails the whole batch.
+- A batch's rows in one lane occupy consecutive lane positions in input order, as before, and are described by one ready segment per run instead of one per row. A key repeated inside one batch keeps its first job in input order.
+
+Binaries before v055 never call the function. They keep calling `awa.insert_job_compat`, which takes the same lane lock, so old and new producers share a lane without reordering it. A database coming from 0.6.15 already has the function from the 0.6 `insert_jobs_compat_batch` schema patch, and v055 replaces it in place.
+
+The batch function takes all of a batch's unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, and binaries before v055) take each job's claim and its lane together, lane by lane. When a per-row transaction already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not yet committed, PostgreSQL aborts one of them with `deadlock detected` (SQLSTATE `40P01`), where before the per-row insert would have waited and then skipped the job or failed with a unique violation (`23505`). Retry the aborted transaction. Two batches through the function take claims in key order and lanes in lane order, so they do not deadlock with each other this way.
+
+New functions are executable by `PUBLIC` unless your deployment revokes that through default privileges. If it does and the runtime role's default privileges do not cover functions created by the migration role, grant it explicitly:
+
+```sql
+GRANT EXECUTE ON FUNCTION awa.insert_jobs_compat_batch(
+    text[], text[], jsonb[], text[], smallint[], smallint[], timestamptz[],
+    jsonb[], jsonb[], bytea[], text[], text[], boolean
+) TO awa_runtime;
+```
+
+Without `EXECUTE`, `insert_many_copy` keeps the per-row path and `insert_many_skip_unique_conflicts` fails with `permission denied`.
+
+External migration runners apply the complete `awa migrate --sql --from 54 --to 55` bundle, which refreshes trusted queue-storage discovery before it replaces the function.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

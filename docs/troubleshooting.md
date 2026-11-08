@@ -186,7 +186,7 @@ Reading them together separates the two usual failure modes:
 
 **1. Producer is going through the compatibility insert path.**
 
-`insert_many_copy_from_pool` / `client.insert_many_copy` routes every row through `awa.insert_job_compat()` once per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row function call dominates — measured at ~100–150 ms per row through a Cloud SQL Auth Proxy in staging, which caps a single producer at ~7 rows/sec regardless of batch or chunk size.
+Before migration v055, `insert_many_copy_from_pool` / `client.insert_many_copy` routes every row through `awa.insert_job_compat()` once per row, and a batch with unique jobs adds a savepoint round trip per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row cost dominates — measured at ~100–150 ms per row through an auth proxy, which caps a single producer at ~7 rows/sec regardless of batch or chunk size. Run `awa migrate` to install `awa.insert_jobs_compat_batch`; COPY then inserts the batch in one function call. Generic `insert_many` keeps its one-statement per-row path either way.
 
 Switch the producer to the direct queue-storage COPY entry point:
 
@@ -214,7 +214,18 @@ DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 
 Use an upsert: first-enqueue may create lane rows before any operator inserts a `queue_meta` row, so a plain `UPDATE` quietly affects zero rows. Raising `enqueue_shards` is a semantic switch from strict to partitioned FIFO; see [ADR-025](adr/025-sharded-enqueue-heads.md).
 
-**3. WAL or commit pressure on the database.**
+**3. Producers wait on one queue's enqueue lane.**
+
+Many connections wait with `wait_event = 'advisory'` while the database is otherwise idle, batch inserts take seconds although the work per batch is milliseconds, and promotion into the same queue runs late while producers saturate it.
+
+On queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until it commits, so concurrent producers for one lane run one at a time; a lane's ceiling is a batch's rows divided by the time the lock is held. Generic `insert_many` and per-row COPY take the lock at the batch's first ready row and hold it while the rest of the batch is processed. From migration v055, `insert_many_copy` and `insert_many_skip_unique_conflicts` prepare the whole batch (job ids, unique claims, payloads) before they take any lane lock, and hold it only for the lane write and the commit.
+
+- Run `awa migrate` and move hot producers to `insert_many_copy` or `insert_many_skip_unique_conflicts`.
+- When `insert_many` fails on a unique conflict, retry with `insert_many_skip_unique_conflicts` rather than inserting the batch again row by row: each single-row insert queues for the lane separately.
+- Keep producer transactions short after the enqueue: the lane stays locked until commit.
+- Raise `enqueue_shards` (above) for a queue whose producers still saturate one lane.
+
+**4. WAL or commit pressure on the database.**
 
 If batch size and shard count both look healthy, sample `pg_stat_activity` for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in [Managed Postgres sizing](deploying-on-managed-postgres.md#pick-a-vcpu-size) are useful reference points.
 
@@ -439,7 +450,9 @@ awa --database-url "$DATABASE_URL" migrate
 Cause:
 
 - on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until the transaction commits; the `DETAIL` names two 64-bit advisory keys, and two transactions that took lanes in opposite orders hold one each and wait on the other's
-- `insert_many`, `insert_many_copy` and the `QueueStorage` batch enqueues take their lane locks in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so batches never deadlock with each other
+- `insert_many`, `insert_many_copy`, `insert_many_skip_unique_conflicts` and the `QueueStorage` batch enqueues register and lock their lanes one at a time in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so two batch calls cannot hold each other's lanes in opposite orders. One exception remains when a `QueueStorage` batch enqueue and an `insert_many` / `insert_many_copy` call both create the same new `(queue, priority)` lane: the two paths take that lane's provisioning lock and its `queue_lanes` row in opposite orders and can deadlock (#692); retry the transaction
+- from migration v055, `insert_many_copy` and `insert_many_skip_unique_conflicts` take all of a batch's unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, and binaries that predate the batch function) take each job's claim and lane together; a per-row transaction that holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed deadlocks with it, where it used to skip the job or fail with `23505`
+- unique keys and the application's own locks can form other cycles
 - a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a batch or another such transaction that touches the same lanes in a different order
 
 Fix:

@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 54;
+pub const CURRENT_VERSION: i32 = 55;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -302,6 +302,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Index compact claim batches by job id",
         &[V23_UP, V54_UP],
     ),
+    (
+        55,
+        "Batch producer insert with a short enqueue lane lock window",
+        &[V23_UP, V55_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -364,6 +369,7 @@ const V51_UP: &str = include_str!("../migrations/v051_claim_slot_functions.sql")
 const V52_UP: &str = include_str!("../migrations/v052_retained_job_output.sql");
 const V53_UP: &str = include_str!("../migrations/v053_definer_lane_provisioning.sql");
 const V54_UP: &str = include_str!("../migrations/v054_claim_batch_job_index.sql");
+const V55_UP: &str = include_str!("../migrations/v055_insert_jobs_compat_batch.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
