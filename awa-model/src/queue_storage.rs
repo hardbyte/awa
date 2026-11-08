@@ -1811,12 +1811,16 @@ impl From<AwaError> for HydrateError {
 impl From<HydrateError> for AwaError {
     fn from(err: HydrateError) -> Self {
         match err {
-            HydrateError::Ambiguous(attempts) => {
-                let (job_id, run_lease) = attempts.first().copied().unwrap_or_default();
-                AwaError::Validation(format!(
+            HydrateError::Ambiguous(attempts) => AwaError::Validation(match attempts.as_slice() {
+                [] => "queue storage ready body ambiguous for deleted lease".to_string(),
+                [(job_id, run_lease)] => format!(
                     "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
-                ))
-            }
+                ),
+                [(job_id, run_lease), rest @ ..] => format!(
+                    "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease} and {} more",
+                    rest.len()
+                ),
+            }),
             HydrateError::Awa(err) => err,
         }
     }
