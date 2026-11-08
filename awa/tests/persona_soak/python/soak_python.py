@@ -33,6 +33,11 @@ PACE = float(os.environ.get("SOAK_PACE", "1"))
 QUEUE_WORK = os.environ.get("SOAK_QUEUE_WORK", "awa_soak_py_work")
 QUEUE_DEADLINE = os.environ.get("SOAK_QUEUE_DEADLINE", "awa_soak_py_deadline")
 QUEUE_SHARED = os.environ.get("SOAK_QUEUE_SHARED", "awa_soak_py_shared")
+# The harness passes the timings every Rust runtime uses, so a Python maintenance
+# leader rescues on the same staleness.
+HEARTBEAT_MS = int(os.environ.get("SOAK_HEARTBEAT_MS", "2000"))
+STALENESS_MS = int(os.environ.get("SOAK_STALENESS_MS", "12000"))
+RESCUE_INTERVAL_MS = os.environ.get("SOAK_RESCUE_INTERVAL_MS")
 WORK_WORKERS = 8
 DEADLINE_WORKERS = 16
 SHARED_WORKERS = 6
@@ -325,10 +330,10 @@ async def main():
             {"name": QUEUE_DEADLINE, "max_workers": DEADLINE_WORKERS, "deadline_duration_ms": DEADLINE_MS},
             {"name": QUEUE_SHARED, "max_workers": SHARED_WORKERS},
         ],
-        heartbeat_interval_ms=2000,
-        heartbeat_staleness_ms=12000,
-        heartbeat_rescue_interval_ms=3000,
-        deadline_rescue_interval_ms=2000,
+        heartbeat_interval_ms=HEARTBEAT_MS,
+        heartbeat_staleness_ms=STALENESS_MS,
+        heartbeat_rescue_interval_ms=int(RESCUE_INTERVAL_MS or 3000),
+        deadline_rescue_interval_ms=int(RESCUE_INTERVAL_MS or 2000),
         promote_interval_ms=250,
     )
     # The deadline queue serves a second kind through the same handler.

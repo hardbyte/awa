@@ -396,9 +396,10 @@ impl Context {
                 }
             }
             2 => {
-                // Bulk retry: every exhausted Mia job may come back.
-                self.shared.ledger.mark_where(
-                    |record| record.persona == Persona::Mia && record.has(flag::EXHAUSTED),
+                // Bulk retry: every exhausted job on the infer queue may come back.
+                super::mia::mark_exhausted_in_queue(
+                    &self.shared,
+                    super::mia::INFER_QUEUE,
                     flag::DLQ_RETRIED,
                 );
                 let bulk = ListDlqFilter {
@@ -416,8 +417,9 @@ impl Context {
                 }
             }
             _ => {
-                self.shared.ledger.mark_where(
-                    |record| record.persona == Persona::Mia && record.has(flag::EXHAUSTED),
+                super::mia::mark_exhausted_in_queue(
+                    &self.shared,
+                    super::mia::TRAIN_QUEUE,
                     flag::DLQ_PURGED,
                 );
                 let bulk = ListDlqFilter {
