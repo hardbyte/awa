@@ -4,6 +4,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- Run `awa migrate` once as the schema owner, before or after rolling binaries. It replaces the body of `awa.insert_jobs_compat_batch`, which a 0.6.15 database now reports as the pending `insert_jobs_compat_batch` patch, and takes no table locks. The fix is in the function, so 0.6.15 producers get it as soon as the patch commits. External migration runners: replace `R__insert_jobs_compat_batch.sql` along with the rest of the `R__` set from `awa migrate --extract-to <dir> --from 40`. See the [upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
+
+### Fixed
+
+- `insert_many_copy` and `insert_many_skip_unique_conflicts` no longer deadlock with per-row producers (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) that share their unique keys or lanes. Since 0.6.15, when a per-row transaction held a lane and then inserted a key a waiting batch had claimed, PostgreSQL aborted one of the two with `deadlock detected` (`40P01`). The batch function now never waits longer than half of PostgreSQL's `deadlock_timeout` while it holds claims or lanes: it releases them and tries again, so the per-row transaction proceeds and the batch then treats the keys it committed as already claimed. A transaction that enqueues lanes in separate statements, in the opposite order to a batch, no longer deadlocks with it either. A lane the batch gave up on is awaited first on its next attempt, while it holds nothing, and the caller's `lock_timeout` bounds the whole call. Results and the lane lock window are unchanged.
+
 ## [0.6.15] — 2026-11-09
 
 Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
