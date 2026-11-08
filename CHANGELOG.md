@@ -11,7 +11,7 @@ Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose
 ### Upgrading
 
 - The schema stays at v40. Run `awa migrate` once as the schema owner, before or after rolling binaries, while traffic keeps running. It applies two repeatable patches, `claim_batch_job_index` and `insert_jobs_compat_batch`, which add functions and take no table locks. Binaries can roll back to 0.6.14 with the patches left in place. See the [upgrade guide](docs/upgrade-0.6.14-to-0.6.15.md).
-- External migration runners: apply `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql` after `V40` (`awa migrate --extract-to <dir> --pending`), replacing all `R__` files together.
+- External migration runners: apply `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql` after `V40`. Replace all `R__` files together with the full set from `awa migrate --extract-to <dir> --from 40`; `--pending` lists only the patches a database lacks.
 - Deployments that revoke `EXECUTE` on new functions from `PUBLIC` should grant it on `awa.insert_jobs_compat_batch` to runtime roles; without it, `insert_many_copy` keeps its per-row path.
 
 ### Fixed

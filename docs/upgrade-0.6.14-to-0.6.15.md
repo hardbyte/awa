@@ -20,7 +20,7 @@ Steps 2 and 3 can also run the other way round. A 0.6.15 producer checks for the
 
 ## What `awa migrate` changes
 
-The schema stays at v40. `awa migrate` applies two repeatable schema patches in one transaction, so an interrupted run leaves nothing applied; run it again. Neither takes a lock on any `awa` or queue-storage table, so both are safe under live traffic.
+The schema stays at v40. `awa migrate` applies two repeatable schema patches, each in its own transaction. An interrupted run can leave the first applied and the second not; run it again to apply the rest. Neither takes a lock on any `awa` or queue-storage table, so both are safe under live traffic.
 
 ### `claim_batch_job_index`
 
@@ -64,9 +64,9 @@ Without `EXECUTE`, `insert_many_copy` keeps the per-row path and `insert_many_sk
 
 ### External migration runners
 
-`awa migrate --sql --pending` prints the `R__claim_batch_job_index` and `R__insert_jobs_compat_batch` patches on a 0.6.14 database. To write them as files instead, run `awa migrate --extract-to <dir> --pending` and apply `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql` as repeatable scripts after `V40`. Both are safe inside the runner's transaction and safe to re-run. Run them as the schema owner, which owns the existing `awa` functions and the queue-storage tables.
+`awa migrate --sql --pending` prints the `R__claim_batch_job_index` and `R__insert_jobs_compat_batch` patches on a 0.6.14 database. Apply them as repeatable scripts after `V40`. Both are safe inside the runner's transaction and safe to re-run. Run them as the schema owner, which owns the existing `awa` functions and the queue-storage tables.
 
-Replace the runner's `R__` files with the set the 0.6.15 CLI extracts, together, and keep the `V` files exactly as originally applied.
+`--pending` lists only the patches that database lacks, so its output is not the full repeatable set. Write the full set with `awa migrate --extract-to <dir> --from 40`, which extracts every 0.6.15 `R__` file and no `V` files. Replace the runner's `R__` files with that set, together, and keep the `V` files exactly as originally applied.
 
 ## Worker memory when completions fall behind
 
