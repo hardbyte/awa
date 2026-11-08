@@ -641,6 +641,176 @@ $repair$;
 
 REVOKE EXECUTE ON FUNCTION awa.repair_lane_sequence(TEXT, TEXT) FROM PUBLIC;
 
+-- Installs p_schema.ensure_claim_batch_job_index(p_slot), which adds the GIN
+-- index on job_ids to one lease_claim_batches partition when that partition
+-- is empty and its lock is free, and otherwise does nothing. Building the
+-- index on a populated partition holds SHARE, which blocks claim inserts, for
+-- the whole build (minutes per million batches), so the index is only ever
+-- created on an empty partition: by the installer, or by claim prune right
+-- after it truncates a slot.
+--
+-- fastupdate is off: job ids arrive in ascending order, so direct inserts
+-- append to the right edge of the entry tree and cost no more than the
+-- pending list does, while a pending list would make every lookup read it
+-- (up to gin_pending_list_limit) and push its flush into a claim insert.
+--
+-- The function is SECURITY DEFINER, owned by the owner of lease_claim_batches
+-- (CREATE INDEX needs table ownership), with a pinned search_path. EXECUTE
+-- goes to the roles that may TRUNCATE lease_claim_batches, which are the roles
+-- that run claim prune, rather than to PUBLIC. Replacing it takes no table
+-- locks and reads no rows. The installer calls this too.
+CREATE OR REPLACE FUNCTION awa.refresh_claim_batch_job_index_helper(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $refresh$
+DECLARE
+    v_table_owner OID;
+    v_table_acl ACLITEM[];
+    v_function REGPROCEDURE;
+    v_function_owner OID;
+    v_grantee TEXT;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
+        RAISE EXCEPTION 'refresh_claim_batch_job_index_helper: schema name must match ^[a-z_][a-z0-9_]*$; got %',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT batches.relowner, batches.relacl INTO v_table_owner, v_table_acl
+    FROM pg_class AS batches
+    WHERE batches.oid = to_regclass(format('%I.lease_claim_batches', p_schema));
+    IF v_table_owner IS NULL THEN
+        RAISE EXCEPTION 'refresh_claim_batch_job_index_helper: schema % has no lease_claim_batches table',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.ensure_claim_batch_job_index(p_slot INTEGER)
+        RETURNS BOOLEAN
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp
+        AS $func$
+        DECLARE
+            v_child TEXT;
+            v_index TEXT;
+            v_has_rows BOOLEAN;
+        BEGIN
+            IF p_slot IS NULL OR p_slot < 0 THEN
+                RAISE EXCEPTION 'invalid claim slot: %%', p_slot
+                    USING ERRCODE = '22023';
+            END IF;
+
+            v_child := format('lease_claim_batches_%%s', p_slot);
+            v_index := format('lease_claim_batches_%%s_job_ids_idx', p_slot);
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_inherits AS inheritance
+                WHERE inheritance.inhparent = to_regclass(format('%%I.lease_claim_batches', %1$L))
+                  AND inheritance.inhrelid = to_regclass(format('%%I.%%I', %1$L, v_child))
+            ) THEN
+                RAISE EXCEPTION 'schema %% has no lease_claim_batches partition for claim slot %%',
+                    %1$L, p_slot
+                    USING ERRCODE = '22023';
+            END IF;
+
+            IF EXISTS (
+                SELECT 1
+                FROM pg_index AS idx
+                JOIN pg_class AS index_class ON index_class.oid = idx.indexrelid
+                JOIN pg_am AS method ON method.oid = index_class.relam
+                WHERE idx.indrelid = to_regclass(format('%%I.%%I', %1$L, v_child))
+                  AND method.amname = 'gin'
+                  AND idx.indisvalid
+                  AND pg_get_indexdef(idx.indexrelid) LIKE '%%USING gin (job_ids)%%'
+            ) THEN
+                RETURN TRUE;
+            END IF;
+
+            -- NOWAIT: a partition someone is writing to is not empty for long
+            -- enough to index, so give up rather than queue behind claims.
+            -- Leaving the block through the exception rolls back its
+            -- subtransaction, which releases a lock taken here on a populated
+            -- partition; a lock the caller already held is kept.
+            BEGIN
+                EXECUTE format('LOCK TABLE %%I.%%I IN SHARE MODE NOWAIT', %1$L, v_child);
+                EXECUTE format('SELECT EXISTS (SELECT 1 FROM %%I.%%I)', %1$L, v_child)
+                    INTO v_has_rows;
+                IF v_has_rows THEN
+                    RAISE EXCEPTION USING ERRCODE = 'object_not_in_prerequisite_state';
+                END IF;
+                EXECUTE format(
+                    'CREATE INDEX IF NOT EXISTS %%I ON %%I.%%I USING GIN (job_ids) WITH (fastupdate = off)',
+                    v_index, %1$L, v_child
+                );
+            EXCEPTION
+                WHEN lock_not_available OR object_not_in_prerequisite_state THEN
+                    RETURN FALSE;
+            END;
+            RETURN TRUE;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    v_function := format('%I.ensure_claim_batch_job_index(integer)', p_schema)::regprocedure;
+
+    SELECT routine.proowner INTO v_function_owner
+    FROM pg_proc AS routine
+    WHERE routine.oid = v_function;
+
+    IF v_function_owner <> v_table_owner THEN
+        IF pg_has_role(current_user, v_function_owner, 'USAGE')
+           AND pg_has_role(current_user, v_table_owner, v_set_mode)
+           AND has_schema_privilege(v_table_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format(
+                'ALTER FUNCTION %s OWNER TO %I',
+                v_function,
+                pg_get_userbyid(v_table_owner)
+            );
+        ELSE
+            RAISE WARNING '% is owned by %, not the owner % of %.lease_claim_batches, so it cannot create the job_ids index',
+                v_function, pg_get_userbyid(v_function_owner), pg_get_userbyid(v_table_owner), p_schema
+                USING HINT = format(
+                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                    quote_ident(pg_get_userbyid(v_table_owner)),
+                    quote_ident(pg_get_userbyid(v_table_owner))
+                );
+        END IF;
+    END IF;
+
+    FOR v_grantee IN
+        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+        FROM pg_proc AS routine
+        CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+        WHERE routine.oid = v_function
+          AND acl.privilege_type = 'EXECUTE'
+          AND acl.grantee <> routine.proowner
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', v_function, v_grantee);
+    END LOOP;
+    FOR v_grantee IN
+        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+        FROM aclexplode(COALESCE(v_table_acl, acldefault('r', v_table_owner))) AS acl
+        WHERE acl.privilege_type = 'TRUNCATE'
+    LOOP
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', v_function, v_grantee);
+    END LOOP;
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(TEXT) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -1892,6 +2062,7 @@ BEGIN
             p_schema, v_slot, p_schema, format('lease_claim_batches_%s', v_slot)
         );
 
+
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claim_closure_batches FOR VALUES IN (%s)',
             p_schema, format('lease_claim_closure_batches_%s', v_slot), p_schema, v_slot
@@ -1911,6 +2082,19 @@ BEGIN
             'DROP INDEX IF EXISTS %I.%I',
             p_schema, format('idx_%s_lease_claim_closure_batches_%s_receipt_ids', p_schema, v_slot)
         );
+    END LOOP;
+
+    PERFORM awa.refresh_claim_batch_job_index_helper(p_schema);
+    -- The by-job lookups of compact claims use a GIN index that is only built
+    -- on an empty partition whose lock is free (see
+    -- awa.refresh_claim_batch_job_index_helper). A partition that is populated
+    -- or busy now gains it after claim prune next empties it.
+    FOR v_slot IN 0..(p_claim_slot_count - 1) LOOP
+        BEGIN
+            EXECUTE format('SELECT %I.ensure_claim_batch_job_index($1)', p_schema) USING v_slot;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'claim slot % of schema % keeps scanning for job ids: %', v_slot, p_schema, SQLERRM;
+        END;
     END LOOP;
 
     EXECUTE format(
