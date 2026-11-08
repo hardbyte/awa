@@ -254,6 +254,8 @@ The formal suite includes passing configs and expected-counterexample configs. T
 
 Planned test matrix for the 0.7 cycle, mapped to the [0.7 roadmap](0.7-roadmap.md) and the release gates on the [#383 tracker](https://github.com/hardbyte/awa/issues/383). Rows move into the matrix above as they are implemented.
 
+Rows V10 and V20–V25 are not 0.7 gates: their issues (#118, #14, #340, #341 and #342) moved to 0.8 in the [scope revision](0.7-roadmap.md#scope-revision-2026-11-03).
+
 V25 adds a focused `AwaKeyedExecution` model for grant safety, partial-legacy coverage scope, and the drain/epoch/verify/resume/activate-or-cancel lowering protocol; it also extends `AwaStorageLockOrder` for the short policy transition windows. V26 adds `AwaCallerOwnedCompletion` for completion-versus-rescue atomicity. These names are planned deliverables, not claims that model files already exist.
 
 ### Harness & compatibility
@@ -326,7 +328,7 @@ V25 adds a focused `AwaKeyedExecution` model for grant safety, partial-legacy co
 | V27 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
 | V28 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
 | V29 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
-| V30 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
+| V30 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | Not a 0.7 gate (moved to 0.8) |
 | V31 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
 
 ## Running Tests
