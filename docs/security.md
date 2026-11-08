@@ -120,6 +120,15 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
 -- Keep the queue-storage installer helper migrator/operator-only.
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN)
   FROM awa_runtime;
+-- Keep fleet control mutation operator-only after the broad grants above.
+REVOKE ALL ON awa.runtime_controls FROM awa_runtime;
+GRANT SELECT ON awa.runtime_controls TO awa_runtime;
+REVOKE ALL ON awa.runtime_control_observations FROM awa_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON awa.runtime_control_observations
+  TO awa_runtime;
+REVOKE EXECUTE ON FUNCTION awa.halt_runtime_scope(TEXT, TEXT, TEXT),
+                          awa.resume_runtime_scope(TEXT, UUID)
+  FROM awa_runtime;
 
 -- Default privileges for future migrations.
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
@@ -138,6 +147,8 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
+
+Reapply the control exceptions after any later blanket grants. Inherited mutation privileges must be removed from the granting role as well. Grant halt/resume only to a separate operator role; see [runtime controls](runtime-controls.md#install).
 
 If you use the compatibility `insert_many_copy` path (Rust `InsertOpts::copy()`), also grant:
 
@@ -430,3 +441,11 @@ See [callback receivers](callback-receivers.md) for end-to-end custom-axum and F
 - [Deployment guide](deployment.md)
 - [Configuration](configuration.md)
 - [Troubleshooting](troubleshooting.md)
+
+## Runtime control privileges
+
+[Runtime controls](runtime-controls.md#install) use explicit operator `EXECUTE` grants for halt/resume. Runtime roles need `SELECT` on `awa.runtime_controls` and `SELECT, INSERT, UPDATE, DELETE` on `awa.runtime_control_observations`. Operators need `SELECT` on both tables and `awa.runtime_instances`, plus `EXECUTE` on the halt/resume functions. Neither role should receive direct control-table writes.
+
+The patch removes mutation privileges from `PUBLIC` and runtime/producer roles, including broad defaults, while preserving explicit operator grants on replay. Reapply the exceptions after blanket table or function grants and remove inherited mutation privileges from the granting role. Schema owners and superusers retain administrative authority.
+
+This boundary protects the requested halt and resume; status confirmation trusts runtime credentials. Runtime roles can write arbitrary rows in `awa.runtime_control_observations` and delete registrations in `awa.runtime_instances`. A holder of those credentials can forge another runtime's halted report or remove an unobserving runtime from status. `halted` is therefore not tamper-evident proof against runtime-role holders. Moving report writes into a `SECURITY DEFINER` function alone would neither authenticate individual runtimes sharing a database role nor prevent registration deletion. Protect and trust runtime credentials, revoke or fence compromised processes, and upgrade or fence every old binary that could become maintenance leader before relying on the halt.

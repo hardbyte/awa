@@ -4,6 +4,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- Run `awa migrate` once as the schema owner to apply `prune_controls` after the existing `claim_batch_job_index` and `insert_jobs_compat_batch` patches. It adds two tables and functions without altering existing tables; schema stays v40. Upgrade or fence every possible maintenance leader before relying on halt. See the [0.6.15 to 0.6.16 upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
+
+### Added
+
+- Durable operator halt/resume for `maintenance.prune`, in drain mode. Compatible leaders observe it on their existing session; dispatch, cron, promotion, rescue and enqueue continue. Status lists live runtimes without supported, recent reports and cannot report the fleet halted while any remain. Older binaries ignore the control. See [runtime controls](docs/runtime-controls.md).
+
 ## [0.6.15] — 2026-11-09
 
 Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.

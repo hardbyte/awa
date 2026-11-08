@@ -13,6 +13,7 @@ pub mod maintenance;
 pub mod metrics;
 mod notify_hub;
 mod runtime;
+mod runtime_control;
 mod storage;
 
 // Re-exports

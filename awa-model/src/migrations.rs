@@ -491,6 +491,18 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         sql: include_str!("../migrations/patches/insert_jobs_compat_batch.sql"),
         applied_probe: crate::insert::BATCH_FUNCTION_PATCH_APPLIED_SQL,
     },
+    SchemaPatch {
+        name: "prune_controls",
+        description: "Durable operator control for maintenance pruning",
+        // Ordinary awa objects only: do not embed or refresh v023. This patch
+        // is independent of substrate installer refreshes.
+        sql: include_str!("../migrations/patches/prune_controls.sql"),
+        applied_probe: "SELECT to_regclass('awa.runtime_controls') IS NOT NULL \
+            AND to_regprocedure('awa.halt_runtime_scope(text,text,text)') IS NOT NULL \
+            AND to_regprocedure('awa.resume_runtime_scope(text,uuid)') IS NOT NULL \
+            AND to_regprocedure('awa.prune_controls_protocol_version()') IS NOT NULL \
+            AND to_regclass('awa.runtime_control_observations') IS NOT NULL",
+    },
 ];
 
 /// Schema patches a database still needs to reach this binary's schema shape.
