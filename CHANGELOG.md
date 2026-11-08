@@ -11,6 +11,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Fixed
 
 - Admin job lists and kind counts work on a queue-storage schema installed with more claim slots than the default, instead of failing with `invalid physical claim slot`.
+- Heartbeat, deadline and callback rescue reach the stale attempts behind a full batch of attempts whose retained ready bodies are ambiguous. Before, every pass selected the same ambiguous attempts first, left them running, and rescued nothing else. A pass now sets all of a batch's ambiguous attempts aside at once.
+- Admin kind counts read each claim slot's receipt closures from that slot's partitions only, so they no longer wait behind claim-ring prune of another slot.
+- A `Completed` lifecycle event of a job with a deadline no longer carries the finished attempt's `heartbeat_at` and `deadline_at`; both are `None`, as a read of the completed job returns them.
 
 ## [0.6.14] — 2026-11-08
 
