@@ -127,7 +127,10 @@ a time-period bucket. Defaults: dedup by args, not by queue. Conflict handling
 depends on the API: a single-row `insert` / `insert_with` and the row-by-row
 `insert_many` **raise `AwaError::UniqueConflict`** (Python raises the
 corresponding error) on a duplicate — you must handle it, do not assume a silent
-no-op. Only the COPY bulk path (`insert_many_copy`) silently skips duplicates.
+no-op. Two batch paths skip duplicates instead: `insert_many_copy` (needs a
+connection) and Rust `insert_many_skip_unique_conflicts`, which takes any
+`PgExecutor` and needs migration v055. Both return only the inserted rows, in
+input order; a job whose key is already claimed is left out of the result.
 Cancel without storing the id via `cancel_by_unique_key(kind, queue=, args=,
 period_bucket=)` — the components must match those used at insert. It cancels
 the oldest live job holding the key. On queue storage, a `by_queue` key is
@@ -259,7 +262,10 @@ Rust exposes two hook families on the client builder:
 - **Observation hooks** (`.on_event` / `.on_event_kind`) fire best-effort in
   process for `Started`, `Completed`, `Retried`, `Exhausted`, `Cancelled`,
   `Rescued`, `WaitingForCallback`. They are **not** a durable workflow — they can
-  be lost on crash and `shutdown()` does not wait for them.
+  be lost on crash and `shutdown()` does not wait for them. Each attempt's hooks
+  hold one of the worker's finalizer slots until they return, so hooks slower
+  than job throughput slow claiming. Keep them fast and move slow work into a
+  job or a durable follow-up.
 - **Durable follow-up hooks** (`on_completed_enqueue`, `on_exhausted_enqueue`,
   and the other `on_*_enqueue`) INSERT a follow-up job for side effects that must
   survive a crash. Atomicity depends on what triggered them:
