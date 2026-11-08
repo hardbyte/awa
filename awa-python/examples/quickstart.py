@@ -1,6 +1,6 @@
 """Awa Python quickstart — a complete runnable example.
 
-Requires: uv add awa-pg==0.6.6
+Requires: uv add awa-pg
 Requires: a running Postgres instance with DATABASE_URL set.
 
 Usage from the repository's awa-python directory:
