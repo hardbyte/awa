@@ -10,7 +10,7 @@ use sqlx::Acquire;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
 use std::cmp::max;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -684,50 +684,43 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
     )
 }
 
-/// The per-kind, per-queue counts behind [`job_kind_overviews`], as a
-/// `kind_counts` CTE of `kind`, `job_count`, `queue_count` and
-/// `completed_last_hour`.
-///
-/// It counts what `current_jobs` holds without expanding it. Each place a job
-/// can live is aggregated to `(kind, queue)` on its own, as a `MATERIALIZED`
-/// CTE, and only those few rows are combined. Read through `current_jobs`,
-/// the receipt-batch join to `ready_entries` and the `UNION ALL` are both
-/// estimated at one row whatever the statistics say, so Postgres chooses
-/// nested loops that probe once per retained row, and a join on
-/// `queue_claim_heads` is only as good as that table's estimate.
-///
-/// Available rows are found per lane as a claim finds them (see
-/// [`crate::queue_storage::available_by_queue_sql`]). A completion batch
-/// member's kind lives on its ready row, so that leg unnests each batch and
-/// probes the ready primary key.
-fn queue_storage_kind_counts_cte(schema: &str) -> String {
+// Per-source kind/queue counts keep the same joins and predicates as the
+// combined projection, while allowing each source's relation locks to end
+// before another source opens a different set of retained partitions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KindCountSource {
+    Available,
+    Leased,
+    Deferred,
+    Done,
+    Receipts,
+    Dlq,
+}
+
+// Generate only this source's relations: unused CTEs would still acquire
+// relation locks during parse/plan before execution could discard them.
+fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) -> String {
     let available =
         crate::queue_storage::available_lane_rows_sql(schema, "heads", "ready.kind", "TRUE");
-    let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
-    format!(
-        r#"
-        heads AS MATERIALIZED (
-            SELECT
-                claims.queue,
-                claims.priority,
-                claims.enqueue_shard,
-                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
-            FROM {schema}.queue_claim_heads AS claims
-            JOIN {schema}.queue_enqueue_heads AS enqueues
-              ON enqueues.queue = claims.queue
-             AND enqueues.priority = claims.priority
-             AND enqueues.enqueue_shard = claims.enqueue_shard
-        ),
-        available_by_kind AS MATERIALIZED (
+    match source {
+        KindCountSource::Available => format!(
+            r#"
+        WITH heads AS MATERIALIZED (
+            SELECT queue, priority, enqueue_shard, claim_seq, next_seq
+            FROM unnest(
+                $1::text[], $2::smallint[], $3::smallint[], $4::bigint[], $5::bigint[]
+            ) AS captured(queue, priority, enqueue_shard, claim_seq, next_seq)
+        )
             SELECT lane.kind, heads.queue, count(*)::bigint AS n, 0::bigint AS n_recent
             FROM heads
             CROSS JOIN LATERAL (
                 {available}
             ) AS lane
             GROUP BY lane.kind, heads.queue
+            "#
         ),
-        leased_by_kind AS MATERIALIZED (
+        KindCountSource::Leased => format!(
+            r#"
             SELECT ready.kind, leases.queue, count(*)::bigint AS n, 0::bigint AS n_recent
             FROM {schema}.leases AS leases
             JOIN {schema}.ready_entries AS ready
@@ -751,27 +744,17 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
                    AND tomb.lane_seq = ready.lane_seq
              )
             GROUP BY ready.kind, leases.queue
+            "#
         ),
-        deferred_by_kind AS MATERIALIZED (
+        KindCountSource::Deferred => format!(
+            r#"
             SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
             FROM {schema}.deferred_jobs
             GROUP BY kind, queue
+            "#
         ),
-        -- Receipt claims that are still open are running; a queue or priority
-        -- move copies a ready row with its kind, so any one of the job's
-        -- ready rows gives it.
-        running_by_kind AS MATERIALIZED (
-            SELECT created.kind, open_claims.queue, count(*)::bigint AS n, 0::bigint AS n_recent
-            FROM ({open_running}) AS open_claims
-            CROSS JOIN LATERAL (
-                SELECT ready.kind
-                FROM {schema}.ready_entries AS ready
-                WHERE ready.job_id = open_claims.job_id
-                LIMIT 1
-            ) AS created
-            GROUP BY created.kind, open_claims.queue
-        ),
-        done_by_kind AS MATERIALIZED (
+        KindCountSource::Done => format!(
+            r#"
             SELECT
                 kind,
                 queue,
@@ -782,8 +765,10 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
                 )::bigint AS n_recent
             FROM {schema}.done_entries
             GROUP BY kind, queue
+            "#
         ),
-        receipts_by_kind AS MATERIALIZED (
+        KindCountSource::Receipts => format!(
+            r#"
             SELECT
                 ready.kind,
                 batch.queue,
@@ -819,23 +804,25 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
                   AND tomb.run_lease = item.run_lease
             )
             GROUP BY ready.kind, batch.queue
+            "#
         ),
-        dlq_by_kind AS MATERIALIZED (
+        KindCountSource::Dlq => format!(
+            r#"
             SELECT kind, queue, count(*)::bigint AS n, 0::bigint AS n_recent
             FROM {schema}.dlq_entries
             GROUP BY kind, queue
+            "#
         ),
+    }
+}
+
+// Merge small (kind, queue) aggregates from separately locked read sources.
+fn queue_storage_kind_counts_cte() -> &'static str {
+    r#"
         kind_queue AS (
             SELECT kind, queue, sum(n)::bigint AS n, sum(n_recent)::bigint AS n_recent
-            FROM (
-                SELECT * FROM available_by_kind
-                UNION ALL SELECT * FROM leased_by_kind
-                UNION ALL SELECT * FROM deferred_by_kind
-                UNION ALL SELECT * FROM running_by_kind
-                UNION ALL SELECT * FROM done_by_kind
-                UNION ALL SELECT * FROM receipts_by_kind
-                UNION ALL SELECT * FROM dlq_by_kind
-            ) AS legs
+            FROM unnest($1::text[], $2::text[], $3::bigint[], $4::bigint[])
+                AS sources(kind, queue, n, n_recent)
             GROUP BY kind, queue
         ),
         kind_counts AS (
@@ -847,8 +834,7 @@ fn queue_storage_kind_counts_cte(schema: &str) -> String {
             FROM kind_queue
             GROUP BY kind
         )
-        "#
-    )
+    "#
 }
 
 async fn notify_cancellation_tx<'a>(
@@ -864,14 +850,21 @@ async fn notify_cancellation_tx<'a>(
     Ok(())
 }
 
-/// Candidate job ids for [`list_jobs`]: the newest `limit` ids below `cursor`
-/// matching `filter`'s state, kind and queue, newest first, with the binds the
-/// statement takes in order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobCandidateSource {
+    States,
+    Receipts(usize),
+}
+
+/// Candidate job ids for [`list_jobs`] from one source: the newest `limit`
+/// distinct ids below `cursor`, with the statement's binds in order. State
+/// sources apply kind/state/queue filters. Receipt sources enumerate open
+/// claims in one physical slot and apply kind/queue before their limit.
 ///
-/// It selects what `current_jobs` would with the same filter, but each place a
-/// job can live is read and limited on its own, with only the legs that can
-/// hold the requested state, and the filter written into the statement rather
-/// than as `$n IS NULL OR` terms that a generic plan can't drop. Read through
+/// Each place a job can live is read and limited on its own, with only the
+/// state legs that can hold the requested state. Known filters are written
+/// into the statement rather than as `$n IS NULL OR` terms that a generic plan
+/// can't drop. Read through
 /// `current_jobs`, Postgres joins every retained completion to a scan of the
 /// ready rows, because that join and the `UNION ALL` are each estimated at one
 /// row. Available rows are found per lane as a claim finds them, and a
@@ -883,13 +876,17 @@ fn queue_storage_job_id_candidates_sql(
     filter: &ListJobsFilter,
     cursor: Option<i64>,
     limit: i64,
+    source: JobCandidateSource,
 ) -> (String, Vec<CandidateBind>) {
     let mut binds = Vec::new();
     let mut bind = |value: CandidateBind| {
         binds.push(value);
         format!("${}", binds.len())
     };
-    let state = filter.state.map(|state| bind(CandidateBind::State(state)));
+    let state = filter
+        .state
+        .filter(|_| source == JobCandidateSource::States)
+        .map(|state| bind(CandidateBind::State(state)));
     let kind = filter
         .kind
         .as_ref()
@@ -923,9 +920,10 @@ fn queue_storage_job_id_candidates_sql(
         sql
     };
     let holds = |states: &[JobState]| {
-        filter
-            .state
-            .is_none_or(|requested| states.contains(&requested))
+        source == JobCandidateSource::States
+            && filter
+                .state
+                .is_none_or(|requested| states.contains(&requested))
     };
 
     let mut legs: Vec<String> = Vec::new();
@@ -964,7 +962,7 @@ fn queue_storage_job_id_candidates_sql(
         );
         legs.push(format!(
             r#"(
-                SELECT lane.job_id
+                SELECT DISTINCT lane.job_id
                 FROM heads
                 CROSS JOIN LATERAL ({lane_rows}) AS lane
                 ORDER BY lane.job_id DESC
@@ -976,7 +974,7 @@ fn queue_storage_job_id_candidates_sql(
         let predicates = predicates(Some("state"), Some("kind"), "queue", "job_id");
         legs.push(format!(
             r#"(
-                SELECT job_id
+                SELECT DISTINCT job_id
                 FROM {schema}.deferred_jobs
                 WHERE TRUE{predicates}
                 ORDER BY job_id DESC
@@ -993,7 +991,7 @@ fn queue_storage_job_id_candidates_sql(
         );
         legs.push(format!(
             r#"(
-                SELECT leases.job_id
+                SELECT DISTINCT leases.job_id
                 FROM {schema}.leases AS leases
                 JOIN {schema}.ready_entries AS ready
                   ON ready.ready_slot = leases.ready_slot
@@ -1021,8 +1019,9 @@ fn queue_storage_job_id_candidates_sql(
             )"#
         ));
     }
-    if holds(&[JobState::Running]) {
-        let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
+    if let JobCandidateSource::Receipts(slot) = source {
+        let open_running =
+            crate::queue_storage::open_receipt_running_claims_sql_in_slot(schema, slot);
         let predicates = predicates(
             None,
             Some("created.kind"),
@@ -1031,7 +1030,7 @@ fn queue_storage_job_id_candidates_sql(
         );
         legs.push(format!(
             r#"(
-                SELECT open_claims.job_id
+                SELECT DISTINCT open_claims.job_id
                 FROM ({open_running}) AS open_claims
                 CROSS JOIN LATERAL (
                     SELECT ready.kind
@@ -1049,7 +1048,7 @@ fn queue_storage_job_id_candidates_sql(
         let predicates = predicates(Some("state"), Some("kind"), "queue", "job_id");
         legs.push(format!(
             r#"(
-                SELECT job_id
+                SELECT DISTINCT job_id
                 FROM {schema}.done_entries
                 WHERE TRUE{predicates}
                 ORDER BY job_id DESC
@@ -1065,7 +1064,7 @@ fn queue_storage_job_id_candidates_sql(
             .unwrap_or_default();
         legs.push(format!(
             r#"(
-                SELECT member.job_id
+                SELECT DISTINCT member.job_id
                 FROM (
                     SELECT
                         batch.ready_slot,
@@ -1114,7 +1113,7 @@ fn queue_storage_job_id_candidates_sql(
         let predicates = predicates(None, Some("kind"), "queue", "job_id");
         legs.push(format!(
             r#"(
-                SELECT job_id
+                SELECT DISTINCT job_id
                 FROM {schema}.dlq_entries
                 WHERE TRUE{predicates}
                 ORDER BY job_id DESC
@@ -1126,7 +1125,7 @@ fn queue_storage_job_id_candidates_sql(
     let sql = format!(
         r#"
         {with}
-        SELECT job_id
+        SELECT DISTINCT job_id
         FROM ({legs}) AS candidates
         ORDER BY job_id DESC
         LIMIT {limit}
@@ -1145,6 +1144,34 @@ enum CandidateBind {
     Int(i64),
 }
 
+async fn fetch_queue_storage_job_candidates(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sql: &str,
+    binds: Vec<CandidateBind>,
+) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query("SAVEPOINT awa_list_candidates")
+        .execute(tx.as_mut())
+        .await?;
+    let mut query = sqlx::query_scalar::<_, i64>(audited_sql(sql));
+    for value in binds {
+        query = match value {
+            CandidateBind::State(state) => query.bind(state),
+            CandidateBind::Text(text) => query.bind(text),
+            CandidateBind::Int(int) => query.bind(int),
+        };
+    }
+    let ids = query.fetch_all(tx.as_mut()).await?;
+    // Keep the outer repeatable-read snapshot, but release this read phase's
+    // relation locks. Destroy the savepoint too rather than stacking names.
+    sqlx::query("ROLLBACK TO SAVEPOINT awa_list_candidates")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT awa_list_candidates")
+        .execute(tx.as_mut())
+        .await?;
+    Ok(ids)
+}
+
 async fn list_queue_storage_jobs(
     store: &QueueStorage,
     pool: &PgPool,
@@ -1161,26 +1188,65 @@ async fn list_queue_storage_jobs(
     let mut cursor = filter.before_id;
 
     loop {
-        let (sql, binds) =
-            queue_storage_job_id_candidates_sql(store.schema(), filter, cursor, candidate_limit);
-        let mut query = sqlx::query_scalar::<_, i64>(audited_sql(sql));
-        for value in binds {
-            query = match value {
-                CandidateBind::State(state) => query.bind(state),
-                CandidateBind::Text(text) => query.bind(text),
-                CandidateBind::Int(int) => query.bind(int),
-            };
-        }
-        // As in `queue_overviews`: compiling costs more than running.
+        // Every candidate phase sees the same MVCC snapshot. Each phase
+        // releases its own read locks before the next one opens more tables.
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await?;
         begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
-        let ids: Vec<i64> = query.fetch_all(tx.as_mut()).await?;
+        let states = filter.state.map_or_else(
+            || {
+                vec![
+                    JobState::Available,
+                    JobState::Scheduled,
+                    JobState::Retryable,
+                    JobState::Running,
+                    JobState::WaitingExternal,
+                    JobState::Completed,
+                    JobState::Failed,
+                    JobState::Cancelled,
+                ]
+            },
+            |state| vec![state],
+        );
+        let mut ids = BTreeSet::new();
+        for state in states {
+            let mut phase_filter = filter.clone();
+            phase_filter.state = Some(state);
+            let (sql, binds) = queue_storage_job_id_candidates_sql(
+                store.schema(),
+                &phase_filter,
+                cursor,
+                candidate_limit,
+                JobCandidateSource::States,
+            );
+            ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
+        }
+        if filter.state.is_none_or(|state| state == JobState::Running) {
+            for slot in queue_storage_populated_claim_slots(&mut tx, store).await? {
+                let (sql, binds) = queue_storage_job_id_candidates_sql(
+                    store.schema(),
+                    filter,
+                    cursor,
+                    candidate_limit,
+                    JobCandidateSource::Receipts(slot),
+                );
+                ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
+            }
+        }
         tx.commit().await?;
         drop(begin_guard);
+        let ids: Vec<i64> = ids
+            .into_iter()
+            .rev()
+            .take(candidate_limit as usize)
+            .collect();
         if ids.is_empty() {
             break;
         }
@@ -3797,6 +3863,173 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
     Ok(rows.into_iter().collect())
 }
 
+#[derive(sqlx::FromRow)]
+struct KindCountHead {
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    claim_seq: i64,
+    next_seq: i64,
+}
+
+// Sequence values do not obey MVCC. Capture them with the first read's
+// snapshot instead of letting later claims advance them during receipt phases.
+async fn queue_storage_kind_heads(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    store: &QueueStorage,
+) -> Result<Vec<KindCountHead>, sqlx::Error> {
+    let schema = store.schema();
+    sqlx::query("SAVEPOINT awa_kind_heads")
+        .execute(tx.as_mut())
+        .await?;
+    let heads = sqlx::query_as::<_, KindCountHead>(audited_sql(format!(
+        r#"
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
+            FROM {schema}.queue_claim_heads AS claims
+            JOIN {schema}.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+    "#
+    )))
+    .fetch_all(tx.as_mut())
+    .await?;
+    sqlx::query("ROLLBACK TO SAVEPOINT awa_kind_heads")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT awa_kind_heads")
+        .execute(tx.as_mut())
+        .await?;
+    Ok(heads)
+}
+
+async fn queue_storage_base_kind_counts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    store: &QueueStorage,
+    heads: Vec<KindCountHead>,
+) -> Result<Vec<(String, String, i64, i64)>, sqlx::Error> {
+    let mut head_queues = Vec::with_capacity(heads.len());
+    let mut head_priorities = Vec::with_capacity(heads.len());
+    let mut head_shards = Vec::with_capacity(heads.len());
+    let mut claim_seqs = Vec::with_capacity(heads.len());
+    let mut next_seqs = Vec::with_capacity(heads.len());
+    for head in heads {
+        head_queues.push(head.queue);
+        head_priorities.push(head.priority);
+        head_shards.push(head.enqueue_shard);
+        claim_seqs.push(head.claim_seq);
+        next_seqs.push(head.next_seq);
+    }
+    let mut counts = Vec::new();
+    for source in [
+        KindCountSource::Available,
+        KindCountSource::Leased,
+        KindCountSource::Deferred,
+        KindCountSource::Done,
+        KindCountSource::Receipts,
+        KindCountSource::Dlq,
+    ] {
+        let sql = queue_storage_kind_count_source_sql(store.schema(), source);
+        sqlx::query("SAVEPOINT awa_kind_source")
+            .execute(tx.as_mut())
+            .await?;
+        let mut query = sqlx::query_as::<_, (String, String, i64, i64)>(audited_sql(sql));
+        if source == KindCountSource::Available {
+            query = query
+                .bind(&head_queues)
+                .bind(&head_priorities)
+                .bind(&head_shards)
+                .bind(&claim_seqs)
+                .bind(&next_seqs);
+        }
+        counts.extend(query.fetch_all(tx.as_mut()).await?);
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_kind_source")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT awa_kind_source")
+            .execute(tx.as_mut())
+            .await?;
+    }
+    Ok(counts)
+}
+
+// The result is bounded by the installed claim-ring slot count, not by
+// retained job volume. Include all populated slots, including old generations.
+async fn queue_storage_populated_claim_slots(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    store: &QueueStorage,
+) -> Result<Vec<usize>, AwaError> {
+    let schema = store.schema();
+    sqlx::query("SAVEPOINT awa_claim_slots")
+        .execute(tx.as_mut())
+        .await?;
+    let slots: Vec<i32> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT claim_slot FROM {schema}.lease_claims WHERE closed_at IS NULL \
+         UNION SELECT claim_slot FROM {schema}.lease_claim_batches ORDER BY claim_slot"
+    )))
+    .fetch_all(tx.as_mut())
+    .await?;
+    sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_slots")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT awa_claim_slots")
+        .execute(tx.as_mut())
+        .await?;
+    // A schema-only admin store carries the default slot count, so take the
+    // installed slot numbers as they are rather than bounding them by it.
+    slots
+        .into_iter()
+        .map(|slot| crate::queue_storage::ring_slot_number(slot, "claim"))
+        .collect()
+}
+
+// Keep only per-kind, per-queue aggregates in Rust, not every claim identity.
+async fn queue_storage_running_kind_counts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    store: &QueueStorage,
+) -> Result<Vec<(String, String, i64)>, AwaError> {
+    let schema = store.schema();
+    let slots = queue_storage_populated_claim_slots(tx, store).await?;
+    let mut counts = Vec::new();
+    for slot in slots {
+        let open_running =
+            crate::queue_storage::open_receipt_running_claims_sql_in_slot(schema, slot);
+        sqlx::query("SAVEPOINT awa_kind_counts")
+            .execute(tx.as_mut())
+            .await?;
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(audited_sql(format!(
+            r#"
+            -- A queue or priority move copies a ready row with its kind, so
+            -- any one of the job's ready rows gives it.
+            SELECT created.kind, open_claims.queue, count(*)::bigint
+            FROM ({open_running}) AS open_claims
+            CROSS JOIN LATERAL (
+                SELECT ready.kind
+                FROM {schema}.ready_entries AS ready
+                WHERE ready.job_id = open_claims.job_id
+                LIMIT 1
+            ) AS created
+            GROUP BY created.kind, open_claims.queue
+        "#
+        )))
+        .fetch_all(tx.as_mut())
+        .await?;
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_kind_counts")
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT awa_kind_counts")
+            .execute(tx.as_mut())
+            .await?;
+        counts.extend(rows);
+    }
+    Ok(counts)
+}
+
 /// Get job-kind overviews for all known kinds.
 pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
@@ -3849,17 +4082,43 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
             ORDER BY k.kind
             "#,
-            kind_counts_cte = queue_storage_kind_counts_cte(store.schema())
+            kind_counts_cte = queue_storage_kind_counts_cte()
         );
 
         // As in `queue_overviews`: compiling costs more than running.
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await?;
         begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
             .await?;
+        let heads = queue_storage_kind_heads(&mut tx, &store).await?;
+        let mut sources = queue_storage_base_kind_counts(&mut tx, &store, heads).await?;
+        sources.extend(
+            queue_storage_running_kind_counts(&mut tx, &store)
+                .await?
+                .into_iter()
+                .map(|(kind, queue, n)| (kind, queue, n, 0)),
+        );
+        let mut kinds = Vec::with_capacity(sources.len());
+        let mut queues = Vec::with_capacity(sources.len());
+        let mut counts = Vec::with_capacity(sources.len());
+        let mut recent_counts = Vec::with_capacity(sources.len());
+        for (kind, queue, count, recent) in sources {
+            kinds.push(kind);
+            queues.push(queue);
+            counts.push(count);
+            recent_counts.push(recent);
+        }
         let rows = sqlx::query_as::<_, JobKindOverview>(audited_sql(sql))
+            .bind(kinds)
+            .bind(queues)
+            .bind(counts)
+            .bind(recent_counts)
             .fetch_all(tx.as_mut())
             .await?;
         tx.commit().await?;

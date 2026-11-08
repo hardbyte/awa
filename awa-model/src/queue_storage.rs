@@ -964,7 +964,7 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
-fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
+pub(crate) fn ring_slot_number(slot: i32, ring: &str) -> Result<usize, AwaError> {
     usize::try_from(slot).map_err(|_| {
         AwaError::Validation(format!(
             "invalid {ring} ring slot {slot}: slot must be non-negative"
@@ -1477,8 +1477,34 @@ pub fn open_receipt_running_claims_sql(schema: &str) -> String {
 /// retained batch header is read, but only batches holding one of the jobs
 /// are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
-    let closure_rel = format!("{schema}.lease_claim_closures");
-    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+    open_receipt_running_claims_sql_from(schema, job_ids, None)
+}
+
+/// The same open-claim projection, scoped to one physical claim slot.
+/// Ready and terminal history are deliberately not restricted to that slot.
+pub(crate) fn open_receipt_running_claims_sql_in_slot(schema: &str, slot: usize) -> String {
+    open_receipt_running_claims_sql_from(schema, None, Some(slot))
+}
+
+fn open_receipt_running_claims_sql_from(
+    schema: &str,
+    job_ids: Option<&str>,
+    slot: Option<usize>,
+) -> String {
+    let (claims_rel, batches_rel, closure_rel, closure_batch_rel) = match slot {
+        Some(slot) => (
+            claim_child_name(schema, slot),
+            claim_batch_child_name(schema, slot),
+            closure_child_name(schema, slot),
+            claim_closure_batch_child_name(schema, slot),
+        ),
+        None => (
+            format!("{schema}.lease_claims"),
+            format!("{schema}.lease_claim_batches"),
+            format!("{schema}.lease_claim_closures"),
+            format!("{schema}.lease_claim_closure_batches"),
+        ),
+    };
     let row_open = receipt_evidence_sql(
         schema,
         &closure_rel,
@@ -1496,7 +1522,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
     format!(
         r#"
         SELECT claims.job_id, claims.run_lease, claims.queue
-        FROM {schema}.lease_claims AS claims
+        FROM {claims_rel} AS claims
         WHERE {row_filter}{row_open}
           AND NOT EXISTS (
               SELECT 1 FROM {schema}.leases AS lease
@@ -1505,7 +1531,7 @@ pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<
           )
         UNION ALL
         SELECT items.job_id, items.run_lease, batches.queue
-        FROM {schema}.lease_claim_batches AS batches
+        FROM {batches_rel} AS batches
         CROSS JOIN LATERAL unnest(
             batches.job_ids,
             batches.run_leases,

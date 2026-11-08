@@ -22648,6 +22648,418 @@ async fn test_moved_ready_row_is_joined_once_by_compact_receipt_reads() {
     moved_ready_row_is_joined_once_by_attempt_reads(true).await;
 }
 
+async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -> Vec<i64> {
+    admin::list_jobs(pool, &filter)
+        .await
+        .expect("list receipt-held jobs")
+        .into_iter()
+        .map(|job| job.id)
+        .collect()
+}
+
+async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = if receipts {
+        "awa_qs_admin_scope_compact"
+    } else {
+        "awa_qs_admin_scope_leases"
+    };
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            lease_claim_receipts: receipts,
+            ..unique_cancel_store_config(schema)
+        },
+    )
+    .await;
+    let queue = "receipt_admin_scope";
+    let other_queue = "receipt_admin_other";
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let other_kind = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 3 },
+        InsertOpts {
+            queue: queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let other = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4 },
+        InsertOpts {
+            queue: other_queue.into(),
+            tags: vec!["selected".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let deadline = if receipts {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(30)
+    };
+    let mut claims = store
+        .claim_runtime_batch(&pool, queue, 3, deadline)
+        .await
+        .unwrap();
+    if receipts {
+        assert!(matches!(
+            store
+                .rotate_claims(&pool)
+                .await
+                .expect("rotate between queues"),
+            RotateOutcome::Rotated { slot: 1, .. }
+        ));
+    }
+    claims.extend(
+        store
+            .claim_runtime_batch(&pool, other_queue, 1, deadline)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(claims.len(), 4);
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.lease_claim_receipt == receipts));
+    assert!(claims
+        .iter()
+        .all(|claim| claim.claim.claim_batch_id.is_some() == receipts));
+
+    let scoped = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        kind: Some(CompleteJob::kind().into()),
+        queue: Some(queue.into()),
+        tag: Some("selected".into()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(receipt_admin_ids(&pool, scoped.clone()).await, vec![second]);
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                before_id: Some(second),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![first]
+    );
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: Some(first),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            tag: Some("absent".into()),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert!(receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            state: Some(JobState::WaitingExternal),
+            ..scoped.clone()
+        }
+    )
+    .await
+    .is_empty());
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                state: None,
+                limit: Some(10),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![second, first]
+    );
+
+    let projected: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
+        "{} SELECT job_id FROM current_jobs WHERE state='running' ORDER BY job_id DESC",
+        admin::queue_storage_current_jobs_cte(schema)
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projected, vec![other, other_kind, second, first]);
+    let kinds = admin::job_kind_overviews(&pool).await.unwrap();
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!((complete.job_count, complete.queue_count), (3, 2));
+    let alternate = kinds
+        .iter()
+        .find(|kind| kind.kind == DlqJob::kind())
+        .unwrap();
+    assert_eq!((alternate.job_count, alternate.queue_count), (1, 1));
+
+    // Materialization keeps the same attempt running. The receipt leg must
+    // yield to the lease leg rather than report both representations.
+    let first_claim = claims.iter().find(|claim| claim.job.id == first).unwrap();
+    store
+        .register_callback(
+            &pool,
+            first,
+            first_claim.job.run_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("materialize one running attempt");
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                limit: Some(10),
+                ..scoped.clone()
+            }
+        )
+        .await,
+        vec![second, first]
+    );
+    let running: i64 = sqlx::query_scalar(audited_sql(format!(
+        "{} SELECT count(*) FROM current_jobs WHERE state='running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 4, "materialization does not duplicate the claim");
+
+    let closed = claims
+        .iter()
+        .find(|claim| claim.job.id == second)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &[closed])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                limit: Some(10),
+                ..scoped
+            }
+        )
+        .await,
+        vec![first],
+        "closed receipts leave running enumeration"
+    );
+    let running: i64 = sqlx::query_scalar(audited_sql(format!(
+        "{} SELECT count(*) FROM current_jobs WHERE state='running'",
+        admin::queue_storage_current_jobs_cte(schema)
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(running, 3);
+    let kinds = admin::job_kind_overviews(&pool).await.unwrap();
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .unwrap();
+    assert_eq!(
+        (complete.job_count, complete.queue_count),
+        (3, 2),
+        "the completed job is counted once, not as both running and terminal"
+    );
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_compact() {
+    receipt_admin_reads_preserve_scope_and_disposition(true).await;
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_materialized_control() {
+    receipt_admin_reads_preserve_scope_and_disposition(false).await;
+}
+
+#[tokio::test]
+async fn test_receipt_list_refills_pages_past_closed_and_other_kind_claims() {
+    let (_guard, pool) = setup_pool(6).await;
+    let queue = "receipt_candidate_refill";
+    let store = create_store_with_config(
+        &pool,
+        unique_cancel_store_config("awa_qs_receipt_candidate_refill"),
+    )
+    .await;
+    let mut targets = Vec::new();
+    for id in 0..3 {
+        targets.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    tags: vec!["selected".into()],
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let targets_claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("claim older targets");
+    assert_eq!(targets_claimed.len(), 3);
+    let first_target = targets_claimed
+        .iter()
+        .find(|claim| claim.job.id == targets[0])
+        .expect("first target was claimed");
+    // The same job appears in both the lease and raw-receipt candidate sources.
+    store
+        .register_callback(
+            &pool,
+            targets[0],
+            first_target.job.run_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("materialize one target");
+
+    let mut all_ids = targets.clone();
+    for id in 10..22 {
+        all_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 12, Duration::ZERO)
+        .await
+        .expect("claim newer completed candidates");
+    assert_eq!(finished.len(), 12);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &finished)
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+    for id in 30..42 {
+        all_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &DlqJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        store
+            .claim_runtime_batch(&pool, queue, 12, Duration::ZERO)
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+
+    let filter = admin::ListJobsFilter {
+        state: Some(JobState::Running),
+        kind: Some(CompleteJob::kind().into()),
+        queue: Some(queue.into()),
+        limit: Some(2),
+        ..Default::default()
+    };
+    targets.sort_unstable_by(|a, b| b.cmp(a));
+    let first = receipt_admin_ids(&pool, filter.clone()).await;
+    assert_eq!(first, targets[..2]);
+    let second = receipt_admin_ids(
+        &pool,
+        admin::ListJobsFilter {
+            before_id: first.last().copied(),
+            ..filter.clone()
+        },
+    )
+    .await;
+    assert_eq!(second, targets[2..]);
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                tag: Some("selected".into()),
+                limit: Some(100),
+                ..filter
+            },
+        )
+        .await,
+        targets
+    );
+    all_ids.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        receipt_admin_ids(
+            &pool,
+            admin::ListJobsFilter {
+                queue: Some(queue.into()),
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await,
+        all_ids,
+        "closed receipts and materialized claims must not duplicate results"
+    );
+}
+
 /// A point read's snapshot can outlive completion. TRUNCATE is not MVCC-safe:
 /// pruning its claim/lease partition before the reader visits it would erase
 /// the old running evidence, while the new completion is outside that snapshot.
