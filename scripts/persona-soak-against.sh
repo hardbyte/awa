@@ -30,7 +30,8 @@ cleanup() { git -C "$here" worktree remove --force "$worktree" >/dev/null 2>&1 |
 trap cleanup EXIT
 
 git -C "$here" worktree add --detach "$worktree" "$ref" >/dev/null
-tar -C "$here" -c awa/tests/persona_soak awa/tests/persona_soak_test.rs scripts/persona-soak.sh \
+tar -C "$here" -c awa/tests/persona_soak awa/tests/persona_soak_test.rs awa/tests/ci_timing.rs \
+  scripts/persona-soak.sh \
   | tar -C "$worktree" -x -m
 echo "== persona soak against $ref ($(git -C "$worktree" rev-parse --short=10 HEAD))"
 (cd "$worktree" && scripts/persona-soak.sh "$@")
