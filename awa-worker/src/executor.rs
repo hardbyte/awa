@@ -1833,15 +1833,12 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job = reload_committed_job(runtime, pool, job.id)
-                    .await
-                    .unwrap_or_else(|| {
-                        let mut completed_job = job.clone();
-                        completed_job.state = JobState::Completed;
-                        completed_job.finalized_at = Some(chrono::Utc::now());
-                        completed_job.progress = None;
-                        completed_job
-                    });
+                // A completed attempt changes only these fields, so the event is
+                // built from the worker's copy rather than re-reading the job.
+                let mut updated_job = job.clone();
+                updated_job.state = JobState::Completed;
+                updated_job.finalized_at = Some(chrono::Utc::now());
+                updated_job.progress = None;
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
                         job: updated_job,
