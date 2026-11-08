@@ -12708,6 +12708,22 @@ impl QueueStorage {
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+        // Prune re-homes retained failed rows into the live slot and then
+        // TRUNCATEs the old one. TRUNCATE is not MVCC-safe: a snapshot taken
+        // before the prune commits sees the old slot empty once it reaches it,
+        // and cannot see the re-homed row either. Seeing the truncation means
+        // the prune has committed, so a fresh snapshot finds the job.
+        match self.load_job_in_snapshot(pool, job_id).await? {
+            Some(job) => Ok(Some(job)),
+            None => self.load_job_in_snapshot(pool, job_id).await,
+        }
+    }
+
+    async fn load_job_in_snapshot(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+    ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
