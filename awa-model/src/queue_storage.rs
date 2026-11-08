@@ -796,9 +796,10 @@ pub(crate) fn open_receipt_running_claims_sql(schema: &str) -> String {
 /// [`open_receipt_running_claims_sql`] restricted to the jobs in `job_ids`,
 /// an SQL expression yielding `bigint[]`. The restriction applies before the
 /// closure and materialisation checks. Row-local claims are found through the
-/// `job_id` index. Compact claim batches have no index on `job_ids`, so every
-/// retained batch header is read, but only batches holding one of the jobs
-/// are unnested and checked.
+/// `job_id` index. Compact claim batches are found through `job_ids && {ids}`,
+/// which uses a claim partition's GIN index on `job_ids` where it has one
+/// (see `ensure_claim_batch_job_index_tx`) and otherwise reads every retained
+/// batch header; only batches holding one of the jobs are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
     open_receipt_running_claims_sql_from(schema, job_ids, None)
 }
@@ -7023,7 +7024,8 @@ impl QueueStorage {
                          AND completed.job_id = items.job_id
                          AND completed.run_lease = items.run_lease
                          AND completed.receipt_id = items.receipt_id
-                        WHERE NOT EXISTS (
+                        WHERE claim_batches.job_ids && $2::bigint[]
+                          AND NOT EXISTS (
                               SELECT 1
                               FROM {schema}.lease_claim_closures AS closures
                               WHERE closures.claim_slot = claim_batches.claim_slot
@@ -8186,7 +8188,8 @@ impl QueueStorage {
                 JOIN refs
                   ON refs.job_id = items.job_id
                  AND refs.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -8420,7 +8423,8 @@ impl QueueStorage {
                 claim_batches.attempts,
                 claim_batches.max_attempts
             ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-            WHERE items.job_id = $1
+            WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
+              AND items.job_id = $1
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -10268,7 +10272,8 @@ impl QueueStorage {
                 JOIN inflight
                   ON inflight.job_id = items.job_id
                  AND inflight.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -10454,7 +10459,8 @@ impl QueueStorage {
                 JOIN inflight
                   ON inflight.job_id = items.job_id
                  AND inflight.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -10571,7 +10577,8 @@ impl QueueStorage {
                 JOIN inflight
                   ON inflight.job_id = items.job_id
                  AND inflight.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -10953,7 +10960,8 @@ impl QueueStorage {
                 JOIN refs
                   ON refs.job_id = items.job_id
                  AND refs.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -11395,7 +11403,8 @@ impl QueueStorage {
                     claim_batches.attempts,
                     claim_batches.max_attempts
                 ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-                WHERE items.job_id = $1
+                WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
+                  AND items.job_id = $1
                   AND items.run_lease = $2
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.lease_claim_closures AS closures
@@ -12961,7 +12970,8 @@ impl QueueStorage {
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
-            WHERE items.job_id = $1
+            WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
+              AND items.job_id = $1
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -17622,6 +17632,7 @@ impl QueueStorage {
             .execute(tx.as_mut())
             .await
                 .map_err(map_sqlx_error)?;
+            self.ensure_claim_batch_job_index_tx(&mut tx, slot).await?;
             sqlx::query(&format!(
                 r#"
                 UPDATE {schema}.claim_ring_slots
@@ -17646,6 +17657,84 @@ impl QueueStorage {
         .await;
 
         settle_prune_tx(tx, locked, PruneOutcome::Blocked { slot }).await
+    }
+
+    /// Give `lease_claim_batches_<slot>` its GIN index on `job_ids` through
+    /// `{schema}.ensure_claim_batch_job_index`. Claim prune calls this right
+    /// after truncating the slot, while it holds the partition's
+    /// `ACCESS EXCLUSIVE` lock, so the build covers an empty table and waits
+    /// on nobody. A schema without the function (the `claim_batch_job_index`
+    /// patch is not applied) or a role that may not execute it skips the
+    /// step. An error inside the function is rolled back to a savepoint and
+    /// logged; it never undoes the prune.
+    async fn ensure_claim_batch_job_index_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        slot: i32,
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        let callable: bool = sqlx::query_scalar(
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), false)",
+        )
+        .bind(format!("{schema}.ensure_claim_batch_job_index(integer)"))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if !callable {
+            tracing::debug!(
+                schema,
+                slot,
+                "Claim batch job index function is absent or not executable; skipping"
+            );
+            return Ok(());
+        }
+
+        sqlx::query("SAVEPOINT awa_claim_batch_job_index")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let indexed: Result<bool, sqlx::Error> =
+            sqlx::query_scalar(&format!("SELECT {schema}.ensure_claim_batch_job_index($1)"))
+                .bind(slot)
+                .fetch_one(tx.as_mut())
+                .await;
+        match indexed {
+            Ok(indexed) => {
+                sqlx::query("RELEASE SAVEPOINT awa_claim_batch_job_index")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                if !indexed {
+                    tracing::debug!(schema, slot, "Claim batch partition was not indexed");
+                }
+            }
+            Err(sqlx::Error::Database(db_err)) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_batch_job_index")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                let code = db_err.code().map(|code| code.into_owned());
+                if matches!(code.as_deref(), Some("42883" | "42501")) {
+                    tracing::debug!(
+                        schema,
+                        slot,
+                        code = code.as_deref().unwrap_or_default(),
+                        error = %db_err.message(),
+                        "Claim batch job index function unavailable; skipping"
+                    );
+                } else {
+                    tracing::warn!(
+                        schema,
+                        slot,
+                        code = code.as_deref().unwrap_or_default(),
+                        error = %db_err.message(),
+                        "Could not index claim batch partition by job id"
+                    );
+                }
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        }
+        Ok(())
     }
 
     fn job_id_sequence(&self) -> String {
