@@ -283,6 +283,14 @@ workers report not ready until the migration runs, as for any version bump.
 External migration runners apply the complete `awa migrate --sql --from 51
 --to 52` bundle, which defines the helper before the tail calls it.
 
+## v054: claim batch job index
+
+Point lookups of compact receipt claims by job id (heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job`) use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. v054 installs `<schema>.ensure_claim_batch_job_index(slot)` in the default and every discovered custom queue-storage schema and builds no index itself, so it takes no lock on any awa or queue-storage table. Claim prune calls that function right after truncating a claim partition, which builds the index while the partition is empty, so every partition gains it within one claim-ring cycle. A new schema's installer indexes its claim partitions as it creates them.
+
+Do not build the index yourself on a populated partition: the build holds a `SHARE` lock, which blocks claim inserts into that partition, for about half a minute per 100k batches. Run the migration as the owner of the queue-storage tables, or as a migrator that can `SET ROLE` to it, so the function can create the index; see [Claim batch index](security/database-roles.md#claim-batch-index).
+
+Binaries before v054 neither use nor build the index, and binaries that use it read the same rows, by scan, from a partition without it. A database coming from 0.6.15 already has the function from the 0.6 `claim_batch_job_index` schema patch, and v054 replaces it in place. External migration runners apply the complete `awa migrate --sql --from 53 --to 54` bundle, which defines the helper before the tail installs the function.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

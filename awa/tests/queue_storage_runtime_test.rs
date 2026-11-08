@@ -26458,3 +26458,580 @@ async fn test_busy_retained_head_cancel_preserves_lock_not_available() {
 async fn test_busy_retained_head_does_not_block_materialized_heartbeat_rescue() {
     historical_busy_attempt_does_not_block_batch(RetainedBatchTransition::Heartbeat, true).await;
 }
+
+/// Claim slots of `schema` whose `lease_claim_batches` partition carries the
+/// GIN index on `job_ids`.
+async fn claim_batch_job_index_slots(pool: &sqlx::PgPool, schema: &str) -> Vec<i32> {
+    sqlx::query_scalar(
+        r#"
+        SELECT substring(index_class.relname FROM '^lease_claim_batches_([0-9]+)_job_ids_idx$')::int
+        FROM pg_class AS index_class
+        JOIN pg_index AS index_meta ON index_meta.indexrelid = index_class.oid
+        JOIN pg_am AS method ON method.oid = index_class.relam
+        WHERE index_class.relnamespace = to_regnamespace($1)
+          AND index_class.relname LIKE 'lease\_claim\_batches\_%\_job\_ids\_idx'
+          AND method.amname = 'gin'
+        ORDER BY 1
+        "#,
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .expect("Failed to list claim batch job_ids indexes")
+}
+
+async fn drop_claim_batch_job_index(pool: &sqlx::PgPool, schema: &str, slot: i32) {
+    sqlx::query(audited_sql(format!(
+        "DROP INDEX {schema}.lease_claim_batches_{slot}_job_ids_idx"
+    )))
+    .execute(pool)
+    .await
+    .expect("Failed to drop claim batch job_ids index");
+}
+
+async fn ensure_claim_batch_job_index<'e, E>(executor: E, schema: &str, slot: i32) -> bool
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(audited_sql(format!(
+        "SELECT {schema}.ensure_claim_batch_job_index($1)"
+    )))
+    .bind(slot)
+    .fetch_one(executor)
+    .await
+    .expect("ensure_claim_batch_job_index should not fail")
+}
+
+/// Index scans PostgreSQL has recorded on one claim partition's job_ids index.
+async fn claim_batch_job_index_scans(pool: &sqlx::PgPool, schema: &str, slot: i32) -> i64 {
+    sqlx::query_scalar(
+        "SELECT idx_scan FROM pg_stat_user_indexes WHERE schemaname = $1 AND indexrelname = $2",
+    )
+    .bind(schema)
+    .bind(format!("lease_claim_batches_{slot}_job_ids_idx"))
+    .fetch_one(pool)
+    .await
+    .expect("Failed to read claim batch job_ids index statistics")
+}
+
+/// Run `work` on its own connection with sequential scans disabled, close
+/// that connection so its statistics are flushed, and return how many scans
+/// the job_ids index of `slot` gained. Disabling sequential scans makes a
+/// lookup the index can serve use it even on a tiny table; a lookup it cannot
+/// serve still scans the table and gains nothing.
+async fn claim_batch_job_index_scans_during<F, Fut>(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    slot: i32,
+    work: F,
+) -> i64
+where
+    F: FnOnce(sqlx::PgPool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let before = claim_batch_job_index_scans(pool, schema, slot).await;
+    let no_seqscan = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .options([("enable_seqscan", "off")]),
+        )
+        .await
+        .expect("Failed to connect with sequential scans disabled");
+    work(no_seqscan.clone()).await;
+    no_seqscan.close().await;
+
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        let gained = claim_batch_job_index_scans(pool, schema, slot).await - before;
+        if gained > 0 || Instant::now() > deadline {
+            return gained;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The by-job lookups of compact claims (`load_job`, receipt heartbeat)
+/// probe `lease_claim_batches` through the job_ids index and return the same
+/// rows they did without it.
+#[tokio::test]
+async fn test_claim_batch_job_index_serves_compact_receipt_lookups() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_claim_batch_job_index_lookup";
+    let schema = "awa_qs_cbji_lookup";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        vec![0, 1],
+        "the installer indexes every empty claim partition"
+    );
+
+    let mut job_ids = Vec::new();
+    for id in 0..3 {
+        job_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("compact claim of zero-deadline jobs");
+    assert_eq!(claimed.len(), 3);
+    assert!(claimed.iter().all(|job| job.claim.lease_claim_receipt));
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
+    let probe = &claimed[1];
+    let store_ref = &store;
+
+    let load_scans = claim_batch_job_index_scans_during(&pool, schema, 0, |indexed| async move {
+        let job = store_ref
+            .load_job(&indexed, probe.job.id)
+            .await
+            .expect("load_job of a compact claim")
+            .expect("compact claim is visible to load_job");
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.run_lease, probe.job.run_lease);
+    })
+    .await;
+    assert!(load_scans > 0, "load_job must probe the job_ids index");
+
+    let heartbeat_scans =
+        claim_batch_job_index_scans_during(&pool, schema, 0, |indexed| async move {
+            let updated = store_ref
+                .heartbeat_batch(&indexed, &[(probe.job.id, probe.job.run_lease)])
+                .await
+                .expect("heartbeat of a compact claim");
+            assert_eq!(updated, 1);
+        })
+        .await;
+    assert!(
+        heartbeat_scans > 0,
+        "receipt heartbeat must probe the job_ids index"
+    );
+    assert_eq!(attempt_state_count(&pool, &store).await, 1);
+
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete compact claims");
+    assert_eq!(completed.len(), 3);
+    for job_id in job_ids {
+        let job = store
+            .load_job(&pool, job_id)
+            .await
+            .expect("load completed job")
+            .expect("completed job is visible");
+        assert_eq!(job.state, JobState::Completed);
+    }
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+}
+
+/// `ensure_claim_batch_job_index` indexes an empty claim partition, leaves a
+/// populated or busy one alone without waiting or keeping a lock, and claim
+/// prune indexes a slot as it truncates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_claim_batch_job_index_build";
+    let schema = "awa_qs_cbji_build";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let function = format!("{schema}.ensure_claim_batch_job_index(integer)");
+    let (definer, config, public_execute): (bool, Vec<String>, bool) = sqlx::query_as(
+        r#"
+        SELECT routine.prosecdef,
+               routine.proconfig,
+               has_function_privilege('public', routine.oid, 'EXECUTE')
+        FROM pg_proc AS routine
+        WHERE routine.oid = $1::regprocedure
+        "#,
+    )
+    .bind(&function)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read ensure_claim_batch_job_index");
+    assert!(definer);
+    assert_eq!(
+        config,
+        vec![
+            "search_path=pg_catalog, pg_temp".to_string(),
+            "quote_all_identifiers=off".to_string(),
+        ]
+    );
+    assert!(!public_execute, "PUBLIC must not execute {function}");
+
+    let grantee = "awa_qs_cbji_truncate_holder";
+    let grantee_executes = |pool: sqlx::PgPool, function: String| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT has_function_privilege($1, $2::regprocedure, 'EXECUTE')",
+        )
+        .bind(grantee)
+        .bind(&function)
+        .fetch_one(&pool)
+        .await
+        .expect("read grantee EXECUTE")
+    };
+    let refresh_helper = |pool: sqlx::PgPool| async move {
+        sqlx::query("SELECT awa.refresh_claim_batch_job_index_helper($1)")
+            .bind(schema)
+            .execute(&pool)
+            .await
+            .expect("refresh the claim batch job index helper");
+    };
+    sqlx::raw_sql(audited_sql(format!(
+        "DROP OWNED BY {grantee}; DROP ROLE IF EXISTS {grantee}"
+    )))
+    .execute(&pool)
+    .await
+    .ok();
+    sqlx::raw_sql(audited_sql(format!(
+        "CREATE ROLE {grantee}; GRANT USAGE ON SCHEMA {schema} TO {grantee}; \
+         GRANT TRUNCATE ON {schema}.lease_claim_batches TO {grantee}"
+    )))
+    .execute(&pool)
+    .await
+    .expect("create a TRUNCATE holder");
+    refresh_helper(pool.clone()).await;
+    assert!(grantee_executes(pool.clone(), function.clone()).await);
+    sqlx::raw_sql(audited_sql(format!(
+        "REVOKE TRUNCATE ON {schema}.lease_claim_batches FROM {grantee}"
+    )))
+    .execute(&pool)
+    .await
+    .expect("revoke TRUNCATE");
+    refresh_helper(pool.clone()).await;
+    let still_executes = grantee_executes(pool.clone(), function.clone()).await;
+    sqlx::raw_sql(audited_sql(format!(
+        "DROP OWNED BY {grantee}; DROP ROLE {grantee}"
+    )))
+    .execute(&pool)
+    .await
+    .expect("drop the TRUNCATE holder");
+    assert!(
+        !still_executes,
+        "a role that lost TRUNCATE must lose EXECUTE on {function} when the helper is refreshed"
+    );
+
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("compact claim of a zero-deadline job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        receipt_claim_count_in_child(&pool, schema, 0, claimed[0].job.id).await,
+        1
+    );
+    drop_claim_batch_job_index(&pool, schema, 0).await;
+    drop_claim_batch_job_index(&pool, schema, 1).await;
+
+    // Populated: no index, and no lock left on the partition afterwards.
+    let mut tx = pool.begin().await.unwrap();
+    assert!(!ensure_claim_batch_job_index(&mut *tx, schema, 0).await);
+    let partition_locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation = $1::regclass",
+    )
+    .bind(format!("{schema}.lease_claim_batches_0"))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        partition_locks, 0,
+        "a populated partition must not stay locked"
+    );
+    tx.rollback().await.unwrap();
+
+    // Empty but locked by a writer: give up at once rather than queue.
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.lease_claim_batches_1 IN ROW EXCLUSIVE MODE"
+    )))
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    let busy = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        ensure_claim_batch_job_index(&pool, schema, 1),
+    )
+    .await
+    .expect("ensure_claim_batch_job_index must not wait for a busy partition");
+    assert!(!busy);
+    writer.rollback().await.unwrap();
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        Vec::<i32>::new()
+    );
+
+    // Empty and free: indexed, and a second call is a no-op.
+    assert!(ensure_claim_batch_job_index(&pool, schema, 1).await);
+    assert!(ensure_claim_batch_job_index(&pool, schema, 1).await);
+    assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![1]);
+
+    // Prune truncates slot 0 and indexes it in the same transaction.
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete compact claim");
+    match store.rotate_claims(&pool).await.expect("rotate claim ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected claim ring rotation to slot 1, got {other:?}"),
+    }
+    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        match store
+            .prune_oldest_claims(&pool)
+            .await
+            .expect("prune oldest claim slot")
+        {
+            PruneOutcome::Pruned { slot, .. } => {
+                assert_eq!(slot, 0);
+                break;
+            }
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {}
+            other => panic!("unexpected claim prune outcome: {other:?}"),
+        }
+    }
+    assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![0, 1]);
+}
+
+/// v054 is idempotent, installs the index function without building any
+/// index, and claim prune then indexes each slot it truncates. A schema
+/// without the function keeps working with unindexed lookups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_batch_job_index_migration_leaves_indexing_to_claim_prune() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_claim_batch_job_index_migration";
+    let schema = "awa_qs_cbji_migration";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    // The schema as a release before v054 left it.
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        DECLARE v_object TEXT;
+        BEGIN
+            FOR v_object IN
+                SELECT routine.oid::regprocedure::text FROM pg_proc AS routine
+                WHERE routine.proname = 'ensure_claim_batch_job_index'
+            LOOP
+                EXECUTE format('DROP FUNCTION %s', v_object);
+            END LOOP;
+            FOR v_object IN
+                SELECT index_class.oid::regclass::text FROM pg_class AS index_class
+                WHERE index_class.relkind = 'i'
+                  AND index_class.relname LIKE 'lease\_claim\_batches\_%\_job\_ids\_idx'
+            LOOP
+                EXECUTE format('DROP INDEX %s', v_object);
+            END LOOP;
+            DROP FUNCTION awa.refresh_claim_batch_job_index_helper(text);
+        END
+        $$;
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to remove the claim batch job index function");
+
+    let mut job_ids = Vec::new();
+    for id in 0..2 {
+        job_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+
+    // Without the function: claim, look up, heartbeat, complete and prune all work.
+    let first = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("compact claim without the index function");
+    assert_eq!(first.len(), 1);
+    let running = store
+        .load_job(&pool, first[0].job.id)
+        .await
+        .unwrap()
+        .expect("compact claim visible without the index");
+    assert_eq!(running.state, JobState::Running);
+    assert_eq!(
+        store
+            .heartbeat_batch(&pool, &[(first[0].job.id, first[0].job.run_lease)])
+            .await
+            .unwrap(),
+        1
+    );
+    store
+        .complete_runtime_batch(&pool, &first)
+        .await
+        .expect("complete compact claim without the index");
+    match store.rotate_claims(&pool).await.expect("rotate claim ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected claim ring rotation to slot 1, got {other:?}"),
+    }
+    let second = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("compact claim into claim slot 1");
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        receipt_claim_count_in_child(&pool, schema, 1, second[0].job.id).await,
+        1
+    );
+    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        match store
+            .prune_oldest_claims(&pool)
+            .await
+            .expect("prune without the index function")
+        {
+            PruneOutcome::Pruned { slot, .. } => {
+                assert_eq!(slot, 0);
+                break;
+            }
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {}
+            other => panic!("unexpected claim prune outcome: {other:?}"),
+        }
+    }
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        Vec::<i32>::new()
+    );
+
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 54")
+        .execute(&pool)
+        .await
+        .expect("roll the schema version back to v053");
+    migrations::run(&pool).await.expect("apply v054");
+    let installed: Vec<String> = sqlx::query_scalar(
+        "SELECT routine.pronamespace::regnamespace::text FROM pg_proc AS routine \
+         WHERE routine.proname = 'ensure_claim_batch_job_index' AND routine.prosecdef \
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(installed, vec!["awa".to_string(), schema.to_string()]);
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        Vec::<i32>::new(),
+        "v054 builds no index, even on the empty slot"
+    );
+
+    let schema_versions = || async {
+        sqlx::query_as::<_, (i32, i64)>("SELECT max(version), count(*) FROM awa.schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let versions_before = schema_versions().await;
+    let (_, _, v054_sql) = migrations::migration_sql_range(53, 54)
+        .pop()
+        .expect("v054 is a migration");
+    sqlx::raw_sql(audited_sql(v054_sql))
+        .execute(&pool)
+        .await
+        .expect("v054 re-applies cleanly");
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(schema_versions().await, versions_before);
+
+    let job = store
+        .load_job(&pool, second[0].job.id)
+        .await
+        .unwrap()
+        .expect("claim in the unindexed slot stays visible");
+    assert_eq!(job.state, JobState::Running);
+    store
+        .complete_runtime_batch(&pool, &second)
+        .await
+        .expect("complete the claim in the unindexed slot");
+    match store.rotate_claims(&pool).await.expect("rotate claim ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("expected claim ring rotation to slot 0, got {other:?}"),
+    }
+    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        match store
+            .prune_oldest_claims(&pool)
+            .await
+            .expect("prune with the index function")
+        {
+            PruneOutcome::Pruned { slot, .. } => {
+                assert_eq!(slot, 1);
+                break;
+            }
+            PruneOutcome::Blocked { slot: 1 } if Instant::now() < prune_deadline => {}
+            other => panic!("unexpected claim prune outcome: {other:?}"),
+        }
+    }
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        vec![1],
+        "claim prune indexes the slot it truncates"
+    );
+    for job_id in job_ids {
+        let job = store.load_job(&pool, job_id).await.unwrap().unwrap();
+        assert_eq!(job.state, JobState::Completed);
+    }
+}
