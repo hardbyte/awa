@@ -4,9 +4,22 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- The schema stays at v40. Run `awa migrate` as the schema owner, before or after rolling binaries, while traffic keeps running. It applies the repeatable `insert_jobs_compat_batch` patch, which adds one function and changes no existing object. Binaries can roll back to 0.6.14 with the patch left in place. See the [upgrade guide](docs/upgrade-0.6.14-to-0.6.15.md).
+- External migration runners: apply `R__insert_jobs_compat_batch.sql` after `V40` (`awa migrate --extract-to <dir> --pending`), replacing all `R__` files together.
+- Deployments that revoke `EXECUTE` on new functions from `PUBLIC` should grant it on `awa.insert_jobs_compat_batch` to runtime roles; without it, `insert_many_copy` keeps its per-row path.
+
 ### Changed
 
+- Compatibility COPY inserts (`insert_many_copy` in Rust and Python) hold a queue lane's enqueue lock only while they write that lane, instead of from the batch's first ready row until commit. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
+- A batch through `awa.insert_jobs_compat_batch` takes all its unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together, lane by lane. A per-row transaction that already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed now fails with `deadlock detected` (SQLSTATE `40P01`) instead of skipping the job or failing with a unique violation (`23505`). Retry the aborted transaction. Batches through the function do not deadlock with each other this way.
 - Queue-storage job lists without a kind filter select receipt candidate IDs before loading their ready bodies. Kind filters still apply before the limit.
+
+### Added
+
+- `insert_many_skip_unique_conflicts` (Rust) inserts a batch through `awa.insert_jobs_compat_batch`, skipping jobs whose unique key is already claimed, and returns the inserted rows in input order. Use it instead of retrying a failed `insert_many` one job at a time, which takes the lane lock once per job. It needs the `insert_jobs_compat_batch` patch. Generic `insert_many` is unchanged.
+- `enqueue_lane_contention_test` benchmarks many producers on one lane, with a nightly gate on per-lane throughput and lock hold time.
 
 ### Fixed
 

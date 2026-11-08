@@ -389,6 +389,7 @@ All coordination through Postgres. The Rust runtime owns dispatch, leases, heart
 | [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
 | [0.5 → 0.6 upgrade](docs/upgrade-0.5-to-0.6.md) | Step-by-step operator checklist for the staged storage transition |
 | [0.6.9 → 0.6.10 upgrade](docs/upgrade-0.6.9-to-0.6.10.md) | Rolling patch upgrade, rollback, and optional runtime privilege tightening |
+| [0.6.14 → 0.6.15 upgrade](docs/upgrade-0.6.14-to-0.6.15.md) | Rolling patch upgrade for the batch compatibility insert |
 | [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
 | [HTTP workers and callbacks](docs/http-callbacks.md) | Serverless dispatch, callback receiver endpoints, signature verification |
 | [Lifecycle hooks](docs/lifecycle-hooks.md) | React to job start/finish/retry/callback events for metrics, alerting, cleanup |
