@@ -38,13 +38,16 @@ class PreviousReleaseTagTests(unittest.TestCase):
         ]
         for previous, current in zip(tags, tags[1:]):
             with self.subTest(current=current):
-                self.assertEqual(previous_release_tag(current, list(reversed(tags))), previous)
+                self.assertEqual(
+                    previous_release_tag(current, list(reversed(tags + ["v1.0.0"]))),
+                    previous,
+                )
 
-    def test_release_skips_its_own_prereleases(self):
+    def test_release_skips_every_prerelease_after_the_previous_release(self):
         self.assertEqual(
             previous_release_tag(
-                "v0.6.14",
-                ["v0.6.13-alpha.1", "v0.6.13", "v0.6.14-rc.1", "v0.6.14"],
+                "v0.6.15",
+                ["v0.6.13-alpha.1", "v0.6.13", "v0.6.14-rc.1", "v0.6.15-rc.1", "v0.6.15"],
             ),
             "v0.6.13",
         )
