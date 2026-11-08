@@ -1839,6 +1839,8 @@ async fn complete_job_queue_storage(
                 updated_job.state = JobState::Completed;
                 updated_job.finalized_at = Some(chrono::Utc::now());
                 updated_job.progress = None;
+                updated_job.heartbeat_at = None;
+                updated_job.deadline_at = None;
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
                         job: updated_job,

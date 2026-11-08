@@ -183,6 +183,68 @@ async fn test_typed_completed_event_handler_runs() {
     assert_eq!(stored.state, JobState::Completed);
 }
 
+/// A completed event carries the job as a terminal read returns it, without the
+/// finished attempt's heartbeat or deadline.
+#[tokio::test]
+async fn test_completed_event_of_a_deadline_job_matches_the_terminal_job() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup_pool().await;
+    let queue = "lifecycle_completed_deadline";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .register::<HookJob, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                if let JobEvent::Completed { job, .. } = event {
+                    tx.send(job).unwrap();
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let inserted = awa::insert_with(
+        &pool,
+        &HookJob {
+            action: "complete".into(),
+            value: "deadline".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let event_job = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let stored = admin::get_job(&pool, inserted.id).await.unwrap();
+    assert_eq!(event_job.id, stored.id);
+    assert_eq!(event_job.state, stored.state);
+    assert_eq!(
+        (event_job.heartbeat_at, event_job.deadline_at),
+        (stored.heartbeat_at, stored.deadline_at)
+    );
+    assert_eq!((stored.heartbeat_at, stored.deadline_at), (None, None));
+}
+
 #[tokio::test]
 async fn test_typed_started_event_handler_runs() {
     let _permit = test_gate()
