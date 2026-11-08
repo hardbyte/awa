@@ -12298,11 +12298,14 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
 /// Open receipt claims count as running until durable evidence closes them:
 /// a completion batch, a retryable transition, or materialization into a
 /// lease, which must be counted once.
-#[tokio::test]
-async fn test_receipt_admin_counts_follow_durable_dispositions() {
+async fn receipt_admin_counts_follow_durable_dispositions(row_local: bool) {
     let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_receipt_dispositions";
-    let schema = "awa_qs_receipt_dispositions";
+    let schema = if row_local {
+        "awa_qs_row_receipt_dispositions"
+    } else {
+        "awa_qs_receipt_dispositions"
+    };
     let store = create_store_with_config(
         &pool,
         QueueStorageConfig {
@@ -12326,11 +12329,16 @@ async fn test_receipt_admin_counts_follow_durable_dispositions() {
     }
 
     store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
-    let claimed = store
-        .claim_runtime_batch(&pool, queue, 3, Duration::from_secs(300))
+    let deadline = Duration::from_secs(300);
+    let mut claimed = store
+        .claim_runtime_batch(&pool, queue, 3, deadline)
         .await
         .expect("claim three deadline-backed receipts");
     assert_eq!(claimed.len(), 3);
+    if row_local {
+        rewrite_as_row_local_claims(&pool, schema, &mut claimed, deadline).await;
+        assert_eq!(lease_claim_count(&pool, &store).await, 3);
+    }
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(counts(&pool, queue).await, (3, 0, 0));
 
@@ -12391,6 +12399,16 @@ async fn test_receipt_admin_counts_follow_durable_dispositions() {
             "point reads and aggregate counts agree"
         );
     }
+}
+
+#[tokio::test]
+async fn test_receipt_admin_counts_follow_durable_dispositions() {
+    receipt_admin_counts_follow_durable_dispositions(false).await;
+}
+
+#[tokio::test]
+async fn test_row_local_receipt_admin_counts_follow_durable_dispositions() {
+    receipt_admin_counts_follow_durable_dispositions(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -22873,6 +22891,57 @@ async fn test_moved_ready_row_is_joined_once_by_compact_receipt_reads() {
     moved_ready_row_is_joined_once_by_attempt_reads(true).await;
 }
 
+/// Rewrites compact receipt claims as the row-local `lease_claims` rows a 0.6
+/// runtime writes for deadline-backed claims, which this runtime must still
+/// read and close during a rolling upgrade, and clears the compact identity on
+/// the claims so completion takes the row-local path.
+async fn rewrite_as_row_local_claims(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    claims: &mut [awa::model::ClaimedRuntimeJob],
+    deadline: Duration,
+) {
+    let batch_ids: Vec<i64> = claims
+        .iter()
+        .map(|claim| claim.claim.claim_batch_id.expect("a compact claim"))
+        .collect();
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.lease_claim_batches WHERE batch_id = ANY($1)"
+    )))
+    .bind(&batch_ids)
+    .execute(pool)
+    .await
+    .expect("remove the compact claims");
+    for claim in claims.iter_mut() {
+        sqlx::query(audited_sql(format!(
+            "INSERT INTO {schema}.lease_claims (
+                claim_slot, receipt_id, job_id, run_lease, ready_slot,
+                ready_generation, queue, priority, attempt, max_attempts,
+                lane_seq, enqueue_shard, deadline_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                      clock_timestamp() + make_interval(secs => $13))"
+        )))
+        .bind(claim.claim.claim_slot)
+        .bind(claim.claim.receipt_id)
+        .bind(claim.job.id)
+        .bind(claim.job.run_lease)
+        .bind(claim.claim.ready_slot)
+        .bind(claim.claim.ready_generation)
+        .bind(&claim.claim.queue)
+        .bind(claim.claim.priority)
+        .bind(claim.job.attempt)
+        .bind(claim.job.max_attempts)
+        .bind(claim.claim.lane_seq)
+        .bind(claim.claim.enqueue_shard)
+        .bind(deadline.as_secs_f64())
+        .execute(pool)
+        .await
+        .expect("write the row-local claim");
+        claim.claim.claim_batch_id = None;
+        claim.claim.claim_batch_index = None;
+    }
+}
+
 async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -> Vec<i64> {
     admin::list_jobs(pool, &filter)
         .await
@@ -22882,12 +22951,12 @@ async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -
         .collect()
 }
 
-async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool) {
+async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool, row_local: bool) {
     let (_db_guard, pool) = setup_pool(6).await;
-    let schema = if receipts {
-        "awa_qs_admin_scope_compact"
-    } else {
-        "awa_qs_admin_scope_leases"
+    let schema = match (receipts, row_local) {
+        (false, _) => "awa_qs_admin_scope_leases",
+        (true, false) => "awa_qs_admin_scope_compact",
+        (true, true) => "awa_qs_admin_scope_row_claims",
     };
     let store = create_store_with_config(
         &pool,
@@ -22943,7 +23012,7 @@ async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool) {
         },
     )
     .await;
-    let deadline = if receipts {
+    let deadline = if receipts && !row_local {
         Duration::ZERO
     } else {
         Duration::from_secs(30)
@@ -22968,12 +23037,22 @@ async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool) {
             .unwrap(),
     );
     assert_eq!(claims.len(), 4);
+    if row_local {
+        rewrite_as_row_local_claims(&pool, schema, &mut claims, deadline).await;
+    }
     assert!(claims
         .iter()
         .all(|claim| claim.claim.lease_claim_receipt == receipts));
     assert!(claims
         .iter()
-        .all(|claim| claim.claim.claim_batch_id.is_some() == receipts));
+        .all(|claim| claim.claim.claim_batch_id.is_some() == (receipts && !row_local)));
+    let row_claims: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claims"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row_claims, if row_local { 4 } else { 0 });
 
     let scoped = admin::ListJobsFilter {
         state: Some(JobState::Running),
@@ -23134,12 +23213,17 @@ async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool) {
 
 #[tokio::test]
 async fn test_receipt_admin_scope_compact() {
-    receipt_admin_reads_preserve_scope_and_disposition(true).await;
+    receipt_admin_reads_preserve_scope_and_disposition(true, false).await;
+}
+
+#[tokio::test]
+async fn test_receipt_admin_scope_row_local() {
+    receipt_admin_reads_preserve_scope_and_disposition(true, true).await;
 }
 
 #[tokio::test]
 async fn test_receipt_admin_scope_materialized_control() {
-    receipt_admin_reads_preserve_scope_and_disposition(false).await;
+    receipt_admin_reads_preserve_scope_and_disposition(false, false).await;
 }
 
 #[tokio::test]
