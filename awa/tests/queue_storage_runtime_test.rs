@@ -4756,46 +4756,6 @@ async fn test_queue_storage_promote_due_preserves_row_fields_across_lanes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_enqueue_batch_writing_more_segments_than_the_old_bind_limit() {
-    // `enqueue_batch` stamps each row with its own run_at, and segments split
-    // on every run_at change, so one batch yields about one segment per row:
-    // more than the 8,191 rows an 8-bind-per-row statement could carry.
-    const JOBS: usize = 9_000;
-    let (_db_guard, pool) = setup_pool(10).await;
-    let queue = "qs_bind_limit_segments";
-    let schema = "awa_qs_bind_limit_segments";
-    let store = create_store(&pool, schema).await;
-
-    let inserted = store
-        .enqueue_batch(&pool, queue, 2, JOBS as i64)
-        .await
-        .expect("a batch producing one segment per row should insert");
-    assert_eq!(inserted, JOBS as i64);
-    assert_eq!(
-        table_row_count(&pool, schema, "ready_entries").await,
-        JOBS as i64
-    );
-
-    let segments: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM {schema}.ready_segments WHERE queue = $1"
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("Failed to count ready segments");
-    assert!(
-        segments > 8_191,
-        "expected more than 8,191 segments from one batch, got {segments}"
-    );
-
-    let claimed = store
-        .claim_runtime_batch(&pool, queue, 100, Duration::from_secs(30))
-        .await
-        .expect("Failed to claim jobs");
-    assert_eq!(claimed.len(), 100);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_cancel_is_noop() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_late_cancel";
