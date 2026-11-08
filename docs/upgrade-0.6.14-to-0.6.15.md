@@ -68,6 +68,18 @@ Without `EXECUTE`, `insert_many_copy` keeps the per-row path and `insert_many_sk
 
 Replace the runner's `R__` files with the set the 0.6.15 CLI extracts, together, and keep the `V` files exactly as originally applied.
 
+## Worker memory when completions fall behind
+
+A 0.6.15 worker bounds how many finished attempts may wait for their completion to commit: the larger of its worker capacity and twice the completion batch size times the completion shard count. With the queue-storage defaults (`AWA_COMPLETION_BATCH_SIZE=512`, one shard) and fewer than 512 workers, that is 1,024 attempts. A handler that finishes while the bound is reached keeps its worker slot until a completion commits, so the worker stops claiming new jobs instead of holding the backlog, and each waiting attempt's payload, in memory.
+
+0.6.14 and earlier admitted every finished attempt. When completions fell behind handlers, for example under lock contention on the completion tables, worker memory grew by roughly 10 KB per waiting attempt plus its payload until the process was killed, and did not shrink afterwards.
+
+What changes in practice:
+
+- A worker whose completions stall shows its workers busy and its claim rate dropping to its completion rate, instead of its memory climbing. Attempts keep heartbeating while they wait, so they are not rescued as stale.
+- Jobs with large payloads hold more memory per waiting attempt. Lower `AWA_COMPLETION_BATCH_SIZE` to lower the bound in proportion.
+- If you reduced worker counts to keep 0.6.14 workers below their completion rate, you can restore them.
+
 ## Roll back
 
 Roll binaries back to 0.6.14 at any time. Leave the patches in place: 0.6.14 binaries neither call the functions nor use the claim batch index, and neither patch holds state.
