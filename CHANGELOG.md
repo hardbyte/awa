@@ -4,6 +4,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.14] — 2026-11-08
+
+Queue-storage fixes for 0.6.13. The schema remains v40. Apply the repeatable
+`definer_lane_provisioning` patch once, then roll processes in any order;
+binaries can roll back to 0.6.13 with the patch retained. See the
+[upgrade guide](docs/upgrade-0.6.13-to-0.6.14.md).
+
 ### Fixed
 
 - Promotion no longer issues NOTIFY inside its per-lane transactions. A
@@ -29,16 +36,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
   completion; the event is now built from the job the worker holds.
 - `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql`
   silently won and nothing was extracted.
-
-## [0.6.14-alpha.1] — 2026-11-07
-
-Prerelease of the 0.6.14 queue-storage fixes. The schema remains v40. Apply the
-repeatable `definer_lane_provisioning` patch once, then roll processes in any
-order; binaries can roll back to 0.6.13 with the patch retained. See the
-[upgrade guide](docs/upgrade-0.6.13-to-0.6.14.md).
-
-### Fixed
-
 - Lane-sequence repair completes missing runtime grants when the migration role can `SET ROLE` to the schema owner without inheriting its privileges, and restores its prior role afterward. `awa migrate` refreshes an older installed repair helper even when the versionless provisioning patch was already applied.
 - Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
 - New queue lanes and their sequences belong to the schema owner and receive
@@ -117,7 +114,8 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   Recovery then prefers a unique live body, which cannot reliably identify the
   original physical lane if an old aging race left a colliding live replacement.
   Multiple equally supported bodies cause an explicit ambiguity error and
-  transaction rollback.
+  transaction rollback; rescue instead skips that attempt and logs an error on
+  each pass, so it stays running until its bodies are repaired.
 - Repair of an old aging replacement runs when a transition hydrates a retained
   tombstoned body. Worker completion using its already carried job body does not
   perform that repair, and can leave an old replacement claimable. The aging
@@ -130,6 +128,10 @@ order; binaries can roll back to 0.6.13 with the patch retained. See the
   single-attempt mutations still fail on contention and callers must retry.
   Workers retry those mutations within their bounded lock-retry window. It adds
   weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ COMMITTED isolation.
+
+## [0.6.14-alpha.1] — 2026-11-07
+
+Prerelease of 0.6.14; every change is listed under 0.6.14.
 
 ## [0.6.13] — 2026-11-06
 
