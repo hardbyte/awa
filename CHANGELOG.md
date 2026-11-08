@@ -20,6 +20,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   the whole rescue. Before, one such attempt stopped rescue of every other
   stale attempt in the schema. The skipped attempt stays running until its
   bodies are repaired.
+- A worker whose completion or callback wait has committed no longer reports
+  it as failed when re-reading the job for its lifecycle event fails. It logs
+  a warning and builds the event from its own copy, so the event and the
+  completion metrics are kept, and a retry no longer re-runs the transition.
 - `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql`
   silently won and nothing was extracted.
 
