@@ -25,6 +25,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - Point lookups of zero-deadline (compact) receipt claims by job ID — heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job` — use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. Under load those scans could pick parallel plans and exhaust dynamic shared memory. The repeatable `claim_batch_job_index` schema patch installs the index function and takes no table locks; claim prune builds the index on each claim partition right after emptying it, so every partition gains it within one claim-ring cycle after the patch and live claims are never blocked behind a build. The schema remains v40.
 - Admin job lists and kind counts work on a queue-storage schema installed with more claim slots than the default, instead of failing with `invalid physical claim slot`.
+- Heartbeat, deadline and callback rescue of lease-backed attempts reach the stale attempts behind a full batch of attempts whose retained ready bodies are ambiguous. Before, every pass selected the same ambiguous attempts first, left them running, and rescued nothing else. A pass now sets all of a batch's ambiguous attempts aside at once.
+- Admin job lists and kind counts no longer read other claim slots' receipt closure partitions when they read one slot's open claims.
+- A `Completed` lifecycle event, and the job a `Completed` follow-up enqueue spec receives, no longer carry the finished attempt's `heartbeat_at` and `deadline_at`; both are `None`, as a read of the completed job returns them.
 
 ## [0.6.14] — 2026-11-08
 

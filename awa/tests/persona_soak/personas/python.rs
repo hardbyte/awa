@@ -141,6 +141,20 @@ fn spawn_process(
         .env("SOAK_QUEUE_WORK", QUEUE_WORK)
         .env("SOAK_QUEUE_DEADLINE", QUEUE_DEADLINE)
         .env("SOAK_QUEUE_SHARED", QUEUE_SHARED)
+        .env(
+            "SOAK_HEARTBEAT_MS",
+            shared.config.heartbeat_interval.as_millis().to_string(),
+        )
+        .env(
+            "SOAK_STALENESS_MS",
+            shared.config.heartbeat_staleness.as_millis().to_string(),
+        )
+        .envs(
+            shared
+                .config
+                .rescue_interval
+                .map(|interval| ("SOAK_RESCUE_INTERVAL_MS", interval.as_millis().to_string())),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

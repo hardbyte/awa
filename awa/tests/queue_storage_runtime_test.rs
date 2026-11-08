@@ -8358,7 +8358,7 @@ async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_or
 /// Holds PostgreSQL's cluster-wide notify-queue lock for about `commits` ×
 /// 100 ms. A transaction that issued NOTIFY takes that lock at COMMIT and
 /// keeps it until its commit record is flushed, which `commit_delay` stretches.
-/// Returns once the lock is held.
+/// Returns once the holder's own backend holds the lock.
 async fn hold_notify_commit_lock(
     pool: &sqlx::PgPool,
     commits: usize,
@@ -8377,6 +8377,10 @@ async fn hold_notify_commit_lock(
         )
         .await
         .expect("connect the notify holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&holder)
+        .await
+        .expect("read the notify holder's backend");
     let holder_task = tokio::spawn(async move {
         for _ in 0..commits {
             sqlx::raw_sql(
@@ -8393,8 +8397,9 @@ async fn hold_notify_commit_lock(
     loop {
         let held: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'object' \
-             AND classid = 'pg_database'::regclass AND objid = 0 AND granted)",
+             AND classid = 'pg_database'::regclass AND objid = 0 AND granted AND pid = $1)",
         )
+        .bind(holder_pid)
         .fetch_one(pool)
         .await
         .expect("read notify lock");
@@ -8445,7 +8450,7 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
         enqueue_due(id).await;
     }
 
-    let holder = hold_notify_commit_lock(&pool, 3).await;
+    let holder = hold_notify_commit_lock(&pool, 10).await;
     let outcome = store
         .promote_due_lanes(
             &pool,
@@ -8456,6 +8461,10 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
         )
         .await
         .expect("promote while the notify lock is held");
+    assert!(
+        !holder.is_finished(),
+        "the notify holder outlasts the promotion"
+    );
     holder.await.expect("notify holder");
     assert_eq!(outcome.promoted, 3, "{outcome:?}");
     assert!(outcome.contended.is_empty(), "{outcome:?}");
@@ -8471,7 +8480,7 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
         .await
         .expect("connect with a session lock_timeout");
     enqueue_due(3).await;
-    let holder = hold_notify_commit_lock(&pool, 3).await;
+    let holder = hold_notify_commit_lock(&pool, 10).await;
     let result = store
         .promote_due_lanes(
             &caller_lock_timeout_pool,
@@ -8481,6 +8490,10 @@ async fn test_queue_storage_promotion_does_not_wait_for_the_notify_lock_in_its_l
             &[],
         )
         .await;
+    assert!(
+        !holder.is_finished(),
+        "the notify holder outlasts the promotion"
+    );
     holder.await.expect("notify holder");
     caller_lock_timeout_pool.close().await;
     let outcome = result.expect("a failed wakeup does not fail the promotion");
@@ -17281,6 +17294,55 @@ async fn receipt_admin_ids(pool: &sqlx::PgPool, filter: admin::ListJobsFilter) -
         .collect()
 }
 
+/// A per-slot receipt read touches only that slot's claim-ring partitions, so a
+/// lock held on another slot's closure evidence, as claim-ring prune takes, does
+/// not hold it up.
+#[tokio::test]
+async fn test_slot_scoped_receipt_reads_do_not_wait_on_other_slots_closures() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_slot_scoped_closures";
+    let store = create_store_with_config(&pool, unique_cancel_store_config(schema)).await;
+    let queue = "slot_scoped_closures";
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim into a compact batch");
+    assert_eq!(claimed.len(), 1);
+    let other_slot = (claimed[0].claim.claim_slot + 1) % 2;
+
+    let mut prune = pool.begin().await.expect("begin prune stand-in");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.lease_claim_closures_{other_slot}, \
+         {schema}.lease_claim_closure_batches_{other_slot} IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(prune.as_mut())
+    .await
+    .expect("lock the other slot's closure evidence");
+    let kinds = tokio::time::timeout(
+        scaled_timeout(Duration::from_secs(5)),
+        admin::job_kind_overviews(&pool),
+    )
+    .await
+    .expect("the read does not wait on another slot's closure locks")
+    .expect("read kind overviews");
+    prune.rollback().await.expect("release the closure locks");
+    let complete = kinds
+        .iter()
+        .find(|kind| kind.kind == CompleteJob::kind())
+        .expect("the running job's kind");
+    assert_eq!(complete.job_count, 1);
+}
+
 async fn receipt_admin_reads_preserve_scope_and_disposition(receipts: bool, row_local: bool) {
     let (_db_guard, pool) = setup_pool(6).await;
     let schema = match (receipts, row_local) {
@@ -19512,6 +19574,83 @@ async fn test_historical_tombstoned_claim_uses_emitted_lane_low_to_high() {
 async fn test_historical_tombstoned_claim_uses_emitted_lane_high_to_low() {
     moved_tombstoned_claim_lane(4, 2, true, false, false).await;
 }
+/// An attempt whose retained ready bodies are ambiguous stays running. A batch's
+/// worth of them, which every pass meets first, must not keep rescue from the stale
+/// attempts behind them.
+#[tokio::test]
+async fn test_ambiguous_attempts_filling_a_batch_do_not_starve_rescue() {
+    const AMBIGUOUS: i64 = 500;
+    let (_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_ambiguous_backlog";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: false,
+            queue_stripe_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_ambiguous_backlog";
+    store
+        .enqueue_batch(&pool, queue, 2, AMBIGUOUS)
+        .await
+        .expect("enqueue the ambiguous backlog");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, AMBIGUOUS, Duration::from_secs(300))
+        .await
+        .expect("claim the ambiguous backlog");
+    assert_eq!(claimed.len(), AMBIGUOUS as usize);
+    // A second body at the same lane position under another priority, as older
+    // physical aging could leave, leaves no way to choose each attempt's body.
+    let duplicated = sqlx::query(&format!(
+        "INSERT INTO {schema}.ready_entries
+         (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+          lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+         SELECT ready_slot,ready_generation,job_id,kind,queue,args,priority-1,attempt,run_lease,
+          max_attempts,lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,
+          unique_states,payload
+         FROM {schema}.ready_entries WHERE queue=$1"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("duplicate the retained bodies");
+    assert_eq!(duplicated.rows_affected(), AMBIGUOUS as u64);
+
+    let other_queue = "qs_ambiguous_backlog_other";
+    let other_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9045 },
+        InsertOpts {
+            queue: other_queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let other_claims = store
+        .claim_runtime_batch(&pool, other_queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim a recoverable job after the backlog");
+    assert_eq!(other_claims.len(), 1);
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .expect("ambiguous attempts do not stop rescue of the others");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![other_id]
+    );
+    assert_eq!(
+        lease_count(&pool, &store).await,
+        AMBIGUOUS,
+        "the ambiguous attempts stay running"
+    );
+}
+
 #[tokio::test]
 async fn test_historical_tombstoned_legacy_ambiguous_lane_is_skipped_by_rescue() {
     moved_tombstoned_claim_lane(2, 4, false, false, false).await;
