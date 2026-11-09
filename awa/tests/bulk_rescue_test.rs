@@ -917,6 +917,7 @@ async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
              now() - interval '19 hours', 10000, true, true, true, true, true, false, false,
              'queue_storage', 'queue_storage_target'
          );
+         ANALYZE awa.ready_entries;
          ANALYZE awa.lease_claims;
          ANALYZE awa.attempt_state;"
     ))
