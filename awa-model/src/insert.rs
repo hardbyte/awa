@@ -538,15 +538,16 @@ const INSERT_MANY_BATCH_SQL: &str = r#"
 
 /// TRUE when `awa.insert_jobs_compat_batch` exists with the body the
 /// `insert_jobs_compat_batch` schema patch installs, whoever may call it: the
-/// patch's probe. The body check matches the end of the bounded-wait phase,
-/// so `awa migrate` replaces an earlier body that waited for a lane without
-/// bound while holding its claims, or that registered every new lane before
-/// reserving any. Catalog lookup only.
+/// patch's probe. The body check matches the end of the bounded-wait phase
+/// and the 10 ms claim probe, so `awa migrate` replaces an earlier body that
+/// waited for a lane without bound while holding its claims, or that
+/// registered every new lane before reserving any. Catalog lookup only.
 pub(crate) const BATCH_FUNCTION_PATCH_APPLIED_SQL: &str = "SELECT EXISTS (\
     SELECT 1 FROM pg_proc AS p WHERE p.oid = to_regprocedure(\
     'awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],\
     timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)') \
-    AND p.prosrc ~ 'v_bounded_until := clock_timestamp\\(\\) \\+ 4 \\* v_wait_budget')";
+    AND p.prosrc ~ 'v_bounded_until := clock_timestamp\\(\\) \\+ 4 \\* v_wait_budget' \
+    AND p.prosrc ~ 'GREATEST\\(1, LEAST\\(10, ceil')";
 
 /// TRUE when the connected role may call `awa.insert_jobs_compat_batch`.
 const BATCH_FUNCTION_USABLE_SQL: &str = "SELECT COALESCE(has_function_privilege(to_regprocedure(\

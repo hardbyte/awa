@@ -373,17 +373,17 @@ BEGIN
 
             -- Claims go in unique-key order, so two producers with overlapping
             -- keys cannot wait on each other in opposite orders. The first
-            -- attempt inserts them in one statement and gives way to any
-            -- in-flight claim of the same key; later bounded attempts go key
-            -- by key, each waiting at most for the rest of the budget; the
-            -- final attempt inserts them in one statement with ordinary waits.
+            -- attempt inserts them in one statement, each lock wait capped at
+            -- 10 ms (or the budget, if shorter), and gives way to any claim of
+            -- the same key still in flight; later bounded attempts go key by
+            -- key, each waiting at most for the rest of the budget; the final
+            -- attempt inserts them in one statement with ordinary waits.
             v_phase := 'claims';
             IF v_final OR NOT v_claims_one_by_one THEN
-                PERFORM set_config(
-                    'lock_timeout',
-                    CASE WHEN v_final THEN v_caller_lock_timeout ELSE '1ms' END,
-                    true
-                );
+                PERFORM set_config('lock_timeout', CASE WHEN v_final THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, LEAST(10, ceil(1000 * extract(epoch FROM
+                        LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
+                        - clock_timestamp()))))::bigint) END, true);
                 IF p_skip_unique_conflicts THEN
                     WITH claimed AS (
                         INSERT INTO awa.job_unique_claims (unique_key, job_id)
