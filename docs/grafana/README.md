@@ -158,6 +158,8 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.maintenance.promote_duration` | Histogram (s) | state | Promotion time |
 | `awa.maintenance.promote.lane_contention` | Counter | state, queue, outcome | Promotion lanes whose lock was busy: `handed_off` to a dedicated waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out` when a waiter's 30 s wait ran out |
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
+| `awa.maintenance.rescue.pass_size` | Histogram | rescue_kind, rescue_pass_end | Attempts rescued per queue-storage rescue pass, and why the pass stopped (`drained`, `time_budget`, `row_limit`, `owners_unconfirmed`, `error`) |
+| `awa.maintenance.rescue.oldest_attempt_age` | Gauge (s) | rescue_kind | Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; `0` when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader |
 
 ### Heartbeat
 

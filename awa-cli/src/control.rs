@@ -8,17 +8,22 @@ pub(crate) enum ControlCommands {
     Status,
     /// Stop new reclamation and housekeeping; let admitted work drain.
     Halt {
+        /// Control to halt; only `maintenance.prune` is supported
         #[arg(long, default_value = "maintenance.prune")]
         scope: String,
+        /// Halt mode; only `drain` is supported
         #[arg(long, default_value = "drain")]
         mode: String,
+        /// Why the halt is requested, stored with it and shown by `status`
         #[arg(long)]
         reason: String,
     },
     /// Lift exactly the named current halt, without waiting for drain completion.
     Resume {
+        /// Control to resume; only `maintenance.prune` is supported
         #[arg(long, default_value = "maintenance.prune")]
         scope: String,
+        /// UUID of the current halt (`halt_id` in the `halt` or `status` output)
         #[arg(long)]
         halt: Uuid,
     },
