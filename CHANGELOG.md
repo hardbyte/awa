@@ -15,6 +15,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Fixed
 
 - `admin::get_job` and the other queue-storage point reads of one job no longer return `JobNotFound` for a failed job while queue prune moves its row out of the slot being pruned. Since 0.6.14 the read used one snapshot, and a prune that committed after that snapshot was taken left the old slot empty and the moved row invisible to it. Prune moves each retained failed row once per ring cycle, and on a new schema prunes slot 0 right after the first rotation, so a read polling for `failed` could hit it within a second of a worker starting. A read that finds nothing now reads once more in a new snapshot.
+- Creating a new queue lane through `QueueStorage` (its batch enqueues, and workers promoting scheduled or retried jobs) no longer deadlocks with a concurrent `insert`, `insert_many` or `insert_many_copy`, or a 0.6.14 or 0.6.15 per-row producer, that is also the first to use the same `(queue, priority)` (#692). `QueueStorage` took the lane's provisioning lock before writing its `queue_lanes` row, while SQL inserts write the row first and take the lock in the head-table trigger that creates the lane's sequences, so each transaction waited on the other and one failed with `40P01`. `QueueStorage` now writes the row first too. Lanes that already existed were never affected. No schema change; 0.6.15 `QueueStorage` processes keep the old order until they are upgraded.
 
 ## [0.6.15] — 2026-11-09
 

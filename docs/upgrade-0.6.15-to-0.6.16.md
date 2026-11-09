@@ -20,6 +20,10 @@
 
 The 0.6.15 lifecycle-hook and finalizer bounds remain in place. Ring defaults, startup capacity checks and reclamation rate limits are unchanged.
 
+## New queue lanes during the roll
+
+When `QueueStorage` is the first to use a `(queue, priority)` lane, through a batch enqueue or a worker promoting scheduled or retried jobs, 0.6.16 writes the lane's `queue_lanes` row before taking its provisioning lock, the order SQL inserts already use. 0.6.15 takes them the other way round. Until every `QueueStorage` process runs 0.6.16, a 0.6.15 one and any other producer that are both first to use the same lane can still deadlock, and one transaction fails with `40P01`. Lanes that already exist are unaffected. To avoid it during the roll, create the lanes of a queue or priority before traffic first reaches it, with the 0.6.16 `awa storage prepare-queue`, or retry the failed transaction.
+
 ## What the migration changes
 
 The patch creates `awa.runtime_controls` and `awa.runtime_control_observations` as ordinary tables, plus functions. The observation table has `instance_id uuid PRIMARY KEY` and `observation jsonb NOT NULL`, with no foreign key. It does not alter `awa.runtime_instances` or any other existing table, refresh the `v023` substrate installer or claim functions, or change storage routing.
