@@ -943,6 +943,10 @@ async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
         setup_started.elapsed()
     );
 
+    // Completed rows leave the ring once queue prune wraps past them, so the
+    // handler counts the recovery runs.
+    let second_attempts = Arc::new(AtomicU64::new(0));
+    let other_attempts = Arc::new(AtomicU64::new(0));
     let mut builder = Client::builder(pool.clone())
         .queue_storage(
             QueueStorageConfig::default(),
@@ -957,7 +961,19 @@ async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
                 ..QueueConfig::default()
             },
         )
-        .register::<AbandonedJob, _, _>(|_, _| async { Ok(JobResult::Completed) });
+        .register::<AbandonedJob, _, _>({
+            let second_attempts = second_attempts.clone();
+            let other_attempts = other_attempts.clone();
+            move |_, ctx| {
+                let runs = if ctx.job.attempt == 2 {
+                    &second_attempts
+                } else {
+                    &other_attempts
+                };
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(JobResult::Completed) }
+            }
+        });
     if let Some(budget) = env_u64("AWA_ROW_LOCAL_RESCUE_PASS_BUDGET_MS") {
         builder = builder.rescue_pass_budget(Duration::from_millis(budget));
     }
@@ -1022,19 +1038,15 @@ async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
         wait_until(
             scaled_timeout(Duration::from_secs(300 + abandoned as u64 / 500)),
             "every rescued job to run on its second attempt",
-            || async {
-                count(
-                    &pool,
-                    format!(
-                        "SELECT count(*) FROM awa.terminal_jobs
-                         WHERE queue = '{ROW_LOCAL_QUEUE}' AND state = 'completed'"
-                    ),
-                )
-                .await
-                    == abandoned
-            },
+            || async { second_attempts.load(Ordering::SeqCst) >= abandoned as u64 },
         )
         .await;
+        assert_eq!(second_attempts.load(Ordering::SeqCst), abandoned as u64);
+        assert_eq!(
+            other_attempts.load(Ordering::SeqCst),
+            0,
+            "only the abandoned first attempts are rescued"
+        );
     }
     client.shutdown(Duration::from_secs(10)).await;
 }
