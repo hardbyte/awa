@@ -673,6 +673,7 @@ DECLARE
     v_function REGPROCEDURE;
     v_function_owner OID;
     v_grantee TEXT;
+    v_previous_role TEXT;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
                             THEN 'SET' ELSE 'MEMBER' END;
 BEGIN
@@ -791,10 +792,39 @@ BEGIN
 
     v_function := format('%I.ensure_claim_batch_job_index(integer)', p_schema)::regprocedure;
 
-    -- Reset EXECUTE before handing the function to the table owner: the
-    -- running role holds the current owner's privileges (it just replaced the
-    -- function), but a role that may only SET ROLE to the table owner cannot
-    -- revoke or grant once that role owns it. ALTER ... OWNER keeps the ACL.
+    SELECT routine.proowner INTO v_function_owner
+    FROM pg_proc AS routine
+    WHERE routine.oid = v_function;
+
+    IF v_function_owner <> v_table_owner THEN
+        IF pg_has_role(current_user, v_function_owner, 'USAGE')
+           AND pg_has_role(current_user, v_table_owner, v_set_mode)
+           AND has_schema_privilege(v_table_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format(
+                'ALTER FUNCTION %s OWNER TO %I',
+                v_function,
+                pg_get_userbyid(v_table_owner)
+            );
+            v_function_owner := v_table_owner;
+        ELSE
+            RAISE WARNING '% is owned by %, not the owner % of %.lease_claim_batches, so it cannot create the job_ids index',
+                v_function, pg_get_userbyid(v_function_owner), pg_get_userbyid(v_table_owner), p_schema
+                USING HINT = format(
+                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                    quote_ident(pg_get_userbyid(v_table_owner)),
+                    quote_ident(pg_get_userbyid(v_table_owner))
+                );
+        END IF;
+    END IF;
+
+    -- Reset EXECUTE as the function's owner, after any transfer, so a former
+    -- owner that holds TRUNCATE keeps it. A role that may only SET ROLE to the
+    -- new owner cannot grant or revoke as itself, so it acts as the owner for
+    -- the reset and then restores its previous role.
+    IF NOT pg_has_role(current_user, v_function_owner, 'USAGE') THEN
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', pg_get_userbyid(v_function_owner), true);
+    END IF;
     FOR v_grantee IN
         SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
                              ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
@@ -814,29 +844,8 @@ BEGIN
     LOOP
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', v_function, v_grantee);
     END LOOP;
-
-    SELECT routine.proowner INTO v_function_owner
-    FROM pg_proc AS routine
-    WHERE routine.oid = v_function;
-
-    IF v_function_owner <> v_table_owner THEN
-        IF pg_has_role(current_user, v_function_owner, 'USAGE')
-           AND pg_has_role(current_user, v_table_owner, v_set_mode)
-           AND has_schema_privilege(v_table_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
-            EXECUTE format(
-                'ALTER FUNCTION %s OWNER TO %I',
-                v_function,
-                pg_get_userbyid(v_table_owner)
-            );
-        ELSE
-            RAISE WARNING '% is owned by %, not the owner % of %.lease_claim_batches, so it cannot create the job_ids index',
-                v_function, pg_get_userbyid(v_function_owner), pg_get_userbyid(v_table_owner), p_schema
-                USING HINT = format(
-                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
-                    quote_ident(pg_get_userbyid(v_table_owner)),
-                    quote_ident(pg_get_userbyid(v_table_owner))
-                );
-        END IF;
+    IF v_previous_role IS NOT NULL THEN
+        PERFORM set_config('role', v_previous_role, true);
     END IF;
 END;
 $refresh$;
