@@ -21,10 +21,11 @@ use sqlx::{PgExecutor, PgPool};
 // `awa.insert_jobs_compat_batch` (the `insert_jobs_compat_batch` schema
 // patch), which does the lane-independent work first (job ids, unique claims,
 // payloads) and then registers and reserves its lanes one at a time in
-// canonical order, so a lane is held only across its registration,
-// reservation, the ready-row writes and the commit. While it holds claims or
-// lanes it waits at most 500 ms (or half of its session's `deadlock_timeout`,
-// if lower) for another; a longer wait releases them all and retries, so a
+// canonical order. Each lane's lock is taken when the batch reaches that
+// lane rather than at the batch's first ready row, and like every enqueue
+// lock it is held until the transaction ends. While it holds claims or lanes
+// it waits at most 500 ms (or half of its session's `deadlock_timeout`, if
+// lower) for another; a longer wait releases them all and retries, so a
 // per-row producer that holds a lane and waits for one of the batch's keys
 // usually proceeds instead of deadlocking with it. After 2 s of retries it
 // makes one last attempt with ordinary lock waits.
