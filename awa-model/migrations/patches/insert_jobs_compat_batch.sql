@@ -16,12 +16,14 @@
 -- Per-row producers take each job's claim and its lane together, so one can
 -- hold a lane the batch needs while it waits for a key the batch has claimed.
 -- The batch therefore takes its claims and lanes in a subtransaction whose
--- lock waits all end within half of deadlock_timeout of its first lock; when
--- one would not, it rolls back, which releases every claim and lane it took,
--- and retries. The per-row producer proceeds before its deadlock check runs,
--- and the batch never waits long enough to run one, so neither is aborted
--- with deadlock detected. A lane the batch gave up on is awaited first on the
--- next attempt, while it holds nothing, so a busy lane cannot starve it.
+-- lock waits all end within a budget of its first lock: 500 ms, or half of the
+-- batch session's deadlock_timeout when that is lower. When a wait would run
+-- longer, the batch rolls back, which releases every claim and lane it took,
+-- and retries. A per-row producer whose deadlock_timeout exceeds the budget
+-- (PostgreSQL's default is 1 s) proceeds before its deadlock check runs, and
+-- the batch never waits long enough to run one, so neither is aborted with
+-- deadlock detected. A lane the batch gave up on is awaited first on the next
+-- attempt, while it holds nothing, so a busy lane cannot starve it.
 --
 -- The column arrays are parallel and must have equal length. Every element is
 -- required except run_at, unique_key, unique_states and ordering_hash;
@@ -289,14 +291,19 @@ BEGIN
 
     -- Every claim and lane the batch takes is taken inside one attempt, a
     -- subtransaction. After an attempt's first lock, each lock wait ends
-    -- within half of deadlock_timeout of that lock; a wait that would run
-    -- longer rolls the attempt back, which releases everything it took, and
-    -- the batch tries again. A per-row producer waiting on the batch is
-    -- therefore released before its own deadlock check, and the batch never
-    -- waits long enough to run one. The caller's lock_timeout, when set,
-    -- bounds the whole insert.
+    -- within the wait budget of that lock; a wait that would run longer rolls
+    -- the attempt back, which releases everything it took, and the batch
+    -- tries again. A per-row producer waiting on the batch is therefore
+    -- released before its own deadlock check, and the batch never waits long
+    -- enough to run one. The budget is capped because the per-row producer's
+    -- check runs on its own session's deadlock_timeout, which this session
+    -- cannot see. The caller's lock_timeout, when set, bounds the whole
+    -- insert.
     v_caller_lock_timeout := current_setting('lock_timeout');
-    v_wait_budget := current_setting('deadlock_timeout')::interval / 2;
+    v_wait_budget := LEAST(
+        current_setting('deadlock_timeout')::interval / 2,
+        interval '500 milliseconds'
+    );
     IF v_caller_lock_timeout::interval > interval '0' THEN
         v_caller_deadline := clock_timestamp() + v_caller_lock_timeout::interval;
     END IF;

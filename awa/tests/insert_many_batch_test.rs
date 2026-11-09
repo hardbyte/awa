@@ -390,21 +390,33 @@ async fn canonical_storage_inserts_and_skips_row_by_row() {
 /// While another transaction holds a lane lock, a batch bound for that lane
 /// has already done its lane-independent work (it holds its unique claims) and
 /// has not yet written a ready row. Every row's unique claim, not just the
-/// first's, is held by then. The batch's session has a long
-/// `deadlock_timeout`, so its first attempt keeps waiting while this is
-/// checked.
+/// first's, is held by then.
 #[tokio::test]
 async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
     let _guard = ENGINE_GUARD.lock().await;
     let pool = queue_storage_pool().await;
+    // The batch keeps its claims only for its first attempt's wait budget
+    // (500 ms by default), so a probe that lands later shows nothing; such a
+    // run is repeated rather than judged.
+    for _ in 0..3 {
+        if lane_window_holds_claims(&pool).await {
+            return;
+        }
+    }
+    panic!("every probe of the batch's claims landed after its first attempt's wait budget");
+}
+
+/// Returns false when the probe landed too late to judge.
+async fn lane_window_holds_claims(pool: &PgPool) -> bool {
+    const JUDGEABLE: Duration = Duration::from_millis(400);
     let queue = unique_queue("window");
 
     // Provision the lane so the gate lock is the only thing to wait for.
-    insert_many(&pool, &[job(&queue, -1, false)])
+    insert_many(pool, &[job(&queue, -1, false)])
         .await
         .expect("provision lane");
 
-    let key = lane_lock_key(&pool, &queue).await;
+    let key = lane_lock_key(pool, &queue).await;
     let mut gate = pool.begin().await.expect("begin gate");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(key)
@@ -413,21 +425,13 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
         .expect("take lane lock");
 
     let jobs_for_probe: Vec<InsertParams> = (0..50).map(|seq| job(&queue, seq, true)).collect();
-    let patient_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            PgConnectOptions::from_str(&setup::database_url())
-                .expect("parse database url")
-                .options([("deadlock_timeout", "20s")]),
-        )
-        .await
-        .expect("connect with a long deadlock_timeout");
+    let started = Instant::now();
     let producer = {
+        let pool = pool.clone();
         let jobs = jobs_for_probe.clone();
-        tokio::spawn(async move { insert_many_skip_unique_conflicts(&patient_pool, &jobs).await })
+        tokio::spawn(async move { insert_many_skip_unique_conflicts(&pool, &jobs).await })
     };
 
-    let started = Instant::now();
     let waiter = loop {
         let pid: Option<i32> = sqlx::query_scalar(
             "SELECT pid FROM pg_locks
@@ -436,33 +440,16 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
              LIMIT 1",
         )
         .bind(key)
-        .fetch_optional(&pool)
+        .fetch_optional(pool)
         .await
         .expect("poll pg_locks");
         if let Some(pid) = pid {
             break pid;
         }
         assert!(started.elapsed() < WAIT_DEADLINE, "producer never waited");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     };
 
-    let holds_relation_lock = |relation: &'static str| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (
-                    SELECT 1 FROM pg_locks
-                    WHERE pid = $1 AND locktype = 'relation' AND granted
-                      AND relation = $2::regclass
-                )",
-            )
-            .bind(waiter)
-            .bind(relation)
-            .fetch_one(&pool)
-            .await
-            .expect("read relation locks")
-        }
-    };
     // The claim of the batch's last row is already held, uncommitted: an
     // insert of the same key waits on the producer's transaction.
     let last = jobs_for_probe.last().expect("probe job");
@@ -473,7 +460,7 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
             .expect("unique key")
             .to_vec();
     let mut probe = pool.begin().await.expect("begin probe");
-    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+    sqlx::query("SET LOCAL lock_timeout = '20ms'")
         .execute(&mut *probe)
         .await
         .expect("set lock timeout");
@@ -484,17 +471,38 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
     .bind(&last_key)
     .execute(&mut *probe)
     .await;
+    let probed_after = started.elapsed();
     match probe_result {
-        Err(sqlx::Error::Database(db_err)) => assert_eq!(
-            db_err.code().as_deref(),
-            Some("55P03"),
-            "the last row's claim must already be held while the lane lock is awaited"
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("55P03") => {}
+        Ok(_) if probed_after > JUDGEABLE => {
+            probe.rollback().await.expect("roll back probe");
+            gate.rollback().await.expect("release lane lock");
+            tokio::time::timeout(WAIT_DEADLINE, producer)
+                .await
+                .expect("producer finished")
+                .expect("producer task")
+                .expect("insert batch");
+            return false;
+        }
+        other => panic!(
+            "claim of the last row was not held while waiting for the lane \
+             ({probed_after:?} after the batch started): {other:?}"
         ),
-        other => panic!("claim of the last row was not held while waiting for the lane: {other:?}"),
     }
     drop(probe);
+    let writes_ready_rows: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE pid = $1 AND locktype = 'relation' AND granted
+              AND relation = 'awa.ready_entries'::regclass
+        )",
+    )
+    .bind(waiter)
+    .fetch_one(pool)
+    .await
+    .expect("read relation locks");
     assert!(
-        !holds_relation_lock("awa.ready_entries").await,
+        !writes_ready_rows,
         "no ready row is written while the lane lock is awaited"
     );
 
@@ -505,7 +513,8 @@ async fn batch_waits_for_the_lane_after_its_lane_independent_work() {
         .expect("producer task")
         .expect("insert batch");
     assert_eq!(inserted.len(), 50);
-    assert_eq!(ready_lane_seqs(&pool, &queue).await.len(), 51);
+    assert_eq!(ready_lane_seqs(pool, &queue).await.len(), 51);
+    true
 }
 
 /// Producers on the per-row function, as released 0.6 binaries are, and
@@ -708,11 +717,36 @@ async fn per_row_insert_of_a_key_a_waiting_batch_claimed_does_not_deadlock() {
     let _guard = ENGINE_GUARD.lock().await;
     let pool = queue_storage_pool().await;
     for path in [Path::SkipUniqueConflicts, Path::Copy] {
-        assert_batch_gives_up_claims_while_waiting_for_a_lane(&pool, path).await;
+        assert_batch_gives_up_claims_while_waiting_for_a_lane(&pool, &pool, path).await;
     }
 }
 
-async fn assert_batch_gives_up_claims_while_waiting_for_a_lane(pool: &PgPool, path: Path) {
+/// The same cycle with the batch's session at a `deadlock_timeout` far above
+/// the per-row producer's default of one second. The batch's wait budget is
+/// capped, so it still gives way before the per-row producer's deadlock check.
+#[tokio::test]
+async fn batch_with_a_long_deadlock_timeout_still_gives_way_to_a_per_row_producer() {
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let batch_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            PgConnectOptions::from_str(&setup::database_url())
+                .expect("parse database url")
+                .options([("deadlock_timeout", "20s")]),
+        )
+        .await
+        .expect("connect with a long deadlock_timeout");
+    for path in [Path::SkipUniqueConflicts, Path::Copy] {
+        assert_batch_gives_up_claims_while_waiting_for_a_lane(&pool, &batch_pool, path).await;
+    }
+}
+
+async fn assert_batch_gives_up_claims_while_waiting_for_a_lane(
+    pool: &PgPool,
+    batch_pool: &PgPool,
+    path: Path,
+) {
     let queue = unique_queue("claim_cycle");
     insert_many(pool, &[job(&queue, -1, false)])
         .await
@@ -724,9 +758,9 @@ async fn assert_batch_gives_up_claims_while_waiting_for_a_lane(pool: &PgPool, pa
         .expect("per-row insert takes the lane");
 
     let batch = {
-        let pool = pool.clone();
+        let batch_pool = batch_pool.clone();
         let jobs = vec![job(&queue, 0, true)];
-        tokio::spawn(async move { path.try_insert(&pool, &jobs).await })
+        tokio::spawn(async move { path.try_insert(&batch_pool, &jobs).await })
     };
     wait_until_lane_awaited(pool, lane_lock_key(pool, &queue).await, "batch").await;
 
@@ -854,9 +888,8 @@ async fn batch_waits_for_a_busy_lane_without_holding_its_claims() {
     };
     wait_until_lane_awaited(&pool, key, "batch").await;
 
-    // Past the first attempt's wait budget (half of the default one-second
-    // deadlock_timeout) and its retry pause, the batch waits for the lane
-    // with nothing claimed.
+    // Past the first attempt's wait budget (500 ms) and its retry pause, the
+    // batch waits for the lane with nothing claimed.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let mut probe = pool.begin().await.expect("begin probe");
     sqlx::query("SET LOCAL lock_timeout = '100ms'")

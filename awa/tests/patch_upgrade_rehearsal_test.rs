@@ -754,8 +754,8 @@ async fn released_patch_upgrade_and_rollback() {
             .unwrap();
         assert_eq!(
             pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-            ["prune_controls"],
-            "a released 0.6.15 deployment needs only prune controls"
+            ["insert_jobs_compat_batch", "prune_controls"],
+            "a released 0.6.15 deployment needs the bounded-wait batch function and prune controls"
         );
     }
 
@@ -824,10 +824,10 @@ async fn released_patch_upgrade_and_rollback() {
     if released_version == "0.6.9" {
         assert!(patch_sql.contains("R__prepared_lane_sequences"));
     } else {
-        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 1);
+        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 2);
         assert!(!patch_sql.contains("R__prepared_lane_sequences"));
         assert!(!patch_sql.contains("R__claim_batch_job_index"));
-        assert!(!patch_sql.contains("R__insert_jobs_compat_batch"));
+        assert!(patch_sql.contains("R__insert_jobs_compat_batch"));
     }
     assert!(
         !patch_sql.contains("-- Migration V"),
@@ -971,6 +971,7 @@ async fn released_patch_upgrade_and_rollback() {
                 "already present"
             }
         ),
+        "Schema patch insert_jobs_compat_batch: applied".to_string(),
         "Schema patch prune_controls: applied".to_string(),
         format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
     ] {
