@@ -14,6 +14,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | T4 | `kill -9` crash recovery | ✓ |  |
 | T5 | Deadline rescue (hung job) | ✓ |  |
 | T5a | Poison jobs (handler panic, crash loop, deadline loop) stop at `max_attempts` on both engines | ✓ |  |
+| T5b | Rescue drains a backlog of abandoned claims in bounded passes without rescuing live claims, and the queue and claim rings then rotate past the pinned slots | ✓ |  |
 | T6 | Transactional atomicity | ✓ |  |
 | T7 | Transactional atomicity (Python) |  | ✓ |
 | T8 | Uniqueness under contention | ✓ | ✓ |
@@ -59,6 +60,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | # | Test | Rust | Py |
 | --- | --- | --- | --- |
 | T13 | Queue pause/resume | ✓ |  |
+| T13a | Durable `maintenance.prune` halt survives a leader handoff and keeps job accounting exact; resume names the current halt | ✓ |  |
 | T22 | Pool exhaustion resilience | ✓ |  |
 | T26 | Migration idempotency | ✓ |  |
 | T27 | Admin ops under load | ✓ |  |
@@ -167,6 +169,7 @@ _HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not 
 | --- | --- | --- | --- |
 | T47-T57a | COPY: empty, single, 1000, special chars, tags, unique, atomic | ✓ | ✓ |
 | QSC1-QSC2 | Queue storage COPY producer: ready/deferred direct COPY, unique-conflict rollback | ✓ | ✓ |
+| QSC3 | Batch inserts give way to per-row producers that share their unique keys or lanes, and every producer pair creates a new lane without deadlock | ✓ |  |
 
 ### Rate Limiting & Weighted Concurrency
 
@@ -241,7 +244,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA9 | AwaShardedPrune | Cross-shard ready/terminal prune matching by `enqueue_shard` |
 | TLA10 | AwaSegmentedStorageRaces | Claim-vs-rotate/prune race exposure and checked-commit safety |
 | TLA11 | AwaSegmentedStorageTrace | Runtime trace acceptance for snooze, receipt rescue, cancel, callback wait, DLQ retry, and DLQ purge paths |
-| TLA12 | AwaStorageLockOrder | Postgres lock ordering across claim, complete, cancel, rescue, rotate, and prune |
+| TLA12 | AwaStorageLockOrder | Postgres lock ordering across enqueue, new-lane provisioning, claim, complete, cancel, rescue, rotate, and prune |
 | TLA13 | AwaStorageTransition | Storage-transition prepare, mixed-entry, finalize, and abort gates |
 | TLA14 | AwaDeadTupleContract | Hot-table reclaim-kind and partition-truncate contract |
 
