@@ -88,7 +88,7 @@ Interpretation:
 
 ### Transient Admin Reads During Partition Pruning
 
-In 0.6, a job-detail read, including list-item hydration, uses several queries within one snapshot. It retains read locks on the located ready body, but does not lock all ring partitions before establishing that snapshot. Prune can truncate a ready partition before its body is located, or a lease or claim partition before that read phase reaches it. A completed job can then briefly appear available or missing. Retry with a fresh read before treating that result as missing durable work. Filtering tombstoned source rows after a queue or priority move does not close these separate windows.
+In 0.6, job detail, list-item hydration, the `list_jobs` candidate scan and kind overviews each run several queries within one snapshot. They release partition locks between queries so prune does not wait for the whole read. `TRUNCATE` is not MVCC-safe: once a prune commits, the later queries of a read whose snapshot predates it see the truncated partition empty and cannot see the failed rows it moved. Since 0.6.16 these reads compare the relfilenode of every ring partition before their snapshot and after it ends, and read again in a new snapshot, up to three times, if prune or the terminal-count rollup truncated one in between. A read that overlaps a truncation on every attempt returns what the last attempt saw, so a job can still briefly appear available or missing; read again before treating it as missing durable work. Single-statement reads, such as state counts and queue overviews, lock their partitions before taking their snapshot under `READ COMMITTED` and are not affected.
 
 ### Failed Jobs Rescued After Priority Aging
 
