@@ -138,7 +138,7 @@ Run the broken correlated-hash witness with:
 
 ## Lock-order companion spec
 
-[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each storage-engine transaction (claim, rotate-leases, prune-leases, rotate-ready, prune-ready) as an ordered sequence of Postgres lock acquisitions, with a simplified shared/exclusive compatibility matrix that captures the cases relevant to deadlock analysis. Invariants:
+[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each storage-engine transaction (enqueue, first enqueue to a new lane, claim, complete, rescue, cancel, and rotate / prune of each ring) as an ordered sequence of Postgres lock acquisitions, with a simplified shared/exclusive compatibility matrix that captures the cases relevant to deadlock analysis. Invariants:
 
 - `NoDeadlock`: the waits-for graph is acyclic
 - `LockCompatibility`: no two incompatible locks on the same resource
@@ -147,14 +147,18 @@ Run the broken correlated-hash witness with:
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models enqueue, the first enqueue to a new lane (`queue_lanes` row, provisioning lock, enqueue lock), claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
+- [`AwaStorageLockOrderOldStripedClaimDeadlock.cfg`](./AwaStorageLockOrderOldStripedClaimDeadlock.cfg): the historical claim shape that walked several physical stripes against the enqueue order — **NoDeadlock tripped**.
+- [`AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg`](./AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg): the historical `QueueStorage` order for a new lane, provisioning lock before the `queue_lanes` row, against a SQL producer of the same lane — **NoDeadlock tripped in 5 steps** (#692).
 
 Run:
 
 ```bash
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg
 ```
 
 Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
