@@ -7,6 +7,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Upgrading
 
 - Run `awa migrate` once as the schema owner to apply `prune_controls` after the existing `claim_batch_job_index` and `insert_jobs_compat_batch` patches. It adds two tables and functions without altering existing tables; schema stays v40. Upgrade or fence every possible maintenance leader before relying on halt. See the [0.6.15 to 0.6.16 upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
+- The same run re-applies `claim_batch_job_index` on a 0.6.15 database, replacing each schema's `ensure_claim_batch_job_index` function. Like the first application it builds no index and takes no table locks. External migration runners: replace `R__claim_batch_job_index.sql` with the new version as well.
 
 ### Added
 
@@ -14,11 +15,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Claim prune no longer treats a partial GIN index on `lease_claim_batches.job_ids`, or a session with `quote_all_identifiers` on, as the claim batch index. It recognises only a valid, non-partial GIN index on `job_ids` alone. When another index or relation already has the index's name, `ensure_claim_batch_job_index` leaves it in place, returns false and raises a warning naming it, instead of reporting the slot indexed; the slot keeps scanning until an operator drops or renames it.
+- Refreshing `ensure_claim_batch_job_index` as a migration role that owns it but may only `SET ROLE` to the table owner (PostgreSQL 16+ membership `WITH INHERIT FALSE`) no longer leaves `EXECUTE` with `PUBLIC`. The refresh used to hand the function to the table owner first, after which that role could no longer revoke or grant on it, and PostgreSQL only warned. It now resets `EXECUTE` after the transfer, acting as the new owner when it cannot as itself, so exactly the roles holding `TRUNCATE` on `lease_claim_batches` can execute it, the former owner included. Migrations run with the owner as the effective role, as documented, were not affected.
 - `admin::get_job` and the other queue-storage point reads of one job no longer return `JobNotFound` for a failed job while queue prune moves its row out of the slot being pruned. Since 0.6.14 the read used one snapshot, and a prune that committed after that snapshot was taken left the old slot empty and the moved row invisible to it. Prune moves each retained failed row once per ring cycle, and on a new schema prunes slot 0 right after the first rotation, so a read polling for `failed` could hit it within a second of a worker starting. A read that finds nothing now reads once more in a new snapshot.
 
 ## [0.6.15] — 2026-11-09
 
-Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
+Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches take a queue lane's enqueue lock when they write that lane rather than at their first ready row.
 
 ### Upgrading
 
@@ -47,7 +50,7 @@ Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose
 
 ### Changed
 
-- Compatibility COPY inserts (`insert_many_copy` in Rust and Python) hold a queue lane's enqueue lock only while they write that lane, instead of from the batch's first ready row until commit. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
+- Compatibility COPY inserts (`insert_many_copy` in Rust and Python) take a queue lane's enqueue lock when the batch writes that lane, instead of at the batch's first ready row. The lock is transaction-scoped, so it is still held until the transaction ends. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
 - A batch through `awa.insert_jobs_compat_batch` takes all its unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together, lane by lane. A per-row transaction that already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed now fails with `deadlock detected` (SQLSTATE `40P01`) instead of skipping the job or failing with a unique violation (`23505`). Retry the aborted transaction. Batches through the function do not deadlock with each other this way.
 
 ### Added
