@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -2908,8 +2907,9 @@
 <p>There are two COPY-shaped producer paths:</p>
 <ul>
 <li>Direct queue-storage COPY is the high-throughput path: Rust producers use a configured <code>QueueStorage::enqueue_params_copy()</code>, and Python producers use <code>enqueue_many_copy()</code>. Each ready or deferred write group uses array-backed INSERT below 2,048 rows and CSV COPY for larger groups. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially <code>queue_stripe_count</code> / <code>queue_storage_queue_stripe_count</code>.</li>
-<li><code>insert_many_copy()</code> is the compatibility path. It stages rows with an array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff, then takes one of two branches. If any staged row has a <code>unique_key</code>, every row is replayed through <code>POSTGRES_INSERT_JOB_SQL</code> inside a per-row savepoint so SQLSTATE <code>23505</code> can skip that duplicate without aborting the batch; that statement itself calls <code>awa.insert_job_compat()</code>. An all-non-unique batch uses one lateral <code>awa.insert_job_compat()</code> call per staged row without savepoints. Both branches therefore preserve cross-storage behavior. The planned <code>awa.insert_job()</code> public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.</li>
+<li><code>insert_many_copy()</code> is the compatibility path. It stages rows with an array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff, then inserts them through <code>awa.insert_jobs_compat_batch()</code> (migration v055), which reserves each lane once, in canonical lane order, after the batch's lane-independent work, and skips unique conflicts in the same statement. It probes its own connection on every call. On a schema before v055, or for a role without <code>EXECUTE</code> on the function, it takes one of two per-row branches: if any staged row has a <code>unique_key</code>, every row is replayed through <code>POSTGRES_INSERT_JOB_SQL</code> inside a per-row savepoint so SQLSTATE <code>23505</code> can skip that duplicate without aborting the batch; that statement itself calls <code>awa.insert_job_compat()</code>. An all-non-unique batch uses one lateral <code>awa.insert_job_compat()</code> call per staged row without savepoints. Every branch therefore preserves cross-storage behavior. The planned <code>awa.insert_job()</code> public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.</li>
 </ul>
+<p>Generic <code>insert_many</code> always uses one statement that calls <code>awa.insert_job_compat()</code> per row in canonical lane order: its <code>PgExecutor</code> is consumed by that statement, so it cannot probe the schema first. <code>insert_many_skip_unique_conflicts</code> requires the batch function.</p>
 <p>Claim is cursor-based rather than heap-scan based:</p>
 <ul>
 <li><code>queue_meta.enqueue_shards</code> controls how many independent enqueue/claim head rows a queue has. The default is one shard. Raising it changes the ordering contract to FIFO within <code>(queue, priority, enqueue_shard)</code>, with no global ordering promise across shards.</li>

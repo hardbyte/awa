@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -2542,9 +2541,11 @@
 <p>Hooks are <strong>best-effort, in-process notifications</strong> — not a durable workflow mechanism:</p>
 <ul>
 <li>They observe <strong>committed</strong> state. An outcome hook carries the post-transition <code>JobRow</code>; a stale/rejected finalization emits no outcome event (though a <code>Started</code> may already have fired for that attempt).</li>
-<li>They do not block executor progress or queue capacity, and <code>shutdown()</code> does not wait for them. They can be lost on process crash or shutdown.</li>
+<li>They do not delay a job's state transition, and <code>shutdown()</code> does not wait for them. They can be lost on process crash or shutdown.</li>
+<li>Each attempt's hooks hold one of the worker's finalizer slots until they return, the same bounded slots that wait for completions to commit. Hooks slower than job throughput therefore slow claiming instead of piling up in memory. Keep hooks fast, and hand slow work to a job or follow-up instead.</li>
+<li>Maintenance dispatches <code>Rescued</code> events, and <code>Cancelled</code> for duplicates it supersedes, on detached tasks with at most 1,024 outstanding per worker. Events beyond that are dropped with a warning rather than holding up rescue.</li>
 <li><strong>Dispatch is not atomic with the state transition.</strong> The hook runs <em>after</em> the job's transition commits, as a separate in-process step — it is not a transactional outbox. If the process dies between the commit and the dispatch, the job state is durable but the event is lost. The same applies to callback resolution: <code>complete_external</code> / <code>resolve_callback</code> commit the outcome first, then dispatch.</li>
-<li><code>Started</code> is dispatched detached, so a very fast job may finish before its <code>Started</code> hook completes — do not rely on strict started-before-outcome ordering for short jobs.</li>
+<li><code>Started</code> runs alongside the handler, so a very fast job's state transition may commit before its <code>Started</code> hook completes. For outcomes the worker finalizes itself, the outcome hook runs only after the <code>Started</code> hook has returned.</li>
 <li>A panicking hook is logged; later hooks for the same kind still run.</li>
 </ul>
 <p>If a side effect must fire exactly once or survive a crash, do not drive it from a hook at all — the dispatch may never run, and enqueueing the follow-up work <em>from</em> the hook just inherits that same unreliability. See the next section for the durable mechanism.</p>

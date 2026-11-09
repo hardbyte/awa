@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -1643,6 +1642,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#claiming-slows-while-handlers-are-idle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Claiming Slows While Handlers Are Idle
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Claiming Slows While Handlers Are Idle">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-usually-means_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What It Usually Means
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-to-check" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What To Check
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#rescue-fails-with-idx_awa_jobs_unique" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1666,7 +1715,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#what-it-usually-means_1" class="md-nav__link">
+  <a href="#what-it-usually-means_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         What It Usually Means
@@ -1727,7 +1776,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#what-to-check" class="md-nav__link">
+  <a href="#what-to-check_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         What To Check
@@ -1788,7 +1837,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#fixes_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -1816,7 +1865,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#what-it-usually-means_2" class="md-nav__link">
+  <a href="#what-it-usually-means_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         What It Usually Means
@@ -2697,6 +2746,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#claiming-slows-while-handlers-are-idle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Claiming Slows While Handlers Are Idle
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Claiming Slows While Handlers Are Idle">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-usually-means_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What It Usually Means
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-to-check" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What To Check
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#rescue-fails-with-idx_awa_jobs_unique" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2720,7 +2819,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#what-it-usually-means_1" class="md-nav__link">
+  <a href="#what-it-usually-means_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         What It Usually Means
@@ -2781,7 +2880,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#what-to-check" class="md-nav__link">
+  <a href="#what-to-check_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         What To Check
@@ -2842,7 +2941,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#fixes_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -2870,7 +2969,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#what-it-usually-means_2" class="md-nav__link">
+  <a href="#what-it-usually-means_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         What It Usually Means
@@ -3196,6 +3295,17 @@
 <li>If the failure is steady (e.g. a Postgres pool sized so all connections are saturated by claim/complete traffic and <code>LISTEN</code> can't acquire one), increase the pool max or dedicate a connection to listening.</li>
 </ul>
 <p>In all cases the cancel itself is durable — only the early wake-up is lost. Long-running handlers that don't poll <code>ctx.is_cancelled()</code> between heartbeats won't notice the cancel until they finish or heartbeat-rescue fires.</p>
+<h2 id="claiming-slows-while-handlers-are-idle">Claiming Slows While Handlers Are Idle<a class="headerlink" href="#claiming-slows-while-handlers-are-idle" title="Permanent link">&para;</a></h2>
+<h3 id="what-it-usually-means_1">What It Usually Means<a class="headerlink" href="#what-it-usually-means_1" title="Permanent link">&para;</a></h3>
+<p>Durable completion, or lifecycle hooks, are behind the handlers. A runtime lets only a bounded number of finished attempts wait for their completion to commit (see <a href="../configuration/#hot-queue-claim-control">completion settings</a>). Once that allowance is used up, finished handlers keep their worker slots, <code>awa_job_in_flight</code> sits at <code>max_workers</code> while handler CPU is idle, and the runtime claims only as fast as completions commit. Worker memory stays flat. 0.6 releases before 0.6.15 kept claiming instead, and their memory grew with every finished attempt until the process was killed.</p>
+<h3 id="what-to-check">What To Check<a class="headerlink" href="#what-to-check" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>awa_completion_flush_duration_seconds</code>: long flushes point at the database, usually lock waits on the completion or terminal tables. Look for long transactions and lock waits on the queue-storage schema, as in <a href="#inspect-long-transactions">Inspect Long Transactions</a>.</li>
+<li><code>awa_completion_deadlock_retry_total</code>: a steady rate means completions are re-running after deadlocks.</li>
+<li>Lifecycle hooks (<code>on_event</code>, <code>on_event_kind</code>): a hook that waits on a slow service or on the same database holds its attempt's slot until it returns. Move slow work into a job or a follow-up.</li>
+</ul>
+<h3 id="fixes">Fixes<a class="headerlink" href="#fixes" title="Permanent link">&para;</a></h3>
+<p>Clear the lock contention or long transaction; claiming recovers as soon as completions commit again. Raising <code>max_workers</code> does not help while completion is the bottleneck. For jobs with large payloads, lowering <code>AWA_COMPLETION_BATCH_SIZE</code> reduces how much memory waiting attempts can hold.</p>
 <h2 id="rescue-fails-with-idx_awa_jobs_unique">Rescue Fails With <code>idx_awa_jobs_unique</code><a class="headerlink" href="#rescue-fails-with-idx_awa_jobs_unique" title="Permanent link">&para;</a></h2>
 <p>Symptom: maintenance repeats, every tick (canonical engine — the queue-storage
 engine wedges identically but logs <code>error: unique conflict</code> instead):</p>
@@ -3213,7 +3323,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <p>Cancel the <code>stuck_job</code> (cancelled is outside the default mask, so the transition succeeds). Delete a claim row only after proving its recorded holder no longer exists; deleting a live holder's claim admits a duplicate.</p>
 <p>Prevention: choose <code>unique_states</code> masks that are <em>closed under runtime transitions</em> — retry/rescue move <code>running -&gt; retryable</code>, snooze moves <code>running -&gt; scheduled</code>, and promotion moves <code>retryable -&gt; available</code> or <code>scheduled -&gt; available</code>. A mask a transition can enter from outside (for example <code>{scheduled, available, retryable}</code> without <code>running</code>) intentionally permits a newer enqueue during execution, so the superseded old attempt can end in a fallback cancellation. <code>{}</code> (no dedup) and the full non-terminal set <code>{scheduled, available, running, retryable}</code> avoid that race; pair the full mask with a short <code>by_period</code> bucket if you need "a change during a run still gets a fresh run" semantics.</p>
 <h2 id="producer-enqueue-is-slower-than-expected">Producer Enqueue Is Slower Than Expected<a class="headerlink" href="#producer-enqueue-is-slower-than-expected" title="Permanent link">&para;</a></h2>
-<h3 id="what-it-usually-means_1">What It Usually Means<a class="headerlink" href="#what-it-usually-means_1" title="Permanent link">&para;</a></h3>
+<h3 id="what-it-usually-means_2">What It Usually Means<a class="headerlink" href="#what-it-usually-means_2" title="Permanent link">&para;</a></h3>
 <p>Producers are enqueuing well below the rate the application offers, batches are taking longer than expected, or the consumer fleet is permanently undersaturated despite plenty of producer concurrency.</p>
 <h3 id="reading-the-producer-histograms">Reading The Producer Histograms<a class="headerlink" href="#reading-the-producer-histograms" title="Permanent link">&para;</a></h3>
 <p>The direct queue-storage COPY path (<code>QueueStorage::enqueue_params_copy</code> in Rust, <code>Client.enqueue_many_copy</code> in Python) records two histograms per batch:</p>
@@ -3242,7 +3352,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </ul>
 <h3 id="diagnoses">Diagnoses<a class="headerlink" href="#diagnoses" title="Permanent link">&para;</a></h3>
 <p><strong>1. Producer is going through the compatibility insert path.</strong></p>
-<p><code>insert_many_copy_from_pool</code> / <code>client.insert_many_copy</code> routes every row through <code>awa.insert_job_compat()</code> once per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row function call dominates — measured at ~100–150 ms per row through a Cloud SQL Auth Proxy in staging, which caps a single producer at ~7 rows/sec regardless of batch or chunk size.</p>
+<p>Before migration v055, <code>insert_many_copy_from_pool</code> / <code>client.insert_many_copy</code> routes every row through <code>awa.insert_job_compat()</code> once per row, and a batch with unique jobs adds a savepoint round trip per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row cost dominates — measured at ~100–150 ms per row through an auth proxy, which caps a single producer at ~7 rows/sec regardless of batch or chunk size. Run <code>awa migrate</code> to install <code>awa.insert_jobs_compat_batch</code>; COPY then inserts the batch in one function call. Generic <code>insert_many</code> keeps its one-statement per-row path either way.</p>
 <p>Switch the producer to the direct queue-storage COPY entry point:</p>
 <ul>
 <li>Rust: <code>QueueStorage::enqueue_params_copy(pool, &amp;jobs)</code></li>
@@ -3260,13 +3370,22 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="k">DO</span><span class="w"> </span><span class="k">UPDATE</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">enqueue_shards</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">EXCLUDED</span><span class="p">.</span><span class="n">enqueue_shards</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Use an upsert: first-enqueue may create lane rows before any operator inserts a <code>queue_meta</code> row, so a plain <code>UPDATE</code> quietly affects zero rows. Raising <code>enqueue_shards</code> is a semantic switch from strict to partitioned FIFO; see <a href="../adr/025-sharded-enqueue-heads/">ADR-025</a>.</p>
-<p><strong>3. WAL or commit pressure on the database.</strong></p>
+<p><strong>3. Producers wait on one queue's enqueue lane.</strong></p>
+<p>Many connections wait with <code>wait_event = 'advisory'</code> while the database is otherwise idle, batch inserts take seconds although the work per batch is milliseconds, and promotion into the same queue runs late while producers saturate it.</p>
+<p>On queue storage every enqueue holds a transaction-scoped advisory lock on its <code>(queue, priority, shard)</code> lane until it commits, so concurrent producers for one lane run one at a time; a lane's ceiling is a batch's rows divided by the time the lock is held. Generic <code>insert_many</code> and per-row COPY take the lock at the batch's first ready row and hold it while the rest of the batch is processed. From migration v055, <code>insert_many_copy</code> and <code>insert_many_skip_unique_conflicts</code> prepare the whole batch (job ids, unique claims, payloads) before they take any lane lock, and hold it only for the lane write and the commit.</p>
+<ul>
+<li>Run <code>awa migrate</code> and move hot producers to <code>insert_many_copy</code> or <code>insert_many_skip_unique_conflicts</code>.</li>
+<li>When <code>insert_many</code> fails on a unique conflict, retry with <code>insert_many_skip_unique_conflicts</code> rather than inserting the batch again row by row: each single-row insert queues for the lane separately.</li>
+<li>Keep producer transactions short after the enqueue: the lane stays locked until commit.</li>
+<li>Raise <code>enqueue_shards</code> (above) for a queue whose producers still saturate one lane.</li>
+</ul>
+<p><strong>4. WAL or commit pressure on the database.</strong></p>
 <p>If batch size and shard count both look healthy, sample <code>pg_stat_activity</code> for <code>LWLock:WALWrite</code> / <code>LWLock:WALSync</code> waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in <a href="../deploying-on-managed-postgres/#pick-a-vcpu-size">Managed Postgres sizing</a> are useful reference points.</p>
 <h2 id="leader-election-delays">Leader Election Delays<a class="headerlink" href="#leader-election-delays" title="Permanent link">&para;</a></h2>
 <h3 id="expected-behavior">Expected Behavior<a class="headerlink" href="#expected-behavior" title="Permanent link">&para;</a></h3>
 <p>Only one instance runs maintenance tasks at a time. Non-leaders retry every <code>10s</code> by default.</p>
 <p>That means failover is not instant by default. A short delay after a pod restart or network blip is normal.</p>
-<h3 id="what-to-check">What To Check<a class="headerlink" href="#what-to-check" title="Permanent link">&para;</a></h3>
+<h3 id="what-to-check_1">What To Check<a class="headerlink" href="#what-to-check_1" title="Permanent link">&para;</a></h3>
 <p>From the runtime snapshot table or your app health endpoint, confirm:</p>
 <ul>
 <li>at least one live instance exists</li>
@@ -3304,7 +3423,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>the pool was undersized and the runtime could not get connections reliably</li>
 </ul>
 <p>For Python workers specifically, the heartbeat loop runs on the Rust runtime rather than the Python event loop. If heartbeats still stop, suspect process health or database connectivity first.</p>
-<h3 id="fixes">Fixes<a class="headerlink" href="#fixes" title="Permanent link">&para;</a></h3>
+<h3 id="fixes_1">Fixes<a class="headerlink" href="#fixes_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>increase container <code>terminationGracePeriodSeconds</code></li>
 <li>make sure your app calls <code>shutdown(...)</code> on SIGTERM</li>
@@ -3318,7 +3437,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </ul>
 <p>If a job really needs <code>20m</code>, set a longer deadline for that queue.</p>
 <h2 id="dead-tuples-growing-in-queue-storage">Dead Tuples Growing In Queue Storage<a class="headerlink" href="#dead-tuples-growing-in-queue-storage" title="Permanent link">&para;</a></h2>
-<h3 id="what-it-usually-means_2">What It Usually Means<a class="headerlink" href="#what-it-usually-means_2" title="Permanent link">&para;</a></h3>
+<h3 id="what-it-usually-means_3">What It Usually Means<a class="headerlink" href="#what-it-usually-means_3" title="Permanent link">&para;</a></h3>
 <p>If queue throughput starts to sag while lease tables keep accumulating dead tuples, the usual cause is not duplicate dispatch. The more common pattern is:</p>
 <ul>
 <li>workers are still claiming and completing jobs</li>
@@ -3442,7 +3561,9 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <p>Cause:</p>
 <ul>
 <li>on queue storage every enqueue holds a transaction-scoped advisory lock on its <code>(queue, priority, shard)</code> lane until the transaction commits; the <code>DETAIL</code> names two 64-bit advisory keys, and two transactions that took lanes in opposite orders hold one each and wait on the other's</li>
-<li><code>insert_many</code>, <code>insert_many_copy</code> and the <code>QueueStorage</code> batch enqueues take their lane locks in one canonical order, <code>(queue, priority, shard)</code> ascending with queue names compared bytewise, so batches never deadlock with each other</li>
+<li><code>insert_many</code>, <code>insert_many_copy</code>, <code>insert_many_skip_unique_conflicts</code> and the <code>QueueStorage</code> batch enqueues register and lock their lanes one at a time in one canonical order, <code>(queue, priority, shard)</code> ascending with queue names compared bytewise, so two batch calls cannot hold each other's lanes in opposite orders. One exception remains when a <code>QueueStorage</code> batch enqueue and an <code>insert_many</code> / <code>insert_many_copy</code> call both create the same new <code>(queue, priority)</code> lane: the two paths take that lane's provisioning lock and its <code>queue_lanes</code> row in opposite orders and can deadlock (#692); retry the transaction</li>
+<li>from migration v055, <code>insert_many_copy</code> and <code>insert_many_skip_unique_conflicts</code> take all of a batch's unique claims before any lane lock, while per-row inserts (generic <code>insert_many</code>, single-job inserts, and binaries that predate the batch function) take each job's claim and lane together; a per-row transaction that holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed deadlocks with it, where it used to skip the job or fail with <code>23505</code></li>
+<li>unique keys and the application's own locks can form other cycles</li>
 <li>a transaction that enqueues with several separate statements (<code>insert</code> per job, handler-staged follow-ups, <code>Transaction.insert</code> in a loop) takes locks in statement order and can deadlock against a batch or another such transaction that touches the same lanes in a different order</li>
 </ul>
 <p>Fix:</p>

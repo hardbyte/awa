@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -1592,6 +1591,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v054-claim-batch-job-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v054: claim batch job index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v055-batch-compatibility-insert" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v055: batch compatibility insert
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2527,6 +2548,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v054-claim-batch-job-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v054: claim batch job index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v055-batch-compatibility-insert" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v055: batch compatibility insert
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2976,6 +3019,29 @@ reads them, and it drops completion outputs (counted as
 workers report not ready until the migration runs, as for any version bump.</p>
 <p>External migration runners apply the complete <code>awa migrate --sql --from 51
 --to 52</code> bundle, which defines the helper before the tail calls it.</p>
+<h2 id="v054-claim-batch-job-index">v054: claim batch job index<a class="headerlink" href="#v054-claim-batch-job-index" title="Permanent link">&para;</a></h2>
+<p>Point lookups of compact receipt claims by job id (heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and <code>load_job</code>) use a GIN index on <code>lease_claim_batches.job_ids</code> instead of reading every retained claim batch. v054 installs <code>&lt;schema&gt;.ensure_claim_batch_job_index(slot)</code> in the default and every discovered custom queue-storage schema and builds no index itself, so it takes no lock on any awa or queue-storage table. Claim prune calls that function right after truncating a claim partition, which builds the index while the partition is empty, so every partition gains it within one claim-ring cycle. A new schema's installer indexes its claim partitions as it creates them.</p>
+<p>Do not build the index yourself on a populated partition: the build holds a <code>SHARE</code> lock, which blocks claim inserts into that partition, for about half a minute per 100k batches. Run the migration as the owner of the queue-storage tables, or as a migrator that can <code>SET ROLE</code> to it, so the function can create the index; see <a href="../security/database-roles/#claim-batch-index">Claim batch index</a>.</p>
+<p>Binaries before v054 neither use nor build the index, and binaries that use it read the same rows, by scan, from a partition without it. A database coming from 0.6.15 already has the function from the 0.6 <code>claim_batch_job_index</code> schema patch, and v054 replaces it in place. External migration runners apply the complete <code>awa migrate --sql --from 53 --to 54</code> bundle, which defines the helper before the tail installs the function.</p>
+<h2 id="v055-batch-compatibility-insert">v055: batch compatibility insert<a class="headerlink" href="#v055-batch-compatibility-insert" title="Permanent link">&para;</a></h2>
+<p>v055 adds one function, <code>awa.insert_jobs_compat_batch</code>, and changes nothing else: no table DDL, no table or sequence locks, no change to <code>awa.insert_job_compat</code> or to storage routing. It inserts a whole batch the way <code>awa.insert_job_compat</code> inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, scheduled rows, the result rows). Then, in <code>(queue, priority, shard)</code> order, it registers each lane it is the first to use, reserves each lane's range of positions once and writes the ready rows. Each lane's enqueue lock is therefore held only for the reservation, the ready-row write and the commit, instead of from the batch's first ready row to the commit, so concurrent producers and promotion on the same lane wait for that much shorter window.</p>
+<p>What callers see:</p>
+<ul>
+<li><code>insert_many_copy</code> (Rust) and <code>Client.insert_many_copy</code> (Python) use the function when it is installed and the connected role may execute it, otherwise the per-row path. They check on every call, so a running producer switches on its next call after the migration commits. Their results are unchanged: rows in input order, jobs whose unique key is already claimed skipped.</li>
+<li><code>insert_many_skip_unique_conflicts</code> (Rust) inserts a batch through the function and skips jobs whose unique key is already claimed, returning the inserted rows in input order. Use it instead of retrying a failed <code>insert_many</code> one job at a time. It returns a validation error on a schema before v055.</li>
+<li>Generic <code>insert_many</code> is unchanged: one statement calling <code>awa.insert_job_compat</code> per row, on every schema, and a unique conflict still fails the whole batch.</li>
+<li>A batch's rows in one lane occupy consecutive lane positions in input order, as before, and are described by one ready segment per run instead of one per row. A key repeated inside one batch keeps its first job in input order.</li>
+</ul>
+<p>Binaries before v055 never call the function. They keep calling <code>awa.insert_job_compat</code>, which takes the same lane lock, so old and new producers share a lane without reordering it. A database coming from 0.6.15 already has the function from the 0.6 <code>insert_jobs_compat_batch</code> schema patch, and v055 replaces it in place.</p>
+<p>The batch function takes all of a batch's unique claims before any lane lock, while per-row inserts (generic <code>insert_many</code>, single-job inserts, and binaries before v055) take each job's claim and its lane together, lane by lane. When a per-row transaction already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not yet committed, PostgreSQL aborts one of them with <code>deadlock detected</code> (SQLSTATE <code>40P01</code>), where before the per-row insert would have waited and then skipped the job or failed with a unique violation (<code>23505</code>). Retry the aborted transaction. Two batches through the function take claims in key order and lanes in lane order, so they do not deadlock with each other this way.</p>
+<p>New functions are executable by <code>PUBLIC</code> unless your deployment revokes that through default privileges. If it does and the runtime role's default privileges do not cover functions created by the migration role, grant it explicitly:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">FUNCTION</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">insert_jobs_compat_batch</span><span class="p">(</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="n">jsonb</span><span class="p">[],</span><span class="w"> </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="nb">smallint</span><span class="p">[],</span><span class="w"> </span><span class="nb">smallint</span><span class="p">[],</span><span class="w"> </span><span class="n">timestamptz</span><span class="p">[],</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">    </span><span class="n">jsonb</span><span class="p">[],</span><span class="w"> </span><span class="n">jsonb</span><span class="p">[],</span><span class="w"> </span><span class="n">bytea</span><span class="p">[],</span><span class="w"> </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="nb">boolean</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="p">)</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Without <code>EXECUTE</code>, <code>insert_many_copy</code> keeps the per-row path and <code>insert_many_skip_unique_conflicts</code> fails with <code>permission denied</code>.</p>
+<p>External migration runners apply the complete <code>awa migrate --sql --from 54 --to 55</code> bundle, which refreshes trusted queue-storage discovery before it replaces the function.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
@@ -2997,9 +3063,9 @@ needs a canonical implementation, and gives operators one unambiguous instructio
 <h2 id="if-you-are-on-06-not-yet-finalized">If you are on 0.6, not yet finalized<a class="headerlink" href="#if-you-are-on-06-not-yet-finalized" title="Permanent link">&para;</a></h2>
 <p>Complete the staged transition <strong>on your 0.6 binaries</strong> first
 (full procedure: <a href="../upgrade-0.5-to-0.6/">Upgrade 0.5 to 0.6</a>):</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
 </span></code></pre></div>
 <p>For a stopped fleet, a CLI containing #457 can replace the middle command
 with <code>awa storage enter-mixed-transition --quiesced</code>; follow the
