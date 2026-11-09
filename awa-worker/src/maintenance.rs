@@ -243,9 +243,12 @@ pub(crate) const DEFAULT_RESCUE_PASS_MAX_ROWS: usize = 5_000;
 /// a drain to about `rescue_pass_max_rows` attempts per second per kind.
 const RESCUE_BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Claims each slot's cursor walk examines during bulk heartbeat rescue and
-/// follow-up batches. Other first batches keep the store's wider default to
-/// walk past long closed prefixes when acceleration is unavailable or disabled.
+/// Claims each slot's cursor walk examines in every batch of a pass that may
+/// take more than one: deadline rescue, and stale-heartbeat rescue once its
+/// owners are confirmed gone. Every claim examined costs its closure checks,
+/// so a narrow window keeps each batch's transaction short; the pass continues
+/// while windows come back full. A pass limited to one batch keeps the store's
+/// wider default so it can walk past a long closed prefix.
 const RESCUE_FOLLOW_UP_SCAN_LIMIT: usize = 2_000;
 
 /// One batch in this many visits the other claim slots before the oldest, so
@@ -2196,11 +2199,14 @@ impl MaintenanceService {
                 slot_order,
                 skip_slots: sweep.idle_slots.clone(),
                 cursor_scan_limit: (batches > 0
-                    || (kind == RescueKind::Heartbeat
-                        && bulk_heartbeat_cutoff.is_some()
-                        && !budget.is_zero()
-                        && self.rescue_pass_max_rows > 0))
-                    .then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
+                    || (!budget.is_zero()
+                        && self.rescue_pass_max_rows > 0
+                        && match kind {
+                            RescueKind::Heartbeat => bulk_heartbeat_cutoff.is_some(),
+                            RescueKind::Deadline => true,
+                            RescueKind::Callback => false,
+                        }))
+                .then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
             };
             let outcome = match kind {
                 RescueKind::Heartbeat => {
