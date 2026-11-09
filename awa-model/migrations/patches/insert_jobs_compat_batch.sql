@@ -13,6 +13,20 @@
 -- segments in two statements. The lock is held across the reservation, those
 -- two statements and the commit.
 --
+-- Per-row producers take each job's claim and its lane together, so one can
+-- hold a lane the batch needs while it waits for a key the batch has claimed.
+-- The batch therefore takes its claims and lanes in a subtransaction, and
+-- limits each lock wait to what remains of a budget measured from the
+-- attempt's start: 500 ms, or half of the batch session's deadlock_timeout
+-- when that is lower. When a wait would run
+-- longer, the batch rolls back, which releases every claim and lane it took,
+-- and retries, so a per-row producer whose deadlock_timeout exceeds the budget
+-- (PostgreSQL's default is 1 s) usually proceeds before its deadlock check
+-- runs. After four budgets of retries the batch makes one last attempt with
+-- ordinary waits, as it did before it had a budget, so contention or a cycle
+-- through locks the caller took earlier ends in success, a lock timeout or
+-- deadlock detected, never in endless retries.
+--
 -- The column arrays are parallel and must have equal length. Every element is
 -- required except run_at, unique_key, unique_states and ordering_hash;
 -- insert_job_compat's per-row defaults are the caller's to apply.
@@ -71,6 +85,19 @@ DECLARE
     v_ready_generation BIGINT;
     v_row RECORD;
     v_shards SMALLINT[];
+    v_result awa.jobs[];
+    v_claim RECORD;
+    v_attempt INT := 0;
+    v_attempt_started TIMESTAMPTZ;
+    v_wait_budget INTERVAL;
+    v_caller_lock_timeout TEXT;
+    v_caller_wait_ms NUMERIC;
+    v_wait_ms NUMERIC;
+    v_wait_is_callers BOOLEAN := FALSE;
+    v_phase TEXT;
+    v_claims_one_by_one BOOLEAN := FALSE;
+    v_bounded_until TIMESTAMPTZ;
+    v_final BOOLEAN := FALSE;
 BEGIN
     IF v_count = 0 THEN
         RETURN;
@@ -237,8 +264,6 @@ BEGIN
     v_old_search_path := current_setting('search_path');
     PERFORM set_config('search_path', format('%I,awa,public', v_schema), true);
 
-    -- Everything up to the lane reservation is lane-independent and runs
-    -- without a lane lock.
     EXECUTE format(
         'SELECT array_agg(nextval(%L::regclass)::bigint) FROM generate_series(1, $1)',
         format('%I.job_id_seq', v_schema)
@@ -266,188 +291,324 @@ BEGIN
         WITH ORDINALITY AS input(queue, state, ordering_hash, ord)
     LEFT JOIN awa.queue_meta AS meta ON meta.queue = input.queue;
 
-    -- Claims go in unique-key order, so two producers with overlapping keys
-    -- cannot wait on each other in opposite orders.
-    IF p_skip_unique_conflicts THEN
-        WITH claimed AS (
-            INSERT INTO awa.job_unique_claims (unique_key, job_id)
-            SELECT input.unique_key, v_job_ids[input.ord]
-            FROM unnest(p_unique_key, p_unique_states, p_state)
-                WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
-            WHERE input.unique_key IS NOT NULL
-              AND input.unique_states IS NOT NULL
-              AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
-            ORDER BY input.unique_key, input.ord
-            ON CONFLICT (unique_key) DO NOTHING
-            RETURNING job_id
-        )
-        SELECT COALESCE(array_agg(wanted.job_id), ARRAY[]::BIGINT[])
-        INTO v_skipped
-        FROM (
-            SELECT v_job_ids[input.ord] AS job_id
-            FROM unnest(p_unique_key, p_unique_states, p_state)
-                WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
-            WHERE input.unique_key IS NOT NULL
-              AND input.unique_states IS NOT NULL
-              AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
-        ) AS wanted
-        WHERE NOT EXISTS (SELECT 1 FROM claimed WHERE claimed.job_id = wanted.job_id);
-    ELSE
-        INSERT INTO awa.job_unique_claims (unique_key, job_id)
-        SELECT input.unique_key, v_job_ids[input.ord]
-        FROM unnest(p_unique_key, p_unique_states, p_state)
-            WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
-        WHERE input.unique_key IS NOT NULL
-          AND input.unique_states IS NOT NULL
-          AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
-        ORDER BY input.unique_key, input.ord;
-    END IF;
-
-    -- Re-enqueues that are not yet due carry no lane.
-    INSERT INTO deferred_jobs (
-        job_id, kind, queue, args, state, priority, attempt, run_lease,
-        max_attempts, run_at, attempted_at, finalized_at, created_at,
-        unique_key, unique_states, payload
-    )
-    SELECT
-        v_job_ids[input.ord],
-        input.kind,
-        input.queue,
-        input.args,
-        input.state::awa.job_state,
-        input.priority,
-        0,
-        0,
-        input.max_attempts,
-        COALESCE(input.run_at, v_now),
-        NULL,
-        NULL,
-        v_now,
-        input.unique_key,
-        input.unique_states,
-        jsonb_build_object(
-            'metadata', input.metadata,
-            'tags', input.tags,
-            'errors', '[]'::jsonb,
-            'progress', NULL
-        )
-    FROM unnest(
-        p_kind, p_queue, p_args, p_state, p_priority, p_max_attempts, p_run_at,
-        p_metadata, p_tags, p_unique_key, p_unique_states
-    ) WITH ORDINALITY AS input(
-        kind, queue, args, state, priority, max_attempts, run_at,
-        metadata, tags, unique_key, unique_states, ord
-    )
-    WHERE input.state <> 'available'
-      AND v_job_ids[input.ord] <> ALL (v_skipped);
-
-    -- The result rows do not depend on the lanes, so build them before the
-    -- lock window opens.
-    RETURN QUERY
-    SELECT
-        v_job_ids[input.ord],
-        input.kind,
-        input.queue,
-        input.args,
-        input.state::awa.job_state,
-        input.priority,
-        0::smallint,
-        input.max_attempts,
-        COALESCE(input.run_at, v_now),
-        NULL::timestamptz,
-        NULL::timestamptz,
-        NULL::timestamptz,
-        NULL::timestamptz,
-        v_now,
-        ARRAY[]::jsonb[],
-        input.metadata,
-        ARRAY(
-            SELECT tag.value
-            FROM jsonb_array_elements_text(input.tags) WITH ORDINALITY AS tag(value, tag_ord)
-            ORDER BY tag.tag_ord
-        ),
-        input.unique_key,
-        input.unique_states::bit(8),
-        NULL::uuid,
-        NULL::timestamptz,
-        NULL::text,
-        NULL::text,
-        NULL::text,
-        NULL::text,
-        0::bigint,
-        NULL::jsonb
-    FROM unnest(
-        p_kind, p_queue, p_args, p_state, p_priority, p_max_attempts, p_run_at,
-        p_metadata, p_tags, p_unique_key, p_unique_states
-    ) WITH ORDINALITY AS input(
-        kind, queue, args, state, priority, max_attempts, run_at,
-        metadata, tags, unique_key, unique_states, ord
-    )
-    WHERE v_job_ids[input.ord] <> ALL (v_skipped)
-    ORDER BY input.ord;
-
-    -- Lane lock window: in (queue, priority, shard) order, register each lane
-    -- the batch is the first to use and reserve its sequence range once, then
-    -- write the ready rows. The locks are held to the end of the transaction,
-    -- which keeps the rows of a lane visible in lane_seq order.
+    -- Every claim and lane the batch takes is taken inside one attempt, a
+    -- subtransaction. Until the bounded phase ends, each lock wait in an
+    -- attempt ends within the wait budget of the attempt's start; a wait that
+    -- would run longer rolls the attempt back, which releases everything it
+    -- took, and the batch tries again. A per-row producer that holds a lane
+    -- and waits for one of the batch's keys is then released before its own
+    -- deadlock check runs, provided its deadlock_timeout exceeds the budget.
+    -- The budget is capped because that check runs on the other session's
+    -- deadlock_timeout, which this session cannot see.
     --
-    -- A new lane is registered only when the loop reaches it, as every other
-    -- producer does: the head tables' row trigger provisions the lane under
-    -- its lock, and the uncommitted head row blocks other producers of that
-    -- lane, so registering a later lane before reserving an earlier one would
-    -- hold it out of order. Only missing rows are proposed, because the
-    -- trigger fires before the conflict check.
-    FOR v_lane IN
-        SELECT lanes.queue, lanes.priority, lanes.shard, lanes.row_count
-        FROM (
-            SELECT input.queue, input.priority, v_shards[input.ord] AS shard,
-                   count(*) AS row_count
-            FROM unnest(p_queue, p_priority, p_state)
-                WITH ORDINALITY AS input(queue, priority, state, ord)
-            WHERE input.state = 'available'
-              AND v_job_ids[input.ord] <> ALL (v_skipped)
-            GROUP BY input.queue, input.priority, v_shards[input.ord]
-        ) AS lanes
-        ORDER BY lanes.queue COLLATE "C", lanes.priority, lanes.shard
+    -- Rolling back cannot release what the caller's transaction took before
+    -- this call, so retrying alone could spin forever on a cycle through such
+    -- a lock. After the bounded phase the batch makes one final attempt with
+    -- the caller's lock_timeout and ordinary waits, as the function did before
+    -- it had a budget: it succeeds, or PostgreSQL's deadlock detector or the
+    -- caller's lock_timeout ends it.
+    --
+    -- The caller's lock_timeout applies to each wait, as it does to any
+    -- statement: a bounded wait is the shorter of the remaining budget and the
+    -- caller's lock_timeout, and only a wait that the caller's lock_timeout
+    -- ended raises lock_not_available to the caller. The budget is per wait
+    -- too: one claim statement can wait on several in-flight keys, and a lane
+    -- reservation can wait for the lane's provisioning lock and then its lane
+    -- lock, each up to the remaining budget.
+    v_caller_lock_timeout := current_setting('lock_timeout');
+    v_caller_wait_ms := ceil(1000 * extract(epoch FROM v_caller_lock_timeout::interval));
+    v_wait_budget := LEAST(
+        current_setting('deadlock_timeout')::interval / 2,
+        interval '500 milliseconds'
+    );
+    v_bounded_until := clock_timestamp() + 4 * v_wait_budget;
+
+    -- The result rows do not depend on claims or lanes, so they are built once,
+    -- before any lock, and the skipped rows are filtered out on return.
+    SELECT array_agg(
+        (
+            v_job_ids[input.ord],
+            input.kind,
+            input.queue,
+            input.args,
+            input.state::awa.job_state,
+            input.priority,
+            0::smallint,
+            input.max_attempts,
+            COALESCE(input.run_at, v_now),
+            NULL::timestamptz,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            v_now,
+            ARRAY[]::jsonb[],
+            input.metadata,
+            ARRAY(
+                SELECT tag.value
+                FROM jsonb_array_elements_text(input.tags) WITH ORDINALITY AS tag(value, tag_ord)
+                ORDER BY tag.tag_ord
+            ),
+            input.unique_key,
+            input.unique_states::bit(8),
+            NULL::uuid,
+            NULL::timestamptz,
+            NULL::text,
+            NULL::text,
+            NULL::text,
+            NULL::text,
+            0::bigint,
+            NULL::jsonb
+        )::awa.jobs
+        ORDER BY input.ord
+    )
+    INTO v_result
+    FROM unnest(
+        p_kind, p_queue, p_args, p_state, p_priority, p_max_attempts, p_run_at,
+        p_metadata, p_tags, p_unique_key, p_unique_states
+    ) WITH ORDINALITY AS input(
+        kind, queue, args, state, priority, max_attempts, run_at,
+        metadata, tags, unique_key, unique_states, ord
+    );
+
     LOOP
-        INSERT INTO queue_lanes (queue, priority)
-        SELECT v_lane.queue, v_lane.priority
-        WHERE NOT EXISTS (
-            SELECT 1 FROM queue_lanes AS existing
-            WHERE existing.queue = v_lane.queue AND existing.priority = v_lane.priority
-        )
-        ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
+        v_attempt := v_attempt + 1;
+        BEGIN
+            v_skipped := ARRAY[]::BIGINT[];
+            v_lane_queues := ARRAY[]::TEXT[];
+            v_lane_priorities := ARRAY[]::SMALLINT[];
+            v_lane_shards := ARRAY[]::SMALLINT[];
+            v_lane_starts := ARRAY[]::BIGINT[];
+            v_attempt_started := clock_timestamp();
 
-        INSERT INTO queue_enqueue_heads (queue, priority, enqueue_shard)
-        SELECT v_lane.queue, v_lane.priority, v_lane.shard
-        WHERE NOT EXISTS (
-            SELECT 1 FROM queue_enqueue_heads AS existing
-            WHERE existing.queue = v_lane.queue
-              AND existing.priority = v_lane.priority
-              AND existing.enqueue_shard = v_lane.shard
-        )
-        ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+            -- Claims go in unique-key order, so two producers with overlapping
+            -- keys cannot wait on each other in opposite orders. The first
+            -- attempt inserts them in one statement, each lock wait capped at
+            -- 10 ms (or the budget, if shorter), and gives way to any claim of
+            -- the same key still in flight; later bounded attempts go key by
+            -- key, each waiting at most for the rest of the budget; the final
+            -- attempt inserts them in one statement with ordinary waits.
+            v_phase := 'claims';
+            IF v_final OR NOT v_claims_one_by_one THEN
+                v_wait_ms := LEAST(10, ceil(1000 * extract(epoch FROM
+                    v_attempt_started + v_wait_budget - clock_timestamp())));
+                v_wait_is_callers := v_final OR v_caller_wait_ms BETWEEN 1 AND v_wait_ms;
+                PERFORM set_config('lock_timeout', CASE WHEN v_wait_is_callers THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, v_wait_ms)::bigint) END, true);
+                IF p_skip_unique_conflicts THEN
+                    WITH claimed AS (
+                        INSERT INTO awa.job_unique_claims (unique_key, job_id)
+                        SELECT input.unique_key, v_job_ids[input.ord]
+                        FROM unnest(p_unique_key, p_unique_states, p_state)
+                            WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
+                        WHERE input.unique_key IS NOT NULL
+                          AND input.unique_states IS NOT NULL
+                          AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
+                        ORDER BY input.unique_key, input.ord
+                        ON CONFLICT (unique_key) DO NOTHING
+                        RETURNING job_id
+                    )
+                    SELECT COALESCE(array_agg(wanted.job_id), ARRAY[]::BIGINT[])
+                    INTO v_skipped
+                    FROM (
+                        SELECT v_job_ids[input.ord] AS job_id
+                        FROM unnest(p_unique_key, p_unique_states, p_state)
+                            WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
+                        WHERE input.unique_key IS NOT NULL
+                          AND input.unique_states IS NOT NULL
+                          AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
+                    ) AS wanted
+                    WHERE NOT EXISTS (SELECT 1 FROM claimed WHERE claimed.job_id = wanted.job_id);
+                ELSE
+                    INSERT INTO awa.job_unique_claims (unique_key, job_id)
+                    SELECT input.unique_key, v_job_ids[input.ord]
+                    FROM unnest(p_unique_key, p_unique_states, p_state)
+                        WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
+                    WHERE input.unique_key IS NOT NULL
+                      AND input.unique_states IS NOT NULL
+                      AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
+                    ORDER BY input.unique_key, input.ord;
+                END IF;
+            ELSE
+                FOR v_claim IN
+                    SELECT input.unique_key, v_job_ids[input.ord] AS job_id
+                    FROM unnest(p_unique_key, p_unique_states, p_state)
+                        WITH ORDINALITY AS input(unique_key, unique_states, state, ord)
+                    WHERE input.unique_key IS NOT NULL
+                      AND input.unique_states IS NOT NULL
+                      AND awa.job_state_in_bitmask(input.unique_states::bit(8), input.state::awa.job_state)
+                    ORDER BY input.unique_key, input.ord
+                LOOP
+                    v_wait_ms := ceil(1000 * extract(epoch FROM
+                        v_attempt_started + v_wait_budget - clock_timestamp()));
+                    v_wait_is_callers := v_caller_wait_ms BETWEEN 1 AND v_wait_ms;
+                    PERFORM set_config('lock_timeout', CASE WHEN v_wait_is_callers THEN v_caller_lock_timeout
+                        ELSE format('%sms', GREATEST(1, v_wait_ms)::bigint) END, true);
+                    IF p_skip_unique_conflicts THEN
+                        INSERT INTO awa.job_unique_claims (unique_key, job_id)
+                        VALUES (v_claim.unique_key, v_claim.job_id)
+                        ON CONFLICT (unique_key) DO NOTHING;
+                        IF NOT FOUND THEN
+                            v_skipped := v_skipped || v_claim.job_id;
+                        END IF;
+                    ELSE
+                        INSERT INTO awa.job_unique_claims (unique_key, job_id)
+                        VALUES (v_claim.unique_key, v_claim.job_id);
+                    END IF;
+                END LOOP;
+            END IF;
 
-        INSERT INTO queue_claim_heads (queue, priority, enqueue_shard)
-        SELECT v_lane.queue, v_lane.priority, v_lane.shard
-        WHERE NOT EXISTS (
-            SELECT 1 FROM queue_claim_heads AS existing
-            WHERE existing.queue = v_lane.queue
-              AND existing.priority = v_lane.priority
-              AND existing.enqueue_shard = v_lane.shard
-        )
-        ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+            -- The writes outside the lane loop wait at most for relation
+            -- extension, or for a prune that gives way under its own
+            -- lock_timeout, so they keep the caller's lock_timeout.
+            v_wait_is_callers := TRUE;
+            PERFORM set_config('lock_timeout', v_caller_lock_timeout, true);
 
-        EXECUTE format('SELECT %I.reserve_enqueue_seq($1, $2, $3, $4)', v_schema)
-        INTO v_start
-        USING v_lane.queue, v_lane.priority, v_lane.shard, v_lane.row_count::BIGINT;
+            -- Re-enqueues that are not yet due carry no lane.
+            INSERT INTO deferred_jobs (
+                job_id, kind, queue, args, state, priority, attempt, run_lease,
+                max_attempts, run_at, attempted_at, finalized_at, created_at,
+                unique_key, unique_states, payload
+            )
+            SELECT
+                v_job_ids[input.ord],
+                input.kind,
+                input.queue,
+                input.args,
+                input.state::awa.job_state,
+                input.priority,
+                0,
+                0,
+                input.max_attempts,
+                COALESCE(input.run_at, v_now),
+                NULL,
+                NULL,
+                v_now,
+                input.unique_key,
+                input.unique_states,
+                jsonb_build_object(
+                    'metadata', input.metadata,
+                    'tags', input.tags,
+                    'errors', '[]'::jsonb,
+                    'progress', NULL
+                )
+            FROM unnest(
+                p_kind, p_queue, p_args, p_state, p_priority, p_max_attempts, p_run_at,
+                p_metadata, p_tags, p_unique_key, p_unique_states
+            ) WITH ORDINALITY AS input(
+                kind, queue, args, state, priority, max_attempts, run_at,
+                metadata, tags, unique_key, unique_states, ord
+            )
+            WHERE input.state <> 'available'
+              AND v_job_ids[input.ord] <> ALL (v_skipped);
 
-        v_lane_queues := v_lane_queues || v_lane.queue;
-        v_lane_priorities := v_lane_priorities || v_lane.priority;
-        v_lane_shards := v_lane_shards || v_lane.shard;
-        v_lane_starts := v_lane_starts || v_start;
+            -- Lane lock window: in (queue, priority, shard) order, register each
+            -- lane the batch is the first to use and reserve its sequence
+            -- range once, then write the ready rows. The locks are held to the
+            -- end of the transaction, which keeps the rows of a lane visible
+            -- in lane_seq order.
+            --
+            -- A new lane is registered only when the loop reaches it, as every
+            -- other producer does: the head tables' row trigger provisions the
+            -- lane under its lock, and the uncommitted head row blocks other
+            -- producers of that lane, so registering a later lane before
+            -- reserving an earlier one would hold it out of order. Only missing
+            -- rows are proposed, because the trigger fires before the conflict
+            -- check.
+            v_phase := 'lanes';
+            FOR v_lane IN
+                SELECT lanes.queue, lanes.priority, lanes.shard, lanes.row_count
+                FROM (
+                    SELECT input.queue, input.priority, v_shards[input.ord] AS shard,
+                           count(*) AS row_count
+                    FROM unnest(p_queue, p_priority, p_state)
+                        WITH ORDINALITY AS input(queue, priority, state, ord)
+                    WHERE input.state = 'available'
+                      AND v_job_ids[input.ord] <> ALL (v_skipped)
+                    GROUP BY input.queue, input.priority, v_shards[input.ord]
+                ) AS lanes
+                ORDER BY lanes.queue COLLATE "C", lanes.priority, lanes.shard
+            LOOP
+                v_wait_ms := ceil(1000 * extract(epoch FROM
+                    v_attempt_started + v_wait_budget - clock_timestamp()));
+                v_wait_is_callers := v_final OR v_caller_wait_ms BETWEEN 1 AND v_wait_ms;
+                PERFORM set_config('lock_timeout', CASE WHEN v_wait_is_callers THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, v_wait_ms)::bigint) END, true);
+
+                INSERT INTO queue_lanes (queue, priority)
+                SELECT v_lane.queue, v_lane.priority
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM queue_lanes AS existing
+                    WHERE existing.queue = v_lane.queue AND existing.priority = v_lane.priority
+                )
+                ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
+
+                v_wait_ms := ceil(1000 * extract(epoch FROM
+                    v_attempt_started + v_wait_budget - clock_timestamp()));
+                v_wait_is_callers := v_final OR v_caller_wait_ms BETWEEN 1 AND v_wait_ms;
+                PERFORM set_config('lock_timeout', CASE WHEN v_wait_is_callers THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, v_wait_ms)::bigint) END, true);
+
+                INSERT INTO queue_enqueue_heads (queue, priority, enqueue_shard)
+                SELECT v_lane.queue, v_lane.priority, v_lane.shard
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM queue_enqueue_heads AS existing
+                    WHERE existing.queue = v_lane.queue
+                      AND existing.priority = v_lane.priority
+                      AND existing.enqueue_shard = v_lane.shard
+                )
+                ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+
+                v_wait_ms := ceil(1000 * extract(epoch FROM
+                    v_attempt_started + v_wait_budget - clock_timestamp()));
+                v_wait_is_callers := v_final OR v_caller_wait_ms BETWEEN 1 AND v_wait_ms;
+                PERFORM set_config('lock_timeout', CASE WHEN v_wait_is_callers THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, v_wait_ms)::bigint) END, true);
+
+                INSERT INTO queue_claim_heads (queue, priority, enqueue_shard)
+                SELECT v_lane.queue, v_lane.priority, v_lane.shard
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM queue_claim_heads AS existing
+                    WHERE existing.queue = v_lane.queue
+                      AND existing.priority = v_lane.priority
+                      AND existing.enqueue_shard = v_lane.shard
+                )
+                ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+
+                v_wait_ms := ceil(1000 * extract(epoch FROM
+                    v_attempt_started + v_wait_budget - clock_timestamp()));
+                v_wait_is_callers := v_final OR v_caller_wait_ms BETWEEN 1 AND v_wait_ms;
+                PERFORM set_config('lock_timeout', CASE WHEN v_wait_is_callers THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, v_wait_ms)::bigint) END, true);
+
+                EXECUTE format('SELECT %I.reserve_enqueue_seq($1, $2, $3, $4)', v_schema)
+                INTO v_start
+                USING v_lane.queue, v_lane.priority, v_lane.shard, v_lane.row_count::BIGINT;
+
+                v_lane_queues := v_lane_queues || v_lane.queue;
+                v_lane_priorities := v_lane_priorities || v_lane.priority;
+                v_lane_shards := v_lane_shards || v_lane.shard;
+                v_lane_starts := v_lane_starts || v_start;
+            END LOOP;
+        EXCEPTION WHEN lock_not_available THEN
+            IF v_wait_is_callers THEN
+                RAISE;
+            END IF;
+            IF v_phase = 'claims' THEN
+                v_claims_one_by_one := TRUE;
+            END IF;
+            v_final := clock_timestamp() >= v_bounded_until;
+            PERFORM pg_sleep(
+                LEAST(0.1, 0.001 * power(2, LEAST(v_attempt, 7))) * (0.5 + random() / 2)
+            );
+            CONTINUE;
+        END;
+        EXIT;
     END LOOP;
 
+    PERFORM set_config('lock_timeout', v_caller_lock_timeout, true);
+
+    -- The lane locks are held, so the ready rows can be written outside the
+    -- attempt.
     IF cardinality(v_lane_queues) > 0 THEN
         IF to_regprocedure(format('%I.ring_cursor(text)', v_schema)) IS NOT NULL THEN
             EXECUTE format('SELECT slot, generation FROM %I.ring_cursor(''queue'')', v_schema)
@@ -557,7 +718,13 @@ BEGIN
         GROUP BY runs.queue, runs.priority, runs.shard, runs.run_at, runs.run_id
         ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq)
             DO NOTHING;
+    END IF;
 
+    RETURN QUERY
+    SELECT * FROM unnest(v_result) AS result
+    WHERE result.id <> ALL (v_skipped);
+
+    IF cardinality(v_lane_queues) > 0 THEN
         PERFORM pg_notify('awa:' || notified.queue, '')
         FROM (SELECT DISTINCT unnest(v_lane_queues) AS queue) AS notified;
     END IF;
