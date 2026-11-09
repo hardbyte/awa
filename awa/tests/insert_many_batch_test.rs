@@ -2,9 +2,9 @@
 //! `insert_jobs_compat_batch` schema patch.
 //!
 //! A batch does its lane-independent work (job ids, unique claims) before it
-//! registers and reserves its lanes one at a time in canonical order, and
-//! holds a lane lock only for the registration, the reservation, the ready-row
-//! writes and the commit. These tests cover that ordering, skip-on-conflict
+//! registers and reserves its lanes one at a time in canonical order, taking
+//! each lane's lock only when it reaches that lane; the lock is then held until
+//! the transaction ends. These tests cover that ordering, skip-on-conflict
 //! inserts, and the shape of what lands in the lanes.
 //!
 //! Requires a running Postgres instance.

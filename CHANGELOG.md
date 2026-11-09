@@ -19,7 +19,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.15] — 2026-11-09
 
-Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
+Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches take a queue lane's enqueue lock when they write that lane rather than at their first ready row.
 
 ### Upgrading
 
@@ -48,7 +48,7 @@ Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose
 
 ### Changed
 
-- Compatibility COPY inserts (`insert_many_copy` in Rust and Python) hold a queue lane's enqueue lock only while they write that lane, instead of from the batch's first ready row until commit. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
+- Compatibility COPY inserts (`insert_many_copy` in Rust and Python) take a queue lane's enqueue lock when the batch writes that lane, instead of at the batch's first ready row. The lock is transaction-scoped, so it is still held until the transaction ends. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
 - A batch through `awa.insert_jobs_compat_batch` takes all its unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together, lane by lane. A per-row transaction that already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed now fails with `deadlock detected` (SQLSTATE `40P01`) instead of skipping the job or failing with a unique violation (`23505`). Retry the aborted transaction. Batches through the function do not deadlock with each other this way.
 
 ### Added
