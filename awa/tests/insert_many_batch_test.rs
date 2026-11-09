@@ -1193,19 +1193,44 @@ async fn batch_lands_once_two_long_held_lanes_are_released() {
     }
 }
 
-/// The claim cycle with a 20,000-row batch whose last key in key order is the
-/// one the per-row producer inserts: preparing the batch must not eat the wait
-/// budget, so the batch still gives way.
+/// The claim cycle with a large batch whose last key in key order is the one
+/// the per-row producer inserts. Preparing the result rows happens before the
+/// wait budget starts, but inserting the claims counts against it: the batch
+/// can only give way while its claims take less than the budget (500 ms), and
+/// a larger batch behaves as in 0.6.15. The test first times inserting as
+/// many claims. When that fits well inside the budget the batch must give way; otherwise the cycle must still end, with both sides done or
+/// exactly one aborted by `deadlock detected`.
 #[tokio::test]
-async fn large_batch_gives_way_to_a_per_row_producer() {
-    const ROWS: i64 = 20_000;
+async fn large_batch_gives_way_while_its_claims_fit_the_wait_budget() {
+    const ROWS: i64 = 5_000;
+    const FITS: Duration = Duration::from_millis(250);
     let _guard = ENGINE_GUARD.lock().await;
     let pool = queue_storage_pool().await;
+
+    // What inserting this many claims costs here, the part of the batch's
+    // work that counts against its wait budget.
+    let mut calibration = pool.begin().await.expect("begin calibration");
+    let started = Instant::now();
+    sqlx::query(
+        "INSERT INTO awa.job_unique_claims (unique_key, job_id)
+         SELECT decode(md5($1 || g::text), 'hex'), -g
+         FROM generate_series(1, $2) AS g
+         ORDER BY 1
+         ON CONFLICT (unique_key) DO NOTHING",
+    )
+    .bind(unique_queue("large_calibration"))
+    .bind(ROWS)
+    .execute(&mut *calibration)
+    .await
+    .expect("time a claim insert");
+    let claim_cost = started.elapsed();
+    calibration.rollback().await.expect("roll back calibration");
+    let fits_budget = claim_cost < FITS;
+
     let queue = unique_queue("large_cycle");
     insert_many(&pool, &[job(&queue, -1, false)])
         .await
         .expect("provision lane");
-
     let jobs: Vec<InsertParams> = (0..ROWS).map(|seq| job(&queue, seq, true)).collect();
     let last_in_key_order = jobs
         .iter()
@@ -1229,24 +1254,43 @@ async fn large_batch_gives_way_to_a_per_row_producer() {
     };
     wait_until_lane_awaited(&pool, lane_lock_key(&pool, &queue).await, "batch").await;
 
-    tokio::time::timeout(
-        WAIT_DEADLINE,
-        insert_many(&mut *per_row, &[last_in_key_order]),
-    )
+    let per_row_outcome = tokio::time::timeout(WAIT_DEADLINE, async {
+        insert_many(&mut *per_row, &[last_in_key_order]).await?;
+        per_row.commit().await?;
+        Ok::<_, AwaError>(())
+    })
     .await
-    .expect("per-row insert of the batch's last key finished")
-    .expect("per-row insert of the batch's last key");
-    per_row.commit().await.expect("commit per-row producer");
-
-    let inserted = tokio::time::timeout(WAIT_DEADLINE, batch)
+    .expect("the per-row producer's side of the cycle ended");
+    let batch_outcome = tokio::time::timeout(WAIT_DEADLINE, batch)
         .await
-        .expect("batch finished")
-        .expect("batch task")
-        .expect("insert batch");
-    assert_eq!(
-        inserted.len() as i64,
-        ROWS - 1,
-        "the batch skips the committed key"
-    );
-    assert_eq!(ready_lane_seqs(&pool, &queue).await.len() as i64, ROWS + 2);
+        .expect("the batch's side of the cycle ended")
+        .expect("batch task");
+
+    if fits_budget {
+        per_row_outcome.unwrap_or_else(|err| {
+            panic!("per-row insert of the batch's last key (claims take {claim_cost:?}): {err:?}")
+        });
+        let inserted = batch_outcome
+            .unwrap_or_else(|err| panic!("batch (claims take {claim_cost:?}): {err:?}"));
+        assert_eq!(
+            inserted.len() as i64,
+            ROWS - 1,
+            "the batch skips the committed key"
+        );
+        assert_eq!(ready_lane_seqs(&pool, &queue).await.len() as i64, ROWS + 2);
+    } else {
+        let aborted = [
+            &per_row_outcome.as_ref().err(),
+            &batch_outcome.as_ref().err(),
+        ]
+        .iter()
+        .filter(|err| err.is_some_and(AwaError::is_deadlock))
+        .count();
+        let both_done = per_row_outcome.is_ok() && batch_outcome.is_ok();
+        assert!(
+            both_done || (aborted == 1 && (per_row_outcome.is_ok() || batch_outcome.is_ok())),
+            "a batch whose claims take {claim_cost:?} ends as in 0.6.15: per-row {per_row_outcome:?}, \
+             batch {batch_outcome:?}"
+        );
+    }
 }

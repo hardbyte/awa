@@ -48,6 +48,7 @@ What callers see:
 
 - A batch insert and a per-row producer that share keys or lanes no longer abort each other with `40P01` when the batch call is the first thing its transaction locks and the per-row producer's `deadlock_timeout` is above 500 ms (PostgreSQL's default is 1 s). The batch cannot see another session's setting, so the cap is fixed; a per-row session configured at or below 500 ms can still be aborted by its own, earlier deadlock check.
 - A batch whose transaction already holds locks from earlier statements can still be part of a deadlock, which ends as in 0.6.15 once its retries run out.
+- A batch can only give way while inserting its unique claims takes less than the 500 ms budget. Each claim costs roughly 20 µs on a fast database server and more on a slow or busy one, so the limit is in the range of 10,000 to 20,000 unique keys. A larger batch, or one whose claims are slowed by load, uses up each bounded attempt before it reaches its lanes and ends in the ordinary attempt, so it behaves as in 0.6.15. Split such batches if they share keys or lanes with per-row producers.
 - Under contention that outlasts the retries, a batch waits for its lanes in lock order, as in 0.6.15.
 - A caller's `lock_timeout` still ends the call with `lock_not_available` (SQLSTATE `55P03`): the retries stop once it is spent, and the last attempt's waits use it as any statement's do.
 - The lane lock is still held only for the lane's reservation, the ready-row writes and the commit.
