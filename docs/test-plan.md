@@ -312,9 +312,7 @@ Durable loss detection covers every lifecycle-observed job and a deterministic `
 On CI, assertion waits and heartbeat staleness use `ci_timing.rs` scaling; load durations, kill schedules and measurement windows retain their configured values.
 
 
-`awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`, Python side in `awa/tests/persona_soak/python/`) runs several
-application-shaped workloads concurrently against one database, the way different
-applications share an `awa` schema, and fails the run on any invariant violation.
+`awa/tests/persona_soak_test.rs` (harness in `awa/tests/persona_soak/`, Python side in `awa/tests/persona_soak/python/`) runs several application-shaped workloads concurrently against one database, the way different applications share an `awa` schema, and fails the run on any invariant violation.
 
 | Persona | Workload | Stresses |
 | --- | --- | --- |
@@ -347,10 +345,7 @@ The oracle checks, while the load runs and again after it stops:
 
 Slow or failing admin endpoints, latency that grows with retained history or backlog, and admin queries cancelled by the statement timeout are reported as non-fatal findings in the report, next to the violations.
 
-Terminal rows are pruned by ring rotation within seconds, so the oracle keeps a
-client-side ledger (job ids per persona, executions per job, lifecycle events,
-operator actions) and reconciles it with the database. Time-based checks are widened
-while a chaos action is recovering.
+Terminal rows are pruned by ring rotation within seconds, so the oracle keeps a client-side ledger (job ids per persona, executions per job, lifecycle events, operator actions) and reconciles it with the database. Time-based checks are widened while a chaos action is recovering.
 
 Environment:
 
@@ -379,17 +374,9 @@ Environment:
 | `AWA_SOAK_METRICS_ENDPOINT`, `AWA_SOAK_METRICS_DIR` | optional OTLP gRPC endpoint and absolute output directory for per-process metric receipts |
 | `AWA_PRESSURE_ROTATE_MULTIPLIER` | pressure comparison setting: `1` (default) or `4`; scales the harness's queue, lease and claim rotation intervals; keeps configured generation rates unchanged |
 
-The report records the engine, server version, `max_connections`, connections at
-start and the per-persona connection budget. A failed run leaves `reproducer.md`
-with the seed, personas and duration, the violating rows, the timeline around each
-violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the
-engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18
-image) in private containers on separate ports and removes them afterwards.
+The report records the engine, server version, `max_connections`, connections at start and the per-persona connection budget. A failed run leaves `reproducer.md` with the seed, personas and duration, the violating rows, the timeline around each violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18 image) in private containers on separate ports and removes them afterwards.
 
-After-exit retained-session findings require a successful `CLOSED`
-acknowledgement and a valid final session observation. Forced or unproven exits
-remain incomplete evidence. Pool-budget and idle-transaction checks after
-readiness remain independent.
+After-exit retained-session findings require a successful `CLOSED` acknowledgement and a valid final session observation. Forced or unproven exits remain incomplete evidence. Pool-budget and idle-transaction checks after readiness remain independent.
 
 ### Optional completion proof and metric capture
 

@@ -1,6 +1,7 @@
 use crate::executor::DlqPolicy;
 use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
+use crate::runtime_control::{LeaderObserver, MaintenanceBranch, PruneControl};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
@@ -9,20 +10,25 @@ use awa_model::cron::{
 use awa_model::SkipReason;
 use awa_model::{
     AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
-    RotateOutcome, TerminalDeltaRollupOutcome,
+    RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
+    TerminalDeltaRollupOutcome,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Detached lifecycle hook tasks maintenance may have outstanding at once.
+const MAINTENANCE_LIFECYCLE_EVENT_CAPACITY: usize = 1024;
+const MAINTENANCE_BRANCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// The canonical unique-claim conflict raised by `awa.sync_job_unique_claims`
 /// (SQLSTATE 23505, constraint reported as `idx_awa_jobs_unique`). See #388.
@@ -225,6 +231,271 @@ const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
 
 /// How often the leader scans for attempts past their deadline by default.
 pub(crate) const DEFAULT_DEADLINE_RESCUE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default wall-clock budget for one queue-storage rescue pass.
+pub(crate) const DEFAULT_RESCUE_PASS_BUDGET: Duration = Duration::from_secs(1);
+
+/// Default cap on attempts one queue-storage rescue pass rescues.
+pub(crate) const DEFAULT_RESCUE_PASS_MAX_ROWS: usize = 5_000;
+
+/// While a rescue kind still has a backlog, its next pass runs after this
+/// rather than after its full interval. With the per-pass row cap this bounds
+/// a drain to about `rescue_pass_max_rows` attempts per second per kind.
+const RESCUE_BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Claims each slot's cursor walk examines in every batch of a pass that may
+/// take more than one: deadline rescue, and stale-heartbeat rescue once its
+/// owners are confirmed gone. Every claim examined costs its closure checks,
+/// so a narrow window keeps each batch's transaction short; the pass continues
+/// while windows come back full. A pass limited to one batch keeps the store's
+/// wider default so it can walk past a long closed prefix.
+const RESCUE_FOLLOW_UP_SCAN_LIMIT: usize = 2_000;
+
+/// One batch in this many visits the other claim slots before the oldest, so
+/// a long drain of the oldest slot leaves the rest at least that share.
+const RESCUE_OTHERS_FIRST_EVERY: usize = 4;
+
+/// Runtime snapshots the leader reads before accelerating stale-heartbeat rescue. A runtime is `fresh` while its snapshot is
+/// within three effective snapshot intervals. An unconfirmed phase exists only
+/// when 3 * max(snapshot_interval, 1s) < heartbeat staleness ($1, milliseconds).
+/// With a larger interval a stalled live runtime can pass directly from fresh
+/// to gone; this evidence is a bounded heuristic, not proof of process death.
+/// `last_gone_heartbeat` estimates the last heartbeat of a gone runtime from
+/// its final snapshot and configured interval.
+const RESCUE_RUNTIME_EVIDENCE_SQL: &str = r#"
+    SELECT
+        count(*) FILTER (WHERE fresh AND NOT heartbeat_alive)::bigint AS fresh_without_heartbeat,
+        count(*) FILTER (WHERE NOT fresh AND NOT gone)::bigint AS unconfirmed,
+        max(last_seen_at + snapshot_interval_ms * 2 * interval '1 millisecond')
+            FILTER (WHERE gone) AS last_gone_heartbeat
+    FROM (
+        SELECT
+            heartbeat_alive,
+            last_seen_at,
+            snapshot_interval_ms,
+            last_seen_at >= now() - GREATEST(snapshot_interval_ms, 1000) * 3 * interval '1 millisecond'
+                AS fresh,
+            last_seen_at < now() - GREATEST(snapshot_interval_ms, 1000) * 3 * interval '1 millisecond'
+                AND last_seen_at < now() - $1 * interval '1 millisecond'
+                AS gone
+        FROM awa.runtime_instances
+    ) AS runtimes
+"#;
+
+/// The queue-storage rescue kinds a leader drains in passes of batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RescueKind {
+    Heartbeat,
+    Deadline,
+    Callback,
+}
+
+impl RescueKind {
+    /// The `awa.rescue.kind` attribute value, as on `awa.maintenance.rescues`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Heartbeat => "heartbeat",
+            Self::Deadline => "deadline",
+            Self::Callback => "callback_timeout",
+        }
+    }
+}
+
+/// Why a queue-storage rescue pass stopped taking batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescuePassEnd {
+    /// The last batch found fewer eligible attempts than its limit.
+    Drained,
+    /// The pass budget is spent.
+    TimeBudget,
+    /// The pass reached `rescue_pass_max_rows`.
+    RowLimit,
+    /// Stale-heartbeat only: the runtime snapshots do not yet show that the
+    /// owners of stale claims are gone, so the pass keeps to one batch.
+    OwnersUnconfirmed,
+    Error,
+}
+
+impl RescuePassEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::TimeBudget => "time_budget",
+            Self::RowLimit => "row_limit",
+            Self::OwnersUnconfirmed => "owners_unconfirmed",
+            Self::Error => "error",
+        }
+    }
+
+    /// The pass stopped with eligible attempts left that it was allowed to
+    /// take, so the next pass should come sooner than the interval.
+    fn backlog_remains(self) -> bool {
+        matches!(self, Self::TimeBudget | Self::RowLimit)
+    }
+}
+
+/// The leader's record of whether every runtime that could own a stale
+/// claim is gone. A claim does not record its runtime, so the evidence is
+/// fleet-wide: every runtime snapshot is either fresh with its heartbeat
+/// loop alive, or silent for at least the heartbeat staleness. That must
+/// hold at every sample for a full staleness window before a stale-heartbeat
+/// rescue may run extra batches or early passes. This settled window may have
+/// started before a runtime stalled. If freshness lasts at least the staleness,
+/// that runtime can pass directly from fresh to gone without resetting it.
+/// A gap between samples longer than half the staleness restarts the window,
+/// because a stall the leader did not sample could have hidden behind it.
+#[derive(Debug, Default)]
+struct RescueOwnerEvidence {
+    steady_since: Option<Instant>,
+    last_sample: Option<Instant>,
+}
+
+impl RescueOwnerEvidence {
+    /// Record one sample and return whether the evidence now allows a
+    /// stale-heartbeat pass to take more than one batch.
+    fn observe(&mut self, now: Instant, settled: bool, staleness: Duration) -> bool {
+        let sampled_recently = self
+            .last_sample
+            .is_some_and(|last| now.saturating_duration_since(last) <= staleness / 2);
+        self.last_sample = Some(now);
+        if !settled {
+            self.steady_since = None;
+            return false;
+        }
+        if !sampled_recently {
+            self.steady_since = Some(now);
+        }
+        let steady_since = *self.steady_since.get_or_insert(now);
+        now.saturating_duration_since(steady_since) >= staleness
+    }
+}
+
+/// A normal interval tick is a baseline visit even if scheduler jitter makes
+/// its actual start slightly earlier than one interval after the last start.
+/// A reset tick is accelerated work and must retain the owner/cadence gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescueTickOrigin {
+    Ordinary,
+    Backlog,
+}
+
+struct RescueTimer {
+    interval: tokio::time::Interval,
+    next_origin: RescueTickOrigin,
+}
+
+impl RescueTimer {
+    fn new(period: Duration) -> Self {
+        Self {
+            interval: leader_loop_interval(period),
+            next_origin: RescueTickOrigin::Ordinary,
+        }
+    }
+
+    async fn tick(&mut self) -> RescueTickOrigin {
+        self.interval.tick().await;
+        // Consume even when the caller's branch cooldown skips this tick.
+        std::mem::replace(&mut self.next_origin, RescueTickOrigin::Ordinary)
+    }
+
+    fn reset_after(&mut self, duration: Duration) {
+        self.interval.reset_after(duration);
+        self.next_origin = RescueTickOrigin::Backlog;
+    }
+}
+
+/// A sweep survives early re-arms: closed history must not keep the leader
+/// scanning once a cursor has made a full revolution. The first window is
+/// already visited, so crossing its end after wrapping completes the sweep.
+#[derive(Debug, Default)]
+struct RescueSweep {
+    cursors: HashMap<i32, Vec<RescueSweepCursor>>,
+    idle_slots: Vec<i32>,
+    last_revisit: Option<Instant>,
+    batches_started: usize,
+}
+
+#[derive(Debug, Default)]
+struct RescueSweepCursor {
+    first: Option<(DateTime<Utc>, i64, i64)>,
+    previous: Option<(DateTime<Utc>, i64, i64)>,
+    wrapped: bool,
+    done: bool,
+}
+
+impl RescueSweep {
+    /// A long drain must revisit slots whose claims have become eligible
+    /// since their last scan. Keep unfinished cursors so a large history
+    /// sweep still converges across these ordinary-cadence revisits.
+    fn revisit(&mut self, now: Instant, interval: Duration, origin: RescueTickOrigin) {
+        if origin == RescueTickOrigin::Ordinary
+            || self
+                .last_revisit
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            self.idle_slots.clear();
+            for cursor in self.cursors.values_mut().flatten() {
+                if cursor.done {
+                    *cursor = RescueSweepCursor::default();
+                }
+            }
+            self.last_revisit = Some(now);
+        }
+    }
+
+    fn observe(&mut self, progress: RescueScanProgress) {
+        let cursors = self.cursors.entry(progress.slot).or_default();
+        cursors.resize_with(progress.cursors.len(), RescueSweepCursor::default);
+        for (cursor, progress) in cursors.iter_mut().zip(progress.cursors) {
+            if !progress.saturated {
+                cursor.done = true;
+            }
+            if let Some(position) = progress.position {
+                if let Some(first) = cursor.first {
+                    let crossed = cursor.previous.is_some_and(|previous| position <= previous);
+                    cursor.done |= (cursor.wrapped && crossed)
+                        || ((cursor.wrapped || crossed) && position >= first);
+                    cursor.wrapped |= crossed;
+                } else {
+                    cursor.first = Some(position);
+                }
+                cursor.previous = Some(position);
+            }
+        }
+        if !cursors.is_empty() && cursors.iter().all(|cursor| cursor.done) {
+            self.idle_slots.push(progress.slot);
+        }
+    }
+}
+
+/// An early re-arm may run after owner evidence disappears. Keep ordinary
+/// first batches on their original cadence; every accelerated batch needs
+/// the same owner cutoff as follow-up batches.
+#[derive(Debug, Default)]
+struct RescueHeartbeatCadence {
+    last_baseline: Option<Instant>,
+}
+
+impl RescueHeartbeatCadence {
+    fn select(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+        cutoff: Option<DateTime<Utc>>,
+        origin: RescueTickOrigin,
+    ) -> Option<Option<DateTime<Utc>>> {
+        if origin == RescueTickOrigin::Ordinary
+            || self
+                .last_baseline
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            self.last_baseline = Some(now);
+            Some(None)
+        } else {
+            cutoff.map(Some)
+        }
+    }
+}
 
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
@@ -657,6 +928,8 @@ const PRUNE_BRANCH_QUEUE: &str = "queue";
 /// Tasks: heartbeat rescue, deadline rescue, scheduled promotion, cleanup,
 /// periodic job sync and evaluation.
 pub struct MaintenanceService {
+    control: Arc<PruneControl>,
+    instance_id: Option<uuid::Uuid>,
     pool: PgPool,
     metrics: crate::metrics::AwaMetrics,
     cancel: CancellationToken,
@@ -675,6 +948,10 @@ pub struct MaintenanceService {
     /// In-process `Rescued` lifecycle hooks (ADR-015), shared with the
     /// executor. Best-effort fire-and-forget per rescued job.
     lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
+    /// Bounds the detached lifecycle hook tasks maintenance has outstanding;
+    /// events beyond it are dropped and counted.
+    lifecycle_event_capacity: Arc<tokio::sync::Semaphore>,
+    dropped_lifecycle_events: Arc<AtomicU64>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
@@ -687,6 +964,12 @@ pub struct MaintenanceService {
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
+    rescue_pass_budget: Duration,
+    rescue_pass_max_rows: usize,
+    rescue_owner_evidence: std::sync::Mutex<RescueOwnerEvidence>,
+    rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
+    rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
+    rescue_others_first_offset: AtomicUsize,
     promote_interval: Duration,
     cleanup_interval: Duration,
     cron_sync_interval: Duration,
@@ -967,6 +1250,8 @@ impl MaintenanceService {
         lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
     ) -> Self {
         Self {
+            control: Arc::new(PruneControl::default()),
+            instance_id: None,
             pool,
             metrics,
             cancel,
@@ -978,9 +1263,19 @@ impl MaintenanceService {
             standby_queue_storage: None,
             enqueue_specs,
             lifecycle_handlers,
+            lifecycle_event_capacity: Arc::new(tokio::sync::Semaphore::new(
+                MAINTENANCE_LIFECYCLE_EVENT_CAPACITY,
+            )),
+            dropped_lifecycle_events: Arc::new(AtomicU64::new(0)),
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: DEFAULT_DEADLINE_RESCUE_INTERVAL,
             callback_rescue_interval: Duration::from_secs(30),
+            rescue_pass_budget: DEFAULT_RESCUE_PASS_BUDGET,
+            rescue_pass_max_rows: DEFAULT_RESCUE_PASS_MAX_ROWS,
+            rescue_owner_evidence: std::sync::Mutex::new(RescueOwnerEvidence::default()),
+            rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
+            rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
+            rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
             cron_sync_interval: Duration::from_secs(60),
@@ -1003,6 +1298,16 @@ impl MaintenanceService {
             terminal_count_rollup_interval: Duration::from_secs(30),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
         }
+    }
+
+    pub(crate) fn runtime_control(
+        mut self,
+        control: Arc<PruneControl>,
+        instance: uuid::Uuid,
+    ) -> Self {
+        self.control = control;
+        self.instance_id = Some(instance);
+        self
     }
 
     /// Set the priority aging interval (default: 60s).
@@ -1087,6 +1392,22 @@ impl MaintenanceService {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches
+    /// (default: 1s, and never more than half the rescue interval). Zero
+    /// keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = budget;
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). A pass always finishes the batch it started;
+    /// zero keeps one batch per ordinary interval, as a zero pass budget does.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = max_rows;
+        self
+    }
+
     /// Set how long a heartbeat must be stale before the job is rescued (default: 90s).
     ///
     /// Should be at least 3× the heartbeat interval to avoid false rescues
@@ -1164,7 +1485,7 @@ impl MaintenanceService {
         loop {
             // Try to acquire advisory lock for leader election.
             // We get back a dedicated connection that holds the lock.
-            let mut leader_conn = match self.try_become_leader().await {
+            let leader_conn = match self.try_become_leader().await {
                 Ok(Some(conn)) => conn,
                 Ok(None) => {
                     // Not leader — back off and try again
@@ -1193,251 +1514,375 @@ impl MaintenanceService {
             debug!("Elected as maintenance leader");
             self.leader.store(true, Ordering::SeqCst);
 
-            // Run maintenance tasks as leader
-            let mut heartbeat_rescue_timer = leader_loop_interval(self.heartbeat_rescue_interval);
-            let mut deadline_rescue_timer = leader_loop_interval(self.deadline_rescue_interval);
-            let mut callback_rescue_timer = leader_loop_interval(self.callback_rescue_interval);
-            let mut promote_timer = leader_loop_interval(self.promote_interval);
-            let mut cleanup_timer = leader_loop_interval(self.cleanup_interval);
-            let mut cron_sync_timer = leader_loop_interval(self.cron_sync_interval);
-            let mut leader_check_timer = leader_loop_interval(self.leader_check_interval);
-            let mut queue_stats_timer = leader_loop_interval(self.queue_stats_interval);
-            let mut dirty_key_timer = leader_loop_interval(self.dirty_key_recompute_interval);
-            let mut metadata_reconciliation_timer =
-                leader_loop_interval(self.metadata_reconciliation_interval);
-            let mut priority_aging_timer = leader_loop_interval(self.priority_aging_interval);
-            let mut batch_operations_timer = leader_loop_interval(self.batch_operations_interval);
-            let mut terminal_count_rollup_timer =
-                leader_loop_interval(self.terminal_count_rollup_interval);
-            let mut vacuum_queue_timer = self
-                .storage
-                .queue_storage()
-                .map(|runtime| leader_loop_interval(runtime.queue_rotate_interval));
-            let mut vacuum_lease_timer = self
-                .storage
-                .queue_storage()
-                .map(|runtime| leader_loop_interval(runtime.lease_rotate_interval));
-            let mut vacuum_claim_timer = self
-                .storage
-                .queue_storage()
-                .map(|runtime| leader_loop_interval(runtime.claim_rotate_interval));
-            // Cache rotate intervals alongside the timers so the per-branch
-            // observability calls can recover the configured period. Both
-            // derive from the same `queue_storage()` source so they are
-            // Some/None in lockstep with their corresponding timers.
-            let vacuum_queue_interval = self
-                .storage
-                .queue_storage()
-                .map(|runtime| runtime.queue_rotate_interval);
-            let vacuum_lease_interval = self
-                .storage
-                .queue_storage()
-                .map(|runtime| runtime.lease_rotate_interval);
-            let vacuum_claim_interval = self
-                .storage
-                .queue_storage()
-                .map(|runtime| runtime.claim_rotate_interval);
-            // Per-branch overrun tracker. Issue #242 — observability only;
-            // the architectural split of this `tokio::select!` is deferred
-            // to v0.7 conditional on the overrun counter showing fleet hits.
-            let branch_tracker = MaintenanceBranchTracker::new();
-            // Per-segment prune backoff (#169). Gates the prune step of
-            // each rotate branch so a pinned MVCC snapshot doesn't make
-            // us repeat the ACCESS-EXCLUSIVE + count(*) attempt every
-            // tick. Local to the leader loop so a re-election resets
-            // backoff to zero.
-            let prune_tracker = PruneBackoffTracker::new();
-            let promoters = LeaderPromoters {
-                primary: self.storage.queue_storage().map(|runtime| {
-                    QueueStoragePromoter::new(
-                        self.pool.clone(),
-                        Arc::clone(&runtime.store),
-                        self.metrics.clone(),
-                    )
-                }),
-                standby: self.standby_queue_storage.as_ref().map(|runtime| {
-                    QueueStoragePromoter::new(
-                        self.pool.clone(),
-                        Arc::clone(&runtime.store),
-                        self.metrics.clone(),
-                    )
-                }),
+            let observer = match LeaderObserver::start(
+                leader_conn,
+                self.control.clone(),
+                self.leader.clone(),
+                self.instance_id,
+                self.leader_check_interval,
+            )
+            .await
+            {
+                Ok(observer) => observer,
+                Err(err) => {
+                    self.leader.store(false, Ordering::SeqCst);
+                    warn!(error = %err, "Leader observer startup failed");
+                    continue;
+                }
             };
+            let leadership_lost = observer.lost.clone();
+            let work = async {
+                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
+                    return;
+                }
+                // Run maintenance tasks as leader
+                let mut heartbeat_rescue_timer = RescueTimer::new(self.heartbeat_rescue_interval);
+                let mut deadline_rescue_timer = RescueTimer::new(self.deadline_rescue_interval);
+                let mut callback_rescue_timer = RescueTimer::new(self.callback_rescue_interval);
+                let mut promote_timer = leader_loop_interval(self.promote_interval);
+                let mut cleanup_timer = leader_loop_interval(self.cleanup_interval);
+                let mut cron_sync_timer = leader_loop_interval(self.cron_sync_interval);
+                let mut queue_stats_timer = leader_loop_interval(self.queue_stats_interval);
+                let mut dirty_key_timer = leader_loop_interval(self.dirty_key_recompute_interval);
+                let mut metadata_reconciliation_timer =
+                    leader_loop_interval(self.metadata_reconciliation_interval);
+                let mut priority_aging_timer = leader_loop_interval(self.priority_aging_interval);
+                let mut batch_operations_timer =
+                    leader_loop_interval(self.batch_operations_interval);
+                let mut terminal_count_rollup_timer =
+                    leader_loop_interval(self.terminal_count_rollup_interval);
+                let mut vacuum_queue_timer = self
+                    .storage
+                    .queue_storage()
+                    .map(|runtime| leader_loop_interval(runtime.queue_rotate_interval));
+                let mut vacuum_lease_timer = self
+                    .storage
+                    .queue_storage()
+                    .map(|runtime| leader_loop_interval(runtime.lease_rotate_interval));
+                let mut vacuum_claim_timer = self
+                    .storage
+                    .queue_storage()
+                    .map(|runtime| leader_loop_interval(runtime.claim_rotate_interval));
+                // Cache rotate intervals alongside the timers so the per-branch
+                // observability calls can recover the configured period. Both
+                // derive from the same `queue_storage()` source so they are
+                // Some/None in lockstep with their corresponding timers.
+                let vacuum_queue_interval = self
+                    .storage
+                    .queue_storage()
+                    .map(|runtime| runtime.queue_rotate_interval);
+                let vacuum_lease_interval = self
+                    .storage
+                    .queue_storage()
+                    .map(|runtime| runtime.lease_rotate_interval);
+                let vacuum_claim_interval = self
+                    .storage
+                    .queue_storage()
+                    .map(|runtime| runtime.claim_rotate_interval);
+                // Per-branch overrun tracker. Issue #242 — observability only;
+                // the architectural split of this `tokio::select!` is deferred
+                // to v0.7 conditional on the overrun counter showing fleet hits.
+                *self
+                    .rescue_owner_evidence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    RescueOwnerEvidence::default();
+                *self
+                    .rescue_heartbeat_cadence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    RescueHeartbeatCadence::default();
+                self.rescue_sweeps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                let branch_tracker = MaintenanceBranchTracker::new();
+                // Per-segment prune backoff (#169). Gates the prune step of
+                // each rotate branch so a pinned MVCC snapshot doesn't make
+                // us repeat the ACCESS-EXCLUSIVE + count(*) attempt every
+                // tick. Local to the leader loop so a re-election resets
+                // backoff to zero.
+                let prune_tracker = PruneBackoffTracker::new();
+                let promoters = LeaderPromoters {
+                    primary: self.storage.queue_storage().map(|runtime| {
+                        QueueStoragePromoter::new(
+                            self.pool.clone(),
+                            Arc::clone(&runtime.store),
+                            self.metrics.clone(),
+                        )
+                    }),
+                    standby: self.standby_queue_storage.as_ref().map(|runtime| {
+                        QueueStoragePromoter::new(
+                            self.pool.clone(),
+                            Arc::clone(&runtime.store),
+                            self.metrics.clone(),
+                        )
+                    }),
+                };
 
-            // Skip the first immediate tick
-            heartbeat_rescue_timer.tick().await;
-            deadline_rescue_timer.tick().await;
-            callback_rescue_timer.tick().await;
-            promote_timer.tick().await;
-            cleanup_timer.tick().await;
-            cron_sync_timer.tick().await;
-            leader_check_timer.tick().await;
-            queue_stats_timer.tick().await;
-            dirty_key_timer.tick().await;
-            metadata_reconciliation_timer.tick().await;
-            priority_aging_timer.tick().await;
-            batch_operations_timer.tick().await;
-            terminal_count_rollup_timer.tick().await;
-            if let Some(timer) = &mut vacuum_queue_timer {
-                timer.tick().await;
-            }
-            if let Some(timer) = &mut vacuum_lease_timer {
-                timer.tick().await;
-            }
-            if let Some(timer) = &mut vacuum_claim_timer {
-                timer.tick().await;
-            }
+                // Skip the first immediate tick
+                heartbeat_rescue_timer.tick().await;
+                deadline_rescue_timer.tick().await;
+                callback_rescue_timer.tick().await;
+                promote_timer.tick().await;
+                cleanup_timer.tick().await;
+                cron_sync_timer.tick().await;
+                queue_stats_timer.tick().await;
+                dirty_key_timer.tick().await;
+                metadata_reconciliation_timer.tick().await;
+                priority_aging_timer.tick().await;
+                batch_operations_timer.tick().await;
+                terminal_count_rollup_timer.tick().await;
+                if let Some(timer) = &mut vacuum_queue_timer {
+                    timer.tick().await;
+                }
+                if let Some(timer) = &mut vacuum_lease_timer {
+                    timer.tick().await;
+                }
+                if let Some(timer) = &mut vacuum_claim_timer {
+                    timer.tick().await;
+                }
 
-            // Do an initial sync immediately on becoming leader
-            self.sync_periodic_jobs_to_db().await;
-            let cron_eval_cancel = self.cancel.child_token();
-            let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
-                self.pool.clone(),
-                cron_eval_cancel.clone(),
-                self.cron_eval_interval,
-            ));
-
-            loop {
-                tokio::select! {
-                    _ = self.cancel.cancelled() => {
-                        debug!("Maintenance service shutting down");
-                        self.leader.store(false, Ordering::SeqCst);
-                        Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
-                        // Release leader lock on the same connection that acquired it.
-                        // If this fails, dropping the connection will release the lock anyway.
-                        let _ = Self::release_leader(&mut leader_conn).await;
-                        return;
-                    }
-                    _ = heartbeat_rescue_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
-                            self.rescue_stale_heartbeats().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = deadline_rescue_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
-                            self.rescue_expired_deadlines().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = callback_rescue_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
-                            self.rescue_expired_callbacks().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = promote_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
-                            self.promote_scheduled(&promoters).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = cleanup_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("cleanup", self.cleanup_interval, &self.metrics) {
-                            self.cleanup_completed().await;
-                            self.cleanup_dlq_rows().await;
-                            self.cleanup_batch_operations().await;
-                            self.cleanup_stale_runtime_snapshots().await;
-                            self.cleanup_stale_descriptors().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = cron_sync_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("cron_sync", self.cron_sync_interval, &self.metrics) {
-                            self.sync_periodic_jobs_to_db().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = queue_stats_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("queue_stats", self.queue_stats_interval, &self.metrics) {
-                            self.publish_queue_health_metrics().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = dirty_key_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics) {
-                            self.recompute_dirty_admin_metadata().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = metadata_reconciliation_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics) {
-                            self.refresh_admin_metadata().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = priority_aging_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("priority_aging", self.priority_aging_interval, &self.metrics) {
-                            self.age_waiting_priorities().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = batch_operations_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("batch_operations", self.batch_operations_interval, &self.metrics) {
-                            self.process_batch_operation().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = terminal_count_rollup_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
-                            self.rollup_terminal_count_deltas().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = async {
-                        if let Some(timer) = &mut vacuum_queue_timer {
-                            timer.tick().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    }, if vacuum_queue_timer.is_some() => {
-                        let interval = vacuum_queue_interval
-                            .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
-                        if let Some(timer) = branch_tracker.try_begin("rotate_queue", interval, &self.metrics) {
-                            self.rotate_queue_storage_queue(&prune_tracker).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = async {
-                        if let Some(timer) = &mut vacuum_lease_timer {
-                            timer.tick().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    }, if vacuum_lease_timer.is_some() => {
-                        let interval = vacuum_lease_interval
-                            .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
-                        if let Some(timer) = branch_tracker.try_begin("rotate_lease", interval, &self.metrics) {
-                            self.rotate_queue_storage_leases(&prune_tracker).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = async {
-                        if let Some(timer) = &mut vacuum_claim_timer {
-                            timer.tick().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    }, if vacuum_claim_timer.is_some() => {
-                        let interval = vacuum_claim_interval
-                            .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
-                        if let Some(timer) = branch_tracker.try_begin("rotate_claim", interval, &self.metrics) {
-                            self.rotate_queue_storage_claims(&prune_tracker).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = leader_check_timer.tick() => {
-                        // Verify leader connection is still alive.
-                        // The advisory lock is session-scoped: if the connection is alive,
-                        // the lock is held. If the query fails, the connection (and lock) are gone.
-                        if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
-                            warn!("Leader connection lost, re-entering election loop");
-                            self.leader.store(false, Ordering::SeqCst);
-                            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
-                            break;
-                        }
+                // Do an initial sync immediately on becoming leader
+                self.sync_periodic_jobs_to_db().await;
+                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
+                    return;
+                }
+                let cron_eval_cancel = leadership_lost.child_token();
+                let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
+                    self.pool.clone(),
+                    cron_eval_cancel.clone(),
+                    self.cron_eval_interval,
+                ));
+                struct CronGuard(CancellationToken, tokio::task::AbortHandle);
+                impl Drop for CronGuard {
+                    fn drop(&mut self) {
+                        self.0.cancel();
+                        self.1.abort();
                     }
                 }
+                let _cron_guard =
+                    CronGuard(cron_eval_cancel.clone(), cron_eval_task.abort_handle());
+
+                loop {
+                    if leadership_lost.is_cancelled() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = leadership_lost.cancelled() => return,
+                        _ = self.cancel.cancelled() => {
+                            debug!("Maintenance service shutting down");
+                            self.leader.store(false, Ordering::SeqCst);
+                            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
+                            // Dropping the observer closes the session holding leadership.
+                            return;
+                        }
+                        origin = heartbeat_rescue_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueHeartbeat.classification().0, self.heartbeat_rescue_interval, &self.metrics) {
+                                let backlog = match self.control.admit(MaintenanceBranch::RescueHeartbeat) {
+                                    Some(admission) => admission.run(self.rescue_stale_heartbeats(origin)).await,
+                                    None => false,
+                                };
+                                timer.finish();
+                                if backlog {
+                                    heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+                                }
+                            }
+                        }
+                        origin = deadline_rescue_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueDeadline.classification().0, self.deadline_rescue_interval, &self.metrics) {
+                                let backlog = match self.control.admit(MaintenanceBranch::RescueDeadline) {
+                                    Some(admission) => admission.run(self.rescue_expired_deadlines(origin)).await,
+                                    None => false,
+                                };
+                                timer.finish();
+                                if backlog {
+                                    deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
+                                }
+                            }
+                        }
+                        origin = callback_rescue_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueCallback.classification().0, self.callback_rescue_interval, &self.metrics) {
+                                let backlog = match self.control.admit(MaintenanceBranch::RescueCallback) {
+                                    Some(admission) => admission.run(self.rescue_expired_callbacks(origin)).await,
+                                    None => false,
+                                };
+                                timer.finish();
+                                if backlog {
+                                    callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
+                                }
+                            }
+                        }
+                        _ = promote_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::Promote.classification().0, self.promote_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::Promote) {
+                                    admission.run(async {
+                                        self.promote_scheduled(&promoters).await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = cleanup_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Cleanup.classification().0, self.cleanup_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::Cleanup) {
+                                    admission.run(async {
+                                        self.cleanup_completed().await;
+                                        self.cleanup_dlq_rows().await;
+                                        self.cleanup_batch_operations().await;
+                                        self.cleanup_stale_runtime_snapshots().await;
+                                        self.cleanup_stale_descriptors().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = cron_sync_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::CronSync.classification().0, self.cron_sync_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::CronSync) {
+                                    admission.run(async {
+                                        self.sync_periodic_jobs_to_db().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = queue_stats_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::QueueHealth.classification().0, self.queue_stats_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::QueueHealth) {
+                                    admission.run(async {
+                                        self.publish_queue_health_metrics().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = dirty_key_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::DirtyMetadata.classification().0, self.dirty_key_recompute_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::DirtyMetadata) {
+                                    admission.run(async {
+                                        self.recompute_dirty_admin_metadata().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = metadata_reconciliation_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RefreshMetadata.classification().0, self.metadata_reconciliation_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::RefreshMetadata) {
+                                    admission.run(async {
+                                        self.refresh_admin_metadata().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = priority_aging_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Aging.classification().0, self.priority_aging_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::Aging) {
+                                    admission.run(async {
+                                        self.age_waiting_priorities().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = batch_operations_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Batch.classification().0, self.batch_operations_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::Batch) {
+                                    admission.run(async {
+                                        self.process_batch_operation().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = terminal_count_rollup_timer.tick() => {
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::TerminalRollup.classification().0, self.terminal_count_rollup_interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::TerminalRollup) {
+                                    admission.run(async {
+                                        self.rollup_terminal_count_deltas().await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = async {
+                            if let Some(timer) = &mut vacuum_queue_timer {
+                                timer.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if vacuum_queue_timer.is_some() => {
+                            let interval = vacuum_queue_interval
+                                .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateQueue.classification().0, interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::RotateQueue) {
+                                    admission.run(async {
+                                        self.rotate_queue_storage_queue(&prune_tracker).await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = async {
+                            if let Some(timer) = &mut vacuum_lease_timer {
+                                timer.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if vacuum_lease_timer.is_some() => {
+                            let interval = vacuum_lease_interval
+                                .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateLease.classification().0, interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::RotateLease) {
+                                    admission.run(async {
+                                        self.rotate_queue_storage_leases(&prune_tracker).await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+                        _ = async {
+                            if let Some(timer) = &mut vacuum_claim_timer {
+                                timer.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if vacuum_claim_timer.is_some() => {
+                            let interval = vacuum_claim_interval
+                                .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
+                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateClaim.classification().0, interval, &self.metrics) {
+                                if let Some(admission) = self.control.admit(MaintenanceBranch::RotateClaim) {
+                                    admission.run(async {
+                                        self.rotate_queue_storage_claims(&prune_tracker).await;
+                                    }).await;
+                                }
+                                timer.finish();
+                            }
+                        }
+
+                    }
+                }
+            };
+            run_leader_term(observer, &self.cancel, work).await;
+            if self.cancel.is_cancelled() {
+                return;
             }
         }
     }
@@ -1461,18 +1906,6 @@ impl MaintenanceService {
         } else {
             Ok(None)
         }
-    }
-
-    /// Release the advisory lock on the same connection that acquired it.
-    ///
-    /// Dropping the connection also releases the lock (PG session-scoped behavior),
-    /// so this is a best-effort explicit release.
-    async fn release_leader(conn: &mut PoolConnection<Postgres>) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(Self::LOCK_KEY)
-            .execute(&mut **conn)
-            .await?;
-        Ok(())
     }
 
     async fn run_cron_evaluator(pool: PgPool, cancel: CancellationToken, interval: Duration) {
@@ -1540,7 +1973,10 @@ impl MaintenanceService {
                 debug!(deleted, "cleaned up expired batch operations");
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to clean up expired batch operations"),
+            Err(err) => {
+                self.control.record_reclamation_error(&err);
+                warn!(error = %err, "failed to clean up expired batch operations");
+            }
         }
     }
 
@@ -1573,7 +2009,10 @@ impl MaintenanceService {
                     "rolled up queue-storage terminal count deltas"
                 );
             }
-            Err(err) => warn!(error = %err, "failed to roll up terminal count deltas"),
+            Err(err) => {
+                self.control.record_reclamation_error(&err);
+                warn!(error = %err, "failed to roll up terminal count deltas");
+            }
         }
     }
 
@@ -1653,39 +2092,300 @@ impl MaintenanceService {
     /// `canonical_live_backlog` above zero and wedge `finalize --wait`,
     /// and stuck queue-storage rows would wait out a drain-only leader.
     /// Both cross-plane sweeps are cheap no-ops once their tables are empty.
+    ///
+    /// Returns whether the queue-storage pass left a backlog it may keep
+    /// draining, so the next pass should run before the full interval.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
-    async fn rescue_stale_heartbeats(&self) {
+    async fn rescue_stale_heartbeats(&self, origin: RescueTickOrigin) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
                 self.process_heartbeat_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_stale_heartbeats_with_dlq(
-                            &self.pool,
-                            self.heartbeat_staleness,
-                            &|queue| self.dlq_policy.enabled_for(queue),
-                        )
-                        .await;
-                    self.process_heartbeat_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Heartbeat, runtime, false, origin)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_stale_heartbeats_with_dlq(
-                        &self.pool,
-                        self.heartbeat_staleness,
-                        &|queue| self.dlq_policy.enabled_for(queue),
-                    )
-                    .await;
-                self.process_heartbeat_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Heartbeat, runtime, true, origin)
                     .await;
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
                 self.process_heartbeat_rescues(outcome, false, None).await;
+                backlog
             }
+        }
+    }
+
+    /// One queue-storage rescue pass: batches of up to 500 attempts per
+    /// source, each in its own transaction, until a batch comes back short,
+    /// the pass budget is spent, or the pass reaches `rescue_pass_max_rows`. Most batches visit the oldest claim slot
+    /// first, since the ring cannot rotate back into it while it holds open
+    /// claims; every [`RESCUE_OTHERS_FIRST_EVERY`]th visits the others first.
+    /// A slot a batch found nothing in is left out for the rest of the pass.
+    ///
+    /// A stale heartbeat cannot tell a dead runtime from a stalled one, so a
+    /// stale-heartbeat pass takes more than one batch only when
+    /// [`RescueOwnerEvidence`] holds, and its later batches take only claims
+    /// last heartbeated before the most recently gone runtime stopped
+    /// reporting. This reduces the chance of draining a lagging live runtime,
+    /// but snapshot freshness and sampling cannot prove an owner is dead.
+    /// Deadline and callback rescues act on a deadline that has passed whoever
+    /// owns the attempt.
+    ///
+    /// Returns whether the pass stopped with a backlog it may keep draining,
+    /// so the next pass should run before the full interval.
+    async fn rescue_queue_storage_pass(
+        &self,
+        kind: RescueKind,
+        runtime: &QueueStorageRuntime,
+        signal_local: bool,
+        origin: RescueTickOrigin,
+    ) -> bool {
+        let started = Instant::now();
+        let interval = match kind {
+            RescueKind::Heartbeat => self.heartbeat_rescue_interval,
+            RescueKind::Deadline => self.deadline_rescue_interval,
+            RescueKind::Callback => self.callback_rescue_interval,
+        };
+        let budget = self.rescue_pass_budget.min(interval / 2);
+        let dlq_enabled = |queue: &str| self.dlq_policy.enabled_for(queue);
+        let bulk_heartbeat_cutoff = if kind == RescueKind::Heartbeat {
+            self.stale_claim_owners_gone().await
+        } else {
+            None
+        };
+        let first_heartbeat_cutoff = if kind == RescueKind::Heartbeat {
+            let selected = self
+                .rescue_heartbeat_cadence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .select(started, interval, bulk_heartbeat_cutoff, origin);
+            let Some(cutoff) = selected else {
+                self.rescue_sweeps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&kind);
+                return false;
+            };
+            cutoff
+        } else {
+            None
+        };
+        let mut rescued_total = 0usize;
+        let mut oldest_attempt: Option<DateTime<Utc>> = None;
+        let mut batches = 0usize;
+        let mut sweep = self
+            .rescue_sweeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&kind)
+            .unwrap_or_default();
+        sweep.revisit(started, interval, origin);
+        let pass_end = loop {
+            let slot_order = if sweep.batches_started % RESCUE_OTHERS_FIRST_EVERY
+                == RESCUE_OTHERS_FIRST_EVERY - 1
+            {
+                RescueSlotOrder::OthersFirst(
+                    self.rescue_others_first_offset
+                        .fetch_add(1, Ordering::Relaxed),
+                )
+            } else {
+                RescueSlotOrder::OldestFirst
+            };
+            let options = RescueBatchOptions {
+                slot_order,
+                skip_slots: sweep.idle_slots.clone(),
+                cursor_scan_limit: (batches > 0
+                    || (!budget.is_zero()
+                        && self.rescue_pass_max_rows > 0
+                        && match kind {
+                            RescueKind::Heartbeat => bulk_heartbeat_cutoff.is_some(),
+                            RescueKind::Deadline => true,
+                            RescueKind::Callback => false,
+                        }))
+                .then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
+            };
+            let outcome = match kind {
+                RescueKind::Heartbeat => {
+                    // Follow-up batches take only claims last heartbeated
+                    // before a runtime known to be gone stopped reporting.
+                    let cutoff = if batches == 0 {
+                        first_heartbeat_cutoff
+                    } else {
+                        bulk_heartbeat_cutoff
+                    };
+                    let staleness = cutoff
+                        .and_then(|cutoff| (Utc::now() - cutoff).to_std().ok())
+                        .map_or(self.heartbeat_staleness, |since_cutoff| {
+                            since_cutoff.max(self.heartbeat_staleness)
+                        });
+                    runtime
+                        .store
+                        .rescue_stale_heartbeats_batch(
+                            &self.pool,
+                            staleness,
+                            &dlq_enabled,
+                            &options,
+                        )
+                        .await
+                }
+                RescueKind::Deadline => {
+                    runtime
+                        .store
+                        .rescue_expired_deadlines_batch(&self.pool, &dlq_enabled, &options)
+                        .await
+                }
+                RescueKind::Callback => {
+                    runtime
+                        .store
+                        .rescue_expired_callbacks_batch(&self.pool, &dlq_enabled, &options)
+                        .await
+                }
+            };
+            batches += 1;
+            sweep.batches_started = sweep.batches_started.wrapping_add(1);
+            let RescueBatch {
+                rescued,
+                saturated,
+                idle_slots: batch_idle_slots,
+                scan_progress,
+            } = match outcome {
+                Ok(batch) => batch,
+                Err(err) => {
+                    self.process_queue_storage_rescues(kind, Err(err), signal_local, runtime)
+                        .await;
+                    break RescuePassEnd::Error;
+                }
+            };
+            sweep.idle_slots.extend(batch_idle_slots);
+            for progress in scan_progress {
+                sweep.observe(progress);
+            }
+            rescued_total += rescued.len();
+            if let Some(attempted_at) = rescued.iter().filter_map(|job| job.attempted_at).min() {
+                oldest_attempt =
+                    Some(oldest_attempt.map_or(attempted_at, |oldest| oldest.min(attempted_at)));
+            }
+            self.process_queue_storage_rescues(kind, Ok(rescued), signal_local, runtime)
+                .await;
+
+            if !saturated {
+                break RescuePassEnd::Drained;
+            }
+            if budget.is_zero() || self.rescue_pass_max_rows == 0 {
+                break RescuePassEnd::TimeBudget;
+            }
+            if kind == RescueKind::Heartbeat && bulk_heartbeat_cutoff.is_none() {
+                break RescuePassEnd::OwnersUnconfirmed;
+            }
+            if rescued_total >= self.rescue_pass_max_rows {
+                break RescuePassEnd::RowLimit;
+            }
+            if started.elapsed() >= budget {
+                break RescuePassEnd::TimeBudget;
+            }
+        };
+
+        let oldest_attempt_age = oldest_attempt
+            .and_then(|attempted_at| (Utc::now() - attempted_at).to_std().ok())
+            .unwrap_or_default();
+        self.metrics.record_rescue_pass(
+            kind.as_str(),
+            pass_end.as_str(),
+            rescued_total as u64,
+            oldest_attempt_age,
+        );
+        if batches > 1 {
+            info!(
+                rescue_kind = kind.as_str(),
+                rescued = rescued_total,
+                batches,
+                pass_end = pass_end.as_str(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                oldest_attempt_age_s = oldest_attempt_age.as_secs(),
+                "Queue-storage rescue pass drained a backlog"
+            );
+        }
+        let rearm = pass_end.backlog_remains()
+            && !budget.is_zero()
+            && self.rescue_pass_max_rows > 0
+            && (kind != RescueKind::Heartbeat || bulk_heartbeat_cutoff.is_some());
+        if rearm {
+            self.rescue_sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(kind, sweep);
+        }
+        rearm
+    }
+
+    async fn process_queue_storage_rescues(
+        &self,
+        kind: RescueKind,
+        outcome: Result<Vec<JobRow>, awa_model::AwaError>,
+        signal_local: bool,
+        runtime: &QueueStorageRuntime,
+    ) {
+        match kind {
+            RescueKind::Heartbeat => {
+                self.process_heartbeat_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+            RescueKind::Deadline => {
+                self.process_deadline_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+            RescueKind::Callback => {
+                self.process_callback_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+        }
+    }
+
+    /// Sample the runtime snapshots and update [`RescueOwnerEvidence`].
+    /// Returns the heartbeat cutoff for accelerated stale-heartbeat batches
+    /// when the evidence holds and some runtime is known to be gone; `None`
+    /// keeps the pass to one batch. A failed read counts as no evidence.
+    async fn stale_claim_owners_gone(&self) -> Option<DateTime<Utc>> {
+        let staleness_ms = i64::try_from(self.heartbeat_staleness.as_millis()).unwrap_or(i64::MAX);
+        let (settled, last_gone_heartbeat) = match sqlx::query_as::<
+            _,
+            (i64, i64, Option<DateTime<Utc>>),
+        >(RESCUE_RUNTIME_EVIDENCE_SQL)
+        .bind(staleness_ms)
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok((fresh_without_heartbeat, unconfirmed, last_gone_heartbeat)) => {
+                if fresh_without_heartbeat > 0 || unconfirmed > 0 {
+                    debug!(
+                        fresh_without_heartbeat,
+                        unconfirmed,
+                        "Stale-heartbeat rescue kept to one batch: runtime snapshots do not show the claim owners gone"
+                    );
+                }
+                (
+                    fresh_without_heartbeat == 0 && unconfirmed == 0,
+                    last_gone_heartbeat,
+                )
+            }
+            Err(err) => {
+                warn!(error = %err, "Failed to read runtime snapshots for stale-heartbeat rescue");
+                (false, None)
+            }
+        };
+        let steady = self
+            .rescue_owner_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(Instant::now(), settled, self.heartbeat_staleness);
+        if steady {
+            last_gone_heartbeat
+        } else {
+            None
         }
     }
 
@@ -1852,33 +2552,25 @@ impl MaintenanceService {
     /// #456 mirror: sweeps both storage planes; see
     /// [`Self::rescue_stale_heartbeats`].
     #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
-    async fn rescue_expired_deadlines(&self) {
+    async fn rescue_expired_deadlines(&self, origin: RescueTickOrigin) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
-                            self.dlq_policy.enabled_for(queue)
-                        })
-                        .await;
-                    self.process_deadline_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Deadline, runtime, false, origin)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
-                        self.dlq_policy.enabled_for(queue)
-                    })
-                    .await;
-                self.process_deadline_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Deadline, runtime, true, origin)
                     .await;
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, false, None).await;
+                backlog
             }
         }
     }
@@ -2025,33 +2717,25 @@ impl MaintenanceService {
     /// doubly here because callback-carrying jobs never migrate off the
     /// canonical plane during a transition.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
-    async fn rescue_expired_callbacks(&self) {
+    async fn rescue_expired_callbacks(&self, origin: RescueTickOrigin) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
-                            self.dlq_policy.enabled_for(queue)
-                        })
-                        .await;
-                    self.process_callback_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Callback, runtime, false, origin)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
-                        self.dlq_policy.enabled_for(queue)
-                    })
-                    .await;
-                self.process_callback_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Callback, runtime, true, origin)
                     .await;
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, false, None).await;
+                backlog
             }
         }
     }
@@ -2412,9 +3096,7 @@ impl MaintenanceService {
                 job: job.clone(),
                 reason,
             };
-            tokio::spawn(async move {
-                crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
-            });
+            self.spawn_lifecycle_event(handlers, kind, event);
         }
     }
 
@@ -2501,8 +3183,41 @@ impl MaintenanceService {
             job: job.clone(),
             reason,
         };
+        self.spawn_lifecycle_event(handlers, kind, event);
+    }
+
+    /// Runs `kind`'s lifecycle hooks for `event` on a detached task, so a slow
+    /// hook does not hold up maintenance. At most
+    /// [`MAINTENANCE_LIFECYCLE_EVENT_CAPACITY`] such tasks are outstanding; an
+    /// event beyond that is dropped rather than retaining its job until the
+    /// hooks catch up.
+    fn spawn_lifecycle_event(
+        &self,
+        handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
+        kind: String,
+        event: crate::events::UntypedJobEvent,
+    ) {
+        if !handlers.contains_key(&kind) {
+            return;
+        }
+        let Ok(permit) = self.lifecycle_event_capacity.clone().try_acquire_owned() else {
+            let dropped = self
+                .dropped_lifecycle_events
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if dropped % 1000 == 1 {
+                warn!(
+                    kind,
+                    dropped,
+                    capacity = MAINTENANCE_LIFECYCLE_EVENT_CAPACITY,
+                    "Dropped a maintenance lifecycle event: earlier hooks have not returned"
+                );
+            }
+            return;
+        };
         tokio::spawn(async move {
             crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
+            drop(permit);
         });
     }
 
@@ -2801,6 +3516,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to rotate queue storage queue segments");
                 return;
             }
@@ -2812,6 +3528,9 @@ impl MaintenanceService {
             return;
         }
 
+        if !self.control.allowed() {
+            return;
+        }
         match runtime
             .store
             .prune_oldest(&self.pool, self.failed_retention)
@@ -2849,6 +3568,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("queue");
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
@@ -2877,6 +3597,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to rotate queue storage lease segments");
                 return;
             }
@@ -2888,6 +3609,9 @@ impl MaintenanceService {
             return;
         }
 
+        if !self.control.allowed() {
+            return;
+        }
         match runtime.store.prune_oldest_leases(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("lease", &outcome);
@@ -2915,6 +3639,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("lease");
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
@@ -2948,6 +3673,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to rotate queue storage claim segments");
                 return;
             }
@@ -2959,6 +3685,9 @@ impl MaintenanceService {
             return;
         }
 
+        if !self.control.allowed() {
+            return;
+        }
         match runtime.store.prune_oldest_claims(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("claim", &outcome);
@@ -2986,6 +3715,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 self.metrics.record_prune_error("claim");
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
@@ -3059,6 +3789,7 @@ impl MaintenanceService {
                 total_deleted += result.rows_affected();
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to clean up old jobs (global pass)");
             }
             _ => {}
@@ -3098,6 +3829,7 @@ impl MaintenanceService {
                     );
                 }
                 Err(err) => {
+                    self.control.record_reclamation_error(&err);
                     error!(
                         queue = %queue_name,
                         error = %err,
@@ -3167,6 +3899,7 @@ impl MaintenanceService {
                 self.metrics.record_dlq_purged(None, result.rows_affected());
             }
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 error!(error = %err, "Failed to clean up DLQ rows (global pass)");
             }
             _ => {}
@@ -3199,6 +3932,7 @@ impl MaintenanceService {
                         .record_dlq_purged(Some(queue), result.rows_affected());
                 }
                 Err(err) => {
+                    self.control.record_reclamation_error(&err);
                     error!(queue, error = %err, "Failed to clean up DLQ rows");
                 }
                 _ => {}
@@ -3208,6 +3942,30 @@ impl MaintenanceService {
 }
 
 struct MaintenanceAliveGuard(Arc<AtomicBool>);
+
+async fn run_leader_term(
+    observer: LeaderObserver,
+    shutdown: &CancellationToken,
+    work: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(work);
+    tokio::select! {
+        _ = observer.lost.cancelled() => {
+            warn!("Leader session lost; draining current maintenance branch");
+        }
+        _ = shutdown.cancelled() => observer.lost.cancel(),
+        _ = &mut work => return,
+    }
+    drop(observer);
+    tokio::select! {
+        _ = &mut work => {},
+        _ = shutdown.cancelled() => {
+            if tokio::time::timeout(MAINTENANCE_BRANCH_SHUTDOWN_GRACE, work).await.is_err() {
+                warn!("Maintenance branch exceeded shutdown grace");
+            }
+        }
+    }
+}
 
 impl Drop for MaintenanceAliveGuard {
     fn drop(&mut self) {
@@ -3377,7 +4135,12 @@ impl MaintenanceService {
         )
         .await
         {
+            self.control.record_reclamation_error(&err);
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
+        }
+        if let Err(err) = self.control.cleanup_orphan_reports(&self.pool).await {
+            self.control.record_reclamation_error(&err);
+            tracing::warn!(error = %err, "Failed to clean up orphan control observations");
         }
     }
 
@@ -3399,6 +4162,7 @@ impl MaintenanceService {
                 }
                 Ok(_) => {}
                 Err(err) => {
+                    self.control.record_reclamation_error(&err);
                     tracing::warn!(table, error = %err, "Failed to clean up stale descriptors");
                 }
             }
@@ -3432,6 +4196,7 @@ impl MaintenanceService {
             return;
         }
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
+            self.control.record_reclamation_error(&err);
             tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
     }
@@ -3660,6 +4425,79 @@ impl MaintenanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[sqlx::test(migrations = false)]
+    async fn leadership_loss_finishes_committed_branch_and_releases_leader_lock(pool: PgPool) {
+        sqlx::query("CREATE TABLE committed_effects(id integer PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(42424242)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let observer = LeaderObserver::start(
+            conn,
+            Arc::new(PruneControl::default()),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let lost = observer.lost.clone();
+        let (committed, committed_rx) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel();
+        let worker = pool.clone();
+        let task = tokio::spawn(async move {
+            run_leader_term(observer, &CancellationToken::new(), async move {
+                sqlx::query("INSERT INTO committed_effects VALUES (1)")
+                    .execute(&worker)
+                    .await
+                    .unwrap();
+                committed.send(()).unwrap();
+                finish_rx.await.unwrap();
+                sqlx::query("INSERT INTO committed_effects VALUES (2)")
+                    .execute(&worker)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        });
+        committed_rx.await.unwrap();
+        lost.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "leadership loss must drain post-commit effects"
+        );
+        let mut next = pool.acquire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(42424242)")
+                    .fetch_one(&mut *next)
+                    .await
+                    .unwrap();
+                if acquired {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("old leadership session is released before its current branch drains");
+        sqlx::query("SELECT pg_advisory_unlock(42424242)")
+            .execute(&mut *next)
+            .await
+            .unwrap();
+        finish.send(()).unwrap();
+        task.await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM committed_effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
     use awa_model::{migrations, QueueStorage, QueueStorageConfig};
     use chrono::TimeZone;
     use sqlx::postgres::PgPoolOptions;
@@ -4024,8 +4862,12 @@ mod tests {
             Arc::new(HashMap::new()),
         );
 
-        service.rescue_stale_heartbeats().await;
-        service.rescue_expired_callbacks().await;
+        service
+            .rescue_stale_heartbeats(RescueTickOrigin::Backlog)
+            .await;
+        service
+            .rescue_expired_callbacks(RescueTickOrigin::Backlog)
+            .await;
 
         // Post-flip the `awa.jobs` view exposes only the queue-storage
         // plane, so assert against the physical canonical tables: both
@@ -4276,6 +5118,645 @@ mod tests {
             Some(clock + BRANCH_COOLDOWN_MAX),
             "cap bounds the cooldown"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_rescue_ticks_survive_jitter_and_revisit_finished_slots() {
+        let interval = Duration::from_secs(30);
+        let mut timer = RescueTimer::new(interval);
+        timer.tick().await;
+        let mut cadence = RescueHeartbeatCadence::default();
+        let mut sweep = RescueSweep::default();
+        tokio::time::advance(interval + Duration::from_millis(2)).await;
+        let first_origin = timer.tick().await;
+        assert_eq!(first_origin, RescueTickOrigin::Ordinary);
+        let first_start = tokio::time::Instant::now().into_std();
+        assert_eq!(
+            cadence.select(first_start, interval, None, first_origin),
+            Some(None)
+        );
+        sweep.revisit(first_start, interval, first_origin);
+        let stamp = Utc::now();
+        for (slot, saturated) in [(0, false), (1, true)] {
+            sweep.observe(RescueScanProgress {
+                slot,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 100, 1)),
+                    saturated,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+        tokio::time::advance(interval - Duration::from_millis(2)).await;
+        let next_origin = timer.tick().await;
+        let next_start = tokio::time::Instant::now().into_std();
+        assert_eq!(
+            next_start.duration_since(first_start),
+            interval - Duration::from_millis(2)
+        );
+        assert_eq!(next_origin, RescueTickOrigin::Ordinary);
+        assert_eq!(
+            cadence.select(next_start, interval, None, next_origin),
+            Some(None),
+            "an ordinary tick must not disappear because the prior tick started 2ms late"
+        );
+        sweep.revisit(next_start, interval, next_origin);
+        assert!(
+            sweep.idle_slots.is_empty(),
+            "newly eligible finished slots must be revisited"
+        );
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "ordinary revisits must retain unfinished sweep progress"
+        );
+    }
+
+    #[test]
+    fn ordinary_rescue_revisit_preserves_unfinished_cursor_under_jitter() {
+        let interval = Duration::from_secs(30);
+        let now = Instant::now();
+        let first_start = now + interval + Duration::from_millis(2);
+        let second_start = now + interval * 2;
+        let stamp = Utc::now();
+        let mut sweep = RescueSweep::default();
+        sweep.revisit(first_start, interval, RescueTickOrigin::Ordinary);
+        for (slot, saturated) in [(0, false), (1, true)] {
+            sweep.observe(RescueScanProgress {
+                slot,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 100, 1)),
+                    saturated,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+        sweep.revisit(second_start, interval, RescueTickOrigin::Ordinary);
+        assert!(
+            sweep.idle_slots.is_empty(),
+            "finished slot must be revisited on the ordinary tick"
+        );
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "unfinished sweep progress must survive the same ordinary revisit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_rescue_baseline_does_not_turn_early_rearm_into_baseline() {
+        let interval = Duration::from_secs(30);
+        let mut timer = RescueTimer::new(interval);
+        timer.tick().await;
+        tokio::time::advance(Duration::from_secs(52)).await;
+        let first_origin = timer.tick().await;
+        let first_start = tokio::time::Instant::now().into_std();
+        let mut cadence = RescueHeartbeatCadence::default();
+        assert_eq!(
+            cadence.select(first_start, interval, None, first_origin),
+            Some(None)
+        );
+        timer.reset_after(Duration::from_secs(8));
+        let origin = timer.tick().await;
+        let now = tokio::time::Instant::now().into_std();
+        assert_eq!(now.duration_since(first_start), Duration::from_secs(8));
+        assert_eq!(origin, RescueTickOrigin::Backlog);
+        assert_eq!(cadence.select(now, interval, None, origin), None,
+            "a tick scheduled 30s but serviced at52s must not make backlog60s an unguarded baseline");
+        let cutoff = Utc::now();
+        assert_eq!(
+            cadence.select(now, interval, Some(cutoff), origin),
+            Some(Some(cutoff)),
+            "an early re-arm must retain the owner cutoff"
+        );
+        let origin = timer.tick().await;
+        let now = tokio::time::Instant::now().into_std();
+        assert_eq!(origin, RescueTickOrigin::Ordinary);
+        assert_eq!(now.duration_since(first_start), Duration::from_secs(38));
+        assert_eq!(cadence.select(now, interval, None, origin), Some(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rescue_backlog_tick_is_consumed_even_when_branch_cooldown_skips_it() {
+        let (tracker, clock, cooldown_until) = tracker_flipped_by_250ms_bodies();
+        let metrics = metrics_for_test();
+        let mut timer = RescueTimer::new(Duration::from_secs(30));
+        timer.tick().await;
+        timer.reset_after(TICK_100MS);
+        let origin = timer.tick().await;
+        assert_eq!(origin, RescueTickOrigin::Backlog);
+        let skipped_at = clock + Duration::from_nanos(1);
+        assert!(skipped_at < cooldown_until);
+        assert!(tracker
+            .try_begin_at("cleanup", TICK_100MS, &metrics, true, skipped_at)
+            .is_none());
+        // tick() consumed the marker before try_begin could skip the work.
+        assert_eq!(timer.tick().await, RescueTickOrigin::Ordinary);
+    }
+
+    #[test]
+    fn rescue_accelerated_first_batch_requires_owner_evidence() {
+        let mut cadence = RescueHeartbeatCadence::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let cutoff = Utc::now();
+        assert_eq!(
+            cadence.select(now, interval, None, RescueTickOrigin::Backlog),
+            Some(None)
+        );
+        assert_eq!(
+            cadence.select(
+                now + Duration::from_secs(1),
+                interval,
+                Some(cutoff),
+                RescueTickOrigin::Backlog
+            ),
+            Some(Some(cutoff))
+        );
+        // The preceding accelerated pass re-armed the timer, but owners
+        // became unconfirmed before it fired: no ordinary batch may slip in.
+        assert_eq!(
+            cadence.select(
+                now + Duration::from_secs(2),
+                interval,
+                None,
+                RescueTickOrigin::Backlog
+            ),
+            None
+        );
+        assert_eq!(
+            cadence.select(now + interval, interval, None, RescueTickOrigin::Backlog),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn rescue_closed_history_sweep_stops_after_wrap() {
+        let mut sweep = RescueSweep::default();
+        let stamp = Utc::now();
+        // First window ends midway around a slot. Sweep state survives
+        // the pass's time budget and the next early timer fire.
+        for id in [20, 40, 60, 10] {
+            sweep.observe(RescueScanProgress {
+                slot: 1,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, id, 1)),
+                    saturated: true,
+                }],
+            });
+            assert!(sweep.idle_slots.is_empty());
+        }
+        sweep.observe(RescueScanProgress {
+            slot: 1,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: Some((stamp, 20, 1)),
+                saturated: true,
+            }],
+        });
+        assert_eq!(sweep.idle_slots, vec![1]);
+
+        let mut one = RescueSweep::default();
+        for _ in 0..2 {
+            one.observe(RescueScanProgress {
+                slot: 0,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 1, 1)),
+                    saturated: true,
+                }],
+            });
+        }
+        assert_eq!(one.idle_slots, vec![0]);
+    }
+
+    #[test]
+    fn rescue_sweep_revisits_newly_eligible_slots_at_the_ordinary_interval() {
+        let mut sweep = RescueSweep::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let stamp = Utc::now();
+        sweep.revisit(now, interval, RescueTickOrigin::Backlog);
+        // Slot A's deadlines are in the future; B keeps a large pass open.
+        sweep.observe(RescueScanProgress {
+            slot: 0,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: None,
+                saturated: false,
+            }],
+        });
+        sweep.observe(RescueScanProgress {
+            slot: 1,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: Some((stamp, 100, 1)),
+                saturated: true,
+            }],
+        });
+        sweep.revisit(now + interval / 2, interval, RescueTickOrigin::Backlog);
+        assert_eq!(sweep.idle_slots, vec![0]);
+        // A can now be expired (or contain claims from a reused generation).
+        sweep.revisit(now + interval, interval, RescueTickOrigin::Backlog);
+        assert!(sweep.idle_slots.is_empty());
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "revisiting an idle slot must not restart an unfinished sweep"
+        );
+    }
+
+    #[test]
+    fn rescue_sweep_detects_a_window_crossing_its_origin() {
+        let mut sweep = RescueSweep::default();
+        let stamp = Utc::now();
+        // A window can cross the origin and wrap again before its last key.
+        // Its end alone need never equal or exceed the original last key.
+        for id in [10_000, 1_999, 3_999, 5_999, 7_999, 9_999, 1_998] {
+            sweep.observe(RescueScanProgress {
+                slot: 0,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, id, 1)),
+                    saturated: true,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+    }
+
+    struct SparseHeartbeatFixture {
+        pool: PgPool,
+        runtime: QueueStorageRuntime,
+        service: MaintenanceService,
+        stale_job: i64,
+        fresh_job: i64,
+        fresh_runtime: Uuid,
+    }
+
+    impl SparseHeartbeatFixture {
+        async fn new(budget: Duration, max_rows: usize, confirmed: bool) -> Self {
+            let pool = setup_pool(4).await;
+            reset_schema(&pool).await;
+            migrations::run(&pool).await.expect("migrations");
+            let config = QueueStorageConfig::default();
+            let store = QueueStorage::new(config.clone()).expect("queue storage");
+            store.install(&pool).await.expect("install");
+            let jobs: Vec<_> = (0..2)
+                .map(|id| awa_model::InsertParams {
+                    kind: "sparse_heartbeat".into(),
+                    args: serde_json::json!({ "id": id }),
+                    opts: awa_model::InsertOpts {
+                        queue: "sparse_heartbeat".into(),
+                        max_attempts: 3,
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            store
+                .enqueue_params_batch(&pool, &jobs)
+                .await
+                .expect("enqueue");
+            let claims = store
+                .claim_runtime_batch(&pool, "sparse_heartbeat", 2, Duration::from_secs(3600))
+                .await
+                .expect("claim real jobs");
+            assert_eq!(claims.len(), 2);
+            let slot = claims[0].claim.claim_slot;
+            assert_eq!(claims[1].claim.claim_slot, slot);
+            let stamp = Utc::now() - chrono::Duration::hours(2);
+
+            // Keep the old row-local representation valid on both versions.
+            // Closed history needs no payload; the two open claims retain their
+            // real ready rows so rescue exercises the actual disposition path.
+            sqlx::query("DELETE FROM awa.lease_claim_batches WHERE queue = 'sparse_heartbeat'")
+                .execute(&pool)
+                .await
+                .expect("replace compact claims with legacy rows");
+            for (index, claim) in claims.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO awa.lease_claims
+                     (claim_slot, receipt_id, job_id, run_lease, ready_slot, ready_generation,
+                      queue, priority, attempt, max_attempts, lane_seq, enqueue_shard, claimed_at, deadline_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+interval '1 hour')
+                     ON CONFLICT (claim_slot,job_id,run_lease) DO UPDATE
+                     SET claimed_at=EXCLUDED.claimed_at, deadline_at=EXCLUDED.deadline_at",
+                )
+                .bind(slot).bind(claim.claim.receipt_id).bind(claim.job.id).bind(claim.job.run_lease)
+                .bind(claim.claim.ready_slot).bind(claim.claim.ready_generation).bind(&claim.claim.queue)
+                .bind(claim.claim.priority).bind(claim.job.attempt).bind(claim.job.max_attempts)
+                .bind(claim.claim.lane_seq).bind(claim.claim.enqueue_shard)
+                .bind(stamp + chrono::Duration::microseconds(if index == 0 { 3500 } else { 4500 }))
+                .execute(&pool).await.expect("legacy open receipt");
+            }
+            sqlx::query(
+                "INSERT INTO awa.lease_claims
+                 (claim_slot,job_id,run_lease,ready_slot,ready_generation,queue,priority,
+                  attempt,max_attempts,lane_seq,claimed_at,closed_at)
+                 SELECT $1,1000000+id,1,0,0,'sparse_history',0,1,3,id,
+                        $2::timestamptz+id*interval '1 microsecond',clock_timestamp()
+                 FROM generate_series(1,6000) AS id",
+            )
+            .bind(slot)
+            .bind(stamp)
+            .execute(&pool)
+            .await
+            .expect("sparse closed prefix");
+            let stale_job = claims[0].job.id;
+            let fresh_job = claims[1].job.id;
+            sqlx::query(
+                "INSERT INTO awa.attempt_state(job_id,run_lease,heartbeat_at,updated_at)
+                 VALUES($1,$2,clock_timestamp(),clock_timestamp())",
+            )
+            .bind(fresh_job)
+            .bind(claims[1].job.run_lease)
+            .execute(&pool)
+            .await
+            .expect("protect fresh claim");
+            let fresh_runtime = Uuid::new_v4();
+            for (id, seen, heartbeat_alive) in [
+                (Uuid::new_v4(), stamp + chrono::Duration::hours(1), false),
+                (fresh_runtime, Utc::now(), true),
+            ] {
+                sqlx::query(
+                    "INSERT INTO awa.runtime_instances
+                     (instance_id,hostname,pid,version,started_at,last_seen_at,snapshot_interval_ms,
+                      healthy,postgres_connected,poll_loop_alive,heartbeat_alive,shutting_down,leader)
+                     VALUES($1,'sparse_test',1,'0.6.13',$2,$2,1000,true,true,true,$3,false,false)",
+                )
+                .bind(id).bind(seen).bind(heartbeat_alive)
+                .execute(&pool).await.expect("runtime evidence");
+            }
+            let runtime =
+                QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                    .expect("runtime");
+            let service = MaintenanceService::new(
+                pool.clone(),
+                metrics_for_test(),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                CancellationToken::new(),
+                Arc::new(Vec::new()),
+                InFlightMap::default(),
+                RuntimeStorage::QueueStorage(runtime.clone()),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+            )
+            .rescue_pass_budget(budget)
+            .rescue_pass_max_rows(max_rows);
+            if confirmed {
+                let now = Instant::now();
+                *service
+                    .rescue_owner_evidence
+                    .lock()
+                    .expect("owner evidence") = RescueOwnerEvidence {
+                    steady_since: Some(now - service.heartbeat_staleness * 2),
+                    last_sample: Some(now),
+                };
+            }
+            Self {
+                pool,
+                runtime,
+                service,
+                stale_job,
+                fresh_job,
+                fresh_runtime,
+            }
+        }
+
+        async fn pass(&self) -> bool {
+            sqlx::query("UPDATE awa.runtime_instances SET last_seen_at=clock_timestamp() WHERE instance_id=$1")
+                .bind(self.fresh_runtime).execute(&self.pool).await.expect("fresh owner snapshot");
+            self.service
+                .rescue_queue_storage_pass(
+                    RescueKind::Heartbeat,
+                    &self.runtime,
+                    false,
+                    RescueTickOrigin::Backlog,
+                )
+                .await
+        }
+
+        async fn assert_dispositions(&self) {
+            let stale = self
+                .runtime
+                .store
+                .load_job(&self.pool, self.stale_job)
+                .await
+                .expect("stale job lookup")
+                .expect("stale job");
+            assert_eq!(stale.state, JobState::Retryable);
+            let fresh = self
+                .runtime
+                .store
+                .load_job(&self.pool, self.fresh_job)
+                .await
+                .expect("fresh job lookup")
+                .expect("fresh job");
+            assert_eq!(
+                fresh.state,
+                JobState::Running,
+                "fresh heartbeat stays protected"
+            );
+            let closures: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM awa.lease_claim_closures WHERE job_id=$1")
+                    .bind(self.stale_job)
+                    .fetch_one(&self.pool)
+                    .await
+                    .expect("closure count");
+            assert_eq!(closures, 1, "sparse stale attempt is rescued exactly once");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_confirmed_heartbeat_sparse_sweep_progresses_and_stops() {
+        let _guard = db_test_mutex().lock().await;
+        // A positive budget below any database round trip makes each pass
+        // finish its first batch and rearm; no elapsed-time assertion is used.
+        let run = SparseHeartbeatFixture::new(Duration::from_nanos(1), 5000, true).await;
+        assert!(run.pass().await, "closed prefix leaves a resumable sweep");
+        let cursor: i64 = sqlx::query_scalar(
+            "SELECT rescue_cursor_job_id FROM awa.claim_ring_slots WHERE slot=0",
+        )
+        .fetch_one(&run.pool)
+        .await
+        .expect("first persisted cursor");
+        assert_eq!(
+            cursor, 1002000,
+            "confirmed bulk starts with one small window"
+        );
+        let stale = run
+            .runtime
+            .store
+            .load_job(&run.pool, run.stale_job)
+            .await
+            .expect("unvisited job lookup")
+            .expect("unvisited job");
+        assert_eq!(
+            stale.state,
+            JobState::Running,
+            "sparse job lies beyond the first window"
+        );
+        let mut drained = false;
+        for _ in 0..12 {
+            if !run.pass().await {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "persisted sparse sweep converges instead of rearming forever"
+        );
+        assert!(run.service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        run.assert_dispositions().await;
+        run.pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_disabled_acceleration_keeps_wide_first_heartbeat_window() {
+        let _guard = db_test_mutex().lock().await;
+        for (budget, max_rows) in [(Duration::ZERO, 5000), (Duration::from_secs(1), 0)] {
+            let run = SparseHeartbeatFixture::new(budget, max_rows, true).await;
+            assert!(!run.pass().await, "disabled acceleration never rearms");
+            run.assert_dispositions().await;
+            run.pool.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_unconfirmed_heartbeat_keeps_wide_first_window() {
+        let _guard = db_test_mutex().lock().await;
+        let run = SparseHeartbeatFixture::new(Duration::from_nanos(1), 5000, false).await;
+        assert!(
+            !run.pass().await,
+            "unconfirmed owners keep the ordinary one-batch cadence"
+        );
+        run.assert_dispositions().await;
+        run.pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_closed_history_stops_rearming() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.expect("migrations");
+        let config = QueueStorageConfig::default();
+        let store = QueueStorage::new(config.clone()).expect("queue storage");
+        store.install(&pool).await.expect("install");
+        sqlx::query(
+            "INSERT INTO awa.lease_claims
+             (claim_slot, job_id, run_lease, ready_slot, ready_generation,
+              queue, priority, attempt, max_attempts, lane_seq, claimed_at, closed_at, deadline_at)
+             SELECT 0, id, 1, 0, 0, 'closed_history', 0, 1, 3, id,
+                    now() - interval '1 hour', now(), now() - interval '1 minute'
+             FROM generate_series(1, 10001) AS id",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed more closed history than a scan window");
+        let runtime =
+            QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("runtime");
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime.clone()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .rescue_pass_budget(Duration::from_millis(200));
+        let mut drained = false;
+        for _ in 0..20 {
+            if !service
+                .rescue_queue_storage_pass(
+                    RescueKind::Deadline,
+                    &runtime,
+                    false,
+                    RescueTickOrigin::Backlog,
+                )
+                .await
+            {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "closed history must finish a bounded sweep instead of rearming forever"
+        );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        // Zero is a documented way to retain the ordinary one-batch cadence.
+        let service = service.rescue_pass_max_rows(0);
+        assert!(
+            !service
+                .rescue_queue_storage_pass(
+                    RescueKind::Deadline,
+                    &runtime,
+                    false,
+                    RescueTickOrigin::Backlog
+                )
+                .await
+        );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        pool.close().await;
+    }
+
+    #[test]
+    fn rescue_owner_evidence_needs_a_full_settled_staleness_window() {
+        let staleness = Duration::from_secs(90);
+        let sample_every = Duration::from_secs(30);
+        let mut evidence = RescueOwnerEvidence::default();
+        let mut clock = Instant::now();
+
+        for _ in 0..3 {
+            assert!(!evidence.observe(clock, true, staleness));
+            clock += sample_every;
+        }
+        assert!(
+            evidence.observe(clock, true, staleness),
+            "settled at every sample across the staleness window"
+        );
+
+        clock += sample_every;
+        assert!(
+            !evidence.observe(clock, false, staleness),
+            "an unsettled sample closes the gate at once"
+        );
+        for _ in 0..3 {
+            clock += sample_every;
+            assert!(
+                !evidence.observe(clock, true, staleness),
+                "the window restarts after an unsettled sample"
+            );
+        }
+        clock += sample_every;
+        assert!(evidence.observe(clock, true, staleness));
+    }
+
+    #[test]
+    fn rescue_owner_evidence_restarts_after_an_unsampled_gap() {
+        let staleness = Duration::from_secs(90);
+        let mut evidence = RescueOwnerEvidence::default();
+        let mut clock = Instant::now();
+        for _ in 0..4 {
+            evidence.observe(clock, true, staleness);
+            clock += Duration::from_secs(30);
+        }
+        assert!(evidence.observe(clock, true, staleness));
+
+        // The leader did not sample for longer than half the staleness: a
+        // stall in that gap would have been invisible, so start over.
+        clock += Duration::from_secs(46);
+        assert!(!evidence.observe(clock, true, staleness));
+        clock += Duration::from_secs(45);
+        assert!(!evidence.observe(clock, true, staleness));
+        clock += Duration::from_secs(45);
+        assert!(evidence.observe(clock, true, staleness));
     }
 
     #[test]

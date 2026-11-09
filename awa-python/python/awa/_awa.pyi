@@ -576,6 +576,8 @@ class Client:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        rescue_pass_budget_ms: int | None = None,
+        rescue_pass_max_rows: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = 16,

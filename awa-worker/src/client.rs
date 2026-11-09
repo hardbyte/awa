@@ -7,6 +7,7 @@ use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, 
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
+use crate::runtime_control::{MaintenanceBranch, PruneControl};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
@@ -143,6 +144,8 @@ pub struct ClientBuilder {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
@@ -202,6 +205,8 @@ impl ClientBuilder {
             heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
+            rescue_pass_budget: None,
+            rescue_pass_max_rows: None,
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
@@ -321,10 +326,11 @@ impl ClientBuilder {
     /// `Started` dispatch is scheduled after the claim commits and before the
     /// worker handler is invoked. Outcome handlers run only after the
     /// corresponding DB state transition commits. Hooks are best-effort
-    /// in-process notifications, not a durable workflow mechanism; because
-    /// they run in detached tasks, a very short job can complete before a
-    /// `Started` handler finishes. Capture any shared dependencies you need in
-    /// the closure environment.
+    /// in-process notifications, not a durable workflow mechanism. `Started`
+    /// runs alongside the handler, so a very short job can complete before a
+    /// `Started` handler finishes. Each attempt's hooks hold a finalizer slot
+    /// until they return, so hooks slower than job throughput slow claiming.
+    /// Capture any shared dependencies you need in the closure environment.
     pub fn on_event<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -761,6 +767,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches of
+    /// 500 attempts, each in its own transaction (default: 1s, capped at half
+    /// the rescue interval). While a backlog remains the next pass runs
+    /// a second later. `Duration::ZERO` keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = Some(budget);
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). With a pass a second while a backlog remains,
+    /// this bounds the number rescued per second per kind, allowing one
+    /// final batch beyond the cap. Zero disables follow-up batches and early
+    /// re-arms. Retried attempts retain their normal backoff; their due times
+    /// can cluster, so this does not cap the promotion rate.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = Some(max_rows);
+        self
+    }
+
     /// Set the leader election retry interval (default: 10s).
     ///
     /// Controls how often a non-leader instance retries acquiring the maintenance
@@ -1117,6 +1143,8 @@ impl ClientBuilder {
             heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
+            rescue_pass_budget: self.rescue_pass_budget,
+            rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
@@ -1153,6 +1181,7 @@ impl ClientBuilder {
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
             runtime_instance_id: Uuid::new_v4(),
+            runtime_control: Arc::new(PruneControl::default()),
             runtime_started_at: Utc::now(),
             runtime_hostname: std::env::var("HOSTNAME").ok(),
             runtime_pid: std::process::id() as i32,
@@ -1213,6 +1242,8 @@ pub struct Client {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
@@ -1256,6 +1287,7 @@ pub struct Client {
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
     runtime_instance_id: Uuid,
+    runtime_control: Arc<PruneControl>,
     runtime_started_at: DateTime<Utc>,
     runtime_hostname: Option<String>,
     runtime_pid: i32,
@@ -1288,6 +1320,7 @@ struct RuntimeReporterState {
     queue_storage_capable: bool,
     transition_role: TransitionWorkerRole,
     metrics: crate::metrics::AwaMetrics,
+    runtime_control: Arc<PruneControl>,
 }
 
 /// Best-effort extraction of the most recent error message from a job's
@@ -1383,17 +1416,6 @@ impl Client {
                     }
                 }
 
-                // Fresh-install auto-finalize: state=canonical with no
-                // operator commands run yet means a brand-new cluster
-                // shouldn't have to step through prepare → enter-mixed-
-                // transition → finalize manually. Install the queue-
-                // storage schema (idempotent — concurrent workers are
-                // safe), then ask the SQL gate to advance state directly
-                // to `active` if the fresh-install conditions hold (no
-                // canonical jobs, no live workers, prepared_engine
-                // still NULL). Returns FALSE on any non-fresh DB; the
-                // caller then falls back to the canonical-storage path
-                // and the staged transition is unaffected.
                 if status.state == "canonical" && status.prepared_engine.is_none() {
                     let configured_schema = runtime.store.schema().to_string();
                     if !transition::queue_storage_schema_ready(&self.pool, &configured_schema)
@@ -1409,20 +1431,12 @@ impl Client {
                     if promoted {
                         return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
                     }
-                    // Another worker promoted concurrently while we
-                    // were installing the schema — re-fetch and use
-                    // the now-current state.
                     let refetched = transition::status(&self.pool).await?;
                     if matches!(refetched.state.as_str(), "mixed_transition" | "active")
                         && refetched.active_engine == "queue_storage"
                     {
                         return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
                     }
-                    // Function returned FALSE because conditions weren't
-                    // met (canonical jobs exist, or another runtime is
-                    // live but in canonical-only mode). Fall through to
-                    // the canonical path; operators will need the
-                    // staged transition.
                 }
 
                 if matches!(status.state.as_str(), "mixed_transition" | "active")
@@ -1489,6 +1503,7 @@ impl Client {
             global_max_workers: self.global_max_workers,
             dlq_policy: self.dlq_policy.clone(),
             instance_id: self.runtime_instance_id,
+            runtime_control: self.runtime_control.clone(),
             started_at: self.runtime_started_at,
             hostname: self.runtime_hostname.clone(),
             pid: self.runtime_pid,
@@ -1587,6 +1602,9 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
+        if let Err(err) = self.runtime_control.observe_pool(&self.pool).await {
+            warn!(error = %err, "Initial prune control read unavailable; reclamation stays closed");
+        }
         let effective_storage = self.resolve_effective_storage().await?;
         {
             let mut guard = self.effective_storage.write().await;
@@ -1597,18 +1615,25 @@ impl Client {
             .await?;
         self.warn_on_unsafe_prune_lock_timeout().await;
 
-        admin::sync_queue_descriptors(
-            &self.pool,
-            &self.declared_queue_descriptors(),
-            self.runtime_snapshot_interval,
-        )
-        .await?;
-        admin::sync_job_kind_descriptors(
-            &self.pool,
-            &self.declared_job_kind_descriptors(),
-            self.runtime_snapshot_interval,
-        )
-        .await?;
+        if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
+            admission
+                .run_result(async {
+                    admin::sync_queue_descriptors(
+                        &self.pool,
+                        &self.declared_queue_descriptors(),
+                        self.runtime_snapshot_interval,
+                    )
+                    .await?;
+                    admin::sync_job_kind_descriptors(
+                        &self.pool,
+                        &self.declared_job_kind_descriptors(),
+                        self.runtime_snapshot_interval,
+                    )
+                    .await?;
+                    Ok::<(), awa_model::AwaError>(())
+                })
+                .await?;
+        }
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -1640,6 +1665,8 @@ impl Client {
             effective_storage.clone(),
             self.dlq_policy.clone(),
             self.finalizers.clone(),
+            self.service_cancel.clone(),
+            runtime_worker_capacity,
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
@@ -1699,6 +1726,7 @@ impl Client {
                 _ => None,
             },
         )
+        .runtime_control(self.runtime_control.clone(), self.runtime_instance_id)
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);
@@ -1711,6 +1739,12 @@ impl Client {
         }
         if let Some(interval) = self.callback_rescue_interval {
             maintenance = maintenance.callback_rescue_interval(interval);
+        }
+        if let Some(budget) = self.rescue_pass_budget {
+            maintenance = maintenance.rescue_pass_budget(budget);
+        }
+        if let Some(max_rows) = self.rescue_pass_max_rows {
+            maintenance = maintenance.rescue_pass_max_rows(max_rows);
         }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
@@ -2467,20 +2501,37 @@ impl RuntimeReporterState {
     }
 
     async fn publish_snapshot(&self) {
+        if !self.leader.load(Ordering::SeqCst) {
+            if let Err(err) = self.runtime_control.observe_pool(&self.pool).await {
+                warn!(error = %err, "Reporter control read failed");
+            }
+        }
         let queue_descriptors = self.declared_queue_descriptors();
         let kind_descriptors = self.declared_job_kind_descriptors();
 
-        if let Err(err) =
-            admin::sync_queue_descriptors(&self.pool, &queue_descriptors, self.snapshot_interval)
-                .await
-        {
-            warn!(error = %err, "Failed to sync queue descriptors");
-        }
-        if let Err(err) =
-            admin::sync_job_kind_descriptors(&self.pool, &kind_descriptors, self.snapshot_interval)
-                .await
-        {
-            warn!(error = %err, "Failed to sync job kind descriptors");
+        if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
+            admission
+                .run(async {
+                    if let Err(err) = admin::sync_queue_descriptors(
+                        &self.pool,
+                        &queue_descriptors,
+                        self.snapshot_interval,
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "Failed to sync queue descriptors");
+                    }
+                    if let Err(err) = admin::sync_job_kind_descriptors(
+                        &self.pool,
+                        &kind_descriptors,
+                        self.snapshot_interval,
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "Failed to sync job kind descriptors");
+                    }
+                })
+                .await;
         }
 
         // Emit OTel info gauges for every declared descriptor. One series per
@@ -2511,6 +2562,16 @@ impl RuntimeReporterState {
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
+        }
+
+        if !self.leader.load(Ordering::SeqCst) {
+            if let Err(err) = self
+                .runtime_control
+                .publish_pool(&self.pool, self.instance_id)
+                .await
+            {
+                warn!(error = %err, "Failed to publish prune control observation");
+            }
         }
 
         if self.queue_storage_capable {

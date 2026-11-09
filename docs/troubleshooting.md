@@ -81,35 +81,18 @@ ORDER BY heartbeat_at ASC;
 
 Interpretation:
 
-- low `heartbeat_age_s`: the worker is still alive
+- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying`
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
+- stale, but every rescue pass logs `Rescue skipped an attempt: queue storage ready body ambiguous`: an aging race in an older release left two equally plausible bodies for this attempt. Rescue leaves it running and moves on to other attempts. Reads and cancellation of the job fail with the same ambiguity error, so it needs manual repair; open an issue with the job id and run lease from the log
 
 ### Transient Admin Reads During Partition Pruning
 
-In 0.6, a job-detail read, including list-item hydration, uses several queries
-within one snapshot. It retains read locks on the located ready body, but does
-not lock all ring partitions before establishing that snapshot. Prune can
-truncate a ready partition before its body is located, or a lease or claim
-partition before that read phase reaches it. A completed job can then briefly
-appear available or missing. Retry with a fresh read before treating that result
-as missing durable work. Filtering tombstoned source rows after a queue or
-priority move does not close these separate windows.
+In 0.6, a job-detail read, including list-item hydration, uses several queries within one snapshot. It retains read locks on the located ready body, but does not lock all ring partitions before establishing that snapshot. Prune can truncate a ready partition before its body is located, or a lease or claim partition before that read phase reaches it. A completed job can then briefly appear available or missing. Retry with a fresh read before treating that result as missing durable work. Filtering tombstoned source rows after a queue or priority move does not close these separate windows.
 
 ### Failed Jobs Rescued After Priority Aging
 
-0.6.14 preserves the physical ready-lane identity when rescue writes a failed
-terminal row, so manual retry, failed-row carry and `terminal_jobs` retain its
-original arguments and retry limit. Rust reads, manual retry and failed-row
-carry also recover older narrow terminal rows by attempt identity while their
-ready backing remains retained. These paths preserve terminal metadata and
-fill missing defaults from the live ready row. The installed `terminal_jobs`
-SQL view and creation-time bucket joins remain unchanged for older rows whose
-stored priority differs from their ready lane. Already-pruned backing data
-cannot be recovered by this fix. Manual terminal retry restarts aging from the
-physical lane. Manual terminal-to-DLQ moves retain that lane for later DLQ
-retry; automatic retryable rescue and automatic DLQ routing retain effective
-priority.
+0.6.14 preserves the physical ready-lane identity when rescue writes a failed terminal row, so manual retry, failed-row carry and `terminal_jobs` retain its original arguments and retry limit. Rust reads, manual retry and failed-row carry also recover older narrow terminal rows by attempt identity while their ready backing remains retained. These paths preserve terminal metadata and fill missing defaults from the live ready row. The installed `terminal_jobs` SQL view and creation-time bucket joins remain unchanged for older rows whose stored priority differs from their ready lane. Already-pruned backing data cannot be recovered by this fix. Manual terminal retry restarts aging from the physical lane. Manual terminal-to-DLQ moves retain that lane for later DLQ retry; automatic retryable rescue and automatic DLQ routing retain effective priority.
 
 ### Inspect Runtime Health
 
@@ -163,10 +146,25 @@ To recover:
 
 In all cases the cancel itself is durable — only the early wake-up is lost. Long-running handlers that don't poll `ctx.is_cancelled()` between heartbeats won't notice the cancel until they finish or heartbeat-rescue fires.
 
+## Claiming Slows While Handlers Are Idle
+
+### What It Usually Means
+
+Durable completion, or lifecycle hooks, are behind the handlers. A runtime lets only a bounded number of finished attempts wait for their completion to commit (see [completion settings](configuration.md#hot-queue-claim-control)). Once that allowance is used up, finished handlers keep their worker slots, `awa_job_in_flight` sits at `max_workers` while handler CPU is idle, and the runtime claims only as fast as completions commit. Worker memory stays flat. Before 0.6.15 the runtime kept claiming instead, and its memory grew with every finished attempt until the process was killed.
+
+### What To Check
+
+- `awa_completion_flush_duration_seconds`: long flushes point at the database, usually lock waits on the completion or terminal tables. Look for long transactions and lock waits on the queue-storage schema, as in [Inspect Long Transactions](#inspect-long-transactions).
+- `awa_completion_deadlock_retry_total`: a steady rate means completions are re-running after deadlocks.
+- Lifecycle hooks (`on_event`, `on_event_kind`): a hook that waits on a slow service or on the same database holds its attempt's slot until it returns. Move slow work into a job or a follow-up.
+
+### Fixes
+
+Clear the lock contention or long transaction; claiming recovers as soon as completions commit again. Raising `max_workers` does not help while completion is the bottleneck. For jobs with large payloads, lowering `AWA_COMPLETION_BATCH_SIZE` reduces how much memory waiting attempts can hold.
+
 ## Rescue Fails With `idx_awa_jobs_unique`
 
-Symptom: maintenance repeats, every tick (canonical engine — the queue-storage
-engine wedges identically but logs `error: unique conflict` instead):
+Symptom: maintenance repeats, every tick (canonical engine — the queue-storage engine wedges identically but logs `error: unique conflict` instead):
 
 ```text
 Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
@@ -212,7 +210,7 @@ Reading them together separates the two usual failure modes:
 
 **1. Producer is going through the compatibility insert path.**
 
-`insert_many_copy_from_pool` / `client.insert_many_copy` routes every row through `awa.insert_job_compat()` once per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row function call dominates — measured at ~100–150 ms per row through a Cloud SQL Auth Proxy in staging, which caps a single producer at ~7 rows/sec regardless of batch or chunk size.
+Without the `insert_jobs_compat_batch` schema patch, `insert_many_copy_from_pool` / `client.insert_many_copy` routes every row through `awa.insert_job_compat()` once per row, and a batch with unique jobs adds a savepoint round trip per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row cost dominates — measured at ~100–150 ms per row through an auth proxy, which caps a single producer at ~7 rows/sec regardless of batch or chunk size. Run `awa migrate` to install the patch; COPY then inserts the batch in one function call. Generic `insert_many` keeps its one-statement per-row path either way.
 
 Switch the producer to the direct queue-storage COPY entry point:
 
@@ -240,7 +238,18 @@ DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 
 Use an upsert: first-enqueue may create lane rows before any operator inserts a `queue_meta` row, so a plain `UPDATE` quietly affects zero rows. Raising `enqueue_shards` is a semantic switch from strict to partitioned FIFO; see [ADR-025](adr/025-sharded-enqueue-heads.md).
 
-**3. WAL or commit pressure on the database.**
+**3. Producers wait on one queue's enqueue lane.**
+
+Many connections wait with `wait_event = 'advisory'` while the database is otherwise idle, batch inserts take seconds although the work per batch is milliseconds, and promotion into the same queue runs late while producers saturate it.
+
+On queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until it commits, so concurrent producers for one lane run one at a time; a lane's ceiling is a batch's rows divided by the time the lock is held. Generic `insert_many` and per-row COPY take the lock at the batch's first ready row and hold it while the rest of the batch is processed. With the `insert_jobs_compat_batch` schema patch, `insert_many_copy` and `insert_many_skip_unique_conflicts` prepare the whole batch (job ids, unique claims, payloads) before they take any lane lock, and take each lane's lock when they write that lane; it is still held until the transaction ends.
+
+- Run `awa migrate` and move hot producers to `insert_many_copy` or `insert_many_skip_unique_conflicts`.
+- When `insert_many` fails on a unique conflict, retry with `insert_many_skip_unique_conflicts` rather than inserting the batch again row by row: each single-row insert queues for the lane separately.
+- Keep producer transactions short after the enqueue: the lane stays locked until commit.
+- Raise `enqueue_shards` (above) for a queue whose producers still saturate one lane.
+
+**4. WAL or commit pressure on the database.**
 
 If batch size and shard count both look healthy, sample `pg_stat_activity` for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in [`docs/deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#pick-a-vcpu-size) are useful reference points.
 
@@ -310,6 +319,32 @@ If long-running jobs are expected, remember:
 - they do not override `deadline_duration`
 
 If a job really needs `20m`, set a longer deadline for that queue.
+
+## Claim Ring Stops Rotating After A Runtime Is Killed
+
+Symptoms on queue storage, usually after a high-throughput runtime was OOM-killed or lost without a graceful shutdown:
+
+- `awa.maintenance.rotate.attempts` for the claim ring reports `skipped_busy` with blocker `claim.rows`, and `awa.ring.generation` for the claim ring stops advancing
+- queue prune skips the slot those claims reference with reason `queue.unclosed_claim_refs`, and the queue ring stops wrapping too
+- the current claim slot keeps growing
+- jobs the dead runtime held wait well past `heartbeat_staleness` before they run again
+
+The dead runtime's claims stay open until rescue closes them, and the ring cannot rotate back into a slot that still holds open claims. Rescue drains such a backlog in passes of 500-attempt batches ([Draining a backlog of abandoned claims](configuration.md#rescue-backlog)). To see where it is:
+
+- `awa.maintenance.rescue.oldest_attempt_age` by `awa.rescue.kind` shows how old the attempts rescue is closing are. It should fall towards `heartbeat_staleness` (or the queue's deadline) as the backlog drains.
+- `awa.maintenance.rescue.pass_size` by `awa.rescue.pass_end` shows why passes stop. `time_budget` or `row_limit` means a drain is running at its configured rate. `owners_unconfirmed` means stale-heartbeat rescue is waiting for evidence that the claims' runtime is gone and is taking one batch per ordinary rescue interval.
+
+If stale-heartbeat passes stay at `owners_unconfirmed`, look at the runtime snapshots:
+
+```sql
+SELECT instance_id, hostname, last_seen_at, snapshot_interval_ms, heartbeat_alive
+FROM awa.runtime_instances
+ORDER BY last_seen_at DESC;
+```
+
+A snapshot that is no longer fresh but is younger than `heartbeat_staleness` holds acceleration back, as does a fresh snapshot with `heartbeat_alive = false`. The unconfirmed phase requires `3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness` for every runtime; otherwise a stalled live runtime can pass directly from fresh to gone ([owner-evidence limits](configuration.md#rescue-backlog)). The drain also needs `heartbeat_rescue_interval` below half of `heartbeat_staleness`. With the defaults, acceleration usually starts about 3–3.5 minutes after the last runtime snapshot, and a leadership change restarts the evidence window. Deadline rescue is not held back this way, so queues with a `deadline_duration` drain through it regardless.
+
+To drain faster, raise `rescue_pass_budget` (at most half the rescue interval, so 15 s by default) and `rescue_pass_max_rows`, keeping in mind that a pass holds the maintenance leader for its budget and can exceed `rescue_pass_max_rows` by one final batch of closures and retry rows. The [measured rates](configuration.md#rescue-backlog) show what to expect. Retry due times can cluster; this cap does not bound promotion throughput.
 
 ## Dead Tuples Growing In Queue Storage
 
@@ -465,8 +500,11 @@ awa --database-url "$DATABASE_URL" migrate
 Cause:
 
 - on queue storage every enqueue holds a transaction-scoped advisory lock on its `(queue, priority, shard)` lane until the transaction commits; the `DETAIL` names two 64-bit advisory keys, and two transactions that took lanes in opposite orders hold one each and wait on the other's
-- `insert_many`, `insert_many_copy` and the `QueueStorage` batch enqueues take their lane locks in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so batches never deadlock with each other
-- a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a batch or another such transaction that touches the same lanes in a different order
+- `insert_many`, `insert_many_copy`, `insert_many_skip_unique_conflicts` and the `QueueStorage` batch enqueues register and lock their lanes one at a time in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so two batch calls cannot hold each other's lanes in opposite orders
+- a 0.6.15 or earlier `QueueStorage` process (batch enqueue, or a worker promoting scheduled or retried jobs) creates a new `(queue, priority)` lane by taking its provisioning lock before writing its `queue_lanes` row; every other producer, and `QueueStorage` from 0.6.16, writes the row first, so one of each that are both the first to use the lane can deadlock. Upgrade those processes, or create a queue's lanes before traffic reaches it with `awa storage prepare-queue`
+- with the `insert_jobs_compat_batch` schema patch, `insert_many_copy` and `insert_many_skip_unique_conflicts` take all of a batch's unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together. For 2 s the function waits at most 500 ms (or half of its session's `deadlock_timeout`, if lower) while it holds claims or lanes, then releases them and retries, so it gives way to a per-row transaction that holds a lane the batch needs and waits for one of its keys, provided that transaction's `deadlock_timeout` is above 500 ms (the default is 1 s) and the batch inserts its unique claims within 500 ms (10,000 to 20,000 keys on a fast server, fewer under load; split larger batches). Its last attempt waits as any statement does, so a per-row transaction that holds the lane for longer than the retries (about 2.5 s) before it inserts the key still deadlocks with it, and a cycle that retrying cannot break, for example through a lock the batch's own transaction took in an earlier statement, still ends in `40P01`, after 3 to 4 s and usually by aborting the batch's transaction. The 0.6.15 body of the function waited instead, and the two deadlocked; `awa migrate` replaces it (`awa migrate --sql --pending` prints `R__insert_jobs_compat_batch` while the old body is installed)
+- unique keys and the application's own locks can form other cycles
+- a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a generic `insert_many`, a `QueueStorage` batch enqueue or another such transaction that touches the same lanes in a different order; a batch through `awa.insert_jobs_compat_batch` normally gives way to it instead
 
 Fix:
 

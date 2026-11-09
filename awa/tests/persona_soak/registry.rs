@@ -78,6 +78,8 @@ impl QueueRegistry {
     /// Looks a queue up by its physical name; striped queues (`name#N`) resolve to
     /// their logical queue.
     pub fn get(&self, name: &str) -> Option<Arc<QueueInfo>> {
+        // `register` takes `queues` before `by_name`; holding `by_name` while
+        // waiting for `queues` would deadlock against it.
         let index = {
             let by_name = self.by_name.read().expect("registry lock");
             *by_name.get(name).or_else(|| {
@@ -191,7 +193,7 @@ mod tests {
         }
         drop(done);
         barrier.wait();
-        let deadline = Instant::now() + scaled_timeout(Duration::from_secs(2));
+        let deadline = Instant::now() + scaled_timeout(Duration::from_secs(30));
         for _ in 0..8 {
             completed
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))

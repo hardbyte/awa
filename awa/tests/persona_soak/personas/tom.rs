@@ -54,6 +54,12 @@ impl Worker for TomWorker {
     }
 }
 
+/// Tenant queues to serve: the scaled count, and never fewer than the queues the cron
+/// schedules write to.
+fn queue_count(scaled: u64) -> usize {
+    (scaled as usize).max(CRON_JOBS)
+}
+
 fn queue_name(index: usize) -> String {
     format!("{PREFIX}{index:03}")
 }
@@ -109,7 +115,7 @@ fn client_factory(shared: Arc<Shared>, queue_count: usize) -> ClientFactory {
 
 pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     let persona = Persona::Tom;
-    let queue_count = shared.config.scaled(100) as usize;
+    let queue_count = queue_count(shared.config.scaled(100));
     let mut served = Vec::new();
     for index in 0..queue_count {
         served.push((
@@ -276,4 +282,15 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     fleet.shutdown_all(Duration::from_secs(20), &shared).await;
     producer_pool.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{queue_count, CRON_JOBS};
+
+    #[test]
+    fn every_cron_target_queue_is_served_at_small_scales() {
+        assert_eq!(queue_count(2), CRON_JOBS);
+        assert_eq!(queue_count(100), 100);
+    }
 }

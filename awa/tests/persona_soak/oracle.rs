@@ -288,8 +288,7 @@ impl Oracle {
         let scan_started_ms = self.shared.now_ms();
         let rows: Result<Vec<(i64, String, i64)>, _> = sqlx::query_as(&format!(
             "SELECT job_id, queue, run_lease FROM {schema}.done_entries
-             WHERE state = 'cancelled' AND finalized_at > now() - make_interval(secs => $1)
-             LIMIT 2000"
+             WHERE state = 'cancelled' AND finalized_at > now() - make_interval(secs => $1)"
         ))
         .bind(((scan_started_ms - since_ms) as f64 / 1000.0 + 15.0).max(20.0))
         .fetch_all(&self.pool)
@@ -1188,6 +1187,46 @@ mod tests {
             .expect("drop oracle database");
             admin.close().await;
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_scan_reads_every_cancellation_in_its_window() {
+        let mut run = TestRun::create().await;
+        let schema = schema(&run.shared);
+        for (queue, count) in [("oracle_cancel_bulk", 2_000), ("oracle_cancel_late", 1)] {
+            run.store
+                .enqueue_batch(&run.pool, queue, 2, count)
+                .await
+                .expect("enqueue jobs to cancel");
+            awa::model::admin::drain_queue(&run.pool, queue)
+                .await
+                .expect("cancel the queue");
+        }
+        let late: i64 = sqlx::query_scalar(&format!(
+            "SELECT job_id FROM {schema}.done_entries WHERE queue = 'oracle_cancel_late'"
+        ))
+        .fetch_one(&run.pool)
+        .await
+        .expect("the late cancellation");
+        run.shared.ledger.register(
+            late,
+            JobRecord::new(Persona::Priya, u32::MAX, 0, expect::COMPLETED, 0),
+        );
+        run.oracle.check_unexplained_cancels().await;
+        assert!(
+            run.shared
+                .violations
+                .lock()
+                .expect("violations")
+                .iter()
+                .any(|violation| violation.kind == "unexplained_cancel"
+                    && violation
+                        .rows
+                        .iter()
+                        .any(|row| row.contains(&format!("\"job_id\":{late},")))),
+            "a cancellation after the first 2,000 in the window is still checked"
+        );
+        run.drop().await;
     }
 
     #[tokio::test]

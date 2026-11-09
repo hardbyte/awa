@@ -120,6 +120,15 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
 -- Keep the queue-storage installer helper migrator/operator-only.
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN)
   FROM awa_runtime;
+-- Keep fleet control mutation operator-only after the broad grants above.
+REVOKE ALL ON awa.runtime_controls FROM awa_runtime;
+GRANT SELECT ON awa.runtime_controls TO awa_runtime;
+REVOKE ALL ON awa.runtime_control_observations FROM awa_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON awa.runtime_control_observations
+  TO awa_runtime;
+REVOKE EXECUTE ON FUNCTION awa.halt_runtime_scope(TEXT, TEXT, TEXT),
+                          awa.resume_runtime_scope(TEXT, UUID)
+  FROM awa_runtime;
 
 -- Default privileges for future migrations.
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
@@ -138,6 +147,8 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
+
+Reapply the control exceptions after any later blanket grants. Inherited mutation privileges must be removed from the granting role as well. Grant halt/resume only to a separate operator role; see [runtime controls](runtime-controls.md#install).
 
 If you use the compatibility `insert_many_copy` path (Rust `InsertOpts::copy()`), also grant:
 
@@ -176,7 +187,7 @@ The default `awa` queue-storage substrate is migrated by `awa migrate`. Custom q
 
 ### Lane sequences
 
-Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. Once the `definer_lane_provisioning` schema patch is applied, they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime role therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard. Apply the patch with `awa migrate` as the schema owner (`PGOPTIONS='-c role=awa_owner'`), or run the exported `R__definer_lane_provisioning.sql` after `V40`.
+Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. Once the `definer_lane_provisioning` schema patch is applied, they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime role therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard. Their inserts into `queue_lanes`, `queue_enqueue_heads` and `queue_claim_heads` fire those tables' triggers as the schema owner, so don't grant `TRIGGER` on them to any other role. Apply the patch with `awa migrate` as the schema owner (`PGOPTIONS='-c role=awa_owner'`), or run the exported `R__definer_lane_provisioning.sql` after `V40`.
 
 A new lane sequence gets the privileges of the head table it backs. A role that may `INSERT` or `UPDATE` `queue_enqueue_heads` gets `USAGE, SELECT, UPDATE` on the enqueue sequences, and one that may only `SELECT` it gets `SELECT`; `queue_claim_heads` does the same for the claim sequences. The table grants above are enough.
 
@@ -232,6 +243,10 @@ Without the CLI, repair one sequence per transaction from `psql` in autocommit m
 SELECT format('SELECT * FROM awa.repair_lane_sequence(%L, %L)', 'awa', sequence_name)
 FROM awa.lane_sequence_problems('awa') \gexec
 ```
+
+### Claim batch index
+
+The `claim_batch_job_index` schema patch adds `ensure_claim_batch_job_index(slot)` to each queue-storage schema. Claim prune calls it right after truncating a claim slot to give that `lease_claim_batches` partition its GIN index on `job_ids`. It is `SECURITY DEFINER`, owned by the owner of `lease_claim_batches` (creating an index needs table ownership), with a pinned `search_path`. It only creates that one index, and only on a partition that is empty and unlocked. `PUBLIC` cannot execute it: Each time the patch or installer runs, `EXECUTE` is reset to exactly the roles that then hold `TRUNCATE` on `lease_claim_batches`: a runtime role given `TRUNCATE` later gets it on the next run (or from the step 4 `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA` until then), and a role that has lost `TRUNCATE` loses it. A runtime that cannot execute it skips the step and claims keep working.
 
 ### 5. Configure your processes
 
@@ -337,7 +352,7 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. A future migration could convert the internal queue-storage helpers to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
+The lane provisioning functions `provision_lane` and `provision_lane_sequences` are `SECURITY DEFINER` since the `definer_lane_provisioning` patch (see [Lane sequences](#lane-sequences)). The rest of the model still requires broad table grants because the other compatibility triggers and helper functions use `SECURITY INVOKER`. A future migration could convert those to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
 
 ## Deployable roles
 
@@ -426,3 +441,11 @@ See [callback receivers](callback-receivers.md) for end-to-end custom-axum and F
 - [Deployment guide](deployment.md)
 - [Configuration](configuration.md)
 - [Troubleshooting](troubleshooting.md)
+
+## Runtime control privileges
+
+[Runtime controls](runtime-controls.md#install) use explicit operator `EXECUTE` grants for halt/resume. Runtime roles need `SELECT` on `awa.runtime_controls` and `SELECT, INSERT, UPDATE, DELETE` on `awa.runtime_control_observations`. Operators need `SELECT` on both tables and `awa.runtime_instances`, plus `EXECUTE` on the halt/resume functions. Neither role should receive direct control-table writes.
+
+The patch removes mutation privileges from `PUBLIC` and runtime/producer roles, including broad defaults, while preserving explicit operator grants on replay. Reapply the exceptions after blanket table or function grants and remove inherited mutation privileges from the granting role. Schema owners and superusers retain administrative authority.
+
+This boundary protects the requested halt and resume; status confirmation trusts runtime credentials. Runtime roles can write arbitrary rows in `awa.runtime_control_observations` and delete registrations in `awa.runtime_instances`. A holder of those credentials can forge another runtime's halted report or remove an unobserving runtime from status. `halted` is therefore not tamper-evident proof against runtime-role holders. Moving report writes into a `SECURITY DEFINER` function alone would neither authenticate individual runtimes sharing a database role nor prevent registration deletion. Protect and trust runtime credentials, revoke or fence compromised processes, and upgrade or fence every old binary that could become maintenance leader before relying on the halt.

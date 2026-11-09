@@ -1,5 +1,6 @@
 """Process-boundary regressions; uses a delayed fake client, never a database."""
 
+import json
 import os
 from pathlib import Path
 import select
@@ -14,6 +15,7 @@ import unittest
 SCRIPT = Path(os.environ.get("SOAK_PYTHON_SCRIPT", Path(__file__).with_name("soak_python.py")))
 FAKE_AWA = '''
 import asyncio
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +39,8 @@ class AsyncClient:
         return lambda handler: handler
 
     async def start(self, *args, **kwargs):
-        Path(os.environ["SOAK_TEST_WORKERS"]).touch()
+        timings = {key: value for key, value in kwargs.items() if key.endswith("_ms")}
+        Path(os.environ["SOAK_TEST_WORKERS"]).write_text(json.dumps(timings))
 
     async def insert(self, *args, **kwargs):
         Path(os.environ["SOAK_TEST_PRODUCED"]).touch()
@@ -68,8 +71,8 @@ class StartupDrainTests(unittest.TestCase):
             self.child.stderr.close()
         self.directory.cleanup()
 
-    def start(self, *, draining=False):
-        env = os.environ | {
+    def start(self, *, draining=False, extra_env=None):
+        env = os.environ | (extra_env or {}) | {
             "PYTHONPATH": str(self.root),
             "SOAK_DATABASE_URL": "unused-by-the-fake-client",
             "SOAK_ROLE": "full",
@@ -113,6 +116,22 @@ class StartupDrainTests(unittest.TestCase):
     def test_restart_during_drain_starts_workers_without_producers(self):
         self.start(draining=True)
         self.assert_draining_workers()
+
+    def test_workers_use_the_timings_the_harness_passes(self):
+        self.start(extra_env={
+            "SOAK_HEARTBEAT_MS": "30000",
+            "SOAK_STALENESS_MS": "90000",
+            "SOAK_RESCUE_INTERVAL_MS": "7000",
+        })
+        self.gate.touch()
+        self.wait_for("READY pid=")
+        self.assertEqual(json.loads(self.workers.read_text()), {
+            "heartbeat_interval_ms": 30000,
+            "heartbeat_staleness_ms": 90000,
+            "heartbeat_rescue_interval_ms": 7000,
+            "deadline_rescue_interval_ms": 7000,
+            "promote_interval_ms": 250,
+        })
 
 
 if __name__ == "__main__":

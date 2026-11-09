@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
@@ -269,6 +271,8 @@ pub struct JobExecutor {
     storage: RuntimeStorage,
     dlq_policy: DlqPolicy,
     finalizers: TaskTracker,
+    finalize_cancel: CancellationToken,
+    finalize_capacity: Arc<Semaphore>,
 }
 
 impl JobExecutor {
@@ -291,7 +295,12 @@ impl JobExecutor {
         storage: RuntimeStorage,
         dlq_policy: DlqPolicy,
         finalizers: TaskTracker,
+        finalize_cancel: CancellationToken,
+        runtime_worker_capacity: u32,
     ) -> Self {
+        let finalize_capacity = Arc::new(Semaphore::new(
+            completion_batcher.finalizer_capacity(runtime_worker_capacity),
+        ));
         Self {
             pool,
             workers,
@@ -305,6 +314,8 @@ impl JobExecutor {
             storage,
             dlq_policy,
             finalizers,
+            finalize_cancel,
+            finalize_capacity,
         }
     }
 
@@ -332,6 +343,8 @@ impl JobExecutor {
         let storage = self.storage.clone();
         let dlq_policy = self.dlq_policy.clone();
         let finalizers = self.finalizers.clone();
+        let finalize_cancel = self.finalize_cancel.clone();
+        let finalize_capacity = self.finalize_capacity.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -357,6 +370,14 @@ impl JobExecutor {
             let in_flight_state = InFlightState {
                 cancel: cancel.clone(),
                 progress: progress_state.clone(),
+                claim: queue_storage_claim.as_ref().and_then(|claim| {
+                    awa_model::queue_storage::ClaimHeartbeatRef::from_claim(
+                        job_id,
+                        job_run_lease,
+                        claim,
+                    )
+                }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
@@ -379,20 +400,21 @@ impl JobExecutor {
                 progress_state.clone(),
             );
 
+            let mut started_event = None;
             let result = match workers.get(&job.kind) {
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
                         let started_job = job.clone();
-                        tokio::spawn(async move {
+                        started_event = Some(tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
                                 &started_kind,
                                 UntypedJobEvent::Started { job: started_job },
                             )
                             .await;
-                        });
+                        }));
                     }
                     let perform = CatchUnwind(worker.perform(&ctx));
                     let outcome = match abandon_after {
@@ -439,6 +461,23 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
+            // The handler's progress snapshot is final: the finalize settles it,
+            // so heartbeats stop flushing progress for this attempt.
+            in_flight.mark_finalizing((job_id, job_run_lease));
+            // Keep worker capacity and heartbeats until a bounded finalizer slot
+            // is available. Otherwise returning handlers can create an unbounded
+            // set of tasks retaining job payloads while completion is stalled.
+            let finalize_permit = match result {
+                Some(_) => tokio::select! {
+                    biased;
+                    _ = finalize_cancel.cancelled() => None,
+                    permit = finalize_capacity.acquire_owned() => {
+                        Some(permit.expect("finalizer capacity is never closed"))
+                    }
+                },
+                None => None,
+            };
+
             if heartbeat_guard.is_none() {
                 in_flight.remove((job_id, job_run_lease));
             }
@@ -447,7 +486,7 @@ impl JobExecutor {
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
-            let Some(result) = result else {
+            let (Some(result), Some(finalize_permit)) = (result, finalize_permit) else {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
@@ -547,12 +586,19 @@ impl JobExecutor {
                 }
 
                 drop(heartbeat_guard);
+                // Lifecycle hooks run under the finalizer permit, so a hook slower
+                // than job throughput holds back claiming instead of accumulating
+                // tasks that each retain a copy of the job.
+                if let Some(started_event) = started_event {
+                    let _ = started_event.await;
+                }
                 if let Ok(CompletionOutcome::Applied {
                     event: Some(event), ..
                 }) = outcome
                 {
                     dispatch_lifecycle_event(&lifecycle_handlers, &job_kind, event).await;
                 }
+                drop(finalize_permit);
             });
         }
         .instrument(span)
@@ -641,6 +687,27 @@ where
                 .await
                 .map_err(|_| FinalizeError::Deadline)?,
             None => tokio::time::sleep(delay).await,
+        }
+    }
+}
+
+/// Re-read a job whose transition has committed, for its lifecycle event.
+/// The transition stands whatever the read returns, so a failed read is logged
+/// and the caller builds the event from the worker's copy instead.
+async fn reload_committed_job(
+    runtime: &QueueStorageRuntime,
+    pool: &PgPool,
+    job_id: i64,
+) -> Option<JobRow> {
+    match runtime.store.load_job(pool, job_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            warn!(
+                job_id,
+                error = %err,
+                "Could not re-read a committed job for its lifecycle event; using the worker's copy"
+            );
+            None
         }
     }
 }
@@ -1702,6 +1769,17 @@ fn rescheduled_event_row(
     row
 }
 
+/// The job as a read returns it after this attempt completes.
+fn completed_event_row(job: &JobRow) -> JobRow {
+    let mut row = job.clone();
+    row.state = JobState::Completed;
+    row.finalized_at = Some(chrono::Utc::now());
+    row.progress = None;
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_job_queue_storage(
     runtime: &QueueStorageRuntime,
@@ -1812,21 +1890,11 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job =
-                    runtime
-                        .store
-                        .load_job(pool, job.id)
-                        .await?
-                        .unwrap_or_else(|| {
-                            let mut completed_job = job.clone();
-                            completed_job.state = JobState::Completed;
-                            completed_job.finalized_at = Some(chrono::Utc::now());
-                            completed_job.progress = None;
-                            completed_job
-                        });
+                // The event is built from the worker's copy rather than
+                // re-reading the job.
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
-                        job: updated_job,
+                        job: completed_event_row(job),
                         duration,
                     }),
                     terminal: false,
@@ -2163,10 +2231,8 @@ async fn complete_job_queue_storage(
                 }
             }
             let event = if needs_event {
-                let parked_job = runtime
-                    .store
-                    .load_job(pool, job.id)
-                    .await?
+                let parked_job = reload_committed_job(runtime, pool, job.id)
+                    .await
                     .unwrap_or_else(|| {
                         let mut parked = job.clone();
                         parked.state = JobState::WaitingExternal;
@@ -2446,12 +2512,7 @@ async fn complete_queue_storage_with_followups(
 
     // Synthesise the post-completion snapshot — the store has just moved the
     // lease into `done_entries` so a live SELECT would race with rotation.
-    // The happy-path fields are exactly those `complete_job_queue_storage`
-    // reconstructs when `load_job` returns None.
-    let mut updated_job = job.clone();
-    updated_job.state = JobState::Completed;
-    updated_job.finalized_at = Some(chrono::Utc::now());
-    updated_job.progress = None;
+    let updated_job = completed_event_row(job);
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
 
@@ -3429,6 +3490,8 @@ mod tests {
             storage,
             DlqPolicy::default(),
             finalizers.clone(),
+            CancellationToken::new(),
+            1,
         );
         executor
             .execute_task(
@@ -3490,6 +3553,99 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn saturated_finalizer_capacity_retains_worker_until_shutdown() {
+        for storage in [
+            RuntimeStorage::Canonical,
+            RuntimeStorage::QueueStorage(
+                QueueStorageRuntime::new(
+                    awa_model::QueueStorageConfig::default(),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let job: JobRow = serde_json::from_value(serde_json::json!({
+                "id": 1, "kind": "finalize_parent", "queue": "test", "args": {},
+                "state": "running", "priority": 2, "attempt": 1, "run_lease": 1,
+                "max_attempts": 5, "run_at": now, "attempted_at": now,
+                "created_at": now, "metadata": {}, "tags": [],
+            }))
+            .unwrap();
+            let key = (job.id, job.run_lease);
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:test@localhost/awa_test")
+                .unwrap();
+            let metrics = test_metrics();
+            let finalizers = TaskTracker::new();
+            let finalize_cancel = CancellationToken::new();
+            let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+            let count = Arc::new(AtomicU32::new(0));
+            let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+                pool.clone(),
+                CancellationToken::new(),
+                metrics.clone(),
+                storage.clone(),
+                1,
+            );
+            let executor = JobExecutor::new(
+                pool.clone(),
+                Arc::new(HashMap::from([(
+                    "finalize_parent".into(),
+                    Box::new(FinalizeWorker) as BoxedWorker,
+                )])),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+                in_flight.clone(),
+                Arc::new(HashMap::from([("test".into(), count.clone())])),
+                Arc::new(HashMap::new()),
+                metrics,
+                handle,
+                storage,
+                DlqPolicy::default(),
+                finalizers.clone(),
+                finalize_cancel.clone(),
+                1,
+            );
+            // Occupy the entire budget without starting database work.
+            let capacity = executor.finalize_capacity.clone();
+            let held = capacity
+                .clone()
+                .acquire_many_owned(capacity.available_permits() as u32)
+                .await
+                .unwrap();
+            let task = tokio::spawn(executor.execute_task(
+                DispatchedJob {
+                    job,
+                    queue_storage_claim: None,
+                    queue_storage_unique_states: None,
+                    abandon_after: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+            ));
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(in_flight.get_cancel(key).is_some());
+            assert!(finalizers.is_empty());
+
+            // Cancelling background services at the drain deadline must release
+            // the capacity waiter without spawning another finalizer.
+            finalize_cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert!(in_flight.get_cancel(key).is_none());
+            assert!(finalizers.is_empty());
+            drop(held);
+            pool.close().await;
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_finalization_unregisters_only_its_exact_lease() {
         let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
@@ -3499,6 +3655,8 @@ mod tests {
                 InFlightState {
                     cancel: Arc::new(AtomicBool::new(false)),
                     progress: Arc::new(std::sync::Mutex::new(ProgressState::new(None))),
+                    claim: None,
+                    finalizing: false,
                 },
             );
         }

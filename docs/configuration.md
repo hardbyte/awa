@@ -245,7 +245,7 @@ Retry backoff and `Snooze` use the same mechanism: the current attempt closes, a
 Operational knobs:
 
 - `promote_interval` controls how often maintenance checks for due deferred rows.
-- A queue whose enqueue lane is kept busy by producers does not delay promotion of other queues or the leader's rescue: promotion waits 50 ms for a lane's lock, then hands the lane to a dedicated waiter that is served in turn. Each waiter holds one connection from the worker's pool while it waits, on top of the leader's own. The leader runs at most one waiter per eight pool connections, never fewer than one or more than four, so a 10-connection pool gives up at most one extra connection to a busy lane. `awa_maintenance_promote_lane_contention_total` counts those hand-offs by queue. A steady `waiter_limit` rate means more lanes are saturated than the waiters cover, and a larger pool allows more waiters. `waiter_timed_out` means a transaction held a lane lock for longer than 30 s.
+- A queue whose enqueue lane is kept busy by producers does not delay promotion of other queues or the leader's rescue: promotion waits 50 ms for a lane's lock, then hands the lane to a dedicated waiter that is served in turn. Each waiter holds one connection from the worker's pool while it waits, on top of the leader's own. The leader runs at most one waiter per eight pool connections, never fewer than one or more than four, so a 10-connection pool gives up at most one extra connection to a busy lane. `awa_maintenance_promote_lane_contention_total` counts those hand-offs by queue. A steady `waiter_limit` rate means more lanes are saturated than the waiters cover, and a larger pool allows more waiters. `waiter_timed_out` means a waiter's promotion transaction waited longer than 30 s for one of its locks, usually the lane lock behind the producers queued ahead of it.
 - Per-job `run_at` controls the due time.
 - Periodic schedules are declared in worker code with `periodic()` and managed through the CLI/UI `cron` surface.
 
@@ -474,6 +474,29 @@ If you suspend a handler with `wait_for_callback()` and the external system neve
 | --- | --- | --- |
 | `ClientBuilder::callback_rescue_interval` | `30s` | How often the maintenance leader scans for `callback_timeout_at < now()`. The per-callback timeout itself is set when registering the callback in the handler. |
 
+### Draining a backlog of abandoned claims { #rescue-backlog }
+
+A runtime that is killed (OOM, `SIGKILL`, a lost node) leaves every attempt it had claimed open. On queue storage those open claims also stop the claim ring from rotating back into their slot, so a large backlog has to be rescued quickly, not 500 attempts per rescue interval.
+
+Each stale-heartbeat, deadline or callback-timeout rescue therefore runs as a pass of batches. A batch scans a bounded claim window and rescues up to 500 attempts per source (lease rows and receipt claims) in its own short transaction. The pass keeps starting batches while a scan window or rescue batch came back full, until its time budget is spent or it has rescued `rescue_pass_max_rows`. While a backlog remains, the next pass of that kind runs one second later instead of after its interval, so a drain proceeds at up to about `rescue_pass_max_rows` attempts per second per rescue kind.
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `ClientBuilder::rescue_pass_budget` (Rust) / `rescue_pass_budget_ms` (Python kwarg) | `1s` | How long one pass keeps starting batches. Capped at half the rescue interval. `Duration::ZERO` / `0` keeps every pass to one batch. |
+| `ClientBuilder::rescue_pass_max_rows` (Rust) / `rescue_pass_max_rows` (Python kwarg) | `5000` | How many attempts one pass rescues before it stops. Bounds the write burst (closures, retry rows, WAL, replica and CDC traffic), with up to one final batch beyond the cap. `0` keeps one batch per ordinary interval without early re-arms. |
+
+In practice the database sets the rate, not the cap. On PostgreSQL 17, a batch of 500 row-local claims (claims with a deadline) spends about 0.1–0.2 s in its rescue statements and writes about 0.3 MB of WAL for its closures, so a default pass takes several batches before its second of rest. Rescue kinds run one after another on the leader, not in parallel. Measured with default intervals, 1.6 million abandoned row-local claims past their deadlines drained in about 17 minutes (1,600 a second), against about 33 a second (500 per kind per interval) without passes. Raising `rescue_pass_budget` towards its cap and `rescue_pass_max_rows` keeps rescue running for more of each second, but each pass holds the leader for its whole budget, so promotion, rotation and prune wait as long. After a large drain the rings take a minute or two to move past the slots the backlog pinned, while promotion admits the rescued retries.
+
+How a pass chooses and paces its work:
+
+- **Oldest claims first.** Batches visit claim slots from the oldest to the current one, because the ring cannot rotate back into the oldest slot until its claims are closed. Every fourth batch visits the other slots first, so a long drain of one slot does not starve the rest. A slot a batch found nothing in is skipped for the rest of the pass.
+- **Stale-heartbeat acceleration uses runtime evidence.** A stale heartbeat cannot distinguish a dead runtime from a stalled one. Extra batches and early passes require every snapshot in `awa.runtime_instances` to be either fresh with its heartbeat loop alive or silent for at least `heartbeat_staleness`, with that condition observed for a full staleness window. Accelerated batches also require the claim's last heartbeat to precede the latest gone-runtime cutoff. The per-attempt staleness condition is unchanged.
+  This is a bounded heuristic, not proof that an owner has exited. To expose an unconfirmed phase between fresh and gone, each runtime needs `3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness`. With 5-second snapshots and 12-second staleness, a stalled live runtime goes directly from fresh to gone; steady evidence may predate the stall, so acceleration can rescue its stale claims faster than the ordinary one-batch cadence. The leader must also sample frequently enough: gaps longer than half the staleness reset the evidence window, and short stalls between samples can be missed. The defaults (10-second snapshots, 90-second staleness, 30-second rescue interval) provide an unconfirmed phase; after a runtime stops reporting, acceleration usually begins after about 3–3.5 minutes. A new maintenance leader resets the evidence window. Deadline and callback rescues use their expired deadline and do not need owner evidence.
+- **Retries retain their backoff.** Rescue bounds closures and retry writes per pass. Backoffs and promotion delays can make retries become due together; `rescue_pass_max_rows` does not cap the rate at which promotion admits them to the ready lanes.
+- **Exhausted attempts are dead-lettered in the same batches.** On a DLQ-enabled queue an attempt rescued on its last try goes to the DLQ in its batch's transaction (reason `heartbeat_stale`, `deadline_exceeded` or `callback_timeout`), so a drain can move many jobs to the DLQ at once. `awa.job.dlq_moved` counts them by reason.
+
+A pass holds the maintenance leader's loop for up to its budget plus one batch, so promotion and the other maintenance branches can wait about that long while a backlog drains. Watch a drain with `awa.maintenance.rescue.pass_size` (attempts per pass, by `awa.rescue.kind` and `awa.rescue.pass_end`: `drained`, `time_budget`, `row_limit`, `owners_unconfirmed` or `error`) and `awa.maintenance.rescue.oldest_attempt_age` (the age of the oldest attempt the latest pass rescued, `0` when it rescued nothing). An `oldest_attempt_age` far above `heartbeat_staleness` or the queue's deadline means rescue is behind.
+
 ### Retention and cleanup
 
 Retention depends on the storage path.
@@ -582,24 +605,12 @@ Use the defaults unless you have a reason not to:
 - Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
 - Increase `queue_stripe_count` only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue `QueueConfig` field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. For single hot-queue workloads, benchmark `2` stripes first; higher values should be treated as workload-specific tuning rather than a general default.
 - Increase `prune_lock_timeout` when `increase(awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}[15m])` stays above zero and the rings stop recycling, typically because frequent short reads of the ring partitions (admin or dashboard queries over the queue-storage tables) hold a conflicting lock at the instant prune tries. A stalled ring grows its current slot, which makes those queries slower and the contention worse. Raise it in small steps (for example `50ms`, then `100ms`, then `250ms`) and keep it well below PostgreSQL's `deadlock_timeout` (default `1s`) and below any `statement_timeout` on the pool's connections. A single lock wait that reaches `deadlock_timeout` makes PostgreSQL run its deadlock detector, and if claims or enqueues are part of a lock cycle with it, the detector can cancel them rather than the prune; a short `lock_timeout` abandons the prune first, so the prune is always the one that gives way. A `statement_timeout` at or below the lock timeout cancels the prune statement before the lock timeout fires, so it fails with an error instead of reporting `blocked`. Startup logs a warning when the configured timeout is at or above either setting. While prune waits, new accesses to the same partition also queue behind its lock request, so a longer timeout trades claim latency for reclamation. Shortening the readers is the more durable fix when they run longer than a few hundred milliseconds. Watch `awa_maintenance_prune_attempts_total` by `awa_ring` and `awa_ring_outcome`: `pruned` should advance steadily, `blocked` means the lock timeout expired, `skipped_active` (with `awa_ring_reason`) means live rows kept the slot, `backed_off` means prune was skipped for up to 32 ticks after consecutive `skipped_active` or `blocked` results, so a persistently blocked ring is retried less often over time, and `error` is a database failure.
-- Consider increasing rotation intervals before raising `prune_lock_timeout`:
-  longer intervals can reduce how often prune requests exclusive locks, while
-  a longer timeout lets each request wait longer. Confirm the effect with
-  workload measurements.
+- Consider increasing rotation intervals before raising `prune_lock_timeout`: longer intervals can reduce how often prune requests exclusive locks, while a longer timeout lets each request wait longer. Confirm the effect with workload measurements.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 
-Longer rotation intervals accumulate more work in each slot. At a steady enqueue
-rate, ready rows per queue slot are roughly the enqueue rate multiplied by
-`queue_rotate_interval`; retries and blocked recycling can increase the retained
-footprint. Budget for larger partitions and indexes. Queue-ring history becomes
-coarser and generally spans about `queue_slot_count × queue_rotate_interval`;
-active or blocked slots can retain it longer. The independent
-`claim_rotate_interval` changes claim-evidence retention, not completed-job
-history in the ready/terminal ring.
+Longer rotation intervals accumulate more work in each slot. At a steady enqueue rate, ready rows per queue slot are roughly the enqueue rate multiplied by `queue_rotate_interval`; retries and blocked recycling can increase the retained footprint. Budget for larger partitions and indexes. Queue-ring history becomes coarser and generally spans about `queue_slot_count × queue_rotate_interval`; active or blocked slots can retain it longer. The independent `claim_rotate_interval` changes claim-evidence retention, not completed-job history in the ready/terminal ring.
 
-A longer interval does not remove the locks required by each prune.
-`prune_lock_timeout` still applies separately to each acquisition; queue prune
-can lock up to eight partitions before its later reads and writes.
+A longer interval does not remove the locks required by each prune. `prune_lock_timeout` still applies separately to each acquisition; queue prune can lock up to eight partitions before its later reads and writes.
 
 ### Sharding the enqueue head per queue
 
@@ -632,6 +643,8 @@ Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` i
 Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` for ordinary runtimes and `4` when the configured runtime worker capacity is at least `512` (`8` on canonical storage). Extra completion flushers can improve large single-process shapes, but they also multiply terminal-write contention across a worker fleet. Override this only after measuring the same north-star metrics for the target topology.
 
 `AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS` defaults to `1`. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.
+
+A runtime lets at most the larger of its worker capacity and `2 × AWA_COMPLETION_BATCH_SIZE × AWA_COMPLETION_SHARDS` finished attempts wait for their completion to commit: 1,024 with the queue-storage defaults below 512 workers. Each attempt's lifecycle hooks run within that allowance. A handler that finishes while it is used up keeps its worker slot until a completion commits, so a runtime whose completions or hooks fall behind claims more slowly instead of holding the backlog in memory. Each waiting attempt holds its job, payload included; for large payloads, lower `AWA_COMPLETION_BATCH_SIZE` to lower the bound in proportion.
 
 For very high-throughput no-op queues, size `max_workers` for durable completion latency, not handler CPU alone. The `10k/s` offered-rate reference shape needs 1,024 in-flight worker permits to absorb the load consistently; real jobs with non-trivial handler time need workload-specific sizing.
 

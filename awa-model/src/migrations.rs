@@ -353,6 +353,50 @@ macro_rules! definer_lane_provisioning_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `claim_batch_job_index` patch: the
+/// function that installs the per-schema index function, the installer, and
+/// each queue-storage schema with partitioned `lease_claim_batches` but no
+/// SECURITY DEFINER `ensure_claim_batch_job_index`. A helper or index function
+/// from before the index check required a non-partial index (0.6.15) is
+/// pending too. The indexes do not keep the patch pending: the patch builds
+/// none, and claim prune adds each one as it empties a partition.
+macro_rules! claim_batch_job_index_pending_sql {
+    () => {
+        "SELECT 'awa.refresh_claim_batch_job_index_helper'::text AS target \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.oid = to_regprocedure('awa.refresh_claim_batch_job_index_helper(text)') \
+               AND p.prosrc LIKE '%indpred IS NULL%') \
+         UNION ALL \
+         SELECT 'awa.install_queue_storage_substrate' \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc NOT LIKE '%refresh_claim_batch_job_index_helper%') \
+         UNION ALL \
+         SELECT format('claim batch job index in schema %s', n.nspname) \
+         FROM pg_namespace AS n \
+         WHERE EXISTS ( \
+                 SELECT 1 FROM pg_proc AS p \
+                 WHERE p.pronamespace = n.oid \
+                   AND p.proname = 'claim_ready_runtime' \
+                   AND oidvectortypes(p.proargtypes) \
+                       = 'text, bigint, double precision, double precision') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'lease_claim_batches' \
+                         AND c.relkind = 'p') \
+           AND NOT EXISTS (SELECT 1 FROM pg_proc AS p \
+                           WHERE p.pronamespace = n.oid \
+                             AND p.proname = 'ensure_claim_batch_job_index' \
+                             AND p.prosecdef \
+                             AND oidvectortypes(p.proargtypes) = 'integer' \
+                             AND p.prosrc LIKE '%indpred IS NULL%' \
+                             AND 'quote_all_identifiers=off' = ANY (p.proconfig))"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
@@ -365,6 +409,9 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
             definer_lane_provisioning_pending_sql!(),
             " ORDER BY 1"
         )),
+        "claim_batch_job_index" => {
+            Some(concat!(claim_batch_job_index_pending_sql!(), " ORDER BY 1"))
+        }
         _ => None,
     }
 }
@@ -425,6 +472,42 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
             definer_lane_provisioning_pending_sql!(),
             ")"
         ),
+    },
+    SchemaPatch {
+        name: "claim_batch_job_index",
+        description: "Index compact claim batches by job id",
+        // The v023 definitions first, so the installer and its index helper
+        // carry the job_ids index; the patch then installs the index function
+        // in each schema. Claim prune builds the indexes.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/claim_batch_job_index.sql"),
+        ),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            claim_batch_job_index_pending_sql!(),
+            ")"
+        ),
+    },
+    SchemaPatch {
+        name: "insert_jobs_compat_batch",
+        description:
+            "Batch producer insert with a short enqueue lane lock window (awa 0.7 migration v055)",
+        sql: include_str!("../migrations/patches/insert_jobs_compat_batch.sql"),
+        applied_probe: crate::insert::BATCH_FUNCTION_PATCH_APPLIED_SQL,
+    },
+    SchemaPatch {
+        name: "prune_controls",
+        description: "Durable operator control for maintenance pruning",
+        // Ordinary awa objects only: do not embed or refresh v023. This patch
+        // is independent of substrate installer refreshes.
+        sql: include_str!("../migrations/patches/prune_controls.sql"),
+        applied_probe: "SELECT to_regclass('awa.runtime_controls') IS NOT NULL \
+            AND to_regprocedure('awa.halt_runtime_scope(text,text,text)') IS NOT NULL \
+            AND to_regprocedure('awa.resume_runtime_scope(text,uuid)') IS NOT NULL \
+            AND to_regprocedure('awa.prune_controls_protocol_version()') IS NOT NULL \
+            AND to_regclass('awa.runtime_control_observations') IS NOT NULL",
     },
 ];
 
@@ -1065,6 +1148,19 @@ mod tests {
             .join("\n");
         assert!(!code.contains("install_queue_storage_substrate"));
         assert!(code.contains("PERFORM awa.refresh_lane_sequence_helpers(v_schema)"));
+    }
+
+    #[test]
+    fn claim_batch_job_index_patch_only_installs_the_helper() {
+        let patch = include_str!("../migrations/patches/claim_batch_job_index.sql");
+        let code: String = patch
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("install_queue_storage_substrate"));
+        assert!(!code.contains("ensure_claim_batch_job_index"));
+        assert!(code.contains("PERFORM awa.refresh_claim_batch_job_index_helper(v_schema)"));
     }
 
     #[test]
