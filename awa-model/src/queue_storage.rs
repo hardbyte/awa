@@ -12711,8 +12711,10 @@ impl QueueStorage {
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        crate::read_transaction::read_until_untruncated(|| self.load_job_in_snapshot(pool, job_id))
-            .await
+        crate::read_transaction::read_until_untruncated(|guard| {
+            self.load_job_in_snapshot(pool, job_id, guard)
+        })
+        .await
     }
 
     /// The job's newest row, and whether no ring partition was truncated
@@ -12721,6 +12723,7 @@ impl QueueStorage {
         &self,
         pool: &PgPool,
         job_id: i64,
+        guard: crate::read_transaction::TruncationGuard,
     ) -> Result<(Option<JobRow>, bool), AwaError> {
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
@@ -12736,9 +12739,10 @@ impl QueueStorage {
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
             .await
             .map_err(map_sqlx_error)?;
-        let fingerprint = crate::read_transaction::PartitionFingerprint::read(
+        let snapshot = crate::read_transaction::GuardedSnapshot::before_begin(
             &mut begin_guard.connection,
             schema,
+            guard,
         )
         .await
         .map_err(map_sqlx_error)?;
@@ -12749,6 +12753,10 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         begin_guard.begin_pending = false;
+        snapshot
+            .after_begin(tx.as_mut(), schema)
+            .await
+            .map_err(map_sqlx_error)?;
 
         sqlx::query("SAVEPOINT awa_read_leg")
             .execute(tx.as_mut())
@@ -13270,8 +13278,8 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
-        let untruncated = fingerprint
-            .unchanged(&mut begin_guard.connection, schema)
+        let untruncated = snapshot
+            .untruncated(&mut begin_guard.connection, schema)
             .await
             .map_err(map_sqlx_error)?;
         drop(begin_guard);

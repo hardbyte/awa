@@ -62,13 +62,10 @@ const RING_PARENT_TABLES: [&str; 13] = [
 /// its own snapshot, equal fingerprints mean no partition was truncated while
 /// the read's snapshot was in use.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PartitionFingerprint(Vec<i64>);
+struct PartitionFingerprint(Vec<i64>);
 
 impl PartitionFingerprint {
-    pub(crate) async fn read(
-        connection: &mut PgConnection,
-        schema: &str,
-    ) -> Result<Self, sqlx::Error> {
+    async fn read(connection: &mut PgConnection, schema: &str) -> Result<Self, sqlx::Error> {
         let parents: Vec<String> = RING_PARENT_TABLES
             .iter()
             .map(|table| format!("{schema}.{table}"))
@@ -90,7 +87,7 @@ impl PartitionFingerprint {
     }
 
     /// Whether no ring partition was truncated since `self` was read.
-    pub(crate) async fn unchanged(
+    async fn unchanged(
         &self,
         connection: &mut PgConnection,
         schema: &str,
@@ -99,34 +96,127 @@ impl PartitionFingerprint {
     }
 }
 
-/// Times a snapshot read runs before it returns a value whose snapshot
-/// overlapped a truncation.
-const SNAPSHOT_READ_ATTEMPTS: usize = 3;
+/// How one run of a snapshot read keeps ring truncations out of its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TruncationGuard {
+    /// Compare [`PartitionFingerprint`]s around the snapshot. Takes no
+    /// partition locks beyond those of each query.
+    Detect,
+    /// Lock every ring partition in `ACCESS SHARE` mode before the snapshot
+    /// is taken and hold the locks until commit, so no truncation can commit
+    /// while the snapshot is in use. Prune waits for, or gives up on, the read.
+    Lock,
+}
 
-/// Runs `read` until a run's snapshot overlaps no ring partition truncation,
-/// at most [`SNAPSHOT_READ_ATTEMPTS`] times. `read` returns its value and
-/// whether its [`PartitionFingerprint`] was unchanged. Only maintenance
-/// passes truncate, so the last run's value is returned even if it overlapped
-/// one.
+/// One run of a repeatable-read snapshot read under a [`TruncationGuard`].
+///
+/// Call [`Self::before_begin`] on the read's connection before `BEGIN`,
+/// [`Self::after_begin`] after `BEGIN` and before any statement that takes the
+/// snapshot, and [`Self::untruncated`] after `COMMIT`.
+pub(crate) struct GuardedSnapshot {
+    fingerprint: Option<PartitionFingerprint>,
+}
+
+impl GuardedSnapshot {
+    pub(crate) async fn before_begin(
+        connection: &mut PgConnection,
+        schema: &str,
+        guard: TruncationGuard,
+    ) -> Result<Self, sqlx::Error> {
+        let fingerprint = match guard {
+            TruncationGuard::Detect => Some(PartitionFingerprint::read(connection, schema).await?),
+            TruncationGuard::Lock => None,
+        };
+        Ok(Self { fingerprint })
+    }
+
+    pub(crate) async fn after_begin(
+        &self,
+        connection: &mut PgConnection,
+        schema: &str,
+    ) -> Result<(), sqlx::Error> {
+        if self.fingerprint.is_none() {
+            let parents = RING_PARENT_TABLES
+                .iter()
+                .map(|table| format!("{schema}.{table}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::query(&format!("LOCK TABLE {parents} IN ACCESS SHARE MODE"))
+                .execute(connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether no ring partition was truncated while the snapshot was in use.
+    pub(crate) async fn untruncated(
+        self,
+        connection: &mut PgConnection,
+        schema: &str,
+    ) -> Result<bool, sqlx::Error> {
+        match self.fingerprint {
+            Some(fingerprint) => fingerprint.unchanged(connection, schema).await,
+            None => Ok(true),
+        }
+    }
+}
+
+/// Runs of a snapshot read that detect truncation before one locks it out.
+const DETECTING_ATTEMPTS: usize = 3;
+
+/// Runs `read` until a run's snapshot overlaps no ring partition truncation.
+/// The first [`DETECTING_ATTEMPTS`] runs use [`TruncationGuard::Detect`]; if
+/// every one overlapped a truncation, a last run uses
+/// [`TruncationGuard::Lock`], whose result cannot overlap one. `read` returns
+/// its value and [`GuardedSnapshot::untruncated`].
 pub(crate) async fn read_until_untruncated<T, E, F, Fut>(mut read: F) -> Result<T, E>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(TruncationGuard) -> Fut,
     Fut: Future<Output = Result<(T, bool), E>>,
 {
-    for _ in 1..SNAPSHOT_READ_ATTEMPTS {
-        let (value, untruncated) = read().await?;
+    for _ in 0..DETECTING_ATTEMPTS {
+        let (value, untruncated) = read(TruncationGuard::Detect).await?;
         if untruncated {
             return Ok(value);
         }
-        tracing::debug!("a ring partition was truncated under a snapshot read; reading again");
     }
-    read().await.map(|(value, _)| value)
+    tracing::debug!(
+        attempts = DETECTING_ATTEMPTS,
+        "ring partitions were truncated under every snapshot read; reading with them locked"
+    );
+    read(TruncationGuard::Lock).await.map(|(value, _)| value)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PartitionFingerprint, RING_PARENT_TABLES};
+    use super::{
+        read_until_untruncated, GuardedSnapshot, PartitionFingerprint, TruncationGuard,
+        DETECTING_ATTEMPTS, RING_PARENT_TABLES,
+    };
     use crate::queue_storage::{QueueStorage, QueueStorageConfig};
+
+    #[tokio::test]
+    async fn reads_with_partitions_locked_after_every_detecting_run_overlaps_a_truncation() {
+        let mut guards = Vec::new();
+        let value = read_until_untruncated(|guard| {
+            guards.push(guard);
+            let untruncated = guard == TruncationGuard::Lock;
+            async move { Ok::<_, ()>((value_for(guard), untruncated)) }
+        })
+        .await
+        .unwrap();
+        let mut expected = vec![TruncationGuard::Detect; DETECTING_ATTEMPTS];
+        expected.push(TruncationGuard::Lock);
+        assert_eq!(guards, expected);
+        assert_eq!(value, "locked");
+    }
+
+    fn value_for(guard: TruncationGuard) -> &'static str {
+        match guard {
+            TruncationGuard::Detect => "detected",
+            TruncationGuard::Lock => "locked",
+        }
+    }
 
     #[sqlx::test(migrations = false)]
     async fn fingerprint_covers_every_ring_partition_and_sees_truncation(pool: sqlx::PgPool) {
@@ -180,5 +270,50 @@ mod tests {
             .unchanged(&mut connection, schema)
             .await
             .unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn locked_snapshot_keeps_truncation_out_until_commit(pool: sqlx::PgPool) {
+        crate::migrations::run(&pool).await.unwrap();
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: "awa_qs_locked_snapshot".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store.install(&pool).await.unwrap();
+        let schema = store.schema();
+
+        let mut reader = pool.acquire().await.unwrap();
+        let snapshot = GuardedSnapshot::before_begin(&mut reader, schema, TruncationGuard::Lock)
+            .await
+            .unwrap();
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *reader,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        )
+        .await
+        .unwrap();
+        snapshot.after_begin(tx.as_mut(), schema).await.unwrap();
+
+        let mut pruner = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL lock_timeout = '50ms'")
+            .execute(pruner.as_mut())
+            .await
+            .unwrap();
+        let error = sqlx::query(&format!("TRUNCATE TABLE {schema}.done_entries_0"))
+            .execute(pruner.as_mut())
+            .await
+            .expect_err("truncation must wait for the locked snapshot");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref(),
+            Some("55P03")
+        );
+        pruner.rollback().await.unwrap();
+
+        tx.commit().await.unwrap();
+        assert!(snapshot.untruncated(&mut reader, schema).await.unwrap());
     }
 }

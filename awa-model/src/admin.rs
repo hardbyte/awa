@@ -2,7 +2,7 @@ use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
-use crate::read_transaction::{read_until_untruncated, PartitionFingerprint};
+use crate::read_transaction::{read_until_untruncated, GuardedSnapshot, TruncationGuard};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -1475,18 +1475,20 @@ async fn queue_storage_job_candidate_ids(
     filter: &ListJobsFilter,
     cursor: Option<i64>,
     candidate_limit: i64,
+    guard: TruncationGuard,
 ) -> Result<(BTreeSet<i64>, bool), AwaError> {
     // Every candidate phase sees the same MVCC snapshot. Each phase
     // releases its own read locks before the next one opens more tables.
     let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-    let fingerprint =
-        PartitionFingerprint::read(&mut begin_guard.connection, store.schema()).await?;
+    let snapshot =
+        GuardedSnapshot::before_begin(&mut begin_guard.connection, store.schema(), guard).await?;
     let mut tx = sqlx::Connection::begin_with(
         &mut *begin_guard.connection,
         "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
     )
     .await?;
     begin_guard.begin_pending = false;
+    snapshot.after_begin(tx.as_mut(), store.schema()).await?;
     sqlx::query("SET LOCAL jit = off")
         .execute(tx.as_mut())
         .await?;
@@ -1531,8 +1533,8 @@ async fn queue_storage_job_candidate_ids(
         }
     }
     tx.commit().await?;
-    let untruncated = fingerprint
-        .unchanged(&mut begin_guard.connection, store.schema())
+    let untruncated = snapshot
+        .untruncated(&mut begin_guard.connection, store.schema())
         .await?;
     drop(begin_guard);
     Ok((ids, untruncated))
@@ -1554,8 +1556,8 @@ async fn list_queue_storage_jobs(
     let mut cursor = filter.before_id;
 
     loop {
-        let ids = read_until_untruncated(|| {
-            queue_storage_job_candidate_ids(store, pool, filter, cursor, candidate_limit)
+        let ids = read_until_untruncated(|guard| {
+            queue_storage_job_candidate_ids(store, pool, filter, cursor, candidate_limit, guard)
         })
         .await?;
         let ids: Vec<i64> = ids
@@ -4193,16 +4195,18 @@ async fn queue_storage_job_kind_overviews(
     store: &QueueStorage,
     pool: &PgPool,
     sql: &str,
+    guard: TruncationGuard,
 ) -> Result<(Vec<JobKindOverview>, bool), AwaError> {
     let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-    let fingerprint =
-        PartitionFingerprint::read(&mut begin_guard.connection, store.schema()).await?;
+    let snapshot =
+        GuardedSnapshot::before_begin(&mut begin_guard.connection, store.schema(), guard).await?;
     let mut tx = sqlx::Connection::begin_with(
         &mut *begin_guard.connection,
         "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
     )
     .await?;
     begin_guard.begin_pending = false;
+    snapshot.after_begin(tx.as_mut(), store.schema()).await?;
     // As in `queue_overviews`: compiling costs more than running.
     sqlx::query("SET LOCAL jit = off")
         .execute(tx.as_mut())
@@ -4233,8 +4237,8 @@ async fn queue_storage_job_kind_overviews(
         .fetch_all(tx.as_mut())
         .await?;
     tx.commit().await?;
-    let untruncated = fingerprint
-        .unchanged(&mut begin_guard.connection, store.schema())
+    let untruncated = snapshot
+        .untruncated(&mut begin_guard.connection, store.schema())
         .await?;
     drop(begin_guard);
     Ok((rows, untruncated))
@@ -4294,8 +4298,10 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             kind_counts_cte = queue_storage_kind_counts_cte()
         );
 
-        return read_until_untruncated(|| queue_storage_job_kind_overviews(&store, pool, &sql))
-            .await;
+        return read_until_untruncated(|guard| {
+            queue_storage_job_kind_overviews(&store, pool, &sql, guard)
+        })
+        .await;
     }
 
     let rows = sqlx::query_as::<_, JobKindOverview>(
