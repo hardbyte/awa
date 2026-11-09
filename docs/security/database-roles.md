@@ -124,6 +124,10 @@ SELECT format('SELECT * FROM awa.repair_lane_sequence(%L, %L)', 'awa', sequence_
 FROM awa.lane_sequence_problems('awa') \gexec
 ```
 
+## Claim batch index
+
+From schema v054 each queue-storage schema has `ensure_claim_batch_job_index(slot)`. Claim prune calls it right after truncating a claim slot to give that `lease_claim_batches` partition its GIN index on `job_ids`. It is `SECURITY DEFINER`, owned by the owner of `lease_claim_batches` (creating an index needs table ownership), with a pinned `search_path`. It only creates that one index, and only on a partition that is empty and unlocked. `PUBLIC` cannot execute it. Each time the migration or installer runs, `EXECUTE` is reset to exactly the roles that then hold `TRUNCATE` on `lease_claim_batches`: a runtime role given `TRUNCATE` later gets it on the next run (or from `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA` above until then), and a role that has lost `TRUNCATE` loses it. A runtime that cannot execute it skips the step and claims keep working.
+
 ## Custom queue-storage schemas
 
 Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and `TRUNCATE`, but never DDL. Check lanes in a custom schema with `awa storage lane-sequences --schema <name>`. See [Queue storage](../queue-storage-substrate.md).

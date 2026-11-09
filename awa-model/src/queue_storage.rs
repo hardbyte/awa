@@ -1473,9 +1473,10 @@ pub fn open_receipt_running_claims_sql(schema: &str) -> String {
 /// [`open_receipt_running_claims_sql`] restricted to the jobs in `job_ids`,
 /// an SQL expression yielding `bigint[]`. The restriction applies before the
 /// closure and materialisation checks. Row-local claims are found through the
-/// `job_id` index. Compact claim batches have no index on `job_ids`, so every
-/// retained batch header is read, but only batches holding one of the jobs
-/// are unnested and checked.
+/// `job_id` index. Compact claim batches are found through `job_ids && {ids}`,
+/// which uses a claim partition's GIN index on `job_ids` where it has one
+/// (see `ensure_claim_batch_job_index_tx`) and otherwise reads every retained
+/// batch header; only batches holding one of the jobs are unnested and checked.
 pub(crate) fn open_receipt_running_claims_sql_for(schema: &str, job_ids: Option<&str>) -> String {
     open_receipt_running_claims_sql_from(schema, job_ids, None)
 }
@@ -1542,20 +1543,20 @@ fn open_receipt_running_claims_sql_from(
         WHERE {batch_filter}NOT (
                   batches.receipt_ranges <@ COALESCE((
                       SELECT range_agg(closed)
-                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      FROM {closure_batch_rel} AS closure_batches
                       CROSS JOIN LATERAL unnest(closure_batches.receipt_ranges) AS closed
                       WHERE closure_batches.claim_slot = batches.claim_slot
                         AND closure_batches.receipt_ranges && batches.receipt_ranges
                   ), '{{}}'::int8multirange)
               )
           AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  SELECT 1 FROM {closure_rel} AS closures
                   WHERE closures.claim_slot = batches.claim_slot
                     AND closures.job_id = items.job_id
                     AND closures.run_lease = items.run_lease
               )
           AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  SELECT 1 FROM {closure_batch_rel} AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
                   -- Keep the range lookup correlated: joining on claim_slot can
@@ -2710,25 +2711,49 @@ struct ReadyRowIdentity {
 }
 
 /// Attempts a rescue pass leaves for a later pass, as `(job_id, run_lease)`.
-struct BusyRetained(Vec<(i64, i64)>);
+struct BusyRetained {
+    attempts: Vec<(i64, i64)>,
+    /// The attempts stay unresolvable until their retained bodies are
+    /// repaired, rather than until a lock is released.
+    unresolvable: bool,
+}
 
 impl BusyRetained {
-    fn exclude(self, excluded: &mut BTreeSet<(i64, i64)>) -> Result<(), AwaError> {
+    fn busy(attempts: Vec<(i64, i64)>) -> Self {
+        Self {
+            attempts,
+            unresolvable: false,
+        }
+    }
+
+    /// Leaves the attempts out of the rest of the pass. Busy attempts shrink
+    /// the pass's selection. Unresolvable attempts are replaced in it, so a
+    /// backlog of them, which every pass meets first, cannot fill each batch
+    /// and keep rescue from the attempts behind it.
+    fn exclude(
+        self,
+        excluded: &mut BTreeSet<(i64, i64)>,
+        selected: &mut Option<BTreeSet<(i64, i64)>>,
+    ) -> Result<(), AwaError> {
         let previous = excluded.len();
-        excluded.extend(self.0);
+        excluded.extend(self.attempts);
         if excluded.len() == previous {
             return Err(AwaError::Validation(
                 "queue storage retained attempt retry made no progress".to_string(),
             ));
         }
+        if self.unresolvable {
+            *selected = None;
+        }
         Ok(())
     }
 }
 
-/// A failure hydrating a deleted lease. `Ambiguous` names an attempt whose
-/// retained ready bodies rank equally, so none can be chosen for it.
+/// A failure hydrating deleted leases. `Ambiguous` names the attempts, as
+/// `(job_id, run_lease)`, whose retained ready bodies rank equally, so none
+/// can be chosen for them.
 enum HydrateError {
-    Ambiguous { job_id: i64, run_lease: i64 },
+    Ambiguous(Vec<(i64, i64)>),
     Awa(AwaError),
 }
 
@@ -2741,9 +2766,16 @@ impl From<AwaError> for HydrateError {
 impl From<HydrateError> for AwaError {
     fn from(err: HydrateError) -> Self {
         match err {
-            HydrateError::Ambiguous { job_id, run_lease } => AwaError::Validation(format!(
-                "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
-            )),
+            HydrateError::Ambiguous(attempts) => AwaError::Validation(match attempts.as_slice() {
+                [] => "queue storage ready body ambiguous for deleted lease".to_string(),
+                [(job_id, run_lease)] => format!(
+                    "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
+                ),
+                [(job_id, run_lease), rest @ ..] => format!(
+                    "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease} and {} more",
+                    rest.len()
+                ),
+            }),
             HydrateError::Awa(err) => err,
         }
     }
@@ -3113,6 +3145,64 @@ mod ready_segment_tests {
         }
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
+        use super::{QueueStorageConfig, RuntimeReadyRow};
+        use crate::audited_sql;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: "awa_qs_segment_bind_limit".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store.install(&pool).await.unwrap();
+
+        // Distinct microsecond timestamps guarantee one segment per row.
+        // Reading the clock for every row can coalesce adjacent timestamps
+        // and fail to exercise the old 8,191-segment bind limit.
+        const JOBS: i64 = 9_000;
+        let first_run_at = Utc::now() - Duration::seconds(1);
+        let rows = (0..JOBS)
+            .map(|seq| RuntimeReadyRow {
+                job_id: None,
+                kind: "segment_test".into(),
+                queue: "segment-q".into(),
+                args: serde_json::json!({"seq": seq}),
+                priority: 2,
+                attempt: 0,
+                run_lease: 0,
+                max_attempts: 25,
+                run_at: first_run_at + Duration::microseconds(seq),
+                attempted_at: None,
+                created_at: first_run_at,
+                unique_key: None,
+                unique_states: None,
+                payload: serde_json::json!({}),
+                ordering_key: None,
+            })
+            .collect();
+        assert_eq!(
+            store.enqueue_runtime_rows(&pool, rows).await.unwrap(),
+            JOBS as usize
+        );
+        let counts: (i64, i64) = sqlx::query_as(audited_sql(format!(
+            "SELECT (SELECT count(*) FROM {}.ready_entries), \
+                    (SELECT count(*) FROM {}.ready_segments)",
+            store.schema(),
+            store.schema()
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (JOBS, JOBS));
+        let claimed = store
+            .claim_runtime_batch(&pool, "segment-q", 100, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 100);
+    }
+
     #[test]
     fn ready_segments_split_on_run_at_boundaries() {
         let first = Utc
@@ -3457,10 +3547,10 @@ fn select_claimed_ready_body<'a>(
     let mut best = candidates.iter().filter(|row| rank(row) == strongest);
     let ready = best.next().expect("ready body rank has a candidate");
     if best.next().is_some() {
-        return Err(HydrateError::Ambiguous {
-            job_id: reference.job_id,
-            run_lease: reference.run_lease,
-        });
+        return Err(HydrateError::Ambiguous(vec![(
+            reference.job_id,
+            reference.run_lease,
+        )]));
     }
     Ok((ready, has_emitted))
 }
@@ -9975,7 +10065,8 @@ impl QueueStorage {
                 JOIN refs
                   ON refs.job_id = items.job_id
                  AND refs.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -10314,7 +10405,8 @@ impl QueueStorage {
                 claim_batches.attempts,
                 claim_batches.max_attempts
             ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-            WHERE items.job_id = $1
+            WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
+              AND items.job_id = $1
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -12258,7 +12350,8 @@ impl QueueStorage {
                 JOIN inflight
                   ON inflight.job_id = items.job_id
                  AND inflight.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -12444,7 +12537,8 @@ impl QueueStorage {
                 JOIN inflight
                   ON inflight.job_id = items.job_id
                  AND inflight.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -12561,7 +12655,8 @@ impl QueueStorage {
                 JOIN inflight
                   ON inflight.job_id = items.job_id
                  AND inflight.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -12874,14 +12969,19 @@ impl QueueStorage {
         match hydrated {
             Ok(hydrated) => Ok(hydrated),
             // One unresolvable attempt must not stop the rescue of the others.
-            Err(HydrateError::Ambiguous { job_id, run_lease }) => {
-                tracing::error!(
-                    schema = self.schema(),
-                    job_id,
-                    run_lease,
-                    "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
-                );
-                Ok(Err(BusyRetained(vec![(job_id, run_lease)])))
+            Err(HydrateError::Ambiguous(attempts)) => {
+                for (job_id, run_lease) in &attempts {
+                    tracing::error!(
+                        schema = self.schema(),
+                        job_id,
+                        run_lease,
+                        "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
+                    );
+                }
+                Ok(Err(BusyRetained {
+                    attempts,
+                    unresolvable: true,
+                }))
             }
             Err(HydrateError::Awa(err)) => Err(err),
         }
@@ -12902,6 +13002,33 @@ impl QueueStorage {
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
         let (ready_map, claimed_lanes) =
             self.load_ready_snapshot_candidates_tx(tx, &deleted).await?;
+        // Report every ambiguous attempt at once, before any write, so a
+        // caller that sets them aside needs one retry for all of them.
+        let ambiguous: Vec<(i64, i64)> = deleted
+            .iter()
+            .filter(|row| {
+                ready_map
+                    .get(&(
+                        row.ready_slot,
+                        row.ready_generation,
+                        row.queue.clone(),
+                        row.enqueue_shard,
+                        row.lane_seq,
+                        row.job_id,
+                        row.run_lease,
+                    ))
+                    .is_some_and(|candidates| {
+                        matches!(
+                            select_claimed_ready_body(candidates, &claimed_lanes, row),
+                            Err(HydrateError::Ambiguous(_))
+                        )
+                    })
+            })
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        if !ambiguous.is_empty() {
+            return Err(HydrateError::Ambiguous(ambiguous));
+        }
 
         let attempt_rows: Vec<AttemptStateRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -12980,7 +13107,8 @@ impl QueueStorage {
                 JOIN refs
                   ON refs.job_id = items.job_id
                  AND refs.run_lease = items.run_lease
-                WHERE NOT EXISTS (
+                WHERE claim_batches.job_ids && $1::bigint[]
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
                       WHERE closures.claim_slot = claim_batches.claim_slot
@@ -13158,10 +13286,10 @@ impl QueueStorage {
                 .insert((source.job_id, source.run_lease), source)
                 .is_some()
             {
-                return Err(HydrateError::Ambiguous {
-                    job_id: source.job_id,
-                    run_lease: source.run_lease + 1,
-                });
+                return Err(HydrateError::Ambiguous(vec![(
+                    source.job_id,
+                    source.run_lease + 1,
+                )]));
             }
         }
         let job_ids: Vec<i64> = sources.iter().map(|row| row.job_id).collect();
@@ -13209,7 +13337,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
             if !busy.is_empty() {
-                return Ok(Some(BusyRetained(busy)));
+                return Ok(Some(BusyRetained::busy(busy)));
             }
         } else {
             self.lock_claim_heads_of_jobs_with_wait_tx(tx, &job_ids, true)
@@ -13294,10 +13422,10 @@ impl QueueStorage {
         for row in &emitted {
             let key = (row.job_id, row.run_lease);
             if !seen.insert(key) || expected.get(&key).copied() != Some(row) {
-                return Err(HydrateError::Ambiguous {
-                    job_id: row.job_id,
-                    run_lease: row.run_lease + 1,
-                });
+                return Err(HydrateError::Ambiguous(vec![(
+                    row.job_id,
+                    row.run_lease + 1,
+                )]));
             }
         }
         sqlx::query(audited_sql(format!(
@@ -13578,7 +13706,8 @@ impl QueueStorage {
                     claim_batches.attempts,
                     claim_batches.max_attempts
                 ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-                WHERE items.job_id = $1
+                WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
+                  AND items.job_id = $1
                   AND items.run_lease = $2
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.lease_claim_closures AS closures
@@ -15509,7 +15638,8 @@ impl QueueStorage {
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
-            WHERE items.job_id = $1
+            WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
+              AND items.job_id = $1
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -18318,7 +18448,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -18329,7 +18459,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -18489,7 +18619,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -18501,7 +18631,7 @@ impl QueueStorage {
                     Ok(moved) => moved,
                     Err(busy) => {
                         attempt.rollback().await.map_err(map_sqlx_error)?;
-                        busy.exclude(&mut excluded)?;
+                        busy.exclude(&mut excluded, &mut selected)?;
                         continue;
                     }
                 },
@@ -18627,7 +18757,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -21106,6 +21236,7 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             let truncate_duration = truncate_started.elapsed();
+            self.ensure_claim_batch_job_index_tx(&mut tx, slot).await?;
             sqlx::query(audited_sql(format!(
                 r#"
                 UPDATE {schema}.claim_ring_slots
@@ -21144,6 +21275,84 @@ impl QueueStorage {
             durations.commit = commit_started.elapsed();
         }
         Ok(outcome)
+    }
+
+    /// Give `lease_claim_batches_<slot>` its GIN index on `job_ids` through
+    /// `{schema}.ensure_claim_batch_job_index`. Claim prune calls this right
+    /// after truncating the slot, while it holds the partition's
+    /// `ACCESS EXCLUSIVE` lock, so the build covers an empty table and waits
+    /// on nobody. A schema without the function or a role that may not
+    /// execute it skips the step. An error inside the function is rolled back
+    /// to a savepoint and logged; it never undoes the prune.
+    async fn ensure_claim_batch_job_index_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        slot: i32,
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        let callable: bool = sqlx::query_scalar(
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), false)",
+        )
+        .bind(format!("{schema}.ensure_claim_batch_job_index(integer)"))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if !callable {
+            tracing::debug!(
+                schema,
+                slot,
+                "Claim batch job index function is absent or not executable; skipping"
+            );
+            return Ok(());
+        }
+
+        sqlx::query("SAVEPOINT awa_claim_batch_job_index")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let indexed: Result<bool, sqlx::Error> = sqlx::query_scalar(audited_sql(format!(
+            "SELECT {schema}.ensure_claim_batch_job_index($1)"
+        )))
+        .bind(slot)
+        .fetch_one(tx.as_mut())
+        .await;
+        match indexed {
+            Ok(indexed) => {
+                sqlx::query("RELEASE SAVEPOINT awa_claim_batch_job_index")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                if !indexed {
+                    tracing::debug!(schema, slot, "Claim batch partition was not indexed");
+                }
+            }
+            Err(sqlx::Error::Database(db_err)) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_claim_batch_job_index")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                let code = db_err.code().map(|code| code.into_owned());
+                if matches!(code.as_deref(), Some("42883" | "42501")) {
+                    tracing::debug!(
+                        schema,
+                        slot,
+                        code = code.as_deref().unwrap_or_default(),
+                        error = %db_err.message(),
+                        "Claim batch job index function unavailable; skipping"
+                    );
+                } else {
+                    tracing::warn!(
+                        schema,
+                        slot,
+                        code = code.as_deref().unwrap_or_default(),
+                        error = %db_err.message(),
+                        "Could not index claim batch partition by job id"
+                    );
+                }
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        }
+        Ok(())
     }
 
     fn job_id_sequence(&self) -> String {

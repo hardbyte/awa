@@ -433,20 +433,21 @@ impl JobExecutor {
                 progress_state.clone(),
             );
 
+            let mut started_event = None;
             let result = match workers.get(&job.kind) {
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
                         let started_job = crate::output::without_outputs(&job).into_owned();
-                        tokio::spawn(async move {
+                        started_event = Some(tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
                                 &started_kind,
                                 UntypedJobEvent::Started { job: started_job },
                             )
                             .await;
-                        });
+                        }));
                     }
                     let perform = CatchUnwind(worker.perform(&ctx));
                     let outcome = match abandon_after {
@@ -521,8 +522,9 @@ impl JobExecutor {
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
-                    permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
+                    biased;
                     _ = finalize_cancel.cancelled() => None,
+                    permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
                 },
                 None => None,
             };
@@ -773,13 +775,22 @@ storage.queue_storage().is_some(),
                         },
                     };
                     drop(heartbeat_guard);
-                    drop(finalize_permit);
-                    if let Some(event) = event {
-                        tokio::select! {
-                            _ = dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event) => {},
-                            _ = finalize_cancel.cancelled() => {},
+                    // Lifecycle hooks run under the finalizer permit, so a hook
+                    // slower than job throughput holds back claiming instead of
+                    // accumulating tasks that each retain a copy of the job.
+                    let hooks = async {
+                        if let Some(started_event) = started_event {
+                            let _ = started_event.await;
                         }
+                        if let Some(event) = event {
+                            dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = hooks => {},
+                        _ = finalize_cancel.cancelled() => {},
                     }
+                    drop(finalize_permit);
                 }
                 .in_current_span(),
             );
@@ -2053,6 +2064,17 @@ fn rescheduled_event_row(
     row
 }
 
+/// The job as a read returns it after this attempt completes.
+fn completed_event_row(job: &JobRow) -> JobRow {
+    let mut row = job.clone();
+    row.state = JobState::Completed;
+    row.finalized_at = Some(chrono::Utc::now());
+    row.progress = None;
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_job_queue_storage(
     runtime: &QueueStorageRuntime,
@@ -2158,16 +2180,11 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                // A completed attempt changes only these fields, so the event is
-                // built from the worker's copy, which carries the sealed output,
-                // rather than re-reading the job.
-                let mut updated_job = job.clone();
-                updated_job.state = JobState::Completed;
-                updated_job.finalized_at = Some(chrono::Utc::now());
-                updated_job.progress = None;
+                // The event is built from the worker's copy, which carries the
+                // sealed output, rather than re-reading the job.
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
-                        job: updated_job,
+                        job: completed_event_row(job),
                         duration,
                     }),
                     terminal: false,
@@ -2704,12 +2721,7 @@ async fn complete_queue_storage_with_followups(
 
     // Synthesise the post-completion snapshot — the store has just moved the
     // lease into `done_entries` so a live SELECT would race with rotation.
-    // The happy-path fields are exactly those `complete_job_queue_storage`
-    // reconstructs when `load_job` returns None.
-    let mut updated_job = job.clone();
-    updated_job.state = JobState::Completed;
-    updated_job.finalized_at = Some(chrono::Utc::now());
-    updated_job.progress = None;
+    let updated_job = completed_event_row(job);
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
     let staged =
@@ -4571,7 +4583,7 @@ false,
     }
 
     #[sqlx::test(migrations = false)]
-    async fn pending_outcome_hook_does_not_hold_durable_finalizer_capacity(pool: PgPool) {
+    async fn pending_outcome_hook_holds_finalizer_capacity(pool: PgPool) {
         let _database_guard = RECONNECT_DB_LOCK.lock().await;
         awa_model::migrations::run(&pool).await.unwrap();
         let first = running_reconnect_job(&pool).await;
@@ -4609,9 +4621,10 @@ false,
             RuntimeStorage::Canonical,
             1,
         );
+        let runs = Arc::new(AtomicU32::new(0));
         let workers: HashMap<String, BoxedWorker> = HashMap::from([(
             "reconnect_parent".into(),
-            Box::new(ReconnectWorker(Arc::new(AtomicU32::new(0)))) as BoxedWorker,
+            Box::new(ReconnectWorker(runs.clone())) as BoxedWorker,
         )]);
         let mut executor = JobExecutor::new(
             pool.clone(),
@@ -4642,15 +4655,29 @@ false,
         tokio::time::timeout(Duration::from_secs(2), hook_started.notified())
             .await
             .expect("first durable finalize must reach its outcome hook");
-        tokio::time::timeout(
-            Duration::from_secs(2),
+        let second_task = tokio::spawn(
             executor.execute_task(dispatched(second), Arc::new(AtomicBool::new(false))),
-        )
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runs.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("pending outcome hook must not consume the only finalize permit");
+        .expect("the second handler runs while the first hook is pending");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_task.is_finished(),
+            "a pending outcome hook must keep the only finalize permit"
+        );
+        release_hook.cancel();
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("the second attempt takes the permit once the hook returns")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), second_completed.notified())
             .await
-            .expect("second durable finalize must finish while the first hook is pending");
+            .expect("second durable finalize must finish after the first hook returns");
         let states: Vec<String> =
             sqlx::query_scalar("SELECT state::text FROM awa.jobs_hot WHERE id = ANY($1)")
                 .bind([first_id, second_id].as_slice())
@@ -4659,7 +4686,6 @@ false,
                 .unwrap();
         assert_eq!(states.len(), 2);
         assert!(states.iter().all(|state| state == "completed"));
-        release_hook.cancel();
         finalizers.close();
         tokio::time::timeout(Duration::from_secs(2), finalizers.wait())
             .await
