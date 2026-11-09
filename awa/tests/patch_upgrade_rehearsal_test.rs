@@ -754,7 +754,11 @@ async fn released_patch_upgrade_and_rollback() {
             .unwrap();
         assert_eq!(
             pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-            ["claim_batch_job_index", "insert_jobs_compat_batch", "prune_controls"],
+            [
+                "claim_batch_job_index",
+                "insert_jobs_compat_batch",
+                "prune_controls"
+            ],
             "a released 0.6.15 deployment needs the claim batch index fix, the bounded-wait \
              batch function and prune controls"
         );

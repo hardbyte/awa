@@ -1000,7 +1000,7 @@ async fn multi_statement_producer_and_batch_in_opposite_lane_order_do_not_deadlo
     }
 }
 
-/// The caller's `lock_timeout` bounds the whole batch insert: a lane held
+/// The caller's `lock_timeout` still ends a batch's lock wait: a lane held
 /// throughout fails it with `lock_not_available`, as it fails a per-row
 /// insert, and the batch leaves its unique claims behind.
 #[tokio::test]
@@ -1442,4 +1442,125 @@ async fn large_batch_gives_way_while_its_claims_fit_the_wait_budget() {
              batch {batch_outcome:?}"
         );
     }
+}
+
+/// The caller's `lock_timeout` applies to each lock wait, as it does in any
+/// statement, not to the whole call: a batch whose own work before its lane
+/// wait takes longer than the caller's `lock_timeout` still lands when the
+/// lane is released within that timeout once it starts waiting.
+#[tokio::test]
+async fn callers_lock_timeout_applies_to_each_wait() {
+    const ROWS: i64 = 10_000;
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("caller_wait");
+    insert_many(&pool, &[job(&queue, -1, false)])
+        .await
+        .expect("provision lane");
+
+    let key = lane_lock_key(&pool, &queue).await;
+    let mut gate = pool.begin().await.expect("begin gate");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *gate)
+        .await
+        .expect("take lane lock");
+
+    let jobs: Vec<InsertParams> = (0..ROWS).map(|seq| job(&queue, seq, true)).collect();
+    let batch = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET LOCAL lock_timeout = '100ms'")
+                .execute(&mut *tx)
+                .await?;
+            let started = Instant::now();
+            let inserted = insert_many_skip_unique_conflicts(&mut *tx, &jobs).await?;
+            let elapsed = started.elapsed();
+            tx.commit().await?;
+            Ok::<_, AwaError>((inserted.len(), elapsed))
+        })
+    };
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+             WHERE locktype = 'advisory' AND NOT granted
+               AND ((classid::bigint << 32) | objid::bigint) = $1)",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .expect("poll pg_locks");
+        if waiting || batch.is_finished() {
+            break;
+        }
+        assert!(started.elapsed() < WAIT_DEADLINE, "batch never waited");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    gate.commit().await.expect("release lane lock");
+
+    let (inserted, elapsed) = tokio::time::timeout(WAIT_DEADLINE, batch)
+        .await
+        .expect("batch finished")
+        .expect("batch task")
+        .expect("batch with a 100 ms lock_timeout");
+    assert_eq!(inserted as i64, ROWS);
+    assert!(
+        elapsed > Duration::from_millis(100),
+        "the batch's own work outlasts the caller's lock_timeout ({elapsed:?})"
+    );
+}
+
+/// The documented limit of the bounded phase: a per-row producer that holds a
+/// lane for longer than the batch's retries (about 2 s), and only then inserts
+/// a key the batch has claimed, meets the batch's ordinary last attempt. The
+/// cycle then ends as in 0.6.15, with one side aborted by `deadlock detected`.
+#[tokio::test]
+async fn per_row_producer_holding_a_lane_past_the_bounded_phase_meets_an_ordinary_wait() {
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("long_hold");
+    insert_many(&pool, &[job(&queue, -1, false)])
+        .await
+        .expect("provision lane");
+
+    let mut per_row = pool.begin().await.expect("begin per-row producer");
+    insert_many(&mut *per_row, &[job(&queue, 100, false)])
+        .await
+        .expect("per-row insert takes the lane");
+    let batch = {
+        let pool = pool.clone();
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            insert_many_skip_unique_conflicts(&pool, &[job(&queue, 0, true)]).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let per_row_outcome = tokio::time::timeout(WAIT_DEADLINE, async {
+        insert_many(&mut *per_row, &[job(&queue, 0, true)]).await?;
+        per_row.commit().await?;
+        Ok::<_, AwaError>(())
+    })
+    .await
+    .expect("the per-row producer's side of the cycle ended");
+    let batch_outcome = tokio::time::timeout(WAIT_DEADLINE, batch)
+        .await
+        .expect("the batch's side of the cycle ended")
+        .expect("batch task");
+    let aborted = [
+        per_row_outcome
+            .as_ref()
+            .err()
+            .is_some_and(AwaError::is_deadlock),
+        batch_outcome
+            .as_ref()
+            .err()
+            .is_some_and(AwaError::is_deadlock),
+    ];
+    assert_eq!(
+        aborted.iter().filter(|aborted| **aborted).count(),
+        1,
+        "exactly one side is aborted: per-row {per_row_outcome:?}, batch {batch_outcome:?}"
+    );
 }
