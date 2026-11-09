@@ -2,6 +2,7 @@ use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
+use crate::read_transaction::{read_until_untruncated, PartitionFingerprint};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -1466,6 +1467,77 @@ async fn fetch_queue_storage_job_candidates(
     Ok(ids)
 }
 
+/// Candidate ids for one page of [`list_jobs`], read from one snapshot, and
+/// whether no ring partition was truncated while that snapshot was in use.
+async fn queue_storage_job_candidate_ids(
+    store: &QueueStorage,
+    pool: &PgPool,
+    filter: &ListJobsFilter,
+    cursor: Option<i64>,
+    candidate_limit: i64,
+) -> Result<(BTreeSet<i64>, bool), AwaError> {
+    // Every candidate phase sees the same MVCC snapshot. Each phase
+    // releases its own read locks before the next one opens more tables.
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+    let fingerprint =
+        PartitionFingerprint::read(&mut begin_guard.connection, store.schema()).await?;
+    let mut tx = sqlx::Connection::begin_with(
+        &mut *begin_guard.connection,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .await?;
+    begin_guard.begin_pending = false;
+    sqlx::query("SET LOCAL jit = off")
+        .execute(tx.as_mut())
+        .await?;
+    let states = filter.state.map_or_else(
+        || {
+            vec![
+                JobState::Available,
+                JobState::Scheduled,
+                JobState::Retryable,
+                JobState::Running,
+                JobState::WaitingExternal,
+                JobState::Completed,
+                JobState::Failed,
+                JobState::Cancelled,
+            ]
+        },
+        |state| vec![state],
+    );
+    let mut ids = BTreeSet::new();
+    for state in states {
+        let mut phase_filter = filter.clone();
+        phase_filter.state = Some(state);
+        let (sql, binds) = queue_storage_job_id_candidates_sql(
+            store.schema(),
+            &phase_filter,
+            cursor,
+            candidate_limit,
+            JobCandidateSource::States,
+        );
+        ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
+    }
+    if filter.state.is_none_or(|state| state == JobState::Running) {
+        for slot in queue_storage_populated_claim_slots(&mut tx, store).await? {
+            let (sql, binds) = queue_storage_job_id_candidates_sql(
+                store.schema(),
+                filter,
+                cursor,
+                candidate_limit,
+                JobCandidateSource::Receipts(slot),
+            );
+            ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
+        }
+    }
+    tx.commit().await?;
+    let untruncated = fingerprint
+        .unchanged(&mut begin_guard.connection, store.schema())
+        .await?;
+    drop(begin_guard);
+    Ok((ids, untruncated))
+}
+
 async fn list_queue_storage_jobs(
     store: &QueueStorage,
     pool: &PgPool,
@@ -1482,60 +1554,10 @@ async fn list_queue_storage_jobs(
     let mut cursor = filter.before_id;
 
     loop {
-        // Every candidate phase sees the same MVCC snapshot. Each phase
-        // releases its own read locks before the next one opens more tables.
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin_with(
-            &mut *begin_guard.connection,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        )
+        let ids = read_until_untruncated(|| {
+            queue_storage_job_candidate_ids(store, pool, filter, cursor, candidate_limit)
+        })
         .await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        let states = filter.state.map_or_else(
-            || {
-                vec![
-                    JobState::Available,
-                    JobState::Scheduled,
-                    JobState::Retryable,
-                    JobState::Running,
-                    JobState::WaitingExternal,
-                    JobState::Completed,
-                    JobState::Failed,
-                    JobState::Cancelled,
-                ]
-            },
-            |state| vec![state],
-        );
-        let mut ids = BTreeSet::new();
-        for state in states {
-            let mut phase_filter = filter.clone();
-            phase_filter.state = Some(state);
-            let (sql, binds) = queue_storage_job_id_candidates_sql(
-                store.schema(),
-                &phase_filter,
-                cursor,
-                candidate_limit,
-                JobCandidateSource::States,
-            );
-            ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
-        }
-        if filter.state.is_none_or(|state| state == JobState::Running) {
-            for slot in queue_storage_populated_claim_slots(&mut tx, store).await? {
-                let (sql, binds) = queue_storage_job_id_candidates_sql(
-                    store.schema(),
-                    filter,
-                    cursor,
-                    candidate_limit,
-                    JobCandidateSource::Receipts(slot),
-                );
-                ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
-            }
-        }
-        tx.commit().await?;
-        drop(begin_guard);
         let ids: Vec<i64> = ids
             .into_iter()
             .rev()
@@ -3443,7 +3465,11 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
 
         // JIT compiles this statement for longer than it runs.
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL READ COMMITTED",
+        )
+        .await?;
         begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
@@ -3924,7 +3950,11 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
         ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
             // As in `queue_overviews`: compiling costs more than running.
             let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-            let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+            let mut tx = sqlx::Connection::begin_with(
+                &mut *begin_guard.connection,
+                "BEGIN ISOLATION LEVEL READ COMMITTED",
+            )
+            .await?;
             begin_guard.begin_pending = false;
             sqlx::query("SET LOCAL jit = off")
                 .execute(tx.as_mut())
@@ -4157,6 +4187,59 @@ async fn queue_storage_running_kind_counts(
     Ok(counts)
 }
 
+/// Kind overviews read from one snapshot, and whether no ring partition was
+/// truncated while that snapshot was in use.
+async fn queue_storage_job_kind_overviews(
+    store: &QueueStorage,
+    pool: &PgPool,
+    sql: &str,
+) -> Result<(Vec<JobKindOverview>, bool), AwaError> {
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+    let fingerprint =
+        PartitionFingerprint::read(&mut begin_guard.connection, store.schema()).await?;
+    let mut tx = sqlx::Connection::begin_with(
+        &mut *begin_guard.connection,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .await?;
+    begin_guard.begin_pending = false;
+    // As in `queue_overviews`: compiling costs more than running.
+    sqlx::query("SET LOCAL jit = off")
+        .execute(tx.as_mut())
+        .await?;
+    let heads = queue_storage_kind_heads(&mut tx, store).await?;
+    let mut sources = queue_storage_base_kind_counts(&mut tx, store, heads).await?;
+    sources.extend(
+        queue_storage_running_kind_counts(&mut tx, store)
+            .await?
+            .into_iter()
+            .map(|(kind, queue, n)| (kind, queue, n, 0)),
+    );
+    let mut kinds = Vec::with_capacity(sources.len());
+    let mut queues = Vec::with_capacity(sources.len());
+    let mut counts = Vec::with_capacity(sources.len());
+    let mut recent_counts = Vec::with_capacity(sources.len());
+    for (kind, queue, count, recent) in sources {
+        kinds.push(kind);
+        queues.push(queue);
+        counts.push(count);
+        recent_counts.push(recent);
+    }
+    let rows = sqlx::query_as::<_, JobKindOverview>(sql)
+        .bind(kinds)
+        .bind(queues)
+        .bind(counts)
+        .bind(recent_counts)
+        .fetch_all(tx.as_mut())
+        .await?;
+    tx.commit().await?;
+    let untruncated = fingerprint
+        .unchanged(&mut begin_guard.connection, store.schema())
+        .await?;
+    drop(begin_guard);
+    Ok((rows, untruncated))
+}
+
 /// Get job-kind overviews for all known kinds.
 pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
@@ -4211,45 +4294,8 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             kind_counts_cte = queue_storage_kind_counts_cte()
         );
 
-        // As in `queue_overviews`: compiling costs more than running.
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin_with(
-            &mut *begin_guard.connection,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        )
-        .await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        let heads = queue_storage_kind_heads(&mut tx, &store).await?;
-        let mut sources = queue_storage_base_kind_counts(&mut tx, &store, heads).await?;
-        sources.extend(
-            queue_storage_running_kind_counts(&mut tx, &store)
-                .await?
-                .into_iter()
-                .map(|(kind, queue, n)| (kind, queue, n, 0)),
-        );
-        let mut kinds = Vec::with_capacity(sources.len());
-        let mut queues = Vec::with_capacity(sources.len());
-        let mut counts = Vec::with_capacity(sources.len());
-        let mut recent_counts = Vec::with_capacity(sources.len());
-        for (kind, queue, count, recent) in sources {
-            kinds.push(kind);
-            queues.push(queue);
-            counts.push(count);
-            recent_counts.push(recent);
-        }
-        let rows = sqlx::query_as::<_, JobKindOverview>(&sql)
-            .bind(kinds)
-            .bind(queues)
-            .bind(counts)
-            .bind(recent_counts)
-            .fetch_all(tx.as_mut())
-            .await?;
-        tx.commit().await?;
-        drop(begin_guard);
-        return Ok(rows);
+        return read_until_untruncated(|| queue_storage_job_kind_overviews(&store, pool, &sql))
+            .await;
     }
 
     let rows = sqlx::query_as::<_, JobKindOverview>(
@@ -4528,7 +4574,11 @@ pub async fn state_timeseries(
             queue_storage_recent_jobs_cte(store.schema(), "$1")
         );
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL READ COMMITTED",
+        )
+        .await?;
         begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
