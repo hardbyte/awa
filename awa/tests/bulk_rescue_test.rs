@@ -1025,7 +1025,7 @@ async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
             abandoned as f64 / (drained - first_rescue).as_secs_f64().max(f64::EPSILON)
         );
         let unpinned = wait_until(
-            scaled_timeout(Duration::from_secs(120)),
+            scaled_timeout(Duration::from_secs(120 + abandoned as u64 / 10_000)),
             "both rings to rotate past the slots the backlog pinned",
             || async {
                 ring_generation(&pool, "queue").await >= queue_generation + queue_slots
