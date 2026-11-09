@@ -970,7 +970,10 @@ mod tests {
             .next()
             .unwrap();
         // Every select arm except cancellation must register and gate its work.
-        let selected = leader.matches("\n                        _ = ").count();
+        let selected = leader.matches("\n                        _ = ").count()
+            + leader
+                .matches("\n                        origin = ")
+                .count();
         assert_eq!(
             selected,
             leader.matches("branch_tracker.try_begin").count() + 2
