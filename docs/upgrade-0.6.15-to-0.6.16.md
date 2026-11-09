@@ -12,7 +12,7 @@
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
    ```
 
-   The schema stays at v40. The repeatable `prune_controls` patch runs after `claim_batch_job_index` and `insert_jobs_compat_batch`.
+   The schema stays at v40. The output reports `Schema patch claim_batch_job_index: applied` and `Schema patch prune_controls: applied`.
 
 3. Apply the [runtime and operator grants](runtime-controls.md#install). Runtime roles need `SELECT` on `awa.runtime_controls` and `SELECT, INSERT, UPDATE, DELETE` on `awa.runtime_control_observations`. Operators need `SELECT` on both tables and `awa.runtime_instances`, plus explicit `EXECUTE` on `awa.halt_runtime_scope(text, text, text)` and `awa.resume_runtime_scope(text, uuid)`. Neither role should have direct control-table writes. Reapply these exceptions after blanket grants and remove inherited mutation privileges from the granting role.
 4. Roll workers, producers and admin processes to 0.6.16 after applying the grants. Compatible runtimes discover the patch without a restart or leadership change. They can also run before installation, retaining the existing reclamation policy while catalog observations remain fresh. Once they detect installation, missing read grants close prune admission when any existing permission expires, within five seconds; newly started runtimes have no permission to prune. Other scopes continue. If compatible runtimes are already deployed, expect this pause between migration and grants, and complete the grants before expecting pruning to resume.
@@ -20,13 +20,25 @@
 
 The 0.6.15 lifecycle-hook and finalizer bounds remain in place. Ring defaults, startup capacity checks and reclamation rate limits are unchanged.
 
+## New queue lanes during the roll
+
+When `QueueStorage` is the first to use a `(queue, priority)` lane, through a batch enqueue or a worker promoting scheduled or retried jobs, 0.6.16 writes the lane's `queue_lanes` row before taking its provisioning lock, the order SQL inserts already use. 0.6.15 takes them the other way round. Until every `QueueStorage` process runs 0.6.16, a 0.6.15 one and any other producer that are both first to use the same lane can still deadlock, and one transaction fails with `40P01`. Lanes that already exist are unaffected. To avoid it during the roll, create the lanes of a queue or priority before traffic first reaches it, with the 0.6.16 `awa storage prepare-queue`, or retry the failed transaction.
+
 ## What the migration changes
+
+### `claim_batch_job_index`
+
+0.6.16 replaces the 0.6.15 `<schema>.ensure_claim_batch_job_index(slot)`, so `awa migrate` applies this patch again. The 0.6.15 function counted a partial GIN index on `job_ids` as the claim batch index, and also any index already holding the index's name, so claim prune could skip building the real one. The new function accepts only a valid, non-partial GIN index on `job_ids`. When something else already has the name `lease_claim_batches_<slot>_job_ids_idx`, it raises a warning naming it and leaves it in place; drop or rename it and claim prune builds the index the next time it empties that slot.
+
+As in 0.6.15 the patch replaces functions only: it builds no index and takes no lock on any `awa` or queue-storage table. Binaries from 0.6.15 call the new function unchanged.
+
+### `prune_controls`
 
 The patch creates `awa.runtime_controls` and `awa.runtime_control_observations` as ordinary tables, plus functions. The observation table has `instance_id uuid PRIMARY KEY` and `observation jsonb NOT NULL`, with no foreign key. It does not alter `awa.runtime_instances` or any other existing table, refresh the `v023` substrate installer or claim functions, or change storage routing.
 
 The observation JSON includes protocol version `1`, report sequence and server `received_at`; publishing keeps the latest sequence for each instance. Re-running the patch preserves the current halt and explicit operator grants. An interrupted migration can be run again.
 
-For an external migration runner, apply `R__prune_controls.sql` after `V40` and the existing `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql` patches. Extract the full repeatable set with:
+For an external migration runner, apply the new `R__claim_batch_job_index.sql` again, then `R__prune_controls.sql`, after `V40` and the existing `R__insert_jobs_compat_batch.sql` patch. Extract the full repeatable set with:
 
 ```bash
 awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --extract-to ./sql/awa --from 40
@@ -61,4 +73,4 @@ A `halted` status is not proof that PostgreSQL released every lock or that stale
 
 ## Roll back
 
-Before rolling back to 0.6.15, fence processes that could prune or explicitly accept losing the halt guarantee: 0.6.15 ignores the control, even when a halt remains stored. Leave the patch installed; its new tables and functions are safe for older binaries, and replay does not resume the fleet.
+Before rolling back to 0.6.15, fence processes that could prune or explicitly accept losing the halt guarantee: 0.6.15 ignores the control, even when a halt remains stored. Leave the patches installed; the `prune_controls` tables and functions are safe for older binaries, and replay does not resume the fleet. 0.6.15 binaries call the new `ensure_claim_batch_job_index` unchanged, and a 0.6.15 `awa migrate` leaves it in place.
