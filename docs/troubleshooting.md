@@ -88,7 +88,7 @@ Interpretation:
 
 ### Transient Admin Reads During Partition Pruning
 
-In 0.6, a job-detail read, including list-item hydration, uses several queries within one snapshot. It retains read locks on the located ready body, but does not lock all ring partitions before establishing that snapshot. Prune can truncate a ready partition before its body is located, or a lease or claim partition before that read phase reaches it. A completed job can then briefly appear available or missing. Retry with a fresh read before treating that result as missing durable work. Filtering tombstoned source rows after a queue or priority move does not close these separate windows.
+In 0.6, a job-detail read, including list-item hydration, uses several queries within one snapshot. It retains read locks on the located ready body, but does not lock all ring partitions before establishing that snapshot. Prune can truncate a ready partition before its body is located, or a lease or claim partition before that read phase reaches it. A completed job can then briefly appear available or missing. A read of one job that finds nothing, including each item a list hydrates, reads once more in a new snapshot (from 0.6.16), so a job whose row prune moved to the live slot after the first snapshot was taken is found rather than reported as `JobNotFound`. A job that appears in an earlier state can still be stale; retry with a fresh read before acting on it. Filtering tombstoned source rows after a queue or priority move does not close these separate windows.
 
 ### Failed Jobs Rescued After Priority Aging
 

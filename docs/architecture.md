@@ -200,6 +200,8 @@ Awa has three rescue paths:
 - **Hard deadline rescue.** Per-queue deadlines write `deadline_at` onto row-local receipt claims or lease rows. The maintenance leader closes expired attempts and routes them through the normal retry/fail/DLQ path.
 - **Callback-timeout rescue.** Waiting attempts with expired callback timeouts are moved back through the same guarded finalization machinery.
 
+On queue storage each rescue runs as a pass of 500-attempt batches, each in its own short transaction, oldest claim slot first. A pass stops when a batch comes back short, after `rescue_pass_budget` or once it has rescued `rescue_pass_max_rows`, and while a backlog remains the next pass runs a second later, so the open claims a killed runtime leaves behind stop pinning the queue and claim rings within minutes. Stale-heartbeat passes take more than one batch only once runtime snapshots show the claims' owners gone; deadline and callback passes need no such evidence. See [draining a backlog of abandoned claims](configuration.md#rescue-backlog).
+
 Rescue closes the old attempt before making work available again. If the old handler later writes a completion, the `run_lease` guard rejects it as stale. When rescue happens in a process that still has the handler registered, the runtime also flips the in-memory cancellation flag.
 
 ## Partition Rotation And Reclamation
@@ -213,6 +215,8 @@ Queue storage has three independent rings, each advanced by the elected maintena
 | Claim | `lease_claims_*`, `lease_claim_batches_*`, `lease_claim_closures_*`, `lease_claim_closure_batches_*` | matches queue ring | incoming claim-row/claim-batch/closure/closure-batch slot is empty | every row claim or compact claim-batch item in the oldest non-current slot has durable closure evidence; count proofs use compact closure-batch ready-segment metadata and skip conservatively when counts do not prove closure, and the open-claim proof is repeated after the bounded exclusive-lock path; stale-rescue cursors are reset when the slot is truncated |
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
+
+Operators can durably halt this reclamation with the `maintenance.prune` control (`awa control halt`). A leader that observes the halt stops admitting rotation, prune, terminal count rollup, cleanup, admin metadata refresh and descriptor publication, while enqueue, dispatch, promotion and rescue continue; the rings stay where they are until `awa control resume`. See [runtime controls](runtime-controls.md).
 
 The common safety pattern is:
 
@@ -292,7 +296,7 @@ Core safety invariants are modeled in TLA+:
 | [`AwaSegmentedStorageRaces`](../correctness/storage/AwaSegmentedStorageRaces.tla) | claim-vs-rotate/prune interleavings |
 | [`AwaSegmentedStorageTrace`](../correctness/storage/AwaSegmentedStorageTrace.tla) | concrete runtime trace acceptance for representative queue-storage flows |
 | [`AwaShardedPrune`](../correctness/storage/AwaShardedPrune.tla) | cross-shard ready/terminal prune matching by `enqueue_shard` |
-| [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across claim, rotate, and prune |
+| [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across enqueue, new-lane provisioning, claim, rescue, rotate, and prune |
 | [`AwaStorageTransition`](../correctness/storage/AwaStorageTransition.tla) | queue-storage transition prepare, mixed-entry, finalize, and abort gates |
 | [`AwaDeadTupleContract`](../correctness/storage/AwaDeadTupleContract.tla) | hot-table reclaim-kind contract for partition truncate and bounded warm tables |
 | [`AwaCbk`](../correctness/races/AwaCbk.tla) | callback registration/resume/finalization races |

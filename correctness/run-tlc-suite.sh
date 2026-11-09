@@ -32,6 +32,8 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; Dlq
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldStripedClaimDeadlock.cfg ;; NoDeadlock is violated ;; old striped-claim order witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg ;; NoDeadlock is violated ;; old QueueStorage lane-provisioning order witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + #456 reschedule drain
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence
