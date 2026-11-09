@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
 ///
@@ -380,6 +380,10 @@ impl JobExecutor {
                 finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
+            let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
+                in_flight: in_flight.clone(),
+                key: (job_id, job_run_lease),
+            });
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
@@ -396,20 +400,21 @@ impl JobExecutor {
                 progress_state.clone(),
             );
 
+            let mut started_event = None;
             let result = match workers.get(&job.kind) {
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
                         let started_job = job.clone();
-                        tokio::spawn(async move {
+                        started_event = Some(tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
                                 &started_kind,
                                 UntypedJobEvent::Started { job: started_job },
                             )
                             .await;
-                        });
+                        }));
                     }
                     let perform = CatchUnwind(worker.perform(&ctx));
                     let outcome = match abandon_after {
@@ -456,26 +461,26 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
-            // The attempt stays in `in_flight`, and so keeps its heartbeat,
-            // until its finalize is over: a finalize that waits behind a
-            // completion backlog must not look like a dead worker to rescue.
-            // Only a bounded number of finished attempts may wait for
-            // finalization; while that queue is full the attempt also keeps
-            // its worker slot, so the dispatcher stops claiming.
+            // The handler's progress snapshot is final: the finalize settles it,
+            // so heartbeats stop flushing progress for this attempt.
             in_flight.mark_finalizing((job_id, job_run_lease));
-            let heartbeat = HeartbeatUntilFinalized {
-                in_flight: in_flight.clone(),
-                key: (job_id, job_run_lease),
-            };
+            // Keep worker capacity and heartbeats until a bounded finalizer slot
+            // is available. Otherwise returning handlers can create an unbounded
+            // set of tasks retaining job payloads while completion is stalled.
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
+                    biased;
+                    _ = finalize_cancel.cancelled() => None,
                     permit = finalize_capacity.acquire_owned() => {
                         Some(permit.expect("finalizer capacity is never closed"))
                     }
-                    _ = finalize_cancel.cancelled() => None,
                 },
                 None => None,
             };
+
+            if heartbeat_guard.is_none() {
+                in_flight.remove((job_id, job_run_lease));
+            }
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
@@ -485,17 +490,9 @@ impl JobExecutor {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            // Graceful shutdown waits for this before stopping the completion
-            // batcher. The heartbeat guard keeps the attempt live until the
-            // durable write completes or this finalizer is abandoned.
             finalizers.spawn(async move {
-                // Every finalize path is one lease-guarded transaction, and a
-                // deadlock abort rolls the whole transaction back, so running
-                // it again is safe. Without the retry the job would sit
-                // `running` until heartbeat rescue re-ran the handler.
-                let mut deadlock_retries = 0u32;
-                let outcome = loop {
-                    let outcome = complete_job(
+                let outcome = finalize_with_retry(
+                    || complete_job(
                         &pool,
                         &job,
                         queue_storage_claim.as_ref(),
@@ -509,30 +506,15 @@ impl JobExecutor {
                         &storage,
                         dlq_enabled,
                         &metrics,
-                    )
-                    .await;
-                    match outcome {
-                        Err(err)
-                            if err.is_deadlock()
-                                && deadlock_retries < COMPLETION_DEADLOCK_RETRIES =>
-                        {
-                            deadlock_retries += 1;
-                            metrics.record_completion_deadlock_retry(&job_kind, &job_queue);
-                            let delay = completion_deadlock_backoff(deadlock_retries);
-                            warn!(
-                                job_id,
-                                retry = deadlock_retries,
-                                max_retries = COMPLETION_DEADLOCK_RETRIES,
-                                delay_ms = delay.as_millis() as u64,
-                                "Completion transaction aborted by the deadlock detector; retrying"
-                            );
-                            tokio::time::sleep(delay).await;
-                        }
-                        outcome => break outcome,
-                    }
-                };
-                drop(heartbeat);
-                drop(finalize_permit);
+                    ),
+                    &metrics,
+                    job_id,
+                    &job_kind,
+                    &job_queue,
+                    COMPLETION_LOCK_WINDOW,
+                    storage.queue_storage().is_some(),
+                )
+                .await;
 
                 match &outcome {
                     Ok(CompletionOutcome::Applied { terminal, .. }) => {
@@ -603,26 +585,32 @@ impl JobExecutor {
                     }
                 }
 
+                drop(heartbeat_guard);
+                // Lifecycle hooks run under the finalizer permit, so a hook slower
+                // than job throughput holds back claiming instead of accumulating
+                // tasks that each retain a copy of the job.
+                if let Some(started_event) = started_event {
+                    let _ = started_event.await;
+                }
                 if let Ok(CompletionOutcome::Applied {
                     event: Some(event), ..
                 }) = outcome
                 {
                     dispatch_lifecycle_event(&lifecycle_handlers, &job_kind, event).await;
                 }
+                drop(finalize_permit);
             });
         }
         .instrument(span)
     }
 }
 
-/// Keeps a finished attempt in the heartbeat set until its finalize is over,
-/// and takes it out however the finalizer ends.
-struct HeartbeatUntilFinalized {
+struct FinalizationHeartbeatGuard {
     in_flight: InFlightMap,
     key: (i64, i64),
 }
 
-impl Drop for HeartbeatUntilFinalized {
+impl Drop for FinalizationHeartbeatGuard {
     fn drop(&mut self) {
         self.in_flight.remove(self.key);
     }
@@ -632,12 +620,104 @@ impl Drop for HeartbeatUntilFinalized {
 /// to break a lock cycle before the failure is surfaced.
 const COMPLETION_DEADLOCK_RETRIES: u32 = 3;
 
-/// Short exponential backoff between deadlock retries (10ms, 20ms, 40ms, ...).
-/// Postgres aborts only one party of a cycle, so the survivor has usually
-/// committed by the time the retry runs.
-fn completion_deadlock_backoff(retry: u32) -> Duration {
+fn completion_contention_backoff(retry: u32) -> Duration {
     Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
 }
+
+#[derive(Debug, thiserror::Error)]
+enum FinalizeError {
+    #[error(transparent)]
+    Operation(#[from] AwaError),
+    #[error("durable finalization lock-retry window expired")]
+    Deadline,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_with_retry<T, F, Fut>(
+    mut finalize: F,
+    metrics: &crate::metrics::AwaMetrics,
+    job_id: i64,
+    kind: &str,
+    queue: &str,
+    window: Duration,
+    retry_lock_contention: bool,
+) -> Result<T, FinalizeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AwaError>>,
+{
+    let deadline = retry_lock_contention.then(|| tokio::time::Instant::now() + window);
+    let mut deadlock_retries = 0;
+    let mut lock_retries = 0;
+    loop {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(FinalizeError::Deadline);
+        }
+        let outcome = finalize().await;
+        let error = match outcome {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => error,
+        };
+        let delay = if error.is_deadlock() && deadlock_retries < COMPLETION_DEADLOCK_RETRIES {
+            deadlock_retries += 1;
+            metrics.record_completion_deadlock_retry(kind, queue);
+            let delay = completion_contention_backoff(deadlock_retries);
+            warn!(
+                job_id,
+                retry = deadlock_retries,
+                max_retries = COMPLETION_DEADLOCK_RETRIES,
+                delay_ms = delay.as_millis() as u64,
+                "Completion transaction aborted by the deadlock detector; retrying"
+            );
+            delay
+        } else if retry_lock_contention && is_completion_lock_contention(&error) {
+            lock_retries += 1;
+            let delay = completion_contention_backoff(lock_retries);
+            if lock_retries == 1 {
+                warn!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
+            } else {
+                debug!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
+            }
+            delay
+        } else {
+            return Err(error.into());
+        };
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                .await
+                .map_err(|_| FinalizeError::Deadline)?,
+            None => tokio::time::sleep(delay).await,
+        }
+    }
+}
+
+/// Re-read a job whose transition has committed, for its lifecycle event.
+/// The transition stands whatever the read returns, so a failed read is logged
+/// and the caller builds the event from the worker's copy instead.
+async fn reload_committed_job(
+    runtime: &QueueStorageRuntime,
+    pool: &PgPool,
+    job_id: i64,
+) -> Option<JobRow> {
+    match runtime.store.load_job(pool, job_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            warn!(
+                job_id,
+                error = %err,
+                "Could not re-read a committed job for its lifecycle event; using the worker's copy"
+            );
+            None
+        }
+    }
+}
+
+fn is_completion_lock_contention(error: &AwaError) -> bool {
+    matches!(error, AwaError::Database(sqlx::Error::Database(database))
+        if database.code().as_deref() == Some("55P03"))
+}
+
+const COMPLETION_LOCK_WINDOW: Duration = Duration::from_secs(120);
 
 /// Update job state in the database based on handler result.
 ///
@@ -1689,6 +1769,17 @@ fn rescheduled_event_row(
     row
 }
 
+/// The job as a read returns it after this attempt completes.
+fn completed_event_row(job: &JobRow) -> JobRow {
+    let mut row = job.clone();
+    row.state = JobState::Completed;
+    row.finalized_at = Some(chrono::Utc::now());
+    row.progress = None;
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_job_queue_storage(
     runtime: &QueueStorageRuntime,
@@ -1799,21 +1890,11 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job =
-                    runtime
-                        .store
-                        .load_job(pool, job.id)
-                        .await?
-                        .unwrap_or_else(|| {
-                            let mut completed_job = job.clone();
-                            completed_job.state = JobState::Completed;
-                            completed_job.finalized_at = Some(chrono::Utc::now());
-                            completed_job.progress = None;
-                            completed_job
-                        });
+                // The event is built from the worker's copy rather than
+                // re-reading the job.
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
-                        job: updated_job,
+                        job: completed_event_row(job),
                         duration,
                     }),
                     terminal: false,
@@ -2150,10 +2231,8 @@ async fn complete_job_queue_storage(
                 }
             }
             let event = if needs_event {
-                let parked_job = runtime
-                    .store
-                    .load_job(pool, job.id)
-                    .await?
+                let parked_job = reload_committed_job(runtime, pool, job.id)
+                    .await
                     .unwrap_or_else(|| {
                         let mut parked = job.clone();
                         parked.state = JobState::WaitingExternal;
@@ -2433,12 +2512,7 @@ async fn complete_queue_storage_with_followups(
 
     // Synthesise the post-completion snapshot — the store has just moved the
     // lease into `done_entries` so a live SELECT would race with rotation.
-    // The happy-path fields are exactly those `complete_job_queue_storage`
-    // reconstructs when `load_job` returns None.
-    let mut updated_job = job.clone();
-    updated_job.state = JobState::Completed;
-    updated_job.finalized_at = Some(chrono::Utc::now());
-    updated_job.progress = None;
+    let updated_job = completed_event_row(job);
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
 
@@ -3111,4 +3185,741 @@ async fn retry_backoff_canonical_with_followups(
 
     tx.commit().await?;
     Ok(Some(updated_job))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_metrics() -> crate::metrics::AwaMetrics {
+        crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("finalize-test"))
+    }
+
+    #[derive(Debug)]
+    struct FinalizeDatabaseError(&'static str);
+
+    impl std::fmt::Display for FinalizeDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "sqlstate {}", self.0)
+        }
+    }
+
+    impl std::error::Error for FinalizeDatabaseError {}
+
+    impl sqlx::error::DatabaseError for FinalizeDatabaseError {
+        fn message(&self) -> &str {
+            "finalize transaction rejected"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn finalize_sqlstate(code: &'static str) -> AwaError {
+        AwaError::Database(sqlx::Error::Database(Box::new(FinalizeDatabaseError(code))))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_lock_contention_preserves_the_sealed_outcome() {
+        let calls = AtomicU32::new(0);
+        let applied = AtomicU32::new(0);
+        let sealed = serde_json::json!({
+            "outcome": "retry_after", "delay_secs": 60,
+            "progress": {"checkpoint": 7}, "followups": [{"id": 42}],
+        });
+        let outcome = finalize_with_retry(
+            || {
+                std::future::ready(if calls.fetch_add(1, Ordering::SeqCst) < 4 {
+                    Err(finalize_sqlstate("55P03"))
+                } else {
+                    applied.fetch_add(1, Ordering::SeqCst);
+                    Ok(sealed.clone())
+                })
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            true,
+        )
+        .await
+        .expect("contention must retry the saved outcome");
+        assert_eq!(outcome, sealed);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(applied.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_lock_contention_keeps_the_absolute_deadline() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(finalize_sqlstate("55P03")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_millis(100),
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert!((3..=5).contains(&calls.load(Ordering::SeqCst)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_finalization_observes_its_acknowledgement_after_the_retry_window() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let events = Arc::new(AtomicU32::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (acknowledge, response) = tokio::sync::oneshot::channel::<UntypedJobEvent>();
+        let observed = events.clone();
+        let handler: BoxedUntypedEventHandler = Arc::new(move |event| {
+            assert!(matches!(event, UntypedJobEvent::Completed { job, .. }
+                if job.id == 1 && job.run_lease == 1));
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        });
+        let handlers = Arc::new(HashMap::from([("finalize_parent".into(), vec![handler])]));
+        let attempts = calls.clone();
+        let notification = started.clone();
+        let task = tokio::spawn(async move {
+            let mut response = Some(response);
+            let outcome = finalize_with_retry(
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let response = response.take().expect("accepted work is never restarted");
+                    let notification = notification.clone();
+                    async move {
+                        notification.notify_one();
+                        let event = response.await.map_err(|_| {
+                            AwaError::Validation("completion acknowledgement dropped".into())
+                        })?;
+                        Ok(CompletionOutcome::Applied {
+                            event: Some(event),
+                            terminal: false,
+                        })
+                    }
+                },
+                &test_metrics(),
+                1,
+                "finalize_parent",
+                "test",
+                Duration::from_millis(100),
+                true,
+            )
+            .await?;
+            let CompletionOutcome::Applied {
+                event: Some(event), ..
+            } = outcome
+            else {
+                panic!("accepted completion must retain its lifecycle event")
+            };
+            dispatch_lifecycle_event(&handlers, "finalize_parent", event).await;
+            Ok::<(), FinalizeError>(())
+        });
+        started.notified().await;
+        tokio::time::advance(Duration::from_millis(110)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the retry window must not cancel accepted work"
+        );
+        let now = chrono::Utc::now();
+        let job = serde_json::from_value(serde_json::json!({
+            "id": 1, "kind": "finalize_parent", "queue": "test", "args": {},
+            "state": "completed", "priority": 2, "attempt": 1, "run_lease": 1,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "finalized_at": now, "metadata": {}, "tags": [],
+        }))
+        .unwrap();
+        assert!(acknowledge
+            .send(UntypedJobEvent::Completed {
+                job,
+                duration: Duration::ZERO
+            })
+            .is_ok());
+        task.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_lock_contention_does_not_retry_unrelated_statement_errors() {
+        for code in ["57014", "23505", "55P04"] {
+            let calls = AtomicU32::new(0);
+            let result = finalize_with_retry(
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<(), _>(finalize_sqlstate(code)))
+                },
+                &test_metrics(),
+                1,
+                "test",
+                "test",
+                Duration::from_secs(2),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(FinalizeError::Operation(_))),
+                "{code}: {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{code}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canonical_finalization_does_not_retry_lock_contention() {
+        let calls = AtomicU32::new(0);
+        let result = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(finalize_sqlstate("55P03")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            false,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Operation(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canonical_finalization_preserves_three_deadlock_retries_without_a_deadline() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(finalize_sqlstate("40P01")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::ZERO,
+            false,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Operation(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(started.elapsed(), Duration::from_millis(70));
+    }
+
+    struct FinalizeWorker;
+
+    #[async_trait::async_trait]
+    impl Worker for FinalizeWorker {
+        fn kind(&self) -> &'static str {
+            "finalize_parent"
+        }
+
+        async fn perform(&self, _context: &JobContext) -> Result<JobResult, JobError> {
+            Ok(JobResult::Completed)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_finalization_retains_heartbeat_without_holding_worker_capacity() {
+        let metrics = test_metrics();
+        let now = chrono::Utc::now();
+        let job: JobRow = serde_json::from_value(serde_json::json!({
+            "id": 1, "kind": "finalize_parent", "queue": "test", "args": {},
+            "state": "running", "priority": 2, "attempt": 1, "run_lease": 1,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "metadata": {}, "tags": [],
+        }))
+        .unwrap();
+        let key = (job.id, job.run_lease);
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig::default(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let storage = RuntimeStorage::QueueStorage(runtime);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .unwrap();
+        let finalizers = TaskTracker::new();
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let count = Arc::new(AtomicU32::new(0));
+        let (unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let executor = JobExecutor::new(
+            pool.clone(),
+            Arc::new(HashMap::from([(
+                "finalize_parent".into(),
+                Box::new(FinalizeWorker) as BoxedWorker,
+            )])),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::from([("test".into(), count.clone())])),
+            Arc::new(HashMap::new()),
+            metrics,
+            handle,
+            storage,
+            DlqPolicy::default(),
+            finalizers.clone(),
+            CancellationToken::new(),
+            1,
+        );
+        executor
+            .execute_task(
+                DispatchedJob {
+                    job,
+                    queue_storage_claim: Some(ClaimedEntry {
+                        queue: "test".into(),
+                        priority: 2,
+                        lane_seq: 1,
+                        ready_slot: 0,
+                        ready_generation: 0,
+                        lease_slot: 0,
+                        lease_generation: 0,
+                        claim_slot: 0,
+                        receipt_id: Some(1),
+                        claim_batch_id: Some(1),
+                        claim_batch_index: Some(1),
+                        lease_claim_receipt: true,
+                        enqueue_shard: 0,
+                    }),
+                    queue_storage_unique_states: None,
+                    abandon_after: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "handler capacity must be released"
+        );
+        assert_eq!(finalizers.len(), 1);
+        assert!(
+            in_flight.get_cancel(key).is_some(),
+            "heartbeat ownership must survive handler return"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            in_flight.get_cancel(key).is_some(),
+            "pending acknowledgement must retain the lease"
+        );
+        tokio::time::advance(COMPLETION_LOCK_WINDOW + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(finalizers.len(), 1);
+        assert!(
+            in_flight.get_cancel(key).is_some(),
+            "accepted completion must retain heartbeat ownership beyond the retry window"
+        );
+        pool.close().await;
+        drop(unstarted);
+        finalizers.close();
+        tokio::time::timeout(Duration::from_secs(1), finalizers.wait())
+            .await
+            .unwrap();
+        assert!(
+            in_flight.get_cancel(key).is_none(),
+            "settlement must unregister the exact lease"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saturated_finalizer_capacity_retains_worker_until_shutdown() {
+        for storage in [
+            RuntimeStorage::Canonical,
+            RuntimeStorage::QueueStorage(
+                QueueStorageRuntime::new(
+                    awa_model::QueueStorageConfig::default(),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let job: JobRow = serde_json::from_value(serde_json::json!({
+                "id": 1, "kind": "finalize_parent", "queue": "test", "args": {},
+                "state": "running", "priority": 2, "attempt": 1, "run_lease": 1,
+                "max_attempts": 5, "run_at": now, "attempted_at": now,
+                "created_at": now, "metadata": {}, "tags": [],
+            }))
+            .unwrap();
+            let key = (job.id, job.run_lease);
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:test@localhost/awa_test")
+                .unwrap();
+            let metrics = test_metrics();
+            let finalizers = TaskTracker::new();
+            let finalize_cancel = CancellationToken::new();
+            let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+            let count = Arc::new(AtomicU32::new(0));
+            let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+                pool.clone(),
+                CancellationToken::new(),
+                metrics.clone(),
+                storage.clone(),
+                1,
+            );
+            let executor = JobExecutor::new(
+                pool.clone(),
+                Arc::new(HashMap::from([(
+                    "finalize_parent".into(),
+                    Box::new(FinalizeWorker) as BoxedWorker,
+                )])),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+                in_flight.clone(),
+                Arc::new(HashMap::from([("test".into(), count.clone())])),
+                Arc::new(HashMap::new()),
+                metrics,
+                handle,
+                storage,
+                DlqPolicy::default(),
+                finalizers.clone(),
+                finalize_cancel.clone(),
+                1,
+            );
+            // Occupy the entire budget without starting database work.
+            let capacity = executor.finalize_capacity.clone();
+            let held = capacity
+                .clone()
+                .acquire_many_owned(capacity.available_permits() as u32)
+                .await
+                .unwrap();
+            let task = tokio::spawn(executor.execute_task(
+                DispatchedJob {
+                    job,
+                    queue_storage_claim: None,
+                    queue_storage_unique_states: None,
+                    abandon_after: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+            ));
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(in_flight.get_cancel(key).is_some());
+            assert!(finalizers.is_empty());
+
+            // Cancelling background services at the drain deadline must release
+            // the capacity waiter without spawning another finalizer.
+            finalize_cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert!(in_flight.get_cancel(key).is_none());
+            assert!(finalizers.is_empty());
+            drop(held);
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_finalization_unregisters_only_its_exact_lease() {
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        for key in [(1, 1), (1, 2)] {
+            in_flight.insert(
+                key,
+                InFlightState {
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    progress: Arc::new(std::sync::Mutex::new(ProgressState::new(None))),
+                    claim: None,
+                    finalizing: false,
+                },
+            );
+        }
+        let guard = FinalizationHeartbeatGuard {
+            in_flight: in_flight.clone(),
+            key: (1, 1),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notification = started.clone();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            notification.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(in_flight.get_cancel((1, 1)).is_none());
+        assert!(in_flight.get_cancel((1, 2)).is_some());
+    }
+    struct RetainedFinalizeFollowup;
+
+    impl crate::enqueue_specs::EnqueueFollowUp for RetainedFinalizeFollowup {
+        fn run<'a>(
+            &'a self,
+            connection: &'a mut sqlx::PgConnection,
+            job: &'a JobRow,
+            _context: Option<&'a crate::enqueue_specs::OutcomeContext>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AwaError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO finalize_followups(parent) VALUES ($1)")
+                    .bind(job.id)
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn retained_head_contention_replays_the_worker_outcome_once(pool: PgPool) {
+        awa_model::migrations::run(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE finalize_followups(parent bigint PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig {
+                queue_stripe_count: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let queue = "retained_finalize";
+        runtime.store.prepare_queue(&pool, queue, 1).await.unwrap();
+        runtime
+            .store
+            .enqueue_params_batch(
+                &pool,
+                &[awa_model::job::InsertParams {
+                    kind: "retained_finalize_parent".into(),
+                    args: serde_json::json!({"body":"retained"}),
+                    opts: awa_model::InsertOpts {
+                        queue: queue.into(),
+                        priority: 4,
+                        max_attempts: 3,
+                        metadata: serde_json::json!({"preserved":true}),
+                        ..Default::default()
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let claimed = runtime
+            .store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let pair = (claimed.job.id, claimed.job.run_lease);
+        let schema = runtime.store.schema();
+        let mut historical = pool.begin().await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.ready_tombstones
+             (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
+             SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id
+             FROM {schema}.ready_entries WHERE job_id=$1"
+        ))
+        .bind(pair.0)
+        .execute(historical.as_mut())
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.ready_entries
+             (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+              lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+             SELECT ready_slot,ready_generation,job_id,kind,queue,args,3,attempt,run_lease,max_attempts,
+              {schema}.reserve_enqueue_seq(queue,3::smallint,enqueue_shard,1::bigint),enqueue_shard,
+              run_at,attempted_at,created_at,unique_key,unique_states,payload
+             FROM {schema}.ready_entries WHERE job_id=$1"
+        )).bind(pair.0).execute(historical.as_mut()).await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.ready_segments
+             (ready_slot,ready_generation,queue,priority,enqueue_shard,first_lane_seq,next_lane_seq,first_run_at,created_at)
+             SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,lane_seq+1,run_at,created_at
+             FROM {schema}.ready_entries WHERE job_id=$1 AND priority=3 ON CONFLICT DO NOTHING"
+        )).bind(pair.0).execute(historical.as_mut()).await.unwrap();
+        historical.commit().await.unwrap();
+        let progress = serde_json::json!({"checkpoint":7});
+        runtime
+            .store
+            .flush_progress(&pool, pair.0, pair.1, progress.clone())
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(&format!(
+            "SELECT 1 FROM {schema}.queue_claim_heads
+             WHERE queue=$1 AND priority=3 AND enqueue_shard=0 FOR UPDATE"
+        ))
+        .bind(queue)
+        .fetch_one(blocker.as_mut())
+        .await
+        .unwrap();
+        let metrics = test_metrics();
+        let storage = RuntimeStorage::QueueStorage(runtime.clone());
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::from([(
+            crate::enqueue_specs::Outcome::Retried,
+            HashMap::from([(
+                "retained_finalize_parent".into(),
+                vec![Arc::new(RetainedFinalizeFollowup) as crate::enqueue_specs::BoxedEnqueueSpec],
+            )]),
+        )]));
+        let intended = Ok(JobResult::RetryAfter(Duration::from_secs(60)));
+        let calls = AtomicU32::new(0);
+        let busy = tokio::sync::Notify::new();
+        let finalize = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let (pool, job, claim, intended, progress, handle, specs, storage, metrics, busy) = (
+                    &pool,
+                    &claimed.job,
+                    &claimed.claim,
+                    &intended,
+                    &progress,
+                    &handle,
+                    &specs,
+                    &storage,
+                    &metrics,
+                    &busy,
+                );
+                async move {
+                    let result = complete_job(
+                        pool,
+                        job,
+                        Some(claim),
+                        None,
+                        intended,
+                        handle,
+                        Some(progress.clone()),
+                        Duration::ZERO,
+                        true,
+                        specs,
+                        storage,
+                        false,
+                        metrics,
+                    )
+                    .await;
+                    if let Err(error) = &result {
+                        assert!(
+                            is_completion_lock_contention(error),
+                            "expected actual held-head55P03: {error}"
+                        );
+                        busy.notify_one();
+                    }
+                    result
+                }
+            },
+            &metrics,
+            pair.0,
+            &claimed.job.kind,
+            queue,
+            Duration::from_secs(5),
+            true,
+        );
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(3), busy.notified())
+                .await
+                .expect("worker transition must encounter the held historical head");
+            let active = runtime
+                .store
+                .load_job(&pool, pair.0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.state, JobState::Running);
+            assert_eq!(active.run_lease, pair.1);
+            assert_eq!(active.progress, Some(progress.clone()));
+            let effects: i64 = sqlx::query_scalar("SELECT count(*) FROM finalize_followups")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(effects, 0, "failed transaction cannot publish its followup");
+            blocker.rollback().await.unwrap();
+        };
+        let (ack, ()) = tokio::join!(finalize, release);
+        let ack = ack.expect("saved worker outcome must survive transient head contention");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        let CompletionOutcome::Applied {
+            event: Some(UntypedJobEvent::Retried { job, .. }),
+            terminal: false,
+        } = ack
+        else {
+            panic!("worker must acknowledge its intended retry outcome")
+        };
+        assert_eq!(job.id, pair.0);
+        assert_eq!(job.run_lease, pair.1);
+        assert_eq!(job.state, JobState::Retryable);
+        assert_eq!(job.args, claimed.job.args);
+        assert_eq!(job.max_attempts, claimed.job.max_attempts);
+        assert_eq!(job.progress, Some(progress.clone()));
+        assert_eq!(job.metadata["preserved"], true);
+        let replay = complete_job(
+            &pool,
+            &claimed.job,
+            Some(&claimed.claim),
+            None,
+            &intended,
+            &handle,
+            Some(progress),
+            Duration::ZERO,
+            true,
+            &specs,
+            &storage,
+            false,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(replay, CompletionOutcome::IgnoredStale));
+        let effects: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM finalize_followups WHERE parent=$1")
+                .bind(pair.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            effects, 1,
+            "the acknowledged outcome publishes exactly one followup"
+        );
+        let deferred:i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.deferred_jobs WHERE job_id=$1 AND run_lease=$2 AND state='retryable'"
+        )).bind(pair.0).bind(pair.1).fetch_one(&pool).await.unwrap();
+        assert_eq!(deferred, 1);
+    }
 }

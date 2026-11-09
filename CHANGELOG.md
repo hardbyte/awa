@@ -4,208 +4,127 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- Run `awa migrate` once as the schema owner to apply `prune_controls` after the existing `claim_batch_job_index` and `insert_jobs_compat_batch` patches. It adds two tables and functions without altering existing tables; schema stays v40. Upgrade or fence every possible maintenance leader before relying on halt. See the [0.6.15 to 0.6.16 upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
+
 ### Added
 
-- **The queue-storage prune `lock_timeout` is configurable, and prune
-  attempts are counted by outcome for every ring.** Prune (queue, lease and
-  claim rings) and terminal-delta rollup take their exclusive locks under a
-  10 ms `lock_timeout` that could only be changed through the hidden
-  `QueueStorage::with_prune_lock_timeout`. When short readers of the ring
-  partitions held a conflicting lock at that instant, prune reported
-  `blocked` every tick and the rings stopped recycling. Set it with
-  `ClientBuilder::prune_lock_timeout` (Rust) or
-  `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
-  timeout applies separately to each lock acquisition, not to the whole prune;
-  queue prune can wait on up to eight partition locks. The default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
-  maximum is rejected. Start logs a warning when the value is at or above the
-  connection's `deadlock_timeout` (prune waiting that long can make deadlock
-  detection cancel a claim instead) or `statement_timeout`. `with_prune_lock_timeout` is now
-  public, with `set_prune_lock_timeout` and `prune_lock_timeout()`.
-  `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
-  gains `backed_off` (prune skipped by the backoff that follows consecutive
-  `skipped_active` or `blocked` results) and
-  `error` (prune failed with a database error) alongside the existing
-  `pruned`, `noop`, `blocked` and `skipped_active`. See
-  [Configuration](docs/configuration.md#what-the-knobs-mean).
+- Durable operator halt/resume for `maintenance.prune`, in drain mode. Compatible leaders observe it on their existing session; dispatch, cron, promotion, rescue and enqueue continue. Status lists live runtimes without supported, recent reports and cannot report the fleet halted while any remain. Older binaries ignore the control. See [runtime controls](docs/runtime-controls.md).
 
 ### Fixed
 
-- Ordinary rescue ticks retain their cadence under scheduler jitter, while
-  backlog re-arms keep the heartbeat owner-evidence gate.
+- `admin::get_job` and the other queue-storage point reads of one job no longer return `JobNotFound` for a failed job while queue prune moves its row out of the slot being pruned. Since 0.6.14 the read used one snapshot, and a prune that committed after that snapshot was taken left the old slot empty and the moved row invisible to it. Prune moves each retained failed row once per ring cycle, and on a new schema prunes slot 0 right after the first rotation, so a read polling for `failed` could hit it within a second of a worker starting. A read that finds nothing now reads once more in a new snapshot.
 
-- Keep confirmed-owner bulk heartbeat rescue's first cursor window small so
-  short passes can reach follow-up batches. Unconfirmed owners and
-  configurations that disable acceleration retain the wider initial scan.
+## [0.6.15] — 2026-11-09
 
-- Queue-storage rescue drains large abandoned-claim backlogs in bounded
-  transactions, controlled by `rescue_pass_budget` and a soft
-  `rescue_pass_max_rows` cap. Cursor sweeps continue past closed or freshly
-  heartbeated history and stop after a full traversal. Accelerated heartbeat
-  rescue requires settled runtime evidence; ordinary first batches keep their
-  configured cadence. Retries retain their backoffs, and due times can cluster:
-  the row cap bounds rescue writes, not promotion throughput. Zero for either
-  pass control keeps one batch per ordinary interval. See the
-  [backlog-drain configuration](docs/configuration.md#rescue-backlog).
+Recommended for everyone on 0.6.14 or 0.6.13 using queue storage. A worker whose completions or lifecycle hooks fall behind stops claiming instead of holding every finished job in memory until it runs out, by-job lookups of compact claims no longer read every retained claim batch, and large COPY batches hold a queue lane's enqueue lock only while they write that lane.
 
-- Queue-storage completion of retried jobs or jobs carrying metadata now
-  addresses compact claims by their batch identity and item index, as on main.
-  It no longer expands every retained claim batch for each completion flush,
-  so bounded finalization can drain large recovery backlogs without that scan.
+### Upgrading
 
-- Finished attempts keep heartbeating until their durable finalization finishes,
-  including while completion writes are stalled. Compact receipt heartbeats
-  address claims by batch identity and skip attempts a closer already holds,
-  so one stalled completion cannot block the rest of a heartbeat pass. Late
-  heartbeats cannot recreate state for a completed attempt.
+- The schema stays at v40. Run `awa migrate` once as the schema owner, before or after rolling binaries, while traffic keeps running. It applies two repeatable patches, `claim_batch_job_index` and `insert_jobs_compat_batch`, which add functions and take no table locks. Binaries can roll back to 0.6.14 with the patches left in place. See the [upgrade guide](docs/upgrade-0.6.14-to-0.6.15.md).
+- External migration runners: apply `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql` after `V40`. Replace all `R__` files together with the full set from `awa migrate --extract-to <dir> --from 40`; `--pending` lists only the patches a database lacks.
+- Deployments that revoke `EXECUTE` on new functions from `PUBLIC` should grant it on `awa.insert_jobs_compat_batch` to runtime roles; without it, `insert_many_copy` keeps its per-row path.
 
-- **A completion backlog no longer gets finished jobs rescued and run
-  again.** An attempt stops heartbeating when its handler returns, and its
-  finalize then waits for the completion batcher. The runtime released the
-  worker slot at the same moment and kept claiming, so when finalization was
-  slower than claiming (for example, retried jobs, whose completions take
-  the slower per-row path) the queue of finished, unheartbeated attempts grew
-  without bound. Attempts that waited longer than `heartbeat_staleness` were
-  rescued and executed again, some of them twice. The bound on attempts waiting
-  for finalization is `max(worker count, 2 × batch size × completion shards)`.
-  Past that, a finished attempt keeps its
-  worker slot and its heartbeat until there is room, so the dispatcher stops
-  claiming until finalization catches up.
-- **Ring prune and terminal-count rollup report `Blocked` when any of their
-  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
-  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
-  only that `LOCK TABLE` and the final `TRUNCATE` turned a timeout into
-  `PruneOutcome::Blocked`. The timeout covers every later statement in the
-  transaction too: the post-lock liveness checks read the lease and claim
-  partitions, the failed-row carry inserts into the current slot's
-  `done_entries` and terminal-count deltas, and the fold writes
-  `queue_terminal_rollups` and deletes `queue_terminal_live_counts` rows. When
-  one of those waited out the timeout, for example behind autovacuum
-  truncating a relation or a hosted Postgres's own background workers, prune
-  failed with a `lock_not_available` (`55P03`) database error, was logged as
-  an error and skipped the prune backoff. A lock timeout anywhere in a queue,
-  lease or claim prune, or in a terminal-count rollup slot, now rolls the
-  whole transaction back and reports `Blocked` (`blocked_slots` for rollup),
-  so maintenance backs off and retries; nothing the attempt wrote survives
-  the rollback. A rollup pass stops at its first blocked slot rather than
-  waiting out the timeout again on each remaining one.
-- **On queue storage, a queue whose enqueue lane is busy no longer holds
-  back promotion of other queues, nor the maintenance leader's rescue,
-  rotation and prune.** Promotion re-enqueues due scheduled and retryable
-  rows into their lane, which takes the lane's reservation lock that
-  producers hold until they commit. A promotion batch was one transaction
-  across every queue it touched, and the leader runs its branches one after
-  another, so a lane kept busy by producers delayed due jobs of unrelated
-  queues in the same batch, and rescue started seconds late. Promotion now
-  gives each `(queue, priority)` lane its own transaction under a 50 ms
-  `lock_timeout`. A lane that times out keeps its rows deferred and is
-  handed to a dedicated task that waits up to 30 s for the lock, queued
-  behind the producers already waiting, so the lane is still promoted in
-  turn however busy it stays; the leader skips it meanwhile. Each waiter
-  holds a pool connection, so the leader runs one per eight pool
-  connections, at least one and at most four; a further contended lane is
-  retried on the next tick. Batch selection skips rows another transaction
-  has locked, so locked due rows cannot fill every batch of a tick. `awa.maintenance.promote.lane_contention`
-  (`awa_maintenance_promote_lane_contention_total{awa_job_state,awa_job_queue,awa_promote_outcome}`)
-  counts `handed_off`, `waiter_limit` and `waiter_timed_out`. Promoted rows
-  now take lane sequence numbers in due order within their lane.
-  `QueueStorage::promote_due` keeps its signature and promotes lane by lane
-  without a lock timeout; `promote_due_lanes` and `promote_due_lane` expose
-  the per-lane form.
-- **A queue lane is usable by every runtime role, whichever role creates it
-  first.** A lane's enqueue and claim sequences belonged to the role that
-  first enqueued into, claimed from or promoted into it, so with several
-  runtime roles sharing a group role, any role other than the creator whose
-  default privileges did not cover it failed with `permission denied for
-  sequence`. That included the maintenance leader promoting into a shard
-  created after `enqueue_shards` was raised. The new schema patch
-  `definer_lane_provisioning` creates lanes through two `SECURITY DEFINER`
-  functions per queue-storage schema, `provision_lane` and
-  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
-  the privileges of the head table it backs, explicitly rather than through
-  default privileges. A runtime without schema `CREATE` can therefore create
-  lanes itself, and `awa storage prepare-queue` is optional and may run as any
-  runtime role. Once the patch commits, `awa migrate` gives existing lane
-  sequences to the schema owner and adds their missing grants, one sequence
-  per transaction with a 300 ms lock wait, and only where it is allowed to,
-  trying the effective role and then the login role. A sequence an open
-  transaction holds is skipped and reported as busy; one it may not change is
-  reported with the roles that can repair it. Neither fails the run. The new read-only `awa storage lane-sequences` (or
-  `awa.lane_sequence_problems(schema)`) lists what remains, with the
-  statements to run and the roles to run them as, and exits 2 while any
-  remain; `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per
-  sequence) repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
-  running before the patch detects that `provision_lane` is missing and
-  creates lanes as before, and older binaries create correctly owned lanes once
-  the patch has refreshed the helpers they call. `awa migrate` applies the
-  patch on any v040 database; external runners apply the exported
-  `R__definer_lane_provisioning.sql` after `V40`. See
-  [`docs/upgrade-0.6.13-to-0.6.14.md`](docs/upgrade-0.6.13-to-0.6.14.md).
-- **A graceful shutdown no longer leaves a finished attempt for stale-heartbeat
-  rescue to run again.** Once a handler returned, its finalize (completion,
-  retry, cancel or failure, and any ADR-029 follow-up inserts) ran in a task
-  that `Client::shutdown` did not wait for. When the last handler returned
-  just as the drain ended, shutdown stopped the completion batcher before
-  that finalize reached it, and the direct fallback raced the process exit.
-  The attempt had already left the heartbeat set, so it went stale and was
-  rescued and executed again `heartbeat_staleness` later; a deploy could
-  re-run a few jobs on every rolling restart. Shutdown now waits for
-  pending finalization, within the same drain timeout, before it stops the
-  completion batcher, heartbeat and maintenance services. A finalize that
-  outlives the timeout is still left to rescue, as before.
-- **Point reads show the live queue and priority after a lane move.** Retained
-  ready rows from before a priority or queue change could win a read's tie
-  after the ring wrapped, returning the old fields even though the batch
-  operation succeeded. Point reads now exclude tombstoned source rows.
+### Fixed
 
-- **Callback completion, `get_job`, lifecycle events and the admin reads
-  find running jobs that priority aging promoted on queue storage** (backport
-  of #600). Claims and leases record a job's aged effective priority while its
-  ready row keeps the lane priority, and eight reads joined the two on
-  priority. With aging on (the default, every 60 s), a job that waited past a
-  minute before it was claimed could not be completed by callback with an
-  expected kind, failed the mixed-transition callback routing check, read back
-  from `get_job` in the wrong state, was missing from the job list, the kinds
-  page and the dashboard's recent-jobs counts, and was not found by
-  `cancel_by_unique_key`. They now match the attempt (`job_id` and `run_lease`). No
-  migration.
-- **`get_job` no longer misses a job that moves while it reads.** It read
-  ready, deferred, leased, claimed, completed and DLQ rows in separate
-  statements, so a job promoted, claimed or completed between two of them
-  could read as missing. It now reads all of them from one read-only snapshot.
-- **`admin::job_kind_overviews` on queue storage no longer depends on the
-  planner's row estimates.** Behind the admin UI's kinds page, it counted
-  every job through the `current_jobs` view. Two nodes of that view are
-  estimated at one row whatever the statistics say: the join from completion
-  batches to `ready_entries`, and the `UNION ALL` over every place a job can
-  live. Postgres therefore chose nested loops that visit each retained row,
-  and the join on `queue_claim_heads` was only as good as that table's
-  estimate, which autovacuum never refreshes. It now aggregates each place to
-  `(kind, queue)` on its own and combines the results: available jobs are
-  found per lane from the claim cursor, and a completion batch's members are
-  unnested and probed along the ready primary key. The rows are identical,
-  and a test compares them with the former definition across every job
-  state. With 2.6 million retained ready rows (1.8 million of them available)
-  and 860,000 retained completions it takes about 6 to 8 s instead of 20 s on
-  PostgreSQL 17 and 18. It still reads each available job and each retained
-  completion's ready row, because a job's kind lives there. JIT is off for
-  the read.
-- **`admin::list_jobs` on queue storage reads only the places that can hold
-  the requested state.** It selected candidate ids from the `current_jobs`
-  view, so every listing, whatever its filter, planned around the same
-  single-row estimates and joined each retained completion to a scan of the
-  ready rows. On PostgreSQL 18 a kind filter ran past a four-minute statement
-  timeout. Each place a job can live is now read and limited on its own,
-  only those that can hold the state asked for, with a predicate for each
-  filter that is set rather than `$n IS NULL OR` terms, which a prepared
-  statement's generic plan can't drop. Completion batches are ordered by job
-  id before their ready rows are probed, so a page probes only as many as it
-  returns. The ids are identical, and a test compares them with the former
-  definition for every state, kind, queue, limit and page. On the dataset
-  above, `state=failed&limit=10` drops from 12 s to 0.7 s,
-  `state=completed&limit=100` from 20 s to 6 s, and an unfiltered or
-  kind-filtered page of 100 from 23 s to 11 s (a kind filter on PostgreSQL 18
-  from more than four minutes). Available jobs and completions are still read
-  in full when the state allows them. JIT is off for the read.
+**Worker memory**
+
+- Worker finalization is bounded to the larger of the runtime's worker capacity and twice the completion batch size times the completion shard count (1,024 attempts with the queue-storage defaults). A finished handler keeps its worker slot while it waits for finalizer capacity, so when durable completion falls behind the runtime stops claiming instead of holding an unbounded backlog of finished attempts and their payloads in memory. Before, a 120-second completion stall could leave about 77,000 finished attempts and 1 GB in one worker. Attempt heartbeats continue until finalization settles. Lowering `AWA_COMPLETION_BATCH_SIZE` lowers the bound in proportion, for jobs with large payloads.
+- Lifecycle hooks (`on_event`, `on_event_kind`) no longer accumulate without bound when they are slower than job throughput. Each attempt's `Started` and outcome hooks now hold its finalizer slot until they return, so slow hooks slow claiming instead of growing worker memory, and a worker-finalized outcome hook runs after that attempt's `Started` hook has returned. Maintenance's `Rescued` and duplicate `Cancelled` events allow 1,024 outstanding hook tasks per worker and drop further events with a warning.
+
+**Claim lookups**
+
+- By-job lookups of zero-deadline (compact) receipt claims — heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job` — use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. Under load those scans could pick parallel plans and exhaust dynamic shared memory. The `claim_batch_job_index` patch installs the index function and takes no table locks; claim prune builds the index on each claim partition right after emptying it, so every partition gains it within one claim-ring cycle and live claims are never blocked behind a build.
+- Retried queue-storage jobs and jobs carrying metadata complete by their compact claim batch and item index, instead of reading every retained claim batch.
+
+**Rescue, events and admin reads**
+
+- Heartbeat, deadline and callback rescue of lease-backed attempts reach the stale attempts behind a full batch of attempts whose retained ready bodies are ambiguous. Before, every pass selected the same ambiguous attempts first, left them running, and rescued nothing else.
+- A `Completed` lifecycle event, and the job a `Completed` follow-up enqueue spec receives, no longer carry the finished attempt's `heartbeat_at` and `deadline_at`; both are `None`, as a read of the completed job returns them.
+- Admin job lists and kind counts work on a queue-storage schema installed with more claim slots than the default, instead of failing with `invalid physical claim slot`, and no longer read other claim slots' receipt closure partitions when they read one slot's open claims.
+- Queue-storage job lists without a kind filter select receipt candidate IDs before loading their ready bodies. Kind filters still apply before the limit.
+
+### Changed
+
+- Compatibility COPY inserts (`insert_many_copy` in Rust and Python) hold a queue lane's enqueue lock only while they write that lane, instead of from the batch's first ready row until commit. Many producers enqueuing large batches into one queue no longer queue behind each other's whole batches, and promotion into a busy queue waits less. The batch goes through the new `awa.insert_jobs_compat_batch` function, which prepares job ids, unique claims and payloads first, then registers each new lane and reserves each lane once, in the sorted `(queue, priority, shard)` order every other producer uses. Each call checks its connection for the function and keeps the per-row path where it is missing or not executable. Results are unchanged: input order, with jobs whose unique key is already claimed skipped.
+- A batch through `awa.insert_jobs_compat_batch` takes all its unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together, lane by lane. A per-row transaction that already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not committed now fails with `deadlock detected` (SQLSTATE `40P01`) instead of skipping the job or failing with a unique violation (`23505`). Retry the aborted transaction. Batches through the function do not deadlock with each other this way.
+
+### Added
+
+- `insert_many_skip_unique_conflicts` (Rust) inserts a batch through `awa.insert_jobs_compat_batch`, skipping jobs whose unique key is already claimed, and returns the inserted rows in input order. Use it instead of retrying a failed `insert_many` one job at a time, which takes the lane lock once per job. It needs the `insert_jobs_compat_batch` patch. Generic `insert_many` is unchanged.
+- `enqueue_lane_contention_test` benchmarks many producers on one lane, with a nightly gate on per-lane throughput and lock hold time.
+
+## [0.6.14] — 2026-11-08
+
+Recommended for everyone on 0.6.13 using queue storage. A busy queue no longer stalls promotion of the others, prune backs off cleanly under lock contention, new queue lanes are usable by every runtime role, and jobs no longer stay running, run again or get misreported after priority aging.
+
+### Upgrading
+
+- The schema stays at v40. Run `awa migrate` once as the schema owner while workers keep running. It applies the repeatable `definer_lane_provisioning` patch and repairs existing lane sequences. Then roll workers, producers and admin processes in any order. Binaries can roll back to 0.6.13 with the patch left in place.
+- `awa storage lane-sequences` checks lane-sequence ownership and grants and exits with code 2 while problems remain; `--repair` fixes what the connected role may.
+- External migration runners: apply `R__definer_lane_provisioning.sql` after `V40` (`awa migrate --extract-to <dir> --pending`), replacing all `R__` files together, then run `awa storage lane-sequences --repair` as the migration role. See the [upgrade guide](docs/upgrade-0.6.13-to-0.6.14.md).
+
+### Fixed
+
+**Lane ownership**
+
+- A queue lane created by one runtime role is usable by every other runtime role. Before, its sequences belonged to whichever role created it, so other roles could fail with `permission denied for sequence`, for example after `enqueue_shards` was raised. New lanes now belong to the schema owner with the head table's grants, and migration repairs existing ones, including when the migration role can only `SET ROLE` to the schema owner.
+
+**Promotion, prune and lock contention**
+
+- A busy queue lane no longer delays promotion of other queues or maintenance. Promotion waits 50 ms for a lane's locks and hands a busy lane to a dedicated waiter.
+- A lock timeout anywhere in prune or terminal rollup rolls the attempt back and reports `Blocked` instead of an error, and prune backs off.
+- Admin job details, lists and kind counts release partition locks between read phases, so they block prune less, and lists of retained history do less repeated work.
+- A read cancelled while starting its transaction closes its connection, so the next caller cannot inherit an open transaction and its partition locks.
+
+**Job correctness after priority aging and recovery**
+
+- Physical priority aging no longer moves a ready row that is being claimed. Before, it could tombstone the body of a just-claimed job, after which completion, cancellation and rescue failed and the claim ring stayed pinned. Bodies left tombstoned by older releases are recovered when the job is read, completed, cancelled or rescued.
+- Reads and callbacks find attempts that priority aging or a priority change moved, and admin lists and kind counts include running jobs whose claims have not yet become leases.
+- Failed jobs keep their arguments, attempt limit and lane in terminal history; manual retries and DLQ moves keep the correct priority and lane.
+- Schema-only admin clients work with ready rings larger than the default.
+
+**Workers**
+
+- Workers retry lock contention during finalization for up to 120 s with the handler's saved result, keeping the job's heartbeat until the outcome settles.
+- Graceful shutdown waits for pending finalization before stopping heartbeat and maintenance, within the existing drain timeout.
+- A completion or callback wait that has committed is no longer reported as failed if re-reading the job for its lifecycle event fails.
+
+**CLI**
+
+- `awa migrate` rejects `--sql` combined with `--extract-to`. Before, `--sql` silently won and nothing was extracted.
+
+### Since 0.6.14-alpha.1
+
+For testers of the prerelease, these fix behaviour that alpha.1 introduced:
+
+- Promotion no longer holds a lane's locks while waiting for PostgreSQL's cluster-wide NOTIFY lock at commit, where under concurrent enqueues the 50 ms lane timeout could expire and roll the batch back. Claimers are woken once after the lanes commit.
+- With lifecycle hooks registered, a completion builds its event from the job the worker holds instead of re-reading it, which cost about 24 round trips per completion.
+- Rescue skips an attempt with ambiguous retained bodies and logs an error on each pass, instead of failing the whole rescue.
+
+### Added
+
+- `ClientBuilder::prune_lock_timeout` in Rust and `queue_storage_prune_lock_timeout_ms` in Python configure prune's lock wait. The timeout applies to each acquisition; queue prune can wait on up to eight partition locks. The default remains 10 ms. `awa.maintenance.prune.attempts` includes the outcomes `backed_off` and `error`.
+- `awa.maintenance.promote.lane_contention` records promotion lane contention and waiter outcomes by queue.
+- Multi-runtime soak coverage for killed workers, shard changes, mixed Rust and Python workloads, durable recovery evidence and ring-lock diagnostics.
+
+### Changed
+
+- Python CI tests 3.14 and 3.15. Older interpreter versions remain best-effort; package classifiers list 3.14 and 3.15.
+- Operator guidance explains that longer rotation intervals reduce churn while increasing rows and index size per slot and extending retained history.
+
+### Known limitations
+
+- A job-detail read can race prune and briefly show a completed job as available or missing; reading again returns the current state.
+- If an older release's aging race left two equally plausible bodies for one running attempt, reads and direct transitions of that attempt fail with an ambiguity error, and rescue skips it until the bodies are repaired.
+- A worker completing a job with the body it already holds does not retire an unclaimed copy left by older aging, so that copy can run again (at-least-once).
+- Direct API calls that recover a body left by older aging (external callback complete, fail and retry; admin cancel and retry; completion by ID) can fail with SQLSTATE 55P03 under contention and must be retried. Workers retry automatically.
+- The installed `terminal_jobs` SQL view still reports the stored priority for older rows whose priority changed.
+
+## [0.6.14-alpha.1] — 2026-11-07
+
+Prerelease of 0.6.14; every change is listed under 0.6.14.
 
 ## [0.6.13] — 2026-11-06
 

@@ -5,17 +5,17 @@
 ## Upgrade
 
 1. Install the 0.6.14 CLI.
-2. Check lane ownership. This is read-only and exits 2 while lanes need repair:
-
-   ```bash
-   awa --database-url "$AWA_DATABASE_URL" storage lane-sequences
-   ```
-
-3. Run `awa migrate` once, with the schema owner as the effective role, while workers keep running:
+2. Run `awa migrate` once, with the schema owner as the effective role, while workers keep running:
 
    ```bash
    PGOPTIONS='-c role=awa_owner' \
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
+   ```
+
+3. Check lane ownership after the patch installs its diagnostic helper. This is read-only and exits 2 while lanes need repair:
+
+   ```bash
+   awa --database-url "$AWA_DATABASE_URL" storage lane-sequences
    ```
 
 4. Read the output. The `definer_lane_provisioning` patch reports `applied`, followed by how many lane sequences were repaired. Any left over are listed in warnings: a busy one needs another run of `awa storage lane-sequences --repair` as the migration role (without `PGOPTIONS`), and the others name the roles that can repair them (see [Check and repair lane ownership](security.md#check-and-repair-lane-ownership)). The migration exit status does not depend on them.
@@ -27,9 +27,11 @@ The schema stays at v40. The `definer_lane_provisioning` patch installs `provisi
 
 Once the patch commits, `awa migrate` repairs existing lane sequences, each in its own short transaction. A sequence not owned by the schema owner is reassigned if the role holds its current owner's privileges and can `SET ROLE` to the schema owner. Missing grants are added if the role holds the owner's privileges. Each sequence is tried as the effective role and then as the login role. Reassigning waits at most 300 ms for the sequence's lock, which an open enqueue or claim on that lane holds, and holds it only for that sequence's transaction. A sequence that is busy, or that neither role may change, is reported and left as it was.
 
+If an earlier build already applied the patch, run `awa migrate` again with the updated CLI. It detects the older installed repair helper and reapplies the repeatable patch before attempting repairs.
+
 The patch:
 
-- only replaces functions; it takes no sequence or table locks;
+- only replaces functions, gives the two provisioning functions to the schema owner and grants `EXECUTE` on them to `PUBLIC`; it takes no sequence or table locks;
 - keeps every lane's sequence position;
 - leaves storage routing unchanged;
 - applies as one transaction, so an interrupted run leaves nothing applied; run it again.
@@ -38,7 +40,13 @@ The patch:
 
 ### External migration runners
 
-`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database; with `--extract-to`, apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the schema owner. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
+`awa migrate --sql --pending` prints the `R__definer_lane_provisioning` patch on a 0.6.13 database. To write it as a file instead, run `awa migrate --extract-to <dir> --pending` (without `--sql`, which can't be combined with it) and apply `R__definer_lane_provisioning.sql` as a repeatable script after `V40`. Run it as the role that owns the existing `awa` functions, normally the schema owner; `CREATE OR REPLACE` fails with `must be owner of function` otherwise, and nothing is applied. The script does not repair existing lane sequences, so then run `awa storage lane-sequences --repair` as the migration role itself.
+
+Each `R__` patch carries the full lane-helper definitions, so an older patch file applied after this one reinstalls the 0.6.13 helpers:
+
+- Replace every `R__` file with the set the 0.6.14 CLI extracts, together, rather than adding `R__definer_lane_provisioning.sql` beside older ones.
+- Don't roll the runner's SQL files back to 0.6.13 when rolling binaries back. Leave the patch in place, as above.
+- Keep the `V` files exactly as originally applied. Extract with `--pending`; a full `--extract-to` rewrites `V23`, which fails a checksum-validating runner.
 
 ## Roll back
 

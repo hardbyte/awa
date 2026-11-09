@@ -1,3 +1,5 @@
+mod control;
+use control::ControlCommands;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,13 +25,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Control automatic maintenance pruning across this database.
+    Control {
+        #[command(subcommand)]
+        command: ControlCommands,
+    },
     /// Run database migrations
     Migrate {
         /// Extract migration SQL to a directory instead of applying
         #[arg(long)]
         extract_to: Option<String>,
         /// Print migration SQL to stdout instead of applying
-        #[arg(long)]
+        #[arg(long, conflicts_with = "extract_to")]
         sql: bool,
         /// Only include migrations after this version (exclusive)
         #[arg(long)]
@@ -832,6 +839,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Commands::Migrate { .. } | Commands::Serve { .. } | Commands::Callbacks { .. } => {
                     unreachable!()
                 }
+
+                Commands::Control { command } => control::run(&pool, command).await?,
 
                 Commands::Job { command } => match command {
                     JobCommands::Dump { id } => {
