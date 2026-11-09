@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.16] — 2026-11-09
 
-Recommended for everyone on 0.6.15 using queue storage. Batch inserts (`insert_many_copy`, `insert_many_skip_unique_conflicts`) give way to per-row producers that share their keys or lanes instead of deadlocking with them, and creating a new queue lane no longer deadlocks between `QueueStorage` and SQL producers. Operators can durably halt and resume `maintenance.prune` across the fleet. `admin::get_job` no longer misses a failed job while prune moves it, and `awa migrate` re-applies the claim batch index and batch insert patches with fixes.
+Recommended for everyone on 0.6.15 using queue storage. Rescue drains a large backlog of abandoned claims, which a killed runtime leaves behind and which stops the queue and claim rings from rotating, in minutes instead of the hours or days 0.6.15 took. Batch inserts (`insert_many_copy`, `insert_many_skip_unique_conflicts`) give way to per-row producers that share their keys or lanes instead of deadlocking with them, and creating a new queue lane no longer deadlocks between `QueueStorage` and SQL producers. Operators can durably halt and resume `maintenance.prune` across the fleet, `admin::get_job` no longer misses a failed job while prune moves it, and `awa migrate` re-applies the claim batch index and batch insert patches with fixes.
 
 ### Upgrading
 
@@ -15,9 +15,15 @@ Recommended for everyone on 0.6.15 using queue storage. Batch inserts (`insert_m
 - External migration runners: apply the new `R__claim_batch_job_index.sql` and `R__insert_jobs_compat_batch.sql`, then `R__prune_controls.sql`, after `V40`. Replace all `R__` files together with the full set from `awa migrate --extract-to <dir> --from 40`; `--pending` lists only the patches a database lacks.
 - During the roll, a 0.6.15 `QueueStorage` process that is the first to use a new `(queue, priority)` lane can still deadlock with another producer of that lane. Create a new queue's lanes ahead of traffic with the 0.6.16 `awa storage prepare-queue`, or retry the failed transaction.
 - 0.6.15 binaries ignore a prune halt and can still become maintenance leader. Upgrade or fence every process that can lead before relying on a halt, and check `awa control status`.
-- Binaries can roll back to 0.6.15 with the patches left in place. A 0.6.15 leader ignores a stored halt.
+- Faster rescue needs no migration and starts once the maintenance leader runs 0.6.16. On a fleet with a backlog of abandoned claims, expect a burst of retries as it drains: every rescued attempt counts against `max_attempts`, so its job goes back to `retryable` with the usual backoff (2^attempt seconds plus up to 25%, about 2 s for a first attempt) and becomes due at about the rate rescue drains, or fails or moves to the DLQ if that was its last attempt. Closures, retry rows and their WAL arrive at the same rate. Setting `rescue_pass_budget` or `rescue_pass_max_rows` to zero keeps the 0.6.15 cadence of one batch per rescue interval.
+- Binaries can roll back to 0.6.15 with the patches left in place. A 0.6.15 leader ignores a stored halt. Rolling the maintenance leader back restores the 0.6.15 rescue rate.
 
 ### Fixed
+
+**Rescue and heartbeats**
+
+- Queue-storage rescue drains a large backlog of abandoned claims in bounded time (#627). A killed runtime leaves every attempt it claimed open, and until they close, queue prune skips the queue slots they reference (`queue.unclosed_claim_refs`) and claim prune skips their claim slots, so neither ring can wrap. 0.6.15 rescued at most 500 attempts per kind per 30-second interval, about 33 a second, and its cursor scans reread every claim already swept. A rescue pass now takes 500-attempt batches, each in its own transaction, until a batch comes back short, `rescue_pass_budget` (default 1 s, at most half the rescue interval) is spent, or it has rescued `rescue_pass_max_rows` (default 5,000), and while a backlog remains the next pass runs a second later. Cursor scans seek through the index, so a batch costs the same at the end of a drain as at the start, and rescue runs without JIT, whose compilation took seconds per statement. With the defaults, 1.6 million abandoned row-local claims past their deadlines drained in about 17 minutes (1,600 a second) instead of about 13 hours, and both rings moved past the pinned slots about two minutes later. Deadline and callback rescue act on expired deadlines from their first pass; stale-heartbeat rescue takes more than one batch per pass only once runtime snapshots show the claims' owners gone, about 3 to 3.5 minutes after a runtime stops reporting with default settings. See [draining a backlog of abandoned claims](docs/configuration.md#rescue-backlog).
+- Heartbeats no longer queue behind a completion. Compact receipt claims are heartbeated by their claim batch and item index, an attempt whose closer holds its lock is skipped rather than waited for, and lease and progress writes skip rows a finalizer has locked and retry them on the next pass. One stalled completion could otherwise hold up a whole heartbeat pass until other attempts went stale and were rescued. A finished attempt stops flushing progress once its handler returns.
 
 **Enqueue deadlocks**
 
@@ -35,10 +41,12 @@ Recommended for everyone on 0.6.15 using queue storage. Batch inserts (`insert_m
 
 ### Changed
 
+- While a backlog remains, each rescue pass holds the maintenance leader for up to `rescue_pass_budget` plus one batch, so promotion, rotation and prune wait up to that long between passes. On DLQ-enabled queues, exhausted attempts move to the DLQ at the drain rate, and `Rescued` lifecycle hooks that run slower than the drain have events dropped, with a warning, once 1,024 are outstanding on a worker.
 - When the batch function's bounded retries run out, it makes one last attempt with ordinary lock waits, as 0.6.15 did. A per-row transaction that holds a lane for longer than about 2.5 s before it inserts one of the batch's keys can therefore still deadlock with it, as can cycles of three or more transactions. A cycle through a lock the batch's own transaction took in an earlier statement, which rolling back the batch cannot release, now ends in `40P01` after about 3 to 4 s instead of 1 to 2 s, and usually aborts the batch's transaction rather than the per-row one. A batch whose unique claims take longer than 500 ms to insert behaves as in 0.6.15; split such batches if they share keys or lanes with per-row producers.
 
 ### Added
 
+- `ClientBuilder::rescue_pass_budget` and `rescue_pass_max_rows` (Python `rescue_pass_budget_ms` and `rescue_pass_max_rows`) control how long and how far one queue-storage rescue pass drains. `awa.maintenance.rescue.pass_size` (by `awa.rescue.kind` and `awa.rescue.pass_end`) and `awa.maintenance.rescue.oldest_attempt_age` show a drain in progress.
 - Durable operator halt and resume for `maintenance.prune`, in drain mode: `awa control halt`, `status` and `resume`, or the `awa.halt_runtime_scope` and `awa.resume_runtime_scope` functions from an existing SQL session. Compatible leaders observe it on their existing session about once a second and stop admitting rotation, prune, rollups, cleanup, admin metadata refresh and descriptor publication; enqueue, dispatch, handlers, cron, promotion, rescue and admin batches continue. Resume names the current halt's UUID. Status lists live runtimes without supported, recent reports and cannot report the fleet halted while any remain. Older binaries ignore the control. See [runtime controls](docs/runtime-controls.md).
 
 ## [0.6.15] — 2026-11-09

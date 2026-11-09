@@ -5,6 +5,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use awa_model::queue_storage::ClaimHeartbeatRef;
+
 const IN_FLIGHT_SHARDS: usize = 64;
 
 pub(crate) type RunLease = i64;
@@ -17,6 +19,13 @@ type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
 pub(crate) struct InFlightState {
     pub cancel: CancelFlag,
     pub progress: Arc<std::sync::Mutex<ProgressState>>,
+    /// Compact receipt claim identity, when the attempt was dispatched from
+    /// queue storage with one; lets the heartbeat address the claim batch
+    /// directly.
+    pub claim: Option<ClaimHeartbeatRef>,
+    /// The handler has returned and the attempt waits for its finalize. It is
+    /// still heartbeated, but its progress is settled by the finalize.
+    pub finalizing: bool,
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -170,13 +179,26 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    pub fn keys(&self) -> Vec<InFlightKey> {
-        let mut keys = Vec::new();
+    /// Every attempt to heartbeat, with its compact claim identity, if any.
+    pub fn claim_refs(&self) -> Vec<(InFlightKey, Option<ClaimHeartbeatRef>)> {
+        let mut refs = Vec::new();
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
-            keys.extend(guard.keys().copied());
+            refs.extend(guard.iter().map(|(key, state)| (*key, state.claim)));
         }
-        keys
+        refs
+    }
+
+    /// The handler has returned: keep heartbeating the attempt until its
+    /// finalize is done, and stop flushing its progress.
+    pub fn mark_finalizing(&self, key: InFlightKey) {
+        let mut guard = self
+            .shard_for(&key)
+            .write()
+            .expect("in_flight shard poisoned");
+        if let Some(state) = guard.get_mut(&key) {
+            state.finalizing = true;
+        }
     }
 
     pub fn flags(&self) -> Vec<CancelFlag> {
@@ -198,6 +220,9 @@ impl InFlightRegistry {
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
             for (&(job_id, run_lease), state) in guard.iter() {
+                if state.finalizing {
+                    continue;
+                }
                 let mut progress = lock_progress(&state.progress);
                 if progress.has_pending() && progress.in_flight.is_none() {
                     if let Some(ref value) = progress.latest {
@@ -283,6 +308,8 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: progress.clone(),
+                claim: None,
+                finalizing: false,
             },
         );
 

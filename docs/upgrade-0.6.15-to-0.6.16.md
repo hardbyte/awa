@@ -107,6 +107,19 @@ As in 0.6.15 the patch replaces functions only: it builds no index and takes no 
 
 `admin::get_job` and the other queue-storage point reads of one job read again in a new snapshot when the first read finds nothing. In 0.6.14 and 0.6.15 a read whose snapshot predated a queue prune could miss a failed job while prune moved its row out of the slot being pruned, and return `JobNotFound`. This part needs no migration and applies to each process once it runs 0.6.16.
 
+## Rescue drains abandoned claims in passes
+
+This part needs no migration and applies once the maintenance leader runs 0.6.16. Queue-storage rescue no longer stops at 500 attempts per kind per interval. Each pass takes 500-attempt batches, each in its own short transaction, for up to `rescue_pass_budget` (default 1 s, at most half the rescue interval) or `rescue_pass_max_rows` (default 5,000) rescued attempts, and while a backlog remains the next pass runs a second later. A runtime killed while holding claims therefore stops pinning the queue and claim rings for hours: with default settings, 1.6 million abandoned row-local claims drained in about 17 minutes, where 0.6.15 needed about 13 hours.
+
+What changes on a fleet with a backlog:
+
+- Claims past their deadline drain from the first deadline pass after the leader starts. Stale-heartbeat passes, the only route for claims without a deadline (`deadline_duration` zero), take more than one batch only once runtime snapshots have shown the dead runtime gone for a full staleness window, about 3–3.5 minutes with default settings.
+- Rescued jobs return to `retryable` with their ordinary backoff, so they become due in bursts and the workers that run them see the backlog arrive within minutes rather than over hours. On DLQ-enabled queues, exhausted attempts move to the DLQ just as quickly.
+- Closures, retry rows and their WAL arrive at the drain rate, about 0.6 KB of closure WAL per claim plus the retry rows, which replicas and CDC consumers see as a burst.
+- Each pass holds the maintenance leader for up to its budget plus one batch, so promotion, rotation and prune run between passes.
+
+`rescue_pass_budget` and `rescue_pass_max_rows` (Python `rescue_pass_budget_ms` and `rescue_pass_max_rows`) tune the drain; zero for either keeps the 0.6.15 cadence of one batch per interval. Watch it with `awa.maintenance.rescue.pass_size` and `awa.maintenance.rescue.oldest_attempt_age`. See [draining a backlog of abandoned claims](configuration.md#rescue-backlog).
+
 ## Roll back
 
 Roll binaries back to 0.6.15 at any time and leave the patches installed:
