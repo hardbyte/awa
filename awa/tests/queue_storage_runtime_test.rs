@@ -21813,7 +21813,13 @@ async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
     .await
     .expect("Failed to read ensure_claim_batch_job_index");
     assert!(definer);
-    assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
+    assert_eq!(
+        config,
+        vec![
+            "search_path=pg_catalog, pg_temp".to_string(),
+            "quote_all_identifiers=off".to_string(),
+        ]
+    );
     assert!(!public_execute, "PUBLIC must not execute {function}");
 
     let grantee = "awa_qs_cbji_truncate_holder";
@@ -21955,6 +21961,117 @@ async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
         }
     }
     assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![0, 1]);
+}
+
+/// `(index name, partial)` for every GIN index on one claim partition.
+async fn claim_partition_gin_indexes(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    slot: i32,
+) -> Vec<(String, bool)> {
+    sqlx::query_as(
+        r#"
+        SELECT index_class.relname::text, index_meta.indpred IS NOT NULL
+        FROM pg_index AS index_meta
+        JOIN pg_class AS index_class ON index_class.oid = index_meta.indexrelid
+        JOIN pg_am AS method ON method.oid = index_class.relam
+        WHERE index_meta.indrelid = to_regclass(format('%I.lease_claim_batches_%s', $1::text, $2::int))
+          AND method.amname = 'gin'
+        ORDER BY 1
+        "#,
+    )
+    .bind(schema)
+    .bind(slot)
+    .fetch_all(pool)
+    .await
+    .expect("Failed to list claim partition GIN indexes")
+}
+
+/// Only a non-partial GIN index on `job_ids` counts as the claim batch index.
+/// A partial one under another name does not stop the real index being
+/// built; an index that already has the real index's name but another
+/// definition is reported and left in place, never dropped or mistaken for
+/// the real one. The check does not depend on the caller's
+/// `quote_all_identifiers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_batch_job_index_requires_a_full_job_ids_index() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cbji_shape";
+    let _store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    drop_claim_batch_job_index(&pool, schema, 0).await;
+    drop_claim_batch_job_index(&pool, schema, 1).await;
+
+    sqlx::raw_sql(&format!(
+        "CREATE INDEX lease_claim_batches_0_job_ids_idx \
+           ON {schema}.lease_claim_batches_0 USING GIN (job_ids) \
+           WHERE cardinality(job_ids) > 1; \
+         CREATE INDEX operator_partial_job_ids \
+           ON {schema}.lease_claim_batches_1 USING GIN (job_ids) \
+           WHERE cardinality(job_ids) > 1"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create partial job_ids indexes");
+
+    assert!(
+        !ensure_claim_batch_job_index(&pool, schema, 0).await,
+        "a partial index under the real index's name is not the real index"
+    );
+    assert_eq!(
+        claim_partition_gin_indexes(&pool, schema, 0).await,
+        vec![("lease_claim_batches_0_job_ids_idx".to_string(), true)],
+        "the conflicting index is left in place"
+    );
+
+    assert!(ensure_claim_batch_job_index(&pool, schema, 1).await);
+    assert_eq!(
+        claim_partition_gin_indexes(&pool, schema, 1).await,
+        vec![
+            ("lease_claim_batches_1_job_ids_idx".to_string(), false),
+            ("operator_partial_job_ids".to_string(), true),
+        ],
+        "a partial index under another name does not stand in for the real one"
+    );
+
+    // With the real index present the check returns before it would try
+    // to lock the partition, so a busy partition still reports indexed, even
+    // for a caller that quotes every identifier.
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.lease_claim_batches_1 IN ROW EXCLUSIVE MODE"
+    ))
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    let mut caller = pool.acquire().await.unwrap();
+    sqlx::query("SET quote_all_identifiers = on")
+        .execute(&mut *caller)
+        .await
+        .unwrap();
+    let indexed = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        ensure_claim_batch_job_index(&mut *caller, schema, 1),
+    )
+    .await
+    .expect("ensure_claim_batch_job_index must not wait for a busy partition");
+    sqlx::query("RESET quote_all_identifiers")
+        .execute(&mut *caller)
+        .await
+        .unwrap();
+    drop(caller);
+    writer.rollback().await.unwrap();
+    assert!(indexed, "the existing job_ids index must be recognised");
 }
 
 /// The `claim_batch_job_index` patch is versionless and idempotent, installs
@@ -22133,6 +22250,36 @@ async fn test_claim_batch_job_index_patch_leaves_indexing_to_claim_prune() {
         .find(|patch| patch.name == "claim_batch_job_index")
         .unwrap();
     assert_eq!(patch.outcome, migrations::PatchOutcome::AlreadyPresent);
+
+    // An index function from before the check pinned its settings (0.6.15)
+    // leaves the patch pending until it is replaced.
+    sqlx::raw_sql(&format!(
+        "ALTER FUNCTION {schema}.ensure_claim_batch_job_index(integer) \
+         RESET quote_all_identifiers"
+    ))
+    .execute(&pool)
+    .await
+    .expect("unpin the index function's settings");
+    let status = migrations::schema_patch_status(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|status| status.name == "claim_batch_job_index")
+        .unwrap();
+    assert!(!status.applied);
+    assert_eq!(
+        status.needs_repair,
+        vec![format!("claim batch job index in schema {schema}")]
+    );
+    let report = migrations::run_with_report(&pool).await.unwrap();
+    let patch = report
+        .patches
+        .iter()
+        .find(|patch| patch.name == "claim_batch_job_index")
+        .unwrap();
+    assert_eq!(patch.outcome, migrations::PatchOutcome::Applied);
+    assert!(patch.still_needs_repair.is_empty(), "{patch:?}");
+
     let patch_sql = migrations::SCHEMA_PATCHES
         .iter()
         .find(|patch| patch.name == "claim_batch_job_index")

@@ -356,13 +356,17 @@ macro_rules! definer_lane_provisioning_pending_sql {
 /// Rows naming what still lacks the `claim_batch_job_index` patch: the
 /// function that installs the per-schema index function, the installer, and
 /// each queue-storage schema with partitioned `lease_claim_batches` but no
-/// SECURITY DEFINER `ensure_claim_batch_job_index`. The indexes do not keep
-/// the patch pending: the patch builds none, and claim prune adds each one as
-/// it empties a partition.
+/// SECURITY DEFINER `ensure_claim_batch_job_index`. A helper or index function
+/// from before the index check required a non-partial index (0.6.15) is
+/// pending too. The indexes do not keep the patch pending: the patch builds
+/// none, and claim prune adds each one as it empties a partition.
 macro_rules! claim_batch_job_index_pending_sql {
     () => {
         "SELECT 'awa.refresh_claim_batch_job_index_helper'::text AS target \
-         WHERE to_regprocedure('awa.refresh_claim_batch_job_index_helper(text)') IS NULL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.oid = to_regprocedure('awa.refresh_claim_batch_job_index_helper(text)') \
+               AND p.prosrc LIKE '%indpred IS NULL%') \
          UNION ALL \
          SELECT 'awa.install_queue_storage_substrate' \
          WHERE EXISTS ( \
@@ -387,7 +391,9 @@ macro_rules! claim_batch_job_index_pending_sql {
                            WHERE p.pronamespace = n.oid \
                              AND p.proname = 'ensure_claim_batch_job_index' \
                              AND p.prosecdef \
-                             AND oidvectortypes(p.proargtypes) = 'integer')"
+                             AND oidvectortypes(p.proargtypes) = 'integer' \
+                             AND p.prosrc LIKE '%indpred IS NULL%' \
+                             AND 'quote_all_identifiers=off' = ANY (p.proconfig))"
     };
 }
 
