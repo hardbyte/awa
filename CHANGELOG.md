@@ -6,7 +6,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
+- Run `awa migrate` once as the schema owner to apply `prune_controls` after the existing `claim_batch_job_index` and `insert_jobs_compat_batch` patches. It adds two tables and functions without altering existing tables; schema stays v40. Upgrade or fence every possible maintenance leader before relying on halt. See the [0.6.15 to 0.6.16 upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
 - Run `awa migrate` once as the schema owner, before or after rolling binaries. It replaces the body of `awa.insert_jobs_compat_batch`, which a 0.6.15 database now reports as the pending `insert_jobs_compat_batch` patch, and takes no table locks. The fix is in the function, so 0.6.15 producers get it as soon as the patch commits. External migration runners: replace `R__insert_jobs_compat_batch.sql` along with the rest of the `R__` set from `awa migrate --extract-to <dir> --from 40`. See the [upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
+
+### Added
+
+- Durable operator halt/resume for `maintenance.prune`, in drain mode. Compatible leaders observe it on their existing session; dispatch, cron, promotion, rescue and enqueue continue. Status lists live runtimes without supported, recent reports and cannot report the fleet halted while any remain. Older binaries ignore the control. See [runtime controls](docs/runtime-controls.md).
 
 ### Fixed
 
