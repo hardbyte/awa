@@ -12041,15 +12041,14 @@ impl QueueStorage {
                     SELECT
                         claim_batches.claimed_at,
                         sum(claim_batches.claimed_count) FILTER (
-                            WHERE claim_batches.claimed_at > cursor_row.rescue_cursor_claimed_at
+                            WHERE claim_batches.claimed_at > (SELECT rescue_cursor_claimed_at FROM cursor_row)
                         ) OVER (
                             ORDER BY claim_batches.claimed_at, claim_batches.batch_id
                         ) AS covered
                     FROM {claim_batch_child} AS claim_batches
-                    CROSS JOIN cursor_row
                     WHERE claim_batches.claim_slot = $1
                       AND claim_batches.claimed_at < $2
-                      AND claim_batches.claimed_at >= cursor_row.rescue_cursor_claimed_at
+                      AND claim_batches.claimed_at >= (SELECT rescue_cursor_claimed_at FROM cursor_row)
                 ) AS running
                 WHERE running.covered >= $3
             ),
@@ -12073,14 +12072,13 @@ impl QueueStorage {
                     claims.closed_at,
                     false AS compact_batch
                     FROM {claim_child} AS claims
-                    CROSS JOIN cursor_row
                     WHERE claims.claim_slot = $1
                       AND claims.claimed_at < $2
                       AND (claims.claimed_at, claims.job_id, claims.run_lease)
                           > (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
                         )
                     ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
                     LIMIT $3
@@ -12104,7 +12102,6 @@ impl QueueStorage {
                     NULL::timestamptz AS closed_at,
                     true AS compact_batch
                 FROM {claim_batch_child} AS claim_batches
-                CROSS JOIN cursor_row
                 CROSS JOIN after_batch_bound
                 CROSS JOIN LATERAL unnest(
                     claim_batches.job_ids,
@@ -12116,14 +12113,14 @@ impl QueueStorage {
                 ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
                 WHERE claim_batches.claim_slot = $1
                   AND claim_batches.claimed_at < $2
-                  AND claim_batches.claimed_at >= cursor_row.rescue_cursor_claimed_at
+                  AND claim_batches.claimed_at >= (SELECT rescue_cursor_claimed_at FROM cursor_row)
                   AND claim_batches.claimed_at
                       <= COALESCE(after_batch_bound.claimed_at, 'infinity'::timestamptz)
                   AND (claim_batches.claimed_at, items.job_id, items.run_lease)
                       > (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
                         )
             ),
             after_cursor AS MATERIALIZED (
@@ -12145,15 +12142,14 @@ impl QueueStorage {
                     SELECT
                         claim_batches.claimed_at,
                         sum(claim_batches.claimed_count) FILTER (
-                            WHERE claim_batches.claimed_at < cursor_row.rescue_cursor_claimed_at
+                            WHERE claim_batches.claimed_at < (SELECT rescue_cursor_claimed_at FROM cursor_row)
                         ) OVER (
                             ORDER BY claim_batches.claimed_at, claim_batches.batch_id
                         ) AS covered
                     FROM {claim_batch_child} AS claim_batches
-                    CROSS JOIN cursor_row
                     WHERE claim_batches.claim_slot = $1
                       AND claim_batches.claimed_at < $2
-                      AND claim_batches.claimed_at <= cursor_row.rescue_cursor_claimed_at
+                      AND claim_batches.claimed_at <= (SELECT rescue_cursor_claimed_at FROM cursor_row)
                 ) AS running
                 WHERE running.covered >= $3
             ),
@@ -12177,15 +12173,14 @@ impl QueueStorage {
                     claims.closed_at,
                     false AS compact_batch
                     FROM {claim_child} AS claims
-                    CROSS JOIN cursor_row
                     WHERE (SELECT count FROM after_count) < $3
                       AND claims.claim_slot = $1
                       AND claims.claimed_at < $2
                       AND (claims.claimed_at, claims.job_id, claims.run_lease)
                           <= (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
                         )
                     ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
                     LIMIT $3
@@ -12209,7 +12204,6 @@ impl QueueStorage {
                     NULL::timestamptz AS closed_at,
                     true AS compact_batch
                 FROM {claim_batch_child} AS claim_batches
-                CROSS JOIN cursor_row
                 CROSS JOIN before_batch_bound
                 CROSS JOIN LATERAL unnest(
                     claim_batches.job_ids,
@@ -12222,14 +12216,14 @@ impl QueueStorage {
                 WHERE (SELECT count FROM after_count) < $3
                   AND claim_batches.claim_slot = $1
                   AND claim_batches.claimed_at < $2
-                  AND claim_batches.claimed_at <= cursor_row.rescue_cursor_claimed_at
+                  AND claim_batches.claimed_at <= (SELECT rescue_cursor_claimed_at FROM cursor_row)
                   AND claim_batches.claimed_at
                       <= COALESCE(before_batch_bound.claimed_at, 'infinity'::timestamptz)
                   AND (claim_batches.claimed_at, items.job_id, items.run_lease)
                       <= (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
                         )
             ),
             before_cursor AS MATERIALIZED (
@@ -12756,15 +12750,14 @@ impl QueueStorage {
                         ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                     ) AS rn
                 FROM {claim_child} AS claims
-                CROSS JOIN cursor_row
                 WHERE claims.claim_slot = $1
                   AND claims.deadline_at IS NOT NULL
                   AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       > (
-                          cursor_row.deadline_cursor_deadline_at,
-                          cursor_row.deadline_cursor_job_id,
-                          cursor_row.deadline_cursor_run_lease
+                          (SELECT deadline_cursor_deadline_at FROM cursor_row),
+                          (SELECT deadline_cursor_job_id FROM cursor_row),
+                          (SELECT deadline_cursor_run_lease FROM cursor_row)
                         )
                 ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                 LIMIT $2
@@ -12781,7 +12774,6 @@ impl QueueStorage {
                         ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                     ) AS rn
                 FROM {claim_child} AS claims
-                CROSS JOIN cursor_row
                 CROSS JOIN after_count
                 WHERE after_count.count < $2
                   AND claims.claim_slot = $1
@@ -12789,9 +12781,9 @@ impl QueueStorage {
                   AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       <= (
-                          cursor_row.deadline_cursor_deadline_at,
-                          cursor_row.deadline_cursor_job_id,
-                          cursor_row.deadline_cursor_run_lease
+                          (SELECT deadline_cursor_deadline_at FROM cursor_row),
+                          (SELECT deadline_cursor_job_id FROM cursor_row),
+                          (SELECT deadline_cursor_run_lease FROM cursor_row)
                         )
                 ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                 LIMIT (SELECT GREATEST($2 - count, 0) FROM after_count)
