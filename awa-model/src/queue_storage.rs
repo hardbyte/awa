@@ -31,6 +31,9 @@ const DRAIN_BATCH_SIZE: i64 = 1_000;
 // which takes seconds against milliseconds of execution.
 const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
 const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
+// Rescue cursor scans are estimated far above their real cost, enough to
+// JIT-compile them, which takes seconds against about 100 ms of execution.
+const RESCUE_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -16118,7 +16121,10 @@ impl QueueStorage {
         options: &RescueBatchOptions,
     ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(RESCUE_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let cutoff = Utc::now()
             - TimeDelta::from_std(staleness)
                 .map_err(|err| AwaError::Validation(format!("invalid staleness: {err}")))?;
@@ -16347,7 +16353,10 @@ impl QueueStorage {
         options: &RescueBatchOptions,
     ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(RESCUE_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut excluded = BTreeSet::new();
         let mut selected: Option<BTreeSet<(i64, i64)>> = None;
         loop {
@@ -16538,7 +16547,10 @@ impl QueueStorage {
         _options: &RescueBatchOptions,
     ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(RESCUE_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut excluded = BTreeSet::new();
         let mut selected: Option<BTreeSet<(i64, i64)>> = None;
         loop {
