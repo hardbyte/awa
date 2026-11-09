@@ -4,7 +4,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
-## [0.6.16] — 2026-11-09
+## [0.6.16] — 2026-11-10
 
 Recommended for everyone on 0.6.15 using queue storage. Rescue drains a large backlog of abandoned claims, which a killed runtime leaves behind and which stops the queue and claim rings from rotating, in minutes instead of the hours or days 0.6.15 took. Batch inserts (`insert_many_copy`, `insert_many_skip_unique_conflicts`) give way to per-row producers that share their keys or lanes instead of deadlocking with them, and creating a new queue lane no longer deadlocks between `QueueStorage` and SQL producers. Operators can durably halt and resume `maintenance.prune` across the fleet, `admin::get_job` no longer misses a failed job while prune moves it, and `awa migrate` re-applies the claim batch index and batch insert patches with fixes.
 
