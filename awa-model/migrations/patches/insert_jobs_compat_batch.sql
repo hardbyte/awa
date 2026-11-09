@@ -16,14 +16,15 @@
 -- Per-row producers take each job's claim and its lane together, so one can
 -- hold a lane the batch needs while it waits for a key the batch has claimed.
 -- The batch therefore takes its claims and lanes in a subtransaction whose
--- lock waits all end within a budget of its first lock: 500 ms, or half of the
+-- lock waits all end within a budget of its start: 500 ms, or half of the
 -- batch session's deadlock_timeout when that is lower. When a wait would run
 -- longer, the batch rolls back, which releases every claim and lane it took,
--- and retries. A per-row producer whose deadlock_timeout exceeds the budget
--- (PostgreSQL's default is 1 s) proceeds before its deadlock check runs, and
--- the batch never waits long enough to run one, so neither is aborted with
--- deadlock detected. A lane the batch gave up on is awaited first on the next
--- attempt, while it holds nothing, so a busy lane cannot starve it.
+-- and retries, so a per-row producer whose deadlock_timeout exceeds the budget
+-- (PostgreSQL's default is 1 s) usually proceeds before its deadlock check
+-- runs. After four budgets of retries the batch makes one last attempt with
+-- ordinary waits, as it did before it had a budget, so contention or a cycle
+-- through locks the caller took earlier ends in success, a lock timeout or
+-- deadlock detected, never in endless retries.
 --
 -- The column arrays are parallel and must have equal length. Every element is
 -- required except run_at, unique_key, unique_states and ordering_hash;
@@ -92,10 +93,8 @@ DECLARE
     v_caller_deadline TIMESTAMPTZ;
     v_phase TEXT;
     v_claims_one_by_one BOOLEAN := FALSE;
-    v_first_lane_queue TEXT;
-    v_first_lane_priority SMALLINT;
-    v_first_lane_shard SMALLINT;
-    v_seq_name TEXT;
+    v_bounded_until TIMESTAMPTZ;
+    v_final BOOLEAN := FALSE;
 BEGIN
     IF v_count = 0 THEN
         RETURN;
@@ -290,15 +289,21 @@ BEGIN
     LEFT JOIN awa.queue_meta AS meta ON meta.queue = input.queue;
 
     -- Every claim and lane the batch takes is taken inside one attempt, a
-    -- subtransaction. After an attempt's first lock, each lock wait ends
-    -- within the wait budget of that lock; a wait that would run longer rolls
-    -- the attempt back, which releases everything it took, and the batch
-    -- tries again. A per-row producer waiting on the batch is therefore
-    -- released before its own deadlock check, and the batch never waits long
-    -- enough to run one. The budget is capped because the per-row producer's
-    -- check runs on its own session's deadlock_timeout, which this session
-    -- cannot see. The caller's lock_timeout, when set, bounds the whole
-    -- insert.
+    -- subtransaction. Until the bounded phase ends, each lock wait in an
+    -- attempt ends within the wait budget of the attempt's start; a wait that
+    -- would run longer rolls the attempt back, which releases everything it
+    -- took, and the batch tries again. A per-row producer that holds a lane
+    -- and waits for one of the batch's keys is then released before its own
+    -- deadlock check runs, provided its deadlock_timeout exceeds the budget.
+    -- The budget is capped because that check runs on the other session's
+    -- deadlock_timeout, which this session cannot see.
+    --
+    -- Rolling back cannot release what the caller's transaction took before
+    -- this call, so retrying alone could spin forever on a cycle through such
+    -- a lock. After the bounded phase the batch makes one final attempt with
+    -- the caller's lock_timeout and ordinary waits, as the function did before
+    -- it had a budget: it succeeds, or PostgreSQL's deadlock detector or the
+    -- caller's lock_timeout ends it.
     v_caller_lock_timeout := current_setting('lock_timeout');
     v_wait_budget := LEAST(
         current_setting('deadlock_timeout')::interval / 2,
@@ -307,6 +312,54 @@ BEGIN
     IF v_caller_lock_timeout::interval > interval '0' THEN
         v_caller_deadline := clock_timestamp() + v_caller_lock_timeout::interval;
     END IF;
+    v_bounded_until := clock_timestamp() + 4 * v_wait_budget;
+
+    -- The result rows do not depend on claims or lanes, so they are built once,
+    -- before any lock, and the skipped rows are filtered out on return.
+    SELECT array_agg(
+        (
+            v_job_ids[input.ord],
+            input.kind,
+            input.queue,
+            input.args,
+            input.state::awa.job_state,
+            input.priority,
+            0::smallint,
+            input.max_attempts,
+            COALESCE(input.run_at, v_now),
+            NULL::timestamptz,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            v_now,
+            ARRAY[]::jsonb[],
+            input.metadata,
+            ARRAY(
+                SELECT tag.value
+                FROM jsonb_array_elements_text(input.tags) WITH ORDINALITY AS tag(value, tag_ord)
+                ORDER BY tag.tag_ord
+            ),
+            input.unique_key,
+            input.unique_states::bit(8),
+            NULL::uuid,
+            NULL::timestamptz,
+            NULL::text,
+            NULL::text,
+            NULL::text,
+            NULL::text,
+            0::bigint,
+            NULL::jsonb
+        )::awa.jobs
+        ORDER BY input.ord
+    )
+    INTO v_result
+    FROM unnest(
+        p_kind, p_queue, p_args, p_state, p_priority, p_max_attempts, p_run_at,
+        p_metadata, p_tags, p_unique_key, p_unique_states
+    ) WITH ORDINALITY AS input(
+        kind, queue, args, state, priority, max_attempts, run_at,
+        metadata, tags, unique_key, unique_states, ord
+    );
 
     LOOP
         v_attempt := v_attempt + 1;
@@ -318,42 +371,19 @@ BEGIN
             v_lane_starts := ARRAY[]::BIGINT[];
             v_attempt_started := clock_timestamp();
 
-            -- A lane whose wait ran out on an earlier attempt is awaited first,
-            -- while the attempt holds nothing, so the batch keeps its place
-            -- in that lane's queue for as long as the caller allows. The key
-            -- is the one reserve_enqueue_seq locks.
-            v_phase := 'first_lane';
-            IF v_first_lane_queue IS NOT NULL THEN
-                SELECT heads.seq_name
-                INTO v_seq_name
-                FROM queue_enqueue_heads AS heads
-                WHERE heads.queue = v_first_lane_queue
-                  AND heads.priority = v_first_lane_priority
-                  AND heads.enqueue_shard = v_first_lane_shard;
-                IF v_seq_name IS NOT NULL THEN
-                    PERFORM set_config(
-                        'lock_timeout',
-                        CASE WHEN v_caller_deadline IS NULL THEN '0'
-                             ELSE format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
-                                 v_caller_deadline - clock_timestamp())))::bigint)
-                        END,
-                        true
-                    );
-                    PERFORM pg_advisory_xact_lock(
-                        hashtextextended(format('%I.%I', v_schema, v_seq_name), 0)
-                    );
-                    v_attempt_started := clock_timestamp();
-                END IF;
-            END IF;
-
             -- Claims go in unique-key order, so two producers with overlapping
             -- keys cannot wait on each other in opposite orders. The first
             -- attempt inserts them in one statement and gives way to any
-            -- in-flight claim of the same key; after that, key by key, each
-            -- waiting at most for the rest of the attempt's budget.
+            -- in-flight claim of the same key; later bounded attempts go key
+            -- by key, each waiting at most for the rest of the budget; the
+            -- final attempt inserts them in one statement with ordinary waits.
             v_phase := 'claims';
-            IF NOT v_claims_one_by_one THEN
-                PERFORM set_config('lock_timeout', '1ms', true);
+            IF v_final OR NOT v_claims_one_by_one THEN
+                PERFORM set_config(
+                    'lock_timeout',
+                    CASE WHEN v_final THEN v_caller_lock_timeout ELSE '1ms' END,
+                    true
+                );
                 IF p_skip_unique_conflicts THEN
                     WITH claimed AS (
                         INSERT INTO awa.job_unique_claims (unique_key, job_id)
@@ -458,54 +488,6 @@ BEGIN
             WHERE input.state <> 'available'
               AND v_job_ids[input.ord] <> ALL (v_skipped);
 
-            -- The result rows do not depend on the lanes, so build them before
-            -- the lock window opens.
-            SELECT array_agg(
-                (
-                    v_job_ids[input.ord],
-                    input.kind,
-                    input.queue,
-                    input.args,
-                    input.state::awa.job_state,
-                    input.priority,
-                    0::smallint,
-                    input.max_attempts,
-                    COALESCE(input.run_at, v_now),
-                    NULL::timestamptz,
-                    NULL::timestamptz,
-                    NULL::timestamptz,
-                    NULL::timestamptz,
-                    v_now,
-                    ARRAY[]::jsonb[],
-                    input.metadata,
-                    ARRAY(
-                        SELECT tag.value
-                        FROM jsonb_array_elements_text(input.tags) WITH ORDINALITY AS tag(value, tag_ord)
-                        ORDER BY tag.tag_ord
-                    ),
-                    input.unique_key,
-                    input.unique_states::bit(8),
-                    NULL::uuid,
-                    NULL::timestamptz,
-                    NULL::text,
-                    NULL::text,
-                    NULL::text,
-                    NULL::text,
-                    0::bigint,
-                    NULL::jsonb
-                )::awa.jobs
-                ORDER BY input.ord
-            )
-            INTO v_result
-            FROM unnest(
-                p_kind, p_queue, p_args, p_state, p_priority, p_max_attempts, p_run_at,
-                p_metadata, p_tags, p_unique_key, p_unique_states
-            ) WITH ORDINALITY AS input(
-                kind, queue, args, state, priority, max_attempts, run_at,
-                metadata, tags, unique_key, unique_states, ord
-            )
-            WHERE v_job_ids[input.ord] <> ALL (v_skipped);
-
             -- Lane lock window: in (queue, priority, shard) order, register each
             -- lane the batch is the first to use and reserve its sequence
             -- range once, then write the ready rows. The locks are held to the
@@ -533,9 +515,10 @@ BEGIN
                 ) AS lanes
                 ORDER BY lanes.queue COLLATE "C", lanes.priority, lanes.shard
             LOOP
-                PERFORM set_config('lock_timeout', format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
-                    LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
-                    - clock_timestamp())))::bigint), true);
+                PERFORM set_config('lock_timeout', CASE WHEN v_final THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
+                        LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
+                        - clock_timestamp())))::bigint) END, true);
 
                 INSERT INTO queue_lanes (queue, priority)
                 SELECT v_lane.queue, v_lane.priority
@@ -544,6 +527,11 @@ BEGIN
                     WHERE existing.queue = v_lane.queue AND existing.priority = v_lane.priority
                 )
                 ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
+
+                PERFORM set_config('lock_timeout', CASE WHEN v_final THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
+                        LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
+                        - clock_timestamp())))::bigint) END, true);
 
                 INSERT INTO queue_enqueue_heads (queue, priority, enqueue_shard)
                 SELECT v_lane.queue, v_lane.priority, v_lane.shard
@@ -555,6 +543,11 @@ BEGIN
                 )
                 ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
 
+                PERFORM set_config('lock_timeout', CASE WHEN v_final THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
+                        LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
+                        - clock_timestamp())))::bigint) END, true);
+
                 INSERT INTO queue_claim_heads (queue, priority, enqueue_shard)
                 SELECT v_lane.queue, v_lane.priority, v_lane.shard
                 WHERE NOT EXISTS (
@@ -565,9 +558,10 @@ BEGIN
                 )
                 ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
 
-                PERFORM set_config('lock_timeout', format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
-                    LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
-                    - clock_timestamp())))::bigint), true);
+                PERFORM set_config('lock_timeout', CASE WHEN v_final THEN v_caller_lock_timeout
+                    ELSE format('%sms', GREATEST(1, ceil(1000 * extract(epoch FROM
+                        LEAST(v_attempt_started + v_wait_budget, COALESCE(v_caller_deadline, 'infinity'))
+                        - clock_timestamp())))::bigint) END, true);
 
                 EXECUTE format('SELECT %I.reserve_enqueue_seq($1, $2, $3, $4)', v_schema)
                 INTO v_start
@@ -579,19 +573,13 @@ BEGIN
                 v_lane_starts := v_lane_starts || v_start;
             END LOOP;
         EXCEPTION WHEN lock_not_available THEN
-            -- The wait the caller allowed has run out.
-            IF v_phase = 'first_lane'
-               OR clock_timestamp() >= COALESCE(v_caller_deadline, 'infinity')
-            THEN
+            IF v_final OR clock_timestamp() >= COALESCE(v_caller_deadline, 'infinity') THEN
                 RAISE;
             END IF;
             IF v_phase = 'claims' THEN
                 v_claims_one_by_one := TRUE;
-            ELSE
-                v_first_lane_queue := v_lane.queue;
-                v_first_lane_priority := v_lane.priority;
-                v_first_lane_shard := v_lane.shard;
             END IF;
+            v_final := clock_timestamp() >= v_bounded_until;
             PERFORM pg_sleep(
                 LEAST(0.1, 0.001 * power(2, LEAST(v_attempt, 7))) * (0.5 + random() / 2)
             );
@@ -715,7 +703,9 @@ BEGIN
             DO NOTHING;
     END IF;
 
-    RETURN QUERY SELECT * FROM unnest(v_result);
+    RETURN QUERY
+    SELECT * FROM unnest(v_result) AS result
+    WHERE result.id <> ALL (v_skipped);
 
     IF cardinality(v_lane_queues) > 0 THEN
         PERFORM pg_notify('awa:' || notified.queue, '')

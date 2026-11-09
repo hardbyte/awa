@@ -851,75 +851,6 @@ async fn multi_statement_producer_and_batch_in_opposite_lane_order_do_not_deadlo
     }
 }
 
-/// A lane held for longer than the batch's bounded wait: the batch gives its
-/// unique claims back and then waits for that lane first, holding nothing, so
-/// its key stays free for others while it keeps its place in the lane's queue.
-/// It lands as soon as the lane is released.
-#[tokio::test]
-async fn batch_waits_for_a_busy_lane_without_holding_its_claims() {
-    let _guard = ENGINE_GUARD.lock().await;
-    let pool = queue_storage_pool().await;
-    let queue = unique_queue("busy_lane");
-    insert_many(&pool, &[job(&queue, -1, false)])
-        .await
-        .expect("provision lane");
-
-    let key = lane_lock_key(&pool, &queue).await;
-    let mut gate = pool.begin().await.expect("begin gate");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(key)
-        .execute(&mut *gate)
-        .await
-        .expect("take lane lock");
-
-    let batch_job = job(&queue, 0, true);
-    let unique_key = awa::model::prepare_raw_job_insert(
-        batch_job.kind.clone(),
-        batch_job.args.clone(),
-        batch_job.opts.clone(),
-    )
-    .expect("prepare job")
-    .unique_key()
-    .expect("unique key")
-    .to_vec();
-    let batch = {
-        let pool = pool.clone();
-        tokio::spawn(async move { insert_many_skip_unique_conflicts(&pool, &[batch_job]).await })
-    };
-    wait_until_lane_awaited(&pool, key, "batch").await;
-
-    // Past the first attempt's wait budget (500 ms) and its retry pause, the
-    // batch waits for the lane with nothing claimed.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let mut probe = pool.begin().await.expect("begin probe");
-    sqlx::query("SET LOCAL lock_timeout = '100ms'")
-        .execute(&mut *probe)
-        .await
-        .expect("set lock timeout");
-    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, 0)")
-        .bind(&unique_key)
-        .execute(&mut *probe)
-        .await
-        .expect("the batch holds no claim while it waits for the busy lane");
-    probe.rollback().await.expect("roll back probe");
-    wait_until_lane_awaited(&pool, key, "batch").await;
-    assert!(!batch.is_finished(), "the batch still waits for the lane");
-
-    gate.commit().await.expect("release lane lock");
-    let inserted = tokio::time::timeout(WAIT_DEADLINE, batch)
-        .await
-        .expect("batch finished")
-        .expect("batch task")
-        .expect("insert batch");
-    assert_eq!(inserted.len(), 1);
-    let seqs: Vec<i64> = ready_lane_seqs(&pool, &queue)
-        .await
-        .into_iter()
-        .map(|(seq, _)| seq)
-        .collect();
-    assert_eq!(seqs, vec![-1, 0]);
-}
-
 /// The caller's `lock_timeout` bounds the whole batch insert: a lane held
 /// throughout fails it with `lock_not_available`, as it fails a per-row
 /// insert, and the batch leaves its unique claims behind.
@@ -1120,4 +1051,202 @@ fn filler_job(lanes: &[String], round: usize, task: usize, lane: usize) -> Inser
             ..Default::default()
         },
     }
+}
+
+/// A batch whose caller already holds a lane from an earlier statement, and a
+/// per-row producer that holds one of the batch's keys and then waits for that
+/// lane. Rolling back the batch's attempts cannot release the caller's lane,
+/// so this is a real deadlock. It must end, as it did before the batch had a
+/// wait budget, with PostgreSQL aborting one side, not with the batch retrying
+/// forever. The per-row producer's session has a long `deadlock_timeout`, so
+/// only the batch's side can run the deadlock check in time.
+#[tokio::test]
+async fn batch_in_a_transaction_that_already_holds_a_lane_ends_a_cycle() {
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let patient_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            PgConnectOptions::from_str(&setup::database_url())
+                .expect("parse database url")
+                .options([("deadlock_timeout", "60s")]),
+        )
+        .await
+        .expect("connect with a long deadlock_timeout");
+    let suffix = &Uuid::new_v4().simple().to_string()[..12];
+    let lane_1 = format!("batch_caller_1_{suffix}");
+    let lane_2 = format!("batch_caller_2_{suffix}");
+    insert_many(&pool, &[job(&lane_1, -1, false), job(&lane_2, -1, false)])
+        .await
+        .expect("provision lanes");
+
+    // The per-row producer claims the key and holds lane 2.
+    let mut per_row = patient_pool.begin().await.expect("begin per-row producer");
+    insert_many(&mut *per_row, &[job(&lane_2, 0, true)])
+        .await
+        .expect("per-row producer claims the key");
+
+    // The caller holds lane 1, then its batch waits for the key.
+    let (holds_lane_1, lane_1_held) = tokio::sync::oneshot::channel();
+    let caller = {
+        let pool = pool.clone();
+        let lane_1 = lane_1.clone();
+        let lane_2 = lane_2.clone();
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await?;
+            insert_many(&mut *tx, &[job(&lane_1, 100, false)]).await?;
+            let _ = holds_lane_1.send(());
+            let inserted =
+                insert_many_skip_unique_conflicts(&mut *tx, &[job(&lane_2, 0, true)]).await?;
+            tx.commit().await?;
+            Ok::<_, AwaError>(inserted)
+        })
+    };
+    lane_1_held.await.expect("the caller took lane 1");
+    let per_row_outcome = tokio::time::timeout(WAIT_DEADLINE, async {
+        insert_many(&mut *per_row, &[job(&lane_1, 200, false)]).await?;
+        per_row.commit().await?;
+        Ok::<_, AwaError>(())
+    })
+    .await
+    .expect("the per-row producer's side of the cycle ended");
+    let caller_outcome = tokio::time::timeout(WAIT_DEADLINE, caller)
+        .await
+        .expect("the caller's side of the cycle ended")
+        .expect("caller task");
+
+    let deadlocks = [
+        per_row_outcome
+            .as_ref()
+            .err()
+            .is_some_and(AwaError::is_deadlock),
+        caller_outcome
+            .as_ref()
+            .err()
+            .is_some_and(AwaError::is_deadlock),
+    ];
+    assert_eq!(
+        deadlocks.iter().filter(|aborted| **aborted).count(),
+        1,
+        "exactly one side is aborted with deadlock detected: per-row {per_row_outcome:?}, \
+         caller {caller_outcome:?}"
+    );
+    assert!(per_row_outcome.is_ok() || caller_outcome.is_ok());
+}
+
+/// Two lanes held for longer than the batch's bounded phase: the batch's last
+/// attempt waits for them as an ordinary producer would, and lands as soon as
+/// they are released.
+#[tokio::test]
+async fn batch_lands_once_two_long_held_lanes_are_released() {
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let suffix = &Uuid::new_v4().simple().to_string()[..12];
+    let lane_a = format!("batch_held_a_{suffix}");
+    let lane_b = format!("batch_held_b_{suffix}");
+    insert_many(&pool, &[job(&lane_a, -1, false), job(&lane_b, -1, false)])
+        .await
+        .expect("provision lanes");
+
+    let mut gates = Vec::new();
+    for lane in [&lane_a, &lane_b] {
+        let mut gate = pool.begin().await.expect("begin gate");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lane_lock_key(&pool, lane).await)
+            .execute(&mut *gate)
+            .await
+            .expect("take lane lock");
+        gates.push(gate);
+    }
+    let started = Instant::now();
+    let batch = {
+        let pool = pool.clone();
+        let jobs = vec![job(&lane_a, 0, true), job(&lane_b, 0, true)];
+        tokio::spawn(async move { insert_many_skip_unique_conflicts(&pool, &jobs).await })
+    };
+    // Past the bounded phase (four 500 ms budgets).
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert!(
+        !batch.is_finished(),
+        "the batch waits while the lanes are held"
+    );
+    for gate in gates {
+        gate.commit().await.expect("release lane");
+    }
+    let inserted = tokio::time::timeout(WAIT_DEADLINE, batch)
+        .await
+        .expect("batch finished")
+        .expect("batch task")
+        .expect("insert batch");
+    assert_eq!(inserted.len(), 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "landed promptly on release"
+    );
+    for lane in [&lane_a, &lane_b] {
+        let seqs: Vec<i64> = ready_lane_seqs(&pool, lane)
+            .await
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(seqs, vec![-1, 0]);
+    }
+}
+
+/// The claim cycle with a 20,000-row batch whose last key in key order is the
+/// one the per-row producer inserts: preparing the batch must not eat the wait
+/// budget, so the batch still gives way.
+#[tokio::test]
+async fn large_batch_gives_way_to_a_per_row_producer() {
+    const ROWS: i64 = 20_000;
+    let _guard = ENGINE_GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("large_cycle");
+    insert_many(&pool, &[job(&queue, -1, false)])
+        .await
+        .expect("provision lane");
+
+    let jobs: Vec<InsertParams> = (0..ROWS).map(|seq| job(&queue, seq, true)).collect();
+    let last_in_key_order = jobs
+        .iter()
+        .max_by_key(|job| {
+            awa::model::prepare_raw_job_insert(job.kind.clone(), job.args.clone(), job.opts.clone())
+                .expect("prepare job")
+                .unique_key()
+                .expect("unique key")
+                .to_vec()
+        })
+        .expect("a job")
+        .clone();
+
+    let mut per_row = pool.begin().await.expect("begin per-row producer");
+    insert_many(&mut *per_row, &[job(&queue, ROWS + 1, false)])
+        .await
+        .expect("per-row insert takes the lane");
+    let batch = {
+        let pool = pool.clone();
+        tokio::spawn(async move { insert_many_skip_unique_conflicts(&pool, &jobs).await })
+    };
+    wait_until_lane_awaited(&pool, lane_lock_key(&pool, &queue).await, "batch").await;
+
+    tokio::time::timeout(
+        WAIT_DEADLINE,
+        insert_many(&mut *per_row, &[last_in_key_order]),
+    )
+    .await
+    .expect("per-row insert of the batch's last key finished")
+    .expect("per-row insert of the batch's last key");
+    per_row.commit().await.expect("commit per-row producer");
+
+    let inserted = tokio::time::timeout(WAIT_DEADLINE, batch)
+        .await
+        .expect("batch finished")
+        .expect("batch task")
+        .expect("insert batch");
+    assert_eq!(
+        inserted.len() as i64,
+        ROWS - 1,
+        "the batch skips the committed key"
+    );
+    assert_eq!(ready_lane_seqs(&pool, &queue).await.len() as i64, ROWS + 2);
 }
