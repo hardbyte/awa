@@ -16,13 +16,10 @@ def load(name):
 
 
 def main():
-    evidence, fast, archive = (load(name) for name in ('evidence', 'offline_core', 'archive'))
+    evidence, archive = (load(name) for name in ('evidence', 'archive'))
     fixture = HERE / 'fixtures/synthetic.json'
     rows = fixture.read_text().splitlines()
     assert len(rows) == 41
-    for row in map(json.loads, rows):
-        message = row['message']
-        assert fast.split_sql(message) == evidence.core.split_sql(message)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         source = {'path': str(fixture), 'original_path': 'synthetic.json', 'source_key': 'synthetic:stable', 'gzip': False}
@@ -64,7 +61,7 @@ def main():
         invalid = evidence.replay([dict(source, path=str(partial))], root / 'invalid')
         assert any(row['reason'] == 'invalid JSON' for row in invalid['invalid'])
         assert any(row['reason'] == 'partial EOF' for row in invalid['invalid'])
-    print('41 synthetic records: parser equivalence, event bytes, provenance multiplicity, archive corruption, partial/invalid JSON controls passed')
+    print('41 synthetic records: replay event bytes, provenance multiplicity, archive corruption, partial/invalid JSON controls passed')
 
 
 if __name__ == '__main__':

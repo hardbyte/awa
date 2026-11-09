@@ -1,9 +1,8 @@
-import collections,threading,gzip,hashlib,importlib.util,json,os,pathlib,re,time
+import collections,threading,gzip,hashlib,importlib.util,json,pathlib,re,time
 HERE=pathlib.Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('core_parser',HERE/'core_parser.py');core=importlib.util.module_from_spec(spec);spec.loader.exec_module(core)
-oldspec=importlib.util.spec_from_file_location('old_telemetry',HERE/'log_helpers.py');old=importlib.util.module_from_spec(oldspec);oldspec.loader.exec_module(old)
-family=old.family;issuer=old.issuer;digest=old.digest
-CRASH=old.CRASH;SEVERE=old.SEVERE
+CRASH=('terminated by signal','TRAP:','server process (PID','PANIC:','all server processes terminated','database system was not properly shut down','restart_after_crash','buffer control','signal 9','signal 11')
+SEVERE={'WARNING','ERROR','FATAL','PANIC'}
 class InodePump:
     def __init__(self,raw,feed,cap=16*1024**2,line_cap=1024**2):
         self.raw=pathlib.Path(raw);self.feed=pathlib.Path(feed);self.feed.touch(exist_ok=False);self.cap=cap;self.line_cap=line_cap;self.streams={};self.emitted=[];self.errors=[];self.crashes=[];self.bytes=0;self.next_ordinal=0;self.lock=threading.RLock()
@@ -106,8 +105,7 @@ class Utilities:
         (self.out/'utility-summary.json').write_text(json.dumps(result,indent=2)+'\n');return result
 
 def replay(sources,out,event_cap=256*1024**2):
-    offline_spec=importlib.util.spec_from_file_location('offline_parser',HERE/'offline_core.py');offline_core=importlib.util.module_from_spec(offline_spec);offline_spec.loader.exec_module(offline_core)
-    out=pathlib.Path(out);out.mkdir(exist_ok=True);utility=Utilities(out,cap=event_cap,classify_statement=offline_core.classify);selected=[];invalid=[]
+    out=pathlib.Path(out);out.mkdir(exist_ok=True);utility=Utilities(out,cap=event_cap);selected=[];invalid=[]
     for source in sources:
         opener=gzip.open if source.get('gzip') else open;offset=0
         with opener(source['path'],'rb') as f:

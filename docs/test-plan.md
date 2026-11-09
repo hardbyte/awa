@@ -406,22 +406,22 @@ Record the collector image digest separately. The wrapper writes raw metric
 JSON, a collector log and a coverage receipt. Its size caps stop capture; they do
 not rotate or discard evidence, and the receipt requires delivery validation.
 
-The ignored `lock_pressure_drain_test` target exercises a finite 50,000-claim
-rescue backlog with logged completion witnesses, rollback and pruning controls.
-The ignored `read_footprint_test` target samples relation locks held by public
-operations and a bulk failed-to-DLQ query plan. Both create disposable databases
-using `DATABASE_URL` and require a role with `CREATEDB`. Run each explicitly with
-`cargo test -p awa --test <target> -- --ignored --nocapture`. Their probes affect
-the measured workload; use them as diagnostics rather than latency acceptance
-benchmarks.
+`bulk_rescue_test` installs the same completion witness for its 50,000-claim
+abandoned backlog, so it checks every committed recovery and live completion
+against the attempts its handlers ran even after prune has removed them.
 
-`operation_lock_footprint_test` is a separate ignored controlled operation
-fixture. Its `OP_START` and `OP_END` JSON markers bracket only the API call;
-backend identity checks and result assertions run outside that window. It
-samples 26 public operations with maintenance disabled and default ring sizes.
-Require the fixture's separate assertions and PASS markers before treating an
-API-success marker as a validated operation. Run it with the same `DATABASE_URL`
-and explicit ignored-test invocation as the other footprint diagnostic.
+The ignored `operation_lock_footprint_test` target holds two diagnostics. A
+controlled operation fixture samples 26 public operations with maintenance
+disabled and default ring sizes; its `OP_START` and `OP_END` JSON markers
+bracket only the API call, and backend identity checks and result assertions
+run outside that window. Require the fixture's separate assertions and PASS
+markers before treating an API-success marker as a validated operation. A
+second test logs the actual plan of a 10,000-job bulk failed-to-DLQ move. Both
+create disposable databases using `DATABASE_URL` and require a role with
+`CREATEDB`; run them with
+`cargo test -p awa --test operation_lock_footprint_test -- --ignored --nocapture`.
+Their probes affect the measured workload; use them as diagnostics rather than
+latency acceptance benchmarks.
 
 ## Running Tests
 

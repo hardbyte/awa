@@ -1,5 +1,7 @@
-//! Controlled operation fixture with API-only timing and backend identity markers.
-//! Maintenance is disabled; the fixture uses default ring sizes.
+//! Opt-in diagnostics in disposable databases: a controlled operation fixture
+//! with API-only timing and backend identity markers, and the query plan of a
+//! 10,000-job bulk failed-to-DLQ move. Maintenance is disabled; the fixture
+//! uses default ring sizes.
 
 use awa::model::{
     admin, migrations, InsertOpts, InsertParams, JobState, QueueStorage, QueueStorageConfig,
@@ -546,6 +548,66 @@ async fn retained_relation_locks_for_public_operations() -> Result<(), Error> {
         Ok(())
     }
     .await;
+    setup.close().await;
+    let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "opt-in diagnostic; creates a disposable database"]
+async fn bulk_failed_to_dlq_actual_plan_at_10k() -> Result<(), Error> {
+    let url = std::env::var("DATABASE_URL")?;
+    let admin_options = PgConnectOptions::from_str(&url)?;
+    let admin = pool(&admin_options, "terminal_plan_setup").await?;
+    let database = format!("awa_terminal_plan_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await?;
+    let options = admin_options.database(&database);
+    let setup = pool(&options, "terminal_plan_setup").await?;
+    let result: Result<(), Error> = async {
+        migrations::run(&setup).await?;
+        let store = QueueStorage::new(QueueStorageConfig::default())?;
+        store.install(&setup).await?;
+        let queue = "terminal_plan_10k";
+        let seed_started = std::time::Instant::now();
+        let ids = failed_jobs(&store, &setup, queue, 10_000).await?;
+        let expected: Vec<(i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT job_id,args FROM awa.ready_entries WHERE queue=$1 ORDER BY job_id",
+        ).bind(queue).fetch_all(&setup).await?;
+        check(expected.len() == 10_000 && expected.iter().map(|row| row.0).eq(ids.iter().copied()), "10k seed identity differs")?;
+        sqlx::raw_sql("ANALYZE awa.done_entries; ANALYZE awa.ready_entries; ANALYZE awa.ready_tombstones")
+            .execute(&setup).await?;
+        eprintln!("TERMINAL_PLAN_SEED count=10000 seconds={:.6}", seed_started.elapsed().as_secs_f64());
+        let measured = pool(&options, "awa_terminal_explain_bulk_dlq").await?;
+        sqlx::raw_sql("LOAD 'auto_explain'; SET auto_explain.log_min_duration=0; SET auto_explain.log_analyze=on; SET auto_explain.log_buffers=on; SET auto_explain.log_timing=off; SET auto_explain.log_format=json; SET auto_explain.log_nested_statements=on; SET auto_explain.sample_rate=1")
+            .execute(&measured).await?;
+        let settings: Vec<(String, String)> = sqlx::query_as("SELECT name,setting FROM pg_settings WHERE name LIKE 'auto_explain.%' ORDER BY name")
+            .fetch_all(&measured).await?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&measured).await?;
+        eprintln!("TERMINAL_PLAN_SETTINGS pid={pid} settings={}", serde_json::to_string(&settings)?);
+        eprintln!("TERMINAL_PLAN_PHASE workload_start");
+        let started = std::time::Instant::now();
+        let moved = store.bulk_move_failed_to_dlq(&measured, None, Some(queue), "plan-10k").await;
+        let seconds = started.elapsed().as_secs_f64();
+        measured.close().await;
+        check(moved? == 10_000, "10k DLQ move count differs")?;
+        let actual: (i64, i64, i64) = sqlx::query_as("SELECT count(*),count(*) FILTER(WHERE args->>'body'='retained-terminal-body' AND max_attempts=1 AND priority=3),(SELECT count(*) FROM awa.done_entries WHERE queue=$1) FROM awa.dlq_entries WHERE queue=$1")
+            .bind(queue).fetch_one(&setup).await?;
+        check(actual == (10_000, 10_000, 0), "10k move lost or corrupted bodies")?;
+        let actual_bodies: Vec<(i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT job_id,args FROM awa.dlq_entries WHERE queue=$1 ORDER BY job_id",
+        ).bind(queue).fetch_all(&setup).await?;
+        check(actual_bodies == expected, "10k move changed an identity or per-job body")?;
+        eprintln!("TERMINAL_PLAN_PHASE recovered");
+        eprintln!("TERMINAL_PLAN_API moved=10000 seconds={seconds:.6} body_checks={actual:?} PASS");
+        Ok(())
+    }.await;
     setup.close().await;
     let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
         .execute(&admin)
