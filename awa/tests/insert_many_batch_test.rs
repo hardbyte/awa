@@ -10,6 +10,7 @@
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test insert_many_batch_test -- --nocapture`
 
+use awa::model::unique::compute_unique_key;
 use awa::model::{
     insert_many, insert_many_copy_from_pool, insert_many_skip_unique_conflicts, AwaError,
     QueueStorage,
@@ -374,6 +375,154 @@ async fn canonical_storage_inserts_and_skips_row_by_row() {
             .collect::<Vec<_>>(),
         vec![0, 2, 3]
     );
+}
+
+/// Call `awa.insert_jobs_compat_batch` directly with `p_skip_unique_conflicts`
+/// set explicitly. The Rust entry points pass `true` whenever a batch has a
+/// unique key, so only a direct caller reaches the failing mode with one.
+async fn insert_through_batch_function(
+    pool: &PgPool,
+    jobs: &[InsertParams],
+    skip_unique_conflicts: bool,
+) -> Result<Vec<awa::JobRow>, sqlx::Error> {
+    let unique_keys: Vec<Option<Vec<u8>>> = jobs
+        .iter()
+        .map(|job| {
+            job.opts.unique.as_ref().map(|unique| {
+                compute_unique_key(
+                    &job.kind,
+                    unique.by_queue.then_some(job.opts.queue.as_str()),
+                    unique.by_args.then_some(&job.args),
+                    unique.by_period,
+                )
+            })
+        })
+        .collect();
+    // PostgreSQL's leftmost bit is UniqueOpts bit 0.
+    let unique_states: Vec<Option<String>> = jobs
+        .iter()
+        .map(|job| {
+            job.opts.unique.as_ref().map(|unique| {
+                (0..8)
+                    .map(|bit| {
+                        if unique.states & (1 << bit) != 0 {
+                            '1'
+                        } else {
+                            '0'
+                        }
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+    sqlx::query_as(
+        r#"
+        SELECT *
+        FROM awa.insert_jobs_compat_batch(
+            $1::text[], $2::text[], $3::jsonb[],
+            array_fill('available'::text, ARRAY[cardinality($1::text[])]),
+            array_fill(2::smallint, ARRAY[cardinality($1::text[])]),
+            array_fill(25::smallint, ARRAY[cardinality($1::text[])]),
+            array_fill(NULL::timestamptz, ARRAY[cardinality($1::text[])]),
+            array_fill('{}'::jsonb, ARRAY[cardinality($1::text[])]),
+            array_fill('[]'::jsonb, ARRAY[cardinality($1::text[])]),
+            $4::bytea[], $5::text[],
+            array_fill(NULL::text, ARRAY[cardinality($1::text[])]),
+            $6
+        )
+        "#,
+    )
+    .bind(jobs.iter().map(|job| job.kind.as_str()).collect::<Vec<_>>())
+    .bind(
+        jobs.iter()
+            .map(|job| job.opts.queue.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(jobs.iter().map(|job| &job.args).collect::<Vec<_>>())
+    .bind(unique_keys)
+    .bind(unique_states)
+    .bind(skip_unique_conflicts)
+    .fetch_all(pool)
+    .await
+}
+
+async fn jobs_in_queue(pool: &PgPool, queue: &str) -> Vec<i64> {
+    sqlx::query_scalar("SELECT (args->>'seq')::bigint FROM awa.jobs WHERE queue = $1 ORDER BY 1")
+        .bind(queue)
+        .fetch_all(pool)
+        .await
+        .expect("read queue jobs")
+}
+
+/// With `p_skip_unique_conflicts = false` a unique conflict, with an already
+/// claimed key or within the batch, fails the whole batch with `23505` and
+/// leaves nothing behind, on queue storage and on canonical storage.
+#[tokio::test]
+async fn batch_function_without_skip_fails_the_batch_on_a_unique_conflict() {
+    let _guard = ENGINE_GUARD.lock().await;
+    for queue_storage in [true, false] {
+        let pool = if queue_storage {
+            queue_storage_pool().await
+        } else {
+            let pool = setup::setup(8).await;
+            setup::reset_to_canonical(&pool).await;
+            pool
+        };
+        let queue = unique_queue(if queue_storage {
+            "noskip_qs"
+        } else {
+            "noskip_canonical"
+        });
+        insert_many(&pool, &[job(&queue, 1, true)])
+            .await
+            .expect("seed");
+
+        for batch in [
+            vec![
+                job(&queue, 0, true),
+                job(&queue, 1, true),
+                job(&queue, 2, true),
+            ],
+            vec![
+                job(&queue, 3, true),
+                job(&queue, 4, true),
+                job(&queue, 4, true),
+            ],
+        ] {
+            let err = insert_through_batch_function(&pool, &batch, false)
+                .await
+                .expect_err("a unique conflict must fail the batch");
+            assert!(
+                is_unique_violation(&AwaError::Database(err)),
+                "queue_storage={queue_storage}"
+            );
+            assert_eq!(
+                jobs_in_queue(&pool, &queue).await,
+                vec![1],
+                "queue_storage={queue_storage}: nothing from the failed batch landed"
+            );
+        }
+
+        let inserted = insert_through_batch_function(
+            &pool,
+            &[
+                job(&queue, 0, true),
+                job(&queue, 1, true),
+                job(&queue, 2, true),
+            ],
+            true,
+        )
+        .await
+        .expect("the same batch with skipping");
+        assert_eq!(
+            inserted
+                .iter()
+                .map(|row| row.args["seq"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 2],
+            "queue_storage={queue_storage}"
+        );
+    }
 }
 
 /// While another transaction holds a lane lock, a batch bound for that lane
