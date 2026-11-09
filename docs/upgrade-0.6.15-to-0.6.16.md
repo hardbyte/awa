@@ -92,6 +92,19 @@ Potentially unsettled reclamation or admin metadata refresh sets `settlement_unk
 
 A `halted` status is not proof that PostgreSQL released every lock or that stale hosts are fenced. Runtime credentials can forge observations or delete runtime registrations, so confirmation also depends on trusting those credentials. The operator boundary protects the requested halt, not the reported proof. Inspect backend activity and cancel or fence lingering sessions if lock relief is required. See [runtime controls](runtime-controls.md#read-status) for the status fields and states and [runtime control privileges](security.md#runtime-control-privileges) for the trust boundary.
 
+## Rescue drains abandoned claims in passes
+
+This part needs no migration and applies once the maintenance leader runs 0.6.16. Queue-storage rescue no longer stops at 500 attempts per kind per interval. Each pass takes 500-attempt batches, each in its own short transaction, for up to `rescue_pass_budget` (default 1 s, at most half the rescue interval) or `rescue_pass_max_rows` (default 5,000) rescued attempts, and while a backlog remains the next pass runs a second later. A runtime killed while holding claims therefore stops pinning the queue and claim rings for hours: with default settings, 1.6 million abandoned row-local claims drained in about 17 minutes, where 0.6.15 needed about 13 hours.
+
+What changes on a fleet with a backlog:
+
+- Claims past their deadline drain from the first deadline pass after the leader starts. Stale-heartbeat passes, the only route for claims without a deadline (`deadline_duration` zero), take more than one batch only once runtime snapshots have shown the dead runtime gone for a full staleness window, about 3–3.5 minutes with default settings.
+- Rescued jobs return to `retryable` with their ordinary backoff, so they become due in bursts and the workers that run them see the backlog arrive within minutes rather than over hours. On DLQ-enabled queues, exhausted attempts move to the DLQ just as quickly.
+- Closures, retry rows and their WAL arrive at the drain rate, about 0.6 KB of closure WAL per claim plus the retry rows, which replicas and CDC consumers see as a burst.
+- Each pass holds the maintenance leader for up to its budget plus one batch, so promotion, rotation and prune run between passes.
+
+`rescue_pass_budget` and `rescue_pass_max_rows` (Python `rescue_pass_budget_ms` and `rescue_pass_max_rows`) tune the drain; zero for either keeps the 0.6.15 cadence of one batch per interval. Watch it with `awa.maintenance.rescue.pass_size` and `awa.maintenance.rescue.oldest_attempt_age`. See [draining a backlog of abandoned claims](configuration.md#rescue-backlog).
+
 ## Roll back
 
 Before rolling back to 0.6.15, fence processes that could prune or explicitly accept losing the halt guarantee: 0.6.15 ignores the control, even when a halt remains stored. Leave the patches installed; the `prune_controls` tables and functions are safe for older binaries, and replay does not resume the fleet. 0.6.15 binaries call the new `ensure_claim_batch_job_index` unchanged, and a 0.6.15 `awa migrate` leaves it in place.

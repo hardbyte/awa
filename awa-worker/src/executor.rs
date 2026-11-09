@@ -370,6 +370,14 @@ impl JobExecutor {
             let in_flight_state = InFlightState {
                 cancel: cancel.clone(),
                 progress: progress_state.clone(),
+                claim: queue_storage_claim.as_ref().and_then(|claim| {
+                    awa_model::queue_storage::ClaimHeartbeatRef::from_claim(
+                        job_id,
+                        job_run_lease,
+                        claim,
+                    )
+                }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
@@ -453,6 +461,9 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
+            // The handler's progress snapshot is final: the finalize settles it,
+            // so heartbeats stop flushing progress for this attempt.
+            in_flight.mark_finalizing((job_id, job_run_lease));
             // Keep worker capacity and heartbeats until a bounded finalizer slot
             // is available. Otherwise returning handlers can create an unbounded
             // set of tasks retaining job payloads while completion is stalled.
@@ -3644,6 +3655,8 @@ mod tests {
                 InFlightState {
                     cancel: Arc::new(AtomicBool::new(false)),
                     progress: Arc::new(std::sync::Mutex::new(ProgressState::new(None))),
+                    claim: None,
+                    finalizing: false,
                 },
             );
         }
