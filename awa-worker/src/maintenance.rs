@@ -2195,7 +2195,6 @@ impl MaintenanceService {
             let options = RescueBatchOptions {
                 slot_order,
                 skip_slots: sweep.idle_slots.clone(),
-                retry_not_before: None,
                 cursor_scan_limit: (batches > 0
                     || (kind == RescueKind::Heartbeat
                         && bulk_heartbeat_cutoff.is_some()

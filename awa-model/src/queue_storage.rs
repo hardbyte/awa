@@ -398,9 +398,6 @@ pub struct RescueBatchOptions {
     /// Claim slots to leave out, typically ones an earlier batch of the same
     /// pass found nothing in ([`RescueBatch::idle_slots`]).
     pub skip_slots: Vec<i32>,
-    /// Earliest `run_at` for a rescued attempt that goes back to `retryable`.
-    /// Its backoff still applies when that is later.
-    pub retry_not_before: Option<DateTime<Utc>>,
     /// How many claims past its cursor each slot's stale-heartbeat or
     /// row-local deadline walk examines (default 10,000). Every claim
     /// examined costs its closure checks, so a batch that follows one that
@@ -15168,7 +15165,6 @@ impl QueueStorage {
         rows: Vec<LeaseTransitionRow>,
         error: &str,
         dlq: RescueDlq<'_>,
-        retry_not_before: Option<DateTime<Utc>>,
     ) -> Result<Vec<JobRow>, AwaError> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -15196,10 +15192,9 @@ impl QueueStorage {
             let exhausted = row.attempt >= row.max_attempts;
             payload.push_error(lifecycle_error(error, row.attempt, exhausted));
             if !exhausted {
-                let backoff_at = retry_run_ats.next().ok_or_else(|| {
+                let run_at = retry_run_ats.next().ok_or_else(|| {
                     AwaError::Validation("rescue backoff missing for a retryable attempt".into())
                 })?;
-                let run_at = retry_not_before.map_or(backoff_at, |floor| floor.max(backoff_at));
                 let deferred = row.clone().into_deferred_row(
                     JobState::Retryable,
                     run_at,
@@ -16300,7 +16295,6 @@ impl QueueStorage {
                         reason: "heartbeat_stale",
                         enabled: dlq_enabled,
                     },
-                    options.retry_not_before,
                 )
                 .await?;
             rescued.extend(
@@ -16312,7 +16306,6 @@ impl QueueStorage {
                         reason: "heartbeat_stale",
                         enabled: dlq_enabled,
                     },
-                    options.retry_not_before,
                 )
                 .await?,
             );
@@ -16504,7 +16497,6 @@ impl QueueStorage {
                         reason: "deadline_exceeded",
                         enabled: dlq_enabled,
                     },
-                    options.retry_not_before,
                 )
                 .await?;
             attempt.commit().await.map_err(map_sqlx_error)?;
@@ -16541,17 +16533,17 @@ impl QueueStorage {
     }
 
     /// One callback-timeout rescue batch in its own transaction: up to
-    /// 500 attempts. `slot_order` does not apply;
-    /// callback waits live in `leases`, not in the claim ring.
+    /// 500 attempts. The options do not apply: callback waits live in
+    /// `leases`, not in the claim ring.
     #[tracing::instrument(
-        skip(self, pool, dlq_enabled, options),
+        skip(self, pool, dlq_enabled, _options),
         name = "queue_storage.rescue_expired_callbacks"
     )]
     pub async fn rescue_expired_callbacks_batch(
         &self,
         pool: &PgPool,
         dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
-        options: &RescueBatchOptions,
+        _options: &RescueBatchOptions,
     ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -16650,7 +16642,6 @@ impl QueueStorage {
                         reason: "callback_timeout",
                         enabled: dlq_enabled,
                     },
-                    options.retry_not_before,
                 )
                 .await?;
             attempt.commit().await.map_err(map_sqlx_error)?;
