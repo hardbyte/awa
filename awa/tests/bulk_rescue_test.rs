@@ -803,3 +803,238 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         live_runs.len()
     );
 }
+
+const ROW_LOCAL_QUEUE: &str = "bulk_rescue_row_local";
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().map(|value| {
+        value
+            .parse()
+            .unwrap_or_else(|err| panic!("{name}={value}: {err}"))
+    })
+}
+
+async fn ring_generation(pool: &PgPool, ring: &str) -> i64 {
+    count(
+        pool,
+        format!("SELECT generation FROM awa.{ring}_ring_state WHERE singleton"),
+    )
+    .await
+}
+
+/// First-attempt claims still open: a dead runtime's attempts that no rescue
+/// has closed. A pruned claim slot takes its closed claims with it.
+async fn open_first_attempt_claims(pool: &PgPool) -> i64 {
+    count(
+        pool,
+        format!(
+            "SELECT count(*) FROM awa.lease_claims
+             WHERE queue = '{ROW_LOCAL_QUEUE}' AND run_lease = 1 AND closed_at IS NULL"
+        ),
+    )
+    .await
+}
+
+/// A killed runtime left hundreds of thousands of row-local claims: claims
+/// with a deadline, so each has its own `lease_claims` row rather than a
+/// compact batch. They span two claim slots, all reference one queue slot,
+/// were last heartbeated hours ago and are past their deadlines. Until they
+/// close, queue prune skips that queue slot and claim prune skips both claim
+/// slots, so neither ring can wrap. With default rescue intervals, rescue
+/// must close every claim and both rings must move past the pinned slots.
+///
+/// `AWA_ROW_LOCAL_RESCUE_CLAIMS` sets the backlog (default 20,000);
+/// `AWA_ROW_LOCAL_RESCUE_PASS_BUDGET_MS` and `AWA_ROW_LOCAL_RESCUE_PASS_MAX_ROWS`
+/// override the pass controls, and `AWA_ROW_LOCAL_RESCUE_OBSERVE_SECS` reports
+/// the drain rate after that long instead of requiring a full drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let abandoned = env_u64("AWA_ROW_LOCAL_RESCUE_CLAIMS").unwrap_or(20_000) as i64;
+    let observe_for = env_u64("AWA_ROW_LOCAL_RESCUE_OBSERVE_SECS").map(Duration::from_secs);
+
+    let db = BulkRescueDatabase::create().await;
+    let pool = db.pool().clone();
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let queue_slots = store.queue_slot_count() as i64;
+    let claim_slots = store.claim_slot_count() as i64;
+
+    let setup_started = Instant::now();
+    for first in (0..abandoned).step_by(5_000) {
+        let params: Vec<_> = (first..(first + 5_000).min(abandoned))
+            .map(|n| {
+                awa::model::insert::params_with(
+                    &AbandonedJob { n },
+                    InsertOpts {
+                        queue: ROW_LOCAL_QUEUE.into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("abandoned params")
+            })
+            .collect();
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("enqueue abandoned jobs");
+    }
+    // Half the backlog in each of two claim slots, as a runtime that kept
+    // claiming across a claim rotation leaves it.
+    let mut claimed = 0;
+    let mut rotated = false;
+    while claimed < abandoned {
+        if !rotated && claimed >= abandoned / 2 {
+            store.rotate_claims(&pool).await.expect("rotate claims");
+            rotated = true;
+        }
+        let batch = store
+            .claim_runtime_batch(&pool, ROW_LOCAL_QUEUE, 5_000, Duration::from_secs(300))
+            .await
+            .expect("claim abandoned jobs");
+        assert!(!batch.is_empty(), "the backlog should still be claimable");
+        claimed += batch.len() as i64;
+    }
+    // The runtime died hours ago: its claims, deadlines and last heartbeats
+    // all predate the staleness window, and its snapshot stopped then too.
+    sqlx::raw_sql(&format!(
+        "UPDATE awa.lease_claims
+            SET claimed_at = claimed_at - interval '20 hours',
+                deadline_at = deadline_at - interval '20 hours'
+          WHERE queue = '{ROW_LOCAL_QUEUE}';
+         INSERT INTO awa.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+         SELECT job_id, run_lease, claimed_at + interval '1 minute', claimed_at + interval '1 minute'
+           FROM awa.lease_claims WHERE queue = '{ROW_LOCAL_QUEUE}'
+         ON CONFLICT (job_id, run_lease) DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at;
+         INSERT INTO awa.runtime_instances (
+             instance_id, pid, version, started_at, last_seen_at, snapshot_interval_ms,
+             healthy, postgres_connected, poll_loop_alive, heartbeat_alive,
+             maintenance_alive, shutting_down, leader, storage_capability, transition_role
+         ) VALUES (
+             gen_random_uuid(), 1, 'killed', now() - interval '21 hours',
+             now() - interval '19 hours', 10000, true, true, true, true, true, false, false,
+             'queue_storage', 'queue_storage_target'
+         );
+         ANALYZE awa.lease_claims;
+         ANALYZE awa.attempt_state;"
+    ))
+    .execute(&pool)
+    .await
+    .expect("age the abandoned claims");
+    let shape: (i64, i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*), count(DISTINCT claim_slot), count(DISTINCT ready_slot),
+                (SELECT count(*) FROM awa.lease_claim_batches)
+           FROM awa.lease_claims WHERE queue = '{ROW_LOCAL_QUEUE}'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("backlog shape");
+    assert_eq!(
+        shape,
+        (abandoned, 2, 1, 0),
+        "row-local claims over two claim slots and one queue slot"
+    );
+    let queue_generation = ring_generation(&pool, "queue").await;
+    let claim_generation = ring_generation(&pool, "claim").await;
+    eprintln!(
+        "{abandoned} abandoned row-local claims built in {:?}",
+        setup_started.elapsed()
+    );
+
+    let mut builder = Client::builder(pool.clone())
+        .queue_storage(
+            QueueStorageConfig::default(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .claim_rotate_interval(Duration::from_secs(1))
+        .queue(
+            ROW_LOCAL_QUEUE,
+            QueueConfig {
+                max_workers: 200,
+                ..QueueConfig::default()
+            },
+        )
+        .register::<AbandonedJob, _, _>(|_, _| async { Ok(JobResult::Completed) });
+    if let Some(budget) = env_u64("AWA_ROW_LOCAL_RESCUE_PASS_BUDGET_MS") {
+        builder = builder.rescue_pass_budget(Duration::from_millis(budget));
+    }
+    if let Some(max_rows) = env_u64("AWA_ROW_LOCAL_RESCUE_PASS_MAX_ROWS") {
+        builder = builder.rescue_pass_max_rows(max_rows as usize);
+    }
+    let client = builder.build().expect("client");
+    let started = Instant::now();
+    client.start().await.expect("start client");
+
+    let mut first_rescue = None;
+    let mut drained = None;
+    loop {
+        let open = open_first_attempt_claims(&pool).await;
+        if open < abandoned && first_rescue.is_none() {
+            first_rescue = Some(started.elapsed());
+        }
+        if open == 0 {
+            drained = Some(started.elapsed());
+            break;
+        }
+        if let Some(observe_for) = observe_for {
+            if started.elapsed() >= observe_for {
+                let rescued = abandoned - open;
+                let since_first = started.elapsed() - first_rescue.unwrap_or_default();
+                eprintln!(
+                    "observed {rescued} of {abandoned} rescued in {:?} ({:?} after the first \
+                     rescue): {:.1} claims/s",
+                    started.elapsed(),
+                    since_first,
+                    rescued as f64 / since_first.as_secs_f64().max(f64::EPSILON)
+                );
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < scaled_timeout(Duration::from_secs(600 + abandoned as u64 / 200)),
+            "{open} of {abandoned} abandoned claims are still open"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    if let Some(drained) = drained {
+        let first_rescue = first_rescue.unwrap_or_default();
+        eprintln!(
+            "first rescue {first_rescue:?} after start; all {abandoned} closed {drained:?} after \
+             start: {:.1} claims/s from the first rescue",
+            abandoned as f64 / (drained - first_rescue).as_secs_f64().max(f64::EPSILON)
+        );
+        let unpinned = wait_until(
+            scaled_timeout(Duration::from_secs(120)),
+            "both rings to rotate past the slots the backlog pinned",
+            || async {
+                ring_generation(&pool, "queue").await >= queue_generation + queue_slots
+                    && ring_generation(&pool, "claim").await >= claim_generation + claim_slots
+            },
+        )
+        .await;
+        eprintln!(
+            "queue and claim rings rotated past the pinned slots {unpinned:?} after the drain"
+        );
+        wait_until(
+            scaled_timeout(Duration::from_secs(300 + abandoned as u64 / 500)),
+            "every rescued job to run on its second attempt",
+            || async {
+                count(
+                    &pool,
+                    format!(
+                        "SELECT count(*) FROM awa.terminal_jobs
+                         WHERE queue = '{ROW_LOCAL_QUEUE}' AND state = 'completed'"
+                    ),
+                )
+                .await
+                    == abandoned
+            },
+        )
+        .await;
+    }
+    client.shutdown(Duration::from_secs(10)).await;
+}
