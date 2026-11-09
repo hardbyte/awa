@@ -27,6 +27,10 @@ const EXHAUSTED_EVERY: i64 = 10;
 const ABANDONED_QUEUE: &str = "bulk_rescue_abandoned";
 const LIVE_QUEUE: &str = "bulk_rescue_live";
 
+/// The backlog tests each load the database heavily enough to slow the other's
+/// heartbeat passes past their staleness window, so they run one at a time.
+static BACKLOG_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// What each run of a job saw, by job id.
 type RunsByJob<T> = HashMap<i64, Vec<T>>;
 
@@ -225,6 +229,62 @@ async fn rescued_rows(pool: &PgPool, queue: &str) -> i64 {
     .expect("count rescued rows")
 }
 
+/// Record, as each compact claim is closed as rescued, how long it had gone
+/// without a heartbeat. The trigger runs inside the closing statement, after
+/// rescue holds the attempt's lock, so no later heartbeat can land.
+async fn record_compact_rescue_heartbeats(pool: &PgPool) {
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE public.rescued_claim_heartbeats (
+            job_id bigint NOT NULL,
+            queue text NOT NULL,
+            unheartbeated_for interval NOT NULL
+        );
+        CREATE FUNCTION public.record_rescued_claim_heartbeat() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            INSERT INTO public.rescued_claim_heartbeats
+            SELECT items.job_id, batches.queue,
+                   NEW.closed_at - COALESCE(attempt.heartbeat_at, batches.claimed_at)
+            FROM awa.lease_claim_batches AS batches
+            CROSS JOIN LATERAL unnest(batches.receipt_ids, batches.job_ids, batches.run_leases)
+                AS items(receipt_id, job_id, run_lease)
+            LEFT JOIN awa.attempt_state AS attempt
+              ON attempt.job_id = items.job_id AND attempt.run_lease = items.run_lease
+            WHERE batches.claim_slot = NEW.claim_slot
+              AND items.receipt_id = ANY(NEW.receipt_ids);
+            RETURN NEW;
+        END
+        $$;
+        CREATE TRIGGER record_rescued_claim_heartbeat
+            AFTER INSERT ON awa.lease_claim_closure_batches
+            FOR EACH ROW WHEN (NEW.outcome = 'rescued')
+            EXECUTE FUNCTION public.record_rescued_claim_heartbeat();
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("record rescued claim heartbeats");
+}
+
+/// Abandoned-queue claims rescued so far: how many had a heartbeat (or claim)
+/// younger than `staleness` when closed, how many there were, and the shortest
+/// time any of them had gone without a heartbeat.
+async fn rescued_heartbeat_ages(pool: &PgPool, staleness: Duration) -> (i64, i64, String) {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE unheartbeated_for < $2 * interval '1 millisecond'),
+                count(*),
+                COALESCE(min(unheartbeated_for)::text, 'n/a')
+         FROM public.rescued_claim_heartbeats
+         WHERE queue = $1",
+    )
+    .bind(ABANDONED_QUEUE)
+    .bind(staleness.as_millis() as f64)
+    .fetch_one(pool)
+    .await
+    .expect("rescued claim heartbeat ages")
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, what: &str, mut done: F) -> Duration
 where
     F: FnMut() -> Fut,
@@ -420,6 +480,7 @@ impl DoomedClient {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
+    let _backlog_test = BACKLOG_TEST.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -557,6 +618,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     // The doomed runtime claims the backlog in chunks, each after the claim
     // ring has rotated, so the abandoned claims span several slots.
     let generation_before = claim_ring_generation(&pool).await;
+    record_compact_rescue_heartbeats(&pool).await;
     let doomed = DoomedClient::start(db.url(), staleness, heartbeat_interval);
     let claim_started = Instant::now();
     for chunk_start in (0..ABANDONED).step_by(ABANDONED_CHUNK as usize) {
@@ -595,10 +657,17 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         }
     }
     let claimed_in = claim_started.elapsed();
+    let (fresh, rescued, freshest) = rescued_heartbeat_ages(&pool, staleness).await;
+    assert_eq!(
+        fresh, 0,
+        "rescue closed {fresh} claims last heartbeated within the {staleness:?} staleness window"
+    );
     assert_eq!(
         rescued_rows(&pool, ABANDONED_QUEUE).await,
         0,
-        "rescue took a claim while its runtime was alive and heartbeating"
+        "rescue took a claim while its runtime was alive: {rescued} claims had gone {freshest} \
+         or longer without a heartbeat, beyond the {staleness:?} staleness, so the live \
+         runtime's heartbeat passes fell behind"
     );
     let generation_at_kill = claim_ring_generation(&pool).await;
     live_hold_ms.store(live_job_duration.as_millis() as u64, Ordering::SeqCst);
@@ -849,6 +918,7 @@ async fn open_first_attempt_claims(pool: &PgPool) -> i64 {
 /// the drain rate after that long instead of requiring a full drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rescue_drains_abandoned_row_local_claims_and_unpins_both_rings() {
+    let _backlog_test = BACKLOG_TEST.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
