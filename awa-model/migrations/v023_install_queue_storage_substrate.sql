@@ -647,7 +647,9 @@ REVOKE EXECUTE ON FUNCTION awa.repair_lane_sequence(TEXT, TEXT) FROM PUBLIC;
 -- index on a populated partition holds SHARE, which blocks claim inserts, for
 -- the whole build (minutes per million batches), so the index is only ever
 -- created on an empty partition: by the installer, or by claim prune right
--- after it truncates a slot.
+-- after it truncates a slot. A different relation that already has the
+-- index's name is never dropped: the function warns, naming it, and the slot
+-- keeps scanning until an operator removes or renames it.
 --
 -- fastupdate is off: job ids arrive in ascending order, so direct inserts
 -- append to the right edge of the entry tree and cost no more than the
@@ -696,6 +698,7 @@ BEGIN
         LANGUAGE plpgsql
         SECURITY DEFINER
         SET search_path = pg_catalog, pg_temp
+        SET quote_all_identifiers = off
         AS $func$
         DECLARE
             v_child TEXT;
@@ -721,17 +724,42 @@ BEGIN
                     USING ERRCODE = '22023';
             END IF;
 
+            -- Only a valid, non-partial GIN index on job_ids alone, with the
+            -- default array_ops opclass, serves the by-job lookups.
             IF EXISTS (
                 SELECT 1
                 FROM pg_index AS idx
                 JOIN pg_class AS index_class ON index_class.oid = idx.indexrelid
                 JOIN pg_am AS method ON method.oid = index_class.relam
+                JOIN pg_attribute AS job_ids
+                  ON job_ids.attrelid = idx.indrelid
+                 AND job_ids.attname = 'job_ids'
+                 AND NOT job_ids.attisdropped
+                JOIN pg_opclass AS opclass ON opclass.oid = idx.indclass[0]
                 WHERE idx.indrelid = to_regclass(format('%%I.%%I', %1$L, v_child))
                   AND method.amname = 'gin'
                   AND idx.indisvalid
-                  AND pg_get_indexdef(idx.indexrelid) LIKE '%%USING gin (job_ids)%%'
+                  AND idx.indpred IS NULL
+                  AND idx.indexprs IS NULL
+                  AND idx.indnatts = 1
+                  AND idx.indkey[0] = job_ids.attnum
+                  AND opclass.opcname = 'array_ops'
+                  AND opclass.opcnamespace = 'pg_catalog'::regnamespace
             ) THEN
                 RETURN TRUE;
+            END IF;
+
+            -- Something else already has the index's name: a partial or
+            -- otherwise different index, or another relation. Leave it alone
+            -- and keep scanning; the operator decides what to do with it.
+            IF to_regclass(format('%%I.%%I', %1$L, v_index)) IS NOT NULL THEN
+                RAISE WARNING '%%.%% is not a GIN index on job_ids, so claim slot %% of schema %% keeps scanning for job ids',
+                    quote_ident(%1$L), quote_ident(v_index), p_slot, %1$L
+                    USING HINT = format(
+                        'Drop or rename %%s.%%s; claim prune builds the job_ids index the next time it empties claim slot %%s.',
+                        quote_ident(%1$L), quote_ident(v_index), p_slot
+                    );
+                RETURN FALSE;
             END IF;
 
             -- NOWAIT: a partition someone is writing to is not empty for long
@@ -747,11 +775,11 @@ BEGIN
                     RAISE EXCEPTION USING ERRCODE = 'object_not_in_prerequisite_state';
                 END IF;
                 EXECUTE format(
-                    'CREATE INDEX IF NOT EXISTS %%I ON %%I.%%I USING GIN (job_ids) WITH (fastupdate = off)',
+                    'CREATE INDEX %%I ON %%I.%%I USING GIN (job_ids) WITH (fastupdate = off)',
                     v_index, %1$L, v_child
                 );
             EXCEPTION
-                WHEN lock_not_available OR object_not_in_prerequisite_state THEN
+                WHEN lock_not_available OR object_not_in_prerequisite_state OR duplicate_table THEN
                     RETURN FALSE;
             END;
             RETURN TRUE;

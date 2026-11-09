@@ -7,10 +7,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Upgrading
 
 - Run `awa migrate` once as the schema owner to apply `prune_controls` after the existing `claim_batch_job_index` and `insert_jobs_compat_batch` patches. It adds two tables and functions without altering existing tables; schema stays v40. Upgrade or fence every possible maintenance leader before relying on halt. See the [0.6.15 to 0.6.16 upgrade guide](docs/upgrade-0.6.15-to-0.6.16.md).
+- The same run re-applies `claim_batch_job_index` on a 0.6.15 database, replacing each schema's `ensure_claim_batch_job_index` function. Like the first application it builds no index and takes no table locks. External migration runners: replace `R__claim_batch_job_index.sql` with the new version as well.
 
 ### Added
 
 - Durable operator halt/resume for `maintenance.prune`, in drain mode. Compatible leaders observe it on their existing session; dispatch, cron, promotion, rescue and enqueue continue. Status lists live runtimes without supported, recent reports and cannot report the fleet halted while any remain. Older binaries ignore the control. See [runtime controls](docs/runtime-controls.md).
+
+### Fixed
+
+- Claim prune no longer treats a partial GIN index on `lease_claim_batches.job_ids`, or a session with `quote_all_identifiers` on, as the claim batch index. It recognises only a valid, non-partial GIN index on `job_ids` alone. When another index or relation already has the index's name, `ensure_claim_batch_job_index` leaves it in place, returns false and raises a warning naming it, instead of reporting the slot indexed; the slot keeps scanning until an operator drops or renames it.
 
 ## [0.6.15] — 2026-11-09
 
