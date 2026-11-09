@@ -893,6 +893,122 @@ async fn set_only_schema_owner_membership_repairs_legacy_lanes_and_restores_role
     cluster.teardown().await
 }
 
+/// `(owner, PUBLIC executes, runtime group executes)` of the default schema's
+/// `ensure_claim_batch_job_index`.
+async fn claim_batch_job_index_function_acl(
+    cluster: &Cluster,
+) -> Result<(String, bool, bool), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT pg_get_userbyid(routine.proowner)::text, \
+                has_function_privilege('public', routine.oid, 'EXECUTE'), \
+                has_function_privilege($1, routine.oid, 'EXECUTE') \
+         FROM pg_proc AS routine \
+         WHERE routine.oid = to_regprocedure('awa.ensure_claim_batch_job_index(integer)')",
+    )
+    .bind(&cluster.runtime_name)
+    .fetch_one(&cluster.owner)
+    .await
+}
+
+/// A migration role whose membership in the schema owner is SET-only
+/// (PostgreSQL 16+: it may `SET ROLE` to the owner but does not inherit its
+/// privileges) leaves `ensure_claim_batch_job_index` owned by the table owner,
+/// executable by the roles that hold `TRUNCATE` on `lease_claim_batches` and
+/// not by `PUBLIC`: when it refreshes the function as itself, handing a
+/// function it owns to the owner, and when it applies the
+/// `claim_batch_job_index` patch as the owner, as the database-roles guide
+/// says to.
+#[tokio::test]
+async fn set_only_schema_owner_membership_resets_claim_batch_job_index_execute() -> TestResult {
+    let cluster = Cluster::new(Schema::Current, false).await?;
+    let server_version: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&cluster.owner)
+            .await?;
+    if server_version < 160_000 {
+        return cluster.teardown().await;
+    }
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        (cluster.owner_name.clone(), false, true)
+    );
+
+    // A function the migration role owns, executable by PUBLIC, as a refresh
+    // by the migration role acting as itself would create it.
+    cluster
+        .owner
+        .execute(sqlx::raw_sql(&sql(format!(
+            "GRANT USAGE, CREATE ON SCHEMA awa TO {migrator}; \
+             GRANT EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(text) TO {migrator}",
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    cluster
+        .migrator
+        .execute(sqlx::raw_sql(&sql(format!(
+            "ALTER FUNCTION awa.ensure_claim_batch_job_index(integer) OWNER TO {migrator}; \
+             GRANT EXECUTE ON FUNCTION awa.ensure_claim_batch_job_index(integer) TO PUBLIC",
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    cluster
+        .admin
+        .execute(sqlx::raw_sql(&sql(format!(
+            "GRANT {owner} TO {migrator} WITH INHERIT FALSE; \
+             GRANT {owner} TO {migrator} WITH SET TRUE",
+            owner = cluster.owner_name,
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    let (inherits_owner, can_set_owner): (bool, bool) = sqlx::query_as(
+        "SELECT pg_has_role(current_user, $1, 'USAGE'), pg_has_role(current_user, $1, 'SET')",
+    )
+    .bind(&cluster.owner_name)
+    .fetch_one(&cluster.migrator)
+    .await?;
+    assert!(!inherits_owner);
+    assert!(can_set_owner);
+
+    sqlx::query("SELECT awa.refresh_claim_batch_job_index_helper('awa')")
+        .execute(&cluster.migrator)
+        .await?;
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        (cluster.owner_name.clone(), false, true),
+        "a refresh by the migration role acting as itself"
+    );
+
+    // The whole patch, with the owner as the effective role.
+    cluster
+        .owner
+        .execute("DROP FUNCTION awa.ensure_claim_batch_job_index(integer)")
+        .await?;
+    let migrate_pool = cluster.migrator_as_owner().await?;
+    assert_eq!(
+        migrations::pending_schema_patches(&migrate_pool)
+            .await?
+            .iter()
+            .map(|patch| patch.name)
+            .collect::<Vec<_>>(),
+        ["claim_batch_job_index"]
+    );
+    let report = migrations::run_with_report(&migrate_pool).await?;
+    migrate_pool.close().await;
+    assert!(report.complete(), "{:?}", report.patches);
+    let patch = report
+        .patches
+        .iter()
+        .find(|patch| patch.name == "claim_batch_job_index")
+        .expect("claim_batch_job_index is a schema patch");
+    assert_eq!(patch.outcome, migrations::PatchOutcome::Applied);
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        (cluster.owner_name.clone(), false, true),
+        "the patch applied by the migration role as the owner"
+    );
+    cluster.teardown().await
+}
+
 /// Reassigning a lane sequence waits on any open enqueue or claim on the lane,
 /// so the repair bounds that wait and holds each sequence's lock only for its
 /// own short transaction. A held sequence is skipped and reported; the rest

@@ -791,6 +791,30 @@ BEGIN
 
     v_function := format('%I.ensure_claim_batch_job_index(integer)', p_schema)::regprocedure;
 
+    -- Reset EXECUTE before handing the function to the table owner: the
+    -- running role holds the current owner's privileges (it just replaced the
+    -- function), but a role that may only SET ROLE to the table owner cannot
+    -- revoke or grant once that role owns it. ALTER ... OWNER keeps the ACL.
+    FOR v_grantee IN
+        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+        FROM pg_proc AS routine
+        CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+        WHERE routine.oid = v_function
+          AND acl.privilege_type = 'EXECUTE'
+          AND acl.grantee <> routine.proowner
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', v_function, v_grantee);
+    END LOOP;
+    FOR v_grantee IN
+        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+        FROM aclexplode(COALESCE(v_table_acl, acldefault('r', v_table_owner))) AS acl
+        WHERE acl.privilege_type = 'TRUNCATE'
+    LOOP
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', v_function, v_grantee);
+    END LOOP;
+
     SELECT routine.proowner INTO v_function_owner
     FROM pg_proc AS routine
     WHERE routine.oid = v_function;
@@ -814,26 +838,6 @@ BEGIN
                 );
         END IF;
     END IF;
-
-    FOR v_grantee IN
-        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
-                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
-        FROM pg_proc AS routine
-        CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
-        WHERE routine.oid = v_function
-          AND acl.privilege_type = 'EXECUTE'
-          AND acl.grantee <> routine.proowner
-    LOOP
-        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', v_function, v_grantee);
-    END LOOP;
-    FOR v_grantee IN
-        SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
-                             ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
-        FROM aclexplode(COALESCE(v_table_acl, acldefault('r', v_table_owner))) AS acl
-        WHERE acl.privilege_type = 'TRUNCATE'
-    LOOP
-        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', v_function, v_grantee);
-    END LOOP;
 END;
 $refresh$;
 

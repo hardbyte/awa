@@ -16,6 +16,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Fixed
 
 - Claim prune no longer treats a partial GIN index on `lease_claim_batches.job_ids`, or a session with `quote_all_identifiers` on, as the claim batch index. It recognises only a valid, non-partial GIN index on `job_ids` alone. When another index or relation already has the index's name, `ensure_claim_batch_job_index` leaves it in place, returns false and raises a warning naming it, instead of reporting the slot indexed; the slot keeps scanning until an operator drops or renames it.
+- Refreshing `ensure_claim_batch_job_index` as a migration role that owns it but may only `SET ROLE` to the table owner (PostgreSQL 16+ membership `WITH INHERIT FALSE`) no longer leaves `EXECUTE` with `PUBLIC`. The refresh used to hand the function to the table owner first, after which that role could no longer revoke or grant on it, and PostgreSQL only warned. It now resets `EXECUTE` to the roles holding `TRUNCATE` on `lease_claim_batches` before the ownership transfer. Migrations run with the owner as the effective role, as documented, were not affected.
 
 ## [0.6.15] — 2026-11-09
 
