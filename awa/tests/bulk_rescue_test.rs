@@ -28,7 +28,9 @@ const ABANDONED_QUEUE: &str = "bulk_rescue_abandoned";
 const LIVE_QUEUE: &str = "bulk_rescue_live";
 
 /// The backlog tests each load the database heavily enough to slow the other's
-/// heartbeat passes past their staleness window, so they run one at a time.
+/// heartbeat passes past their staleness window, so they run one at a time:
+/// this lock serialises them under `cargo test`, and a nextest test group in
+/// `.config/nextest.toml` does so across processes.
 static BACKLOG_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What each run of a job saw, by job id.
