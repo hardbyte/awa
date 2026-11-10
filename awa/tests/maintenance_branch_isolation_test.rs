@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 
 const QUEUE: &str = "branch_isolation";
 const CRON: &str = "branch_isolation_nightly";
+/// Declared after `CRON`, so a leader's startup sync reaches it only after
+/// the locked `CRON` row, while its row already exists from an earlier run.
+const EVERY_SECOND: &str = "branch_isolation_every_second";
+const LEADER_LOCK_KEY: i64 = 0x4157_415f_4d41_494e;
 
 /// Completes at once, unless `overrun` is set: then its first attempt
 /// outlives its deadline, so only deadline rescue lets a second attempt run.
@@ -63,6 +67,12 @@ async fn client(pool: &PgPool) -> Client {
                 .build(&IsolationProbe { overrun: false })
                 .unwrap(),
         )
+        .periodic(
+            PeriodicJob::builder(EVERY_SECOND, "* * * * * *")
+                .queue(QUEUE)
+                .build(&IsolationProbe { overrun: false })
+                .unwrap(),
+        )
         .leader_election_interval(Duration::from_millis(50))
         .leader_check_interval(Duration::from_millis(100))
         .promote_interval(Duration::from_millis(50))
@@ -72,22 +82,26 @@ async fn client(pool: &PgPool) -> Client {
         .unwrap()
 }
 
-#[sqlx::test(migrations = false)]
-async fn a_blocked_cron_sync_does_not_delay_promotion_or_rescue(pool: PgPool) {
-    migrations::run(&pool).await.unwrap();
-    // Register the schedule once, then lock its row so the next leader's
-    // startup sync waits on it.
-    let first = client(&pool).await;
+/// A leader whose startup cron sync is waiting on a `CRON` row that the
+/// returned transaction holds `FOR UPDATE`.
+async fn leader_with_blocked_cron_sync(
+    pool: &PgPool,
+) -> (Client, sqlx::Transaction<'static, sqlx::Postgres>) {
+    migrations::run(pool).await.unwrap();
+    // Register both schedules once, then lock `CRON`'s row so the next
+    // leader's startup sync waits on it.
+    let first = client(pool).await;
     first.start().await.unwrap();
     let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
     loop {
-        let synced: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM awa.cron_jobs WHERE name = $1)")
+        let synced: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM awa.cron_jobs WHERE name IN ($1, $2)")
                 .bind(CRON)
-                .fetch_one(&pool)
+                .bind(EVERY_SECOND)
+                .fetch_one(pool)
                 .await
                 .unwrap();
-        if synced {
+        if synced == 2 {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "cron never synced");
@@ -102,7 +116,7 @@ async fn a_blocked_cron_sync_does_not_delay_promotion_or_rescue(pool: PgPool) {
         .await
         .unwrap();
 
-    let leader = client(&pool).await;
+    let leader = client(pool).await;
     leader.start().await.unwrap();
     let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
     while !leader.health_check().await.leader {
@@ -113,6 +127,33 @@ async fn a_blocked_cron_sync_does_not_delay_promotion_or_rescue(pool: PgPool) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // The startup sync is waiting on the locked row.
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE datname = current_database()
+                              AND wait_event_type = 'Lock'
+                              AND query LIKE '%cron_jobs%')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the startup cron sync never waited on the locked row"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (leader, holder)
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_blocked_cron_sync_does_not_delay_promotion_or_rescue(pool: PgPool) {
+    let (leader, holder) = leader_with_blocked_cron_sync(&pool).await;
     let store = QueueStorage::new(QueueStorageConfig::default()).unwrap();
     let scheduled = awa::insert_with(
         &pool,
@@ -177,5 +218,128 @@ async fn a_blocked_cron_sync_does_not_delay_promotion_or_rescue(pool: PgPool) {
     assert!(
         shutdown.is_ok(),
         "shutdown waited {shutdown_took:?} on the blocked cron sync"
+    );
+}
+
+/// The cron evaluator runs on its own task and starts before the startup
+/// sync, so schedules already stored keep firing while the sync waits.
+#[sqlx::test(migrations = false)]
+async fn stored_schedules_fire_while_the_startup_sync_waits(pool: PgPool) {
+    let (leader, holder) = leader_with_blocked_cron_sync(&pool).await;
+    let since = chrono::Utc::now();
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
+    let fired = loop {
+        let fired: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM awa.cron_jobs
+                            WHERE name = $1 AND last_enqueued_at > $2)",
+        )
+        .bind(EVERY_SECOND)
+        .bind(since)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if fired || tokio::time::Instant::now() >= deadline {
+            break fired;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    leader.shutdown(Duration::from_secs(5)).await;
+    drop(holder);
+    assert!(
+        fired,
+        "an every-second schedule did not fire while the startup sync waited"
+    );
+}
+
+/// Losing the leader lock while the hygiene loop is stuck must still fence
+/// recovery: nothing is promoted while no session holds the lock, and
+/// shutdown stays bounded.
+#[sqlx::test(migrations = false)]
+async fn losing_leadership_while_hygiene_is_stuck_stops_promotion(pool: PgPool) {
+    let (leader, holder) = leader_with_blocked_cron_sync(&pool).await;
+    let holder_pid: i32 = sqlx::query_scalar(
+        "SELECT l.pid FROM pg_locks l
+         WHERE l.locktype = 'advisory' AND l.granted
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND ((l.classid::bigint << 32) | l.objid::bigint) = $1",
+    )
+    .bind(LEADER_LOCK_KEY)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT pg_terminate_backend($1)")
+        .bind(holder_pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
+    while leader.health_check().await.leader {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runtime kept reporting leadership after its lock session ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let store = QueueStorage::new(QueueStorageConfig::default()).unwrap();
+    let scheduled = awa::insert_with(
+        &pool,
+        &IsolationProbe { overrun: false },
+        InsertOpts {
+            queue: QUEUE.into(),
+            run_at: Some(chrono::Utc::now() + chrono::Duration::milliseconds(100)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Promotion runs every 50 ms while leading. Watch for 2 s: whenever no
+    // session holds the lock, the job must not have left `scheduled`.
+    let window = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut promoted_while_unled = None;
+    while tokio::time::Instant::now() < window {
+        let lock_held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks l
+                            WHERE l.locktype = 'advisory' AND l.granted
+                              AND l.database = (SELECT oid FROM pg_database
+                                                WHERE datname = current_database())
+                              AND ((l.classid::bigint << 32) | l.objid::bigint) = $1)",
+        )
+        .bind(LEADER_LOCK_KEY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let state = store
+            .load_job(&pool, scheduled.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state;
+        if !lock_held && state != JobState::Scheduled {
+            promoted_while_unled = Some(state);
+            break;
+        }
+        if lock_held {
+            // Leadership came back; fencing is no longer what is observed.
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let shutdown_started = Instant::now();
+    let shutdown = tokio::time::timeout(
+        scaled_timeout(Duration::from_secs(20)),
+        leader.shutdown(Duration::from_secs(5)),
+    )
+    .await;
+    let shutdown_took = shutdown_started.elapsed();
+    drop(holder);
+    assert_eq!(
+        promoted_while_unled, None,
+        "a job was promoted while no session held the leader lock"
+    );
+    assert!(
+        shutdown.is_ok(),
+        "shutdown waited {shutdown_took:?} after leadership was lost with hygiene stuck"
     );
 }

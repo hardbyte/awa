@@ -31,43 +31,50 @@ The branch metrics do not show this either. The leader's startup cron sync is no
 The leader term runs two loops concurrently:
 
 - **Recovery loop:** promotion and the three rescues.
-- **Hygiene loop:** the initial cron sync, the cron evaluator, and every other branch.
+- **Hygiene loop:** the initial cron sync and every other branch. It also starts the cron evaluator, which runs on its own task.
+
+The hygiene loop starts the cron evaluator before the initial cron sync, not after it. A sync waiting on a locked `awa.cron_jobs` row therefore no longer stops schedules already in the table from firing. Until the sync commits, a schedule whose declaration changed is evaluated as stored, which is how the previous leader left it, and `last_enqueued_at` still guards against a double fire.
 
 Both run on the leader-term task (`tokio::join!`), not in a spawned task. Every branch waits on the database, so running them concurrently on one task is enough for one loop's wait not to block the other. Borrowing the service and its trackers needs no `'static` bounds or `Arc` wrapping.
 
 Leadership and shutdown are unchanged:
 
 - Each loop selects on the same leadership-lost and shutdown tokens and returns on either.
-- `run_leader_term` still bounds the leader term as a whole. On shutdown, the in-flight branch in either loop gets `MAINTENANCE_BRANCH_SHUTDOWN_GRACE`.
-- Leadership is still one session advisory lock. Losing it ends both loops.
+- On shutdown, `run_leader_term` gives the branches in flight one shared `MAINTENANCE_BRANCH_SHUTDOWN_GRACE`.
+- Leadership is still one session advisory lock. Losing it ends both loops at their next select. Neither loop starts a branch after the loss. A branch already in flight runs to completion, as before; `run_leader_term` bounds that drain only on shutdown.
+- `maintenance_branch_isolation_test` covers both: it kills the lock session while the hygiene loop is stuck, checks that nothing is promoted while no session holds the lock, and checks that shutdown is bounded.
 
 Branch registration is unchanged. Every arm still goes through `MaintenanceBranchTracker::try_begin` and `PruneControl::admit`. `scheduler_registers_branches_with_the_closed_scope_vocabulary` now also asserts that the recovery loop admits exactly the four user-visible branches and the hygiene loop admits none of them.
 
 ## Why concurrent branches are safe
 
-Before the split, two branches never ran at once on one leader. They could already run at once across two leaders: on leadership loss, the old leader's in-flight branch finishes within its grace period while the new leader starts. Operator commands (cancel, retry, batch operations through the API) and producers also run concurrently with every branch. Each branch is its own transaction or sequence of transactions, and their safety rests on SQL locks, not on the loop serialising them.
+Before the split, two branches never ran at once on one leader. They could already run at once across two leaders. When a leader loses its lock, its in-flight branch keeps running until it finishes, with no time bound except on shutdown. That covers the 1–3 s before `LeaderObserver` notices a dead session, too. Meanwhile the new leader starts its own branches. Operator commands (cancel, retry, batch operations through the API) and producers also run concurrently with every branch. Each branch is its own transaction or sequence of transactions, and their safety rests on SQL locks, not on the loop serialising them.
 
 The pairs that newly overlap within one leader:
 
-- **Rescue and claim or lease prune.** Prune takes `ACCESS EXCLUSIVE` on the partition with a 10 ms lock timeout and re-checks emptiness under the lock. A rescue transaction holding row locks makes prune time out and retry, counted as `blocked`. This already happens with claimers.
-- **Promotion and queue rotation.** Promotion inserts into the current ready slot as producers do. Rotation changes the current slot under the same locks producers wait on.
+- **Rescue and lease prune.** Lease prune takes `ACCESS EXCLUSIVE` on the partition under a 10 ms `lock_timeout` and re-checks emptiness under the lock. A rescue transaction holding row locks makes it time out and retry, counted as `blocked`.
+- **Rescue and claim prune.** Receipt rescue locks the claim slot's `claim_ring_slots` row `FOR UPDATE`, oldest slot first. Claim prune takes `claim_ring_state` and then that same slot row `FOR UPDATE` before setting any `lock_timeout`, so it waits for the rescue batch's transaction to commit. That blocks the hygiene loop for one rescue batch per collision, which is routine while a backlog drains and rescue re-arms every second. There is no lock cycle: rescue reads `claim_ring_state` without locking it, only rotation and prune lock it (both in the hygiene loop), and where rescue's closure inserts meet prune's `ACCESS EXCLUSIVE`, prune's `lock_timeout` breaks the wait.
+- **Promotion and queue rotation.** Promotion re-enqueues through the same insert path as retries and callback resumes, reading the current ready slot without a lock. Rotation serialises on its own `queue_ring_state` `FOR UPDATE` and its busy checks, which already tolerate those writers.
 - **Promotion and batch operations.** Both are already concurrent with operator API calls and take row locks in their own transactions.
 
-The TLA+ models do not change, because each branch is still its own transaction.
+The TLA+ models do not change. `AwaStorageLockOrder` interleaves transactions arbitrarily, and `AwaExtended` and `AwaCron` model each maintenance action atomically, with no serialisation within a leader.
+
+One mapping does depend on the loop structure. `correctness/storage/MAPPING.md` relies on the leader running one rescue batch at a time. That still holds, because all three rescues run in the recovery loop, one after another. `scheduler_registers_branches_with_the_closed_scope_vocabulary` fails if a rescue moves to the hygiene loop.
 
 ## Consequences
 
 **Positive**
 
 - A hygiene branch waiting on a lock or scanning a large table no longer delays promotion or rescue.
+- A locked cron row no longer stops stored schedules from firing.
 - Shutdown stays bounded while a hygiene branch is stuck.
 - No configuration, schema or protocol change, and rolling upgrades are unaffected. Old and new leaders differ only in how they schedule their own branches.
 
 **Negative**
 
-- A leader now holds up to two maintenance connections at once instead of one, plus the existing promotion lane waiters. The pool is not partitioned, so a hygiene loop that holds connections can still slow recovery's acquires under pool pressure. Reserving recovery capacity is left for later; the hygiene loop runs one branch at a time.
-- Prune may report more `blocked` outcomes while a rescue pass runs, as described above.
-- Branch timing histograms for hygiene branches no longer include time spent waiting behind recovery branches, and the reverse. They measure each branch's own body, as intended.
+- A leader now holds one more pool connection at a time. The total is its lock session, one connection per loop, the cron evaluator's, and up to `lane_waiter_limit` promotion lane waiters: one in eight pool connections, clamped to between one and four. A 10-connection pool gives about five to maintenance instead of four. The pool is not partitioned, so under pool pressure the hygiene loop can still slow recovery's acquires. Reserving recovery capacity is left for later.
+- Lease prune may report more `blocked` outcomes while a rescue pass runs, and claim prune may wait out a rescue batch, as described above.
+- Hygiene branches still delay one another. A stuck cleanup, cron sync, batch-operation scan or metadata refresh holds back ring rotation and prune, rollup and the other hygiene branches until it finishes, and the overrun counter still does not show a branch blocked in its body. Bounding those statements individually, or exporting the age of the in-flight branch, is left for later.
 
 ## Alternatives considered
 

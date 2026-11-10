@@ -633,11 +633,11 @@ impl<'a> BranchTimer<'a> {
     }
 }
 
-/// Owns the per-branch overrun state for the maintenance leader loop.
-/// All access is logically single-threaded — the maintenance loop is the
-/// only caller — but the loop runs inside a `tokio::spawn`-ed task that
-/// requires `Send`, so we use `std::sync::Mutex` rather than `RefCell`.
-/// The mutex is uncontended in practice (one acquirer); cost is one
+/// Owns the per-branch overrun state for the maintenance leader's loops.
+/// The recovery and hygiene loops share it on one task, so access never
+/// overlaps, but the task is `tokio::spawn`-ed and must be `Send`, so this
+/// is a `std::sync::Mutex` rather than a `RefCell`. State is keyed by
+/// branch and the guard is never held across an `.await`; cost is one
 /// uncontended lock per branch tick.
 #[derive(Default)]
 struct MaintenanceBranchTracker {
@@ -1579,9 +1579,8 @@ impl MaintenanceService {
                     .storage
                     .queue_storage()
                     .map(|runtime| runtime.claim_rotate_interval);
-                // Per-branch overrun tracker. Issue #242 — observability only;
-                // the architectural split of this `tokio::select!` is deferred
-                // to v0.7 conditional on the overrun counter showing fleet hits.
+                // Per-branch overrun tracker (#242). Shared by the recovery
+                // and hygiene loops below (#303, ADR-051).
                 *self
                     .rescue_owner_evidence
                     .lock()
@@ -1647,10 +1646,12 @@ impl MaintenanceService {
                 // hygiene branch waiting on a lock or scanning a large table
                 // cannot hold back the work users wait on. Both loops run on
                 // this task, under the same leadership: each returns when
-                // leadership is lost or the service shuts down, and
-                // `run_leader_term` bounds whichever branch is in flight.
-                // Branches already overlap across a leader handoff, so each
-                // is its own transaction and safe to run beside the others.
+                // leadership is lost or the service shuts down. On shutdown,
+                // `run_leader_term` gives the branches in flight one shared
+                // grace. Branches never relied on running one at a time:
+                // each is its own transaction, kept safe by SQL locks, as it
+                // must be when an old leader's branch outlives its lock and
+                // overlaps the new leader's.
                 let recovery = async {
                     loop {
                         if leadership_lost.is_cancelled() {
@@ -1716,11 +1717,13 @@ impl MaintenanceService {
                     }
                 };
                 let hygiene = async {
-                    // Do an initial sync immediately on becoming leader
-                    self.sync_periodic_jobs_to_db().await;
-                    if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
-                        return;
-                    }
+                    // The evaluator starts before the initial sync, on its
+                    // own task, so a sync waiting on a locked cron row does
+                    // not stop schedules already in `awa.cron_jobs` from
+                    // firing. Until the sync commits, a schedule whose
+                    // declaration changed is evaluated as stored, as the
+                    // previous leader left it; `last_enqueued_at` still
+                    // guards against a double fire.
                     let cron_eval_cancel = leadership_lost.child_token();
                     let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
                         self.pool.clone(),
@@ -1736,6 +1739,12 @@ impl MaintenanceService {
                     }
                     let _cron_guard =
                         CronGuard(cron_eval_cancel.clone(), cron_eval_task.abort_handle());
+
+                    // Do an initial sync immediately on becoming leader
+                    self.sync_periodic_jobs_to_db().await;
+                    if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
+                        return;
+                    }
 
                     loop {
                         if leadership_lost.is_cancelled() {
@@ -1809,6 +1818,8 @@ impl MaintenanceService {
                                     timer.finish();
                                 }
                             }
+                            // Aging shares promotion's control scope but only
+                            // rewrites waiting priorities, so it is hygiene.
                             _ = priority_aging_timer.tick() => {
                                 if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
                                 if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Aging.classification().0, self.priority_aging_interval, &self.metrics) {

@@ -288,18 +288,21 @@ Use lower values carefully. Faster checks mean more advisory-lock traffic.
 
 ### A Maintenance Statement Waits On A Lock
 
-The leader runs promotion and the three rescues (stale heartbeat, deadline, callback timeout) in one loop, and its other maintenance in another: cleanup, cron sync, metadata, batch operations, terminal-count rollup and ring rotation. A statement in the second loop that waits on a lock, such as the cron sync upserting a schedule row another session holds, delays only that loop. Promotion and rescue keep running.
+The leader runs promotion and the three rescues (stale heartbeat, deadline, callback timeout) in one loop, and its other maintenance in another: cleanup, cron sync, metadata, batch operations, terminal-count rollup and ring rotation and prune. A statement in the second loop that waits on a lock, such as the cron sync upserting a schedule row another session holds, delays only that loop. Promotion and rescue keep running, and schedules already stored keep firing, because the cron evaluator runs on its own task.
 
-In releases after 0.6.16, a leader whose scheduled jobs are not promoted is therefore not blocked by its own cleanup or cron sync. Look instead at promotion's own locks (`awa.maintenance.promote.lane_contention`) and at pool exhaustion. To find a stuck maintenance statement, list the leader's waiting backends:
+Everything else in the second loop does wait. While that statement waits, cleanup does not run and the queue, lease and claim rings do not rotate or prune, so queue-storage partitions are not reclaimed.
+
+In releases after 0.6.16, a leader whose scheduled jobs are not promoted is therefore not blocked by its own cleanup or cron sync. Look instead at promotion's own lane locks (`awa.maintenance.promote.lane_contention`), at pool exhaustion, and at a long rescue pass. To find a stuck maintenance statement, list the sessions waiting on locks, and pick out the leader's by `application_name` or by its pid in `pg_locks`:
 
 ```sql
-SELECT pid, wait_event_type, wait_event, now() - query_start AS waiting, left(query, 120)
+SELECT pid, application_name, wait_event_type, wait_event,
+       now() - query_start AS waiting, left(query, 120)
 FROM pg_stat_activity
 WHERE wait_event_type = 'Lock' AND datname = current_database()
 ORDER BY query_start;
 ```
 
-0.6.16 and earlier ran every branch in one loop, so there a single waiting statement stopped promotion and rescue until its lock was released. See [ADR-051](adr/051-maintenance-recovery-loop.md).
+0.6.16 and earlier ran every branch in one loop, so there a single waiting statement stopped promotion, rescue and cron until its lock was released. See [ADR-051](adr/051-maintenance-recovery-loop.md).
 
 ## Heartbeat Timeouts
 
