@@ -413,9 +413,12 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
         },
     )
     .await;
-    admin::cancel(pool, cancelled)
+    // Prune may remove the cancellation's terminal row before the rescue waits finish.
+    let cancelled = admin::cancel(pool, cancelled)
         .await
-        .expect("the runtime role can cancel a job");
+        .expect("the runtime role can cancel a job")
+        .expect("the scheduled job should be found");
+    assert_eq!(cancelled.state, JobState::Cancelled);
 
     for (id, state) in [
         (completed, JobState::Completed),
@@ -425,7 +428,6 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
         (terminal, JobState::Failed),
         (scheduled, JobState::Completed),
         (rescued, JobState::Completed),
-        (cancelled, JobState::Cancelled),
     ] {
         wait_for_state(&logs, &store, pool, id, state).await;
     }
