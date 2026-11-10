@@ -45,6 +45,7 @@ Template: `Status / Context / Decision / Consequences (positive, negative) / Alt
 | 035 | [Backpressure and flow control](035-backpressure-flow-control.md) | Proposed | Soft depth signals from lane-head cursors by default, opt-in hard rejection, paced-producer helpers (#341) | Makes the ADR-006 transactional-enqueue tension explicit; composes ADR-025/031 |
 | 036 | [Public surface stability policy](036-public-surface-stability-policy.md) | Proposed | Surface-by-surface compatibility map and deprecation policy, published as `docs/stability.md` (#369) | Governs ADR-016 and the #342 SQL producer contract |
 | 037 | [Canonical engine deprecation](037-canonical-engine-deprecation.md) | Proposed | 0.7 migrate gate requires a finalized queue-storage transition; canonical paths removed in 0.8 (#370) | Completes ADR-019's supersession of the pre-0.6 model |
+| 051 | [Maintenance recovery loop](051-maintenance-recovery-loop.md) | Accepted | Promotion and the three rescues run in their own loop within the leader term, so a hygiene branch waiting on a lock or scanning cannot delay them (#303). Numbered to avoid `main`'s 038–050 | Composes with ADR-028; runs ADR-030 batch operations in the hygiene loop |
 
 ## Validation artifacts
 
