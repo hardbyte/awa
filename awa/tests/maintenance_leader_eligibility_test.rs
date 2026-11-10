@@ -106,14 +106,16 @@ impl Host {
             .unwrap()
     }
 
-    async fn shutdown(mut self) {
-        let runtime = self.runtime.take().unwrap();
+    /// Graceful stop. The runtime stays owned by `self`, so a caller that
+    /// abandons this future (a timeout) still drops it through `Drop`.
+    async fn shutdown(self) {
         let client = self.client.clone();
-        runtime
+        self.runtime
+            .as_ref()
+            .unwrap()
             .spawn(async move { client.shutdown(Duration::from_secs(5)).await })
             .await
             .unwrap();
-        runtime.shutdown_background();
     }
 }
 
@@ -363,4 +365,184 @@ async fn orphan_eligibility_rows_are_swept(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(left, vec![fresh]);
+}
+
+/// An opted-out runtime syncs its periodic jobs outside any leader term. A
+/// sync waiting on a cron row that another session has locked must not hold
+/// shutdown open indefinitely.
+#[sqlx::test(migrations = false)]
+async fn opted_out_shutdown_is_bounded_while_cron_sync_waits_on_a_lock(pool: PgPool) {
+    migrations::run(&pool).await.unwrap();
+    let first = Host::start(&pool, "registers_cron", false, true).await;
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
+    loop {
+        let synced: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM awa.cron_jobs WHERE name = 'leader_eligibility_nightly')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if synced {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "cron never synced");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    first.shutdown().await;
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM awa.cron_jobs WHERE name = 'leader_eligibility_nightly' FOR UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let blocked = Host::start(&pool, "blocked_cron_sync", false, true).await;
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(10));
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE application_name = 'blocked_cron_sync'
+                              AND wait_event_type = 'Lock')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the startup cron sync never waited on the locked row"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 5s drain + 5s maintenance grace, with margin.
+    tokio::time::timeout(scaled_timeout(Duration::from_secs(20)), blocked.shutdown())
+        .await
+        .expect("shutdown waited on the blocked cron sync without bound");
+    holder.rollback().await.unwrap();
+}
+
+/// A role that may INSERT into the eligibility table but not SELECT from it.
+/// Naming a conflict target would need SELECT, and a failed opt-out write must
+/// never stop the runtime snapshot that marks the runtime live.
+#[sqlx::test(migrations = false)]
+async fn partial_grants_never_block_the_runtime_snapshot(pool: PgPool) {
+    migrations::run(&pool).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let insert_only = format!("eligibility_insert_{suffix}");
+    let ungranted = format!("eligibility_none_{suffix}");
+    for role in [&insert_only, &ungranted] {
+        sqlx::raw_sql(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'eligibility';
+             GRANT USAGE ON SCHEMA awa TO {role};
+             GRANT SELECT, INSERT, UPDATE ON awa.runtime_instances TO {role};"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(&format!(
+        "GRANT INSERT ON awa.runtime_maintenance_eligibility TO {insert_only};
+         GRANT DELETE ON awa.runtime_maintenance_eligibility TO {insert_only};"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let connect_as = |role: &str| {
+        let options = (*pool.connect_options())
+            .clone()
+            .username(role)
+            .password("eligibility");
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+    };
+    let snapshot = |instance_id| admin::RuntimeSnapshotInput {
+        instance_id,
+        hostname: Some("partial-grants".into()),
+        pid: 1,
+        version: "test".into(),
+        storage_capability: admin::StorageCapability::Canonical,
+        transition_role: admin::TransitionRole::Auto,
+        started_at: chrono::Utc::now(),
+        snapshot_interval_ms: 10_000,
+        healthy: true,
+        postgres_connected: true,
+        poll_loop_alive: true,
+        heartbeat_alive: true,
+        maintenance_alive: true,
+        shutting_down: false,
+        leader: false,
+        maintenance_leader: false,
+        global_max_workers: None,
+        queues: vec![],
+        queue_descriptor_hashes: Default::default(),
+        job_kind_descriptor_hashes: Default::default(),
+    };
+    let recorded = |instance_id| {
+        let pool = pool.clone();
+        async move {
+            let runtime: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM awa.runtime_instances WHERE instance_id = $1)",
+            )
+            .bind(instance_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let opt_out: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM awa.runtime_maintenance_eligibility
+                                WHERE instance_id = $1 AND NOT maintenance_leader)",
+            )
+            .bind(instance_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            (runtime, opt_out)
+        }
+    };
+
+    let insert_pool = connect_as(&insert_only).await.unwrap();
+    let id = uuid::Uuid::new_v4();
+    // Twice: the second write takes the conflict path.
+    for _ in 0..2 {
+        admin::upsert_runtime_snapshot(&insert_pool, &snapshot(id))
+            .await
+            .expect("an INSERT-only role publishes its snapshot");
+    }
+    assert_eq!(recorded(id).await, (true, true));
+    // Without SELECT the sweep cannot evaluate its WHERE clause, so it skips,
+    // and readers fall back to "every runtime is eligible".
+    assert_eq!(
+        admin::cleanup_runtime_maintenance_eligibility(
+            &insert_pool,
+            chrono::TimeDelta::try_minutes(10).unwrap()
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let listed = admin::list_runtime_instances(&insert_pool).await.unwrap();
+    assert!(listed.iter().all(|instance| instance.maintenance_leader));
+    insert_pool.close().await;
+
+    let ungranted_pool = connect_as(&ungranted).await.unwrap();
+    let id = uuid::Uuid::new_v4();
+    admin::upsert_runtime_snapshot(&ungranted_pool, &snapshot(id))
+        .await
+        .expect("a role with no grant on the table publishes its snapshot");
+    assert_eq!(recorded(id).await, (true, false));
+    assert!(!admin::maintenance_eligibility_reportable(&ungranted_pool)
+        .await
+        .unwrap());
+    ungranted_pool.close().await;
+
+    for role in [&insert_only, &ungranted] {
+        sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role};"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }

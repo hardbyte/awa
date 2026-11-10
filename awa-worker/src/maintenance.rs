@@ -1972,7 +1972,24 @@ impl MaintenanceService {
                     debug!("Maintenance service shutting down (not eligible to lead)");
                     return;
                 }
-                _ = cron_sync_timer.tick() => self.sync_periodic_jobs_to_db().await,
+                _ = cron_sync_timer.tick() => {}
+            }
+            // A sync can wait on a cron row another session has locked.
+            // Shutdown gives it the same grace as a leader's branch, rather
+            // than waiting on the lock without bound.
+            let sync = self.sync_periodic_jobs_to_db();
+            tokio::pin!(sync);
+            tokio::select! {
+                _ = &mut sync => {}
+                _ = self.cancel.cancelled() => {
+                    if tokio::time::timeout(MAINTENANCE_BRANCH_SHUTDOWN_GRACE, sync)
+                        .await
+                        .is_err()
+                    {
+                        warn!("Periodic job sync exceeded shutdown grace");
+                    }
+                    return;
+                }
             }
         }
     }

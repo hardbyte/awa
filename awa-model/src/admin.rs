@@ -3118,7 +3118,9 @@ struct RuntimeInstanceRow {
 ///
 /// A snapshot with `maintenance_leader: false` also records the opt-out in
 /// `awa.runtime_maintenance_eligibility` when that table exists and the role
-/// may insert into it; see [`maintenance_eligibility_reportable`].
+/// may insert into it; see [`maintenance_eligibility_reportable`]. Recording
+/// the opt-out is best-effort: a failure is logged and never stops the
+/// snapshot, which the fleet relies on to tell live runtimes from dead ones.
 pub async fn upsert_runtime_snapshot<'a, A>(
     conn: A,
     snapshot: &RuntimeSnapshotInput,
@@ -3129,14 +3131,13 @@ where
     let mut conn = conn.acquire().await?;
     // Recorded before the snapshot row, so a reader never sees a new
     // opted-out runtime without its opt-out.
-    if !snapshot.maintenance_leader && eligibility_table_usable(&mut conn, "INSERT").await? {
-        sqlx::query(
-            "INSERT INTO awa.runtime_maintenance_eligibility (instance_id, maintenance_leader) \
-             VALUES ($1, false) ON CONFLICT (instance_id) DO NOTHING",
-        )
-        .bind(snapshot.instance_id)
-        .execute(&mut *conn)
-        .await?;
+    if !snapshot.maintenance_leader {
+        if let Err(err) = record_maintenance_opt_out(&mut conn, snapshot.instance_id).await {
+            tracing::warn!(
+                error = %err,
+                "Could not record this runtime's maintenance leadership opt-out"
+            );
+        }
     }
     sqlx::query(
         r#"
@@ -3212,19 +3213,43 @@ where
     Ok(())
 }
 
+/// Record that `instance_id` never contends for maintenance leadership, if
+/// the table exists and this role may insert into it.
+async fn record_maintenance_opt_out(
+    conn: &mut sqlx::PgConnection,
+    instance_id: Uuid,
+) -> Result<(), AwaError> {
+    if !eligibility_table_usable(conn, &["INSERT"]).await? {
+        return Ok(());
+    }
+    // No conflict target: naming `instance_id` would also need SELECT on it.
+    // The primary key is the table's only unique constraint.
+    sqlx::query(
+        "INSERT INTO awa.runtime_maintenance_eligibility (instance_id, maintenance_leader) \
+         VALUES ($1, false) ON CONFLICT DO NOTHING",
+    )
+    .bind(instance_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Whether `awa.runtime_maintenance_eligibility` exists and this role holds
-/// `privilege` on it. The table comes from a schema patch, so a binary may
-/// run against a database without it, or with a role that was never granted
-/// it; both read as "every runtime is eligible".
+/// every one of `privileges` on it. The table comes from a schema patch, so a
+/// binary may run against a database without it, or with a role that was
+/// never granted it; both read as "every runtime is eligible".
 pub(crate) async fn eligibility_table_usable(
     conn: &mut sqlx::PgConnection,
-    privilege: &str,
+    privileges: &[&str],
 ) -> Result<bool, AwaError> {
+    // has_table_privilege with a comma-separated list is true when *any* of
+    // them is held, so each privilege is checked on its own.
     let usable: bool = sqlx::query_scalar(
         "SELECT to_regclass('awa.runtime_maintenance_eligibility') IS NOT NULL \
-           AND has_table_privilege('awa.runtime_maintenance_eligibility', $1)",
+           AND (SELECT bool_and(has_table_privilege('awa.runtime_maintenance_eligibility', privilege)) \
+                FROM unnest($1::text[]) AS privilege)",
     )
-    .bind(privilege)
+    .bind(privileges)
     .fetch_one(&mut *conn)
     .await?;
     Ok(usable)
@@ -3235,7 +3260,7 @@ pub(crate) async fn eligibility_table_usable(
 pub(crate) async fn maintenance_leader_sql(
     conn: &mut sqlx::PgConnection,
 ) -> Result<&'static str, AwaError> {
-    Ok(if eligibility_table_usable(conn, "SELECT").await? {
+    Ok(if eligibility_table_usable(conn, &["SELECT"]).await? {
         "NOT EXISTS (SELECT 1 FROM awa.runtime_maintenance_eligibility AS eligibility \
                      WHERE eligibility.instance_id = runtime.instance_id \
                        AND NOT eligibility.maintenance_leader)"
@@ -3253,7 +3278,7 @@ where
     A: Acquire<'a, Database = Postgres>,
 {
     let mut conn = conn.acquire().await?;
-    eligibility_table_usable(&mut conn, "INSERT").await
+    eligibility_table_usable(&mut conn, &["INSERT"]).await
 }
 
 /// Delete eligibility rows whose runtime snapshot row has gone. Rows younger
@@ -3268,7 +3293,8 @@ where
     A: Acquire<'a, Database = Postgres>,
 {
     let mut conn = conn.acquire().await?;
-    if !eligibility_table_usable(&mut conn, "DELETE").await? {
+    // The WHERE clause reads the table's columns, which needs SELECT too.
+    if !eligibility_table_usable(&mut conn, &["DELETE", "SELECT"]).await? {
         return Ok(0);
     }
     let seconds = max(min_age.num_seconds(), 1);
