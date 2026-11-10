@@ -173,7 +173,7 @@ impl Worker for Probe {
             // Outlives its deadline on the first attempt, so deadline rescue
             // takes it back and a second attempt completes it.
             "overrun_once" if first_attempt => {
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(JobResult::Completed)
             }
             _ => Ok(JobResult::Completed),
@@ -188,6 +188,9 @@ fn runtime_client(pool: PgPool, maintenance_leader: bool) -> Client {
             QueueConfig {
                 max_workers: 8,
                 poll_interval: Duration::from_millis(20),
+                // Queue storage takes each attempt's deadline from the queue,
+                // not from InsertOpts. Every other mode finishes well within it.
+                deadline_duration: Duration::from_millis(500),
                 ..Default::default()
             },
         )
@@ -400,15 +403,7 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
         },
     )
     .await;
-    let rescued = insert(
-        pool,
-        "overrun_once",
-        InsertOpts {
-            deadline_duration: Some(chrono::Duration::milliseconds(300)),
-            ..Default::default()
-        },
-    )
-    .await;
+    let rescued = insert(pool, "overrun_once", InsertOpts::default()).await;
     let cancelled = insert(
         pool,
         "complete",
@@ -434,6 +429,16 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
     ] {
         wait_for_state(&logs, &store, pool, id, state).await;
     }
+    let rescued_attempt = store
+        .load_job(pool, rescued)
+        .await
+        .unwrap()
+        .unwrap()
+        .attempt;
+    assert!(
+        rescued_attempt >= 2,
+        "the overrunning job must complete on a rescued attempt, not its first"
+    );
 
     // Let the maintenance loop run its slower branches: ring rotation wraps
     // and prunes, cleanup deletes completed rows, cron fires.
