@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- A maintenance branch waiting on a lock or running a long scan no longer holds back promotion and rescue (#303). The maintenance leader ran every branch from one loop, so while one branch's statement waited, scheduled and retryable jobs were not promoted and stale, overdue and timed-out attempts were not rescued. With one `awa.cron_jobs` row locked by another session, the leader's cron sync stalled both for as long as the lock was held. Promotion and the three rescues now run in their own loop within the leader term; cleanup, cron sync, metadata, batch operations, rollup and ring rotation stay in the other. Leadership and the shutdown grace are unchanged, and no configuration or schema change is needed. A leader may hold one more maintenance connection at a time, and queue-storage prune may report more `blocked` outcomes while a rescue pass runs. See [ADR-051](docs/adr/051-maintenance-recovery-loop.md).
+
 ## [0.6.16] — 2026-11-10
 
 Recommended for everyone on 0.6.15 using queue storage. Rescue drains a large backlog of abandoned claims, which a killed runtime leaves behind and which stops the queue and claim rings from rotating, in minutes instead of the hours or days 0.6.15 took. Batch inserts (`insert_many_copy`, `insert_many_skip_unique_conflicts`) give way to per-row producers that share their keys or lanes instead of deadlocking with them, and creating a new queue lane no longer deadlocks between `QueueStorage` and SQL producers. Operators can durably halt and resume `maintenance.prune` across the fleet, `admin::get_job` no longer misses a failed job while prune moves it, and `awa migrate` re-applies the claim batch index and batch insert patches with fixes.

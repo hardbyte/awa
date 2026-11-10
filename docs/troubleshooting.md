@@ -286,6 +286,21 @@ If you want faster leader failover:
 
 Use lower values carefully. Faster checks mean more advisory-lock traffic.
 
+### A Maintenance Statement Waits On A Lock
+
+The leader runs promotion and the three rescues (stale heartbeat, deadline, callback timeout) in one loop, and its other maintenance in another: cleanup, cron sync, metadata, batch operations, terminal-count rollup and ring rotation. A statement in the second loop that waits on a lock, such as the cron sync upserting a schedule row another session holds, delays only that loop. Promotion and rescue keep running.
+
+In releases after 0.6.16, a leader whose scheduled jobs are not promoted is therefore not blocked by its own cleanup or cron sync. Look instead at promotion's own locks (`awa.maintenance.promote.lane_contention`) and at pool exhaustion. To find a stuck maintenance statement, list the leader's waiting backends:
+
+```sql
+SELECT pid, wait_event_type, wait_event, now() - query_start AS waiting, left(query, 120)
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock' AND datname = current_database()
+ORDER BY query_start;
+```
+
+0.6.16 and earlier ran every branch in one loop, so there a single waiting statement stopped promotion and rescue until its lock was released. See [ADR-051](adr/051-maintenance-recovery-loop.md).
+
 ## Heartbeat Timeouts
 
 ### Defaults

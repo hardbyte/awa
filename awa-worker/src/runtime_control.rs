@@ -969,15 +969,54 @@ mod tests {
             .split("            run_leader_term(")
             .next()
             .unwrap();
-        // Every select arm except cancellation must register and gate its work.
-        let selected = leader.matches("\n                        _ = ").count()
+        // Every select arm except the two cancellation arms in each of the
+        // recovery and hygiene loops must register and gate its work.
+        let selected = leader.matches("\n                            _ = ").count()
             + leader
-                .matches("\n                        origin = ")
+                .matches("\n                            origin = ")
                 .count();
         assert_eq!(
             selected,
-            leader.matches("branch_tracker.try_begin").count() + 2
+            leader.matches("branch_tracker.try_begin").count() + 4
         );
+        // #303: promotion and rescue run in the recovery loop, and nothing
+        // else does, so no hygiene branch can delay them.
+        let recovery = leader
+            .split("let recovery = async {")
+            .nth(1)
+            .unwrap()
+            .split("let hygiene = async {")
+            .next()
+            .unwrap();
+        let hygiene = leader.split("let hygiene = async {").nth(1).unwrap();
+        let admitted = |section: &str| -> Vec<String> {
+            section
+                .split("self.control.admit(MaintenanceBranch::")
+                .skip(1)
+                .map(|rest| rest.split(')').next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            admitted(recovery),
+            [
+                "RescueHeartbeat",
+                "RescueDeadline",
+                "RescueCallback",
+                "Promote"
+            ]
+        );
+        for branch in admitted(hygiene) {
+            assert!(
+                ![
+                    "RescueHeartbeat",
+                    "RescueDeadline",
+                    "RescueCallback",
+                    "Promote"
+                ]
+                .contains(&branch.as_str()),
+                "{branch} belongs in the recovery loop"
+            );
+        }
         assert!(!leader.contains("try_begin(\""));
         assert!(!leader.contains("try_begin_without_cooldown(\""));
         assert_eq!(
