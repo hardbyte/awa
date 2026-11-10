@@ -93,6 +93,9 @@ pub struct RuntimeControlRuntime {
     pub pid: i32,
     pub version: String,
     pub leader: bool,
+    /// False for a runtime that never contends for maintenance leadership.
+    #[serde(default = "maintenance_leader_default")]
+    pub maintenance_leader: bool,
     pub shutting_down: bool,
     pub last_seen_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
@@ -119,6 +122,13 @@ pub struct RuntimeControlStatus {
     pub runtimes: Vec<RuntimeControlRuntime>,
     /// Live runtimes without a supported, fresh observation of this scope.
     pub unobserving_runtimes: Vec<RuntimeControlRuntime>,
+    /// Live runtimes, not shutting down, that may take maintenance
+    /// leadership. Zero while runtimes are live means none of them will.
+    pub leader_eligible_runtimes: usize,
+}
+
+fn maintenance_leader_default() -> bool {
+    true
 }
 
 #[derive(sqlx::FromRow)]
@@ -144,7 +154,8 @@ pub async fn status(pool: &PgPool) -> Result<RuntimeControlStatus, AwaError> {
     )
     .await?;
     begin_guard.begin_pending = false;
-    let snapshot: StatusSnapshot = sqlx::query_as(
+    let maintenance_leader = crate::admin::maintenance_leader_sql(tx.as_mut()).await?;
+    let snapshot: StatusSnapshot = sqlx::query_as(&format!(
         r#"
         WITH status_clock AS MATERIALIZED (SELECT statement_timestamp() AS at)
         SELECT to_jsonb(requested) AS requested, status_clock.at AS observed_at,
@@ -156,6 +167,7 @@ pub async fn status(pool: &PgPool) -> Result<RuntimeControlStatus, AwaError> {
                            'pid', runtime.pid,
                            'version', runtime.version,
                            'leader', runtime.leader,
+                           'maintenance_leader', {maintenance_leader},
                            'shutting_down', runtime.shutting_down,
                            'last_seen_at', runtime.last_seen_at,
                            'snapshot_interval_ms', runtime.snapshot_interval_ms,
@@ -169,8 +181,8 @@ pub async fn status(pool: &PgPool) -> Result<RuntimeControlStatus, AwaError> {
                ), '[]'::jsonb) AS runtimes
         FROM awa.runtime_controls requested CROSS JOIN status_clock
         WHERE requested.scope = 'maintenance.prune'
-        "#,
-    )
+        "#
+    ))
     .fetch_one(tx.as_mut())
     .await?;
     tx.commit().await?;
@@ -209,12 +221,17 @@ pub async fn status(pool: &PgPool) -> Result<RuntimeControlStatus, AwaError> {
         .cloned()
         .collect();
     let state = aggregate_state(&requested, &runtimes, &unobserving_runtimes);
+    let leader_eligible_runtimes = runtimes
+        .iter()
+        .filter(|runtime| runtime.live && !runtime.shutting_down && runtime.maintenance_leader)
+        .count();
     Ok(RuntimeControlStatus {
         requested,
         state,
         observed_at: snapshot.observed_at,
         runtimes,
         unobserving_runtimes,
+        leader_eligible_runtimes,
     })
 }
 

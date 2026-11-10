@@ -976,6 +976,9 @@ pub struct MaintenanceService {
     cron_eval_interval: Duration,
     leader_check_interval: Duration,
     leader_election_interval: Duration,
+    /// Whether this runtime contends for the maintenance advisory lock. A
+    /// runtime that does not still syncs its own periodic job declarations.
+    leader_eligible: bool,
     heartbeat_staleness: Duration,
     completed_retention: Duration,
     failed_retention: Duration,
@@ -1282,6 +1285,7 @@ impl MaintenanceService {
             cron_eval_interval: Duration::from_secs(1),
             leader_check_interval: Duration::from_secs(30),
             leader_election_interval: Duration::from_secs(10),
+            leader_eligible: true,
             heartbeat_staleness: Duration::from_secs(90),
             completed_retention: Duration::from_secs(86400), // 24h
             failed_retention: Duration::from_secs(259200),   // 72h
@@ -1357,6 +1361,13 @@ impl MaintenanceService {
     /// Set the leader connection health-check interval (default: 30s).
     pub fn leader_check_interval(mut self, interval: Duration) -> Self {
         self.leader_check_interval = interval;
+        self
+    }
+
+    /// Set whether this runtime contends for maintenance leadership
+    /// (default: true). When false the service never takes the leader lock.
+    pub fn leader_eligible(mut self, eligible: bool) -> Self {
+        self.leader_eligible = eligible;
         self
     }
 
@@ -1481,6 +1492,11 @@ impl MaintenanceService {
         self.alive.store(true, Ordering::SeqCst);
         let _alive_guard = MaintenanceAliveGuard(self.alive.clone());
         self.leader.store(false, Ordering::SeqCst);
+
+        if !self.leader_eligible {
+            self.run_ineligible().await;
+            return;
+        }
 
         loop {
             // Try to acquire advisory lock for leader election.
@@ -1940,6 +1956,24 @@ impl MaintenanceService {
             Ok(Some(conn))
         } else {
             Ok(None)
+        }
+    }
+
+    /// The maintenance loop of a runtime that never leads. Leaders only sync
+    /// the schedules their own runtime declares, so a runtime that never leads
+    /// keeps its declarations in `awa.cron_jobs` itself; the leader, wherever
+    /// it runs, evaluates every schedule there.
+    async fn run_ineligible(&self) {
+        info!("Maintenance leadership disabled for this runtime; it will not contend for the leader lock");
+        let mut cron_sync_timer = leader_loop_interval(self.cron_sync_interval);
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    debug!("Maintenance service shutting down (not eligible to lead)");
+                    return;
+                }
+                _ = cron_sync_timer.tick() => self.sync_periodic_jobs_to_db().await,
+            }
         }
     }
 
@@ -4176,6 +4210,14 @@ impl MaintenanceService {
         if let Err(err) = self.control.cleanup_orphan_reports(&self.pool).await {
             self.control.record_reclamation_error(&err);
             tracing::warn!(error = %err, "Failed to clean up orphan control observations");
+        }
+        if let Err(err) = awa_model::admin::cleanup_runtime_maintenance_eligibility(
+            &self.pool,
+            chrono::TimeDelta::try_minutes(10).unwrap(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, "Failed to clean up orphan maintenance eligibility rows");
         }
     }
 
