@@ -971,10 +971,13 @@ mod tests {
             .unwrap();
         // Every select arm except the two cancellation arms in each of the
         // recovery and hygiene loops must register and gate its work.
-        let selected = leader.matches("\n                            _ = ").count()
-            + leader
-                .matches("\n                            origin = ")
-                .count();
+        // Matched by shape, not indentation, so the count survives a
+        // change in nesting.
+        let selected = leader
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("_ = ") || line.starts_with("origin = "))
+            .count();
         assert_eq!(
             selected,
             leader.matches("branch_tracker.try_begin").count() + 4
