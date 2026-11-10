@@ -37,6 +37,14 @@
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
 #   SOAK_PG_CPUS              CPU limit for each database container (default: none)
+#   SOAK_PG_MEMORY            memory limit for each database container, as `docker run --memory`
+#                             takes it (default: none)
+#   SOAK_PG_ARGS              extra server arguments for pg17 and pg18, e.g.
+#                             "-c log_lock_waits=on -c deadlock_timeout=5ms"
+#   SOAK_KEEP_SERVER_LOG      set to 1 to write server.log for a run that passed too
+#   AWA_SOAK_QUEUE_ROTATE_MS, AWA_SOAK_CLAIM_ROTATE_MS, AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS
+#                             queue and claim ring rotation intervals and the prune lock timeout
+#                             of every in-process runtime (default: the library's 1000, 1000 and 10)
 #   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0; the
 #                             -epqlog5 build, which logs every partition-pruning setup with its
 #                             query text, is opt-in for diagnosing pruning crashes)
@@ -99,7 +107,11 @@ start_container() {
   local engine="$1" name="$2" port="$3"
   local cpu_args=()
   [ -n "${SOAK_PG_CPUS:-}" ] && cpu_args=(--cpus "$SOAK_PG_CPUS")
+  [ -n "${SOAK_PG_MEMORY:-}" ] && cpu_args+=(--memory "$SOAK_PG_MEMORY")
   local common=(-c "max_connections=$MAX_CONNECTIONS" -c max_locks_per_transaction=256 -c shared_buffers=512MB -c "log_line_prefix=%m [%p] %u@%a ")
+  local extra=()
+  read -r -a extra <<<"${SOAK_PG_ARGS:-}"
+  common+=("${extra[@]}")
   case "$engine" in
     pg17)
       docker run -d --name "$name" --shm-size=1g "${cpu_args[@]}" -e POSTGRES_PASSWORD=test -p "$port:5432" postgres:17 "${common[@]}" >/dev/null ;;
@@ -205,6 +217,10 @@ for index in "${!ENGINES[@]}"; do
     [ "$engine" = pg18-cassert ] && docker exec "$name" cat "$SOAK_PG_LOG_FILE" >"$out/server.log" 2>/dev/null
   else
     echo "   passed; report in $out/report.md"
+    if [ "${SOAK_KEEP_SERVER_LOG:-0}" = 1 ]; then
+      docker logs "$name" >"$out/server.log" 2>&1 || true
+      [ "$engine" = pg18-cassert ] && docker exec "$name" cat "$SOAK_PG_LOG_FILE" >"$out/server.log" 2>/dev/null
+    fi
   fi
   docker rm -f -v "$name" >/dev/null 2>&1
 done

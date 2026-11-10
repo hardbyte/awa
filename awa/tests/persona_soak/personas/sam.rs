@@ -8,7 +8,7 @@ use super::super::fleet::Fleet;
 use super::super::ledger::{expect, flag};
 use super::super::rng::Rng;
 use super::super::shared::Shared;
-use super::{attach_events, backoff, queue, register_rows, tune};
+use super::{attach_events, backoff, queue, register_rows, storage, tune};
 use awa::model::{insert_many, QueueStorage, QueueStorageConfig};
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, RateLimit, Worker,
@@ -124,16 +124,12 @@ fn striped_factory(shared: Arc<Shared>, order: Arc<Mutex<Order>>) -> ClientFacto
     Arc::new(move |pool| {
         let builder = Client::builder(pool)
             .queue(STRIPED_QUEUE, queue(16))
-            .queue_storage(
-                striped_config(),
-                Duration::from_millis(1_000),
-                Duration::from_millis(1_000),
-            )
             .register_worker(SamWorker {
                 shared: shared.clone(),
                 order: order.clone(),
             });
-        attach_events(tune(builder, &shared), &shared, &["sam_job"])
+        let builder = storage(tune(builder, &shared), &shared, striped_config());
+        attach_events(builder, &shared, &["sam_job"])
             .build()
             .expect("build sam stripe client")
     })
