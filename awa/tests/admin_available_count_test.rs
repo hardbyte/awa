@@ -68,6 +68,10 @@ async fn lanes_within_the_cap_are_counted_exactly(pool: PgPool) -> TestResult {
         (CAP - 7, false)
     );
     assert!(below.lag_seconds.is_some());
+
+    let counts = admin::state_counts(&pool).await?;
+    assert_eq!(counts.count(JobState::Available), 90 + CAP - 7);
+    assert!(!counts.available_is_estimate);
     Ok(())
 }
 
@@ -109,10 +113,11 @@ async fn a_queue_mixing_exact_and_estimated_lanes_is_an_estimate(pool: PgPool) -
 
     let counts = admin::state_counts(&pool).await?;
     assert_eq!(
-        counts[&JobState::Available],
+        counts.count(JobState::Available),
         45 + CAP + 500 + 20,
         "dashboard counts use the same per-lane rule"
     );
+    assert!(counts.available_is_estimate);
     Ok(())
 }
 

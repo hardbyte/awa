@@ -259,7 +259,7 @@ export function JobsPage() {
   };
 
   const total = statsQuery.data
-    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
+    ? Object.values(statsQuery.data.counts).reduce((a, b) => a + b, 0)
     : undefined;
 
   const lastJob = jobs[jobs.length - 1];
@@ -335,7 +335,7 @@ export function JobsPage() {
       {/* Compact state filter pills + search on same row */}
       <div className="flex flex-wrap items-center gap-2">
         {STATES.map((s) => {
-          const count = s === "all" ? total : statsQuery.data?.[s];
+          const count = s === "all" ? total : statsQuery.data?.counts[s];
           const isActive = filters.state === s;
           return (
             <button

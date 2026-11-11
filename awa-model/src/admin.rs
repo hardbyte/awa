@@ -4174,18 +4174,36 @@ pub async fn dump_run(
     })
 }
 
+/// Job counts by state, as [`state_counts`] returns them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StateCounts {
+    pub counts: HashMap<JobState, i64>,
+    /// `counts[Available]` is a head-sequence estimate for at least one lane
+    /// holding more than [`AVAILABLE_LANE_EXACT_COUNT_CAP`] unclaimed rows;
+    /// otherwise it is exact.
+    pub available_is_estimate: bool,
+}
+
+impl StateCounts {
+    /// The count for `state`, zero if the state has no row.
+    pub fn count(&self, state: JobState) -> i64 {
+        self.counts.get(&state).copied().unwrap_or(0)
+    }
+}
+
 /// Count jobs grouped by state.
 ///
 /// Reads from the `queue_state_counts` cache table. On queue storage,
 /// `available` is exact up to [`AVAILABLE_LANE_EXACT_COUNT_CAP`] unclaimed
-/// rows per lane; [`queue_overviews`] reports which queues are estimated.
-pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaError> {
+/// rows per lane, and `available_is_estimate` says when it is not.
+pub async fn state_counts(pool: &PgPool) -> Result<StateCounts, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
             SELECT
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
-                COALESCE((SELECT sum(available)::bigint FROM ({available}) AS lanes), 0) AS available,
+                COALESCE(avail.available, 0) AS available,
+                COALESCE(avail.available_is_estimate, FALSE) AS available_is_estimate,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM ({open_running}) AS open_running), 0) AS running,
                 -- A completion batch carries its size, so completed jobs are
@@ -4200,6 +4218,12 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'cancelled'), 0) AS cancelled,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
+            FROM (
+                SELECT
+                    sum(available)::bigint AS available,
+                    bool_or(available_is_estimate) AS available_is_estimate
+                FROM ({available}) AS lanes
+            ) AS avail
             "#,
             available = queue_storage_available_by_queue_sql(store.schema()),
             open_running = crate::queue_storage::open_receipt_running_claims_sql(store.schema()),
@@ -4209,13 +4233,14 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
         let (
             scheduled,
             available,
+            available_is_estimate,
             running,
             completed,
             retryable,
             failed,
             cancelled,
             waiting_external,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
+        ): (i64, i64, bool, i64, i64, i64, i64, i64, i64) = {
             // As in `queue_overviews`: compiling costs more than running.
             let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
             let mut tx = sqlx::Connection::begin_with(
@@ -4233,16 +4258,19 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             counts
         };
 
-        return Ok(HashMap::from([
-            (JobState::Scheduled, scheduled),
-            (JobState::Available, available),
-            (JobState::Running, running),
-            (JobState::Completed, completed),
-            (JobState::Retryable, retryable),
-            (JobState::Failed, failed),
-            (JobState::Cancelled, cancelled),
-            (JobState::WaitingExternal, waiting_external),
-        ]));
+        return Ok(StateCounts {
+            counts: HashMap::from([
+                (JobState::Scheduled, scheduled),
+                (JobState::Available, available),
+                (JobState::Running, running),
+                (JobState::Completed, completed),
+                (JobState::Retryable, retryable),
+                (JobState::Failed, failed),
+                (JobState::Cancelled, cancelled),
+                (JobState::WaitingExternal, waiting_external),
+            ]),
+            available_is_estimate,
+        });
     }
 
     // Single scan of queue_state_counts — sums all columns in one pass
@@ -4276,7 +4304,10 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().collect())
+    Ok(StateCounts {
+        counts: rows.into_iter().collect(),
+        available_is_estimate: false,
+    })
 }
 
 #[derive(sqlx::FromRow)]

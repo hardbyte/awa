@@ -191,7 +191,11 @@ export interface CronJobRow {
   paused_by: string | null;
 }
 
-export type StateCounts = Record<string, number>;
+export interface StateCounts {
+  counts: Record<string, number>;
+  /** `counts.available` is a head-sequence estimate for an over-deep lane. */
+  available_is_estimate: boolean;
+}
 
 export interface TimeseriesBucket {
   bucket: string;

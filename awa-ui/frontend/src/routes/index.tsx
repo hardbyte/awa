@@ -121,7 +121,7 @@ export function DashboardPage() {
     : null;
 
   const totalJobs = statsQuery.data
-    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
+    ? Object.values(statsQuery.data.counts).reduce((a, b) => a + b, 0)
     : null;
 
   // Sort queues by visible workload so deferred-heavy queues stay prominent.
@@ -143,7 +143,7 @@ export function DashboardPage() {
       {/* Headline counter cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {COUNTER_KEYS.map((key) => {
-          const count = statsQuery.data?.[key];
+          const count = statsQuery.data?.counts[key];
           const bg = STATE_CARD_BG[key] ?? "";
           const series = seriesByState[key] ?? [];
           return (
@@ -164,8 +164,7 @@ export function DashboardPage() {
                       <AvailableCount
                         count={count ?? 0}
                         isEstimate={
-                          key === "available" &&
-                          queuesQuery.data?.some((q) => q.available_is_estimate)
+                          key === "available" && statsQuery.data?.available_is_estimate
                         }
                       />
                     )}
