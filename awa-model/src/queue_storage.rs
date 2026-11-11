@@ -619,6 +619,15 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
+/// A lock timeout, or a deadlock in which the prune was the victim.
+fn is_prune_contention_error(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db_err)
+            if matches!(db_err.code().as_deref(), Some("55P03" | "40P01"))
+    )
+}
+
 async fn set_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     timeout: Duration,
@@ -640,21 +649,22 @@ const PRUNE_LOCK_UPGRADE_CEILING: Duration = Duration::from_millis(320);
 /// Partitions of a queue ring slot that queue prune locks in one statement.
 const QUEUE_PRUNE_LOCKED_PARTITIONS: u32 = 8;
 
-/// The longest single wait of [`upgrade_prune_lock_tx`] for `base`.
+/// The longest single wait of [`acquire_prune_exclusive_lock_tx`] for `base`.
 fn prune_lock_upgrade_ceiling(base: Duration) -> Duration {
     base.max(PRUNE_LOCK_UPGRADE_CEILING)
 }
 
-/// Upgrade `tables`, already held in `SHARE ROW EXCLUSIVE`, to
-/// `ACCESS EXCLUSIVE`.
+/// Take `ACCESS EXCLUSIVE` on `tables` for a prune's truncate.
 ///
 /// A pending `ACCESS EXCLUSIVE` request stalls every new reader of the
 /// tables, so each attempt waits a bounded time and then lets the readers
 /// through before the next, longer attempt. The first attempt waits `base`
 /// and each later one twice as long, up to [`prune_lock_upgrade_ceiling`].
-/// The last timeout is returned as the usual lock contention error, and
-/// `lock_timeout` is back at `base` on success.
-async fn upgrade_prune_lock_tx(
+/// A deadlock reported for the request counts as contention: PostgreSQL
+/// raises it at once when a transaction that already reads one of the tables
+/// is waiting to write a table the prune holds in `SHARE ROW EXCLUSIVE`. The
+/// last failure is returned, and `lock_timeout` is back at `base` on success.
+async fn acquire_prune_exclusive_lock_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     tables: &str,
     base: Duration,
@@ -678,7 +688,7 @@ async fn upgrade_prune_lock_tx(
                     .map_err(map_sqlx_error)?;
                 return set_lock_timeout_tx(tx, base).await;
             }
-            Err(err) if is_lock_contention_error(&err) && timeout < ceiling => {
+            Err(err) if is_prune_contention_error(&err) && timeout < ceiling => {
                 sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_lock_upgrade")
                     .execute(tx.as_mut())
                     .await
@@ -697,9 +707,10 @@ async fn upgrade_prune_lock_tx(
 /// The timeout applies to every later statement in the transaction, not only
 /// the explicit `LOCK TABLE`: an insert, update or read of another relation can
 /// also queue behind a conflicting lock (autovacuum's heap truncation takes
-/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere therefore rolls the
-/// whole transaction back and reports `blocked`, so the caller backs off and
-/// retries instead of surfacing an error.
+/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere, or a deadlock
+/// that PostgreSQL resolves by cancelling the prune, therefore rolls the whole
+/// transaction back and reports `blocked`, so the caller backs off and retries
+/// instead of surfacing an error.
 async fn settle_prune_tx<T>(
     tx: sqlx::Transaction<'_, Postgres>,
     result: Result<T, AwaError>,
@@ -713,7 +724,7 @@ async fn settle_prune_tx<T>(
         Err(err) => {
             let _ = tx.rollback().await;
             match err {
-                AwaError::Database(ref db_err) if is_lock_contention_error(db_err) => Ok(blocked),
+                AwaError::Database(ref db_err) if is_prune_contention_error(db_err) => Ok(blocked),
                 err => Err(err),
             }
         }
@@ -18511,7 +18522,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            upgrade_prune_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout).await?;
+            acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout).await?;
 
             // A receipt claim inserts its attempt batch into this slot, so
             // it cannot have started after the slot was frozen, and closures
@@ -18949,23 +18960,15 @@ impl QueueStorage {
             let slot_children = format!(
                 "{claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
             );
-            // SHARE ROW EXCLUSIVE waits for every transaction that has
-            // written to this slot and blocks new writers, while readers of
-            // the sealed children carry on. The ring state row locked above
-            // keeps the slot from becoming current again, so nothing can
-            // open a claim in it after the proof below, and
-            // ACCESS EXCLUSIVE is only requested for the truncate.
-            sqlx::query(&format!(
-                "LOCK TABLE {slot_children} IN SHARE ROW EXCLUSIVE MODE"
-            ))
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            // Heartbeat, retry, fail and snooze read `lease_claims` and then
+            // update it in the same transaction. A weaker lock held across
+            // the proof below would let them read and then block their
+            // update, and the request for ACCESS EXCLUSIVE would deadlock
+            // with every one of them. Claim prune therefore takes
+            // ACCESS EXCLUSIVE before the proof.
+            acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout)
+                .await?;
 
-            // After taking ACCESS EXCLUSIVE, recheck that the slot is still
-            // not the current one. The ring-state lock should already make
-            // this stable, but keeping the explicit gate documents the
-            // truncate precondition.
             let current_slot: i32 = sqlx::query_scalar(&format!(
                 r#"
                 SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
@@ -18999,8 +19002,6 @@ impl QueueStorage {
                     count: busy_indicator(open_claims),
                 });
             }
-
-            upgrade_prune_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout).await?;
 
             sqlx::query(&format!("TRUNCATE TABLE {slot_children}"))
                 .execute(tx.as_mut())
