@@ -151,6 +151,7 @@ Configs:
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
 - [`AwaStorageLockOrderOldStripedClaimDeadlock.cfg`](./AwaStorageLockOrderOldStripedClaimDeadlock.cfg): the historical claim shape that walked several physical stripes against the enqueue order — **NoDeadlock tripped**.
 - [`AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg`](./AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg): the historical `QueueStorage` order for a new lane, provisioning lock before the `queue_lanes` row, against a SQL producer of the same lane — **NoDeadlock tripped in 5 steps** (#692).
+- [`AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg`](./AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg): the 0.6.16 claim prune order, the slot's `claim_ring_slots` row before the slot's partitions, against stale receipt rescue, which takes the partitions and then the row — **NoDeadlock tripped** (#721).
 
 Run:
 
@@ -161,7 +162,9 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg
 ```
 
-Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
+Plan order follows PostgreSQL, not the SQL text: a statement takes every relation lock when it is planned and its row locks afterwards, so a `FOR UPDATE` written in a leading CTE is still acquired after the locks on every table the statement reads. The rescue plans listed the cursor row first until #721, which hid their cycle with claim prune.
+
+Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named (a claim, completion or heartbeat that reads a partitioned parent through a cached generic plan locks every slot's partition, and the plans list only the slot the statement targets), the difference between `ROW EXCLUSIVE`, `SHARE ROW EXCLUSIVE` and `ACCESS SHARE`, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
 
 ## Race-exposure companion spec
 
