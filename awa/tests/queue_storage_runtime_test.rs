@@ -22833,3 +22833,276 @@ async fn cursor_advance_requires_claim_evidence(receipts: bool) {
         "the job whose claim was lost stays claimable"
     );
 }
+
+/// Children of one sealed slot of each ring, as prune locks them.
+fn sealed_slot_children(schema: &str, queue_slot: usize, claim_slot: usize) -> Vec<String> {
+    let mut children: Vec<String> = [
+        "ready_entries",
+        "ready_claim_attempt_batches",
+        "done_entries",
+        "ready_tombstones",
+        "ready_segments",
+        "receipt_completion_batches",
+        "receipt_completion_tombstones",
+        "queue_terminal_count_deltas",
+    ]
+    .iter()
+    .map(|table| format!("{schema}.{table}_{queue_slot}"))
+    .collect();
+    children.extend(
+        [
+            "lease_claims",
+            "lease_claim_batches",
+            "lease_claim_closures",
+            "lease_claim_closure_batches",
+        ]
+        .iter()
+        .map(|table| format!("{schema}.{table}_{claim_slot}")),
+    );
+    children
+}
+
+/// Runs `operation` while another session holds `ACCESS EXCLUSIVE` on
+/// `locked`, and records its name if it had not finished after two seconds.
+/// The lock is then released and the same operation is left to finish, so
+/// later steps have its result.
+async fn run_against_locked_children<T, F, Fut>(
+    pool: &sqlx::PgPool,
+    locked: &[String],
+    blocked: &mut Vec<&'static str>,
+    name: &'static str,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    if locked.is_empty() {
+        return operation().await;
+    }
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    sqlx::query(&format!(
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        locked.join(", ")
+    ))
+    .execute(holder.as_mut())
+    .await
+    .expect("lock the sealed slot's children");
+    let operation = operation();
+    tokio::pin!(operation);
+    match tokio::time::timeout(Duration::from_secs(2), &mut operation).await {
+        Ok(value) => {
+            holder.rollback().await.expect("release the sealed slot");
+            value
+        }
+        Err(_) => {
+            blocked.push(name);
+            holder.rollback().await.expect("release the sealed slot");
+            operation.await
+        }
+    }
+}
+
+/// Prune takes `ACCESS EXCLUSIVE` on the children of a sealed slot. Live
+/// traffic works in the current slot, so it must not need a lock on any
+/// sealed child (#721).
+///
+/// Set `AWA_AUDIT_SEALED_LOCKS` to lock one child at a time and print which
+/// operations wait on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails until the hot paths address slot children directly (#721)"]
+async fn test_hot_paths_do_not_lock_sealed_slot_children() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_sealed_slot_locks";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_sealed_slot_locks";
+
+    // Work that starts and finishes in slot 0 of the queue and claim rings.
+    store.enqueue_batch(&pool, queue, 2, 2).await.unwrap();
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(finished.len(), 2);
+    store
+        .complete_runtime_batch(&pool, &finished)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    let all_locked = sealed_slot_children(schema, 0, 0);
+    let audit = std::env::var("AWA_AUDIT_SEALED_LOCKS").is_ok();
+    // Plans are cached per session and change shape after five executions,
+    // so the traffic runs on one connection and is warmed up unlocked first.
+    let mut lock_sets: Vec<Vec<String>> = vec![Vec::new(); 8];
+    if audit {
+        lock_sets.extend(all_locked.iter().map(|child| vec![child.clone()]));
+    } else {
+        lock_sets.push(all_locked.clone());
+    }
+    let holder_pool = pool.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("single-connection traffic pool");
+    let mut all_blocked = Vec::new();
+    for locked in &lock_sets {
+        let locked = locked.clone();
+        let mut blocked = Vec::new();
+
+        run_against_locked_children(&holder_pool, &locked, &mut blocked, "enqueue", || async {
+            store.enqueue_batch(&pool, queue, 2, 8).await.unwrap()
+        })
+        .await;
+
+        let deadline_claims = run_against_locked_children(
+            &pool,
+            &locked,
+            &mut blocked,
+            "claim (deadline)",
+            || async {
+                store
+                    .claim_runtime_batch(&pool, queue, 4, Duration::from_secs(30))
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+        assert_eq!(deadline_claims.len(), 4);
+        let pairs: Vec<(i64, i64)> = deadline_claims
+            .iter()
+            .map(|job| (job.job.id, job.job.run_lease))
+            .collect();
+        run_against_locked_children(&holder_pool, &locked, &mut blocked, "heartbeat", || async {
+            store.heartbeat_batch(&pool, &pairs).await.unwrap()
+        })
+        .await;
+        run_against_locked_children(
+            &pool,
+            &locked,
+            &mut blocked,
+            "complete (deadline)",
+            || async {
+                store
+                    .complete_runtime_batch(&pool, &deadline_claims[..1])
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+        run_against_locked_children(&holder_pool, &locked, &mut blocked, "retry", || async {
+            store
+                .retry_after(
+                    &pool,
+                    deadline_claims[1].job.id,
+                    deadline_claims[1].job.run_lease,
+                    Duration::from_secs(60),
+                    None,
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        run_against_locked_children(&holder_pool, &locked, &mut blocked, "fail", || async {
+            store
+                .fail_terminal(
+                    &pool,
+                    deadline_claims[2].job.id,
+                    deadline_claims[2].job.run_lease,
+                    "boom",
+                    None,
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        run_against_locked_children(&holder_pool, &locked, &mut blocked, "snooze", || async {
+            store
+                .snooze(
+                    &pool,
+                    deadline_claims[3].job.id,
+                    deadline_claims[3].job.run_lease,
+                    Duration::from_secs(60),
+                    None,
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+
+        let compact_claims = run_against_locked_children(
+            &pool,
+            &locked,
+            &mut blocked,
+            "claim (compact)",
+            || async {
+                store
+                    .claim_runtime_batch(&pool, queue, 4, Duration::ZERO)
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+        assert_eq!(compact_claims.len(), 4);
+        let refs: Vec<_> = compact_claims
+            .iter()
+            .map(|job| {
+                awa::model::queue_storage::ClaimHeartbeatRef::from_claim(
+                    job.job.id,
+                    job.job.run_lease,
+                    &job.claim,
+                )
+                .expect("compact claim identity")
+            })
+            .collect();
+        run_against_locked_children(
+            &pool,
+            &locked,
+            &mut blocked,
+            "heartbeat (compact)",
+            || async { store.heartbeat_claims_batch(&pool, &refs).await.unwrap() },
+        )
+        .await;
+        run_against_locked_children(
+            &pool,
+            &locked,
+            &mut blocked,
+            "complete (compact)",
+            || async {
+                store
+                    .complete_runtime_batch(&pool, &compact_claims)
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+
+        if audit {
+            eprintln!("AUDIT {} => {blocked:?}", locked.join(","));
+        }
+        all_blocked.extend(blocked);
+    }
+
+    assert!(
+        all_blocked.is_empty(),
+        "hot paths waited on a sealed slot's children: {all_blocked:?}"
+    );
+}
