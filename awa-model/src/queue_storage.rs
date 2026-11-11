@@ -18881,13 +18881,16 @@ impl QueueStorage {
             return Ok(PruneOutcome::Noop);
         };
 
-        // Lock the slot row so concurrent rotate/prune observe the same
-        // state machine transition.
+        // The ring state row locked above already serializes rotate and
+        // prune. The slot row is only read here: rescue takes its table
+        // locks on the slot's partitions and then locks this row for its
+        // cursor, so holding the row while waiting for ACCESS EXCLUSIVE on
+        // those partitions would deadlock with every rescue of the slot.
+        // Prune locks the row once it holds the partitions.
         let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
             r#"
             SELECT slot FROM {schema}.claim_ring_slots
             WHERE slot = $1
-            FOR UPDATE
             "#
         ))
         .bind(slot)
@@ -18968,6 +18971,14 @@ impl QueueStorage {
             // ACCESS EXCLUSIVE before the proof.
             acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout)
                 .await?;
+
+            sqlx::query(&format!(
+                "SELECT slot FROM {schema}.claim_ring_slots WHERE slot = $1 FOR UPDATE"
+            ))
+            .bind(slot)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
             let current_slot: i32 = sqlx::query_scalar(&format!(
                 r#"

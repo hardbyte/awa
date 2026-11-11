@@ -23192,6 +23192,77 @@ async fn test_claim_prune_does_not_deadlock_with_a_read_then_write_transaction()
     );
 }
 
+/// Rescue takes its table locks on a claim slot's partitions and then locks
+/// the slot's `claim_ring_slots` row for its cursor. Claim prune must not
+/// hold that row while it waits for the partitions, or the two deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_claim_prune_does_not_hold_the_slot_row_while_it_waits_for_partitions() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_claim_prune_slot_row";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let store = Arc::new(store);
+    let queue = "qs_claim_prune_slot_row";
+
+    store.enqueue_batch(&pool, queue, 2, 2).await.unwrap();
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    store
+        .complete_runtime_batch(&pool, &finished)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    let mut rescue = pool.begin().await.unwrap();
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.lease_claims_0 IN ACCESS SHARE MODE"
+    ))
+    .execute(rescue.as_mut())
+    .await
+    .unwrap();
+
+    let prune = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.prune_oldest_claims(&pool).await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let started = Instant::now();
+    sqlx::query(&format!(
+        "SELECT slot FROM {schema}.claim_ring_slots WHERE slot = 0 FOR UPDATE"
+    ))
+    .execute(rescue.as_mut())
+    .await
+    .expect("lock the slot row");
+    let row_wait = started.elapsed();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    rescue.commit().await.unwrap();
+
+    let outcome = prune.await.expect("prune task").expect("claim prune");
+    assert!(
+        row_wait < Duration::from_millis(200),
+        "the slot row lock waited {row_wait:?} behind claim prune"
+    );
+    assert!(
+        matches!(outcome, PruneOutcome::Pruned { slot: 0, .. }),
+        "claim prune should win once rescue commits, got {outcome:?}"
+    );
+}
+
 /// Prune takes `ACCESS EXCLUSIVE` on the children of a sealed slot. Live
 /// traffic works in the current slot, so it must not need a lock on any
 /// sealed child (#721).
