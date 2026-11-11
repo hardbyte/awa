@@ -39,6 +39,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Claim batches keep tombstone checks as indexed probes instead of hashing an entire tombstone partition for each small batch (migration v056). Existing claim functions are replaced in place, including trusted custom substrates, without reinstalling tables or triggers.
+
 - **A queue lane is usable by every runtime role, whichever role creates it
   first (migration v053).** A lane's enqueue and claim sequences belonged to
   the role that first enqueued into, claimed from or promoted into it, so with

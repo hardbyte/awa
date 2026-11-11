@@ -4612,6 +4612,8 @@ BEGIN
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
                           AND tomb.lane_seq = ready.lane_seq
+                        -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                        OFFSET 0
                     ) AS is_tombstone
                 FROM %1$I.ready_entries AS ready
                 WHERE ready.queue = p_queue
@@ -4925,6 +4927,8 @@ BEGIN
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
                           AND tomb.lane_seq = ready.lane_seq
+                        -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                        OFFSET 0
                     ) AS is_tombstone
                 FROM %1$I.ready_entries_%4$s AS ready
                 WHERE ready.queue = p_queue
