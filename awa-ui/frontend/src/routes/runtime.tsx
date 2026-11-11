@@ -190,6 +190,8 @@ export function RuntimePage() {
                 </div>
                 <div className="mt-1 text-warning-subtle-fg/80">
                   Expected exactly one maintenance leader, found {runtime?.leader_instances ?? 0}.
+                  {runtime?.leader_eligible_instances === 0 &&
+                    " Every live runtime opted out of maintenance leadership, so none will take it until a runtime that may lead starts."}
                 </div>
               </div>
             )}
@@ -373,6 +375,9 @@ export function RuntimePage() {
                     <div className="flex flex-wrap gap-1">
                       <RuntimeHealthBadge instance={instance} />
                       {instance.leader && <Badge intent="primary">Leader</Badge>}
+                      {instance.maintenance_leader === false && (
+                        <Badge intent="secondary">Never leads</Badge>
+                      )}
                       <PostgresBadge connected={instance.postgres_connected} />
                       <ShutdownBadge shuttingDown={instance.shutting_down} />
                     </div>
@@ -468,7 +473,11 @@ export function RuntimePage() {
                         {instance.leader ? (
                           <Badge intent="primary" className="w-fit">Leader</Badge>
                         ) : (
-                          <span className="text-sm text-muted-fg">Worker</span>
+                          <span className="text-sm text-muted-fg">
+                            {instance.maintenance_leader === false
+                              ? "Worker · never leads"
+                              : "Worker"}
+                          </span>
                         )}
                         <EngineCaption
                           instance={instance}

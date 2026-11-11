@@ -8,6 +8,7 @@ use sqlx::types::Json;
 use sqlx::Acquire;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
+use sqlx::Postgres;
 use std::cmp::max;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -2930,10 +2931,19 @@ pub struct RuntimeSnapshotInput {
     pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
+    /// Whether this runtime contends for maintenance leadership. Recorded in
+    /// `awa.runtime_maintenance_eligibility` only when false, and only once
+    /// the `runtime_maintenance_eligibility` schema patch is applied.
+    #[serde(default = "maintenance_leader_default")]
+    pub maintenance_leader: bool,
     pub global_max_workers: Option<u32>,
     pub queues: Vec<QueueRuntimeSnapshot>,
     pub queue_descriptor_hashes: HashMap<String, String>,
     pub job_kind_descriptor_hashes: HashMap<String, String>,
+}
+
+fn maintenance_leader_default() -> bool {
+    true
 }
 
 /// A worker runtime instance as exposed through the admin API.
@@ -2957,11 +2967,23 @@ pub struct RuntimeInstance {
     pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
+    /// Whether this runtime may become maintenance leader. False only for a
+    /// runtime started with `maintenance_leader(false)` on a database with
+    /// the `runtime_maintenance_eligibility` schema patch; runtimes from
+    /// before the option always contend, so they report true.
+    #[serde(default = "maintenance_leader_default")]
+    pub maintenance_leader: bool,
     pub global_max_workers: Option<u32>,
     pub queues: Vec<QueueRuntimeSnapshot>,
 }
 
 impl RuntimeInstance {
+    /// Whether this runtime could take maintenance leadership now: it is
+    /// live, not shutting down, and has not opted out.
+    pub fn can_take_leadership(&self) -> bool {
+        !self.stale && !self.shutting_down && self.maintenance_leader
+    }
+
     fn stale_cutoff(interval_ms: i64) -> Duration {
         let interval_ms = max(interval_ms, 1_000);
         Duration::milliseconds(max(interval_ms.saturating_mul(3), 30_000))
@@ -2998,6 +3020,7 @@ impl RuntimeInstance {
             maintenance_alive: row.maintenance_alive,
             shutting_down: row.shutting_down,
             leader: row.leader,
+            maintenance_leader: row.maintenance_leader,
             global_max_workers: row.global_max_workers.map(|v| v as u32),
             queues: row.queues.0,
         })
@@ -3012,6 +3035,10 @@ pub struct RuntimeOverview {
     pub stale_instances: usize,
     pub healthy_instances: usize,
     pub leader_instances: usize,
+    /// Live runtimes, not shutting down, that may become maintenance leader.
+    /// Zero while runtimes are live means none of them will take leadership.
+    #[serde(default)]
+    pub leader_eligible_instances: usize,
     pub instances: Vec<RuntimeInstance>,
 }
 
@@ -3082,18 +3109,36 @@ struct RuntimeInstanceRow {
     maintenance_alive: bool,
     shutting_down: bool,
     leader: bool,
+    maintenance_leader: bool,
     global_max_workers: Option<i32>,
     queues: Json<Vec<QueueRuntimeSnapshot>>,
 }
 
 /// Upsert a runtime observability snapshot for one worker instance.
-pub async fn upsert_runtime_snapshot<'e, E>(
-    executor: E,
+///
+/// A snapshot with `maintenance_leader: false` also records the opt-out in
+/// `awa.runtime_maintenance_eligibility` when that table exists and the role
+/// may insert into it; see [`maintenance_eligibility_reportable`]. Recording
+/// the opt-out is best-effort: a failure is logged and never stops the
+/// snapshot, which the fleet relies on to tell live runtimes from dead ones.
+pub async fn upsert_runtime_snapshot<'a, A>(
+    conn: A,
     snapshot: &RuntimeSnapshotInput,
 ) -> Result<(), AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
+    let mut conn = conn.acquire().await?;
+    // Recorded before the snapshot row, so a reader never sees a new
+    // opted-out runtime without its opt-out.
+    if !snapshot.maintenance_leader {
+        if let Err(err) = record_maintenance_opt_out(&mut conn, snapshot.instance_id).await {
+            tracing::warn!(
+                error = %err,
+                "Could not record this runtime's maintenance leadership opt-out"
+            );
+        }
+    }
     sqlx::query(
         r#"
         INSERT INTO awa.runtime_instances (
@@ -3162,10 +3207,109 @@ where
     .bind(Json(&snapshot.queues))
     .bind(Json(&snapshot.queue_descriptor_hashes))
     .bind(Json(&snapshot.job_kind_descriptor_hashes))
-    .execute(executor)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
+}
+
+/// Record that `instance_id` never contends for maintenance leadership, if
+/// the table exists and this role may insert into it.
+async fn record_maintenance_opt_out(
+    conn: &mut sqlx::PgConnection,
+    instance_id: Uuid,
+) -> Result<(), AwaError> {
+    if !eligibility_table_usable(conn, &["INSERT"]).await? {
+        return Ok(());
+    }
+    // No conflict target: naming `instance_id` would also need SELECT on it.
+    // The primary key is the table's only unique constraint.
+    sqlx::query(
+        "INSERT INTO awa.runtime_maintenance_eligibility (instance_id, maintenance_leader) \
+         VALUES ($1, false) ON CONFLICT DO NOTHING",
+    )
+    .bind(instance_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Whether `awa.runtime_maintenance_eligibility` exists and this role holds
+/// every one of `privileges` on it. The table comes from a schema patch, so a
+/// binary may run against a database without it, or with a role that was
+/// never granted it; both read as "every runtime is eligible".
+pub(crate) async fn eligibility_table_usable(
+    conn: &mut sqlx::PgConnection,
+    privileges: &[&str],
+) -> Result<bool, AwaError> {
+    // has_table_privilege with a comma-separated list is true when *any* of
+    // them is held, so each privilege is checked on its own.
+    let usable: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa.runtime_maintenance_eligibility') IS NOT NULL \
+           AND (SELECT bool_and(has_table_privilege('awa.runtime_maintenance_eligibility', privilege)) \
+                FROM unnest($1::text[]) AS privilege)",
+    )
+    .bind(privileges)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(usable)
+}
+
+/// SQL for whether the `awa.runtime_instances` row aliased `runtime` may lead,
+/// for the tables this role can read.
+pub(crate) async fn maintenance_leader_sql(
+    conn: &mut sqlx::PgConnection,
+) -> Result<&'static str, AwaError> {
+    Ok(if eligibility_table_usable(conn, &["SELECT"]).await? {
+        "NOT EXISTS (SELECT 1 FROM awa.runtime_maintenance_eligibility AS eligibility \
+                     WHERE eligibility.instance_id = runtime.instance_id \
+                       AND NOT eligibility.maintenance_leader)"
+    } else {
+        "true"
+    })
+}
+
+/// Whether a runtime that opts out of maintenance leadership can have that
+/// opt-out recorded and seen: the `runtime_maintenance_eligibility` schema
+/// patch is applied and this role may insert into its table and read it.
+/// Without `SELECT` the role's own reads, including its check for other
+/// runtimes that may lead, treat every runtime as eligible. When false the
+/// runtime still never leads, but it reads, and may be reported, as eligible.
+pub async fn maintenance_eligibility_reportable<'a, A>(conn: A) -> Result<bool, AwaError>
+where
+    A: Acquire<'a, Database = Postgres>,
+{
+    let mut conn = conn.acquire().await?;
+    eligibility_table_usable(&mut conn, &["INSERT", "SELECT"]).await
+}
+
+/// Delete eligibility rows whose runtime snapshot row has gone. Rows younger
+/// than `min_age` are kept, so a runtime's opt-out recorded just before its
+/// first snapshot is not swept. Returns the number of rows deleted, or zero
+/// when the table is absent or this role may not delete from it.
+pub async fn cleanup_runtime_maintenance_eligibility<'a, A>(
+    conn: A,
+    min_age: Duration,
+) -> Result<u64, AwaError>
+where
+    A: Acquire<'a, Database = Postgres>,
+{
+    let mut conn = conn.acquire().await?;
+    // The WHERE clause reads the table's columns, which needs SELECT too.
+    if !eligibility_table_usable(&mut conn, &["DELETE", "SELECT"]).await? {
+        return Ok(0);
+    }
+    let seconds = max(min_age.num_seconds(), 1);
+    let result = sqlx::query(
+        "DELETE FROM awa.runtime_maintenance_eligibility AS eligibility \
+         WHERE eligibility.recorded_at < now() - make_interval(secs => $1) \
+           AND NOT EXISTS (SELECT 1 FROM awa.runtime_instances AS runtime \
+                           WHERE runtime.instance_id = eligibility.instance_id)",
+    )
+    .bind(seconds)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Opportunistically delete long-stale runtime snapshot rows.
@@ -3220,36 +3364,39 @@ where
 }
 
 /// List all runtime instances ordered with leader/live instances first.
-pub async fn list_runtime_instances<'e, E>(executor: E) -> Result<Vec<RuntimeInstance>, AwaError>
+pub async fn list_runtime_instances<'a, A>(conn: A) -> Result<Vec<RuntimeInstance>, AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
-    let rows = sqlx::query_as::<_, RuntimeInstanceRow>(
+    let mut conn = conn.acquire().await?;
+    let maintenance_leader = maintenance_leader_sql(&mut conn).await?;
+    let rows = sqlx::query_as::<_, RuntimeInstanceRow>(&format!(
         r#"
         SELECT
-            instance_id,
-            hostname,
-            pid,
-            version,
-            storage_capability,
-            transition_role,
-            started_at,
-            last_seen_at,
-            snapshot_interval_ms,
-            healthy,
-            postgres_connected,
-            poll_loop_alive,
-            heartbeat_alive,
-            maintenance_alive,
-            shutting_down,
-            leader,
-            global_max_workers,
-            queues
-        FROM awa.runtime_instances
-        ORDER BY leader DESC, last_seen_at DESC, started_at DESC
-        "#,
-    )
-    .fetch_all(executor)
+            runtime.instance_id,
+            runtime.hostname,
+            runtime.pid,
+            runtime.version,
+            runtime.storage_capability,
+            runtime.transition_role,
+            runtime.started_at,
+            runtime.last_seen_at,
+            runtime.snapshot_interval_ms,
+            runtime.healthy,
+            runtime.postgres_connected,
+            runtime.poll_loop_alive,
+            runtime.heartbeat_alive,
+            runtime.maintenance_alive,
+            runtime.shutting_down,
+            runtime.leader,
+            {maintenance_leader} AS maintenance_leader,
+            runtime.global_max_workers,
+            runtime.queues
+        FROM awa.runtime_instances AS runtime
+        ORDER BY runtime.leader DESC, runtime.last_seen_at DESC, runtime.started_at DESC
+        "#
+    ))
+    .fetch_all(&mut *conn)
     .await?;
 
     let now = Utc::now();
@@ -3259,16 +3406,17 @@ where
 }
 
 /// Cluster runtime overview with instance list.
-pub async fn runtime_overview<'e, E>(executor: E) -> Result<RuntimeOverview, AwaError>
+pub async fn runtime_overview<'a, A>(conn: A) -> Result<RuntimeOverview, AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
-    let instances = list_runtime_instances(executor).await?;
+    let instances = list_runtime_instances(conn).await?;
     let total_instances = instances.len();
     let stale_instances = instances.iter().filter(|i| i.stale).count();
     let live_instances = total_instances.saturating_sub(stale_instances);
     let healthy_instances = instances.iter().filter(|i| !i.stale && i.healthy).count();
     let leader_instances = instances.iter().filter(|i| !i.stale && i.leader).count();
+    let leader_eligible_instances = instances.iter().filter(|i| i.can_take_leadership()).count();
 
     Ok(RuntimeOverview {
         total_instances,
@@ -3276,16 +3424,17 @@ where
         stale_instances,
         healthy_instances,
         leader_instances,
+        leader_eligible_instances,
         instances,
     })
 }
 
 /// Queue runtime/config summary aggregated across worker snapshots.
-pub async fn queue_runtime_summary<'e, E>(executor: E) -> Result<Vec<QueueRuntimeSummary>, AwaError>
+pub async fn queue_runtime_summary<'a, A>(conn: A) -> Result<Vec<QueueRuntimeSummary>, AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
-    let instances = list_runtime_instances(executor).await?;
+    let instances = list_runtime_instances(conn).await?;
     let mut by_queue: HashMap<String, Vec<(bool, bool, QueueRuntimeSnapshot)>> = HashMap::new();
 
     for instance in instances {

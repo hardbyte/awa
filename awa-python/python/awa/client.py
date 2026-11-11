@@ -869,6 +869,7 @@ class AsyncClient:
         descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
+        maintenance_leader: bool = True,
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
@@ -936,6 +937,14 @@ class AsyncClient:
         server's ``deadlock_timeout`` and ``statement_timeout`` (a warning is
         logged at start otherwise). Must be > 0.
 
+        ``maintenance_leader=False`` keeps this runtime from ever contending
+        for maintenance leadership. It still claims and runs jobs, heartbeats,
+        publishes runtime snapshots and keeps its own periodic job
+        declarations synced, but never promotes, rescues or cleans up for the
+        fleet, and maintenance settings passed here only apply on a runtime
+        that leads. At least one live runtime must keep the default ``True``;
+        an opted-out runtime logs a warning while it sees none.
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -950,6 +959,7 @@ class AsyncClient:
             descriptor_retention_days=descriptor_retention_days,
             cleanup_batch_size=cleanup_batch_size,
             leader_election_interval_ms=leader_election_interval_ms,
+            maintenance_leader=maintenance_leader,
             heartbeat_interval_ms=heartbeat_interval_ms,
             promote_interval_ms=promote_interval_ms,
             heartbeat_rescue_interval_ms=heartbeat_rescue_interval_ms,

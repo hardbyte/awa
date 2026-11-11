@@ -431,6 +431,38 @@ await client.start([("email", 8)])
 
 Both surfaces must be called before `start()` / `build()`. Declaring a descriptor for a queue the client doesn't run is an error, so dead references show up at startup instead of silently producing stale rows.
 
+## Maintenance leader election { #leader-election }
+
+One runtime at a time is the maintenance leader. It promotes scheduled and retryable jobs, rescues stale heartbeats and expired deadlines and callbacks, rotates and prunes queue storage, cleans up retained rows and evaluates cron schedules. Leadership is a PostgreSQL session advisory lock: every runtime tries to take it, the one that does leads until its session ends, and the others retry.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `ClientBuilder::leader_election_interval` (Rust) / `leader_election_interval_ms` (Python) | `10s` | How often a runtime that does not lead retries the lock. Lower values fail over faster. |
+| `ClientBuilder::leader_check_interval` (Rust) | `30s` | How often the leader checks that its lock session is still alive. |
+| `ClientBuilder::maintenance_leader` (Rust) / `maintenance_leader` (Python) | `true` | Whether the runtime contends for leadership at all. |
+
+The intervals change how quickly leadership moves, not where it lands: any runtime can win the lock. To keep leadership off some deployments, such as GPU or bulk workers whose pools are sized for their jobs, start them with `maintenance_leader(false)`:
+
+```rust
+let client = Client::builder(pool)
+    .queue("bulk", QueueConfig::default())
+    .register::<BulkExport, _, _>(handle_bulk_export)
+    .maintenance_leader(false)
+    .build()?;
+```
+
+```python
+await client.start([("bulk", 8)], maintenance_leader=False)
+```
+
+A runtime started this way never tries the lock, even when it is the only runtime. Everything else it does is unchanged: it claims and executes jobs, heartbeats them, publishes runtime snapshots, reports runtime-control observations and syncs its own periodic job declarations to `awa.cron_jobs`, where whichever runtime leads evaluates them.
+
+- **Keep at least one runtime that may lead.** With none live, nothing promotes scheduled or retryable jobs, rescues abandoned attempts or rotates queue storage; jobs that are already available still run. An opted-out runtime logs a warning when it sees no other live runtime that may lead, and records the count it sees as `awa.maintenance.leader_eligible_runtimes`. Every runtime records `awa.maintenance.leader_eligible` (`1` or `0`).
+- **Register rescue follow-ups on the runtimes that may lead.** Rescue runs on the leader, so `Rescued` lifecycle hooks and `Rescued` enqueue specs fire from the leader's registrations. One registered only on an opted-out runtime never fires. This already holds for any runtime that is not leading; opting out makes it permanent.
+- **Keep periodic job declarations identical across runtimes that declare the same name.** Every opted-out runtime writes its own declarations each `cron_sync_interval`, as the leader does. An unchanged declaration writes nothing, but two runtimes that declare one name differently, as during a rolling deploy that changes a schedule, overwrite each other until the old runtimes are gone.
+- **Configure maintenance on the runtimes that may lead.** Settings that only the leader uses, such as retention, rescue intervals, per-queue retention overrides and the queue-storage prune lock timeout, have no effect on an opted-out runtime.
+- **Reporting needs the `runtime_maintenance_eligibility` schema patch.** `awa migrate` adds the `awa.runtime_maintenance_eligibility` table, which opted-out runtimes write to and `awa control status`, the admin API (`leader_eligible_instances`, and `maintenance_leader` per instance) and the admin UI read. The runtime role needs `SELECT, INSERT, DELETE` on it, which the default privileges in [security](security.md) grant. Without the patch, or without the grants, an opted-out runtime still never leads but is shown as eligible, and it logs a warning at startup. Runtimes from before the option always contend and are shown as eligible.
+
 ## Reliability timings: heartbeat, deadline, rescue
 
 These knobs control **how fast a stuck or crashed handler is noticed and rescued**. They live on `ClientBuilder` (Rust) and `client.start()` kwargs (Python). All of them have `_ms`-suffixed kwargs on the Python side (e.g. `heartbeat_interval_ms=15000`).

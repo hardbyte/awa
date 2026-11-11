@@ -4,6 +4,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- The schema stays at v40. `awa migrate` applies one new repeatable patch, `runtime_maintenance_eligibility`, which creates the `awa.runtime_maintenance_eligibility` table and locks no existing table. External migration runners apply `R__runtime_maintenance_eligibility.sql` after `V40`. Runtime roles need `SELECT, INSERT, DELETE` on the table; the default privileges in the security guide grant them. 0.6.16 binaries ignore the table, so binaries and the patch can roll in either order.
+
+### Added
+
+- `ClientBuilder::maintenance_leader(false)` (Python `client.start(..., maintenance_leader=False)`) keeps a runtime from ever contending for maintenance leadership, so leadership stays on the deployments that may lead. The runtime still claims and executes jobs, heartbeats, publishes runtime snapshots, reports runtime-control observations and syncs its own periodic job declarations. `awa control status` (`maintenance_leader` per runtime, `leader_eligible_runtimes`), the admin API (`maintenance_leader`, `leader_eligible_instances`) and the admin UI show which runtimes may lead. An opted-out runtime logs a warning and records `awa.maintenance.leader_eligible_runtimes = 0` while it sees no live runtime that may lead; every runtime records `awa.maintenance.leader_eligible`. See [maintenance leader election](docs/configuration.md#leader-election). `Rescued` hooks and enqueue specs fire only from the leader's registrations, so register them on a runtime that may lead.
+
+### Changed
+
+- Syncing a periodic job declaration that matches the stored schedule no longer rewrites its `awa.cron_jobs` row or moves `updated_at`, so runtimes that sync on a timer stop generating a row version per schedule per interval.
+
 ### Fixed
 
 - Python handlers receive an asyncio cancellation request when the Rust executor abandons their attempt after its deadline grace or shutdown exceeds its worker timeout (#697). Previously, dropping the Rust result receiver left the Python coroutine running, so repeated abandoned attempts leaked live handlers and could produce late effects. Shutdown also waits up to one additional second for that client's Python handlers to finish cancellation cleanup, then warns if any remain. Cancellable handlers receive `asyncio.CancelledError` and can release resources in `finally`; cancellation is cooperative and cannot stop blocking code, spawned threads, child tasks or handlers that suppress cancellation. No schema change.
