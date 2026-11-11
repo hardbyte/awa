@@ -81,7 +81,7 @@ ORDER BY heartbeat_at ASC;
 
 Interpretation:
 
-- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying`
+- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying` or `Another transaction holds this attempt's completion lock; still retrying`
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 - stale, but every rescue pass logs `Rescue skipped an attempt: queue storage ready body ambiguous`: an aging race in an older release left two equally plausible bodies for this attempt. Rescue leaves it running and moves on to other attempts. Reads and cancellation of the job fail with the same ambiguity error, so it needs manual repair; open an issue with the job id and run lease from the log
@@ -161,6 +161,21 @@ Durable completion, or lifecycle hooks, are behind the handlers. A runtime lets 
 ### Fixes
 
 Clear the lock contention or long transaction; claiming recovers as soon as completions commit again. Raising `max_workers` does not help while completion is the bottleneck. For jobs with large payloads, lowering `AWA_COMPLETION_BATCH_SIZE` reduces how much memory waiting attempts can hold.
+
+### A Completion Waits On An Application's Transaction
+
+A transaction that changes a running attempt, such as `admin::cancel_tx` run inside an application's own transaction, holds that attempt's completion lock until it commits or rolls back. If the attempt's handler returns meanwhile, its completion cannot proceed until then. Once the attempt has waited a second, the worker logs `Another transaction holds this attempt's completion lock; still retrying` with the attempt's `job_id` and `waited_ms`.
+
+In queue storage with receipts on (the default), a successful attempt in that state is left out of its completion batch and retried with backoff, without holding a pool connection, so completions of other jobs carry on. Its worker slot stays held while it retries. When the transaction commits, the retry sees the committed change: a cancelled attempt's completion is ignored as stale. If the lock is still held after two minutes, the worker gives up, logs `Failed to complete job`, stops heartbeating the attempt, and leaves it to stale-heartbeat rescue.
+
+Earlier releases waited on the lock inside the batch instead. Every completion the runtime sent through its completion batcher then waited behind that one transaction, and once the in-flight completion allowance filled, the runtime stopped claiming in every queue.
+
+Not every completion is covered:
+
+- Attempts that end in a retry, snooze, cancel, failure or callback wait, and successful attempts of a kind with follow-up enqueues, finalize one job at a time. They still wait on the lock while holding a pool connection and their worker slot, but no other attempt waits with them.
+- With receipts off (`lease_claim_receipts = false`, only possible on a non-default queue-storage schema), a successful attempt's batch still waits on the lock, and the rest of the batch waits with it.
+
+Keep transactions that touch running jobs short, and commit or roll back before doing slow work in them.
 
 ## Rescue Fails With `idx_awa_jobs_unique`
 
