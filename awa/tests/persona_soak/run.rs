@@ -18,6 +18,7 @@ const HEADROOM: u32 = 14;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
+    let maintenance_metrics = super::maintenance_metrics::install();
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -249,6 +250,9 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     };
     if let Err(error) = report::write(&shared, &outcome) {
         eprintln!("could not write the report: {error}");
+    }
+    if let Err(error) = maintenance_metrics.write(&shared.config.report_dir) {
+        eprintln!("could not write the maintenance metrics: {error}");
     }
     oracle_pool.close().await;
     Ok(shared)

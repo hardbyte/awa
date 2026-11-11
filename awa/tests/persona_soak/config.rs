@@ -152,6 +152,11 @@ pub struct SoakConfig {
     /// for every runtime. The library's own defaults are 30 s and 90 s.
     pub heartbeat_interval: Duration,
     pub heartbeat_staleness: Duration,
+    /// Queue and claim ring rotation intervals and the prune lock timeout of every
+    /// in-process runtime. Unset keeps the library defaults.
+    pub queue_rotate_interval: Option<Duration>,
+    pub claim_rotate_interval: Option<Duration>,
+    pub prune_lock_timeout: Option<Duration>,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -267,6 +272,12 @@ impl SoakConfig {
             heartbeat_staleness: scaled_staleness(Duration::from_secs(
                 env_parse("AWA_SOAK_STALENESS_SECONDS").unwrap_or(DEFAULT_STALENESS_SECONDS),
             )),
+            queue_rotate_interval: env_parse::<u64>("AWA_SOAK_QUEUE_ROTATE_MS")
+                .map(Duration::from_millis),
+            claim_rotate_interval: env_parse::<u64>("AWA_SOAK_CLAIM_ROTATE_MS")
+                .map(Duration::from_millis),
+            prune_lock_timeout: env_parse::<u64>("AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS")
+                .map(Duration::from_millis),
         })
     }
 

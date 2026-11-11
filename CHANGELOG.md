@@ -4,6 +4,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- The schema stays at v40. `awa migrate` applies one new repeatable patch, `runtime_maintenance_eligibility`, which creates the `awa.runtime_maintenance_eligibility` table and locks no existing table. External migration runners apply `R__runtime_maintenance_eligibility.sql` after `V40`. Runtime roles need `SELECT, INSERT, DELETE` on the table; the default privileges in the security guide grant them. 0.6.16 binaries ignore the table, so binaries and the patch can roll in either order.
+
+### Added
+
+- `ClientBuilder::maintenance_leader(false)` (Python `client.start(..., maintenance_leader=False)`) keeps a runtime from ever contending for maintenance leadership, so leadership stays on the deployments that may lead. The runtime still claims and executes jobs, heartbeats, publishes runtime snapshots, reports runtime-control observations and syncs its own periodic job declarations. `awa control status` (`maintenance_leader` per runtime, `leader_eligible_runtimes`), the admin API (`maintenance_leader`, `leader_eligible_instances`) and the admin UI show which runtimes may lead. An opted-out runtime logs a warning and records `awa.maintenance.leader_eligible_runtimes = 0` while it sees no live runtime that may lead; every runtime records `awa.maintenance.leader_eligible`. See [maintenance leader election](docs/configuration.md#leader-election). `Rescued` hooks and enqueue specs fire only from the leader's registrations, so register them on a runtime that may lead.
+
+### Changed
+
+- Syncing a periodic job declaration that matches the stored schedule no longer rewrites its `awa.cron_jobs` row or moves `updated_at`, so runtimes that sync on a timer stop generating a row version per schedule per interval.
+
 ### Fixed
 
 - Cleanup, cron sync, batch operations, metadata refresh, rollup and ring rotation no longer hold back promotion and rescue (#303). The maintenance leader ran every branch from one loop, so while one branch's statement waited on a lock or ran a long scan, scheduled and retryable jobs were not promoted and stale, overdue and timed-out attempts were not rescued. With one `awa.cron_jobs` row locked by another session, the leader's cron sync stalled both for as long as the lock was held, and stopped cron from firing. Promotion and the three rescues now run in their own loop within the leader term, and the cron evaluator starts before the startup cron sync. A rescue pass still delays promotion, and the other branches still delay one another: a stuck cleanup or cron sync still holds back ring rotation and prune. Leadership and the shutdown grace are unchanged, and no configuration or schema change is needed. A leader holds one more pool connection at a time. While a rescue pass runs, lease prune may report more `blocked` outcomes and claim prune may wait out a rescue batch. See [ADR-051](docs/adr/051-maintenance-recovery-loop.md).
