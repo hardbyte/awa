@@ -509,6 +509,15 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
             AND to_regprocedure('awa.prune_controls_protocol_version()') IS NOT NULL \
             AND to_regclass('awa.runtime_control_observations') IS NOT NULL",
     },
+    SchemaPatch {
+        name: "runtime_maintenance_eligibility",
+        description: "Report runtimes that never contend for maintenance leadership",
+        // A new table only: it locks no existing relation, so it never queues
+        // behind runtime snapshot writes.
+        sql: include_str!("../migrations/patches/runtime_maintenance_eligibility.sql"),
+        applied_probe:
+            "SELECT to_regclass('awa.runtime_maintenance_eligibility') IS NOT NULL",
+    },
 ];
 
 /// Schema patches a database still needs to reach this binary's schema shape.

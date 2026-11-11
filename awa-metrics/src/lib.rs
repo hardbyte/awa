@@ -63,6 +63,9 @@ pub mod names {
     pub const MAINTENANCE_RESCUES: &str = "awa.maintenance.rescues";
     pub const MAINTENANCE_RESCUE_PASS_SIZE: &str = "awa.maintenance.rescue.pass_size";
     pub const MAINTENANCE_RESCUE_OLDEST_AGE: &str = "awa.maintenance.rescue.oldest_attempt_age";
+    pub const MAINTENANCE_LEADER_ELIGIBLE: &str = "awa.maintenance.leader_eligible";
+    pub const MAINTENANCE_LEADER_ELIGIBLE_RUNTIMES: &str =
+        "awa.maintenance.leader_eligible_runtimes";
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
@@ -184,6 +187,13 @@ pub struct AwaMetrics {
     /// works oldest claim first, so a value well above the heartbeat
     /// staleness or deadline means a backlog of abandoned claims.
     pub maintenance_rescue_oldest_attempt_age_seconds: Gauge<f64>,
+    /// Whether this runtime contends for maintenance leadership (1) or was
+    /// started with `maintenance_leader(false)` (0).
+    pub maintenance_leader_eligible: Gauge<i64>,
+    /// Live runtimes, not shutting down, that may take maintenance
+    /// leadership, as seen by a runtime that has opted out. Only opted-out
+    /// runtimes record it; 0 means nothing visible will take leadership.
+    pub maintenance_leader_eligible_runtimes: Gauge<i64>,
     /// Total jobs parked for external callback.
     pub jobs_waiting_external: Counter<u64>,
     /// Current queue depth per state — how many jobs are in each state per queue.
@@ -455,6 +465,19 @@ impl AwaMetrics {
                     "Age of the oldest attempt rescued by the latest queue-storage rescue pass",
                 )
                 .with_unit("s")
+                .build(),
+            maintenance_leader_eligible: meter
+                .i64_gauge(names::MAINTENANCE_LEADER_ELIGIBLE)
+                .with_description(
+                    "Whether this runtime contends for maintenance leadership (1) or not (0)",
+                )
+                .build(),
+            maintenance_leader_eligible_runtimes: meter
+                .i64_gauge(names::MAINTENANCE_LEADER_ELIGIBLE_RUNTIMES)
+                .with_description(
+                    "Live runtimes that may take maintenance leadership, seen by an opted-out runtime",
+                )
+                .with_unit("{runtime}")
                 .build(),
             jobs_waiting_external: meter
                 .u64_counter(names::JOB_WAITING_EXTERNAL)
@@ -1038,6 +1061,17 @@ impl AwaMetrics {
     /// Record canonical live backlog for the storage transition.
     pub fn record_storage_canonical_live_backlog(&self, count: i64) {
         self.storage_canonical_live_backlog.record(count, &[]);
+    }
+
+    /// Record whether this runtime contends for maintenance leadership.
+    pub fn record_maintenance_leader_eligible(&self, eligible: bool) {
+        self.maintenance_leader_eligible
+            .record(i64::from(eligible), &[]);
+    }
+
+    /// Record how many live runtimes may take maintenance leadership.
+    pub fn record_maintenance_leader_eligible_runtimes(&self, count: i64) {
+        self.maintenance_leader_eligible_runtimes.record(count, &[]);
     }
 
     /// Record the number of live runtimes reporting a given storage capability.

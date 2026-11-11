@@ -137,6 +137,11 @@ export interface RuntimeInstance {
   maintenance_alive: boolean;
   shutting_down: boolean;
   leader: boolean;
+  /**
+   * False for a runtime started with `maintenance_leader(false)`, which never
+   * contends for maintenance leadership. Absent from servers that predate it.
+   */
+  maintenance_leader?: boolean;
   global_max_workers: number | null;
   queues: QueueRuntimeSnapshot[];
 }
@@ -147,6 +152,8 @@ export interface RuntimeOverview {
   stale_instances: number;
   healthy_instances: number;
   leader_instances: number;
+  /** Live runtimes that may take maintenance leadership. */
+  leader_eligible_instances?: number;
   instances: RuntimeInstance[];
 }
 

@@ -2222,6 +2222,7 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         maintenance_alive: true,
         shutting_down: false,
         leader: false,
+        maintenance_leader: true,
         global_max_workers: None,
         queues: vec![],
         queue_descriptor_hashes: std::collections::HashMap::new(),
