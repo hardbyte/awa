@@ -1589,7 +1589,14 @@ impl Client {
             return;
         };
         let timeout = runtime.store.prune_lock_wait_ceiling();
-        let risks = match crate::storage::check_prune_lock_timeout(&self.pool, timeout).await {
+        let statement_wait = runtime.store.prune_lock_statement_wait_ceiling();
+        let risks = match crate::storage::check_prune_lock_timeout(
+            &self.pool,
+            timeout,
+            statement_wait,
+        )
+        .await
+        {
             Ok(risks) => risks,
             Err(err) => {
                 debug!(error = %err, "Could not read lock settings to check the prune lock timeout");
@@ -1607,10 +1614,12 @@ impl Client {
                      deadlock_timeout"
                 ),
                 crate::storage::PruneLockTimeoutRisk::StatementTimeout { limit_ms } => warn!(
-                    prune_lock_wait_ceiling_ms = timeout.as_millis() as u64,
+                    prune_lock_statement_wait_ms = statement_wait.as_millis() as u64,
                     statement_timeout_ms = limit_ms,
-                    "Prune's longest lock wait is at or above statement_timeout; prune is cancelled \
-                     by the statement timeout and fails instead of reporting blocked"
+                    "A prune lock statement can wait as long as statement_timeout, because the \
+                     lock timeout applies to each of the eight partitions it locks; prune is \
+                     then cancelled by the statement timeout and fails instead of reporting \
+                     blocked"
                 ),
             }
         }
@@ -3154,18 +3163,26 @@ mod tests {
             .await
             .expect("connect with session limits");
 
-        assert!(check_prune_lock_timeout(&pool, Duration::from_millis(100))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(check_prune_lock_timeout(
+            &pool,
+            Duration::from_millis(100),
+            Duration::from_millis(100)
+        )
+        .await
+        .unwrap()
+        .is_empty());
         assert_eq!(
-            check_prune_lock_timeout(&pool, Duration::from_millis(300))
-                .await
-                .unwrap(),
+            check_prune_lock_timeout(
+                &pool,
+                Duration::from_millis(300),
+                Duration::from_millis(300)
+            )
+            .await
+            .unwrap(),
             vec![PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 }]
         );
         assert_eq!(
-            check_prune_lock_timeout(&pool, Duration::from_secs(5))
+            check_prune_lock_timeout(&pool, Duration::from_secs(5), Duration::from_secs(5))
                 .await
                 .unwrap(),
             vec![

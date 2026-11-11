@@ -637,6 +637,9 @@ async fn set_lock_timeout_tx(
 /// prune lock timeout is shorter than this.
 const PRUNE_LOCK_UPGRADE_CEILING: Duration = Duration::from_millis(320);
 
+/// Partitions of a queue ring slot that queue prune locks in one statement.
+const QUEUE_PRUNE_LOCKED_PARTITIONS: u32 = 8;
+
 /// The longest single wait of [`upgrade_prune_lock_tx`] for `base`.
 fn prune_lock_upgrade_ceiling(base: Duration) -> Duration {
     base.max(PRUNE_LOCK_UPGRADE_CEILING)
@@ -3231,6 +3234,18 @@ impl QueueStorage {
     /// when that is longer.
     pub fn prune_lock_wait_ceiling(&self) -> Duration {
         prune_lock_upgrade_ceiling(self.prune_lock_timeout)
+    }
+
+    /// The longest a single prune lock statement can wait.
+    ///
+    /// `lock_timeout` applies to each relation a `LOCK TABLE` statement
+    /// acquires, and queue prune locks eight partitions in one statement, so
+    /// the statement can wait eight times [`Self::prune_lock_wait_ceiling`].
+    /// A `statement_timeout` at or below this can cancel the prune before
+    /// its lock timeout fires.
+    pub fn prune_lock_statement_wait_ceiling(&self) -> Duration {
+        self.prune_lock_wait_ceiling()
+            .saturating_mul(QUEUE_PRUNE_LOCKED_PARTITIONS)
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
