@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/description-list";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
+import { AvailableCount } from "@/components/AvailableCount";
 import type { QueueRuntimeSummary } from "@/lib/api";
 import { timeAgo } from "@/lib/time";
 import {
@@ -267,7 +268,9 @@ export function QueueDetailPage() {
             <DescriptionDetails>{queue.scheduled.toLocaleString()}</DescriptionDetails>
 
             <DescriptionTerm>Available</DescriptionTerm>
-            <DescriptionDetails>{queue.available.toLocaleString()}</DescriptionDetails>
+            <DescriptionDetails>
+              <AvailableCount count={queue.available} isEstimate={queue.available_is_estimate} />
+            </DescriptionDetails>
 
             <DescriptionTerm>Retryable</DescriptionTerm>
             <DescriptionDetails>{queue.retryable.toLocaleString()}</DescriptionDetails>

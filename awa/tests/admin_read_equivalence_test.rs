@@ -421,10 +421,14 @@ async fn job_kind_overviews_match_the_current_jobs_definition() -> TestResult {
             JobState::Cancelled,
         ] {
             assert!(
-                states.get(&state).copied().unwrap_or(0) > 0,
+                states.count(state) > 0,
                 "the fixture holds no {state:?} jobs: {states:?}"
             );
         }
+        assert!(
+            !states.available_is_estimate,
+            "the fixture's lanes are small"
+        );
 
         let expected = reference_job_kind_overviews(&fixture.pool, fixture.store.schema()).await?;
         let actual = admin::job_kind_overviews(&fixture.pool).await?;

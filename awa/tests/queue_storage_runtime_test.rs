@@ -9763,7 +9763,7 @@ async fn test_queue_storage_admin_counts_include_receipt_held_running_jobs() {
     assert_eq!(overview.total_queued, 1);
 
     let counts = admin::state_counts(&pool).await.expect("read state counts");
-    assert_eq!(counts.get(&JobState::Running).copied(), Some(1));
+    assert_eq!(counts.count(JobState::Running), 1);
 
     let running_in_timeseries: i64 = admin::state_timeseries(&pool, 60)
         .await
@@ -11918,9 +11918,8 @@ async fn test_queue_storage_admin_reads_stay_exact_across_concurrent_prunes() {
                         let failed = admin::state_counts(&pool)
                             .await
                             .expect("state_counts")
-                            .get(&JobState::Failed)
-                            .copied();
-                        (failed != Some(FAILED_JOBS))
+                            .count(JobState::Failed);
+                        (failed != FAILED_JOBS)
                             .then(|| format!("state_counts counted {failed:?} failed"))
                     }
                 };
@@ -15661,7 +15660,7 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
         .await
         .expect("read queue-storage state counts");
     assert_eq!(
-        state_counts.get(&JobState::Available).copied().unwrap_or(0),
+        state_counts.count(JobState::Available),
         16,
         "admin state_counts must not multiply ready rows by other shard cursors",
     );
@@ -15808,9 +15807,9 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     let counts = admin::state_counts(&pool)
         .await
         .expect("read queue-storage state counts");
-    assert_eq!(counts.get(&JobState::Completed).copied(), Some(4));
-    assert_eq!(counts.get(&JobState::Available).copied(), Some(2));
-    assert_eq!(counts.get(&JobState::Cancelled).copied(), Some(1));
+    assert_eq!(counts.count(JobState::Completed), 4);
+    assert_eq!(counts.count(JobState::Available), 2);
+    assert_eq!(counts.count(JobState::Cancelled), 1);
 
     let mut by_state: HashMap<JobState, i64> = HashMap::new();
     for bucket in admin::state_timeseries(&pool, 60)
@@ -15861,7 +15860,7 @@ async fn test_queue_storage_queue_overview_counts_without_terminal_history() {
     let counts = admin::state_counts(&pool)
         .await
         .expect("read queue-storage state counts");
-    assert_eq!(counts.get(&JobState::Completed).copied(), Some(3));
+    assert_eq!(counts.count(JobState::Completed), 3);
 }
 
 /// Queue lag is the age of the oldest available job, wherever it sits in its
