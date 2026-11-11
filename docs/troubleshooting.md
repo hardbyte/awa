@@ -173,7 +173,7 @@ Earlier releases waited on the lock inside the batch instead. Every completion t
 Not every completion is covered:
 
 - Attempts that end in a retry, snooze, cancel, failure or callback wait, and successful attempts of a kind with follow-up enqueues, finalize one job at a time. They still wait on the lock while holding a pool connection and their worker slot, but no other attempt waits with them.
-- With receipts off (`lease_claim_receipts = false`), a successful attempt's batch still waits on the lock, and the rest of the batch waits with it.
+- With receipts off (`lease_claim_receipts = false`, only possible on a non-default queue-storage schema), a successful attempt's batch still waits on the lock, and the rest of the batch waits with it.
 
 Keep transactions that touch running jobs short, and commit or roll back before doing slow work in them.
 

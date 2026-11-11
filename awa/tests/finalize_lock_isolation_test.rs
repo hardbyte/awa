@@ -123,7 +123,7 @@ async fn a_held_attempt_lock_does_not_stall_other_completions(pool: PgPool) {
     // An application cancels the running job inside its own transaction and
     // has not committed yet.
     let mut app = pool.begin().await.unwrap();
-    admin::cancel_tx(&mut *app, held.id)
+    admin::cancel_tx(&mut app, held.id)
         .await
         .expect("cancel inside the application's transaction");
 
