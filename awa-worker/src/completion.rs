@@ -84,12 +84,30 @@ const COMPLETE_BATCH_SQL: &str = r#"
     RETURNING locked.id, locked.run_lease
 "#;
 
+/// Why the batcher did not complete an attempt.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompletionError {
+    /// Another transaction holds the attempt's completion lock, so the batch
+    /// left it out. The attempt is neither completed nor stale; complete it
+    /// again once that transaction ends.
+    #[error(
+        "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
+    )]
+    LockHeld { job_id: i64, run_lease: RunLease },
+    #[error(transparent)]
+    Storage(#[from] AwaError),
+}
+
+fn lock_held((job_id, run_lease): (i64, RunLease)) -> CompletionError {
+    CompletionError::LockHeld { job_id, run_lease }
+}
+
 struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
     claim: Option<ClaimedEntry>,
     runtime_job: Option<ClaimedRuntimeJob>,
-    response: oneshot::Sender<Result<bool, AwaError>>,
+    response: oneshot::Sender<Result<bool, CompletionError>>,
 }
 
 fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
@@ -118,14 +136,18 @@ impl CompletionBatcherHandle {
             .min(tokio::sync::Semaphore::MAX_PERMITS)
     }
 
-    pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
+    pub async fn complete(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(job_id, run_lease, None, None).await
     }
 
     pub async fn complete_runtime_job(
         &self,
         runtime_job: ClaimedRuntimeJob,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(
             runtime_job.job.id,
             runtime_job.job.run_lease,
@@ -141,7 +163,7 @@ impl CompletionBatcherHandle {
         run_lease: RunLease,
         claim: Option<ClaimedEntry>,
         runtime_job: Option<ClaimedRuntimeJob>,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
         self.shards[shard]
@@ -303,6 +325,9 @@ impl CompletionWorker {
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
 
+        // Attempts whose completion lock another transaction holds are left
+        // out of the batch, so one held attempt cannot hold up the shard.
+        let mut contended: HashSet<(i64, i64)> = HashSet::new();
         let updated = match &self.storage {
             RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
                 .bind(&job_ids)
@@ -318,8 +343,12 @@ impl CompletionWorker {
                 {
                     runtime
                         .store
-                        .complete_runtime_batch(&self.pool, &runtime_jobs)
+                        .complete_runtime_batch_isolating(&self.pool, &runtime_jobs)
                         .await
+                        .map(|outcome| {
+                            contended.extend(outcome.contended);
+                            outcome.updated
+                        })
                 } else if let Some(claimed) = batch
                     .iter()
                     .map(|request| request.claim.clone())
@@ -355,14 +384,19 @@ impl CompletionWorker {
                     flush_start.elapsed(),
                 );
                 for request in batch {
-                    let _ = request
-                        .response
-                        .send(Ok(updated.contains(&(request.job_id, request.run_lease))));
+                    let pair = (request.job_id, request.run_lease);
+                    let response = if contended.contains(&pair) {
+                        Err(lock_held(pair))
+                    } else {
+                        Ok(updated.contains(&pair))
+                    };
+                    let _ = request.response.send(response);
                 }
                 debug!(
                     shard = self.shard_id,
                     batch_size = job_ids.len(),
                     updated = updated_count,
+                    contended = contended.len(),
                     "Flushed completed job batch"
                 );
             }
@@ -386,13 +420,21 @@ impl CompletionWorker {
                                 Ok(true)
                             } else {
                                 let updated = if let Some(runtime_job) = &request.runtime_job {
-                                    runtime
+                                    match runtime
                                         .store
-                                        .complete_runtime_batch(
+                                        .complete_runtime_batch_isolating(
                                             &self.pool,
                                             std::slice::from_ref(runtime_job),
                                         )
                                         .await
+                                    {
+                                        Ok(outcome) if outcome.contended.contains(&pair) => {
+                                            let _ = request.response.send(Err(lock_held(pair)));
+                                            continue;
+                                        }
+                                        Ok(outcome) => Ok(outcome.updated),
+                                        Err(err) => Err(err),
+                                    }
                                 } else if let Some(claim) = &request.claim {
                                     runtime
                                         .store
@@ -412,7 +454,9 @@ impl CompletionWorker {
                             if matches!(&response, Ok(true)) {
                                 committed_pairs.insert(pair);
                             }
-                            let _ = request.response.send(response);
+                            let _ = request
+                                .response
+                                .send(response.map_err(CompletionError::from));
                         }
                         self.metrics.record_completion_flush(
                             self.shard_id,
@@ -431,7 +475,7 @@ impl CompletionWorker {
                 for request in batch {
                     let _ = request
                         .response
-                        .send(Err(AwaError::Validation(message.clone())));
+                        .send(Err(AwaError::Validation(message.clone()).into()));
                 }
             }
         }
@@ -1198,7 +1242,7 @@ mod tests {
             .expect("contended batch isolates singleton errors without waiting");
         let busy = responses.remove(0).await.unwrap();
         assert!(
-            matches!(busy, Err(AwaError::Database(ref error))
+            matches!(busy, Err(CompletionError::Storage(AwaError::Database(ref error)))
             if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))),
             "busy attempt must report its real error, never stale: {busy:?}"
         );
