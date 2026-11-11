@@ -633,11 +633,11 @@ impl<'a> BranchTimer<'a> {
     }
 }
 
-/// Owns the per-branch overrun state for the maintenance leader loop.
-/// All access is logically single-threaded — the maintenance loop is the
-/// only caller — but the loop runs inside a `tokio::spawn`-ed task that
-/// requires `Send`, so we use `std::sync::Mutex` rather than `RefCell`.
-/// The mutex is uncontended in practice (one acquirer); cost is one
+/// Owns the per-branch overrun state for the maintenance leader's loops.
+/// The recovery and hygiene loops share it on one task, so access never
+/// overlaps, but the task is `tokio::spawn`-ed and must be `Send`, so this
+/// is a `std::sync::Mutex` rather than a `RefCell`. State is keyed by
+/// branch and the guard is never held across an `.await`; cost is one
 /// uncontended lock per branch tick.
 #[derive(Default)]
 struct MaintenanceBranchTracker {
@@ -1579,9 +1579,8 @@ impl MaintenanceService {
                     .storage
                     .queue_storage()
                     .map(|runtime| runtime.claim_rotate_interval);
-                // Per-branch overrun tracker. Issue #242 — observability only;
-                // the architectural split of this `tokio::select!` is deferred
-                // to v0.7 conditional on the overrun counter showing fleet hits.
+                // Per-branch overrun tracker (#242). Shared by the recovery
+                // and hygiene loops below (#303, ADR-051).
                 *self
                     .rescue_owner_evidence
                     .lock()
@@ -1643,242 +1642,278 @@ impl MaintenanceService {
                     timer.tick().await;
                 }
 
-                // Do an initial sync immediately on becoming leader
-                self.sync_periodic_jobs_to_db().await;
-                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
-                    return;
-                }
-                let cron_eval_cancel = leadership_lost.child_token();
-                let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
-                    self.pool.clone(),
-                    cron_eval_cancel.clone(),
-                    self.cron_eval_interval,
-                ));
-                struct CronGuard(CancellationToken, tokio::task::AbortHandle);
-                impl Drop for CronGuard {
-                    fn drop(&mut self) {
-                        self.0.cancel();
-                        self.1.abort();
-                    }
-                }
-                let _cron_guard =
-                    CronGuard(cron_eval_cancel.clone(), cron_eval_task.abort_handle());
-
-                loop {
-                    if leadership_lost.is_cancelled() {
-                        return;
-                    }
-                    tokio::select! {
-                        _ = leadership_lost.cancelled() => return,
-                        _ = self.cancel.cancelled() => {
-                            debug!("Maintenance service shutting down");
-                            self.leader.store(false, Ordering::SeqCst);
-                            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
-                            // Dropping the observer closes the session holding leadership.
+                // #303: promotion and rescue run in their own loop, so a
+                // hygiene branch waiting on a lock or scanning a large table
+                // cannot hold back the work users wait on. Both loops run on
+                // this task, under the same leadership: each returns when
+                // leadership is lost or the service shuts down. On shutdown,
+                // `run_leader_term` gives the branches in flight one shared
+                // grace. Branches never relied on running one at a time:
+                // each is its own transaction, kept safe by SQL locks, as it
+                // must be when an old leader's branch outlives its lock and
+                // overlaps the new leader's.
+                let recovery = async {
+                    loop {
+                        if leadership_lost.is_cancelled() {
                             return;
                         }
-                        origin = heartbeat_rescue_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueHeartbeat.classification().0, self.heartbeat_rescue_interval, &self.metrics) {
-                                let backlog = match self.control.admit(MaintenanceBranch::RescueHeartbeat) {
-                                    Some(admission) => admission.run(self.rescue_stale_heartbeats(origin)).await,
-                                    None => false,
-                                };
-                                timer.finish();
-                                if backlog {
-                                    heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+                        tokio::select! {
+                            _ = leadership_lost.cancelled() => return,
+                            _ = self.cancel.cancelled() => {
+                                self.leader.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            origin = heartbeat_rescue_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueHeartbeat.classification().0, self.heartbeat_rescue_interval, &self.metrics) {
+                                    let backlog = match self.control.admit(MaintenanceBranch::RescueHeartbeat) {
+                                        Some(admission) => admission.run(self.rescue_stale_heartbeats(origin)).await,
+                                        None => false,
+                                    };
+                                    timer.finish();
+                                    if backlog {
+                                        heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+                                    }
+                                }
+                            }
+                            origin = deadline_rescue_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueDeadline.classification().0, self.deadline_rescue_interval, &self.metrics) {
+                                    let backlog = match self.control.admit(MaintenanceBranch::RescueDeadline) {
+                                        Some(admission) => admission.run(self.rescue_expired_deadlines(origin)).await,
+                                        None => false,
+                                    };
+                                    timer.finish();
+                                    if backlog {
+                                        deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
+                                    }
+                                }
+                            }
+                            origin = callback_rescue_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueCallback.classification().0, self.callback_rescue_interval, &self.metrics) {
+                                    let backlog = match self.control.admit(MaintenanceBranch::RescueCallback) {
+                                        Some(admission) => admission.run(self.rescue_expired_callbacks(origin)).await,
+                                        None => false,
+                                    };
+                                    timer.finish();
+                                    if backlog {
+                                        callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
+                                    }
+                                }
+                            }
+                            _ = promote_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::Promote.classification().0, self.promote_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Promote) {
+                                        admission.run(async {
+                                            self.promote_scheduled(&promoters).await;
+                                        }).await;
+                                    }
+                                    timer.finish();
                                 }
                             }
                         }
-                        origin = deadline_rescue_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueDeadline.classification().0, self.deadline_rescue_interval, &self.metrics) {
-                                let backlog = match self.control.admit(MaintenanceBranch::RescueDeadline) {
-                                    Some(admission) => admission.run(self.rescue_expired_deadlines(origin)).await,
-                                    None => false,
-                                };
-                                timer.finish();
-                                if backlog {
-                                    deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
-                                }
-                            }
-                        }
-                        origin = callback_rescue_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RescueCallback.classification().0, self.callback_rescue_interval, &self.metrics) {
-                                let backlog = match self.control.admit(MaintenanceBranch::RescueCallback) {
-                                    Some(admission) => admission.run(self.rescue_expired_callbacks(origin)).await,
-                                    None => false,
-                                };
-                                timer.finish();
-                                if backlog {
-                                    callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
-                                }
-                            }
-                        }
-                        _ = promote_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::Promote.classification().0, self.promote_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::Promote) {
-                                    admission.run(async {
-                                        self.promote_scheduled(&promoters).await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = cleanup_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Cleanup.classification().0, self.cleanup_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::Cleanup) {
-                                    admission.run(async {
-                                        self.cleanup_completed().await;
-                                        self.cleanup_dlq_rows().await;
-                                        self.cleanup_batch_operations().await;
-                                        self.cleanup_stale_runtime_snapshots().await;
-                                        self.cleanup_stale_descriptors().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = cron_sync_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::CronSync.classification().0, self.cron_sync_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::CronSync) {
-                                    admission.run(async {
-                                        self.sync_periodic_jobs_to_db().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = queue_stats_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::QueueHealth.classification().0, self.queue_stats_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::QueueHealth) {
-                                    admission.run(async {
-                                        self.publish_queue_health_metrics().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = dirty_key_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::DirtyMetadata.classification().0, self.dirty_key_recompute_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::DirtyMetadata) {
-                                    admission.run(async {
-                                        self.recompute_dirty_admin_metadata().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = metadata_reconciliation_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RefreshMetadata.classification().0, self.metadata_reconciliation_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::RefreshMetadata) {
-                                    admission.run(async {
-                                        self.refresh_admin_metadata().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = priority_aging_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Aging.classification().0, self.priority_aging_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::Aging) {
-                                    admission.run(async {
-                                        self.age_waiting_priorities().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = batch_operations_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Batch.classification().0, self.batch_operations_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::Batch) {
-                                    admission.run(async {
-                                        self.process_batch_operation().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = terminal_count_rollup_timer.tick() => {
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::TerminalRollup.classification().0, self.terminal_count_rollup_interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::TerminalRollup) {
-                                    admission.run(async {
-                                        self.rollup_terminal_count_deltas().await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = async {
-                            if let Some(timer) = &mut vacuum_queue_timer {
-                                timer.tick().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        }, if vacuum_queue_timer.is_some() => {
-                            let interval = vacuum_queue_interval
-                                .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateQueue.classification().0, interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::RotateQueue) {
-                                    admission.run(async {
-                                        self.rotate_queue_storage_queue(&prune_tracker).await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = async {
-                            if let Some(timer) = &mut vacuum_lease_timer {
-                                timer.tick().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        }, if vacuum_lease_timer.is_some() => {
-                            let interval = vacuum_lease_interval
-                                .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateLease.classification().0, interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::RotateLease) {
-                                    admission.run(async {
-                                        self.rotate_queue_storage_leases(&prune_tracker).await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-                        _ = async {
-                            if let Some(timer) = &mut vacuum_claim_timer {
-                                timer.tick().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        }, if vacuum_claim_timer.is_some() => {
-                            let interval = vacuum_claim_interval
-                                .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
-                            if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
-                            if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateClaim.classification().0, interval, &self.metrics) {
-                                if let Some(admission) = self.control.admit(MaintenanceBranch::RotateClaim) {
-                                    admission.run(async {
-                                        self.rotate_queue_storage_claims(&prune_tracker).await;
-                                    }).await;
-                                }
-                                timer.finish();
-                            }
-                        }
-
                     }
-                }
+                };
+                let hygiene = async {
+                    // The evaluator starts before the initial sync, on its
+                    // own task, so a sync waiting on a locked cron row does
+                    // not stop schedules already in `awa.cron_jobs` from
+                    // firing. Until the sync commits, a schedule whose
+                    // declaration changed is evaluated as stored, as the
+                    // previous leader left it; `last_enqueued_at` still
+                    // guards against a double fire.
+                    let cron_eval_cancel = leadership_lost.child_token();
+                    let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
+                        self.pool.clone(),
+                        cron_eval_cancel.clone(),
+                        self.cron_eval_interval,
+                    ));
+                    struct CronGuard(CancellationToken, tokio::task::AbortHandle);
+                    impl Drop for CronGuard {
+                        fn drop(&mut self) {
+                            self.0.cancel();
+                            self.1.abort();
+                        }
+                    }
+                    let _cron_guard =
+                        CronGuard(cron_eval_cancel.clone(), cron_eval_task.abort_handle());
+
+                    // Do an initial sync immediately on becoming leader
+                    self.sync_periodic_jobs_to_db().await;
+                    if leadership_lost.is_cancelled() || self.cancel.is_cancelled() {
+                        return;
+                    }
+
+                    loop {
+                        if leadership_lost.is_cancelled() {
+                            return;
+                        }
+                        tokio::select! {
+                            _ = leadership_lost.cancelled() => return,
+                            _ = self.cancel.cancelled() => {
+                                debug!("Maintenance service shutting down");
+                                self.leader.store(false, Ordering::SeqCst);
+                                Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
+                                // Dropping the observer closes the session holding leadership.
+                                return;
+                            }
+                            _ = cleanup_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Cleanup.classification().0, self.cleanup_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Cleanup) {
+                                        admission.run(async {
+                                            self.cleanup_completed().await;
+                                            self.cleanup_dlq_rows().await;
+                                            self.cleanup_batch_operations().await;
+                                            self.cleanup_stale_runtime_snapshots().await;
+                                            self.cleanup_stale_descriptors().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = cron_sync_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::CronSync.classification().0, self.cron_sync_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::CronSync) {
+                                        admission.run(async {
+                                            self.sync_periodic_jobs_to_db().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = queue_stats_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::QueueHealth.classification().0, self.queue_stats_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::QueueHealth) {
+                                        admission.run(async {
+                                            self.publish_queue_health_metrics().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = dirty_key_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::DirtyMetadata.classification().0, self.dirty_key_recompute_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::DirtyMetadata) {
+                                        admission.run(async {
+                                            self.recompute_dirty_admin_metadata().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = metadata_reconciliation_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RefreshMetadata.classification().0, self.metadata_reconciliation_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RefreshMetadata) {
+                                        admission.run(async {
+                                            self.refresh_admin_metadata().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            // Aging shares promotion's control scope but only
+                            // rewrites waiting priorities, so it is hygiene.
+                            _ = priority_aging_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Aging.classification().0, self.priority_aging_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Aging) {
+                                        admission.run(async {
+                                            self.age_waiting_priorities().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = batch_operations_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::Batch.classification().0, self.batch_operations_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::Batch) {
+                                        admission.run(async {
+                                            self.process_batch_operation().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = terminal_count_rollup_timer.tick() => {
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin_without_cooldown(MaintenanceBranch::TerminalRollup.classification().0, self.terminal_count_rollup_interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::TerminalRollup) {
+                                        admission.run(async {
+                                            self.rollup_terminal_count_deltas().await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = async {
+                                if let Some(timer) = &mut vacuum_queue_timer {
+                                    timer.tick().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            }, if vacuum_queue_timer.is_some() => {
+                                let interval = vacuum_queue_interval
+                                    .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateQueue.classification().0, interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RotateQueue) {
+                                        admission.run(async {
+                                            self.rotate_queue_storage_queue(&prune_tracker).await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = async {
+                                if let Some(timer) = &mut vacuum_lease_timer {
+                                    timer.tick().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            }, if vacuum_lease_timer.is_some() => {
+                                let interval = vacuum_lease_interval
+                                    .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateLease.classification().0, interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RotateLease) {
+                                        admission.run(async {
+                                            self.rotate_queue_storage_leases(&prune_tracker).await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                            _ = async {
+                                if let Some(timer) = &mut vacuum_claim_timer {
+                                    timer.tick().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            }, if vacuum_claim_timer.is_some() => {
+                                let interval = vacuum_claim_interval
+                                    .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
+                                if leadership_lost.is_cancelled() || self.cancel.is_cancelled() { return; }
+                                if let Some(timer) = branch_tracker.try_begin(MaintenanceBranch::RotateClaim.classification().0, interval, &self.metrics) {
+                                    if let Some(admission) = self.control.admit(MaintenanceBranch::RotateClaim) {
+                                        admission.run(async {
+                                            self.rotate_queue_storage_claims(&prune_tracker).await;
+                                        }).await;
+                                    }
+                                    timer.finish();
+                                }
+                            }
+                        }
+                    }
+                };
+                tokio::join!(recovery, hygiene);
             };
             run_leader_term(observer, &self.cancel, work).await;
             if self.cancel.is_cancelled() {
