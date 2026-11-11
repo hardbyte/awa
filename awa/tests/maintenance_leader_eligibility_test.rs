@@ -526,6 +526,11 @@ async fn partial_grants_never_block_the_runtime_snapshot(pool: PgPool) {
     );
     let listed = admin::list_runtime_instances(&insert_pool).await.unwrap();
     assert!(listed.iter().all(|instance| instance.maintenance_leader));
+    // Recorded but not readable by this role, so the runtime warns at
+    // startup that its opt-out is not reported.
+    assert!(!admin::maintenance_eligibility_reportable(&insert_pool)
+        .await
+        .unwrap());
     insert_pool.close().await;
 
     let ungranted_pool = connect_as(&ungranted).await.unwrap();

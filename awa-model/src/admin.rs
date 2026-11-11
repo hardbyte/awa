@@ -3270,15 +3270,17 @@ pub(crate) async fn maintenance_leader_sql(
 }
 
 /// Whether a runtime that opts out of maintenance leadership can have that
-/// opt-out recorded: the `runtime_maintenance_eligibility` schema patch is
-/// applied and this role may insert into its table. When false the runtime
-/// still never leads, but status and the admin API report it as eligible.
+/// opt-out recorded and seen: the `runtime_maintenance_eligibility` schema
+/// patch is applied and this role may insert into its table and read it.
+/// Without `SELECT` the role's own reads, including its check for other
+/// runtimes that may lead, treat every runtime as eligible. When false the
+/// runtime still never leads, but it reads, and may be reported, as eligible.
 pub async fn maintenance_eligibility_reportable<'a, A>(conn: A) -> Result<bool, AwaError>
 where
     A: Acquire<'a, Database = Postgres>,
 {
     let mut conn = conn.acquire().await?;
-    eligibility_table_usable(&mut conn, &["INSERT"]).await
+    eligibility_table_usable(&mut conn, &["INSERT", "SELECT"]).await
 }
 
 /// Delete eligibility rows whose runtime snapshot row has gone. Rows younger

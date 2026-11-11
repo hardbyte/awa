@@ -27,13 +27,14 @@ mod ci_timing;
 
 use awa::model::{admin, migrations, runtime_control, QueueStorage};
 use awa::{
-    Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobState, PeriodicJob,
+    Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, PeriodicJob,
     QueueConfig, QueueStorageConfig, Worker,
 };
 use ci_timing::scaled_timeout;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -173,7 +174,10 @@ impl Worker for Probe {
             // Outlives its deadline on the first attempt, so deadline rescue
             // takes it back and a second attempt completes it.
             "overrun_once" if first_attempt => {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                // Well past the queue's 500 ms deadline, but short enough
+                // that the abandoned first attempt does not keep the job's
+                // queue slot referenced for the rest of the test.
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 Ok(JobResult::Completed)
             }
             _ => Ok(JobResult::Completed),
@@ -214,10 +218,15 @@ fn runtime_client(pool: PgPool, maintenance_leader: bool) -> Client {
         .leader_check_interval(Duration::from_millis(100))
         .runtime_snapshot_interval(Duration::from_millis(100))
         .promote_interval(Duration::from_millis(50))
-        .heartbeat_interval(Duration::from_millis(100))
-        .heartbeat_rescue_interval(Duration::from_millis(200))
-        .deadline_rescue_interval(Duration::from_millis(200))
-        .callback_rescue_interval(Duration::from_millis(200))
+        // Rescue scans hold shared locks on the queue ring's partitions, and
+        // queue prune needs an exclusive lock within its 10 ms lock timeout.
+        // Scanning every few hundred milliseconds leaves prune too few gaps
+        // to wrap the ring in the test's window, so only deadline rescue,
+        // which the overrunning job needs, runs fast.
+        .heartbeat_interval(Duration::from_millis(250))
+        .heartbeat_rescue_interval(Duration::from_secs(2))
+        .deadline_rescue_interval(Duration::from_millis(500))
+        .callback_rescue_interval(Duration::from_secs(2))
         .cleanup_interval(Duration::from_millis(200))
         .completed_retention(Duration::from_millis(1))
         .queue_stats_interval(Duration::from_millis(200))
@@ -241,25 +250,42 @@ async fn insert(pool: &PgPool, mode: &str, opts: InsertOpts) -> i64 {
     .id
 }
 
-async fn wait_for_state(
+/// Wait until every job has reached its expected state, and return the row
+/// each was first seen in. All jobs are polled together, and a state once seen
+/// is kept: with the test's short retention and fast rotation, queue prune can
+/// remove a terminal row soon after it is written.
+async fn wait_for_states(
     logs: &CapturedLogs,
     store: &QueueStorage,
     pool: &PgPool,
-    id: i64,
-    want: JobState,
-) {
+    expected: &[(i64, JobState)],
+) -> HashMap<i64, JobRow> {
     let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(30));
+    let mut reached: HashMap<i64, JobRow> = HashMap::new();
     loop {
         logs.assert_no_permission_errors();
-        let state = store.load_job(pool, id).await.unwrap().map(|job| job.state);
-        if state == Some(want) {
-            return;
+        for (id, want) in expected {
+            if reached.contains_key(id) {
+                continue;
+            }
+            if let Some(job) = store.load_job(pool, *id).await.unwrap() {
+                if job.state == *want {
+                    reached.insert(*id, job);
+                }
+            }
         }
+        if reached.len() == expected.len() {
+            return reached;
+        }
+        let missing: Vec<_> = expected
+            .iter()
+            .filter(|(id, _)| !reached.contains_key(id))
+            .collect();
         assert!(
             tokio::time::Instant::now() < deadline,
-            "job {id} never reached {want:?}; last state {state:?}"
+            "jobs never reached their expected states: {missing:?}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -420,23 +446,22 @@ async fn exercise(url: String, names: Names, logs: CapturedLogs) {
         .expect("the scheduled job should be found");
     assert_eq!(cancelled.state, JobState::Cancelled);
 
-    for (id, state) in [
-        (completed, JobState::Completed),
-        (progress, JobState::Completed),
-        (retried, JobState::Completed),
-        (exhausted, JobState::Failed),
-        (terminal, JobState::Failed),
-        (scheduled, JobState::Completed),
-        (rescued, JobState::Completed),
-    ] {
-        wait_for_state(&logs, &store, pool, id, state).await;
-    }
-    let rescued_attempt = store
-        .load_job(pool, rescued)
-        .await
-        .unwrap()
-        .unwrap()
-        .attempt;
+    let reached = wait_for_states(
+        &logs,
+        &store,
+        pool,
+        &[
+            (completed, JobState::Completed),
+            (progress, JobState::Completed),
+            (retried, JobState::Completed),
+            (exhausted, JobState::Failed),
+            (terminal, JobState::Failed),
+            (scheduled, JobState::Completed),
+            (rescued, JobState::Completed),
+        ],
+    )
+    .await;
+    let rescued_attempt = reached[&rescued].attempt;
     assert!(
         rescued_attempt >= 2,
         "the overrunning job must complete on a rescued attempt, not its first"
