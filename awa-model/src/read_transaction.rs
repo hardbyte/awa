@@ -174,11 +174,15 @@ where
     F: FnMut(TruncationGuard) -> Fut,
     Fut: Future<Output = Result<(T, bool), E>>,
 {
-    for _ in 0..DETECTING_ATTEMPTS {
+    for attempt in 1..=DETECTING_ATTEMPTS {
         let (value, untruncated) = read(TruncationGuard::Detect).await?;
         if untruncated {
             return Ok(value);
         }
+        tracing::debug!(
+            attempt,
+            "a ring partition was truncated under a snapshot read; reading again"
+        );
     }
     tracing::debug!(
         attempts = DETECTING_ATTEMPTS,
