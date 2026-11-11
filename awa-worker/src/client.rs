@@ -1588,7 +1588,7 @@ impl Client {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
-        let timeout = runtime.store.prune_lock_timeout();
+        let timeout = runtime.store.prune_lock_wait_ceiling();
         let risks = match crate::storage::check_prune_lock_timeout(&self.pool, timeout).await {
             Ok(risks) => risks,
             Err(err) => {
@@ -1599,16 +1599,17 @@ impl Client {
         for risk in risks {
             match risk {
                 crate::storage::PruneLockTimeoutRisk::DeadlockTimeout { limit_ms } => warn!(
-                    prune_lock_timeout_ms = timeout.as_millis() as u64,
+                    prune_lock_wait_ceiling_ms = timeout.as_millis() as u64,
                     deadlock_timeout_ms = limit_ms,
-                    "Prune lock timeout is at or above deadlock_timeout; a waiting prune can \
+                    "Prune's longest lock wait is at or above deadlock_timeout; a waiting prune can \
                      make PostgreSQL run deadlock detection and cancel a concurrent claim. \
-                     Keep the timeout well below deadlock_timeout"
+                     Keep the prune lock timeout and its 320 ms retry ceiling well below \
+                     deadlock_timeout"
                 ),
                 crate::storage::PruneLockTimeoutRisk::StatementTimeout { limit_ms } => warn!(
-                    prune_lock_timeout_ms = timeout.as_millis() as u64,
+                    prune_lock_wait_ceiling_ms = timeout.as_millis() as u64,
                     statement_timeout_ms = limit_ms,
-                    "Prune lock timeout is at or above statement_timeout; prune is cancelled \
+                    "Prune's longest lock wait is at or above statement_timeout; prune is cancelled \
                      by the statement timeout and fails instead of reporting blocked"
                 ),
             }

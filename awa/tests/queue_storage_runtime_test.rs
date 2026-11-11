@@ -11736,31 +11736,31 @@ async fn fail_jobs_in_sealed_slot(
 /// reaches the pruned slot after the prune commits sees the slot empty, and
 /// cannot see the failed row prune re-homed into the live slot either.
 ///
-/// Holds prune after it has locked slot 0 and before it carries the failed
-/// row into slot 1, starts `read` so it takes its snapshot and queues behind
-/// prune's slot 0 lock in the statement containing `read_fragment`, then lets
-/// prune commit.
+/// Holds prune after it has carried the failed row into slot 1 and truncated
+/// slot 0, at the counter cleanup that follows, starts `read` so it takes its
+/// snapshot and queues behind prune's slot 0 lock in the statement containing
+/// `read_fragment`, then lets prune commit.
 async fn read_across_failed_row_carry<T>(
     pool: &sqlx::PgPool,
     store: &QueueStorage,
     read_fragment: &str,
     read: impl std::future::Future<Output = T>,
 ) -> T {
-    let mut holder = pool.begin().await.expect("begin carry holder");
+    let mut holder = pool.begin().await.expect("begin prune holder");
     sqlx::query(&format!(
-        "LOCK TABLE {}.done_entries_1 IN SHARE MODE",
+        "LOCK TABLE {}.queue_terminal_live_counts IN SHARE MODE",
         store.schema()
     ))
     .execute(holder.as_mut())
     .await
-    .expect("hold the live done slot");
+    .expect("hold the live terminal counters");
 
     let prune = store.prune_oldest(pool, Duration::from_secs(3600));
     let read = async {
-        wait_for_lock_waiter(pool, "WITH carried AS").await;
+        wait_for_lock_waiter(pool, "queue_terminal_live_counts WHERE ready_slot").await;
         let release = async {
             wait_for_lock_waiter(pool, read_fragment).await;
-            holder.rollback().await.expect("release carry holder");
+            holder.rollback().await.expect("release prune holder");
         };
         let (value, ()) = tokio::join!(read, release);
         value
@@ -22917,6 +22917,212 @@ where
     }
 }
 
+/// Readers of the ring parents hold `ACCESS SHARE` on every child, sealed
+/// slots included. When several of them overlap there is never a moment with
+/// no holder, so a prune that only ever waits its base lock timeout cannot
+/// win (#721). Each reader here holds the lock for 40 ms and four of them are
+/// staggered 10 ms apart. They take the children in the order a claim and a
+/// heartbeat do, so one that arrives while prune waits holds nothing prune
+/// still needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_prune_wins_against_overlapping_short_readers() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let schema = "awa_qs_prune_overlapping_readers";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_prune_overlapping_readers";
+
+    store.enqueue_batch(&pool, queue, 2, 4).await.unwrap();
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 4, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(finished.len(), 4);
+    store
+        .complete_runtime_batch(&pool, &finished)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for reader in 0..4u64 {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let read = format!(
+            "SELECT (SELECT count(*) FROM {schema}.ready_segments)
+                  + (SELECT count(*) FROM {schema}.ready_entries)
+                  + (SELECT count(*) FROM {schema}.ready_tombstones)
+                  + (SELECT count(*) FROM {schema}.lease_claims)
+                  + (SELECT count(*) FROM {schema}.lease_claim_closures)
+             FROM pg_sleep(0.04)"
+        );
+        readers.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10 * reader)).await;
+            let mut slowest = Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let started = Instant::now();
+                let _: i64 = sqlx::query_scalar(&read)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("reader");
+                slowest = slowest.max(started.elapsed());
+            }
+            slowest
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut queue_outcomes = Vec::new();
+    for _ in 0..5 {
+        let outcome = store.prune_oldest(&pool, Duration::ZERO).await.unwrap();
+        let pruned = matches!(outcome, PruneOutcome::Pruned { slot: 0, .. });
+        queue_outcomes.push(outcome);
+        if pruned {
+            break;
+        }
+    }
+    let mut claim_outcomes = Vec::new();
+    for _ in 0..5 {
+        let outcome = store.prune_oldest_claims(&pool).await.unwrap();
+        let pruned = matches!(outcome, PruneOutcome::Pruned { slot: 0, .. });
+        claim_outcomes.push(outcome);
+        if pruned {
+            break;
+        }
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut slowest = Duration::ZERO;
+    for reader in readers {
+        slowest = slowest.max(reader.await.expect("reader task"));
+    }
+
+    assert!(
+        matches!(
+            queue_outcomes.last(),
+            Some(PruneOutcome::Pruned { slot: 0, .. })
+        ),
+        "queue prune never won: {queue_outcomes:?}"
+    );
+    assert!(
+        matches!(
+            claim_outcomes.last(),
+            Some(PruneOutcome::Pruned { slot: 0, .. })
+        ),
+        "claim prune never won: {claim_outcomes:?}"
+    );
+    // A reader waits at most one upgrade attempt, which is capped at 32
+    // times the 10 ms lock timeout, on top of its own 40 ms.
+    assert!(
+        slowest < Duration::from_millis(1_000),
+        "a reader stalled for {slowest:?} behind prune"
+    );
+}
+
+/// A claim that writes a lease directly touches no child of the queue slot
+/// it claims from, so freezing the slot's writers does not wait for it. If
+/// it read its ready row before the freeze and commits while prune waits to
+/// upgrade its lock, only the gates after the upgrade can see the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_prune_sees_a_lease_committed_while_it_waits_to_truncate() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_prune_late_lease";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let store = Arc::new(store);
+    let queue = "qs_prune_late_lease";
+
+    store.enqueue_batch(&pool, queue, 2, 2).await.unwrap();
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    store
+        .complete_runtime_batch(&pool, &finished)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let generation: i64 = sqlx::query_scalar(&format!(
+        "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = 0"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let mut claimer = pool.begin().await.unwrap();
+    let _: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.ready_entries_0"))
+        .fetch_one(claimer.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.leases
+             (lease_slot, lease_generation, ready_slot, ready_generation,
+              job_id, queue, priority, lane_seq)
+         VALUES (0, 0, 0, $1, 9000001, $2, 2, 9000001)"
+    ))
+    .bind(generation)
+    .bind(queue)
+    .execute(claimer.as_mut())
+    .await
+    .unwrap();
+
+    let prune = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.prune_oldest(&pool, Duration::ZERO).await })
+    };
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    claimer.commit().await.unwrap();
+
+    let outcome = prune.await.expect("prune task").unwrap();
+    assert!(
+        matches!(
+            outcome,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueueActiveLeases,
+                ..
+            }
+        ),
+        "prune truncated or missed a slot with a live lease: {outcome:?}"
+    );
+    let ready_rows: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.ready_entries_0"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ready_rows, 2, "the skipped prune left the slot intact");
+}
+
 /// Prune takes `ACCESS EXCLUSIVE` on the children of a sealed slot. Live
 /// traffic works in the current slot, so it must not need a lock on any
 /// sealed child (#721).
@@ -22966,7 +23172,18 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
     // Plans are cached per session and change shape after five executions,
     // so the traffic runs on one connection and is warmed up unlocked first.
     let mut lock_sets: Vec<Vec<String>> = vec![Vec::new(); 8];
-    if audit {
+    let audit_mode = std::env::var("AWA_AUDIT_SEALED_LOCKS").unwrap_or_default();
+    if audit && audit_mode != "all" && audit_mode != "1" {
+        // A comma-separated list of name fragments locks the matching
+        // children together, which shows the one an operation takes first.
+        lock_sets.push(
+            all_locked
+                .iter()
+                .filter(|child| audit_mode.split(',').any(|part| child.contains(part)))
+                .cloned()
+                .collect(),
+        );
+    } else if audit && audit_mode != "all" {
         lock_sets.extend(all_locked.iter().map(|child| vec![child.clone()]));
     } else {
         lock_sets.push(all_locked.clone());
