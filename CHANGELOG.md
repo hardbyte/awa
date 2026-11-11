@@ -18,6 +18,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- The embedded admin UI now works when its axum router is nested under a path such as `/awa` (#502). Assets, API requests, navigation and direct deep links automatically use the mount path, including outer nested routers, without rebuilding the frontend or changing existing router calls.
 - Cleanup, cron sync, batch operations, metadata refresh, rollup and ring rotation no longer hold back promotion and rescue (#303). The maintenance leader ran every branch from one loop, so while one branch's statement waited on a lock or ran a long scan, scheduled and retryable jobs were not promoted and stale, overdue and timed-out attempts were not rescued. With one `awa.cron_jobs` row locked by another session, the leader's cron sync stalled both for as long as the lock was held, and stopped cron from firing. Promotion and the three rescues now run in their own loop within the leader term, and the cron evaluator starts before the startup cron sync. A rescue pass still delays promotion, and the other branches still delay one another: a stuck cleanup or cron sync still holds back ring rotation and prune. Leadership and the shutdown grace are unchanged, and no configuration or schema change is needed. A leader holds one more pool connection at a time. While a rescue pass runs, lease prune may report more `blocked` outcomes and claim prune may wait out a rescue batch. See [ADR-051](docs/adr/051-maintenance-recovery-loop.md).
 
 ## [0.6.16] — 2026-11-10
