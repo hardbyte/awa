@@ -7164,9 +7164,8 @@ impl QueueStorage {
     /// attempt whose completion lock another transaction holds is left out
     /// and returned in [`RuntimeBatchCompletion::contended`] instead of
     /// holding up the rest of the batch. An application that calls
-    /// `admin::cancel_tx` or a callback `*_in_tx` function inside its own
-    /// transaction holds that lock until it commits. The caller completes
-    /// contended attempts on their own.
+    /// `admin::cancel_tx` inside its own transaction holds that lock until it
+    /// commits. The caller completes contended attempts on their own.
     #[tracing::instrument(
         skip(self, pool, claimed),
         name = "queue_storage.complete_runtime_batch_isolating"

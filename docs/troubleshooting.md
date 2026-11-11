@@ -162,6 +162,21 @@ Durable completion, or lifecycle hooks, are behind the handlers. A runtime lets 
 
 Clear the lock contention or long transaction; claiming recovers as soon as completions commit again. Raising `max_workers` does not help while completion is the bottleneck. For jobs with large payloads, lowering `AWA_COMPLETION_BATCH_SIZE` reduces how much memory waiting attempts can hold.
 
+### A Completion Waits On An Application's Transaction
+
+A transaction that changes a running attempt, such as `admin::cancel_tx` run inside an application's own transaction, holds that attempt's completion lock until it commits or rolls back. If the attempt's handler returns meanwhile, its completion cannot proceed until then. The worker logs `Durable finalization failed; retrying` with `completion lock for job <id> run lease <lease> is held by another transaction`.
+
+In queue storage with receipts on (the default), a successful attempt in that state is left out of its completion batch and retried with backoff, without holding a pool connection, so completions of other jobs carry on. Its worker slot stays held while it retries. When the transaction commits, the retry sees the committed change: a cancelled attempt's completion is ignored as stale. If the lock is still held after two minutes, the worker gives up, logs `Failed to complete job`, stops heartbeating the attempt, and leaves it to stale-heartbeat rescue.
+
+Earlier releases waited on the lock inside the batch instead. Every completion the runtime sent through its completion batcher then waited behind that one transaction, and once the in-flight completion allowance filled, the runtime stopped claiming in every queue.
+
+Not every completion is covered:
+
+- Attempts that end in a retry, snooze, cancel, failure or callback wait, and successful attempts of a kind with follow-up enqueues, finalize one job at a time. They still wait on the lock while holding a pool connection and their worker slot, but no other attempt waits with them.
+- With receipts off (`lease_claim_receipts = false`), a successful attempt's batch still waits on the lock, and the rest of the batch waits with it.
+
+Keep transactions that touch running jobs short, and commit or roll back before doing slow work in them.
+
 ## Rescue Fails With `idx_awa_jobs_unique`
 
 Symptom: maintenance repeats, every tick (canonical engine — the queue-storage engine wedges identically but logs `error: unique conflict` instead):
