@@ -198,6 +198,28 @@ async def test_registry_drain_waits_for_existing_tasks_actual_cleanup():
         await wrapper
 
 
+@pytest.mark.asyncio
+async def test_handler_registered_after_drain_never_starts_until_reopened():
+    started = []
+
+    async def handler():
+        started.append(True)
+
+    registry = HandlerRegistry()
+    await registry.drain()
+
+    late = handler()
+    task = asyncio.ensure_future(HandlerTask(late, asyncio.get_running_loop(), registry))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not started
+    assert inspect.getcoroutinestate(late) == inspect.CORO_CLOSED
+
+    registry.reopen()
+    await HandlerTask(handler(), asyncio.get_running_loop(), registry)
+    assert started == [True]
+
+
 def test_cancel_supports_future_without_python_311_cancelling_method():
     class LegacyFuture:
         cancelled = False

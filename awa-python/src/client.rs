@@ -1959,11 +1959,18 @@ impl PyClient {
         let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
         let runtime_lock = self.runtime_lock.clone();
+        let handler_registry = self.handler_registry.clone_ref(py);
         crate::async_bridge::future_into_py(py, async move {
             let _operation = runtime_lock
                 .try_lock()
                 .map_err(|_| state_error("worker runtime is already running or shutting down"))?;
             begin_runtime_start(&lifecycle)?;
+            if let Err(err) =
+                Python::attach(|py| handler_registry.call_method0(py, "reopen").map(|_| ()))
+            {
+                set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+                return Err(err);
+            }
             let runtime = match builder.build() {
                 Ok(runtime) => Arc::new(runtime),
                 Err(err) => {

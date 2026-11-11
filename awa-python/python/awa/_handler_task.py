@@ -13,10 +13,21 @@ class HandlerRegistry:
     def __init__(self):
         self._lock = threading.Lock()
         self._owners = set()
+        self._draining = False
 
     def add(self, owner):
         with self._lock:
             self._owners.add(owner)
+            draining = self._draining
+        # A job task can reach its handler after drain took its snapshot.
+        # Nothing waits for that handler any more, so it must not start.
+        if draining:
+            owner.cancel()
+
+    def reopen(self):
+        """Accept handlers again; called when the worker runtime starts."""
+        with self._lock:
+            self._draining = False
 
     def discard(self, owner):
         with self._lock:
@@ -24,6 +35,7 @@ class HandlerRegistry:
 
     async def drain(self, timeout=1.0):
         with self._lock:
+            self._draining = True
             owners = tuple(self._owners)
         for owner in owners:
             owner.cancel()
@@ -151,7 +163,11 @@ class HandlerTask:
             self._finished = True
         if self._registry is not None:
             self._registry.discard(self)
-        self.completion.set_result(None)
+        try:
+            self.completion.set_result(None)
+        except concurrent.futures.InvalidStateError:
+            # A waiter cancelled the record; the handler has finished all the same.
+            pass
 
     @staticmethod
     def _close(awaitable):
