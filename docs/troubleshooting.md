@@ -81,7 +81,7 @@ ORDER BY heartbeat_at ASC;
 
 Interpretation:
 
-- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying`
+- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying` or `Another transaction holds this attempt's completion lock; still retrying`
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 - stale, but every rescue pass logs `Rescue skipped an attempt: queue storage ready body ambiguous`: an aging race in an older release left two equally plausible bodies for this attempt. Rescue leaves it running and moves on to other attempts. Reads and cancellation of the job fail with the same ambiguity error, so it needs manual repair; open an issue with the job id and run lease from the log
@@ -164,7 +164,7 @@ Clear the lock contention or long transaction; claiming recovers as soon as comp
 
 ### A Completion Waits On An Application's Transaction
 
-A transaction that changes a running attempt, such as `admin::cancel_tx` run inside an application's own transaction, holds that attempt's completion lock until it commits or rolls back. If the attempt's handler returns meanwhile, its completion cannot proceed until then. The worker logs `Durable finalization failed; retrying` with `completion lock for job <id> run lease <lease> is held by another transaction`.
+A transaction that changes a running attempt, such as `admin::cancel_tx` run inside an application's own transaction, holds that attempt's completion lock until it commits or rolls back. If the attempt's handler returns meanwhile, its completion cannot proceed until then. Once the attempt has waited a second, the worker logs `Another transaction holds this attempt's completion lock; still retrying` with the attempt's `job_id` and `waited_ms`.
 
 In queue storage with receipts on (the default), a successful attempt in that state is left out of its completion batch and retried with backoff, without holding a pool connection, so completions of other jobs carry on. Its worker slot stays held while it retries. When the transaction commits, the retry sees the committed change: a cancelled attempt's completion is ignored as stale. If the lock is still held after two minutes, the worker gives up, logs `Failed to complete job`, stops heartbeating the attempt, and leaves it to stale-heartbeat rescue.
 
