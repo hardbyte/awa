@@ -11691,67 +11691,81 @@ async fn wait_for_lock_waiter(pool: &sqlx::PgPool, fragment: &str) {
     }
 }
 
-/// `TRUNCATE` is not MVCC-safe: a read whose snapshot predates a prune and
-/// reaches the pruned slot after the prune commits sees the slot empty, and
-/// cannot see the failed row prune re-homed into the live slot either. A
-/// point read that lands in that window must still find the failed job.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_load_job_finds_failed_row_carried_by_concurrent_prune() {
-    let (_db_guard, pool) = setup_pool(10).await;
-    let queue = "qs_load_job_prune_carry";
-    let schema = "awa_qs_load_job_prune_carry";
-    let store = create_store(&pool, schema)
-        .await
-        .with_prune_lock_timeout(Duration::from_secs(30))
-        .expect("prune lock timeout");
-
-    let job_id = enqueue_job(
-        &pool,
-        &store,
-        &CompleteJob { id: 1 },
-        InsertOpts {
-            queue: queue.to_string(),
-            ..Default::default()
-        },
-    )
-    .await;
-    let claimed = store
-        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
-        .await
-        .expect("claim job")
-        .into_iter()
-        .next()
-        .expect("missing claimed job");
-    store
-        .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
-        .await
-        .expect("fail job")
-        .expect("running job should fail");
+/// Enqueues, claims and fails one job per id in `ids` on `queue`, then rotates
+/// the queue ring so slot 0, which holds the failed rows, is sealed.
+async fn fail_jobs_in_sealed_slot(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    ids: std::ops::Range<i64>,
+) -> Vec<i64> {
+    let mut job_ids = Vec::new();
+    for id in ids {
+        let job_id = enqueue_job(
+            pool,
+            store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(pool, queue, 1, Duration::from_secs(30))
+            .await
+            .expect("claim job")
+            .into_iter()
+            .next()
+            .expect("missing claimed job");
+        store
+            .fail_terminal(pool, job_id, claimed.job.run_lease, "boom", None)
+            .await
+            .expect("fail job")
+            .expect("running job should fail");
+        job_ids.push(job_id);
+    }
     assert!(matches!(
-        store.rotate(&pool).await.expect("rotate"),
+        store.rotate(pool).await.expect("rotate"),
         RotateOutcome::Rotated { slot: 1, .. }
     ));
+    job_ids
+}
 
-    // Hold prune after it has locked slot 0 and before it carries the failed
-    // row into slot 1, then start a read so it takes its snapshot and queues
-    // behind prune's slot 0 lock.
+/// `TRUNCATE` is not MVCC-safe: a read whose snapshot predates a prune and
+/// reaches the pruned slot after the prune commits sees the slot empty, and
+/// cannot see the failed row prune re-homed into the live slot either.
+///
+/// Holds prune after it has locked slot 0 and before it carries the failed
+/// row into slot 1, starts `read` so it takes its snapshot and queues behind
+/// prune's slot 0 lock in the statement containing `read_fragment`, then lets
+/// prune commit.
+async fn read_across_failed_row_carry<T>(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    read_fragment: &str,
+    read: impl std::future::Future<Output = T>,
+) -> T {
     let mut holder = pool.begin().await.expect("begin carry holder");
-    sqlx::query(&format!("LOCK TABLE {schema}.done_entries_1 IN SHARE MODE"))
-        .execute(holder.as_mut())
-        .await
-        .expect("hold the live done slot");
+    sqlx::query(&format!(
+        "LOCK TABLE {}.done_entries_1 IN SHARE MODE",
+        store.schema()
+    ))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold the live done slot");
 
-    let prune = store.prune_oldest(&pool, Duration::from_secs(3600));
+    let prune = store.prune_oldest(pool, Duration::from_secs(3600));
     let read = async {
-        wait_for_lock_waiter(&pool, "WITH carried AS").await;
+        wait_for_lock_waiter(pool, "WITH carried AS").await;
         let release = async {
-            wait_for_lock_waiter(&pool, "SELECT DISTINCT ready_slot").await;
+            wait_for_lock_waiter(pool, read_fragment).await;
             holder.rollback().await.expect("release carry holder");
         };
-        let (job, ()) = tokio::join!(store.load_job(&pool, job_id), release);
-        job
+        let (value, ()) = tokio::join!(read, release);
+        value
     };
-    let (pruned, job) = tokio::join!(prune, read);
+    let (pruned, value) = tokio::join!(prune, read);
 
     assert!(
         matches!(
@@ -11763,11 +11777,201 @@ async fn test_queue_storage_load_job_finds_failed_row_carried_by_concurrent_prun
         ),
         "prune should carry the failed row out of slot 0"
     );
-    let job = job
-        .expect("load_job")
-        .expect("a failed job carried by a concurrent prune must stay visible");
+    value
+}
+
+async fn create_prune_carry_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
+    create_store(pool, schema)
+        .await
+        .with_prune_lock_timeout(Duration::from_secs(30))
+        .expect("prune lock timeout")
+}
+
+/// A point read that lands in a prune's carry must still find the failed job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_load_job_finds_failed_row_carried_by_concurrent_prune() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_load_job_prune_carry";
+    let store = create_prune_carry_store(&pool, "awa_qs_load_job_prune_carry").await;
+    let job_id = fail_jobs_in_sealed_slot(&pool, &store, queue, 1..2).await[0];
+
+    let job = read_across_failed_row_carry(
+        &pool,
+        &store,
+        "SELECT DISTINCT ready_slot",
+        store.load_job(&pool, job_id),
+    )
+    .await
+    .expect("load_job")
+    .expect("a failed job carried by a concurrent prune must stay visible");
     assert_eq!(job.id, job_id);
     assert_eq!(job.state, JobState::Failed);
+}
+
+/// A job listing that lands in a prune's carry must still list the failed job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_list_jobs_lists_failed_row_carried_by_concurrent_prune() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_list_jobs_prune_carry";
+    let store = create_prune_carry_store(&pool, "awa_qs_list_jobs_prune_carry").await;
+    let job_id = fail_jobs_in_sealed_slot(&pool, &store, queue, 1..2).await[0];
+
+    let filter = admin::ListJobsFilter {
+        queue: Some(queue.to_string()),
+        ..Default::default()
+    };
+    let jobs = read_across_failed_row_carry(
+        &pool,
+        &store,
+        "SELECT DISTINCT lane.job_id",
+        admin::list_jobs(&pool, &filter),
+    )
+    .await
+    .expect("list_jobs");
+    let listed: Vec<(i64, JobState)> = jobs.iter().map(|job| (job.id, job.state)).collect();
+    assert_eq!(listed, vec![(job_id, JobState::Failed)]);
+}
+
+/// Kind counts that land in a prune's carry must still count the failed job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_kind_counts_count_failed_row_carried_by_concurrent_prune() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_kind_counts_prune_carry";
+    let store = create_prune_carry_store(&pool, "awa_qs_kind_counts_prune_carry").await;
+    fail_jobs_in_sealed_slot(&pool, &store, queue, 1..2).await;
+
+    let overviews = read_across_failed_row_carry(
+        &pool,
+        &store,
+        "AS captured(queue, priority, enqueue_shard, claim_seq, next_seq)",
+        admin::job_kind_overviews(&pool),
+    )
+    .await
+    .expect("job_kind_overviews");
+    let counts: Vec<(&str, i64, i64)> = overviews
+        .iter()
+        .map(|kind| (kind.kind.as_str(), kind.job_count, kind.queue_count))
+        .collect();
+    assert_eq!(counts, vec![(CompleteJob::kind(), 1, 1)]);
+}
+
+/// Admin reads racing prunes that carry failed rows from slot to slot never
+/// omit or undercount them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_queue_storage_admin_reads_stay_exact_across_concurrent_prunes() {
+    const FAILED_JOBS: i64 = 6;
+    const READERS: usize = 4;
+    const TRUNCATING_PRUNES: usize = 20;
+
+    let (_db_guard, pool) = setup_pool(12).await;
+    let queue = "qs_admin_reads_prune_stress";
+    let store = create_store(&pool, "awa_qs_admin_reads_prune_stress")
+        .await
+        .with_prune_lock_timeout(Duration::from_millis(200))
+        .expect("prune lock timeout");
+    let mut expected = fail_jobs_in_sealed_slot(&pool, &store, queue, 0..FAILED_JOBS).await;
+    expected.sort_unstable_by(|left, right| right.cmp(left));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for reader in 0..READERS {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let expected = expected.clone();
+        readers.push(tokio::spawn(async move {
+            let mut misreads = Vec::new();
+            let mut reads = 0_usize;
+            while !stop.load(Ordering::Relaxed) {
+                reads += 1;
+                let job_id = expected[reads % expected.len()];
+                let observed = match (reader + reads) % 4 {
+                    0 => {
+                        let filter = admin::ListJobsFilter {
+                            queue: Some(queue.to_string()),
+                            ..Default::default()
+                        };
+                        let jobs = admin::list_jobs(&pool, &filter).await.expect("list_jobs");
+                        let listed: Vec<i64> = jobs
+                            .iter()
+                            .filter(|job| job.state == JobState::Failed)
+                            .map(|job| job.id)
+                            .collect();
+                        (listed != expected).then(|| format!("list_jobs listed {listed:?}"))
+                    }
+                    1 => {
+                        let overviews = admin::job_kind_overviews(&pool)
+                            .await
+                            .expect("job_kind_overviews");
+                        let counts: Vec<(String, i64)> = overviews
+                            .into_iter()
+                            .map(|kind| (kind.kind, kind.job_count))
+                            .collect();
+                        (counts != vec![(CompleteJob::kind().to_string(), FAILED_JOBS)])
+                            .then(|| format!("job_kind_overviews counted {counts:?}"))
+                    }
+                    2 => {
+                        let state = admin::get_job(&pool, job_id).await.map(|job| job.state);
+                        (!matches!(state, Ok(JobState::Failed)))
+                            .then(|| format!("get_job({job_id}) returned {state:?}"))
+                    }
+                    _ => {
+                        let failed = admin::state_counts(&pool)
+                            .await
+                            .expect("state_counts")
+                            .get(&JobState::Failed)
+                            .copied();
+                        (failed != Some(FAILED_JOBS))
+                            .then(|| format!("state_counts counted {failed:?} failed"))
+                    }
+                };
+                misreads.extend(observed);
+            }
+            (reads, misreads)
+        }));
+    }
+
+    let mut truncating_prunes = 0;
+    let started = Instant::now();
+    while truncating_prunes < TRUNCATING_PRUNES {
+        assert!(
+            started.elapsed() < ci_timing::scaled_timeout(Duration::from_secs(60)),
+            "only {truncating_prunes} prunes carried the failed rows"
+        );
+        match store
+            .prune_oldest(&pool, Duration::from_secs(3600))
+            .await
+            .expect("prune_oldest")
+        {
+            PruneOutcome::Pruned {
+                carried_failed_rows,
+                ..
+            } => {
+                assert_eq!(carried_failed_rows, FAILED_JOBS as u64);
+                truncating_prunes += 1;
+            }
+            PruneOutcome::Noop => {
+                store.rotate(&pool).await.expect("rotate");
+            }
+            PruneOutcome::Blocked { .. } => {}
+            outcome => panic!("unexpected prune outcome {outcome:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let mut total_reads = 0;
+    let mut misreads = Vec::new();
+    for reader in readers {
+        let (reads, reader_misreads) = reader.await.expect("reader task");
+        total_reads += reads;
+        misreads.extend(reader_misreads);
+    }
+    assert!(total_reads > TRUNCATING_PRUNES, "readers barely ran");
+    assert!(
+        misreads.is_empty(),
+        "{} of {total_reads} reads missed carried failed rows: {misreads:?}",
+        misreads.len()
+    );
 }
 
 /// #337: a mix of completed and failed terminal rows under a generous

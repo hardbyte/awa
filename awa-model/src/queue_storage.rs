@@ -13214,22 +13214,20 @@ impl QueueStorage {
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        // Prune re-homes retained failed rows into the live slot and then
-        // TRUNCATEs the old one. TRUNCATE is not MVCC-safe: a snapshot taken
-        // before the prune commits sees the old slot empty once it reaches it,
-        // and cannot see the re-homed row either. Seeing the truncation means
-        // the prune has committed, so a fresh snapshot finds the job.
-        match self.load_job_in_snapshot(pool, job_id).await? {
-            Some(job) => Ok(Some(job)),
-            None => self.load_job_in_snapshot(pool, job_id).await,
-        }
+        crate::read_transaction::read_until_untruncated(|guard| {
+            self.load_job_in_snapshot(pool, job_id, guard)
+        })
+        .await
     }
 
+    /// The job's newest row, and whether no ring partition was truncated
+    /// while the read's snapshot was in use.
     async fn load_job_in_snapshot(
         &self,
         pool: &PgPool,
         job_id: i64,
-    ) -> Result<Option<JobRow>, AwaError> {
+        guard: crate::read_transaction::TruncationGuard,
+    ) -> Result<(Option<JobRow>, bool), AwaError> {
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
@@ -13244,6 +13242,13 @@ impl QueueStorage {
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
             .await
             .map_err(map_sqlx_error)?;
+        let snapshot = crate::read_transaction::GuardedSnapshot::before_begin(
+            &mut begin_guard.connection,
+            schema,
+            guard,
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         let mut tx = sqlx::Connection::begin_with(
             &mut *begin_guard.connection,
             "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
@@ -13251,6 +13256,10 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         begin_guard.begin_pending = false;
+        snapshot
+            .after_begin(tx.as_mut(), schema)
+            .await
+            .map_err(map_sqlx_error)?;
 
         sqlx::query("SAVEPOINT awa_read_leg")
             .execute(tx.as_mut())
@@ -13772,14 +13781,19 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
+        let untruncated = snapshot
+            .untruncated(&mut begin_guard.connection, schema)
+            .await
+            .map_err(map_sqlx_error)?;
         drop(begin_guard);
-        Ok(candidates.into_iter().max_by_key(|job| {
+        let job = candidates.into_iter().max_by_key(|job| {
             (
                 job.run_lease,
                 transition_timestamp(job),
                 state_rank(job.state),
             )
-        }))
+        });
+        Ok((job, untruncated))
     }
 
     pub async fn register_callback(
