@@ -16,7 +16,7 @@ pub mod ui;
 use super::config::Persona;
 use super::ledger::{expect, JobRecord};
 use super::shared::Shared;
-use awa::{ClientBuilder, JobRow, QueueConfig};
+use awa::{ClientBuilder, JobRow, QueueConfig, QueueStorageConfig};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,12 +52,49 @@ pub fn tune(builder: ClientBuilder, shared: &Shared) -> ClientBuilder {
         shared.config.heartbeat_interval,
         shared.config.heartbeat_staleness,
     );
-    match shared.config.rescue_interval {
+    let builder = match shared.config.rescue_interval {
         Some(interval) => builder
             .heartbeat_rescue_interval(interval)
             .deadline_rescue_interval(interval),
         None => builder,
+    };
+    let builder = match shared.config.prune_lock_timeout {
+        Some(timeout) => builder.prune_lock_timeout(timeout),
+        None => builder,
+    };
+    if shared.config.queue_rotate_interval.is_some()
+        || shared.config.claim_rotate_interval.is_some()
+    {
+        storage(builder, shared, QueueStorageConfig::default())
+    } else {
+        builder
     }
+}
+
+const DEFAULT_ROTATE_INTERVAL: Duration = Duration::from_millis(1_000);
+
+/// Selects `config` with the run's rotation intervals. A runtime with a storage
+/// configuration of its own calls this after [`tune`], which would otherwise replace it.
+pub fn storage(
+    builder: ClientBuilder,
+    shared: &Shared,
+    config: QueueStorageConfig,
+) -> ClientBuilder {
+    builder
+        .queue_storage(
+            config,
+            shared
+                .config
+                .queue_rotate_interval
+                .unwrap_or(DEFAULT_ROTATE_INTERVAL),
+            DEFAULT_ROTATE_INTERVAL,
+        )
+        .claim_rotate_interval(
+            shared
+                .config
+                .claim_rotate_interval
+                .unwrap_or(DEFAULT_ROTATE_INTERVAL),
+        )
 }
 
 /// The timings of [`tune`] that do not depend on the run, for runtimes that live in a
