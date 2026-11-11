@@ -22882,8 +22882,9 @@ where
     }
     let mut holder = pool.begin().await.expect("begin lock holder");
     sqlx::query(&format!(
-        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
-        locked.join(", ")
+        "LOCK TABLE {} IN {} MODE",
+        locked.join(", "),
+        std::env::var("AWA_AUDIT_LOCK_MODE").unwrap_or_else(|_| "ACCESS EXCLUSIVE".into())
     ))
     .execute(holder.as_mut())
     .await
@@ -22897,6 +22898,19 @@ where
         }
         Err(_) => {
             blocked.push(name);
+            if std::env::var("AWA_AUDIT_SEALED_LOCKS").is_ok() {
+                let waiting: Vec<(String, String, String)> = sqlx::query_as(
+                    "SELECT l.mode, l.relation::regclass::text, left(regexp_replace(a.query, '\\s+', ' ', 'g'), 150)
+                     FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                     WHERE NOT l.granted AND l.locktype = 'relation'",
+                )
+                .fetch_all(holder.as_mut())
+                .await
+                .expect("read waiting locks");
+                for (mode, relation, query) in waiting {
+                    eprintln!("WAIT {name}: {mode} on {relation} :: {query}");
+                }
+            }
             holder.rollback().await.expect("release the sealed slot");
             operation.await
         }
@@ -22974,7 +22988,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         .await;
 
         let deadline_claims = run_against_locked_children(
-            &pool,
+            &holder_pool,
             &locked,
             &mut blocked,
             "claim (deadline)",
@@ -22996,7 +23010,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         })
         .await;
         run_against_locked_children(
-            &pool,
+            &holder_pool,
             &locked,
             &mut blocked,
             "complete (deadline)",
@@ -23049,7 +23063,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         .await;
 
         let compact_claims = run_against_locked_children(
-            &pool,
+            &holder_pool,
             &locked,
             &mut blocked,
             "claim (compact)",
@@ -23074,7 +23088,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
             })
             .collect();
         run_against_locked_children(
-            &pool,
+            &holder_pool,
             &locked,
             &mut blocked,
             "heartbeat (compact)",
@@ -23082,7 +23096,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         )
         .await;
         run_against_locked_children(
-            &pool,
+            &holder_pool,
             &locked,
             &mut blocked,
             "complete (compact)",
