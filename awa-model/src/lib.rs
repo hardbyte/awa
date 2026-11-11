@@ -52,7 +52,8 @@ pub use partitioned_queue::{
 pub use queue_storage::{
     ClaimedEntry, ClaimedRuntimeJob, PromoteOutcome, PromotionLane, PruneOutcome, QueueCounts,
     QueueStorage, QueueStorageConfig, RescueBatch, RescueBatchOptions, RescueScanCursor,
-    RescueScanProgress, RescueSlotOrder, RotateOutcome, SkipReason, TerminalDeltaRollupOutcome,
+    RescueScanProgress, RescueSlotOrder, RotateOutcome, RuntimeBatchCompletion, SkipReason,
+    TerminalDeltaRollupOutcome,
 };
 pub use storage::StorageStatus;
 
