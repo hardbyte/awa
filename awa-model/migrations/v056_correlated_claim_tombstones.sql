@@ -3,7 +3,7 @@
 -- Function replacement only: no table DDL or substrate reinstallation. Work
 -- scales with installed claim functions, not job count. Apply with an owner-
 -- capable role; external runners must include V23_UP's discovery bootstrap.
--- Tracking: https://github.com/hardbyte/awa/pulls
+-- Tracking: https://github.com/hardbyte/awa/pull/713
 
 DO $$
 DECLARE
