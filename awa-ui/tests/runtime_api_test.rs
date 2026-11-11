@@ -50,6 +50,7 @@ async fn seed_runtime_snapshot(pool: &sqlx::PgPool, queue: &str, hostname: &str)
             maintenance_alive: true,
             shutting_down: false,
             leader: true,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -144,6 +145,77 @@ async fn test_get_runtime_endpoint_returns_runtime_overview() {
 }
 
 #[tokio::test]
+async fn test_runtime_endpoint_reports_runtimes_that_never_lead() {
+    let _guard = runtime_api_test_guard().await;
+    let pool = setup_pool().await;
+    let queue = "ui_runtime_api_never_leads";
+    clean_runtime_snapshots_for_queue(&pool, queue).await;
+    let snapshot = RuntimeSnapshotInput {
+        instance_id: Uuid::new_v4(),
+        hostname: Some("runtime-api-never-leads".to_string()),
+        pid: 4321,
+        version: "0.6.16-test".to_string(),
+        storage_capability: StorageCapability::Canonical,
+        transition_role: TransitionRole::Auto,
+        started_at: Utc::now(),
+        snapshot_interval_ms: 10_000,
+        healthy: true,
+        postgres_connected: true,
+        poll_loop_alive: true,
+        heartbeat_alive: true,
+        maintenance_alive: true,
+        shutting_down: false,
+        leader: false,
+        maintenance_leader: false,
+        global_max_workers: None,
+        queues: vec![QueueRuntimeSnapshot {
+            queue: queue.to_string(),
+            in_flight: 0,
+            overflow_held: None,
+            config: weighted_config(1),
+        }],
+        queue_descriptor_hashes: HashMap::new(),
+        job_kind_descriptor_hashes: HashMap::new(),
+    };
+    let instance_id = seed_runtime_snapshot_with(&pool, snapshot).await;
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runtime")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("runtime request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let overview: RuntimeOverview =
+        serde_json::from_slice(&body).expect("runtime overview should deserialize");
+
+    let instance = overview
+        .instances
+        .iter()
+        .find(|instance| instance.instance_id == instance_id)
+        .expect("seeded runtime instance should be present");
+    assert!(!instance.maintenance_leader);
+    assert!(!instance.can_take_leadership());
+    assert_eq!(
+        overview.leader_eligible_instances,
+        overview
+            .instances
+            .iter()
+            .filter(|instance| instance.can_take_leadership())
+            .count()
+    );
+}
+
+#[tokio::test]
 async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live_counts() {
     let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
@@ -167,6 +239,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
             maintenance_alive: true,
             shutting_down: false,
             leader: true,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -197,6 +270,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
             maintenance_alive: true,
             shutting_down: false,
             leader: true,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -351,6 +425,7 @@ async fn test_queue_runtime_endpoint_treats_unknown_dlq_policy_as_rollout_compat
             maintenance_alive: true,
             shutting_down: false,
             leader: true,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -382,6 +457,7 @@ async fn test_queue_runtime_endpoint_treats_unknown_dlq_policy_as_rollout_compat
             maintenance_alive: true,
             shutting_down: false,
             leader: false,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -459,6 +535,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             maintenance_alive: true,
             shutting_down: false,
             leader: true,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -490,6 +567,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             maintenance_alive: true,
             shutting_down: false,
             leader: false,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),
@@ -521,6 +599,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             maintenance_alive: true,
             shutting_down: false,
             leader: false,
+            maintenance_leader: true,
             global_max_workers: Some(16),
             queues: vec![QueueRuntimeSnapshot {
                 queue: queue.to_string(),

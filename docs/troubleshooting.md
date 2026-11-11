@@ -277,6 +277,21 @@ If no leader appears:
 - confirm the worker process actually called `start()`
 - make sure the pool is not exhausted
 
+### No Runtime May Lead
+
+A runtime started with `maintenance_leader(false)` (Python `maintenance_leader=False`) never takes leadership. If every live runtime is started that way, leadership stays vacant: jobs that are already available still run, but scheduled and retryable jobs stop being promoted, abandoned attempts are not rescued, and queue storage stops rotating. An alert on a missing maintenance leader fires and does not clear on its own.
+
+Signs:
+
+- an opted-out runtime logs `no live runtime that may lead is visible`
+- `awa.maintenance.leader_eligible_runtimes` is `0` on an opted-out runtime
+- `awa control status` shows `"leader_eligible_runtimes": 0`, and each runtime shows `"maintenance_leader": false`
+- the admin UI marks every runtime "Never leads"
+
+Start or scale up a deployment that may lead (the default), and leadership is taken within one `leader_election_interval`. If leadership instead keeps moving between deployments, or lands on one you would rather keep it off, opt those deployments out and keep at least two runtimes that may lead, so a restart of one does not leave leadership vacant.
+
+`awa control status` and the admin UI show opted-out runtimes only once `awa migrate` has applied the `runtime_maintenance_eligibility` schema patch. Before that, every runtime reads as eligible. See [maintenance leader election](configuration.md#leader-election).
+
 ### Tuning
 
 If you want faster leader failover:
