@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_SCHEMA: &str = "awa";
@@ -23,6 +23,10 @@ const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
+/// Claim and claim-cursor transactions commit without waiting for the WAL
+/// flush. A claim lost to a server crash leaves its job claimable again, and
+/// any later synchronous commit flushes every earlier claim first.
+const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off";
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
@@ -214,6 +218,16 @@ impl ClaimHeartbeatRef {
 pub struct QueueClaimerLease {
     pub claimer_slot: i16,
     pub lease_epoch: i64,
+}
+
+/// How long a claim may reuse this instance's cached claimer lease before
+/// re-reading the lease row and the queue's claimer target.
+const CLAIMER_GATE_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy)]
+struct CachedClaimerGate {
+    checked_at: Instant,
+    lease: QueueClaimerLeaseRow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
@@ -1400,6 +1414,7 @@ mod claim_cursor_advance_tests {
             enqueue_shard: 0,
             next_seq,
             only_if_current,
+            evidence: None,
         }
     }
 
@@ -2046,12 +2061,32 @@ struct ClaimCursorAdvance {
     enqueue_shard: i16,
     next_seq: i64,
     only_if_current: Option<i64>,
+    /// Claim batch row that must exist for the advance to apply: the cursor
+    /// only moves past a lane position whose claim is visible on the server
+    /// the advance runs against.
+    evidence: Option<ClaimEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimEvidence {
+    ready_slot: i32,
+    ready_generation: i64,
+    lane_seq: i64,
+    /// `(job_id, run_lease)` of a claim written straight into `leases`. A
+    /// receipt claim, with or without a deadline, is proven by its
+    /// `ready_claim_attempt_batches` row instead.
+    legacy_attempt: Option<(i64, i64)>,
 }
 
 type ClaimCursorLaneKey = (String, i16, i16);
 type ConditionalClaimCursorAdvances = BTreeMap<i64, i64>;
-type GroupedClaimCursorAdvances =
-    BTreeMap<ClaimCursorLaneKey, (Option<i64>, ConditionalClaimCursorAdvances)>;
+type GroupedClaimCursorAdvances = BTreeMap<
+    ClaimCursorLaneKey,
+    (
+        Option<(i64, Option<ClaimEvidence>)>,
+        ConditionalClaimCursorAdvances,
+    ),
+>;
 type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
 struct CancelJobTxResult {
@@ -3014,6 +3049,9 @@ pub struct QueueStorage {
     /// `reset()`. With the default `enqueue_shards = 1`, the cache holds 1
     /// and `pick_shard` returns 0 unconditionally.
     enqueue_shards_cache: Mutex<HashMap<String, i16>>,
+    /// This instance's claimer lease per queue, as last read or written, so a
+    /// claim does not re-read the lease and claimer target on every call.
+    claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
     /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
     /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
     /// queue_claim_heads) we have previously inserted. Skips the three
@@ -3072,6 +3110,7 @@ impl QueueStorage {
             next_stripe_probe: AtomicUsize::new(0),
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
+            claimer_gates: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
@@ -4017,14 +4056,18 @@ impl QueueStorage {
 
         tx.commit().await.map_err(map_sqlx_error)?;
 
-        // queue_lanes was TRUNCATEd above and queue_meta may have a new
-        // shard configuration for the next round. Clear both caches so
-        // the next ensure_lane / shard_for_enqueue calls re-observe DB
-        // state.
+        // queue_lanes and queue_claimer_leases were TRUNCATEd above and
+        // queue_meta may have a new shard configuration for the next round.
+        // Clear the caches so the next ensure_lane / shard_for_enqueue /
+        // claim calls re-observe DB state.
         self.clear_lane_cache();
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
+            .clear();
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
             .clear();
         Ok(())
     }
@@ -4528,25 +4571,37 @@ impl QueueStorage {
     }
 
     fn claim_cursor_advances(rows: &[ReadyJobLeaseRow]) -> Vec<ClaimCursorAdvance> {
-        let mut next_by_lane: BTreeMap<ClaimCursorLaneKey, i64> = BTreeMap::new();
+        let mut last_by_lane: BTreeMap<ClaimCursorLaneKey, &ReadyJobLeaseRow> = BTreeMap::new();
         for row in rows {
             let key = (row.queue.clone(), row.lane_priority, row.enqueue_shard);
-            let next = row.lane_seq + 1;
-            next_by_lane
+            last_by_lane
                 .entry(key)
-                .and_modify(|current| *current = (*current).max(next))
-                .or_insert(next);
+                .and_modify(|current| {
+                    if row.lane_seq > current.lane_seq {
+                        *current = row;
+                    }
+                })
+                .or_insert(row);
         }
 
-        next_by_lane
+        last_by_lane
             .into_iter()
             .map(
-                |((queue, priority, enqueue_shard), next_seq)| ClaimCursorAdvance {
+                |((queue, priority, enqueue_shard), last)| ClaimCursorAdvance {
                     queue,
                     priority,
                     enqueue_shard,
-                    next_seq,
+                    next_seq: last.lane_seq + 1,
                     only_if_current: None,
+                    evidence: Some(ClaimEvidence {
+                        ready_slot: last.ready_slot,
+                        ready_generation: last.ready_generation,
+                        lane_seq: last.lane_seq,
+                        legacy_attempt: last
+                            .receipt_id
+                            .is_none()
+                            .then_some((last.job_id, last.run_lease)),
+                    }),
                 },
             )
             .collect()
@@ -4567,24 +4622,21 @@ impl QueueStorage {
                     .entry(only_if_current)
                     .and_modify(|next| *next = (*next).max(advance.next_seq))
                     .or_insert(advance.next_seq);
-            } else {
-                *unconditional = Some(
-                    unconditional
-                        .map(|next| next.max(advance.next_seq))
-                        .unwrap_or(advance.next_seq),
-                );
+            } else if unconditional.is_none_or(|(next, _)| advance.next_seq > next) {
+                *unconditional = Some((advance.next_seq, advance.evidence));
             }
         }
 
         let mut normalized = Vec::with_capacity(advances.len());
         for ((queue, priority, enqueue_shard), (unconditional, conditional)) in grouped {
-            if let Some(next_seq) = unconditional {
+            if let Some((next_seq, evidence)) = unconditional {
                 normalized.push(ClaimCursorAdvance {
                     queue,
                     priority,
                     enqueue_shard,
                     next_seq,
                     only_if_current: None,
+                    evidence,
                 });
                 continue;
             }
@@ -4596,11 +4648,42 @@ impl QueueStorage {
                     enqueue_shard,
                     next_seq,
                     only_if_current: Some(only_if_current),
+                    evidence: None,
                 });
             }
         }
 
         normalized
+    }
+
+    /// Replay the post-commit advance for an actual claim on the current server.
+    #[doc(hidden)]
+    pub async fn replay_claim_cursor_advance(
+        &self,
+        pool: &PgPool,
+        claimed: &ClaimedRuntimeJob,
+    ) -> Result<(), AwaError> {
+        let claim = &claimed.claim;
+        self.advance_claim_cursors_strict(
+            pool,
+            &[ClaimCursorAdvance {
+                queue: claim.queue.clone(),
+                priority: claim.priority,
+                enqueue_shard: claim.enqueue_shard,
+                next_seq: claim.lane_seq + 1,
+                only_if_current: None,
+                evidence: Some(ClaimEvidence {
+                    ready_slot: claim.ready_slot,
+                    ready_generation: claim.ready_generation,
+                    lane_seq: claim.lane_seq,
+                    legacy_attempt: claim
+                        .receipt_id
+                        .is_none()
+                        .then_some((claimed.job.id, claimed.job.run_lease)),
+                }),
+            }],
+        )
+        .await
     }
 
     async fn advance_claim_cursors(&self, pool: &PgPool, advances: &[ClaimCursorAdvance]) {
@@ -4643,7 +4726,10 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         for advance in advances {
             sqlx::query(&format!(
                 r#"
@@ -4657,8 +4743,30 @@ impl QueueStorage {
                 )
                 SELECT {schema}.set_sequence_next(seq_name, $4)
                 FROM head
-                WHERE $5::bigint IS NULL
-                   OR {schema}.sequence_next_value(seq_name) = $5
+                WHERE ($5::bigint IS NULL OR {schema}.sequence_next_value(seq_name) = $5)
+                  AND (
+                      $6::int IS NULL
+                      OR ($9::bigint IS NULL AND EXISTS (
+                          SELECT 1
+                          FROM {schema}.ready_claim_attempt_batches AS attempts
+                          WHERE attempts.ready_slot = $6
+                            AND attempts.ready_generation = $7
+                            AND attempts.queue = $1
+                            AND attempts.priority = $2
+                            AND attempts.enqueue_shard = $3
+                            AND attempts.first_lane_seq <= $8
+                            AND attempts.next_lane_seq > $8
+                            AND attempts.lane_ranges @> int8range($8, $8 + 1, '[)')
+                      ))
+                      OR EXISTS (
+                          SELECT 1 FROM {schema}.leases AS leases
+                          WHERE $9::bigint IS NOT NULL
+                            AND leases.job_id = $9 AND leases.run_lease = $10
+                            AND leases.ready_slot = $6 AND leases.ready_generation = $7
+                            AND leases.queue = $1 AND leases.enqueue_shard = $3
+                            AND leases.lane_seq = $8
+                      )
+                  )
                 "#
             ))
             .bind(&advance.queue)
@@ -4666,6 +4774,19 @@ impl QueueStorage {
             .bind(advance.enqueue_shard)
             .bind(advance.next_seq)
             .bind(advance.only_if_current)
+            .bind(advance.evidence.map(|evidence| evidence.ready_slot))
+            .bind(advance.evidence.map(|evidence| evidence.ready_generation))
+            .bind(advance.evidence.map(|evidence| evidence.lane_seq))
+            .bind(
+                advance
+                    .evidence
+                    .and_then(|evidence| evidence.legacy_attempt.map(|attempt| attempt.0)),
+            )
+            .bind(
+                advance
+                    .evidence
+                    .and_then(|evidence| evidence.legacy_attempt.map(|attempt| attempt.1)),
+            )
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -6091,7 +6212,10 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut claimed_rows = Vec::new();
         let stripe_queues = self.physical_queues_for_logical(queue);
         let start = self.stripe_probe_start(stripe_queues.len());
@@ -6214,7 +6338,10 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
         claimed.extend(
             self.claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration, aging_interval)
@@ -6404,6 +6531,27 @@ impl QueueStorage {
         }
 
         Ok(None)
+    }
+
+    #[doc(hidden)]
+    pub fn cached_claimer_lease_count(&self) -> usize {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .len()
+    }
+
+    fn cache_claimer_gate(&self, key: (String, Uuid), lease: QueueClaimerLeaseRow) {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .insert(
+                key,
+                CachedClaimerGate {
+                    checked_at: Instant::now(),
+                    lease,
+                },
+            );
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
@@ -6628,22 +6776,43 @@ impl QueueStorage {
         lease_ttl: Duration,
         idle_threshold: Duration,
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
-        let target_claimers = self
-            .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
-            .await?;
-
-        let Some(lease) = self
-            .acquire_queue_claimer_row(
-                pool,
-                queue,
-                instance_id,
-                target_claimers,
-                lease_ttl,
-                idle_threshold,
-            )
-            .await?
-        else {
-            return Ok(Vec::new());
+        let gate_key = (queue.to_string(), instance_id);
+        let cached_lease = self
+            .claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .get(&gate_key)
+            .filter(|gate| {
+                gate.checked_at.elapsed() < CLAIMER_GATE_CACHE_TTL
+                    && gate.lease.expires_at > Utc::now() + TimeDelta::seconds(1)
+            })
+            .map(|gate| gate.lease);
+        let lease = match cached_lease {
+            Some(lease) => lease,
+            None => {
+                let target_claimers = self
+                    .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
+                    .await?;
+                let Some(lease) = self
+                    .acquire_queue_claimer_row(
+                        pool,
+                        queue,
+                        instance_id,
+                        target_claimers,
+                        lease_ttl,
+                        idle_threshold,
+                    )
+                    .await?
+                else {
+                    self.claimer_gates
+                        .lock()
+                        .expect("claimer gate cache poisoned")
+                        .remove(&gate_key);
+                    return Ok(Vec::new());
+                };
+                self.cache_claimer_gate(gate_key.clone(), lease);
+                lease
+            }
         };
 
         let claimed = self
@@ -6656,10 +6825,27 @@ impl QueueStorage {
             )
             .await?;
 
-        if !claimed.is_empty() && lease.needs_refresh(Utc::now(), lease_ttl, idle_threshold) {
-            let _ = self
+        let now = Utc::now();
+        if !claimed.is_empty() && lease.needs_refresh(now, lease_ttl, idle_threshold) {
+            let still_owned = self
                 .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
                 .await?;
+            if still_owned {
+                let refreshed = QueueClaimerLeaseRow {
+                    last_claimed_at: now,
+                    expires_at: now
+                        + TimeDelta::from_std(lease_ttl).map_err(|err| {
+                            AwaError::Validation(format!("invalid claimer lease ttl: {err}"))
+                        })?,
+                    ..lease
+                };
+                self.cache_claimer_gate(gate_key, refreshed);
+            } else {
+                self.claimer_gates
+                    .lock()
+                    .expect("claimer gate cache poisoned")
+                    .remove(&gate_key);
+            }
         }
 
         Ok(claimed)
@@ -9092,6 +9278,7 @@ impl QueueStorage {
                 enqueue_shard: ready.enqueue_shard,
                 next_seq: ready.lane_seq + 1,
                 only_if_current: Some(ready.lane_seq),
+                evidence: None,
             };
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,

@@ -120,7 +120,7 @@ With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_i
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
 
-Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
+Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
 
 Rust producers and workers can share `PartitionedQueue`:
 
@@ -668,7 +668,7 @@ Lowering the value is safe at any time — see [`docs/upgrade-0.5-to-0.6.md`](up
 
 ### Hot-Queue Claim Control
 
-Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
+Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. Each instance may reuse its claimer lease and target check for up to 250 ms, bypassing the cache within one second of lease expiry. Target reductions constrain new acquisition; existing owned slots remain valid. These are coordination hints: job ownership still comes from the database claim transaction. Reset clears the local cache after truncating the coordination leases. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
 
 Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` is the change that turns overload into bounded end-to-end throughput; raising `claimers` to `4` increases transaction pressure and worsens tail latency in that shape. For extreme single-queue workloads, raise `enqueue_shards` first when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific reason, and judge the result by durable completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed job, transaction commits per completed job, and dead tuples. Lower `claim_batch_size` from `512` for small or latency-sensitive queues; raise claimers only with workload-specific evidence.
 
