@@ -2891,6 +2891,10 @@ pub struct QueueOverview {
     pub failed: i64,
     pub waiting_external: i64,
     pub completed_last_hour: i64,
+    /// Seconds since the earliest `run_at` among the available rows counted.
+    /// While `available_is_estimate` is set this is a lower bound: a job
+    /// moved or aged into a lane behind its first
+    /// [`AVAILABLE_LANE_EXACT_COUNT_CAP`] rows is not seen.
     pub lag_seconds: Option<f64>,
     pub paused: bool,
 }
@@ -4861,6 +4865,11 @@ pub struct StateTimeseriesBucket {
 }
 
 /// Return time-bucketed state counts over the last N minutes.
+///
+/// On queue storage the available buckets read at most
+/// [`AVAILABLE_LANE_EXACT_COUNT_CAP`] rows per lane, newest first. A lane
+/// that gained more available jobs than that inside the window is
+/// undercounted, with nothing in the result to mark it.
 pub async fn state_timeseries(
     pool: &PgPool,
     minutes: i32,

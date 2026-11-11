@@ -8,7 +8,7 @@ export function AvailableCount({
 }) {
   if (!isEstimate) return <>{count.toLocaleString()}</>;
   return (
-    <span title="estimated: backlog exceeds exact-count limit">
+    <span title="estimated: backlog exceeds exact-count limit; lag is a lower bound">
       ≈{count.toLocaleString()}
     </span>
   );
