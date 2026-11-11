@@ -10,7 +10,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
-- `ClientBuilder::maintenance_leader(false)` (Python `client.start(..., maintenance_leader=False)`) keeps a runtime from ever contending for maintenance leadership, so leadership stays on the deployments that may lead. The runtime still claims and executes jobs, heartbeats, publishes runtime snapshots, reports runtime-control observations and syncs its own periodic job declarations. `awa control status` (`maintenance_leader` per runtime, `leader_eligible_runtimes`), the admin API (`maintenance_leader`, `leader_eligible_instances`) and the admin UI show which runtimes may lead. An opted-out runtime logs a warning and records `awa.maintenance.leader_eligible_runtimes = 0` while it sees no live runtime that may lead; every runtime records `awa.maintenance.leader_eligible`. See [maintenance leader election](docs/configuration.md#leader-election).
+- `ClientBuilder::maintenance_leader(false)` (Python `client.start(..., maintenance_leader=False)`) keeps a runtime from ever contending for maintenance leadership, so leadership stays on the deployments that may lead. The runtime still claims and executes jobs, heartbeats, publishes runtime snapshots, reports runtime-control observations and syncs its own periodic job declarations. `awa control status` (`maintenance_leader` per runtime, `leader_eligible_runtimes`), the admin API (`maintenance_leader`, `leader_eligible_instances`) and the admin UI show which runtimes may lead. An opted-out runtime logs a warning and records `awa.maintenance.leader_eligible_runtimes = 0` while it sees no live runtime that may lead; every runtime records `awa.maintenance.leader_eligible`. See [maintenance leader election](docs/configuration.md#leader-election). `Rescued` hooks and enqueue specs fire only from the leader's registrations, so register them on a runtime that may lead.
+
+### Changed
+
+- Syncing a periodic job declaration that matches the stored schedule no longer rewrites its `awa.cron_jobs` row or moves `updated_at`, so runtimes that sync on a timer stop generating a row version per schedule per interval.
 
 ### Fixed
 
