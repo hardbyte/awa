@@ -303,6 +303,9 @@ impl CompletionWorker {
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
 
+        // Attempts whose completion lock another transaction holds are left
+        // out of the batch, so one held attempt cannot hold up the shard.
+        let mut contended: HashSet<(i64, i64)> = HashSet::new();
         let updated = match &self.storage {
             RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
                 .bind(&job_ids)
@@ -318,8 +321,12 @@ impl CompletionWorker {
                 {
                     runtime
                         .store
-                        .complete_runtime_batch(&self.pool, &runtime_jobs)
+                        .complete_runtime_batch_isolating(&self.pool, &runtime_jobs)
                         .await
+                        .map(|outcome| {
+                            contended.extend(outcome.contended);
+                            outcome.updated
+                        })
                 } else if let Some(claimed) = batch
                     .iter()
                     .map(|request| request.claim.clone())
@@ -355,14 +362,19 @@ impl CompletionWorker {
                     flush_start.elapsed(),
                 );
                 for request in batch {
-                    let _ = request
-                        .response
-                        .send(Ok(updated.contains(&(request.job_id, request.run_lease))));
+                    let pair = (request.job_id, request.run_lease);
+                    let response = if contended.contains(&pair) {
+                        Err(completion_lock_held(pair))
+                    } else {
+                        Ok(updated.contains(&pair))
+                    };
+                    let _ = request.response.send(response);
                 }
                 debug!(
                     shard = self.shard_id,
                     batch_size = job_ids.len(),
                     updated = updated_count,
+                    contended = contended.len(),
                     "Flushed completed job batch"
                 );
             }
@@ -386,13 +398,23 @@ impl CompletionWorker {
                                 Ok(true)
                             } else {
                                 let updated = if let Some(runtime_job) = &request.runtime_job {
-                                    runtime
+                                    match runtime
                                         .store
-                                        .complete_runtime_batch(
+                                        .complete_runtime_batch_isolating(
                                             &self.pool,
                                             std::slice::from_ref(runtime_job),
                                         )
                                         .await
+                                    {
+                                        Ok(outcome) if outcome.contended.contains(&pair) => {
+                                            let _ = request
+                                                .response
+                                                .send(Err(completion_lock_held(pair)));
+                                            continue;
+                                        }
+                                        Ok(outcome) => Ok(outcome.updated),
+                                        Err(err) => Err(err),
+                                    }
                                 } else if let Some(claim) = &request.claim {
                                     runtime
                                         .store
@@ -435,6 +457,54 @@ impl CompletionWorker {
                 }
             }
         }
+    }
+}
+
+/// The response for an attempt left out of a batch because another
+/// transaction holds its completion lock. It reads as PostgreSQL's
+/// `lock_not_available` (SQLSTATE `55P03`), the error a `NOWAIT` lock raises,
+/// so the executor retries it with backoff inside its finalization window
+/// instead of waiting on the lock while holding a connection.
+fn completion_lock_held((job_id, run_lease): (i64, i64)) -> AwaError {
+    AwaError::Database(sqlx::Error::Database(Box::new(CompletionLockHeld(format!(
+        "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
+    )))))
+}
+
+#[derive(Debug)]
+struct CompletionLockHeld(String);
+
+impl std::fmt::Display for CompletionLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CompletionLockHeld {}
+
+impl sqlx::error::DatabaseError for CompletionLockHeld {
+    fn message(&self) -> &str {
+        &self.0
+    }
+
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(std::borrow::Cow::Borrowed("55P03"))
+    }
+
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
     }
 }
 

@@ -1866,6 +1866,11 @@ async fn complete_job_queue_storage(
                 None => completion_batcher.complete(job.id, job.run_lease).await,
             } {
                 Ok(updated) => updated,
+                // Another transaction holds this attempt's completion lock.
+                // Finalizing it directly would wait on that lock while
+                // holding a pool connection; `finalize_with_retry` retries it
+                // with backoff instead.
+                Err(err) if is_completion_lock_contention(&err) => return Err(err),
                 Err(err) => {
                     warn!(
                         job_id = job.id,

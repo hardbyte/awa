@@ -151,6 +151,25 @@ pub struct ClaimedEntry {
     pub enqueue_shard: i16,
 }
 
+/// Whether a batch completion waits for each attempt's completion lock or
+/// leaves out attempts whose lock another transaction holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptLocks {
+    Wait,
+    Try,
+}
+
+/// The result of [`QueueStorage::complete_runtime_batch_isolating`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeBatchCompletion {
+    /// `(job_id, run_lease)` of attempts this batch completed.
+    pub updated: Vec<(i64, i64)>,
+    /// `(job_id, run_lease)` of attempts left out because another
+    /// transaction held their completion lock. They are neither completed
+    /// nor stale: the caller completes each on its own.
+    pub contended: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedRuntimeJob {
     pub claim: ClaimedEntry,
@@ -6783,10 +6802,31 @@ impl QueueStorage {
         &self,
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
-    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        locks: AttemptLocks,
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
         if claimed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RuntimeBatchCompletion::default());
         }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let (held, contended) = match locks {
+            AttemptLocks::Wait => (claimed.to_vec(), Vec::new()),
+            AttemptLocks::Try => match self.try_lock_runtime_attempts_tx(&mut tx, claimed).await {
+                Ok(split) => split,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            },
+        };
+        if held.is_empty() {
+            let _ = tx.rollback().await;
+            return Ok(RuntimeBatchCompletion {
+                updated: Vec::new(),
+                contended,
+            });
+        }
+        let claimed = held.as_slice();
 
         let schema = self.schema();
         let finalized_at = Utc::now();
@@ -6801,8 +6841,6 @@ impl QueueStorage {
                 .or_default()
                 .push(entry);
         }
-
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         // Without the per-job closure-row insert,
         // lease_claim_closure_batches become the idempotence evidence.
@@ -7101,7 +7139,10 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(rows)
+        Ok(RuntimeBatchCompletion {
+            updated: rows,
+            contended,
+        })
     }
 
     #[tracing::instrument(
@@ -7113,45 +7154,128 @@ impl QueueStorage {
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
     ) -> Result<Vec<(i64, i64)>, AwaError> {
+        Ok(self
+            .complete_runtime_batch_inner(pool, claimed, AttemptLocks::Wait)
+            .await?
+            .updated)
+    }
+
+    /// [`Self::complete_runtime_batch`] for a batch of unrelated attempts: an
+    /// attempt whose completion lock another transaction holds is left out
+    /// and returned in [`RuntimeBatchCompletion::contended`] instead of
+    /// holding up the rest of the batch. An application that calls
+    /// `admin::cancel_tx` or a callback `*_in_tx` function inside its own
+    /// transaction holds that lock until it commits. The caller completes
+    /// contended attempts on their own.
+    #[tracing::instrument(
+        skip(self, pool, claimed),
+        name = "queue_storage.complete_runtime_batch_isolating"
+    )]
+    pub async fn complete_runtime_batch_isolating(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
+        self.complete_runtime_batch_inner(pool, claimed, AttemptLocks::Try)
+            .await
+    }
+
+    async fn complete_runtime_batch_inner(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+        locks: AttemptLocks,
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
         if claimed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RuntimeBatchCompletion::default());
         }
 
         if self.lease_claim_receipts() && claimed.iter().all(Self::receipt_fast_complete_candidate)
         {
-            let mut updated = self
-                .complete_receipt_runtime_batch_fast(pool, claimed)
+            let mut outcome = self
+                .complete_receipt_runtime_batch_fast(pool, claimed, locks)
                 .await?;
-            if updated.len() == claimed.len() {
-                return Ok(updated);
+            if outcome.updated.len() + outcome.contended.len() == claimed.len() {
+                return Ok(outcome);
             }
 
-            let updated_pairs: BTreeSet<(i64, i64)> = updated.iter().copied().collect();
+            let settled: BTreeSet<(i64, i64)> = outcome
+                .updated
+                .iter()
+                .chain(outcome.contended.iter())
+                .copied()
+                .collect();
             let missed: Vec<_> = claimed
                 .iter()
-                .filter(|entry| !updated_pairs.contains(&(entry.job.id, entry.job.run_lease)))
+                .filter(|entry| !settled.contains(&(entry.job.id, entry.job.run_lease)))
                 .cloned()
                 .collect();
             if !missed.is_empty() {
-                updated.extend(self.complete_runtime_batch_slow(pool, &missed).await?);
+                let slow = self.complete_runtime_batch_slow(pool, &missed, locks).await?;
+                outcome.updated.extend(slow.updated);
+                outcome.contended.extend(slow.contended);
             }
-            return Ok(updated);
+            return Ok(outcome);
         }
 
-        self.complete_runtime_batch_slow(pool, claimed).await
+        self.complete_runtime_batch_slow(pool, claimed, locks).await
     }
 
     async fn complete_runtime_batch_slow(
         &self,
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
-    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        locks: AttemptLocks,
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let result = self
-            .complete_runtime_batch_slow_in_tx(&mut tx, claimed)
+        // With `Try`, the attempts this transaction could lock stay locked to
+        // commit; the slow path's own `lock_receipt_attempts_tx` then takes
+        // them again, which does not wait on this transaction's own locks.
+        let (claimed, contended) = match locks {
+            AttemptLocks::Wait => (claimed.to_vec(), Vec::new()),
+            AttemptLocks::Try if self.lease_claim_receipts() => {
+                self.try_lock_runtime_attempts_tx(&mut tx, claimed).await?
+            }
+            AttemptLocks::Try => (claimed.to_vec(), Vec::new()),
+        };
+        let updated = self
+            .complete_runtime_batch_slow_in_tx(&mut tx, &claimed)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(result)
+        Ok(RuntimeBatchCompletion { updated, contended })
+    }
+
+    /// Try to take the completion lock of each attempt in `claimed` without
+    /// waiting. Returns the attempts this transaction now holds and the
+    /// `(job_id, run_lease)` pairs another transaction holds.
+    async fn try_lock_runtime_attempts_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<(Vec<ClaimedRuntimeJob>, Vec<(i64, i64)>), AwaError> {
+        let pairs: Vec<(i64, i64)> = claimed
+            .iter()
+            .map(|entry| (entry.job.id, entry.job.run_lease))
+            .collect();
+        let acquired: BTreeSet<(i64, i64)> = self
+            .try_lock_receipt_attempt_keys_tx(tx, &pairs)
+            .await?
+            .into_iter()
+            .collect();
+        let contended: BTreeSet<(i64, i64)> = pairs
+            .iter()
+            .filter(|pair| !acquired.contains(pair))
+            .copied()
+            .collect();
+        if contended.is_empty() {
+            return Ok((claimed.to_vec(), Vec::new()));
+        }
+        let held = claimed
+            .iter()
+            .filter(|entry| !contended.contains(&(entry.job.id, entry.job.run_lease)))
+            .cloned()
+            .collect();
+        Ok((held, contended.into_iter().collect()))
     }
 
     /// Same as [`Self::complete_runtime_batch_slow`] but runs on the caller's
