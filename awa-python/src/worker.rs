@@ -24,15 +24,33 @@ pub struct PythonWorker {
     handler: Py<PyAny>,
     args_type: Py<PyAny>,
     task_locals: pyo3_async_runtimes::TaskLocals,
+    handler_registry: Py<PyAny>,
+}
+
+/// Dropping the SDK's result receiver does not cancel its asyncio task. Keep
+/// cancellation ownership alongside that receiver for every executor exit path.
+struct HandlerCancellation(Option<Py<PyAny>>);
+
+impl Drop for HandlerCancellation {
+    fn drop(&mut self) {
+        if let Some(handler_task) = self.0.take() {
+            // Do not attach to a finalizing interpreter. A closed event loop or
+            // a failed cancellation callback must never panic a Rust destructor.
+            Python::try_attach(|py| {
+                let _ = handler_task.call_method0(py, "cancel");
+            });
+        }
+    }
 }
 
 impl PythonWorker {
-    pub fn from_entry(entry: &WorkerEntry) -> Self {
+    pub fn from_entry(entry: &WorkerEntry, handler_registry: &Py<PyAny>) -> Self {
         Python::attach(|py| Self {
             kind: Box::leak(entry.kind.clone().into_boxed_str()),
             handler: entry.handler.clone_ref(py),
             args_type: entry.args_type.clone_ref(py),
             task_locals: entry.task_locals.clone(),
+            handler_registry: handler_registry.clone_ref(py),
         })
     }
 }
@@ -50,15 +68,23 @@ impl Worker for PythonWorker {
         let py_job = Python::attach(|py| build_dispatch_job(py, ctx.job.clone(), &args_type, ctx))
             .map_err(|err| classify_python_error(err, true))?;
 
-        let future = Python::attach(|py| {
+        let (future, mut cancellation) = Python::attach(|py| {
+            let owner_type = py.import("awa._handler_task")?.getattr("HandlerTask")?;
             let coro = handler.call1(py, (py_job,))?;
-            pyo3_async_runtimes::into_future_with_locals(&task_locals, coro.into_bound(py))
+            let owner = owner_type.call1((
+                coro,
+                task_locals.event_loop(py),
+                self.handler_registry.bind(py),
+            ))?;
+            let cancellation = HandlerCancellation(Some(owner.clone().unbind()));
+            let future = pyo3_async_runtimes::into_future_with_locals(&task_locals, owner)?;
+            Ok::<_, PyErr>((future, cancellation))
         })
         .map_err(|err| classify_python_error(err, true))?;
 
-        let value = future
-            .await
-            .map_err(|err| classify_python_error(err, false))?;
+        let result = future.await;
+        cancellation.0 = None;
+        let value = result.map_err(|err| classify_python_error(err, false))?;
 
         classify_handler_result(value).map_err(|err| classify_python_error(err, true))
     }
