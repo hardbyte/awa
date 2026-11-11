@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -3171,6 +3170,12 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Histogram (s)</td>
 <td>state</td>
 <td>Promotion time</td>
+</tr>
+<tr>
+<td><code>awa.maintenance.promote.lane_contention</code></td>
+<td>Counter</td>
+<td>state, queue, outcome</td>
+<td>Promotion lanes whose lock was busy: <code>handed_off</code> to a dedicated waiter, <code>waiter_limit</code> when every waiter was busy, <code>waiter_timed_out</code> when a waiter's 30 s wait ran out</td>
 </tr>
 <tr>
 <td><code>awa.maintenance.rescues</code></td>

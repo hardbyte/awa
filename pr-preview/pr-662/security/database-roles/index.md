@@ -67,7 +67,7 @@ If an existing installation created objects as `awa_migrator` without first sett
 
 ## Lane sequences
 
-Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. From schema v053 they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard.
+Each queue lane, `(queue, priority, enqueue_shard)`, has an enqueue and a claim sequence. From schema v053 they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call `provision_lane` and `provision_lane_sequences` in the queue-storage schema. These are `SECURITY DEFINER` functions owned by the schema owner with a pinned `search_path`. Like the other runtime-callable functions they are executable by `PUBLIC`, so schema `USAGE` is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime therefore needs neither schema `CREATE` nor default privileges to start using a new queue, priority or shard. Their inserts into `queue_lanes`, `queue_enqueue_heads` and `queue_claim_heads` fire those tables' triggers as the schema owner, so don't grant `TRIGGER` on them to any other role.
 
 A new lane sequence gets the privileges of the head table it backs. A role that may `INSERT` or `UPDATE` `queue_enqueue_heads` gets `USAGE, SELECT, UPDATE` on the enqueue sequences, and one that may only `SELECT` it gets `SELECT`; `queue_claim_heads` does the same for the claim sequences. Granting the runtime the table privileges above is enough, and no sequence default privileges are needed for lanes.
 
@@ -125,6 +125,10 @@ Without the CLI, repair one sequence per transaction from `psql` in autocommit m
 SELECT format('SELECT * FROM awa.repair_lane_sequence(%L, %L)', 'awa', sequence_name)
 FROM awa.lane_sequence_problems('awa') \gexec
 ```
+
+## Claim batch index
+
+From schema v054 each queue-storage schema has `ensure_claim_batch_job_index(slot)`. Claim prune calls it right after truncating a claim slot to give that `lease_claim_batches` partition its GIN index on `job_ids`. It is `SECURITY DEFINER`, owned by the owner of `lease_claim_batches` (creating an index needs table ownership), with a pinned `search_path`. It only creates that one index, and only on a partition that is empty and unlocked. `PUBLIC` cannot execute it. Each time the migration or installer runs, `EXECUTE` is reset to exactly the roles that then hold `TRUNCATE` on `lease_claim_batches`: a runtime role given `TRUNCATE` later gets it on the next run (or from `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA` above until then), and a role that has lost `TRUNCATE` loses it. A runtime that cannot execute it skips the step and claims keep working.
 
 ## Custom queue-storage schemas
 

@@ -1,6 +1,6 @@
 > For the complete AWA documentation index, see [`llms.txt`](../../llms.txt).
 
-# ADR-051: Scoped runtime controls
+# ADR-052: Scoped runtime controls
 
 ## Status
 

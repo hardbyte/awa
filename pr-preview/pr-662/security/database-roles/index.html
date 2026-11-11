@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -1732,6 +1731,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#claim-batch-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Claim batch index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-queue-storage-schemas" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2301,6 +2311,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#claim-batch-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Claim batch index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-queue-storage-schemas" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2406,7 +2427,7 @@
 </span></code></pre></div>
 <p>If an existing installation created objects as <code>awa_migrator</code> without first setting the owner role, transfer every existing schema object to <code>awa_owner</code> before relying on owner-scoped defaults. New migrations should use the effective-role command above.</p>
 <h2 id="lane-sequences">Lane sequences<a class="headerlink" href="#lane-sequences" title="Permanent link">&para;</a></h2>
-<p>Each queue lane, <code>(queue, priority, enqueue_shard)</code>, has an enqueue and a claim sequence. From schema v053 they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call <code>provision_lane</code> and <code>provision_lane_sequences</code> in the queue-storage schema. These are <code>SECURITY DEFINER</code> functions owned by the schema owner with a pinned <code>search_path</code>. Like the other runtime-callable functions they are executable by <code>PUBLIC</code>, so schema <code>USAGE</code> is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime therefore needs neither schema <code>CREATE</code> nor default privileges to start using a new queue, priority or shard.</p>
+<p>Each queue lane, <code>(queue, priority, enqueue_shard)</code>, has an enqueue and a claim sequence. From schema v053 they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call <code>provision_lane</code> and <code>provision_lane_sequences</code> in the queue-storage schema. These are <code>SECURITY DEFINER</code> functions owned by the schema owner with a pinned <code>search_path</code>. Like the other runtime-callable functions they are executable by <code>PUBLIC</code>, so schema <code>USAGE</code> is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime therefore needs neither schema <code>CREATE</code> nor default privileges to start using a new queue, priority or shard. Their inserts into <code>queue_lanes</code>, <code>queue_enqueue_heads</code> and <code>queue_claim_heads</code> fire those tables' triggers as the schema owner, so don't grant <code>TRIGGER</code> on them to any other role.</p>
 <p>A new lane sequence gets the privileges of the head table it backs. A role that may <code>INSERT</code> or <code>UPDATE</code> <code>queue_enqueue_heads</code> gets <code>USAGE, SELECT, UPDATE</code> on the enqueue sequences, and one that may only <code>SELECT</code> it gets <code>SELECT</code>; <code>queue_claim_heads</code> does the same for the claim sequences. Granting the runtime the table privileges above is enough, and no sequence default privileges are needed for lanes.</p>
 <p>Run migrations with the schema owner as the effective role, as above, so the provisioning functions belong to it. A migrator that cannot <code>SET ROLE</code> to the owner leaves them owned by itself and the migration warns.</p>
 <p><code>awa storage prepare-queue</code> still creates every priority and shard of a queue in one transaction, and any runtime role may run it. Use it to create lanes before a deploy rather than on first use.</p>
@@ -2443,6 +2464,8 @@
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">format</span><span class="p">(</span><span class="s1">'SELECT * FROM awa.repair_lane_sequence(%L, %L)'</span><span class="p">,</span><span class="w"> </span><span class="s1">'awa'</span><span class="p">,</span><span class="w"> </span><span class="n">sequence_name</span><span class="p">)</span>
 </span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">)</span><span class="w"> </span><span class="err">\</span><span class="n">gexec</span>
 </span></code></pre></div>
+<h2 id="claim-batch-index">Claim batch index<a class="headerlink" href="#claim-batch-index" title="Permanent link">&para;</a></h2>
+<p>From schema v054 each queue-storage schema has <code>ensure_claim_batch_job_index(slot)</code>. Claim prune calls it right after truncating a claim slot to give that <code>lease_claim_batches</code> partition its GIN index on <code>job_ids</code>. It is <code>SECURITY DEFINER</code>, owned by the owner of <code>lease_claim_batches</code> (creating an index needs table ownership), with a pinned <code>search_path</code>. It only creates that one index, and only on a partition that is empty and unlocked. <code>PUBLIC</code> cannot execute it. Each time the migration or installer runs, <code>EXECUTE</code> is reset to exactly the roles that then hold <code>TRUNCATE</code> on <code>lease_claim_batches</code>: a runtime role given <code>TRUNCATE</code> later gets it on the next run (or from <code>GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA</code> above until then), and a role that has lost <code>TRUNCATE</code> loses it. A runtime that cannot execute it skips the step and claims keep working.</p>
 <h2 id="custom-queue-storage-schemas">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas" title="Permanent link">&para;</a></h2>
 <p>Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and <code>TRUNCATE</code>, but never DDL. Check lanes in a custom schema with <code>awa storage lane-sequences --schema &lt;name&gt;</code>. See <a href="../../queue-storage-substrate/">Queue storage</a>.</p>
 <h2 id="why-the-grants-are-broad">Why the grants are broad<a class="headerlink" href="#why-the-grants-are-broad" title="Permanent link">&para;</a></h2>

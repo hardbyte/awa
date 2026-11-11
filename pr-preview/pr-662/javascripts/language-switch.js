@@ -31,10 +31,13 @@
     );
   }
 
+  // A label click focuses its input, which scrolls that tab set into view.
   function selectTabs(language) {
     languageTabs()
       .filter((label) => label.textContent.trim().toLowerCase() === language)
-      .forEach((label) => label.click());
+      .map((label) => document.getElementById(label.htmlFor))
+      .filter((input) => input && !input.checked)
+      .forEach((input) => input.click());
   }
 
   function updateButtons(language) {

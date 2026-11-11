@@ -109,8 +109,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -2110,6 +2109,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#scope-revision-2026-11-03" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scope revision (2026-11-03)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#1-theme-and-thesis" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2371,13 +2381,82 @@
 
 <h1 id="awa-07-design-roadmap">Awa 0.7 — Design &amp; Roadmap<a class="headerlink" href="#awa-07-design-roadmap" title="Permanent link">&para;</a></h1>
 <blockquote>
-<p><strong>Status:</strong> Proposed. This is the design document for the 0.7 release cycle: strategic
-decisions, workstreams, fully-scoped issues (existing and new), experiments with decision
-rules, milestones, and release gates. Companion context: <a href="https://github.com/hardbyte/awa/blob/main/docs/0.7-planning-brief.md">0.7 planning brief</a>
+<p><strong>Status:</strong> Proposed; scope revised 2026-11-03 (below). Live release state, gate
+checklists and the gap map are in <a href="https://github.com/hardbyte/awa/issues/383">#383</a>; where they
+differ from this document, #383 is current. Companion context: <a href="https://github.com/hardbyte/awa/blob/main/docs/0.7-planning-brief.md">0.7 planning brief</a>
 (0.6 recap, open-issue inventory, the #169 hot-row chronology, and the #197 process template).
 No timeline, effort, or cost assumptions are made; sequencing is expressed as dependencies
 and gates, not dates.</p>
 </blockquote>
+<h2 id="scope-revision-2026-11-03">Scope revision (2026-11-03)<a class="headerlink" href="#scope-revision-2026-11-03" title="Permanent link">&para;</a></h2>
+<p>0.7 ships the storage and claim-path work already on <code>main</code> (migrations v041 onward) plus three
+themes from this document: <strong>operations</strong> (WS-3, D3, D5), <strong>observability</strong> (WS-4) and
+<strong>tracing</strong> (D8). Workstream WS-5 and the remaining unstarted issues move to 0.8:</p>
+<table>
+<thead>
+<tr>
+<th>Moved to 0.8</th>
+<th>Was</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>#14 job dependencies</td>
+<td>M4, D7</td>
+</tr>
+<tr>
+<td>#340 per-key execution control</td>
+<td>M4, D4</td>
+</tr>
+<tr>
+<td>#341 backpressure</td>
+<td>M4</td>
+</tr>
+<tr>
+<td>#342 SQL producer contract</td>
+<td>M4, D6. The SQL enqueue functions are not a stable surface in 0.7.</td>
+</tr>
+<tr>
+<td>#401 transactional completion</td>
+<td>M4</td>
+</tr>
+<tr>
+<td>#118 serverless <code>tick()</code></td>
+<td>M2</td>
+</tr>
+<tr>
+<td>#295 segment-engine RFC</td>
+<td>M5. Gate A kept the incremental queue-storage design.</td>
+</tr>
+<tr>
+<td>#303 maintenance task split, #418 fragmented-backlog drain</td>
+<td>M5 / evidence track</td>
+</tr>
+<tr>
+<td>#360 residual triage</td>
+<td>M0. The harness core (#362) and its <code>queue_storage</code> CI leg stay in 0.7 and already run green; only triage of leftover canonical-only test artifacts moves, and nothing in M0 depends on it.</td>
+</tr>
+<tr>
+<td>#377 versioned docs site, #385 hot reload</td>
+<td>WS-6 / not scheduled</td>
+</tr>
+</tbody>
+</table>
+<p>Consequences for the sections below:</p>
+<ul>
+<li><strong>M2</strong> keeps #282, #343, #344, #372, #373 and #374, and adds #424 (<code>awa queue await-drain</code>).
+  The tick()-only demo leaves its exit criterion.</li>
+<li><strong>M3</strong> keeps its exit criterion. Rust and Python propagation shipped (ADR-039); what remains is
+  a Python retry trace-link test and the #375 timeline. #376 alerts and #391 join M3.</li>
+<li><strong>M4 and M5</strong> move to 0.8. Their ADRs (033, 034, 035, 042) stay Proposed. M6's beta no longer
+  waits on them.</li>
+<li><strong>§7 gates.</strong> Gate 1 drops the dependency-promotion and claim-time key-gating models. Gate 2
+  drops the ≥9k jobs/s partitioned preset and adds <code>claim_ready_runtime</code> p99 on the release
+  candidate. Gate 3's 14 consecutive green runs count runs of the chaos workflow, which runs
+  weekly since #500; #383 tracks how the window is run before RC. Gate 5 drops the SQL contract
+  and the versioned docs site.</li>
+<li><strong>§10</strong> dispositions for the moved issues are superseded by the table above.</li>
+</ul>
 <hr />
 <h2 id="1-theme-and-thesis">1. Theme and thesis<a class="headerlink" href="#1-theme-and-thesis" title="Permanent link">&para;</a></h2>
 <p><strong>0.6 was the storage release</strong> — it made the substrate honest: bounded degradation under
@@ -2896,12 +2975,12 @@ named.
 <em>Exit:</em> Gate A recorded with data; every 0.7 ADR in review or accepted; #246 has a fix plan or a
 closure with evidence.</p>
 <p><strong>M2 — Deployment shapes.</strong>
-Issues #282, #372 (ADR-027/028 → Accepted), #118, #343, #373, #374, and #344 (last — consumes
+Issues #282, #372 (ADR-027/028 → Accepted), #343, #373, #374, #424, and #344 (last — consumes
 all of the above).
 <em>Exit:</em> the four-surface reference topology (private admin, public signed callbacks, workers,
-maintenance-only) installable from the Helm chart with kind smoke in CI; tick()-only demo green.</p>
+maintenance-only) installable from the Helm chart with kind smoke in CI.</p>
 <p><strong>M3 — Observability.</strong>
-Issue #110 (Rust path → Python boundary), the E8 gate, #375, and #376.
+Issue #110 (Rust path → Python boundary), the E8 gate, #375, #376 and #391.
 <em>Exit:</em> a job enqueued in a traced FastAPI request shows one connected trace through a Python
 worker retry to completion; UI attempt timeline links to it.</p>
 <p><strong>M4 — Flow &amp; tenancy.</strong>
@@ -2915,13 +2994,17 @@ the Gate-A restructuring migrations with TLA+ deltas and a fresh long-horizon ac
 the raised bar.
 <em>Exit:</em> §7 performance gate numbers hold on clean main.</p>
 <p><strong>M6 — Release train.</strong>
-<code>0.7.0-beta.1</code> when M0+M2+M3 are done and M4/M5 are merge-complete (judgment-call gates resolve
+<code>0.7.0-beta.1</code> when M0+M2+M3 are done (M4 and M5 moved to 0.8 and do not gate it; judgment-call gates resolve
 under beta exposure, per the 0.6 precedent). RC when every §7 gate is green. Stable when the
 tracker checklist is fully checked, release notes carry caveated evidence (not universal
 claims), and publish mechanics (crates in dependency order, wheels, chart OCI push, Docker,
 GitHub release) are green.</p>
 <hr />
 <h2 id="7-release-gates-for-070-stable">7. Release gates for 0.7.0 stable<a class="headerlink" href="#7-release-gates-for-070-stable" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p>The scope revision changes Gates 1, 2, 3 and 5 (see the top of this document). The list below
+is the original baseline; #383 holds the current checklist.</p>
+</blockquote>
 <p>The #383 tracker opens with these as live checklists (the #197 template, six gates):</p>
 <ol>
 <li><strong>Correctness.</strong> TLA+ green including new models: dependency promotion race (ADR-034),
