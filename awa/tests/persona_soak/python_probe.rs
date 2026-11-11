@@ -214,6 +214,12 @@ mod tests {
         evidence.observe(Phase::Migrating, Ok(migrating));
         tx.commit().await.unwrap();
         evidence.observe(Phase::Ready, sessions(&observer, &application).await);
+        // The commit hands the connection back to the pool on a spawned task.
+        // If that task is still testing the connection when `close` runs,
+        // `close` waits for it but returns without closing the connection it
+        // then puts on the idle queue, which stays open while the pool lives.
+        // The second `close` closes it.
+        client.close().await;
         client.close().await;
         evidence.record_exit(Phase::Closed, true);
         // An acknowledged close can precede the server removing its backend.
