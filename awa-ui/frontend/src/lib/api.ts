@@ -66,6 +66,8 @@ export interface QueueOverview extends DescriptorFields {
   total_queued: number;
   scheduled: number;
   available: number;
+  /** Absent on servers that predate the exact-count limit. */
+  available_is_estimate?: boolean;
   retryable: number;
   running: number;
   failed: number;

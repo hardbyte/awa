@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
+import { AvailableCount } from "@/components/AvailableCount";
 import { timeAgo } from "@/lib/time";
 import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
 import { usePollInterval } from "@/hooks/use-poll-interval";
@@ -160,7 +161,13 @@ export function DashboardPage() {
                     {statsQuery.isLoading ? (
                       <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
                     ) : (
-                      (count ?? 0).toLocaleString()
+                      <AvailableCount
+                        count={count ?? 0}
+                        isEstimate={
+                          key === "available" &&
+                          queuesQuery.data?.some((q) => q.available_is_estimate)
+                        }
+                      />
                     )}
                   </div>
                   <div className="mt-1.5 flex items-center justify-center gap-2">
@@ -459,7 +466,7 @@ export function DashboardPage() {
                         {q.scheduled.toLocaleString()}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
-                        {q.available.toLocaleString()}
+                        <AvailableCount count={q.available} isEstimate={q.available_is_estimate} />
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {q.retryable.toLocaleString()}

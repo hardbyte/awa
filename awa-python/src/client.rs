@@ -326,6 +326,8 @@ pub struct PyQueueStat {
     #[pyo3(get)]
     pub available: i64,
     #[pyo3(get)]
+    pub available_is_estimate: bool,
+    #[pyo3(get)]
     pub retryable: i64,
     #[pyo3(get)]
     pub running: i64,
@@ -1233,6 +1235,7 @@ impl PyClient {
                             total_queued: stat.total_queued,
                             scheduled: stat.scheduled,
                             available: stat.available,
+                            available_is_estimate: stat.available_is_estimate,
                             retryable: stat.retryable,
                             running: stat.running,
                             failed: stat.failed,
@@ -2825,6 +2828,7 @@ impl PyClient {
                         total_queued: s.total_queued,
                         scheduled: s.scheduled,
                         available: s.available,
+                        available_is_estimate: s.available_is_estimate,
                         retryable: s.retryable,
                         running: s.running,
                         failed: s.failed,
