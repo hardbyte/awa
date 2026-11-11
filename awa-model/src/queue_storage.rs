@@ -619,6 +619,15 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
+/// A lock timeout, or a deadlock in which the prune was the victim.
+fn is_prune_contention_error(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db_err)
+            if matches!(db_err.code().as_deref(), Some("55P03" | "40P01"))
+    )
+}
+
 async fn set_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     timeout: Duration,
@@ -633,15 +642,75 @@ async fn set_lock_timeout_tx(
     Ok(())
 }
 
+/// The longest single wait for prune's `ACCESS EXCLUSIVE` upgrade when the
+/// prune lock timeout is shorter than this.
+const PRUNE_LOCK_UPGRADE_CEILING: Duration = Duration::from_millis(320);
+
+/// Partitions of a queue ring slot that queue prune locks in one statement.
+const QUEUE_PRUNE_LOCKED_PARTITIONS: u32 = 8;
+
+/// The longest single wait of [`acquire_prune_exclusive_lock_tx`] for `base`.
+fn prune_lock_upgrade_ceiling(base: Duration) -> Duration {
+    base.max(PRUNE_LOCK_UPGRADE_CEILING)
+}
+
+/// Take `ACCESS EXCLUSIVE` on `tables` for a prune's truncate.
+///
+/// A pending `ACCESS EXCLUSIVE` request stalls every new reader of the
+/// tables, so each attempt waits a bounded time and then lets the readers
+/// through before the next, longer attempt. The first attempt waits `base`
+/// and each later one twice as long, up to [`prune_lock_upgrade_ceiling`].
+/// A deadlock reported for the request counts as contention: PostgreSQL
+/// raises it at once when a transaction that already reads one of the tables
+/// is waiting to write a table the prune holds in `SHARE ROW EXCLUSIVE`. The
+/// last failure is returned, and `lock_timeout` is back at `base` on success.
+async fn acquire_prune_exclusive_lock_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tables: &str,
+    base: Duration,
+) -> Result<(), AwaError> {
+    let ceiling = prune_lock_upgrade_ceiling(base);
+    let mut timeout = base;
+    loop {
+        sqlx::query("SAVEPOINT awa_prune_lock_upgrade")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(tx, timeout).await?;
+        let locked = sqlx::query(&format!("LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"))
+            .execute(tx.as_mut())
+            .await;
+        match locked {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT awa_prune_lock_upgrade")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return set_lock_timeout_tx(tx, base).await;
+            }
+            Err(err) if is_prune_contention_error(&err) && timeout < ceiling => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_lock_upgrade")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                tokio::time::sleep(base).await;
+                timeout = timeout.saturating_mul(2).min(ceiling);
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        }
+    }
+}
+
 /// Commit or roll back a maintenance transaction that has set the prune
 /// `lock_timeout`.
 ///
 /// The timeout applies to every later statement in the transaction, not only
 /// the explicit `LOCK TABLE`: an insert, update or read of another relation can
 /// also queue behind a conflicting lock (autovacuum's heap truncation takes
-/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere therefore rolls the
-/// whole transaction back and reports `blocked`, so the caller backs off and
-/// retries instead of surfacing an error.
+/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere, or a deadlock
+/// that PostgreSQL resolves by cancelling the prune, therefore rolls the whole
+/// transaction back and reports `blocked`, so the caller backs off and retries
+/// instead of surfacing an error.
 async fn settle_prune_tx<T>(
     tx: sqlx::Transaction<'_, Postgres>,
     result: Result<T, AwaError>,
@@ -655,7 +724,7 @@ async fn settle_prune_tx<T>(
         Err(err) => {
             let _ = tx.rollback().await;
             match err {
-                AwaError::Database(ref db_err) if is_lock_contention_error(db_err) => Ok(blocked),
+                AwaError::Database(ref db_err) if is_prune_contention_error(db_err) => Ok(blocked),
                 err => Err(err),
             }
         }
@@ -3165,6 +3234,29 @@ impl QueueStorage {
     /// The `lock_timeout` applied to prune's exclusive-lock steps.
     pub fn prune_lock_timeout(&self) -> Duration {
         self.prune_lock_timeout
+    }
+
+    /// The longest single lock wait of a prune.
+    ///
+    /// Queue and claim prune first wait [`Self::prune_lock_timeout`] for the
+    /// `ACCESS EXCLUSIVE` lock they truncate under, then retry with twice the
+    /// wait each time up to this value before reporting
+    /// [`PruneOutcome::Blocked`]. It is 320 ms, or the prune lock timeout
+    /// when that is longer.
+    pub fn prune_lock_wait_ceiling(&self) -> Duration {
+        prune_lock_upgrade_ceiling(self.prune_lock_timeout)
+    }
+
+    /// The longest a single prune lock statement can wait.
+    ///
+    /// `lock_timeout` applies to each relation a `LOCK TABLE` statement
+    /// acquires, and queue prune locks eight partitions in one statement, so
+    /// the statement can wait eight times [`Self::prune_lock_wait_ceiling`].
+    /// A `statement_timeout` at or below this can cancel the prune before
+    /// its lock timeout fires.
+    pub fn prune_lock_statement_wait_ceiling(&self) -> Duration {
+        self.prune_lock_wait_ceiling()
+            .saturating_mul(QUEUE_PRUNE_LOCKED_PARTITIONS)
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
@@ -18177,16 +18269,34 @@ impl QueueStorage {
         let locked: Result<PruneOutcome, AwaError> = async {
             set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+            // Locks are requested in this order, and a statement that holds
+            // a later child while it waits behind the request for an earlier
+            // one deadlocks with prune until the lock timeout. Claims take
+            // the segment child first, and retry, fail and snooze take the
+            // done child before the ready child.
+            let slot_children = format!(
+                "{segment_child}, {done_child}, {ready_child}, {claim_attempt_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
+            );
+            // SHARE ROW EXCLUSIVE waits for every transaction that has
+            // written to this slot and blocks new writers, while claims,
+            // completions and admin reads keep reading the sealed children.
+            // The gates and the scans below can therefore take as long as
+            // the slot needs without stalling traffic; ACCESS EXCLUSIVE is
+            // only requested once the truncate is the next statement.
             sqlx::query(&format!(
-                "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
+                "LOCK TABLE {slot_children} IN SHARE ROW EXCLUSIVE MODE"
             ))
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+            sqlx::query("SAVEPOINT awa_prune_slot_frozen")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
 
-            // The pre-lock gates are only an MVCC snapshot. If an in-flight
-            // producer or claimer committed while the exclusive partition
-            // lock waited, these post-lock gates see it before TRUNCATE.
+            // The pre-lock gates are only an MVCC snapshot. Writers that
+            // touched the slot have committed by the time the lock is
+            // granted, so these gates see them.
             let active_leases =
                 queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
             if active_leases {
@@ -18412,9 +18522,37 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            sqlx::query(&format!(
-                "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
-            ))
+            acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout).await?;
+
+            // A receipt claim inserts its attempt batch into this slot, so
+            // it cannot have started after the slot was frozen, and closures
+            // only accumulate: the claim-reference proof above still holds.
+            // A claim that writes a lease directly touches no child of the
+            // slot, and one that read its ready row before the freeze can
+            // commit until the upgrade is granted. These two gates see it.
+            let active_leases =
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+            let pending = !active_leases
+                && queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation)
+                    .await?;
+            if active_leases || pending {
+                // Drops the carried failed rows along with the slot locks.
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_slot_frozen")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: if active_leases {
+                        SkipReason::QueueActiveLeases
+                    } else {
+                        SkipReason::QueuePendingReady
+                    },
+                    count: busy_indicator(true),
+                });
+            }
+
+            sqlx::query(&format!("TRUNCATE TABLE {slot_children}"))
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -18743,13 +18881,16 @@ impl QueueStorage {
             return Ok(PruneOutcome::Noop);
         };
 
-        // Lock the slot row so concurrent rotate/prune observe the same
-        // state machine transition.
+        // The ring state row locked above already serializes rotate and
+        // prune. The slot row is only read here: rescue takes its table
+        // locks on the slot's partitions and then locks this row for its
+        // cursor, so holding the row while waiting for ACCESS EXCLUSIVE on
+        // those partitions would deadlock with every rescue of the slot.
+        // Prune locks the row once it holds the partitions.
         let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
             r#"
             SELECT slot FROM {schema}.claim_ring_slots
             WHERE slot = $1
-            FOR UPDATE
             "#
         ))
         .bind(slot)
@@ -18819,17 +18960,26 @@ impl QueueStorage {
         let locked: Result<PruneOutcome, AwaError> = async {
             set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+            let slot_children = format!(
+                "{claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
+            );
+            // Heartbeat, retry, fail and snooze read `lease_claims` and then
+            // update it in the same transaction. A weaker lock held across
+            // the proof below would let them read and then block their
+            // update, and the request for ACCESS EXCLUSIVE would deadlock
+            // with every one of them. Claim prune therefore takes
+            // ACCESS EXCLUSIVE before the proof.
+            acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout)
+                .await?;
+
             sqlx::query(&format!(
-                "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
+                "SELECT slot FROM {schema}.claim_ring_slots WHERE slot = $1 FOR UPDATE"
             ))
+            .bind(slot)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
-            // After taking ACCESS EXCLUSIVE, recheck that the slot is still
-            // not the current one. The ring-state lock should already make
-            // this stable, but keeping the explicit gate documents the
-            // truncate precondition.
             let current_slot: i32 = sqlx::query_scalar(&format!(
                 r#"
                 SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
@@ -18864,11 +19014,9 @@ impl QueueStorage {
                 });
             }
 
-            sqlx::query(&format!(
-                "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
-            ))
-            .execute(tx.as_mut())
-            .await
+            sqlx::query(&format!("TRUNCATE TABLE {slot_children}"))
+                .execute(tx.as_mut())
+                .await
                 .map_err(map_sqlx_error)?;
             self.ensure_claim_batch_job_index_tx(&mut tx, slot).await?;
             sqlx::query(&format!(

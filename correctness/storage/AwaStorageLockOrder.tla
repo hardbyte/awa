@@ -351,13 +351,16 @@ CloseReceiptPlan(claimSlot) ==
 \*   UPDATE claim_ring_slots[slot] rescue cursor
 \* The leases anti-join takes AccessShare on the leases
 \* parent so rescue can race against prune_oldest_leases.
+\* PostgreSQL takes every relation lock of a statement when it plans it,
+\* before the executor takes any row lock. The cursor row's FOR UPDATE is
+\* written first in the statement but is therefore acquired last.
 RescueReceiptsPlan(claimSlot) ==
-    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
-       Step(ClaimChildResource(claimSlot), ModeShared),
+    << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClaimBatchChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared),
-       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
+       Step(ClaimRingSlotResource(claimSlot), ModeExclusive) >>
 
 \* rescue_expired_receipt_deadlines_tx
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
@@ -370,11 +373,11 @@ RescueReceiptsPlan(claimSlot) ==
 \* Same resource order as stale receipt rescue; only the index order and
 \* advancement predicate differ.
 RescueReceiptDeadlinesPlan(claimSlot) ==
-    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
-       Step(ClaimChildResource(claimSlot), ModeShared),
+    << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared),
-       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
+       Step(ClaimRingSlotResource(claimSlot), ModeExclusive) >>
 
 \* ensure_running_leases_from_receipts_tx
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
@@ -492,11 +495,11 @@ PruneReadyPlan(slot) ==
        Step(ClosureProofResource, ModeShared),
        Step(ClosureBatchProofResource, ModeShared),
        Step(ReadyChildResource(slot), ModeShared),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
+       Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyChildResource(slot), ModeExclusive),
        Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
-       Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyTombstoneChildResource(slot), ModeExclusive),
-       Step(ReadySegmentChildResource(slot), ModeExclusive),
        Step(ReceiptBatchChildResource(slot), ModeExclusive),
        Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
        Step(TerminalDeltaChildResource(slot), ModeExclusive),
@@ -536,7 +539,11 @@ RotateClaimsPlan(nextSlot) ==
 \*     models the successful truncate path after the proof has passed
 \*   TRUNCATE claim_child[slot] + claim_batch_child[slot] +
 \*     closure_child[slot] + closure_batch_child[slot]
-PruneClaimsPlan(slot) ==
+\* The slot row is locked only once the partitions are held. Rescue takes
+\* the partitions and then the slot row, so the 0.6.16 order below, slot row
+\* first, deadlocked with every rescue of the slot for as long as prune
+\* waited for the partitions.
+OldPruneClaimsPlan(slot) ==
     << Step(ClaimRingStateResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
        Step(ClaimChildResource(slot), ModeShared),
@@ -547,6 +554,18 @@ PruneClaimsPlan(slot) ==
        Step(ClaimBatchChildResource(slot), ModeExclusive),
        Step(ClosureChildResource(slot), ModeExclusive),
        Step(ClosureBatchChildResource(slot), ModeExclusive) >>
+
+PruneClaimsPlan(slot) ==
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimChildResource(slot), ModeShared),
+       Step(ClaimBatchChildResource(slot), ModeShared),
+       Step(ClosureChildResource(slot), ModeShared),
+       Step(ClosureBatchChildResource(slot), ModeShared),
+       Step(ClaimChildResource(slot), ModeExclusive),
+       Step(ClaimBatchChildResource(slot), ModeExclusive),
+       Step(ClosureChildResource(slot), ModeExclusive),
+       Step(ClosureBatchChildResource(slot), ModeExclusive),
+       Step(ClaimRingSlotResource(slot), ModeExclusive) >>
 
 VARIABLES
     heldLocks,     \* [resource -> set of <<tx, mode>>]
@@ -955,6 +974,33 @@ NextOldLaneProvisioningDeadlockDemo ==
 
 SpecOldLaneProvisioningDeadlockDemo ==
     ConfigOK /\ Init /\ [][NextOldLaneProvisioningDeadlockDemo]_vars
+
+\* ---- Historical claim-prune slot-row deadlock harness ----
+\*
+\* 0.6.16 claim prune locked the slot's `claim_ring_slots` row before the
+\* slot's partitions. Rescue holds the partitions and waits for that row
+\* while prune holds the row and waits for the partitions. TLC is expected
+\* to flag NoDeadlock on this spec.
+
+StartOldPruneClaims(t, slot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ slot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldPruneClaimsPlan(slot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+NextOldClaimPruneSlotRowDeadlockDemo ==
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartOldPruneClaims(t, cs)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldClaimPruneSlotRowDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldClaimPruneSlotRowDeadlockDemo]_vars
 
 \* ---- Invariants ----
 
