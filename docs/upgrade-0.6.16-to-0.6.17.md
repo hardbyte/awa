@@ -1,6 +1,6 @@
 # Upgrading from 0.6.16 to 0.6.17
 
-0.6.17 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Claims commit asynchronously and reuse the runtime's claimer lease, promotion and rescue run in their own maintenance loop, a runtime can opt out of maintenance leadership, and ring prune no longer runs its checks under an exclusive lock.
+0.6.17 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Claims commit asynchronously and reuse the runtime's claimer lease, promotion and rescue run in their own maintenance loop, a runtime can opt out of maintenance leadership, and queue prune no longer runs its checks under an exclusive lock.
 
 Binaries and the migration can roll in either order. One response shape changes for callers of the admin API and `admin::state_counts`.
 
@@ -34,7 +34,7 @@ Replace all `R__` files together with that set and keep previously applied `V` f
 
 ## Claims commit asynchronously
 
-This part needs no migration and applies to each runtime as it rolls. Claim transactions and the claim-cursor advance that follows them run with `synchronous_commit = off`, set with `SET LOCAL` in those transactions only. Enqueues, completions and every other transaction stay synchronous.
+This part needs no migration and applies to each queue-storage runtime as it rolls. Queue-storage claim transactions and the claim-cursor advance that follows them run with `synchronous_commit = off`, set with `SET LOCAL` in those transactions only. Enqueues, completions and every other transaction stay synchronous, and so do claims on the canonical backend, including during a storage transition.
 
 What changes:
 
@@ -42,7 +42,7 @@ What changes:
 - A worker still running a claim lost this way is not fenced by its run lease, because the job's next claim reuses it. See [architecture](architecture.md#enqueue-and-claim).
 - Throughput rises where WAL flushes were the limit. Against 0.6.16 on PostgreSQL 18 with `synchronous_commit = on`, three interleaved rounds gave 19 to 21% more jobs per second at 4, 16 and 64 workers, and end-to-end p99 at 800 jobs/s fell from 31 ms to 24 ms. PostgreSQL used about a quarter more CPU for the extra work.
 
-A claim also reuses the runtime's claimer lease for up to 250 ms instead of reading it on every call. No configuration changes either behaviour.
+A queue-storage claim also reuses the runtime's claimer lease for up to 250 ms instead of reading it on every call. No configuration changes either behaviour.
 
 ## Promotion and rescue have their own loop
 
