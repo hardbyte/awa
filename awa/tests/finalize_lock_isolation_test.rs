@@ -15,6 +15,7 @@ use ci_timing::scaled_timeout;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -61,12 +62,14 @@ async fn a_held_attempt_lock_does_not_stall_other_completions(pool: PgPool) {
     let store = QueueStorage::new(QueueStorageConfig::default()).unwrap();
 
     let gate = Arc::new(Semaphore::new(0));
+    let returned = Arc::new(AtomicBool::new(false));
     let runtime_pool = PgPoolOptions::new()
         .max_connections(20)
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
     let handler_gate = gate.clone();
+    let handler_returned = returned.clone();
     let client = Client::builder(runtime_pool)
         .queue(
             HELD_QUEUE,
@@ -86,8 +89,10 @@ async fn a_held_attempt_lock_does_not_stall_other_completions(pool: PgPool) {
         )
         .register::<GatedJob, _, _>(move |_args, _ctx| {
             let gate = handler_gate.clone();
+            let returned = handler_returned.clone();
             async move {
                 gate.acquire().await.unwrap().forget();
+                returned.store(true, Ordering::SeqCst);
                 Ok(JobResult::Completed)
             }
         })
@@ -122,24 +127,21 @@ async fn a_held_attempt_lock_does_not_stall_other_completions(pool: PgPool) {
         .await
         .expect("cancel inside the application's transaction");
 
-    // The handler returns; its completion now waits on the held lock.
+    // The handler returns; its completion cannot proceed until the
+    // application commits.
     gate.add_permits(1);
     wait_for(
-        "the held job's completion to wait on the application's lock",
+        "the gated handler to return",
         scaled_timeout(Duration::from_secs(10)),
-        || async {
-            sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM pg_locks
-                                WHERE locktype = 'advisory' AND NOT granted
-                                  AND database = (SELECT oid FROM pg_database
-                                                  WHERE datname = current_database()))",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-        },
+        || async { returned.load(Ordering::SeqCst) },
     )
     .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        state(&store, &pool, held.id).await,
+        Some(JobState::Running),
+        "the held job's completion must wait for the application's transaction"
+    );
 
     // Jobs in another queue complete while that completion waits.
     let mut bystanders = Vec::new();

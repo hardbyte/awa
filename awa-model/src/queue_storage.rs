@@ -7211,7 +7211,9 @@ impl QueueStorage {
                 .cloned()
                 .collect();
             if !missed.is_empty() {
-                let slow = self.complete_runtime_batch_slow(pool, &missed, locks).await?;
+                let slow = self
+                    .complete_runtime_batch_slow(pool, &missed, locks)
+                    .await?;
                 outcome.updated.extend(slow.updated);
                 outcome.contended.extend(slow.contended);
             }

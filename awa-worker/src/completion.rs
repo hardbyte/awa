@@ -466,9 +466,11 @@ impl CompletionWorker {
 /// so the executor retries it with backoff inside its finalization window
 /// instead of waiting on the lock while holding a connection.
 fn completion_lock_held((job_id, run_lease): (i64, i64)) -> AwaError {
-    AwaError::Database(sqlx::Error::Database(Box::new(CompletionLockHeld(format!(
-        "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
-    )))))
+    AwaError::Database(sqlx::Error::Database(Box::new(CompletionLockHeld(
+        format!(
+            "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
+        ),
+    ))))
 }
 
 #[derive(Debug)]
