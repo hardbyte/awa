@@ -1,4 +1,5 @@
 /** Typed fetch wrapper for the AWA API. */
+import { apiPath } from "./base-path";
 
 export interface JobRow {
   id: number;
@@ -325,7 +326,7 @@ export interface ListJobsParams {
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(apiPath(path), {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
@@ -575,7 +576,7 @@ export async function fetchStorage(
   options: { history?: boolean } = {}
 ): Promise<StorageStatusReport | null> {
   const qs = options.history ? "?history=true" : "";
-  const res = await fetch(`/api/storage${qs}`, {
+  const res = await fetch(apiPath(`/storage${qs}`), {
     headers: { "Content-Type": "application/json" },
   });
   if (res.status === 404) return null;

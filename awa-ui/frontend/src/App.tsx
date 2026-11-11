@@ -20,6 +20,7 @@ import { BatchOpsPage } from "./routes/batch-ops";
 import { RuntimePage } from "./routes/runtime";
 import { RuntimeInstancePage } from "./routes/runtime-detail";
 import { NotFoundPage } from "./routes/not-found";
+import { mountRewrite } from "./lib/base-path";
 
 const rootRoute = createRootRoute({
   component: Shell,
@@ -113,7 +114,7 @@ const routeTree = rootRoute.addChildren([
   batchOpsRoute,
 ]);
 
-const router = createRouter({ routeTree });
+const router = createRouter({ routeTree, rewrite: mountRewrite() });
 
 import { Toaster } from "@/components/ui/toast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";

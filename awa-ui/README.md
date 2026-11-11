@@ -4,6 +4,33 @@ Embedded web admin UI and REST API for the [Awa](https://crates.io/crates/awa) j
 
 `awa-ui` is shipped as an axum router and a static React/TypeScript bundle (built with [IntentUI](https://intentui.com) components and embedded via `rust-embed`). The CLI's `awa serve` mounts this router at `/` and `/api/*`; you can also embed it inside your own axum application.
 
+## Embedding under a path
+
+Mount the router with axum's `Router::nest`; no frontend rebuild or base-path
+configuration is needed:
+
+```rust,no_run
+# async fn example(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+let ui = awa_ui::router(pool, std::time::Duration::from_secs(5)).await?;
+let app = axum::Router::new().nest("/awa", ui);
+# Ok(())
+# }
+```
+
+The dashboard is available at `/awa`, API endpoints at `/awa/api/*`,
+and assets at `/awa/assets/*`. Navigation, opening links in a new tab, and direct
+requests to deep links such as `/awa/jobs/123` stay under the mount. Outer nested
+routers work too, for example `/admin/awa`. The host application's `/api/*` and
+`/assets/*` routes remain available for its own use. Serving the router directly
+preserves the standalone behavior. A reverse proxy must preserve the prefix when forwarding
+requests so that axum can infer it from its nesting.
+
+Axum distinguishes trailing slashes at the mount root: `nest("/awa", ui)` serves
+`/awa`, while `nest("/awa/", ui)` serves `/awa/`. The UI generates the matching
+dashboard links automatically. To accept both root forms, use
+`Router::new().nest_service("/awa", ui)` instead; assets, API and deep links work
+the same way.
+
 ## Tabs
 
 - **Dashboard** — job state counts, throughput timeseries, runtime capability summary.

@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod callback_router;
 pub mod error;
+mod frontend;
 pub mod handlers;
 pub mod pool;
 pub mod state;
@@ -14,19 +15,12 @@ pub use pool::{
 
 use std::time::Duration;
 
-use axum::http::header;
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{any, delete, get, patch, post};
 use axum::Router;
-use rust_embed::Embed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 
 use crate::state::{AppState, ReadOnlyMode};
-
-#[derive(Embed)]
-#[folder = "static/"]
-struct StaticAssets;
 
 /// Create the awa-ui router with all API routes and static file serving.
 ///
@@ -57,6 +51,9 @@ pub async fn router_with_callback_secret(
 ///   DB can write
 /// - [`ReadOnlyMode::Writable`] — force mutation endpoints on; the DB still
 ///   has the final say at query time
+///
+/// The router can be mounted with [`Router::nest`] at any path. The UI's
+/// assets, API requests and navigation automatically use that mount path.
 pub async fn router_with(
     pool: PgPool,
     cache_ttl: Duration,
@@ -151,36 +148,11 @@ pub async fn router_with(
 
     Ok(Router::new()
         .nest("/api", api)
-        .fallback(static_handler)
+        // Explicit SPA routes survive multiple outer Router::nest calls;
+        // axum does not propagate an inherited fallback through every nest.
+        .route("/", any(frontend::static_handler))
+        .route("/{*path}", any(frontend::static_handler))
+        .fallback(frontend::static_handler)
         .layer(CorsLayer::permissive())
         .with_state(state))
 }
-
-/// Serve embedded static files, falling back to index.html for SPA routing.
-async fn static_handler(uri: axum::http::Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-
-    // Try to serve the exact file
-    if let Some(file) = StaticAssets::get(path) {
-        let mime = mime_guess::from_path(path).first_or_octet_stream();
-        return ([(header::CONTENT_TYPE, mime.as_ref())], file.data.to_vec()).into_response();
-    }
-
-    // SPA fallback: serve index.html for non-API routes
-    if let Some(index) = StaticAssets::get("index.html") {
-        return Html(index.data.to_vec()).into_response();
-    }
-
-    // No frontend built — serve placeholder
-    Html(PLACEHOLDER_HTML).into_response()
-}
-
-const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head><title>AWA</title></head>
-<body>
-  <h1>AWA Job Queue</h1>
-  <p>API available at <a href="/api/stats">/api/stats</a></p>
-  <p>Frontend not built. Run <code>cd awa-ui/frontend && npm install && npm run build</code> to build the UI.</p>
-</body>
-</html>"#;
