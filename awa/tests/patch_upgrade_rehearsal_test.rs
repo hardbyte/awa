@@ -758,10 +758,12 @@ async fn released_patch_upgrade_and_rollback() {
                 "claim_batch_job_index",
                 "insert_jobs_compat_batch",
                 "prune_controls",
-                "runtime_maintenance_eligibility"
+                "runtime_maintenance_eligibility",
+                "correlated_claim_tombstones"
             ],
             "a released 0.6.15 deployment needs the claim batch index fix, the bounded-wait \
-             batch function, prune controls and the maintenance eligibility table"
+             batch function, prune controls, the maintenance eligibility table and the \
+             correlated tombstone checks"
         );
     }
 
@@ -830,7 +832,7 @@ async fn released_patch_upgrade_and_rollback() {
     if released_version == "0.6.9" {
         assert!(patch_sql.contains("R__prepared_lane_sequences"));
     } else {
-        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 4);
+        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 5);
         assert!(!patch_sql.contains("R__prepared_lane_sequences"));
         assert!(
             patch_sql.contains("R__claim_batch_job_index"),
@@ -838,6 +840,7 @@ async fn released_patch_upgrade_and_rollback() {
         );
         assert!(patch_sql.contains("R__insert_jobs_compat_batch"));
         assert!(patch_sql.contains("R__runtime_maintenance_eligibility"));
+        assert!(patch_sql.contains("R__correlated_claim_tombstones"));
     }
     assert!(
         !patch_sql.contains("-- Migration V"),
@@ -985,6 +988,7 @@ async fn released_patch_upgrade_and_rollback() {
         "Schema patch insert_jobs_compat_batch: applied".to_string(),
         "Schema patch prune_controls: applied".to_string(),
         "Schema patch runtime_maintenance_eligibility: applied".to_string(),
+        "Schema patch correlated_claim_tombstones: applied".to_string(),
         format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
     ] {
         assert!(

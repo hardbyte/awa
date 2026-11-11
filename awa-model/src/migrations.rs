@@ -397,6 +397,32 @@ macro_rules! claim_batch_job_index_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `correlated_claim_tombstones` patch: the
+/// installer, and each claim function of an installed queue-storage substrate
+/// whose tombstone check closes straight after the `lane_seq` comparison, with
+/// no `OFFSET 0` to keep it correlated.
+macro_rules! correlated_claim_tombstones_pending_sql {
+    () => {
+        "SELECT 'awa.install_queue_storage_substrate'::text AS target \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc ~ 'AND tomb[.]lane_seq = ready[.]lane_seq[[:space:]]*[)]') \
+         UNION ALL \
+         SELECT format('claim function %s.%s', n.nspname, p.proname) \
+         FROM pg_proc AS p \
+         JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+         WHERE p.prokind = 'f' \
+           AND (p.proname = 'claim_ready_runtime' OR p.proname ~ '^claim_ready_slot_[0-9]+$') \
+           AND p.prosrc ~ 'AND tomb[.]lane_seq = ready[.]lane_seq[[:space:]]*[)]' \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'ready_tombstones' \
+                         AND c.relkind = 'p')"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
@@ -412,6 +438,10 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
         "claim_batch_job_index" => {
             Some(concat!(claim_batch_job_index_pending_sql!(), " ORDER BY 1"))
         }
+        "correlated_claim_tombstones" => Some(concat!(
+            correlated_claim_tombstones_pending_sql!(),
+            " ORDER BY 1"
+        )),
         _ => None,
     }
 }
@@ -517,6 +547,23 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         sql: include_str!("../migrations/patches/runtime_maintenance_eligibility.sql"),
         applied_probe:
             "SELECT to_regclass('awa.runtime_maintenance_eligibility') IS NOT NULL",
+    },
+    SchemaPatch {
+        name: "correlated_claim_tombstones",
+        description: "Keep claim tombstone checks on indexed probes (awa 0.7 migration v056)",
+        // The v023 definitions first, so the installer writes the fenced
+        // check into new substrates; the patch then rewrites the claim
+        // functions of every installed queue-storage schema.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/correlated_claim_tombstones.sql"),
+        ),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            correlated_claim_tombstones_pending_sql!(),
+            ")"
+        ),
     },
 ];
 
