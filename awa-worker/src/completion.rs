@@ -84,12 +84,30 @@ const COMPLETE_BATCH_SQL: &str = r#"
     RETURNING locked.id, locked.run_lease
 "#;
 
+/// Why the batcher did not complete an attempt.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompletionError {
+    /// Another transaction holds the attempt's completion lock, so the batch
+    /// left it out. The attempt is neither completed nor stale; complete it
+    /// again once that transaction ends.
+    #[error(
+        "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
+    )]
+    LockHeld { job_id: i64, run_lease: RunLease },
+    #[error(transparent)]
+    Storage(#[from] AwaError),
+}
+
+fn lock_held((job_id, run_lease): (i64, RunLease)) -> CompletionError {
+    CompletionError::LockHeld { job_id, run_lease }
+}
+
 struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
     claim: Option<ClaimedEntry>,
     runtime_job: Option<ClaimedRuntimeJob>,
-    response: oneshot::Sender<Result<bool, AwaError>>,
+    response: oneshot::Sender<Result<bool, CompletionError>>,
 }
 
 fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
@@ -118,14 +136,18 @@ impl CompletionBatcherHandle {
             .min(tokio::sync::Semaphore::MAX_PERMITS)
     }
 
-    pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
+    pub async fn complete(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(job_id, run_lease, None, None).await
     }
 
     pub async fn complete_runtime_job(
         &self,
         runtime_job: ClaimedRuntimeJob,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(
             runtime_job.job.id,
             runtime_job.job.run_lease,
@@ -141,7 +163,7 @@ impl CompletionBatcherHandle {
         run_lease: RunLease,
         claim: Option<ClaimedEntry>,
         runtime_job: Option<ClaimedRuntimeJob>,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
         self.shards[shard]
@@ -364,7 +386,7 @@ impl CompletionWorker {
                 for request in batch {
                     let pair = (request.job_id, request.run_lease);
                     let response = if contended.contains(&pair) {
-                        Err(completion_lock_held(pair))
+                        Err(lock_held(pair))
                     } else {
                         Ok(updated.contains(&pair))
                     };
@@ -407,9 +429,7 @@ impl CompletionWorker {
                                         .await
                                     {
                                         Ok(outcome) if outcome.contended.contains(&pair) => {
-                                            let _ = request
-                                                .response
-                                                .send(Err(completion_lock_held(pair)));
+                                            let _ = request.response.send(Err(lock_held(pair)));
                                             continue;
                                         }
                                         Ok(outcome) => Ok(outcome.updated),
@@ -434,7 +454,9 @@ impl CompletionWorker {
                             if matches!(&response, Ok(true)) {
                                 committed_pairs.insert(pair);
                             }
-                            let _ = request.response.send(response);
+                            let _ = request
+                                .response
+                                .send(response.map_err(CompletionError::from));
                         }
                         self.metrics.record_completion_flush(
                             self.shard_id,
@@ -453,60 +475,10 @@ impl CompletionWorker {
                 for request in batch {
                     let _ = request
                         .response
-                        .send(Err(AwaError::Validation(message.clone())));
+                        .send(Err(AwaError::Validation(message.clone()).into()));
                 }
             }
         }
-    }
-}
-
-/// The response for an attempt left out of a batch because another
-/// transaction holds its completion lock. It reads as PostgreSQL's
-/// `lock_not_available` (SQLSTATE `55P03`), the error a `NOWAIT` lock raises,
-/// so the executor retries it with backoff inside its finalization window
-/// instead of waiting on the lock while holding a connection.
-fn completion_lock_held((job_id, run_lease): (i64, i64)) -> AwaError {
-    AwaError::Database(sqlx::Error::Database(Box::new(CompletionLockHeld(
-        format!(
-            "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
-        ),
-    ))))
-}
-
-#[derive(Debug)]
-struct CompletionLockHeld(String);
-
-impl std::fmt::Display for CompletionLockHeld {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for CompletionLockHeld {}
-
-impl sqlx::error::DatabaseError for CompletionLockHeld {
-    fn message(&self) -> &str {
-        &self.0
-    }
-
-    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-        Some(std::borrow::Cow::Borrowed("55P03"))
-    }
-
-    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-        self
-    }
-
-    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-        self
-    }
-
-    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-        self
-    }
-
-    fn kind(&self) -> sqlx::error::ErrorKind {
-        sqlx::error::ErrorKind::Other
     }
 }
 
@@ -1270,7 +1242,7 @@ mod tests {
             .expect("contended batch isolates singleton errors without waiting");
         let busy = responses.remove(0).await.unwrap();
         assert!(
-            matches!(busy, Err(AwaError::Database(ref error))
+            matches!(busy, Err(CompletionError::Storage(AwaError::Database(ref error)))
             if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))),
             "busy attempt must report its real error, never stale: {busy:?}"
         );
