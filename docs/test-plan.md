@@ -15,6 +15,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | T5 | Deadline rescue (hung job) | ✓ |  |
 | T5a | Poison jobs (handler panic, crash loop, deadline loop) stop at `max_attempts` on both engines | ✓ |  |
 | T5b | Rescue drains a backlog of abandoned claims in bounded passes without rescuing live claims, and the queue and claim rings then rotate past the pinned slots | ✓ |  |
+| T5c | Ring prune wins against overlapping short readers, sees a lease committed while it waits to truncate, and does not deadlock with rescue or a read-then-write transaction on the claim ring | ✓ |  |
 | T6 | Transactional atomicity | ✓ |  |
 | T7 | Transactional atomicity (Python) |  | ✓ |
 | T8 | Uniqueness under contention | ✓ | ✓ |
@@ -247,6 +248,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA12 | AwaStorageLockOrder | Postgres lock ordering across enqueue, new-lane provisioning, claim, complete, cancel, rescue, rotate, and prune |
 | TLA13 | AwaStorageTransition | Storage-transition prepare, mixed-entry, finalize, and abort gates |
 | TLA14 | AwaDeadTupleContract | Hot-table reclaim-kind and partition-truncate contract |
+| TLA15 | AwaQueuePruneTwoPhase | Queue prune's writer lock, exclusive upgrade and recheck against a claim that commits during the upgrade |
 
 The formal suite includes passing configs and expected-counterexample configs. The expected-counterexample configs keep historical bugs executable: old dispatch claim, old view trigger, naive segment race, old storage-transition gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs use a `TraceIncomplete` invariant as a positive witness: a valid trace violates that invariant after TLC consumes every event.
 
