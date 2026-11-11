@@ -1,4 +1,4 @@
-# ADR-051: Scoped runtime controls
+# ADR-052: Scoped runtime controls
 
 ## Status
 
