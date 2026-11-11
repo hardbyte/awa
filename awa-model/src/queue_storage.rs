@@ -2072,6 +2072,9 @@ struct ClaimEvidence {
     ready_slot: i32,
     ready_generation: i64,
     lane_seq: i64,
+    /// `(job_id, run_lease)` of a claim written straight into `leases`. A
+    /// receipt claim, with or without a deadline, is proven by its
+    /// `ready_claim_attempt_batches` row instead.
     legacy_attempt: Option<(i64, i64)>,
 }
 
@@ -4595,7 +4598,7 @@ impl QueueStorage {
                         ready_generation: last.ready_generation,
                         lane_seq: last.lane_seq,
                         legacy_attempt: last
-                            .claim_batch_id
+                            .receipt_id
                             .is_none()
                             .then_some((last.job_id, last.run_lease)),
                     }),
@@ -4674,7 +4677,7 @@ impl QueueStorage {
                     ready_generation: claim.ready_generation,
                     lane_seq: claim.lane_seq,
                     legacy_attempt: claim
-                        .claim_batch_id
+                        .receipt_id
                         .is_none()
                         .then_some((claimed.job.id, claimed.job.run_lease)),
                 }),

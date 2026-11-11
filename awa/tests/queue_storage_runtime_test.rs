@@ -22757,7 +22757,7 @@ async fn cursor_advance_requires_claim_evidence(receipts: bool) {
         .next()
         .expect("missing claimed job");
     let claim = claimed.claim.clone();
-    assert_eq!(claim.claim_batch_id.is_some(), receipts);
+    assert_eq!(claim.receipt_id.is_some(), receipts);
     assert_eq!(
         claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
         claim.lane_seq + 1,
@@ -22792,6 +22792,7 @@ async fn cursor_advance_requires_claim_evidence(receipts: bool) {
     for table in [
         "ready_claim_attempt_batches",
         "lease_claim_batches",
+        "lease_claims",
         "leases",
     ] {
         sqlx::query(&format!("DELETE FROM {schema}.{table} WHERE queue = $1"))
