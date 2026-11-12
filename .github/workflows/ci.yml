@@ -87,7 +87,7 @@ jobs:
 
           # Paths no code job reads. Leaving a path out of this list only costs
           # a re-run; listing one that a job reads lets a change to it skip the job.
-          not_code="docs mkdocs.yml requirements-docs.txt CHANGELOG.md AGENTS.md benchmarks correctness skills"
+          not_code=".coderabbit.yaml docs mkdocs.yml requirements-docs.txt CHANGELOG.md AGENTS.md benchmarks correctness skills"
           code=$(except $not_code | digest)
           tla=$(only correctness | digest)
           skills=$(only skills | digest)
