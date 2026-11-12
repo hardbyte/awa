@@ -348,3 +348,61 @@ async fn all_tables_publication_accepts_update_and_delete(pool: PgPool) -> TestR
     }
     Ok(())
 }
+
+async fn mark_identities(pool: &PgPool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT relname::text, relreplident::text FROM pg_class
+         WHERE oid IN (to_regclass('awa.admin_dirty_queue_marks'),
+                       to_regclass('awa.admin_dirty_kind_marks'))
+         ORDER BY relname",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// External runners apply repeatable scripts in name order, so
+/// `R__replica_identity` can run before `R__wait_free_dirty_marks` creates the
+/// mark tables. The mark tables still end up with a FULL identity, and a
+/// replay of `wait_free_dirty_marks` leaves existing tables alone.
+#[sqlx::test(migrations = false)]
+async fn mark_tables_created_after_the_replica_identity_patch_get_their_identity(
+    pool: PgPool,
+) -> TestResult {
+    migrations::run(&pool).await?;
+    let wait_free = migrations::SCHEMA_PATCHES
+        .iter()
+        .find(|patch| patch.name == "wait_free_dirty_marks")
+        .expect("the patch is registered");
+
+    sqlx::raw_sql(
+        "DROP TABLE awa.admin_dirty_queue_marks;
+         DROP TABLE awa.admin_dirty_kind_marks;",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql(patch().sql).execute(&pool).await?;
+    sqlx::raw_sql(wait_free.sql).execute(&pool).await?;
+    assert_eq!(
+        mark_identities(&pool).await?,
+        vec![
+            ("admin_dirty_kind_marks".to_string(), "f".to_string()),
+            ("admin_dirty_queue_marks".to_string(), "f".to_string()),
+        ]
+    );
+
+    sqlx::raw_sql(
+        "ALTER TABLE awa.admin_dirty_queue_marks REPLICA IDENTITY DEFAULT;
+         ALTER TABLE awa.admin_dirty_kind_marks REPLICA IDENTITY DEFAULT;",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql(wait_free.sql).execute(&pool).await?;
+    assert_eq!(
+        mark_identities(&pool).await?,
+        vec![
+            ("admin_dirty_kind_marks".to_string(), "d".to_string()),
+            ("admin_dirty_queue_marks".to_string(), "d".to_string()),
+        ]
+    );
+    Ok(())
+}

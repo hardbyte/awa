@@ -1235,7 +1235,8 @@ mod tests {
             let guarded_identity = "ALTER TABLE %S REPLICA IDENTITY %S";
             if upper.contains(guarded_identity) {
                 assert!(
-                    upper.contains("RELREPLIDENT <> 'F'") && upper.contains("INDISREPLIDENT"),
+                    upper.contains("RELREPLIDENT <> 'F'")
+                        && (!upper.contains("USING INDEX") || upper.contains("INDISREPLIDENT")),
                     "patch {} must skip tables that already have their identity",
                     patch.name
                 );

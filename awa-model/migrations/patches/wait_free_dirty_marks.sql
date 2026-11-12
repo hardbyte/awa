@@ -29,6 +29,37 @@ CREATE TABLE IF NOT EXISTS awa.admin_dirty_kind_marks (
     touched_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- A mark table created by this transaction gets REPLICA IDENTITY FULL here,
+-- as the replica_identity patch would give it, whichever order a migration
+-- runner applies the two in. Only a table this session already holds in
+-- ACCESS EXCLUSIVE mode is altered, so the change never waits for a lock.
+DO $$
+DECLARE
+    v_table REGCLASS;
+BEGIN
+    FOR v_table IN
+        SELECT c.oid::regclass
+        FROM pg_class AS c
+        WHERE c.oid IN (
+                to_regclass('awa.admin_dirty_queue_marks'),
+                to_regclass('awa.admin_dirty_kind_marks')
+            )
+          AND c.relreplident <> 'f'
+          AND EXISTS (
+              SELECT 1 FROM pg_locks AS l
+              WHERE l.locktype = 'relation'
+                AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                AND l.relation = c.oid
+                AND l.pid = pg_backend_pid()
+                AND l.mode = 'AccessExclusiveLock'
+                AND l.granted
+          )
+    LOOP
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY %s', v_table, 'FULL');
+    END LOOP;
+END;
+$$;
+
 -- Carry pending dirtiness across the switch so nothing waits for the next
 -- full refresh. Marks that released trigger bodies commit into the old
 -- tables after this copy are reconciled by refresh_admin_metadata().
