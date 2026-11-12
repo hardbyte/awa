@@ -1559,6 +1559,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#sizing-workers-from-utilization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sizing workers from utilization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#what-can-be-tuned-per-queue-vs-per-job" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3019,6 +3030,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#sizing-workers-from-utilization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sizing workers from utilization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#what-can-be-tuned-per-queue-vs-per-job" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3739,6 +3761,10 @@
 </span></code></pre></div>
 <h3 id="weighted-mode">Weighted mode<a class="headerlink" href="#weighted-mode" title="Permanent link">&para;</a></h3>
 <p>Enabled by <code>global_max_workers(N)</code> (Rust) or <code>global_max_workers=N</code> (Python). Each queue's <code>min_workers</code> is guaranteed; remaining capacity is distributed by <code>weight</code>. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.</p>
+<h3 id="sizing-workers-from-utilization">Sizing workers from utilization<a class="headerlink" href="#sizing-workers-from-utilization" title="Permanent link">&para;</a></h3>
+<p>A queue's utilization is the fraction of its worker slots that are busy: <code>awa.queue.worker.in_use</code> divided by <code>awa.queue.worker.capacity</code>, summed over runtimes (see <a href="../grafana/#queue-utilization">queue utilization</a>). Watch it per queue rather than for the whole fleet. In weighted mode the capacity counts the whole overflow pool, so while other queues hold overflow permits a queue can be saturated at a low ratio; read its backlog alongside utilization.</p>
+<p>Waiting time does not grow in proportion to utilization. Kingman's approximation for a queue served by one worker puts the mean wait at roughly <code>ρ / (1 − ρ) × (Ca² + Cs²) / 2 × mean service time</code>, where <code>ρ</code> is utilization and <code>Ca</code> and <code>Cs</code> are the coefficients of variation of the arrival gaps and the service times. At 0.5 utilization the <code>ρ / (1 − ρ)</code> factor is 1, at 0.8 it is 4 and at 0.9 it is 9. A queue with many workers keeps waits short up to a higher utilization, but its wait still grows as <code>1 / (1 − ρ)</code> near 1, so a queue that runs above about 0.8 for long periods has waits that climb steeply with each further increase in load. Give it more workers or move part of its load elsewhere before it reaches that point. In hard-reserved mode that means a larger <code>max_workers</code>. In weighted mode, raise <code>global_max_workers</code> when the overflow pool is exhausted, or raise the queue's <code>min_workers</code> or <code>weight</code> when queues compete for the pool. A short burst to 1 is normal; sustained utilization near 1 means the backlog and <code>awa.job.wait_duration</code> keep growing.</p>
+<p>The <code>(Ca² + Cs²) / 2</code> term means variable service times inflate waits at any utilization. A queue that mixes a job kind taking 10 ms with one taking 30 s has a large <code>Cs</code>, and the short jobs wait behind the long ones. Put job kinds with very different service times on separate queues, each with its own <code>max_workers</code>.</p>
 <h3 id="what-can-be-tuned-per-queue-vs-per-job">What can be tuned per queue vs per job<a class="headerlink" href="#what-can-be-tuned-per-queue-vs-per-job" title="Permanent link">&para;</a></h3>
 <p>Queue configuration is the normal way to express operational policy. Job kinds are primarily handler registrations and descriptor/catalog entries; if two kinds need different runtime policy, put them on different queues.</p>
 <table>
@@ -4274,7 +4300,7 @@ no claim interval override, the claim ring uses the queue decision interval.</p>
 <p>Queue storage also uses a bounded-claimer control plane (<code>queue_claimer_state</code> / <code>queue_claimer_leases</code>) so not every replica hammers a hot queue's claim path at once. In 0.7, each instance may reuse its claimer lease and target check for up to 250 ms, bypassing the cache within one second of lease expiry. Target reductions constrain new acquisition; existing owned slots remain valid. These are coordination hints: job ownership still comes from the database claim transaction. Reset clears the local cache after truncating the coordination leases. For a single hot queue, raising <code>QueueConfig.claimers</code> lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's <code>max_workers</code> / <code>min_workers</code> permits.</p>
 <p>Keep <code>claimers</code> modest. In the hot-queue reference shape, <code>enqueue_shards = 4</code> is the change that turns overload into bounded end-to-end throughput; raising <code>claimers</code> to <code>4</code> increases transaction pressure and worsens tail latency in that shape. For extreme single-queue workloads, raise <code>enqueue_shards</code> first when the ordering contract allows partitioned FIFO. Benchmark <code>claimers = 2</code> or <code>4</code> only for a workload-specific reason, and judge the result by durable completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed job, transaction commits per completed job, and dead tuples. Lower <code>claim_batch_size</code> from <code>512</code> for small or latency-sensitive queues; raise claimers only with workload-specific evidence.</p>
 <p>Queue storage defaults <code>AWA_COMPLETION_SHARDS</code> to <code>1</code> for ordinary runtimes and <code>4</code> when the configured runtime worker capacity is at least <code>512</code> (<code>8</code> on canonical storage). Extra completion flushers can improve large single-process shapes, but they also multiply terminal-write contention across a worker fleet. Override this only after measuring the same north-star metrics for the target topology.</p>
-<p><code>AWA_COMPLETION_BATCH_SIZE</code> defaults to <code>512</code> and <code>AWA_COMPLETION_FLUSH_MS</code> defaults to <code>1</code>. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.</p>
+<p><code>AWA_COMPLETION_BATCH_SIZE</code> defaults to <code>512</code> and <code>AWA_COMPLETION_FLUSH_MS</code> defaults to <code>1</code>. A completion shard writes its batch when it holds <code>AWA_COMPLETION_BATCH_SIZE</code> attempts or <code>AWA_COMPLETION_FLUSH_MS</code> after the first of them arrived, whichever comes first. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.</p>
 <p>A runtime lets at most the larger of its worker capacity and <code>2 × AWA_COMPLETION_BATCH_SIZE × AWA_COMPLETION_SHARDS</code> finished attempts wait for their completion to commit: 1,024 with the queue-storage defaults below 512 workers. Each attempt's lifecycle hooks run within that allowance. A handler that finishes while it is used up keeps its worker slot until a completion commits, so a runtime whose completions or hooks fall behind claims more slowly instead of holding the backlog in memory. Each waiting attempt holds its job, payload included; for large payloads, lower <code>AWA_COMPLETION_BATCH_SIZE</code> to lower the bound in proportion.</p>
 <p>For very high-throughput no-op queues, size <code>max_workers</code> for durable completion latency, not handler CPU alone. The <code>10k/s</code> offered-rate reference shape needs 1,024 in-flight worker permits to absorb the load consistently; real jobs with non-trivial handler time need workload-specific sizing.</p>
 <p>The terminal write path is already narrow for running/waiting jobs: successful receipt completions use compact <code>receipt_completion_batches_*</code> rows, and other retained terminal facts use <code>done_entries_*</code> without duplicating immutable ready body fields when the ready row is still retained. Both surfaces hydrate through <code>terminal_jobs</code>, so the default completion settings stay conservative without giving up durable terminal history.</p>

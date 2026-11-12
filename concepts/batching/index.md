@@ -34,7 +34,7 @@ Lower `claim_batch_size` for a small queue where latency matters more than throu
 
 ## Complete: one write per shard batch
 
-A finished attempt goes to completion shard `job_id mod AWA_COMPLETION_SHARDS`. Each shard collects attempts until 512 are waiting (`AWA_COMPLETION_BATCH_SIZE`) or none has arrived for 1 ms (`AWA_COMPLETION_FLUSH_MS`), then writes them in one statement. For successful short jobs that statement closes their receipts and appends one compact terminal row for the whole batch.
+A finished attempt goes to completion shard `job_id mod AWA_COMPLETION_SHARDS`. Each shard collects attempts until 512 are waiting (`AWA_COMPLETION_BATCH_SIZE`) or 1 ms has passed since the first of them arrived (`AWA_COMPLETION_FLUSH_MS`), then writes them in one statement. For successful short jobs that statement closes their receipts and appends one compact terminal row for the whole batch.
 
 The worker slot is freed when the handler returns, not when its completion commits, so a slow commit does not hold a worker. To bound memory, a runtime lets at most the larger of its worker capacity and `2 × batch size × shards` finished attempts wait to be written; beyond that, a handler that returns keeps its worker until a completion commits. A runtime whose completions fall behind therefore claims more slowly instead of piling up results.
 
