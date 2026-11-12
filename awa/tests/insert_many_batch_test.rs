@@ -1074,12 +1074,12 @@ async fn mixed_producers_on_shared_keys_and_lanes_never_deadlock() {
     .expect("provision lanes");
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(TASKS));
-    let mut tasks = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     for task in 0..TASKS {
         let pool = pool.clone();
         let barrier = barrier.clone();
         let lanes = lanes.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut committed: Vec<i64> = Vec::new();
             let mut deadlocks = 0usize;
             for round in 0..ROUNDS {
@@ -1132,15 +1132,22 @@ async fn mixed_producers_on_shared_keys_and_lanes_never_deadlock() {
                 }
             }
             (committed, deadlocks)
-        }));
+        });
     }
 
     let mut committed: Vec<i64> = Vec::new();
     let mut deadlocks = 0usize;
-    for task in tasks {
-        let (ids, task_deadlocks) = task.await.expect("producer task");
-        committed.extend(ids);
-        deadlocks += task_deadlocks;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((ids, task_deadlocks)) => {
+                committed.extend(ids);
+                deadlocks += task_deadlocks;
+            }
+            Err(err) => {
+                tasks.abort_all();
+                std::panic::resume_unwind(err.into_panic());
+            }
+        }
     }
     assert_eq!(deadlocks, 0, "producers failed with deadlock detected");
 
@@ -1474,15 +1481,13 @@ async fn callers_lock_timeout_applies_to_each_wait() {
             sqlx::query("SET LOCAL lock_timeout = '100ms'")
                 .execute(&mut *tx)
                 .await?;
-            let started = Instant::now();
             let inserted = insert_many_skip_unique_conflicts(&mut *tx, &jobs).await?;
-            let elapsed = started.elapsed();
             tx.commit().await?;
-            Ok::<_, AwaError>((inserted.len(), elapsed))
+            Ok::<_, AwaError>(inserted.len())
         })
     };
     let started = Instant::now();
-    loop {
+    let waited_after = loop {
         let waiting: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks
              WHERE locktype = 'advisory' AND NOT granted
@@ -1492,23 +1497,27 @@ async fn callers_lock_timeout_applies_to_each_wait() {
         .fetch_one(&pool)
         .await
         .expect("poll pg_locks");
-        if waiting || batch.is_finished() {
-            break;
+        if waiting {
+            break started.elapsed();
         }
+        assert!(
+            !batch.is_finished(),
+            "batch finished without waiting for the lane"
+        );
         assert!(started.elapsed() < WAIT_DEADLINE, "batch never waited");
         tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    };
     gate.commit().await.expect("release lane lock");
 
-    let (inserted, elapsed) = tokio::time::timeout(WAIT_DEADLINE, batch)
+    let inserted = tokio::time::timeout(WAIT_DEADLINE, batch)
         .await
         .expect("batch finished")
         .expect("batch task")
         .expect("batch with a 100 ms lock_timeout");
     assert_eq!(inserted as i64, ROWS);
     assert!(
-        elapsed > Duration::from_millis(100),
-        "the batch's own work outlasts the caller's lock_timeout ({elapsed:?})"
+        waited_after > Duration::from_millis(100),
+        "the batch's work before its lane wait outlasts the caller's lock_timeout ({waited_after:?})"
     );
 }
 
