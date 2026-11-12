@@ -44,7 +44,7 @@ Each ring is a fixed number of slots, each slot a set of partitions. The mainten
 | --- | --- | --: | --- |
 | Queue | ready jobs, their terminal history and the bookkeeping for both | 16 | every ready job in it has been claimed or cancelled, and every attempt claimed from it has ended |
 | Claim | claim receipts and their closures | 8 | every receipt in it has a closure |
-| Lease | leases of attempts waiting on a callback, or of every claim when `lease_claim_receipts` is off | 8 | it is empty |
+| Lease | leases of attempts that register a callback, or of every claim when `lease_claim_receipts` is off | 8 | it is empty |
 
 A job's rows are spread across the rings: its ready row and terminal history in one queue slot, its receipts in the claim slots that were current when it was claimed. So one attempt that is still running keeps both its queue slot and its claim slot from being pruned.
 

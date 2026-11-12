@@ -1,6 +1,6 @@
 # Claims, receipts and leases
 
-A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that waits for an external callback gets a lease.
+A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that registers an external callback gets a lease.
 
 ## `run_lease`: the attempt's number
 
@@ -17,14 +17,14 @@ This is what makes rescue safe. Worker A in the diagram is not dead; it is pause
 ## What an attempt writes
 
 <div class="awa-diagram" markdown>
-![Rows written by one attempt: a receipt at claim, attempt state on heartbeat and progress, a lease while waiting for a callback, and terminal history at finish](../assets/how-it-works/attempt-records.svg)
+![Rows written by one attempt: a receipt at claim, attempt state on heartbeat and progress, a lease once a callback is registered, and terminal history at finish](../assets/how-it-works/attempt-records.svg)
 </div>
 
 **Claim receipt.** The claim appends one receipt row per claim batch to the current slot of the claim ring, listing every job, `run_lease` and receipt id in the batch. It is never updated. When an attempt ends, closure evidence is appended in the same claim slot: successful short jobs share one closure batch row per completion batch, and other outcomes, rescue and cancellation append a closure row of their own. An attempt is open while its receipt has neither.
 
 **Attempt state.** The first heartbeat or progress update creates a small row for the attempt, and later ones update it. It holds the heartbeat time and the latest progress, and is deleted when the attempt finishes. A job that finishes before its first heartbeat never creates one.
 
-**Lease.** An attempt that registers a callback and waits for it needs state that changes while no handler is running: the callback id, its timeout and the waiting state. That attempt gets a lease row in the lease ring, which the callback or a timeout later resolves. With `lease_claim_receipts` turned off, every claim writes a lease instead of a receipt.
+**Lease.** An attempt that waits for a callback needs state that changes while no handler is running: the callback id, its timeout and the waiting state. Registering the callback creates a lease row in the lease ring, while the handler is still running, and the callback or a timeout later resolves it. With `lease_claim_receipts` turned off, every claim writes a lease instead of a receipt.
 
 **Terminal history.** Finishing appends the outcome to the queue ring, in the same slot as the job's ready row. Successful short jobs share one compact row per completion batch. Read finished jobs through `terminal_jobs` or the admin API, not the physical tables.
 
