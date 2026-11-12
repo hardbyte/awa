@@ -21,6 +21,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
+- **Per-queue worker utilization metrics (#733).** Every runtime samples `awa.queue.worker.in_use` (worker slots held by a running handler or one waiting for finalizer capacity) and `awa.queue.worker.capacity` (`max_workers`, or in weighted mode `min_workers` plus the overflow pool) for each queue on each runtime snapshot, so a dashboard can plot utilization as in-use ÷ capacity. Waits grow steeply once utilization stays above about 0.8; see [sizing workers from utilization](docs/configuration.md#sizing-workers-from-utilization). The overview Grafana dashboard has a **Worker utilization by queue** panel.
 - **The queue-storage prune `lock_timeout` is configurable, and prune
   attempts are counted by outcome for every ring.** Prune (queue, lease and
   claim rings) and terminal-delta rollup take their exclusive locks under a
@@ -44,8 +45,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `pruned`, `noop`, `blocked`, `skipped_active` and `already_pruned`. See
   [Configuration](docs/configuration.md#what-the-knobs-mean).
 
+### Changed
+
+- **Automatic retries spread wider (#733, migration v059).** `awa.backoff_duration` drew the delay before a retry from `2^attempt` seconds plus 0 to 25%, so jobs that failed together retried close together and hit a recovering dependency at once. The delay is now `2^attempt` seconds times a random factor in [0.5, 1.5), capped at 24 hours as before: the mean is the base delay (previously 12.5% above it), the shortest possible delay halves, and in a simulation of 10,000 jobs failing together the peak retry rate for each attempt falls by about 3.5×. v059 is one function replacement with no table locks, and binaries before it use the new delays as soon as it commits. See [v059](docs/upgrade-0.6-to-0.7.md#v059-wider-retry-jitter).
+
 ### Fixed
 
+- **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.
 - **A queue lane is usable by every runtime role, whichever role creates it
   first (migration v053).** A lane's enqueue and claim sequences belonged to
   the role that first enqueued into, claimed from or promoted into it, so with

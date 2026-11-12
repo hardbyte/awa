@@ -51,6 +51,8 @@ pub mod names {
     pub const JOB_DLQ_DEPTH: &str = "awa.job.dlq_depth";
     pub const QUEUE_DEPTH: &str = "awa.queue.depth";
     pub const QUEUE_LAG: &str = "awa.queue.lag";
+    pub const QUEUE_WORKER_IN_USE: &str = "awa.queue.worker.in_use";
+    pub const QUEUE_WORKER_CAPACITY: &str = "awa.queue.worker.capacity";
     pub const QUEUE_INFO: &str = "awa.queue.info";
     pub const JOB_KIND_INFO: &str = "awa.job_kind.info";
     pub const DISPATCH_CLAIM_BATCHES: &str = "awa.dispatch.claim_batches";
@@ -220,6 +222,13 @@ pub struct AwaMetrics {
     pub queue_depth: Gauge<i64>,
     /// Queue lag — age of the oldest available job per queue.
     pub queue_lag_seconds: Gauge<f64>,
+    /// Worker slots of a queue held by attempts in this runtime: a handler
+    /// running, or a finished handler waiting for finalizer capacity.
+    pub queue_worker_in_use: Gauge<i64>,
+    /// Worker slots this runtime can give a queue: `max_workers` in
+    /// hard-reserved mode, `min_workers` plus the whole overflow pool in
+    /// weighted mode.
+    pub queue_worker_capacity: Gauge<i64>,
     /// Time from job creation to claim — the user-visible queuing latency.
     pub wait_duration_seconds: Histogram<f64>,
     /// Total jobs moved into the Dead Letter Queue.
@@ -545,6 +554,16 @@ impl AwaMetrics {
                 .f64_gauge(names::QUEUE_LAG)
                 .with_description("Age of the oldest available job per queue")
                 .with_unit("s")
+                .build(),
+            queue_worker_in_use: meter
+                .i64_gauge(names::QUEUE_WORKER_IN_USE)
+                .with_description("Worker slots per queue held by attempts in this runtime")
+                .with_unit("{worker}")
+                .build(),
+            queue_worker_capacity: meter
+                .i64_gauge(names::QUEUE_WORKER_CAPACITY)
+                .with_description("Worker slots per queue this runtime can run at once")
+                .with_unit("{worker}")
                 .build(),
             wait_duration_seconds: meter
                 .f64_histogram(names::JOB_WAIT_DURATION)
@@ -1007,6 +1026,18 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.queue_lag_seconds.record(lag_seconds, &attrs);
+    }
+
+    /// Record a queue's worker slots in use and its capacity in this runtime,
+    /// sampled together so their ratio is the queue's utilization.
+    pub fn record_queue_workers(&self, queue: &str, in_use: u32, capacity: u32) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.queue_worker_in_use.record(i64::from(in_use), &attrs);
+        self.queue_worker_capacity
+            .record(i64::from(capacity), &attrs);
     }
 
     /// Record job wait duration (time from creation to claim).

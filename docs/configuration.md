@@ -221,6 +221,14 @@ await client.start(
 
 Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Each queue's `min_workers` is guaranteed; remaining capacity is distributed by `weight`. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.
 
+### Sizing workers from utilization
+
+A queue's utilization is the fraction of its worker slots that are busy: `awa.queue.worker.in_use` divided by `awa.queue.worker.capacity`, summed over runtimes (see [queue utilization](grafana/README.md#queue-utilization)). Watch it per queue rather than for the whole fleet. In weighted mode the capacity counts the whole overflow pool, so while other queues hold overflow permits a queue can be saturated at a low ratio; read its backlog alongside utilization.
+
+Waiting time does not grow in proportion to utilization. Kingman's approximation for a queue served by one worker puts the mean wait at roughly `ρ / (1 − ρ) × (Ca² + Cs²) / 2 × mean service time`, where `ρ` is utilization and `Ca` and `Cs` are the coefficients of variation of the arrival gaps and the service times. At 0.5 utilization the `ρ / (1 − ρ)` factor is 1, at 0.8 it is 4 and at 0.9 it is 9. A queue with many workers keeps waits short up to a higher utilization, but its wait still grows as `1 / (1 − ρ)` near 1, so a queue that runs above about 0.8 for long periods has waits that climb steeply with each further increase in load. Give it more workers or move part of its load elsewhere before it reaches that point. In hard-reserved mode that means a larger `max_workers`. In weighted mode, raise `global_max_workers` when the overflow pool is exhausted, or raise the queue's `min_workers` or `weight` when queues compete for the pool. A short burst to 1 is normal; sustained utilization near 1 means the backlog and `awa.job.wait_duration` keep growing.
+
+The `(Ca² + Cs²) / 2` term means variable service times inflate waits at any utilization. A queue that mixes a job kind taking 10 ms with one taking 30 s has a large `Cs`, and the short jobs wait behind the long ones. Put job kinds with very different service times on separate queues, each with its own `max_workers`.
+
 ### What can be tuned per queue vs per job
 
 Queue configuration is the normal way to express operational policy. Job kinds are primarily handler registrations and descriptor/catalog entries; if two kinds need different runtime policy, put them on different queues.
@@ -658,7 +666,7 @@ Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` i
 
 Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` for ordinary runtimes and `4` when the configured runtime worker capacity is at least `512` (`8` on canonical storage). Extra completion flushers can improve large single-process shapes, but they also multiply terminal-write contention across a worker fleet. Override this only after measuring the same north-star metrics for the target topology.
 
-`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS` defaults to `1`. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.
+`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS` defaults to `1`. A completion shard writes its batch when it holds `AWA_COMPLETION_BATCH_SIZE` attempts or `AWA_COMPLETION_FLUSH_MS` after the first of them arrived, whichever comes first. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.
 
 A runtime lets at most the larger of its worker capacity and `2 × AWA_COMPLETION_BATCH_SIZE × AWA_COMPLETION_SHARDS` finished attempts wait for their completion to commit: 1,024 with the queue-storage defaults below 512 workers. Each attempt's lifecycle hooks run within that allowance. A handler that finishes while it is used up keeps its worker slot until a completion commits, so a runtime whose completions or hooks fall behind claims more slowly instead of holding the backlog in memory. Each waiting attempt holds its job, payload included; for large payloads, lower `AWA_COMPLETION_BATCH_SIZE` to lower the bound in proportion.
 
