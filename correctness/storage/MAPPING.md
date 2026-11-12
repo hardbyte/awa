@@ -232,6 +232,8 @@ The spec plus `AwaSegmentedStorageRaces.cfg` (race-exposing) and `AwaSegmentedSt
 
 `AwaStorageLockOrder.tla` (see [`README.md`](./README.md)) is the complementary positive artifact: it models the Postgres locks directly and checks that no interleaving of prepare-queue / enqueue / claim / complete / close-receipt / rescue-receipts / ensure-running / cancel / rotate / prune transactions produces a waits-for cycle. The producer and preparer both take multiple physical queue lane locks in string order; the current runtime claim path claims only one physical stripe per transaction. `AwaStorageLockOrderPrepareQueue.cfg` checks the `q#10` before `q#2` ordering, and `AwaStorageLockOrderPrepareQueueNumeric.cfg` demonstrates the cycle caused by numeric preparation order. The other demo configs check the detector and the historical unsafe logical-claim shape.
 
+`ProvisionLanePlan` models the first enqueue to a new `(queue, priority)` lane, which every producer takes in one order: the `queue_lanes` row (SQL inserts in `awa.insert_job_compat` and `insert_jobs_compat_batch`; `QueueStorage::ensure_lane_inserts` for batch enqueue, promotion and `prepare_queue`), then the provisioning advisory lock (the head-table trigger, or `ensure_lane_inserts` before `provision_lane`), then the lane's enqueue lock. `AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg` keeps the earlier `QueueStorage` order, provisioning lock before the row, and must violate `NoDeadlock` against a SQL producer of the same new lane (#692).
+
 Together the two specs cover complementary risks:
 
 - `AwaSegmentedStorageRaces` catches data-level races that would occur if the locks were removed — proves the locks are necessary
@@ -320,8 +322,9 @@ Model checking results:
 - `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers, 332 distinct states, clean.
 - `AwaShardedPrune.cfg`: 1,028 distinct states, clean. This checks the fixed queue-ring prune predicate that matches ready rows to terminal rows by `(enqueue_shard, lane_seq)`.
 - `AwaShardedPruneBroken.cfg`: expected failure. It ignores `enqueue_shard` in the ready/terminal match and produces the counterexample where shard 0's completed `lane_seq = 1` row masks shard 1's still-pending `lane_seq = 1` row.
-- `AwaStorageLockOrder.cfg`: 153,515 distinct states, clean. Models the receipts and legacy claim modes separately, plus `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`, `CancelReceiptOnlyPlan`, and `CancelRunningPlan`.
+- `AwaStorageLockOrder.cfg`: 2,629,707 distinct states, clean. Models the receipts and legacy claim modes separately, plus `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`, `CancelReceiptOnlyPlan`, `CancelRunningPlan`, and `ProvisionLanePlan`.
 - `AwaStorageLockOrderDeadlockDemo.cfg`: trips `NoDeadlock` in 5 steps, confirming the detector works.
+- `AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg`: trips `NoDeadlock` in 5 steps, one transaction holding the new lane's `queue_lanes` row and the other its provisioning lock.
 - `AwaDeadTupleContract.cfg`: 1 distinct state, clean. TLC generated 2 states because the contract is an ASSUME-style architectural check. The checks (`HotTablesAreNotRowVacuum`, `PartitionTruncateTablesAreReclaimed`, `WarmTablesDocumentTheirBound`, `BacklogRowVacuumTablesDocumentTheirBound`, `OnlyBoundedKindsHaveBoundedBy`, `AppendOnlyAcceptsOnlyInsert`, `VacuumKindTablesNotTruncated`) all hold for the current schema and transaction list. Workflow: when adding a new table to `prepare_schema()` or a new SQL site to queue_storage.rs, register it in `AwaDeadTupleContract.tla` with the correct reclaim kind, hotness, optional `bounded_by`, and mutation list. An `open_receipt_claims`-style proposal (hot table, RowVacuum reclaim, INSERT+DELETE traffic) fires `HotTablesAreNotRowVacuum` at parse time; a `Warm` table without a declared `bounded_by` fires `WarmTablesDocumentTheirBound`.
 
 ### Receipt-plane shape
