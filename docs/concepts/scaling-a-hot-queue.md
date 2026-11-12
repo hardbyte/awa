@@ -35,7 +35,7 @@ One busy queue can outgrow the coordination around a single [lane](lanes-and-cla
 
 ## Measuring the result
 
-Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Before spreading a queue, check whether it is short of workers instead: a queue whose [utilization](../configuration.md#sizing-workers-from-utilization) stays above about 0.8 needs more `max_workers` or a split by service time, which no lane lever provides. The `awa.job.claimed` counter carries an `awa.enqueue.shard` attribute, so a dashboard can confirm that claims are spread evenly across shards.
+Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Before spreading a queue, check whether it is short of workers instead: a queue whose [utilization](../configuration.md#sizing-workers-from-utilization) stays above about 0.8 needs more workers or a split by service time. Raising `max_workers` adds workers, and so does a `PartitionedQueue`, whose partitions each get their own; enqueue shards, stripes and claimers add none. The `awa.job.claimed` counter carries an `awa.enqueue.shard` attribute, so a dashboard can confirm that claims are spread evenly across shards.
 
 ## Related
 

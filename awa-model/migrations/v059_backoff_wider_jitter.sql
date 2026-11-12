@@ -5,7 +5,9 @@
 -- and reached a recovering dependency together. The delay is now drawn
 -- uniformly from [0.5, 1.5] x 2^attempt seconds, still capped at 24 hours: the
 -- same mean as the base delay, with retries from one failure spread over a
--- window as wide as the base delay itself.
+-- window as wide as the base delay itself. Below the cap, that is: from
+-- attempt 16 the top of the range is cut to 24 hours, and from attempt 18
+-- every retry waits exactly 24 hours.
 --
 -- The signature, volatility, owner and grants are unchanged. N-1 binaries call
 -- awa.backoff_duration from the same statements and get the new delays as soon
