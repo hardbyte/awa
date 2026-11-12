@@ -170,7 +170,7 @@ impl HeartbeatService {
                      AND jobs.run_lease = inflight.run_lease
                     WHERE jobs.state = 'running'
                     ORDER BY jobs.id
-                    FOR UPDATE OF jobs
+                    FOR UPDATE OF jobs SKIP LOCKED
                 )
                 UPDATE awa.jobs_hot AS jobs
                 SET heartbeat_at = now()
@@ -217,7 +217,7 @@ impl HeartbeatService {
                          AND jobs.run_lease = inflight.run_lease
                         WHERE jobs.state = 'running'
                         ORDER BY jobs.id
-                        FOR UPDATE OF jobs
+                        FOR UPDATE OF jobs SKIP LOCKED
                     )
                     UPDATE awa.jobs_hot AS jobs
                     SET heartbeat_at = now(),
@@ -243,7 +243,13 @@ impl HeartbeatService {
                             .iter()
                             .map(|(id, lease, gen, _)| (*id, *lease, *gen))
                             .collect();
-                        self.in_flight.ack_progress(&acked);
+                        if result.rows_affected() as usize == chunk.len() {
+                            self.in_flight.ack_progress(&acked);
+                        } else {
+                            // Re-send successful snapshots too: replay is safe,
+                            // whereas acknowledging a skipped write loses progress.
+                            self.in_flight.clear_in_flight_progress(&acked);
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "Failed to send heartbeat+progress batch");
@@ -314,7 +320,11 @@ impl HeartbeatService {
                             .iter()
                             .map(|(id, lease, gen, _)| (*id, *lease, *gen))
                             .collect();
-                        self.in_flight.ack_progress(&acked);
+                        if updated == chunk.len() {
+                            self.in_flight.ack_progress(&acked);
+                        } else {
+                            self.in_flight.clear_in_flight_progress(&acked);
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "Failed to send heartbeat+progress batch");
