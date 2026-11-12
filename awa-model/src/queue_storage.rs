@@ -12798,6 +12798,7 @@ impl QueueStorage {
         self.lock_receipt_attempts_tx(tx, &receipt_jobs).await?;
 
         let schema = self.schema();
+        let leases = self.leases_table();
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
         let closed_evidence =
@@ -12885,6 +12886,13 @@ impl QueueStorage {
                     claim_refs.progress,
                     clock_timestamp()
                 FROM claim_refs
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {leases} AS parked
+                    WHERE parked.job_id = claim_refs.job_id
+                      AND parked.run_lease = claim_refs.run_lease
+                      AND parked.state = 'waiting_external'
+                )
                 ON CONFLICT (job_id, run_lease)
                 DO UPDATE SET
                     heartbeat_at = clock_timestamp(),
@@ -16592,6 +16600,13 @@ impl QueueStorage {
         callback_id: Uuid,
         progress: Option<&serde_json::Value>,
     ) -> Result<bool, AwaError> {
+        // Heartbeats write receipt progress under the attempt lock and skip
+        // parked attempts, so holding it here keeps an older heartbeat
+        // snapshot from replacing the progress stored with the park.
+        if self.lease_claim_receipts() {
+            self.lock_receipt_attempts_tx(tx, &[(job_id, run_lease)])
+                .await?;
+        }
         let entered = self
             .enter_callback_wait_in_tx(tx, job_id, run_lease, callback_id)
             .await?;
@@ -16943,6 +16958,35 @@ impl QueueStorage {
             .await
     }
 
+    /// Take the attempt locks for the leases parked on `callback_id` before
+    /// an external finalizer deletes them, so it locks the attempt before the
+    /// lease row like the other receipt paths.
+    async fn lock_callback_receipt_attempts_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        callback_id: Uuid,
+        run_lease: Option<i64>,
+    ) -> Result<(), AwaError> {
+        if !self.lease_claim_receipts() {
+            return Ok(());
+        }
+        let pairs: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+            r#"
+            SELECT job_id, run_lease
+            FROM {}
+            WHERE callback_id = $1
+              AND ($2::bigint IS NULL OR run_lease = $2)
+            "#,
+            self.leases_table()
+        )))
+        .bind(callback_id)
+        .bind(run_lease)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.lock_receipt_attempts_tx(tx, &pairs).await
+    }
+
     /// Complete a job waiting on `callback_id` and store `output` as its
     /// output (ADR-048), if this schema has the output columns. The caller
     /// validates the output. Returns the completed row, whose `output` is
@@ -16959,6 +17003,8 @@ impl QueueStorage {
             Some(output) if self.supports_job_output(tx.as_mut()).await? => Some(output),
             _ => None,
         };
+        self.lock_callback_receipt_attempts_tx(tx, callback_id, run_lease)
+            .await?;
         let schema = self.schema();
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -17062,6 +17108,8 @@ impl QueueStorage {
         error_entry: serde_json::Value,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
+        self.lock_callback_receipt_attempts_tx(tx, callback_id, run_lease)
+            .await?;
         let schema = self.schema();
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -17161,6 +17209,8 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
+        self.lock_callback_receipt_attempts_tx(tx, callback_id, run_lease)
+            .await?;
         let schema = self.schema();
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
             r#"

@@ -9914,7 +9914,7 @@ async fn test_queue_storage_flush_progress_waits_for_a_locked_receipt_attempt() 
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_lock_waiter(&pool, "pg_advisory_xact_lock").await;
     assert!(
         !flush.is_finished(),
         "an explicit flush must wait for the attempt lock rather than skip the attempt"
@@ -18434,6 +18434,166 @@ async fn test_queue_storage_callback_wait_stores_the_final_progress() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_legacy_callback_wait_stores_the_final_progress() {
     callback_wait_stores_the_final_progress(false).await;
+}
+
+/// A heartbeat that read an older progress snapshot before the attempt was
+/// parked must not replace the progress stored with the park.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_heartbeat_does_not_overwrite_parked_progress() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_parked_progress_heartbeat";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_parked_progress_heartbeat".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CallbackJob { id: 6 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim")
+        .into_iter()
+        .next()
+        .expect("claimed job");
+    let run_lease = claim.job.run_lease;
+    let callback_id = store
+        .register_callback(&pool, job_id, run_lease, Duration::from_secs(300))
+        .await
+        .expect("register callback");
+
+    let parked_progress = serde_json::json!({"percent": 60});
+    assert!(store
+        .enter_callback_wait_with_progress(
+            &pool,
+            job_id,
+            run_lease,
+            callback_id,
+            Some(&parked_progress),
+        )
+        .await
+        .expect("park the attempt"));
+
+    let updated = store
+        .heartbeat_progress_batch(
+            &pool,
+            &[(job_id, run_lease, serde_json::json!({"percent": 40}))],
+        )
+        .await
+        .expect("late heartbeat");
+    assert_eq!(updated, 0, "a heartbeat must skip a parked attempt");
+
+    let parked = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load parked job")
+        .expect("parked job exists");
+    assert_eq!(parked.state, JobState::WaitingExternal);
+    assert_eq!(parked.progress, Some(parked_progress));
+}
+
+/// An external completion waits for the attempt lock before it locks the
+/// lease row, so a worker parking the same attempt cannot deadlock with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_external_completion_locks_the_attempt_before_the_lease() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_external_completion_lock_order";
+    let schema = "awa_qs_external_completion_lock_order";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CallbackJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim")
+        .into_iter()
+        .next()
+        .expect("claimed job");
+    let run_lease = claim.job.run_lease;
+    let callback_id = store
+        .register_callback(&pool, job_id, run_lease, Duration::from_secs(300))
+        .await
+        .expect("register callback");
+
+    let mut attempt_lock = pool.begin().await.expect("begin attempt lock tx");
+    sqlx::query(
+        r#"
+        SELECT pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended(
+                format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint),
+                0
+            )
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(attempt_lock.as_mut())
+    .await
+    .expect("hold the attempt lock");
+
+    let store = Arc::new(store);
+    let completion = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            store
+                .complete_external(&pool, callback_id, None, Some(run_lease), false)
+                .await
+        })
+    };
+    wait_for_lock_waiter(&pool, "pg_advisory_xact_lock").await;
+
+    let lease_rows: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT job_id FROM {schema}.leases WHERE job_id = $1 FOR UPDATE NOWAIT"
+    )))
+    .bind(job_id)
+    .fetch_all(attempt_lock.as_mut())
+    .await
+    .expect("the lease row stays unlocked while the completion waits for the attempt");
+    assert_eq!(lease_rows, vec![job_id]);
+
+    attempt_lock
+        .commit()
+        .await
+        .expect("release the attempt lock");
+    let completed = completion
+        .await
+        .expect("completion task")
+        .expect("complete external after the lock is released");
+    assert_eq!(completed.state, JobState::Completed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
