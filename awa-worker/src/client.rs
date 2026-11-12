@@ -105,6 +105,18 @@ pub enum QueueCapacity {
     },
 }
 
+/// The most worker slots a queue can hold at once in this runtime.
+///
+/// Hard-reserved mode: `max_workers`. Weighted mode: `min_workers` plus the
+/// whole overflow pool, which the queue can hold while no other queue wants
+/// overflow; under contention its fair share of the pool is smaller.
+fn queue_worker_capacity(config: &QueueConfig, overflow_pool: Option<&OverflowPool>) -> u32 {
+    match overflow_pool {
+        Some(pool) => config.min_workers.saturating_add(pool.total()),
+        None => config.max_workers,
+    }
+}
+
 /// Temporary execution role used during a storage transition.
 ///
 /// This is not intended as a long-term “run either backend forever” feature.
@@ -2849,7 +2861,21 @@ impl RuntimeReporterState {
         }
     }
 
+    /// Sample each queue's worker slots in use and its capacity.
+    fn record_queue_worker_metrics(&self) {
+        for (queue, config) in &self.queues {
+            let in_use = self
+                .queue_in_flight
+                .get(queue)
+                .map(|counter| counter.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            let capacity = queue_worker_capacity(config, self.overflow_pool.as_deref());
+            self.metrics.record_queue_workers(queue, in_use, capacity);
+        }
+    }
+
     async fn publish_snapshot(&self) {
+        self.record_queue_worker_metrics();
         let queue_descriptors = self.declared_queue_descriptors();
         let kind_descriptors = self.declared_job_kind_descriptors();
 
@@ -2981,6 +3007,18 @@ mod tests {
         let config = QueueConfig::default();
         assert_eq!(config.claimers, 1);
         assert_eq!(config.claim_batch_size, 512);
+    }
+
+    #[test]
+    fn queue_worker_capacity_follows_the_concurrency_mode() {
+        let config = QueueConfig {
+            max_workers: 7,
+            min_workers: 2,
+            ..Default::default()
+        };
+        assert_eq!(queue_worker_capacity(&config, None), 7);
+        let overflow = OverflowPool::new(10, HashMap::from([("q".to_string(), 1)]));
+        assert_eq!(queue_worker_capacity(&config, Some(&overflow)), 12);
     }
 
     #[tokio::test]

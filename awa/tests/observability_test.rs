@@ -737,3 +737,141 @@ async fn test_staged_follow_ups_emit_committed_metrics() {
 
     let _ = meter_provider.shutdown();
 }
+
+/// Every value exported for the i64 gauge `name` on `queue`, in export order.
+fn queue_gauge_values(exporter: &InMemoryMetricExporter, name: &str, queue: &str) -> Vec<i64> {
+    let mut values = Vec::new();
+    for resource_metrics in exporter
+        .get_finished_metrics()
+        .expect("Failed to get finished metrics")
+    {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics
+                .metrics()
+                .filter(|metric| metric.name() == name)
+            {
+                let AggregatedMetrics::I64(MetricData::Gauge(gauge)) = metric.data() else {
+                    panic!("{name} should be an i64 gauge");
+                };
+                values.extend(
+                    gauge
+                        .data_points()
+                        .filter(|point| {
+                            point.attributes().any(|kv| {
+                                kv.key.as_str() == "awa.job.queue" && kv.value.as_str() == queue
+                            })
+                        })
+                        .map(|point| point.value()),
+                );
+            }
+        }
+    }
+    values
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_queue_worker_gauges_report_slots_in_use_and_capacity() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup().await;
+    let queue = "observ_worker_utilization";
+    clean_queue(&pool, queue).await;
+
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 3,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .runtime_snapshot_interval(Duration::from_millis(100))
+        .register::<ObservableJob, _, _>({
+            let started = started.clone();
+            let release = release.clone();
+            move |_args, _ctx| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    release
+                        .acquire()
+                        .await
+                        .expect("release gate stays open")
+                        .forget();
+                    Ok(JobResult::Completed)
+                }
+            }
+        })
+        .build()
+        .expect("Failed to build client");
+    client.start().await.expect("Failed to start client");
+
+    let mut jobs = Vec::new();
+    for value in ["a", "b"] {
+        jobs.push(
+            insert_with(
+                &pool,
+                &ObservableJob {
+                    value: value.into(),
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert job"),
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both handlers should start"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Let the runtime reporter sample the busy queue.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+
+    let in_use = queue_gauge_values(&exporter, "awa.queue.worker.in_use", queue);
+    let capacity = queue_gauge_values(&exporter, "awa.queue.worker.capacity", queue);
+    assert_eq!(in_use.last(), Some(&2), "in use samples: {in_use:?}");
+    assert_eq!(capacity.last(), Some(&3), "capacity samples: {capacity:?}");
+
+    release.add_permits(2);
+    for job in &jobs {
+        let state = wait_for_job_state(
+            &pool,
+            job.id,
+            &[JobState::Completed],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(state, JobState::Completed);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+    let in_use = queue_gauge_values(&exporter, "awa.queue.worker.in_use", queue);
+    assert_eq!(in_use.last(), Some(&0), "in use samples: {in_use:?}");
+
+    client.shutdown(Duration::from_secs(5)).await;
+    let _ = meter_provider.shutdown();
+}

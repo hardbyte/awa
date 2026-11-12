@@ -21,6 +21,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
+- **Per-queue worker utilization metrics (#733).** Every runtime samples `awa.queue.worker.in_use` (worker slots held by a running handler or one waiting for finalizer capacity) and `awa.queue.worker.capacity` (`max_workers`, or in weighted mode `min_workers` plus the overflow pool) for each queue on each runtime snapshot, so a dashboard can plot utilization as in-use ÷ capacity. Waits grow steeply once utilization stays above about 0.8; see [sizing workers from utilization](docs/configuration.md#sizing-workers-from-utilization). The overview Grafana dashboard has a **Worker utilization by queue** panel.
 - **The queue-storage prune `lock_timeout` is configurable, and prune
   attempts are counted by outcome for every ring.** Prune (queue, lease and
   claim rings) and terminal-delta rollup take their exclusive locks under a
