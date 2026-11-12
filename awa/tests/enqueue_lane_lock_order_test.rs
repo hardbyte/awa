@@ -11,16 +11,22 @@
 //! with the lanes in the opposite input order is then observed waiting on the
 //! first lane's lock through `pg_locks`, and only then is the gate released.
 //!
+//! The first producer to use a lane also writes its `queue_lanes` row and
+//! takes its provisioning lock, and every producer must take the row first.
+//! Those tests stall the first producer inside the lane's sequence creation
+//! with a gate transaction holding an uncommitted sequence of the same name.
+//!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test enqueue_lane_lock_order_test -- --nocapture`
 
 use awa::audited_sql;
 use awa::model::{
-    insert_many, insert_many_copy_from_pool, insert_many_skip_unique_conflicts, AwaError,
-    QueueStorage, QueueStorageConfig,
+    insert_many, insert_many_copy_from_pool, insert_many_skip_unique_conflicts, insert_with,
+    AwaError, QueueStorage, QueueStorageConfig,
 };
-use awa::{InsertOpts, InsertParams, JobRow, UniqueOpts};
+use awa::{InsertOpts, InsertParams, JobArgs, JobRow, UniqueOpts};
 use awa_testing::setup;
+use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -521,4 +527,270 @@ async fn insert_many_copy_reserves_sharded_lanes_in_canonical_order() {
 #[tokio::test]
 async fn insert_many_copy_csv_reserves_sharded_lanes_in_canonical_order() {
     assert_batch_reserves_lanes_in_canonical_order(Producer::CopyLarge).await;
+}
+
+/// Producers that can be the first to use a lane.
+#[derive(Debug, Clone, Copy)]
+enum LaneCreator {
+    QueueStorageBatch,
+    PerRowInsert,
+    InsertMany,
+    Copy,
+}
+
+#[derive(Debug, Serialize, JobArgs)]
+struct LaneCreationJob {
+    queue: String,
+    seq: usize,
+}
+
+impl LaneCreator {
+    async fn run(self, pool: &PgPool, jobs: &[InsertParams]) -> Result<usize, AwaError> {
+        match self {
+            LaneCreator::QueueStorageBatch => {
+                let store = QueueStorage::new(QueueStorageConfig::default())?;
+                store.enqueue_params_batch(pool, jobs).await
+            }
+            LaneCreator::PerRowInsert => {
+                let mut tx = pool.begin().await?;
+                for params in jobs {
+                    let args = LaneCreationJob {
+                        queue: params.opts.queue.clone(),
+                        seq: params.args["seq"].as_u64().expect("seq arg") as usize,
+                    };
+                    insert_with(&mut *tx, &args, params.opts.clone()).await?;
+                }
+                tx.commit().await?;
+                Ok(jobs.len())
+            }
+            LaneCreator::InsertMany => insert_many(pool, jobs).await.map(|rows| rows.len()),
+            LaneCreator::Copy => insert_many_copy_from_pool(pool, jobs)
+                .await
+                .map(|rows| rows.len()),
+        }
+    }
+}
+
+/// Wait until a backend of the pool tagged `application_name` is blocked on a
+/// heavyweight lock.
+async fn wait_for_lock_waiter(pool: &PgPool, application_name: &str) {
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE application_name = $1
+                  AND state = 'active'
+                  AND wait_event_type = 'Lock'
+            )
+            "#,
+        )
+        .bind(application_name)
+        .fetch_one(pool)
+        .await
+        .expect("poll pg_stat_activity");
+        if waiting {
+            return;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "no {application_name} backend started waiting on a lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Run `creator` on its own pool, tagged `application_name`.
+async fn spawn_lane_creator(
+    creator: LaneCreator,
+    application_name: &str,
+    jobs: Vec<InsertParams>,
+) -> tokio::task::JoinHandle<Result<usize, AwaError>> {
+    let producer_pool =
+        setup::pool_with_url(&setup::database_url_with_app_name(application_name), 2).await;
+    tokio::spawn(async move { creator.run(&producer_pool, &jobs).await })
+}
+
+/// Two producers create the same two new lanes, A then B. A gate transaction
+/// holds an uncommitted copy of lane A's enqueue sequence, so the first
+/// producer stalls inside lane A's provisioning, after it has taken whatever
+/// it takes before creating the sequence. The second producer is then observed
+/// blocked on lane A before the gate rolls back. Both producers must commit.
+async fn assert_lane_creators_do_not_deadlock(first: LaneCreator, second: LaneCreator) {
+    let _guard = LANE_LOCK_TEST_GUARD.lock().await;
+    let (pool, _config) = setup_queue_storage().await;
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let first_queue = format!("lane_create_a_{suffix}");
+    let second_queue = format!("lane_create_b_{suffix}");
+
+    let sequence_name: String = sqlx::query_scalar(
+        "SELECT awa.queue_lane_sequence_name('queue_enqueue_seq', $1, 2::smallint, 0::smallint)",
+    )
+    .bind(&first_queue)
+    .fetch_one(&pool)
+    .await
+    .expect("derive lane sequence name");
+    let mut gate = pool.begin().await.expect("begin gate transaction");
+    sqlx::query(audited_sql(format!(
+        "CREATE SEQUENCE awa.\"{sequence_name}\" AS bigint START WITH 1 MINVALUE 1 CACHE 1"
+    )))
+    .execute(&mut *gate)
+    .await
+    .expect("gate lane sequence");
+
+    let jobs: Vec<InsertParams> = [&first_queue, &second_queue]
+        .into_iter()
+        .flat_map(|queue| (0..2).map(move |seq| job(queue, seq, false)))
+        .collect();
+
+    let first_name = format!("lane_first_{suffix}");
+    let first_task = spawn_lane_creator(first, &first_name, jobs.clone()).await;
+    wait_for_lock_waiter(&pool, &first_name).await;
+
+    let second_name = format!("lane_second_{suffix}");
+    let second_task = spawn_lane_creator(second, &second_name, jobs).await;
+    wait_for_lock_waiter(&pool, &second_name).await;
+
+    gate.rollback().await.expect("release gate");
+
+    let first_result = tokio::time::timeout(WAIT_DEADLINE, first_task)
+        .await
+        .expect("first producer finished")
+        .expect("first producer task");
+    let second_result = tokio::time::timeout(WAIT_DEADLINE, second_task)
+        .await
+        .expect("second producer finished")
+        .expect("second producer task");
+    assert_eq!(
+        first_result.unwrap_or_else(|err| panic!("{first:?} after {second:?}: {err}")),
+        4
+    );
+    assert_eq!(
+        second_result.unwrap_or_else(|err| panic!("{second:?} after {first:?}: {err}")),
+        4
+    );
+
+    for queue in [&first_queue, &second_queue] {
+        let stored: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM awa.ready_entries WHERE queue = $1")
+                .bind(queue)
+                .fetch_one(&pool)
+                .await
+                .expect("count stored jobs");
+        assert_eq!(stored, 4, "queue {queue}");
+    }
+}
+
+#[tokio::test]
+async fn queue_storage_batch_and_per_row_insert_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::QueueStorageBatch, LaneCreator::PerRowInsert)
+        .await;
+}
+
+#[tokio::test]
+async fn queue_storage_batch_and_insert_many_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::QueueStorageBatch, LaneCreator::InsertMany)
+        .await;
+}
+
+#[tokio::test]
+async fn queue_storage_batch_and_insert_many_copy_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::QueueStorageBatch, LaneCreator::Copy).await;
+}
+
+#[tokio::test]
+async fn per_row_insert_and_queue_storage_batch_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::PerRowInsert, LaneCreator::QueueStorageBatch)
+        .await;
+}
+
+#[tokio::test]
+async fn queue_storage_batches_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(
+        LaneCreator::QueueStorageBatch,
+        LaneCreator::QueueStorageBatch,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn per_row_inserts_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::PerRowInsert, LaneCreator::PerRowInsert)
+        .await;
+}
+
+#[tokio::test]
+async fn insert_many_copies_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::Copy, LaneCreator::Copy).await;
+}
+
+/// A direct `provision_lane` call that meets a producer's uncommitted lane row
+/// waits for it without holding the lane lock, which the producer takes next.
+#[tokio::test]
+async fn provision_lane_writes_the_lane_row_before_the_lane_lock() {
+    let _guard = LANE_LOCK_TEST_GUARD.lock().await;
+    let (pool, _config) = setup_queue_storage().await;
+
+    let queue = format!("provision_row_first_{}", Uuid::new_v4().simple());
+    let provisioning = provisioning_lock_key(&pool, &queue).await;
+
+    let mut producer = pool.begin().await.expect("begin producer transaction");
+    sqlx::query("INSERT INTO awa.queue_lanes (queue, priority) VALUES ($1, 2)")
+        .bind(&queue)
+        .execute(&mut *producer)
+        .await
+        .expect("write the lane row");
+
+    let provision = {
+        let pool = pool.clone();
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            sqlx::query("SELECT awa.provision_lane($1, 2::smallint, 0::smallint)")
+                .bind(queue)
+                .execute(&pool)
+                .await
+        })
+    };
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE wait_event_type = 'Lock'
+                  AND query LIKE 'SELECT awa.provision_lane(%'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("poll pg_stat_activity");
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "provision_lane never waited for the producer's lane row"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(provisioning)
+        .fetch_one(&mut *producer)
+        .await
+        .expect("try the lane lock");
+    assert!(
+        acquired,
+        "provision_lane must not hold the lane lock while it waits for the lane row"
+    );
+    producer.commit().await.expect("commit producer");
+    provision
+        .await
+        .expect("provision task")
+        .expect("provision_lane after the producer commits");
 }

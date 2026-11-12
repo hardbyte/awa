@@ -28512,9 +28512,121 @@ async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
     assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![0, 1]);
 }
 
+/// `(index name, partial)` for every GIN index on one claim partition.
+async fn claim_partition_gin_indexes(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    slot: i32,
+) -> Vec<(String, bool)> {
+    sqlx::query_as(
+        r#"
+        SELECT index_class.relname::text, index_meta.indpred IS NOT NULL
+        FROM pg_index AS index_meta
+        JOIN pg_class AS index_class ON index_class.oid = index_meta.indexrelid
+        JOIN pg_am AS method ON method.oid = index_class.relam
+        WHERE index_meta.indrelid = to_regclass(format('%I.lease_claim_batches_%s', $1::text, $2::int))
+          AND method.amname = 'gin'
+        ORDER BY 1
+        "#,
+    )
+    .bind(schema)
+    .bind(slot)
+    .fetch_all(pool)
+    .await
+    .expect("Failed to list claim partition GIN indexes")
+}
+
+/// Only a non-partial GIN index on `job_ids` counts as the claim batch index.
+/// A partial one under another name does not stop the real index being
+/// built; an index that already has the real index's name but another
+/// definition is reported and left in place, never dropped or mistaken for
+/// the real one. The check does not depend on the caller's
+/// `quote_all_identifiers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_batch_job_index_requires_a_full_job_ids_index() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cbji_shape";
+    let _store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    drop_claim_batch_job_index(&pool, schema, 0).await;
+    drop_claim_batch_job_index(&pool, schema, 1).await;
+
+    sqlx::raw_sql(audited_sql(format!(
+        "CREATE INDEX lease_claim_batches_0_job_ids_idx \
+           ON {schema}.lease_claim_batches_0 USING GIN (job_ids) \
+           WHERE cardinality(job_ids) > 1; \
+         CREATE INDEX operator_partial_job_ids \
+           ON {schema}.lease_claim_batches_1 USING GIN (job_ids) \
+           WHERE cardinality(job_ids) > 1"
+    )))
+    .execute(&pool)
+    .await
+    .expect("create partial job_ids indexes");
+
+    assert!(
+        !ensure_claim_batch_job_index(&pool, schema, 0).await,
+        "a partial index under the real index's name is not the real index"
+    );
+    assert_eq!(
+        claim_partition_gin_indexes(&pool, schema, 0).await,
+        vec![("lease_claim_batches_0_job_ids_idx".to_string(), true)],
+        "the conflicting index is left in place"
+    );
+
+    assert!(ensure_claim_batch_job_index(&pool, schema, 1).await);
+    assert_eq!(
+        claim_partition_gin_indexes(&pool, schema, 1).await,
+        vec![
+            ("lease_claim_batches_1_job_ids_idx".to_string(), false),
+            ("operator_partial_job_ids".to_string(), true),
+        ],
+        "a partial index under another name does not stand in for the real one"
+    );
+
+    // With the real index present the check returns before it would try
+    // to lock the partition, so a busy partition still reports indexed, even
+    // for a caller that quotes every identifier.
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.lease_claim_batches_1 IN ROW EXCLUSIVE MODE"
+    )))
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    let mut caller = pool.acquire().await.unwrap();
+    sqlx::query("SET quote_all_identifiers = on")
+        .execute(&mut *caller)
+        .await
+        .unwrap();
+    let indexed = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        ensure_claim_batch_job_index(&mut *caller, schema, 1),
+    )
+    .await
+    .expect("ensure_claim_batch_job_index must not wait for a busy partition");
+    sqlx::query("RESET quote_all_identifiers")
+        .execute(&mut *caller)
+        .await
+        .unwrap();
+    drop(caller);
+    writer.rollback().await.unwrap();
+    assert!(indexed, "the existing job_ids index must be recognised");
+}
+
 /// v054 is idempotent, installs the index function without building any
 /// index, and claim prune then indexes each slot it truncates. A schema
-/// without the function keeps working with unindexed lookups.
+/// without the function keeps working with unindexed lookups. v056 replaces
+/// an index function that predates it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_claim_batch_job_index_migration_leaves_indexing_to_claim_prune() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -28670,6 +28782,47 @@ async fn test_claim_batch_job_index_migration_leaves_indexing_to_claim_prune() {
     assert_eq!(
         claim_batch_job_index_slots(&pool, schema).await,
         Vec::<i32>::new()
+    );
+    assert_eq!(schema_versions().await, versions_before);
+
+    // An index function from before v056 is replaced by it.
+    sqlx::raw_sql(audited_sql(format!(
+        "CREATE OR REPLACE FUNCTION {schema}.ensure_claim_batch_job_index(p_slot INTEGER) \
+         RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER \
+         SET search_path = pg_catalog, pg_temp \
+         AS $$ BEGIN RETURN TRUE; END $$; \
+         DELETE FROM awa.schema_version WHERE version >= 56"
+    )))
+    .execute(&pool)
+    .await
+    .expect("install an earlier index function");
+    migrations::run(&pool).await.expect("apply v056");
+    let requires_full_index = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT routine.prosrc LIKE '%indpred IS NULL%' \
+                    AND 'quote_all_identifiers=off' = ANY (routine.proconfig) \
+             FROM pg_proc AS routine \
+             WHERE routine.oid = to_regprocedure($1)",
+        )
+        .bind(format!("{schema}.ensure_claim_batch_job_index(integer)"))
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(requires_full_index().await, "v056 replaces the function");
+    assert_eq!(schema_versions().await, versions_before);
+    let (_, _, v056_sql) = migrations::migration_sql_range(55, 56)
+        .pop()
+        .expect("v056 is a migration");
+    sqlx::raw_sql(audited_sql(v056_sql))
+        .execute(&pool)
+        .await
+        .expect("v056 re-applies cleanly");
+    assert!(requires_full_index().await);
+    assert_eq!(
+        claim_batch_job_index_slots(&pool, schema).await,
+        Vec::<i32>::new(),
+        "v056 builds no index"
     );
     assert_eq!(schema_versions().await, versions_before);
 

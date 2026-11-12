@@ -67,6 +67,8 @@ AwaRotationCadence.tla        ;; AwaRotationCadenceHardCap.cfg          ;; Targe
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueue.cfg     ;; pass ;; prepared lanes and producer lock order
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueueNumeric.cfg ;; NoDeadlock is violated ;; numeric stripe order inversion witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldStripedClaimDeadlock.cfg ;; NoDeadlock is violated ;; old striped-claim order witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg ;; NoDeadlock is violated ;; old QueueStorage lane-provisioning order witness
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrder.cfg            ;; pass ;; unique claim before enqueue lane
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrderBroken.cfg      ;; NoDeadlock is violated ;; old retry lane-before-claim witness
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKey.cfg             ;; pass ;; unique claims in key order

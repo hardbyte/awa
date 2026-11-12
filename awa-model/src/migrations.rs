@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 55;
+pub const CURRENT_VERSION: i32 = 58;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -307,6 +307,21 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Batch producer insert with a short enqueue lane lock window",
         &[V23_UP, V55_UP],
     ),
+    (
+        56,
+        "Recognise only a full job_ids index as the claim batch index",
+        &[V23_UP, V56_UP],
+    ),
+    (
+        57,
+        "Batch producer insert that gives way instead of deadlocking",
+        &[V23_UP, V57_UP],
+    ),
+    (
+        58,
+        "Provision a lane's row before its lock",
+        &[V23_UP, V58_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -370,6 +385,9 @@ const V52_UP: &str = include_str!("../migrations/v052_retained_job_output.sql");
 const V53_UP: &str = include_str!("../migrations/v053_definer_lane_provisioning.sql");
 const V54_UP: &str = include_str!("../migrations/v054_claim_batch_job_index.sql");
 const V55_UP: &str = include_str!("../migrations/v055_insert_jobs_compat_batch.sql");
+const V56_UP: &str = include_str!("../migrations/v056_claim_batch_job_index_shape.sql");
+const V57_UP: &str = include_str!("../migrations/v057_insert_jobs_compat_batch_bounded_wait.sql");
+const V58_UP: &str = include_str!("../migrations/v058_provision_lane_row_first.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

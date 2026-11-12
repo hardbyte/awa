@@ -1,5 +1,6 @@
 //! `insert_many` and `insert_many_copy` against a schema without
-//! `awa.insert_jobs_compat_batch` (migration v055), and the migration itself.
+//! `awa.insert_jobs_compat_batch` (migration v055), and the migrations that
+//! install it (v055) and replace its body (v057).
 //!
 //! A binary may run ahead of `awa migrate`. Generic `insert_many` keeps using
 //! the per-row function; COPY probes its own connection and uses the batch
@@ -25,6 +26,7 @@ use uuid::Uuid;
 
 const BATCH_FUNCTION: &str = "insert_jobs_compat_batch";
 const BATCH_FUNCTION_VERSION: i32 = 55;
+const BOUNDED_WAIT_VERSION: i32 = 57;
 const DROP_BATCH_FUNCTION: &str = "DROP FUNCTION awa.insert_jobs_compat_batch(text[], text[], \
      jsonb[], text[], smallint[], smallint[], timestamptz[], jsonb[], jsonb[], bytea[], text[], \
      text[], boolean)";
@@ -357,6 +359,87 @@ async fn exported_migration_reapplies_in_one_transaction() {
         .expect("COPY through the exported migration");
     assert_eq!(seqs(&copied), vec![0, 1, 2, 3]);
     assert_eq!(segments(pool, "exported").await, 1);
+
+    db.drop().await;
+}
+
+/// TRUE when the installed batch function has the body v057 installs, which
+/// bounds its lock waits and applies the caller's `lock_timeout` to each.
+async fn batch_function_gives_way(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT p.prosrc ~ 'v_bounded_until := clock_timestamp\\(\\) \\+ 4 \\* v_wait_budget' \
+                AND p.prosrc ~ 'v_caller_wait_ms BETWEEN 1 AND v_wait_ms' \
+         FROM pg_proc AS p WHERE p.oid = to_regprocedure(\
+         'awa.insert_jobs_compat_batch(text[],text[],jsonb[],text[],smallint[],smallint[],\
+         timestamptz[],jsonb[],jsonb[],bytea[],text[],text[],boolean)')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read the batch function body")
+}
+
+/// The database as v056 left it: the batch function has v055's body, which
+/// waited for a lane without bound while holding the batch's unique claims.
+async fn roll_back_to_the_unbounded_batch_function(pool: &PgPool) {
+    let (_, _, v055) =
+        migrations::migration_sql_range(BATCH_FUNCTION_VERSION - 1, BATCH_FUNCTION_VERSION)
+            .pop()
+            .expect("v055 is a migration");
+    sqlx::raw_sql(audited_sql(v055))
+        .execute(pool)
+        .await
+        .expect("install v055's body");
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= $1")
+        .bind(BOUNDED_WAIT_VERSION)
+        .execute(pool)
+        .await
+        .expect("roll the schema version back");
+}
+
+/// v057 replaces v055's body of the batch function: through `awa migrate`,
+/// and through the exported SQL applied twice in one explicit transaction and
+/// then over the installed function.
+#[tokio::test]
+async fn migration_replaces_the_unbounded_batch_function_body() {
+    let db = ScratchDatabase::create().await;
+    let pool = &db.pool;
+    assert!(batch_function_gives_way(pool).await);
+
+    roll_back_to_the_unbounded_batch_function(pool).await;
+    assert!(!batch_function_gives_way(pool).await);
+    migrations::run(pool).await.expect("migrate");
+    assert!(batch_function_gives_way(pool).await);
+    assert_eq!(
+        migrations::current_version(pool).await.expect("version"),
+        migrations::CURRENT_VERSION
+    );
+
+    let (_, _, sql) =
+        migrations::migration_sql_range(BOUNDED_WAIT_VERSION - 1, BOUNDED_WAIT_VERSION)
+            .pop()
+            .expect("v057 is a migration");
+    roll_back_to_the_unbounded_batch_function(pool).await;
+    sqlx::raw_sql(audited_sql(format!("BEGIN;\n{sql}\n{sql}\nCOMMIT;")))
+        .execute(pool)
+        .await
+        .expect("apply v057 twice in one transaction");
+    sqlx::raw_sql(audited_sql(sql))
+        .execute(pool)
+        .await
+        .expect("apply over the installed function");
+    assert!(batch_function_gives_way(pool).await);
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.schema_version WHERE version = $1")
+            .bind(BOUNDED_WAIT_VERSION)
+            .fetch_one(pool)
+            .await
+            .expect("read schema versions");
+    assert_eq!(recorded, 1);
+    let copied = insert_many_copy_from_pool(pool, &jobs("bounded", 0..4, true))
+        .await
+        .expect("COPY through the exported migration");
+    assert_eq!(seqs(&copied), vec![0, 1, 2, 3]);
+    assert_eq!(segments(pool, "bounded").await, 1);
 
     db.drop().await;
 }

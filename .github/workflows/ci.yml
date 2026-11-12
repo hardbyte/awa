@@ -259,7 +259,7 @@ jobs:
     # doctests run as `workspace`. Shard membership lives in
     # scripts/ci-test-shard.sh; the lint job runs its `check` mode so renames
     # can't silently drop coverage.
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
