@@ -15388,17 +15388,28 @@ async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
-        PruneOutcome::Pruned {
-            slot: 0,
-            carried_failed_rows: 2,
-            ..
-        } => {}
-        other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 2 }}, got {other:?}"),
+    // Prune takes its locks NOWAIT, so a background session on the slot
+    // (autovacuum, or a hosted Postgres's own workers) reports Blocked;
+    // retry as the maintenance loop would.
+    let prune_deadline = Instant::now() + scaled_timeout(Duration::from_secs(5));
+    loop {
+        match store
+            .prune_oldest(&pool, Duration::from_secs(3600))
+            .await
+            .expect("prune_oldest")
+        {
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 2,
+                ..
+            } => break,
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => {
+                panic!("expected Pruned {{ slot: 0, carried_failed_rows: 2 }}, got {other:?}")
+            }
+        }
     }
 
     // Only the two failed rows survive in done_entries, both widened to
