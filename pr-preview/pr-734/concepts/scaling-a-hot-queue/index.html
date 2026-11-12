@@ -2488,7 +2488,7 @@
 <li>Add claimers last, and only with evidence that one claim loop leaves workers idle.</li>
 </ol>
 <h2 id="measuring-the-result">Measuring the result<a class="headerlink" href="#measuring-the-result" title="Permanent link">&para;</a></h2>
-<p>Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Before spreading a queue, check whether it is short of workers instead: a queue whose <a href="../../configuration/#sizing-workers-from-utilization">utilization</a> stays above about 0.8 needs more <code>max_workers</code> or a split by service time, which no lane lever provides. The <code>awa.job.claimed</code> counter carries an <code>awa.enqueue.shard</code> attribute, so a dashboard can confirm that claims are spread evenly across shards.</p>
+<p>Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Before spreading a queue, check whether it is short of workers instead: a queue whose <a href="../../configuration/#sizing-workers-from-utilization">utilization</a> stays above about 0.8 needs more workers or a split by service time. Raising <code>max_workers</code> adds workers, and so does a <code>PartitionedQueue</code>, whose partitions each get their own; enqueue shards, stripes and claimers add none. The <code>awa.job.claimed</code> counter carries an <code>awa.enqueue.shard</code> attribute, so a dashboard can confirm that claims are spread evenly across shards.</p>
 <h2 id="related">Related<a class="headerlink" href="#related" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../lanes-and-claiming/">Lanes and claiming</a>: what a lane is and how a claim takes from it.</li>
