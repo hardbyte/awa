@@ -159,7 +159,9 @@ A handler's return value decides the outcome:
 
 An uncaught error is retryable by default. Make it terminal with
 `JobError::terminal(msg)` (Rust) or by raising a subclass of `awa.TerminalError`
-(Python). Automatic backoff is `min(2^attempt seconds + up to 25% jitter, 24h)`.
+(Python). Automatic backoff is `min(2^attempt seconds × a random factor in
+[0.5, 1.5), 24h)` from schema v059 (0.7); earlier schemas use
+`min(2^attempt seconds + up to 25% jitter, 24h)`.
 
 **The key gotcha:** use `Snooze` — not `RetryAfter` — for "not ready yet" polling
 or rate-limit waits, so `max_attempts` bounds genuine failures only.

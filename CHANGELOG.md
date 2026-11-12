@@ -44,6 +44,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `pruned`, `noop`, `blocked`, `skipped_active` and `already_pruned`. See
   [Configuration](docs/configuration.md#what-the-knobs-mean).
 
+### Changed
+
+- **Automatic retries spread wider (#733, migration v059).** `awa.backoff_duration` drew the delay before a retry from `2^attempt` seconds plus 0 to 25%, so jobs that failed together retried close together and hit a recovering dependency at once. The delay is now `2^attempt` seconds times a random factor in [0.5, 1.5), capped at 24 hours as before: the mean is the base delay (previously 12.5% above it), the shortest possible delay halves, and in a simulation of 10,000 jobs failing together the peak retry rate for each attempt falls by about 3.5×. v059 is one function replacement with no table locks, and binaries before it use the new delays as soon as it commits. See [v059](docs/upgrade-0.6-to-0.7.md#v059-wider-retry-jitter).
+
 ### Fixed
 
 - **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.

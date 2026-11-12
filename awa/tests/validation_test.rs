@@ -852,6 +852,51 @@ async fn t18b_backoff_duration_handles_subsecond_jitter() {
     .expect("backoff_duration should handle sub-second jitter without parse errors");
 }
 
+#[tokio::test]
+async fn t18c_backoff_duration_spreads_around_the_base_delay_up_to_the_cap() {
+    let pool = setup().await;
+    const SAMPLES: i32 = 5_000;
+    const CAP_SECS: f64 = 86_400.0;
+
+    for attempt in [1i16, 3, 6, 10, 17, 25] {
+        let (min, max, mean): (f64, f64, f64) = sqlx::query_as(
+            r#"
+            SELECT min(secs), max(secs), avg(secs)
+            FROM (
+                SELECT EXTRACT(EPOCH FROM awa.backoff_duration($1, 25::smallint))::float8 AS secs
+                FROM generate_series(1, $2)
+            ) AS samples
+            "#,
+        )
+        .bind(attempt)
+        .bind(SAMPLES)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let base = 2f64.powi(attempt as i32);
+        let lower = (0.5 * base).min(CAP_SECS);
+        let upper = (1.5 * base).min(CAP_SECS);
+        assert!(
+            min >= lower && max <= upper,
+            "attempt {attempt}: samples in [{min}, {max}], expected within [{lower}, {upper}]"
+        );
+        if upper < CAP_SECS {
+            // The draw covers the whole window, not only a slice near the base.
+            assert!(
+                min < 0.6 * base && max > 1.4 * base,
+                "attempt {attempt}: samples in [{min}, {max}] do not span [0.5, 1.5] x {base}"
+            );
+            assert!(
+                (mean / base - 1.0).abs() < 0.05,
+                "attempt {attempt}: mean {mean} is not close to the base delay {base}"
+            );
+        } else {
+            assert_eq!(max, CAP_SECS, "attempt {attempt}: the 24 h cap must bind");
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // T19: Snooze Semantics
 // ═══════════════════════════════════════════════════════════════════════
