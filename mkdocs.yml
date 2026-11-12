@@ -110,6 +110,8 @@ nav:
       - Lanes and claiming: concepts/lanes-and-claiming.md
       - Claims, receipts and leases: concepts/claims-receipts-and-leases.md
       - "Rings: rotation and prune": concepts/rings.md
+      - Batching: concepts/batching.md
+      - Scaling a hot queue: concepts/scaling-a-hot-queue.md
       - Job lifecycle: concepts/job-lifecycle.md
       - Transactional enqueue: concepts/transactional-enqueue.md
       - Interactive failure lab: concepts/failure-lab.md
