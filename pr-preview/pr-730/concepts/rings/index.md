@@ -46,7 +46,7 @@ Each ring is a fixed number of slots, each slot a set of partitions. The mainten
 | --- | --- | --: | --- |
 | Queue | ready jobs, their terminal history and the bookkeeping for both | 16 | every ready job in it has been claimed or cancelled, and every attempt claimed from it has ended |
 | Claim | claim receipts and their closures | 8 | every receipt in it has a closure |
-| Lease | leases of attempts waiting on a callback | 8 | it is empty |
+| Lease | leases of attempts waiting on a callback, or of every claim when `lease_claim_receipts` is off | 8 | it is empty |
 
 A job's rows are spread across the rings: its ready row and terminal history in one queue slot, its receipts in the claim slots that were current when it was claimed. So one attempt that is still running keeps both its queue slot and its claim slot from being pruned.
 
@@ -58,7 +58,7 @@ The leader runs each ring's maintenance about once a second. A non-empty slot be
 - its storage has reached 2 MiB, or
 - it has been current for 60 seconds.
 
-A busy queue therefore rotates every few seconds and a quiet one about once a minute. A ring with no rows anywhere stops rotating, which is expected on an idle queue. These thresholds are set with `ring_rotation_cadence`; see [Architecture: partition rotation and reclamation](../../architecture/index.md#partition-rotation-and-reclamation).
+A busy queue therefore rotates every few seconds and a quiet one about once a minute. A ring with nothing left to seal or prune stops rotating, which is expected on an idle queue: the queue and claim rings stop once no slot holds rows, and the lease ring once no slot holds reclaimable storage. These thresholds are set with `ring_rotation_cadence`; see [Architecture: partition rotation and reclamation](../../architecture/index.md#partition-rotation-and-reclamation).
 
 ## What holds a ring back
 
@@ -66,8 +66,8 @@ A busy queue therefore rotates every few seconds and a quiet one about once a mi
 | --- | --- | --- |
 | A job that runs for a long time | its slots stay sealed until it finishes; the rings move again afterwards | expected; give long jobs a realistic `deadline_duration` so a hung one is rescued |
 | A worker killed with jobs in flight | the claim ring reports `skipped_busy` until rescue closes the dead worker's attempts | see [claim ring stops rotating](../../troubleshooting/index.md#claim-ring-stops-rotating-after-a-runtime-is-killed) |
-| A long transaction on the primary | prune is blocked or skipped while the transaction holds old row versions or locks | keep analytical reads off the primary; see [MVCC discipline](../../deploying-on-managed-postgres/index.md#mvcc-discipline-long-running-readers-pin-the-whole-database) |
-| Readers holding locks on a sealed partition | prune reports `blocked` and retries | usually transient; persistent blocking points at a long-lived reader |
+| A long transaction that has read a ring's tables | it holds a lock on their partitions until it ends, so prune of those partitions reports `blocked` and retries | end or shorten the transaction; keep analytical reads off the primary |
+| A long transaction that only holds an old snapshot | prune is not held back, but dead rows build up in the ordinary tables outside the rings | see [MVCC discipline](../../deploying-on-managed-postgres/index.md#mvcc-discipline-long-running-readers-pin-the-whole-database) |
 
 A ring that stops moving does not lose work or stop dispatching: jobs are still claimed and finished, and the current slot simply grows until the ring can move again. Watch `awa.ring.generation` per ring and `awa.maintenance.rotate.attempts` and `awa.maintenance.prune.attempts` by outcome; a generation that stays flat while rows accumulate is the condition to alert on.
 

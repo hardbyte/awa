@@ -2303,9 +2303,9 @@
 <li><strong>Claim.</strong> A worker takes the next job from the head of a lane and records a <a href="claims-receipts-and-leases/">claim receipt</a>. The claim increments the job's <code>run_lease</code>, the number that identifies this attempt.</li>
 <li><strong>Run.</strong> The handler runs while the worker heartbeats the attempt. If the handler waits for an external callback, the attempt also gets a lease row that holds the callback state.</li>
 <li><strong>Finish.</strong> Completion, failure, cancellation, retry or snooze is written only if the attempt's <code>run_lease</code> is still current. A retry or snooze goes back to deferred jobs.</li>
-<li><strong>Reclaim.</strong> The rows a job left behind sit in ring partitions. Once every job in an old slot has finished, the maintenance leader <a href="rings/">truncates the whole slot</a> instead of deleting rows one at a time.</li>
+<li><strong>Reclaim.</strong> The rows a job left behind sit in ring partitions. Once every job in an old slot has been claimed or cancelled and every attempt claimed from it has ended, the maintenance leader <a href="rings/">truncates the whole slot</a> instead of deleting rows one at a time.</li>
 </ol>
-<p>If a worker stops heartbeating, the maintenance leader rescues its attempts and the jobs run again. That makes delivery <strong>at least once</strong>: <code>run_lease</code> stops a stale worker from overwriting a newer attempt, but it cannot undo a side effect the stale worker already caused. Handlers that call external systems need an idempotency key; see the <a href="failure-lab/">failure lab</a>.</p>
+<p>If a worker stops heartbeating, the maintenance leader rescues its attempts. Each job runs again if it has attempts left, and otherwise fails or moves to the dead-letter queue. That makes delivery <strong>at least once</strong>: <code>run_lease</code> stops a stale worker from overwriting a newer attempt, but it cannot undo a side effect the stale worker already caused. Handlers that call external systems need an idempotency key; see the <a href="failure-lab/">failure lab</a>.</p>
 <h2 id="three-rings">Three rings<a class="headerlink" href="#three-rings" title="Permanent link">&para;</a></h2>
 <p>Hot storage is split into three rings of partitions, each rotated and pruned independently:</p>
 <table>
@@ -2329,7 +2329,7 @@
 </tr>
 <tr>
 <td>Lease</td>
-<td>leases for attempts waiting on an external callback</td>
+<td>leases for attempts waiting on an external callback, or for every claim when <code>lease_claim_receipts</code> is off</td>
 <td style="text-align: right;">8</td>
 </tr>
 </tbody>
@@ -2356,7 +2356,7 @@
 </tr>
 <tr>
 <td><a href="rings/">Rings: rotation and prune</a></td>
-<td>How storage stays bounded without vacuuming hot tables, and what stops a ring from moving</td>
+<td>How storage is reclaimed without vacuuming hot tables, and what stops a ring from moving</td>
 </tr>
 <tr>
 <td><a href="job-lifecycle/">Job lifecycle</a></td>

@@ -2417,7 +2417,7 @@
 
 
 <h1 id="claims-receipts-and-leases">Claims, receipts and leases<a class="headerlink" href="#claims-receipts-and-leases" title="Permanent link">&para;</a></h1>
-<p>A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: most attempts only append rows, and only an attempt that waits for an external callback gets a row that is updated in place.</p>
+<p>A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that waits for an external callback gets a lease.</p>
 <h2 id="run_lease-the-attempts-number"><code>run_lease</code>: the attempt's number<a class="headerlink" href="#run_lease-the-attempts-number" title="Permanent link">&para;</a></h2>
 <p>Every claim increments the job's <code>run_lease</code>. Every later write for that attempt (heartbeat, progress, completion, retry, snooze, cancel, callback) names the job and its <code>run_lease</code>, and is applied only if that attempt is still open. A write for a closed attempt changes nothing.</p>
 <div class="awa-diagram">
@@ -2435,7 +2435,8 @@
 <p><strong>Terminal history.</strong> Finishing appends the outcome to the queue ring, in the same slot as the job's ready row. Successful short jobs share one compact row per completion batch. Read finished jobs through <code>terminal_jobs</code> or the admin API, not the physical tables.</p>
 <p>The common path, claim then finish, therefore only appends rows to partitions that are later truncated whole. That keeps the hot tables free of dead rows; see <a href="../rings/">rings</a>.</p>
 <h2 id="heartbeats">Heartbeats<a class="headerlink" href="#heartbeats" title="Permanent link">&para;</a></h2>
-<p>While a handler runs, its worker heartbeats each attempt it holds, every <code>heartbeat_interval</code> (30 s by default). Heartbeats come from the worker's runtime, not from the handler, so a handler that blocks or computes for a long time still keeps its attempt alive. A heartbeat proves the process is alive; it does not extend the queue's <code>deadline_duration</code>, which bounds the attempt however healthy the worker is.</p>
+<p>While a handler runs, its worker heartbeats each attempt it holds, every <code>heartbeat_interval</code> (30 s by default). Heartbeats come from a task on the worker's async runtime, not from the handler. A Python handler that blocks, or a Rust handler that awaits a long operation, still keeps its attempt alive. A Rust handler that blocks the runtime's threads stops heartbeats too and its attempt can be rescued while it runs, so run blocking work with <code>spawn_blocking</code> and give it a timeout.</p>
+<p>A heartbeat proves the process is alive; it does not extend the queue's <code>deadline_duration</code>, which bounds the attempt however healthy the worker is. A queue with <code>deadline_duration</code> set to zero has no deadline, and a hung handler holds its attempt for as long as its worker keeps heartbeating.</p>
 <h2 id="rescue">Rescue<a class="headerlink" href="#rescue" title="Permanent link">&para;</a></h2>
 <p>The maintenance leader closes attempts that can no longer finish on their own:</p>
 <table>
@@ -2454,7 +2455,7 @@
 </tr>
 <tr>
 <td>Deadline</td>
-<td>the attempt has run longer than the queue's <code>deadline_duration</code></td>
+<td>the attempt has run longer than the queue's <code>deadline_duration</code>, unless that is zero</td>
 <td>per queue</td>
 </tr>
 <tr>

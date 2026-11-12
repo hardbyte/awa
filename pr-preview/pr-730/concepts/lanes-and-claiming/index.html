@@ -2395,7 +2395,7 @@
 
 
 <h1 id="lanes-and-claiming">Lanes and claiming<a class="headerlink" href="#lanes-and-claiming" title="Permanent link">&para;</a></h1>
-<p>Every runnable job sits in a <strong>lane</strong>: an ordered sequence for one <code>(queue, priority, enqueue_shard)</code>. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed and waiting.</p>
+<p>Every runnable job sits in a <strong>lane</strong>: an ordered sequence for one <code>(queue, priority, enqueue_shard)</code>. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed, and waits for a worker unless it was cancelled first.</p>
 <div class="awa-diagram">
 <p><img alt="Three lanes of one queue, each a numbered sequence with a claim cursor and an enqueue head" src="../../assets/how-it-works/lanes.svg" /></p>
 </div>
@@ -2408,14 +2408,15 @@
 <ol>
 <li>locks the lane's claim cursor with <code>SKIP LOCKED</code>, so a worker never waits behind another worker on the same lane, it moves on;</li>
 <li>reads the next committed jobs after the cursor;</li>
-<li>writes <a href="../claims-receipts-and-leases/">claim receipts</a> for them and advances the cursor past them.</li>
+<li>writes <a href="../claims-receipts-and-leases/">claim receipts</a> for them, or leases when <code>lease_claim_receipts</code> is off, and advances the cursor past them.</li>
 </ol>
 <p>Claiming reads ready rows by position and never rewrites them. A ready row is written once and stays unchanged until its slot is <a href="../rings/">truncated</a>; the cursor alone records how far the lane has been consumed.</p>
 <h2 id="priority-and-ordering">Priority and ordering<a class="headerlink" href="#priority-and-ordering" title="Permanent link">&para;</a></h2>
-<p>Priority runs from 1 (first) to 4. A worker prefers the lane whose head has the best <strong>effective</strong> priority, which improves the longer the head job has waited, so low-priority work cannot starve. See <a href="../../configuration/#job-priority-and-aging">Job priority and aging</a>. Within one lane, jobs come out in sequence order.</p>
+<p>Priority runs from 1 (first) to 4. A worker prefers the lane whose head has the best <strong>effective</strong> priority, which improves the longer the head job has waited, so low-priority work cannot starve unless the queue turns aging off. See <a href="../../configuration/#job-priority-and-aging">Job priority and aging</a>. Within one lane, jobs come out in sequence order.</p>
 <p>Ordering is only promised within a lane:</p>
 <ul>
-<li>Two jobs on the same queue and priority, enqueued by separate transactions, come out in commit order when the queue has one shard.</li>
+<li>Two jobs on the same queue and priority, enqueued ready to run by separate transactions, come out in commit order when the queue has one shard.</li>
+<li>A scheduled, snoozed or retrying job joins its lane when it is promoted, behind whatever was enqueued before then.</li>
 <li>With several enqueue shards, each shard is its own lane. Order holds within a shard, not across shards.</li>
 <li>Jobs at different priorities are ordered by effective priority, not by when they were enqueued.</li>
 </ul>

@@ -14,9 +14,9 @@ AWA is a library and a PostgreSQL schema, not a separate broker. Producers, work
 2. **Claim.** A worker takes the next job from the head of a lane and records a [claim receipt](claims-receipts-and-leases/index.md). The claim increments the job's `run_lease`, the number that identifies this attempt.
 3. **Run.** The handler runs while the worker heartbeats the attempt. If the handler waits for an external callback, the attempt also gets a lease row that holds the callback state.
 4. **Finish.** Completion, failure, cancellation, retry or snooze is written only if the attempt's `run_lease` is still current. A retry or snooze goes back to deferred jobs.
-5. **Reclaim.** The rows a job left behind sit in ring partitions. Once every job in an old slot has finished, the maintenance leader [truncates the whole slot](rings/index.md) instead of deleting rows one at a time.
+5. **Reclaim.** The rows a job left behind sit in ring partitions. Once every job in an old slot has been claimed or cancelled and every attempt claimed from it has ended, the maintenance leader [truncates the whole slot](rings/index.md) instead of deleting rows one at a time.
 
-If a worker stops heartbeating, the maintenance leader rescues its attempts and the jobs run again. That makes delivery **at least once**: `run_lease` stops a stale worker from overwriting a newer attempt, but it cannot undo a side effect the stale worker already caused. Handlers that call external systems need an idempotency key; see the [failure lab](failure-lab/index.md).
+If a worker stops heartbeating, the maintenance leader rescues its attempts. Each job runs again if it has attempts left, and otherwise fails or moves to the dead-letter queue. That makes delivery **at least once**: `run_lease` stops a stale worker from overwriting a newer attempt, but it cannot undo a side effect the stale worker already caused. Handlers that call external systems need an idempotency key; see the [failure lab](failure-lab/index.md).
 
 ## Three rings
 
@@ -26,7 +26,7 @@ Hot storage is split into three rings of partitions, each rotated and pruned ind
 | --- | --- | --: |
 | Queue | ready jobs and the terminal history of jobs claimed from them | 16 |
 | Claim | claim receipts and the evidence that each attempt ended | 8 |
-| Lease | leases for attempts waiting on an external callback | 8 |
+| Lease | leases for attempts waiting on an external callback, or for every claim when `lease_claim_receipts` is off | 8 |
 
 Deferred jobs, the dead-letter queue and the small control tables (lane cursors, ring cursors, runtime snapshots) are ordinary tables outside the rings.
 
@@ -40,7 +40,7 @@ Every worker process dispatches and heartbeats its own attempts. One of them als
 | --- | --- |
 | [Lanes and claiming](lanes-and-claiming/index.md) | How jobs are ordered, how a producer's commit makes them visible, and how workers pick the next one |
 | [Claims, receipts and leases](claims-receipts-and-leases/index.md) | What a claim writes, how heartbeats and rescue work, and how `run_lease` fences out stale workers |
-| [Rings: rotation and prune](rings/index.md) | How storage stays bounded without vacuuming hot tables, and what stops a ring from moving |
+| [Rings: rotation and prune](rings/index.md) | How storage is reclaimed without vacuuming hot tables, and what stops a ring from moving |
 | [Job lifecycle](job-lifecycle/index.md) | Every state a job can be in and how handlers move it between them |
 | [Transactional enqueue](transactional-enqueue/index.md) | Committing a job with the business write that caused it |
 | [Architecture](../architecture/index.md) | The reference description of every table, invariant and maintenance path |

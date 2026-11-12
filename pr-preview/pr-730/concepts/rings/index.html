@@ -2473,7 +2473,7 @@
 </tr>
 <tr>
 <td>Lease</td>
-<td>leases of attempts waiting on a callback</td>
+<td>leases of attempts waiting on a callback, or of every claim when <code>lease_claim_receipts</code> is off</td>
 <td style="text-align: right;">8</td>
 <td>it is empty</td>
 </tr>
@@ -2487,7 +2487,7 @@
 <li>its storage has reached 2 MiB, or</li>
 <li>it has been current for 60 seconds.</li>
 </ul>
-<p>A busy queue therefore rotates every few seconds and a quiet one about once a minute. A ring with no rows anywhere stops rotating, which is expected on an idle queue. These thresholds are set with <code>ring_rotation_cadence</code>; see <a href="../../architecture/#partition-rotation-and-reclamation">Architecture: partition rotation and reclamation</a>.</p>
+<p>A busy queue therefore rotates every few seconds and a quiet one about once a minute. A ring with nothing left to seal or prune stops rotating, which is expected on an idle queue: the queue and claim rings stop once no slot holds rows, and the lease ring once no slot holds reclaimable storage. These thresholds are set with <code>ring_rotation_cadence</code>; see <a href="../../architecture/#partition-rotation-and-reclamation">Architecture: partition rotation and reclamation</a>.</p>
 <h2 id="what-holds-a-ring-back">What holds a ring back<a class="headerlink" href="#what-holds-a-ring-back" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -2509,14 +2509,14 @@
 <td>see <a href="../../troubleshooting/#claim-ring-stops-rotating-after-a-runtime-is-killed">claim ring stops rotating</a></td>
 </tr>
 <tr>
-<td>A long transaction on the primary</td>
-<td>prune is blocked or skipped while the transaction holds old row versions or locks</td>
-<td>keep analytical reads off the primary; see <a href="../../deploying-on-managed-postgres/#mvcc-discipline-long-running-readers-pin-the-whole-database">MVCC discipline</a></td>
+<td>A long transaction that has read a ring's tables</td>
+<td>it holds a lock on their partitions until it ends, so prune of those partitions reports <code>blocked</code> and retries</td>
+<td>end or shorten the transaction; keep analytical reads off the primary</td>
 </tr>
 <tr>
-<td>Readers holding locks on a sealed partition</td>
-<td>prune reports <code>blocked</code> and retries</td>
-<td>usually transient; persistent blocking points at a long-lived reader</td>
+<td>A long transaction that only holds an old snapshot</td>
+<td>prune is not held back, but dead rows build up in the ordinary tables outside the rings</td>
+<td>see <a href="../../deploying-on-managed-postgres/#mvcc-discipline-long-running-readers-pin-the-whole-database">MVCC discipline</a></td>
 </tr>
 </tbody>
 </table>
