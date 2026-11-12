@@ -3195,6 +3195,18 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>ring, phase</td>
 <td>Successful destructive prune time split into <code>lock</code>, <code>truncate</code>, and <code>commit</code></td>
 </tr>
+<tr>
+<td><code>awa.maintenance.rescue.pass_size</code></td>
+<td>Histogram</td>
+<td>rescue_kind, rescue_pass_end</td>
+<td>Attempts rescued per queue-storage rescue pass, and why the pass stopped (<code>drained</code>, <code>time_budget</code>, <code>row_limit</code>, <code>owners_unconfirmed</code>, <code>error</code>)</td>
+</tr>
+<tr>
+<td><code>awa.maintenance.rescue.oldest_attempt_age</code></td>
+<td>Gauge (s)</td>
+<td>rescue_kind</td>
+<td>Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; <code>0</code> when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader</td>
+</tr>
 </tbody>
 </table>
 <h3 id="heartbeat">Heartbeat<a class="headerlink" href="#heartbeat" title="Permanent link">&para;</a></h3>

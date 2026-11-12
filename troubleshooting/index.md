@@ -314,6 +314,32 @@ If long-running jobs are expected, remember:
 
 If a job really needs `20m`, set a longer deadline for that queue.
 
+## Claim Ring Stops Rotating After A Runtime Is Killed
+
+Symptoms on queue storage, usually after a high-throughput runtime was OOM-killed or lost without a graceful shutdown:
+
+- `awa.maintenance.rotate.attempts` for the claim ring reports `skipped_busy` with blocker `claim.rows`, and `awa.ring.generation` for the claim ring stops advancing
+- queue prune skips the slot those claims reference with reason `queue.unclosed_claim_refs`, and the queue ring stops wrapping too
+- the current claim slot keeps growing
+- jobs the dead runtime held wait well past `heartbeat_staleness` before they run again
+
+The dead runtime's claims stay open until rescue closes them, and the ring cannot rotate back into a slot that still holds open claims. Rescue drains such a backlog in passes of 500-attempt batches ([Draining a backlog of abandoned claims](../configuration/index.md#rescue-backlog)). To see where it is:
+
+- `awa.maintenance.rescue.oldest_attempt_age` by `awa.rescue.kind` shows how old the attempts rescue is closing are. It should fall towards `heartbeat_staleness` (or the queue's deadline) as the backlog drains.
+- `awa.maintenance.rescue.pass_size` by `awa.rescue.pass_end` shows why passes stop. `time_budget` or `row_limit` means a drain is running at its configured rate. `owners_unconfirmed` means stale-heartbeat rescue is waiting for evidence that the claims' runtime is gone and is taking one batch per ordinary rescue interval.
+
+If stale-heartbeat passes stay at `owners_unconfirmed`, look at the runtime snapshots:
+
+```sql
+SELECT instance_id, hostname, last_seen_at, snapshot_interval_ms, heartbeat_alive
+FROM awa.runtime_instances
+ORDER BY last_seen_at DESC;
+```
+
+A snapshot that is no longer fresh but is younger than `heartbeat_staleness` holds acceleration back, as does a fresh snapshot with `heartbeat_alive = false`. The unconfirmed phase requires `3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness` for every runtime; otherwise a stalled live runtime can pass directly from fresh to gone ([owner-evidence limits](../configuration/index.md#rescue-backlog)). The drain also needs `heartbeat_rescue_interval` below half of `heartbeat_staleness`. With the defaults, acceleration usually starts about 3–3.5 minutes after the last runtime snapshot, and a leadership change restarts the evidence window. Deadline rescue is not held back this way, so queues with a `deadline_duration` drain through it regardless.
+
+To drain faster, raise `rescue_pass_budget` (at most half the rescue interval, so 15 s by default) and `rescue_pass_max_rows`, keeping in mind that a pass holds the maintenance leader for its budget and can exceed `rescue_pass_max_rows` by one final batch of closures and retry rows. The [measured rates](../configuration/index.md#rescue-backlog) show what to expect. Retry due times can cluster; this cap does not bound promotion throughput.
+
 ## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means
