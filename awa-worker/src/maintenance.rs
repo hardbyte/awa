@@ -419,6 +419,8 @@ struct RescueSweepCursor {
     first: Option<(DateTime<Utc>, i64, i64)>,
     previous: Option<(DateTime<Utc>, i64, i64)>,
     wrapped: bool,
+    /// The latest scan left its window unfilled.
+    drained: bool,
     done: bool,
 }
 
@@ -447,7 +449,11 @@ impl RescueSweep {
         cursors.resize_with(progress.cursors.len(), RescueSweepCursor::default);
         for (cursor, progress) in cursors.iter_mut().zip(progress.cursors) {
             if !progress.saturated {
+                cursor.drained = true;
                 cursor.done = true;
+            } else if cursor.drained {
+                // A drained cursor whose window fills again starts a new sweep.
+                *cursor = RescueSweepCursor::default();
             }
             if let Some(position) = progress.position {
                 if let Some(first) = cursor.first {
@@ -5376,6 +5382,42 @@ mod tests {
                 }],
             });
         }
+        assert_eq!(sweep.idle_slots, vec![0]);
+    }
+
+    /// A slot with two cursors is idle only while both are finished. One
+    /// that drained and then filled its window again is not finished when
+    /// the other drains.
+    #[test]
+    fn rescue_sweep_keeps_a_slot_whose_drained_cursor_fills_again() {
+        let stamp = Utc::now();
+        let observe = |sweep: &mut RescueSweep, first: (i64, bool), second: (i64, bool)| {
+            sweep.observe(RescueScanProgress {
+                slot: 0,
+                cursors: [first, second]
+                    .into_iter()
+                    .map(|(id, saturated)| awa_model::RescueScanCursor {
+                        position: Some((stamp, id, 0)),
+                        saturated,
+                    })
+                    .collect(),
+            });
+        };
+        let mut sweep = RescueSweep::default();
+        observe(&mut sweep, (10, false), (100, true));
+        assert!(sweep.cursors[&0][0].done);
+        assert!(sweep.idle_slots.is_empty());
+        observe(&mut sweep, (20, true), (200, true));
+        assert!(
+            !sweep.cursors[&0][0].done,
+            "a cursor whose window fills again has work left"
+        );
+        observe(&mut sweep, (30, true), (300, false));
+        assert!(
+            sweep.idle_slots.is_empty(),
+            "the slot stays active while its first cursor is saturated"
+        );
+        observe(&mut sweep, (40, false), (300, false));
         assert_eq!(sweep.idle_slots, vec![0]);
     }
 
