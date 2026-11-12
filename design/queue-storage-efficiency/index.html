@@ -680,6 +680,12 @@
       
         
       
+        
+      
+        
+      
+        
+      
     
     
     
@@ -732,6 +738,90 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -3085,61 +3175,58 @@ and the idle-prune test now asserts that an empty child's relfilenode is
 left alone.</p>
 <h2 id="4-flows">4. Flows<a class="headerlink" href="#4-flows" title="Permanent link">&para;</a></h2>
 <h3 id="41-wake-up-before-and-after-p1">4.1 Wake-up: before and after P1<a class="headerlink" href="#41-wake-up-before-and-after-p1" title="Permanent link">&para;</a></h3>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>flowchart LR
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>  subgraph before["Before: one LISTEN connection per queue dispatcher"]
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    P[Producer commit&lt;br/&gt;NOTIFY awa:q1 … awa:qN] --&gt; L1[Listener q1]
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    P --&gt; L2[Listener q2]
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    P --&gt; LN[Listener qN]
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    L1 --&gt; D1[Dispatcher q1&lt;br/&gt;poll every 200 ms]
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    L2 --&gt; D2[Dispatcher q2&lt;br/&gt;poll every 200 ms]
-</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    LN --&gt; DN[Dispatcher qN&lt;br/&gt;poll every 200 ms]
-</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    D1 &amp; D2 &amp; DN --&gt; PG[(Postgres&lt;br/&gt;N LISTEN backends&lt;br/&gt;N claims per 200 ms)]
-</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>  end
-</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>  subgraph after["After: one hub, per-queue Notify, bounded claims"]
-</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    P2[Producer commit] --&gt; H[QueueNotifyHub&lt;br/&gt;one LISTEN on all channels]
-</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    H --&gt;|notify_one| W1[Notify q1] --&gt; E1[Dispatcher q1&lt;br/&gt;poll 200 ms → 2 s when empty]
-</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>    H --&gt;|notify_one| WN[Notify qN] --&gt; EN[Dispatcher qN]
-</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>    E1 &amp; EN --&gt; G{{claim gate&lt;br/&gt;max_concurrent_claims}} --&gt; PG2[(Postgres&lt;br/&gt;1 LISTEN backend)]
-</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>  end
-</span></code></pre></div>
+<pre class="mermaid"><code>flowchart LR
+  subgraph before["Before: one LISTEN connection per queue dispatcher"]
+    P[Producer commit&lt;br/&gt;NOTIFY awa:q1 … awa:qN] --&gt; L1[Listener q1]
+    P --&gt; L2[Listener q2]
+    P --&gt; LN[Listener qN]
+    L1 --&gt; D1[Dispatcher q1&lt;br/&gt;poll every 200 ms]
+    L2 --&gt; D2[Dispatcher q2&lt;br/&gt;poll every 200 ms]
+    LN --&gt; DN[Dispatcher qN&lt;br/&gt;poll every 200 ms]
+    D1 &amp; D2 &amp; DN --&gt; PG[(Postgres&lt;br/&gt;N LISTEN backends&lt;br/&gt;N claims per 200 ms)]
+  end
+  subgraph after["After: one hub, per-queue Notify, bounded claims"]
+    P2[Producer commit] --&gt; H[QueueNotifyHub&lt;br/&gt;one LISTEN on all channels]
+    H --&gt;|notify_one| W1[Notify q1] --&gt; E1[Dispatcher q1&lt;br/&gt;poll 200 ms → 2 s when empty]
+    H --&gt;|notify_one| WN[Notify qN] --&gt; EN[Dispatcher qN]
+    E1 &amp; EN --&gt; G{{claim gate&lt;br/&gt;max_concurrent_claims}} --&gt; PG2[(Postgres&lt;br/&gt;1 LISTEN backend)]
+  end</code></pre>
 <h3 id="42-closing-an-attempt-on-failure-before-and-after-p2">4.2 Closing an attempt on failure: before and after P2<a class="headerlink" href="#42-closing-an-attempt-on-failure-before-and-after-p2" title="Permanent link">&para;</a></h3>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>sequenceDiagram
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>  participant W as Worker
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>  participant S as Store
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>  participant PG as Postgres
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>  Note over W,PG: Before
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>  W-&gt;&gt;S: fail_retryable(job_id, run_lease)
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>  S-&gt;&gt;PG: advisory xact lock (job_id, run_lease)
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>  S-&gt;&gt;PG: unnest ALL lease_claim_batches, 6 anti-joins, FOR UPDATE batch row
-</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>  PG--&gt;&gt;S: target (O(open batches × 512), waits on other closers of the batch)
-</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>  S-&gt;&gt;PG: INSERT closure batch
-</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>  S-&gt;&gt;PG: hydrate: unnest ALL batches again for a rescue closure
-</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>  S-&gt;&gt;PG: INSERT deferred_jobs
-</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>  Note over W,PG: After
-</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>  W-&gt;&gt;S: fail_retryable_with_claim(job_id, run_lease, ClaimedEntry)
-</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>  S-&gt;&gt;PG: advisory xact lock (job_id, run_lease)
-</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>  S-&gt;&gt;PG: lease_claim_batches_{slot} WHERE (claim_slot, batch_id) = PK, item [index], indexed evidence probes
-</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>  PG--&gt;&gt;S: target (O(1), no batch row lock)
-</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>  S-&gt;&gt;PG: INSERT closure batch
-</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a>  S-&gt;&gt;PG: INSERT deferred_jobs
-</span></code></pre></div>
+<pre class="mermaid"><code>sequenceDiagram
+  participant W as Worker
+  participant S as Store
+  participant PG as Postgres
+  Note over W,PG: Before
+  W-&gt;&gt;S: fail_retryable(job_id, run_lease)
+  S-&gt;&gt;PG: advisory xact lock (job_id, run_lease)
+  S-&gt;&gt;PG: unnest ALL lease_claim_batches, 6 anti-joins, FOR UPDATE batch row
+  PG--&gt;&gt;S: target (O(open batches × 512), waits on other closers of the batch)
+  S-&gt;&gt;PG: INSERT closure batch
+  S-&gt;&gt;PG: hydrate: unnest ALL batches again for a rescue closure
+  S-&gt;&gt;PG: INSERT deferred_jobs
+  Note over W,PG: After
+  W-&gt;&gt;S: fail_retryable_with_claim(job_id, run_lease, ClaimedEntry)
+  S-&gt;&gt;PG: advisory xact lock (job_id, run_lease)
+  S-&gt;&gt;PG: lease_claim_batches_{slot} WHERE (claim_slot, batch_id) = PK, item [index], indexed evidence probes
+  PG--&gt;&gt;S: target (O(1), no batch row lock)
+  S-&gt;&gt;PG: INSERT closure batch
+  S-&gt;&gt;PG: INSERT deferred_jobs</code></pre>
 <h3 id="43-claim-and-cursor-today-and-with-p5p6">4.3 Claim and cursor: today and with P5+P6<a class="headerlink" href="#43-claim-and-cursor-today-and-with-p5p6" title="Permanent link">&para;</a></h3>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>flowchart TB
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>  subgraph today["Today"]
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    A[BEGIN sync_commit=off] --&gt; B[lane probe&lt;br/&gt;FOR UPDATE SKIP LOCKED head]
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    B --&gt; C[spent-prefix check&lt;br/&gt;tombstones / attempt batches]
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    C --&gt; D[claim CTE over partitioned parents&lt;br/&gt;custom plan every call]
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    D --&gt; E[COMMIT]
-</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    E --&gt; F[BEGIN: FOR UPDATE head,&lt;br/&gt;setval claim cursor&lt;br/&gt;evidence-guarded]
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    F --&gt; G[COMMIT]
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>  end
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>  subgraph proposed["With P5 + P6"]
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    A2[BEGIN sync_commit=off] --&gt; B2[lane probe&lt;br/&gt;FOR UPDATE SKIP LOCKED head]
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    B2 --&gt; C2[catch up cursor from visible&lt;br/&gt;attempt-batch evidence]
-</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>    C2 --&gt; D2[claim CTE on ready_entries_slot /&lt;br/&gt;lease_claim_batches_slot&lt;br/&gt;generic plan, invalidated 1/16 rotations]
-</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>    D2 --&gt; E2[COMMIT]
-</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>  end
-</span></code></pre></div>
+<pre class="mermaid"><code>flowchart TB
+  subgraph today["Today"]
+    A[BEGIN sync_commit=off] --&gt; B[lane probe&lt;br/&gt;FOR UPDATE SKIP LOCKED head]
+    B --&gt; C[spent-prefix check&lt;br/&gt;tombstones / attempt batches]
+    C --&gt; D[claim CTE over partitioned parents&lt;br/&gt;custom plan every call]
+    D --&gt; E[COMMIT]
+    E --&gt; F[BEGIN: FOR UPDATE head,&lt;br/&gt;setval claim cursor&lt;br/&gt;evidence-guarded]
+    F --&gt; G[COMMIT]
+  end
+  subgraph proposed["With P5 + P6"]
+    A2[BEGIN sync_commit=off] --&gt; B2[lane probe&lt;br/&gt;FOR UPDATE SKIP LOCKED head]
+    B2 --&gt; C2[catch up cursor from visible&lt;br/&gt;attempt-batch evidence]
+    C2 --&gt; D2[claim CTE on ready_entries_slot /&lt;br/&gt;lease_claim_batches_slot&lt;br/&gt;generic plan, invalidated 1/16 rotations]
+    D2 --&gt; E2[COMMIT]
+  end</code></pre>
 <h2 id="5-recommended-order">5. Recommended order<a class="headerlink" href="#5-recommended-order" title="Permanent link">&para;</a></h2>
 <ol>
 <li>Land P1 (+P1b), P2 (+P2b) and P3: they remove the three measured
