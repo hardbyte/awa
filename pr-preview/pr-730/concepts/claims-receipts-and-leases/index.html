@@ -2417,7 +2417,7 @@
 
 
 <h1 id="claims-receipts-and-leases">Claims, receipts and leases<a class="headerlink" href="#claims-receipts-and-leases" title="Permanent link">&para;</a></h1>
-<p>A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that registers an external callback gets a lease.</p>
+<p>A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that registers an external callback gets a lease, unless <code>lease_claim_receipts</code> is turned off and every claim writes one.</p>
 <h2 id="run_lease-the-attempts-number"><code>run_lease</code>: the attempt's number<a class="headerlink" href="#run_lease-the-attempts-number" title="Permanent link">&para;</a></h2>
 <p>Every claim increments the job's <code>run_lease</code>. Every later write for that attempt (heartbeat, progress, completion, retry, snooze, cancel, callback) names the job and its <code>run_lease</code>, and is applied only if that attempt is still open. A write for a closed attempt changes nothing.</p>
 <div class="awa-diagram">
