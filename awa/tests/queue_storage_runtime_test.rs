@@ -18370,6 +18370,72 @@ async fn test_queue_prune_releases_segment_lock_on_every_tail_conflict() {
     assert_eq!(store.queue_counts(&pool, "q").await.unwrap().terminal, 1);
 }
 
+struct CallbackProgressWorker;
+
+#[async_trait::async_trait]
+impl Worker for CallbackProgressWorker {
+    fn kind(&self) -> &'static str {
+        "callback_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let callback = ctx
+            .register_callback(Duration::from_secs(30))
+            .await
+            .map_err(JobError::retryable)?;
+        ctx.set_progress(60, "awaiting callback");
+        Ok(JobResult::WaitForCallback(callback))
+    }
+}
+
+/// Progress a handler sets after registering its callback, with no heartbeat
+/// in between, is stored when the attempt is parked.
+async fn callback_wait_stores_the_final_progress(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_callback_progress";
+    let store_config = QueueStorageConfig {
+        schema: "awa_qs_callback_progress".to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: receipts,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CallbackJob { id: 5 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = queue_storage_client(&pool, queue, store_config, CallbackProgressWorker);
+    client.start().await.expect("start callback client");
+    let waiting = wait_for_callback_job(&store, &pool, job_id, Duration::from_secs(10)).await;
+    client.shutdown(Duration::from_secs(5)).await;
+    assert_eq!(
+        waiting
+            .progress
+            .as_ref()
+            .and_then(|progress| progress.get("percent")),
+        Some(&serde_json::json!(60)),
+        "parked attempt's progress: {:?}",
+        waiting.progress
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_callback_wait_stores_the_final_progress() {
+    callback_wait_stores_the_final_progress(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_legacy_callback_wait_stores_the_final_progress() {
+    callback_wait_stores_the_final_progress(false).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_complete_external() {
     let (_db_guard, pool) = setup_pool(10).await;

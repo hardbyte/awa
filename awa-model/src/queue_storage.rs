@@ -16554,12 +16554,85 @@ impl QueueStorage {
         run_lease: i64,
         callback_id: Uuid,
     ) -> Result<bool, AwaError> {
+        self.enter_callback_wait_with_progress(pool, job_id, run_lease, callback_id, None)
+            .await
+    }
+
+    /// [`Self::enter_callback_wait`], storing `progress` as the parked
+    /// attempt's progress in the same transaction.
+    pub async fn enter_callback_wait_with_progress(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        callback_id: Uuid,
+        progress: Option<&serde_json::Value>,
+    ) -> Result<bool, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let entered = self
-            .enter_callback_wait_in_tx(&mut tx, job_id, run_lease, callback_id)
+            .enter_callback_wait_with_progress_in_tx(
+                &mut tx,
+                job_id,
+                run_lease,
+                callback_id,
+                progress,
+            )
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(entered)
+    }
+
+    /// Transaction-aware variant of
+    /// [`Self::enter_callback_wait_with_progress`].
+    pub async fn enter_callback_wait_with_progress_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        callback_id: Uuid,
+        progress: Option<&serde_json::Value>,
+    ) -> Result<bool, AwaError> {
+        let entered = self
+            .enter_callback_wait_in_tx(tx, job_id, run_lease, callback_id)
+            .await?;
+        if let (true, Some(progress)) = (entered, progress) {
+            self.write_lease_progress_tx(tx, job_id, run_lease, progress)
+                .await?;
+        }
+        Ok(entered)
+    }
+
+    /// Store `progress` for an attempt that has a lease row.
+    async fn write_lease_progress_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        progress: &serde_json::Value,
+    ) -> Result<(), AwaError> {
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {} (job_id, run_lease, progress, updated_at)
+            SELECT lease.job_id, lease.run_lease, $3, clock_timestamp()
+            FROM {} AS lease
+            WHERE lease.job_id = $1
+              AND lease.run_lease = $2
+              AND lease.state IN ('running', 'waiting_external')
+            ON CONFLICT (job_id, run_lease)
+            DO UPDATE SET
+                progress = EXCLUDED.progress,
+                updated_at = clock_timestamp()
+            "#,
+            self.attempt_state_table(),
+            self.leases_table()
+        )))
+        .bind(job_id)
+        .bind(run_lease)
+        .bind(progress)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
     }
 
     /// Transaction-aware variant of [`Self::enter_callback_wait`] (ADR-029).
@@ -17217,28 +17290,8 @@ impl QueueStorage {
             )
             .await?;
         }
-        sqlx::query(audited_sql(format!(
-            r#"
-            INSERT INTO {} (job_id, run_lease, progress, updated_at)
-            SELECT lease.job_id, lease.run_lease, $3, clock_timestamp()
-            FROM {} AS lease
-            WHERE lease.job_id = $1
-              AND lease.run_lease = $2
-              AND lease.state IN ('running', 'waiting_external')
-            ON CONFLICT (job_id, run_lease)
-            DO UPDATE SET
-                progress = EXCLUDED.progress,
-                updated_at = clock_timestamp()
-            "#,
-            self.attempt_state_table(),
-            self.leases_table()
-        )))
-        .bind(job_id)
-        .bind(run_lease)
-        .bind(progress)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        self.write_lease_progress_tx(&mut tx, job_id, run_lease, &progress)
+            .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(())
     }

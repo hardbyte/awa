@@ -2388,9 +2388,15 @@ async fn complete_job_queue_storage(
                 .and_then(|by_kind| by_kind.get(&job.kind))
                 .cloned();
             if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
-                let parked =
-                    park_queue_storage_with_followups(runtime, pool, job, guard.id(), &specs)
-                        .await?;
+                let parked = park_queue_storage_with_followups(
+                    runtime,
+                    pool,
+                    job,
+                    guard.id(),
+                    progress_snapshot.as_ref(),
+                    &specs,
+                )
+                .await?;
                 if let Some(parked_job) = parked {
                     let event = if needs_event {
                         Some(UntypedJobEvent::WaitingForCallback { job: parked_job })
@@ -2407,7 +2413,13 @@ async fn complete_job_queue_storage(
 
             let entered = runtime
                 .store
-                .enter_callback_wait(pool, job.id, job.run_lease, guard.id())
+                .enter_callback_wait_with_progress(
+                    pool,
+                    job.id,
+                    job.run_lease,
+                    guard.id(),
+                    progress_snapshot.as_ref(),
+                )
                 .await?;
             if !entered {
                 let current = runtime.store.load_job(pool, job.id).await?;
@@ -2929,12 +2941,19 @@ async fn park_queue_storage_with_followups(
     pool: &PgPool,
     job: &JobRow,
     callback_id: uuid::Uuid,
+    progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
     let entered = runtime
         .store
-        .enter_callback_wait_in_tx(&mut tx, job.id, job.run_lease, callback_id)
+        .enter_callback_wait_with_progress_in_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            callback_id,
+            progress_snapshot,
+        )
         .await?;
     if !entered {
         tx.rollback().await?;
