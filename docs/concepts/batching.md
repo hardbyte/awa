@@ -10,15 +10,15 @@ Batching changes how many jobs share a statement, not what happens to each one. 
 
 ## Enqueue: many jobs, one statement
 
-A batch insert writes all its jobs in one statement inside the caller's transaction, so they commit or roll back together. It reserves each [lane](lanes-and-claiming.md) it touches once for the whole batch, in a fixed lane order, so two batches that share lanes cannot lock them in opposite orders.
+A batch insert writes all its jobs in one statement, so they commit or roll back together. Whether that is the caller's transaction depends on the API: the compatibility functions run in a transaction you pass them, while the direct queue-storage path opens and commits its own. It reserves each [lane](lanes-and-claiming.md) it touches once for the whole batch, in a fixed lane order, so two batches that share lanes cannot lock them in opposite orders.
 
-| API | Path | Use it for |
-| --- | --- | --- |
-| `QueueStorage::enqueue_params_copy` (Rust), `enqueue_many_copy` (Python) | writes straight into queue storage; array insert below 2,048 rows, `COPY` from there up | bulk producers on queue storage |
-| `insert_many_copy`, `insert_many_skip_unique_conflicts` | the batch insert function, which can skip unique-key conflicts in the same statement | the compatibility insert API |
-| `insert_many` | one statement that inserts each row in turn | small batches inside an existing transaction |
+| API | Path | Transaction | Use it for |
+| --- | --- | --- | --- |
+| `QueueStorage::enqueue_params_copy` (Rust), `enqueue_many_copy` (Python) | writes straight into queue storage; array insert below 2,048 rows, `COPY` from there up | its own, committed before it returns | bulk producers that do not need to commit with other writes |
+| `insert_many_copy`, `insert_many_skip_unique_conflicts` | the batch insert function, which can skip unique-key conflicts in the same statement | the caller's | batches that commit with the business write |
+| `insert_many` | one statement that inserts each row in turn | the caller's | small batches inside an existing transaction |
 
-The lane locks a batch takes are held until its transaction commits. A large batch in a long transaction holds every lane it touched for that long, and other producers on those lanes wait behind it. Commit large batches promptly, or split them.
+To enqueue in the same transaction as a business write, use an API that takes your transaction; see [transactional enqueue](transactional-enqueue.md). The lane locks a batch takes are held until its transaction commits. A large batch in a long transaction holds every lane it touched for that long, and other producers on those lanes wait behind it. Commit large batches promptly, or split them.
 
 Direct producers must use the same queue-storage settings as the workers, in particular the stripe count; see [Producer path choice](../configuration.md#producer-path-choice).
 
