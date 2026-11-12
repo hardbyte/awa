@@ -4,6 +4,8 @@
 //! queue_storage backend enabled.
 
 mod ci_timing;
+#[path = "../../awa-model/src/storage_footprint_sql.rs"]
+mod storage_footprint_sql;
 
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
@@ -23476,4 +23478,276 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         all_blocked.is_empty(),
         "hot paths waited on a sealed slot's children: {all_blocked:?}"
     );
+}
+
+/// Relfilenode, heap size and total size of each named relation.
+async fn child_storage(pool: &sqlx::PgPool, relations: &[String]) -> Vec<(String, i64, i64, i64)> {
+    let mut rows = Vec::with_capacity(relations.len());
+    for relation in relations {
+        let (filenode, heap, total): (i64, i64, i64) = sqlx::query_as(
+            "SELECT pg_relation_filenode($1::regclass)::bigint,
+                    pg_relation_size($1::regclass),
+                    pg_total_relation_size($1::regclass)",
+        )
+        .bind(relation)
+        .fetch_one(pool)
+        .await
+        .expect("read child storage");
+        rows.push((relation.clone(), filenode, heap, total));
+    }
+    rows
+}
+
+fn queue_slot_children(schema: &str, slot: usize) -> Vec<String> {
+    [
+        "ready_segments",
+        "done_entries",
+        "ready_entries",
+        "ready_claim_attempt_batches",
+        "ready_tombstones",
+        "receipt_completion_batches",
+        "receipt_completion_tombstones",
+        "queue_terminal_count_deltas",
+    ]
+    .iter()
+    .map(|table| format!("{schema}.{table}_{slot}"))
+    .collect()
+}
+
+fn claim_slot_children(schema: &str, slot: usize) -> Vec<String> {
+    [
+        "lease_claims",
+        "lease_claim_batches",
+        "lease_claim_closures",
+        "lease_claim_closure_batches",
+    ]
+    .iter()
+    .map(|table| format!("{schema}.{table}_{slot}"))
+    .collect()
+}
+
+/// Queue and claim prune truncate only the children of the sealed slot that
+/// hold storage beyond an empty table's metadata. Every child is empty
+/// afterwards, children that never held a row keep their relfilenode, and the
+/// slot is reused cleanly once the ring wraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_truncates_only_ring_children_that_hold_rows() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_used_children";
+    let queue = "prune_used_children";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let children: Vec<String> = queue_slot_children(schema, 0)
+        .into_iter()
+        .chain(claim_slot_children(schema, 0))
+        .collect();
+    let fresh = child_storage(&pool, &children).await;
+    assert!(fresh.iter().all(|(_, _, heap, _)| *heap == 0));
+
+    store.enqueue_batch(&pool, queue, 2, 40).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 40, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 40);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        40
+    );
+    let used = child_storage(&pool, &children).await;
+
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let pruned = store.prune_oldest(&pool, Duration::ZERO).await.unwrap();
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
+        "{pruned:?}"
+    );
+    let pruned = store.prune_oldest_claims(&pool).await.unwrap();
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
+        "{pruned:?}"
+    );
+    let after = child_storage(&pool, &children).await;
+
+    let mut truncated = 0;
+    let mut kept = 0;
+    for ((fresh, used), after) in fresh.iter().zip(&used).zip(&after) {
+        let relation = &fresh.0;
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {relation}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "{relation} keeps rows after prune");
+        assert_eq!(after.2, 0, "{relation} keeps heap pages after prune");
+        // Any page of an index method other than btree, GiST or BRIN (the
+        // GIN index on claim batches) counts as storage to reclaim.
+        let other_index_method: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             JOIN pg_am am ON am.oid = c.relam
+             WHERE i.indrelid = $1::regclass AND am.amname NOT IN ('btree', 'gist', 'brin'))",
+        )
+        .bind(relation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if used.2 > 0 {
+            assert_ne!(
+                after.1, used.1,
+                "{relation} held rows but was not truncated"
+            );
+            truncated += 1;
+        } else if used.3 == fresh.3 && !other_index_method {
+            assert_eq!(
+                after.1, used.1,
+                "{relation} never held a row but was truncated"
+            );
+            kept += 1;
+        }
+    }
+    assert!(
+        truncated >= 3,
+        "expected ready, receipt and claim batch children with rows: {used:?}"
+    );
+    assert!(
+        kept >= 3,
+        "expected unused children to be skipped: {used:?}"
+    );
+
+    // Wrap both rings back onto slot 0 and use it again.
+    for expected in [2, 3, 0] {
+        let rotated = store.rotate(&pool).await.unwrap();
+        assert!(
+            matches!(rotated, RotateOutcome::Rotated { slot, .. } if slot == expected),
+            "{rotated:?}"
+        );
+    }
+    assert!(matches!(
+        store.rotate_claims(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 0, .. }
+    ));
+    store.enqueue_batch(&pool, queue, 2, 7).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 40, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 7, "only the new jobs are claimable");
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        7
+    );
+    let generations: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT ready_generation FROM {schema}.ready_entries_0"
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(generations, vec![4], "slot 0 holds only its new generation");
+    let completed: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(cardinality(job_ids)), 0)::bigint
+         FROM {schema}.receipt_completion_batches_0"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(completed, 7);
+}
+
+/// A child whose rows were deleted and vacuumed away can keep a zero-byte heap
+/// with expanded indexes; prune still truncates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_truncates_a_vacuumed_child_with_expanded_indexes() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_vacuumed_child";
+    let queue = "prune_vacuumed_child";
+    let store = create_store(&pool, schema).await;
+    let done_child = format!("{schema}.done_entries_0");
+    let fresh = child_storage(&pool, std::slice::from_ref(&done_child)).await[0].clone();
+
+    store.enqueue_batch(&pool, queue, 2, 500).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 500, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 500);
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+    sqlx::raw_sql(&format!("DELETE FROM {done_child}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&format!("VACUUM (TRUNCATE TRUE) {done_child}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let vacuumed = child_storage(&pool, std::slice::from_ref(&done_child)).await[0].clone();
+    assert_eq!(vacuumed.2, 0, "VACUUM returns every heap page");
+    assert!(vacuumed.3 > fresh.3, "the indexes keep their pages");
+
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let pruned = store.prune_oldest(&pool, Duration::ZERO).await.unwrap();
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
+        "{pruned:?}"
+    );
+    let reclaimed = child_storage(&pool, std::slice::from_ref(&done_child)).await[0].clone();
+    assert_ne!(reclaimed.1, vacuumed.1, "the vacuumed child is truncated");
+    assert_eq!(reclaimed.3, fresh.3, "its indexes are back to empty");
+}
+
+#[tokio::test]
+async fn test_prune_brin_fsm_baseline_follows_block_size() {
+    let (_db_guard, pool) = setup_pool(2).await;
+    // Equality is empty metadata; one more FSM page is reclaimable.
+    let rows: Vec<(i64, bool, bool)> = sqlx::query_as(&format!(
+        "WITH samples(block_size, empty_pages) AS (
+             VALUES (1024::bigint, 4), (2048, 4), (4096, 3), (8192, 3), (16384, 3), (32768, 3)
+         )
+         SELECT block_size,
+                empty_pages * block_size > block_size * ({depth}) AS empty_is_used,
+                (empty_pages + 1) * block_size > block_size * ({depth}) AS extra_is_used
+         FROM samples ORDER BY block_size",
+        depth = storage_footprint_sql::brin_fsm_empty_pages_sql!(),
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 6);
+    for (block_size, empty_is_used, extra_is_used) in rows {
+        assert!(
+            !empty_is_used,
+            "empty BRIN metadata at block_size={block_size}"
+        );
+        assert!(
+            extra_is_used,
+            "one extra FSM page at block_size={block_size}"
+        );
+    }
 }

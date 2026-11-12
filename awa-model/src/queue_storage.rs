@@ -2,6 +2,7 @@ use crate::admin::{CallbackConfig, CallbackPollResult};
 use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
+use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
@@ -41,6 +42,42 @@ const RESCUE_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
+
+// Whether a ring child holds storage beyond the metadata an empty table keeps:
+// any heap, TOAST, free-space-map or visibility-map page, or index pages beyond
+// one btree/GiST page and three BRIN main-fork pages plus the BRIN FSM. Other
+// index methods count from their first page.
+const RECLAIMABLE_CHILD_STORAGE_SQL: &str = concat!(
+    r#"
+WITH heaps AS (
+    SELECT oid, reltoastrelid FROM pg_class
+    WHERE oid = $1::regclass AND relkind = 'r'
+), heap_relations AS (
+    SELECT oid FROM heaps
+    UNION ALL
+    SELECT reltoastrelid FROM heaps WHERE reltoastrelid <> 0
+), storage_relations AS (
+    SELECT oid, NULL::name AS amname FROM heap_relations
+    UNION ALL
+    SELECT i.indexrelid, am.amname FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_am am ON am.oid = c.relam
+    WHERE i.indrelid IN (SELECT oid FROM heap_relations)
+)
+SELECT EXISTS (
+    SELECT 1 FROM storage_relations
+    CROSS JOIN (SELECT current_setting('block_size')::bigint AS block_size) settings
+    WHERE pg_relation_size(oid, 'fsm') > block_size *
+          CASE amname WHEN 'brin' THEN "#,
+    brin_fsm_empty_pages_sql!(),
+    r#" ELSE 0 END
+       OR pg_relation_size(oid, 'vm') > 0
+       OR pg_relation_size(oid) > block_size *
+          CASE amname WHEN 'btree' THEN 1 WHEN 'gist' THEN 1
+                      WHEN 'brin' THEN 3 ELSE 0 END
+)
+"#
+);
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -17422,6 +17459,33 @@ impl QueueStorage {
         Ok(false)
     }
 
+    /// TRUNCATE those of `children` that hold reclaimable storage. The caller
+    /// must already hold ACCESS EXCLUSIVE on every child; a child it skips has
+    /// no heap page, so it holds no row.
+    async fn truncate_used_children_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        children: &[&str],
+    ) -> Result<(), AwaError> {
+        let mut targets: Vec<&str> = Vec::with_capacity(children.len());
+        for child in children {
+            let reclaimable: bool = sqlx::query_scalar(RECLAIMABLE_CHILD_STORAGE_SQL)
+                .bind(child)
+                .fetch_one(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            if reclaimable {
+                targets.push(child);
+            }
+        }
+        if !targets.is_empty() {
+            sqlx::query(&format!("TRUNCATE TABLE {}", targets.join(", ")))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
     pub async fn rotate(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
@@ -18552,10 +18616,20 @@ impl QueueStorage {
                 });
             }
 
-            sqlx::query(&format!("TRUNCATE TABLE {slot_children}"))
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            Self::truncate_used_children_tx(
+                &mut tx,
+                &[
+                    &segment_child,
+                    &done_child,
+                    &ready_child,
+                    &claim_attempt_child,
+                    &tomb_child,
+                    &receipt_batch_child,
+                    &receipt_tomb_child,
+                    &delta_child,
+                ],
+            )
+            .await?;
 
             if !pruned_terminal_counts.is_empty() {
                 self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
@@ -18705,10 +18779,7 @@ impl QueueStorage {
                 });
             }
 
-            sqlx::query(&format!("TRUNCATE TABLE {lease_child}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+            Self::truncate_used_children_tx(&mut tx, &[&lease_child]).await?;
             Ok(PruneOutcome::Pruned {
                 slot,
                 carried_failed_rows: 0,
@@ -19014,10 +19085,16 @@ impl QueueStorage {
                 });
             }
 
-            sqlx::query(&format!("TRUNCATE TABLE {slot_children}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+            Self::truncate_used_children_tx(
+                &mut tx,
+                &[
+                    &claim_child,
+                    &claim_batch_child,
+                    &closure_child,
+                    &closure_batch_child,
+                ],
+            )
+            .await?;
             self.ensure_claim_batch_job_index_tx(&mut tx, slot).await?;
             sqlx::query(&format!(
                 r#"

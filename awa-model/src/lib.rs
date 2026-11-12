@@ -16,6 +16,7 @@ mod read_transaction;
 pub mod reschedule;
 pub mod runtime_control;
 pub mod storage;
+mod storage_footprint_sql;
 pub mod unique;
 
 // Re-exports for ergonomics

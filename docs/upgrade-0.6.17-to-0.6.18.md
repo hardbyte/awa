@@ -1,6 +1,6 @@
 # Upgrading from 0.6.17 to 0.6.18
 
-0.6.18 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Every awa table gets a replica identity, so awa keeps working when its schema is in a logical-replication publication.
+0.6.18 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Every awa table gets a replica identity, so awa keeps working when its schema is in a logical-replication publication, and ring prune truncates only the partitions that hold rows.
 
 Binaries and the migration can roll in either order.
 
@@ -50,6 +50,10 @@ Each `ALTER` takes `ACCESS EXCLUSIVE` on its table, and the `USING INDEX` form a
 Run the patch at a quiet moment if writers cannot tolerate a stall of a few hundred milliseconds. Replica identity changes only what PostgreSQL writes to WAL for `UPDATE` and `DELETE`: the mark tables log an old-row image of about 40 bytes per drained mark, and the delta tables are only inserted into and truncated, so they log nothing extra.
 
 Keeping the awa schema out of publications remains the recommendation; see [logical replication and CDC](deploying-on-managed-postgres.md#logical-replication-and-cdc).
+
+## Prune truncates only children that hold rows
+
+This part needs no migration and applies once the maintenance leader runs 0.6.18. Queue, lease and claim prune lock every child of the sealed slot exactly as 0.6.17 does, then `TRUNCATE` only the children that hold storage; empty children keep their relfilenode. Expect fewer relfilenode changes and less WAL per prune, most visibly on storage engines where each truncate costs I/O. Prune outcomes, metrics and lock waits are unchanged.
 
 ## Rollback
 
