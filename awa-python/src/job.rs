@@ -1045,25 +1045,21 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => Ok(b
-            .into_pyobject(py)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .into_pyobject(py)?
             .to_owned()
             .into_any()
             .unbind()),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(i.into_pyobject(py)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                Ok(i.into_pyobject(py)?
                     .into_any()
                     .unbind())
             } else if let Some(u) = n.as_u64() {
-                Ok(u.into_pyobject(py)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                Ok(u.into_pyobject(py)?
                     .into_any()
                     .unbind())
             } else if let Some(f) = n.as_f64() {
-                Ok(f.into_pyobject(py)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                Ok(f.into_pyobject(py)?
                     .into_any()
                     .unbind())
             } else {
@@ -1071,8 +1067,7 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
             }
         }
         serde_json::Value::String(s) => Ok(s
-            .into_pyobject(py)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .into_pyobject(py)?
             .into_any()
             .unbind()),
         serde_json::Value::Array(arr) => {
