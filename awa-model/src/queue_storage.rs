@@ -12798,6 +12798,7 @@ impl QueueStorage {
         self.lock_receipt_attempts_tx(tx, &receipt_jobs).await?;
 
         let schema = self.schema();
+        let leases = self.leases_table();
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
         let closed_evidence =
@@ -12885,6 +12886,13 @@ impl QueueStorage {
                     claim_refs.progress,
                     clock_timestamp()
                 FROM claim_refs
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {leases} AS parked
+                    WHERE parked.job_id = claim_refs.job_id
+                      AND parked.run_lease = claim_refs.run_lease
+                      AND parked.state = 'waiting_external'
+                )
                 ON CONFLICT (job_id, run_lease)
                 DO UPDATE SET
                     heartbeat_at = clock_timestamp(),
@@ -16592,6 +16600,13 @@ impl QueueStorage {
         callback_id: Uuid,
         progress: Option<&serde_json::Value>,
     ) -> Result<bool, AwaError> {
+        // Heartbeats write receipt progress under the attempt lock and skip
+        // parked attempts, so holding it here keeps an older heartbeat
+        // snapshot from replacing the progress stored with the park.
+        if self.lease_claim_receipts() {
+            self.lock_receipt_attempts_tx(tx, &[(job_id, run_lease)])
+                .await?;
+        }
         let entered = self
             .enter_callback_wait_in_tx(tx, job_id, run_lease, callback_id)
             .await?;
