@@ -46,6 +46,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.
 - **A queue lane is usable by every runtime role, whichever role creates it
   first (migration v053).** A lane's enqueue and claim sequences belonged to
   the role that first enqueued into, claimed from or promoted into it, so with
