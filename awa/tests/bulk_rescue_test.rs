@@ -617,6 +617,13 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         "claimed {ABANDONED} in {claimed_in:?}; drained {drained_in:?} after the kill \
          (claims stale after {staleness:?})"
     );
+    let (fresh, rescued, freshest) = rescued_heartbeat_ages(&pool, staleness).await;
+    assert_eq!(
+        (fresh, rescued),
+        (0, ABANDONED),
+        "every abandoned claim is rescued once it has gone {staleness:?} without a heartbeat \
+         (the freshest had gone {freshest})"
+    );
 
     wait_until(
         scaled_timeout(Duration::from_secs(10)),
@@ -722,13 +729,20 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
             .expect("recovery client")
     };
     recovery.start().await.expect("start recovery client");
+    // Completed rows leave the ring once queue prune wraps past them, so the
+    // handler counts the recovery runs.
     wait_until(
         scaled_timeout(Duration::from_secs(120)),
-        "the retried jobs to complete",
+        "every retried job to run",
+        || async { recovered.lock().expect("recovered").len() as i64 >= ABANDONED - exhausted },
+    )
+    .await;
+    wait_until(
+        scaled_timeout(Duration::from_secs(30)),
+        "the retried jobs to finish",
         || async {
-            count(&pool, format!(
-                "SELECT count(*) FROM awa.terminal_jobs WHERE queue = '{ABANDONED_QUEUE}' AND state = 'completed'"
-            )).await == ABANDONED - exhausted
+            running(&pool, &store, ABANDONED_QUEUE).await == 0
+                && waiting_retry_counts(&pool, ABANDONED_QUEUE).await == (0, 0)
         },
     )
     .await;

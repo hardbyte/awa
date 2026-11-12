@@ -33,10 +33,17 @@ fn database_url() -> String {
 }
 
 fn with_database(url: &str, database: &str) -> String {
-    let (base, _) = url
+    let (without_query, query) = match url.split_once('?') {
+        Some((prefix, query)) => (prefix, Some(query)),
+        None => (url, None),
+    };
+    let (base, _) = without_query
         .rsplit_once('/')
         .expect("database URL has a database name");
-    format!("{base}/{database}")
+    match query {
+        Some(query) => format!("{base}/{database}?{query}"),
+        None => format!("{base}/{database}"),
+    }
 }
 
 async fn fresh_database(name: &str) -> PgPool {
