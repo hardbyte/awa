@@ -15221,53 +15221,95 @@ impl QueueStorage {
                 WHERE slot = $1
                 FOR UPDATE
             ),
+            -- The window is counted in members, not batches: it takes whole
+            -- batches after the cursor in (deadline_at, batch_id) order until
+            -- they hold $2 members, then wraps to the first batches at or
+            -- before the cursor for the rest. Every batch has at least one
+            -- member, so $2 batches are always enough to read.
             after_cursor AS MATERIALIZED (
                 SELECT
-                    claim_batches.claim_slot,
-                    claim_batches.batch_id,
+                    counted.claim_slot,
+                    counted.batch_id,
+                    counted.claimed_count,
                     row_number() OVER (
-                        ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                        ORDER BY counted.deadline_at, counted.batch_id
                     ) AS rn
-                FROM {claim_batch_child} AS claim_batches
-                WHERE claim_batches.claim_slot = $1
-                  AND claim_batches.deadline_at IS NOT NULL
-                  AND claim_batches.deadline_at < clock_timestamp()
-                  AND (claim_batches.deadline_at, claim_batches.batch_id)
-                      > (
-                          (SELECT batch_deadline_cursor_deadline_at FROM cursor_row),
-                          (SELECT batch_deadline_cursor_batch_id FROM cursor_row)
-                        )
-                ORDER BY claim_batches.deadline_at, claim_batches.batch_id
-                LIMIT $2
+                FROM (
+                    SELECT
+                        nearest.*,
+                        COALESCE(sum(nearest.claimed_count) OVER (
+                            ORDER BY nearest.deadline_at, nearest.batch_id
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                        ), 0) AS members_before
+                    FROM (
+                        SELECT
+                            claim_batches.claim_slot,
+                            claim_batches.batch_id,
+                            claim_batches.deadline_at,
+                            claim_batches.claimed_count
+                        FROM {claim_batch_child} AS claim_batches
+                        WHERE claim_batches.claim_slot = $1
+                          AND claim_batches.deadline_at IS NOT NULL
+                          AND claim_batches.deadline_at < clock_timestamp()
+                          AND (claim_batches.deadline_at, claim_batches.batch_id)
+                              > (
+                                  (SELECT batch_deadline_cursor_deadline_at FROM cursor_row),
+                                  (SELECT batch_deadline_cursor_batch_id FROM cursor_row)
+                                )
+                        ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                        LIMIT $2
+                    ) AS nearest
+                ) AS counted
+                WHERE counted.members_before < $2
             ),
-            after_count AS (
-                SELECT count(*)::bigint AS count FROM after_cursor
+            after_count AS MATERIALIZED (
+                SELECT
+                    count(*)::bigint AS count,
+                    COALESCE(sum(claimed_count), 0)::bigint AS members
+                FROM after_cursor
             ),
             before_cursor AS MATERIALIZED (
                 SELECT
-                    claim_batches.claim_slot,
-                    claim_batches.batch_id,
+                    counted.claim_slot,
+                    counted.batch_id,
+                    counted.claimed_count,
                     after_count.count + row_number() OVER (
-                        ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                        ORDER BY counted.deadline_at, counted.batch_id
                     ) AS rn
-                FROM {claim_batch_child} AS claim_batches
+                FROM (
+                    SELECT
+                        nearest.*,
+                        COALESCE(sum(nearest.claimed_count) OVER (
+                            ORDER BY nearest.deadline_at, nearest.batch_id
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                        ), 0) AS members_before
+                    FROM (
+                        SELECT
+                            claim_batches.claim_slot,
+                            claim_batches.batch_id,
+                            claim_batches.deadline_at,
+                            claim_batches.claimed_count
+                        FROM {claim_batch_child} AS claim_batches
+                        WHERE (SELECT members FROM after_count) < $2
+                          AND claim_batches.claim_slot = $1
+                          AND claim_batches.deadline_at IS NOT NULL
+                          AND claim_batches.deadline_at < clock_timestamp()
+                          AND (claim_batches.deadline_at, claim_batches.batch_id)
+                              <= (
+                                  (SELECT batch_deadline_cursor_deadline_at FROM cursor_row),
+                                  (SELECT batch_deadline_cursor_batch_id FROM cursor_row)
+                                )
+                        ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                        LIMIT (SELECT GREATEST($2 - members, 0) FROM after_count)
+                    ) AS nearest
+                ) AS counted
                 CROSS JOIN after_count
-                WHERE after_count.count < $2
-                  AND claim_batches.claim_slot = $1
-                  AND claim_batches.deadline_at IS NOT NULL
-                  AND claim_batches.deadline_at < clock_timestamp()
-                  AND (claim_batches.deadline_at, claim_batches.batch_id)
-                      <= (
-                          (SELECT batch_deadline_cursor_deadline_at FROM cursor_row),
-                          (SELECT batch_deadline_cursor_batch_id FROM cursor_row)
-                        )
-                ORDER BY claim_batches.deadline_at, claim_batches.batch_id
-                LIMIT (SELECT GREATEST($2 - count, 0) FROM after_count)
+                WHERE counted.members_before < $2 - after_count.members
             ),
             candidate_keys AS MATERIALIZED (
-                SELECT claim_slot, batch_id, rn FROM after_cursor
+                SELECT claim_slot, batch_id, claimed_count, rn FROM after_cursor
                 UNION ALL
-                SELECT claim_slot, batch_id, rn FROM before_cursor
+                SELECT claim_slot, batch_id, claimed_count, rn FROM before_cursor
             ),
             -- Every member of a candidate batch, annotated with the same
             -- durable closure evidence and materialized-lease anti-joins the
@@ -15528,7 +15570,7 @@ impl QueueStorage {
             )
             SELECT
                 COALESCE((SELECT jsonb_agg(to_jsonb(rescued_rows)) FROM rescued_rows), '[]'::jsonb),
-                (SELECT count(*) >= $2 FROM candidate_keys),
+                (SELECT COALESCE(sum(claimed_count), 0) >= $2 FROM candidate_keys),
                 (SELECT batch_deadline_cursor_deadline_at FROM advance_cursor),
                 (SELECT batch_deadline_cursor_batch_id FROM advance_cursor),
                 (SELECT 0::bigint FROM advance_cursor)

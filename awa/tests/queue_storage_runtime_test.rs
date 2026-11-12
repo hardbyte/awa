@@ -9264,6 +9264,180 @@ async fn test_rescue_batch_keeps_a_partially_rescued_scan_active() {
     assert_eq!(tail.rescued.len(), 1);
 }
 
+/// Out-of-line array reads from one claim slot's batch partition so far, as
+/// seen by the only connection of `pool`. A large claim batch stores its
+/// member arrays out of line, and a statement that expands the batch's members
+/// reads each array it uses once.
+async fn claim_batch_array_reads(pool: &sqlx::PgPool, schema: &str, slot: i32) -> i64 {
+    sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(pool)
+        .await
+        .expect("force a statistics flush");
+    sqlx::query("SELECT 1")
+        .execute(pool)
+        .await
+        .expect("flush statistics");
+    sqlx::query_scalar(
+        "SELECT COALESCE(toast.idx_scan, 0)::bigint
+         FROM pg_class AS batches
+         JOIN pg_namespace AS namespace ON namespace.oid = batches.relnamespace
+         JOIN pg_stat_all_tables AS toast ON toast.relid = batches.reltoastrelid
+         WHERE namespace.nspname = $1 AND batches.relname = $2",
+    )
+    .bind(schema)
+    .bind(format!("lease_claim_batches_{slot}"))
+    .fetch_one(pool)
+    .await
+    .expect("claim batch array reads")
+}
+
+/// A deadline backlog in a few compact batches, each larger than the scan
+/// window: every rescue transaction examines the batch at the cursor, not
+/// every expired batch in the slot, and the backlog still drains with each
+/// claim closed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rescue_deadline_batch_scan_examines_a_bounded_number_of_members() {
+    const BATCHES: i64 = 4;
+    const BATCH_MEMBERS: i64 = 1_500;
+    const SCAN_LIMIT: i64 = 1_000;
+    const RESCUE_LIMIT: i64 = 500;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_rescue_deadline_batch_bound";
+    let queue = "rescue_deadline_batch_bound";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    let params: Vec<_> = (0..BATCHES * BATCH_MEMBERS)
+        .map(|id| {
+            insert::params_with(
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &params)
+        .await
+        .expect("enqueue the backlog");
+    let mut slot = None;
+    for _ in 0..BATCHES {
+        let claims = store
+            .claim_runtime_batch(&pool, queue, BATCH_MEMBERS, Duration::from_secs(30))
+            .await
+            .expect("claim one large batch");
+        assert_eq!(claims.len() as i64, BATCH_MEMBERS);
+        slot = Some(claims[0].claim.claim_slot);
+    }
+    let slot = slot.expect("claim slot");
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.lease_claim_batches SET deadline_at = now() - interval '1 minute'"
+    )))
+    .execute(&pool)
+    .await
+    .expect("expire the batches");
+    let shape: (i64, i64, i64, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT count(*), min(claimed_count)::bigint, max(claimed_count)::bigint,
+                count(DISTINCT claim_slot)
+         FROM {schema}.lease_claim_batches"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("backlog shape");
+    assert_eq!(
+        shape,
+        (BATCHES, BATCH_MEMBERS, BATCH_MEMBERS, 1),
+        "a few large compact batches in one claim slot"
+    );
+
+    // One connection, so the statistics read sees the rescue's own reads.
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("single-connection pool");
+    let options = awa::model::RescueBatchOptions {
+        cursor_scan_limit: Some(SCAN_LIMIT as usize),
+        ..Default::default()
+    };
+    // The window holds the batches after the cursor up to the one that
+    // crosses the scan limit. Each of the two rescue statements expands a
+    // window batch's six member arrays once.
+    let window_batches = (SCAN_LIMIT + BATCH_MEMBERS - 1) / BATCH_MEMBERS;
+    let read_bound = 2 * 6 * window_batches;
+    assert!(
+        window_batches < BATCHES,
+        "the window must be smaller than the backlog for the bound to mean anything"
+    );
+    let mut rescued = HashSet::new();
+    let mut transactions = 0;
+    while (rescued.len() as i64) < BATCHES * BATCH_MEMBERS {
+        let before = claim_batch_array_reads(&single, schema, slot).await;
+        let batch = store
+            .rescue_expired_deadlines_batch(&single, &|_| false, &options)
+            .await
+            .expect("rescue batch");
+        let reads = claim_batch_array_reads(&single, schema, slot).await - before;
+        transactions += 1;
+        assert!(
+            reads > 0 && reads <= read_bound,
+            "rescue transaction {transactions} read {reads} member arrays, more than the \
+             {read_bound} its window of {window_batches} of the {BATCHES} batches allows"
+        );
+        assert_eq!(batch.rescued.len() as i64, RESCUE_LIMIT);
+        assert!(batch.saturated);
+        for job in &batch.rescued {
+            assert_eq!(job.state, JobState::Retryable);
+            assert!(rescued.insert(job.id), "job {} was rescued twice", job.id);
+        }
+        assert!(transactions <= BATCHES * BATCH_MEMBERS / RESCUE_LIMIT);
+    }
+
+    // With nothing left, the walk wraps to the first batch and stays bounded.
+    for _ in 0..2 {
+        let before = claim_batch_array_reads(&single, schema, slot).await;
+        let batch = store
+            .rescue_expired_deadlines_batch(&single, &|_| false, &options)
+            .await
+            .expect("rescue batch over closed history");
+        let reads = claim_batch_array_reads(&single, schema, slot).await - before;
+        assert!(batch.rescued.is_empty());
+        assert!(
+            reads <= read_bound,
+            "a transaction over closed batches read {reads} member arrays"
+        );
+    }
+    single.close().await;
+
+    let closed: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT COALESCE(sum(closed_count), 0)::bigint
+         FROM {schema}.lease_claim_closure_batches WHERE outcome = 'deadline_expired'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("closed claims");
+    assert_eq!(closed, BATCHES * BATCH_MEMBERS, "each claim is closed once");
+    let retryable: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.deferred_jobs WHERE state = 'retryable'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("retryable jobs");
+    assert_eq!(retryable, BATCHES * BATCH_MEMBERS);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_rescue_batch_continues_past_closed_scan_windows() {
     for (deadline, fresh_history) in [(false, false), (true, false), (false, true)] {
