@@ -362,6 +362,12 @@ v058 replaces `<schema>.provision_lane` in the default and every discovered cust
 
 It replaces functions only and takes no lock on any `awa` or queue-storage table. Binaries before v058 call the function with the same arguments, so they can run before or after the migration.
 
+## v059: wider retry jitter
+
+v059 replaces the body of `awa.backoff_duration(attempt, max_attempts)`, which sets the delay before an automatic retry. The delay was `2^attempt` seconds plus up to 25% of that, so jobs that failed together, for example while a dependency was down, retried within a quarter of their base delay of each other and reached the recovering dependency together. It is now `2^attempt` seconds multiplied by a random factor in [0.5, 1.5), still capped at 24 hours. The mean delay is the base delay (the old mean was 12.5% above it), the shortest delay for an attempt halves, and the retries from one failure spread over a window four times as wide, which cuts their peak arrival rate by about 3.5×. The function sets every retry delay awa chooses itself: after a retryable handler error and after rescue of a stale heartbeat, an expired deadline or a callback timeout. `RetryAfter` and `Snooze` keep the delay the handler gives.
+
+It is one `CREATE OR REPLACE FUNCTION` that keeps the function's signature, volatility, owner and privileges, and takes no lock on any `awa` or queue-storage table. Binaries before v059 call the same function from the same statements, so they get the new delays as soon as the migration commits and can run before or after it. Jobs already waiting to retry keep their scheduled time. External migration runners apply `awa migrate --sql --from 58 --to 59`.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
