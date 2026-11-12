@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
   <title id="title">Where AWA batches work</title>
-  <desc id="desc">Enqueue inserts many jobs in one statement and reserves each lane once. A claim takes up to 512 jobs, one per free worker permit, and writes one shared receipt row. Finished jobs are grouped per completion shard and written by one statement once 512 are waiting or none has arrived for a millisecond.</desc>
+  <desc id="desc">Enqueue inserts many jobs in one statement and reserves each lane once. A claim takes up to 512 jobs, one per free worker permit, and writes one shared receipt row. Finished jobs are grouped per completion shard and written by one statement once 512 are waiting or a millisecond after the first arrived.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="context-stroke"/></marker>
     <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line class="hatch-l" x1="0" y1="0" x2="0" y2="8"/></pattern>
@@ -49,7 +49,7 @@
 <text class="term-t" x="980" y="118" font-size="25" font-weight="760" text-anchor="middle">3 · Complete</text>
 <text class="c" x="980" y="150.0" font-size="17.5" font-weight="400" text-anchor="middle">finished jobs queue per</text>
 <text class="c" x="980" y="175.0" font-size="17.5" font-weight="400" text-anchor="middle">shard until 512 wait or</text>
-<text class="c" x="980" y="200.0" font-size="17.5" font-weight="400" text-anchor="middle">none arrive for 1 ms</text>
+<text class="c" x="980" y="200.0" font-size="17.5" font-weight="400" text-anchor="middle">1 ms after the first</text>
 <rect class="muted" x="70" y="240" width="30" height="30" rx="6"/>
 <rect class="muted" x="110" y="240" width="30" height="30" rx="6"/>
 <rect class="muted" x="150" y="240" width="30" height="30" rx="6"/>

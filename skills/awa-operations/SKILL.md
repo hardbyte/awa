@@ -200,6 +200,13 @@ Health signals:
 - `awa health [--json]`: database-only readiness (reachable, schema migrated for
   this binary, fleet heartbeat counts). Exit 0 ready, 1 unreachable or
   unmigrated.
+- Worker utilization (0.7+): `sum by (awa_job_queue) (awa_queue_worker_in_use)
+  / sum by (awa_job_queue) (awa_queue_worker_capacity)`. Waits climb steeply
+  once a queue stays above about 0.8; add `max_workers`, and put job kinds with
+  very different service times on separate queues. Weighted-mode capacity counts
+  the whole overflow pool, so a queue can be saturated at a low ratio while
+  other queues hold overflow permits; check its backlog too. See
+  [sizing workers from utilization](../../docs/configuration.md#sizing-workers-from-utilization).
 
 On Kubernetes, set `terminationGracePeriodSeconds` above the shutdown drain
 timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.
