@@ -2,6 +2,12 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [Unreleased]
+
+### Fixed
+
+- `JobContext::flush_progress` (Python `ctx.flush_progress()`) on a queue-storage attempt with receipts, the default, no longer returns success without writing the progress. A heartbeat leaves out an attempt whose lock another transaction holds, and since 0.6.16 an explicit flush shared that path, so a flush that overlapped a heartbeat or a completion of the same attempt was dropped and the worker treated the progress as persisted. An explicit flush now waits for the attempt's lock; heartbeats still skip.
+
 ## [0.6.17] — 2026-11-12
 
 Recommended for everyone on 0.6.16 using queue storage. Claims commit asynchronously and reuse the runtime's claimer lease, which raised throughput by 19 to 21% at 4, 16 and 64 workers and cut end-to-end p99 at 800 jobs/s from 31 ms to 24 ms in a three-round comparison against 0.6.16 on PostgreSQL 18 with `synchronous_commit = on`. Promotion and rescue no longer wait behind the leader's other maintenance work, a runtime can opt out of maintenance leadership, and several admin reads and the admin UI are fixed. See the [upgrade guide](docs/upgrade-0.6.16-to-0.6.17.md).
