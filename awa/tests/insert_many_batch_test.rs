@@ -1487,18 +1487,21 @@ async fn callers_lock_timeout_applies_to_each_wait() {
         })
     };
     let started = Instant::now();
-    let waited_after = loop {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_locks
-             WHERE locktype = 'advisory' AND NOT granted
-               AND ((classid::bigint << 32) | objid::bigint) = $1)",
+    let pre_lane_work = loop {
+        let waited_after: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM locks.waitstart - activity.query_start)::float8
+             FROM pg_locks AS locks
+             JOIN pg_stat_activity AS activity USING (pid)
+             WHERE locks.locktype = 'advisory' AND NOT locks.granted
+               AND locks.waitstart IS NOT NULL
+               AND ((locks.classid::bigint << 32) | locks.objid::bigint) = $1",
         )
         .bind(key)
-        .fetch_one(&pool)
+        .fetch_optional(&pool)
         .await
         .expect("poll pg_locks");
-        if waiting {
-            break started.elapsed();
+        if let Some(seconds) = waited_after {
+            break Duration::from_secs_f64(seconds);
         }
         assert!(
             !batch.is_finished(),
@@ -1516,8 +1519,8 @@ async fn callers_lock_timeout_applies_to_each_wait() {
         .expect("batch with a 100 ms lock_timeout");
     assert_eq!(inserted as i64, ROWS);
     assert!(
-        waited_after > Duration::from_millis(100),
-        "the batch's work before its lane wait outlasts the caller's lock_timeout ({waited_after:?})"
+        pre_lane_work > Duration::from_millis(100),
+        "the batch's work before its lane wait outlasts the caller's lock_timeout ({pre_lane_work:?})"
     );
 }
 
