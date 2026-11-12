@@ -2,6 +2,16 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [Unreleased]
+
+### Upgrading
+
+- The schema stays at v40. `awa migrate` applies one new repeatable patch, `replica_identity`. Unlike the earlier 0.6 patches it takes table locks: `ACCESS EXCLUSIVE` on each table it changes (`awa.admin_dirty_queue_marks`, `awa.admin_dirty_kind_marks`, `awa.job_unique_claims` and each `queue_terminal_count_deltas` table and partition), plus `SHARE` on `idx_awa_jobs_unique`, held until the patch commits, which is milliseconds once granted. Each lock wait is bounded by the session's `lock_timeout`, or 300 ms when none is set; a timeout fails the patch with `55P03` and changes nothing, so run `awa migrate` again. A re-run after success takes no lock. External migration runners apply `R__replica_identity.sql` after `V40` and after the other `R__` scripts, as the owner of the awa and queue-storage tables. 0.6.17 binaries run unchanged on the patched schema, so binaries and the patch can roll in either order. See the [upgrade guide](docs/upgrade-0.6.17-to-0.6.18.md).
+
+### Fixed
+
+- **awa keeps working when its schema is in a logical-replication publication (0.6 port of #509).** With a `CREATE PUBLICATION ... FOR ALL TABLES` (Debezium's default) or `FOR TABLES IN SCHEMA awa`, PostgreSQL rejected every `UPDATE` and `DELETE` on the 19 awa tables without a primary key, so the admin dirty-mark drain failed on every maintenance tick with `cannot delete from table "admin_dirty_queue_marks" because it does not have a replica identity and publishes deletes`, and unique-claim release failed the same way. The `replica_identity` patch gives `awa.job_unique_claims` its uniqueness index as replica identity and sets `REPLICA IDENTITY FULL` on the two mark tables and on `queue_terminal_count_deltas` and each of its partitions, which adds no WAL on their insert-and-truncate path. PostgreSQL does not copy the setting to partitions, so the queue-storage installer sets it on every partition of a schema prepared later. Keeping the awa schema out of CDC publications remains the recommendation; see [logical replication and CDC](docs/deploying-on-managed-postgres.md#logical-replication-and-cdc).
+
 ## [0.6.17] — 2026-11-12
 
 Recommended for everyone on 0.6.16 using queue storage. Claims commit asynchronously and reuse the runtime's claimer lease, which raised throughput by 19 to 21% at 4, 16 and 64 workers and cut end-to-end p99 at 800 jobs/s from 31 ms to 24 ms in a three-round comparison against 0.6.16 on PostgreSQL 18 with `synchronous_commit = on`. Promotion and rescue no longer wait behind the leader's other maintenance work, a runtime can opt out of maintenance leadership, and several admin reads and the admin UI are fixed. See the [upgrade guide](docs/upgrade-0.6.16-to-0.6.17.md).
