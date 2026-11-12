@@ -22,7 +22,7 @@ This is what makes rescue safe. Worker A in the diagram is not dead; it is pause
 ![Rows written by one attempt: a receipt at claim, attempt state on heartbeat and progress, a lease while waiting for a callback, and terminal history at finish](../../assets/how-it-works/attempt-records.svg)
 </div>
 
-**Claim receipt.** The claim appends one receipt row per claim batch to the current slot of the claim ring, listing every job, `run_lease` and receipt id in the batch. It is never updated. When an attempt ends, a closure row is appended next to it; an attempt is open while its receipt has no closure.
+**Claim receipt.** The claim appends one receipt row per claim batch to the current slot of the claim ring, listing every job, `run_lease` and receipt id in the batch. It is never updated. When an attempt ends, closure evidence is appended in the same claim slot: successful short jobs share one closure batch row per completion batch, and other outcomes, rescue and cancellation append a closure row of their own. An attempt is open while its receipt has neither.
 
 **Attempt state.** The first heartbeat or progress update creates a small row for the attempt, and later ones update it. It holds the heartbeat time and the latest progress, and is deleted when the attempt finishes. A job that finishes before its first heartbeat never creates one.
 
