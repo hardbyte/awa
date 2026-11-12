@@ -14492,6 +14492,119 @@ async fn test_queue_storage_retry_jobs_by_ids_dedupes_duplicate_ids() {
     assert_eq!(counts.terminal, 0);
 }
 
+/// Waits until another backend in this database is blocked on a lock while
+/// running a statement that contains `fragment`.
+async fn wait_for_lock_waiter(pool: &sqlx::PgPool, fragment: &str) {
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND pid <> pg_backend_pid()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE '%' || $1 || '%'
+             )",
+        )
+        .bind(fragment)
+        .fetch_one(pool)
+        .await
+        .expect("poll pg_stat_activity for a lock waiter");
+        if waiting {
+            return;
+        }
+        assert!(
+            started.elapsed() < ci_timing::scaled_timeout(Duration::from_secs(10)),
+            "no backend waited on a lock while running {fragment:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `TRUNCATE` is not MVCC-safe: a read whose snapshot predates a prune and
+/// reaches the pruned slot after the prune commits would see the slot empty,
+/// and could not see the failed row prune re-homed into the live slot either.
+/// A point read locks the ring before it takes its snapshot, so one that
+/// starts while prune holds the slot waits for the prune and must find the
+/// failed job in the live slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_load_job_finds_failed_row_carried_by_concurrent_prune() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_load_job_prune_carry";
+    let schema = "awa_qs_load_job_prune_carry";
+    let store = create_store(&pool, schema)
+        .await
+        .with_prune_lock_timeout(Duration::from_secs(30))
+        .expect("prune lock timeout");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    store
+        .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail job")
+        .expect("running job should fail");
+    assert!(matches!(
+        store.rotate(&pool).await.expect("rotate"),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+
+    // Hold prune after it has locked slot 0 and before it carries the failed
+    // row into slot 1, then start a read so it queues behind prune's slot 0
+    // lock.
+    let mut holder = pool.begin().await.expect("begin carry holder");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_1 IN SHARE MODE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .expect("hold the live done slot");
+
+    let prune = store.prune_oldest(&pool, Duration::from_secs(3600));
+    let read = async {
+        wait_for_lock_waiter(&pool, "WITH carried AS").await;
+        let release = async {
+            wait_for_lock_waiter(&pool, "IN ACCESS SHARE MODE").await;
+            holder.rollback().await.expect("release carry holder");
+        };
+        let (job, ()) = tokio::join!(store.load_job(&pool, job_id), release);
+        job
+    };
+    let (pruned, job) = tokio::join!(prune, read);
+
+    assert!(
+        matches!(
+            pruned.expect("prune_oldest"),
+            PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 1,
+                ..
+            }
+        ),
+        "prune should carry the failed row out of slot 0"
+    );
+    let job = job
+        .expect("load_job")
+        .expect("a failed job carried by a concurrent prune must stay visible");
+    assert_eq!(job.id, job_id);
+    assert_eq!(job.state, JobState::Failed);
+}
+
 /// #337: a mix of completed and failed terminal rows under a generous
 /// retention floor. The completed rows fold into `pruned_completed_count`;
 /// the failed rows (including a NARROW ready-backed one) are carried into
