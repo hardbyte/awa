@@ -629,6 +629,10 @@ pub struct RescueBatchOptions {
     /// examined costs its closure checks, so a batch that follows one that
     /// filled up on a dense backlog can examine far fewer.
     pub cursor_scan_limit: Option<usize>,
+    /// A stale-heartbeat batch takes only attempts last heartbeated before
+    /// this instant as well as before its staleness cutoff. The other
+    /// rescue kinds ignore it.
+    pub heartbeated_before: Option<DateTime<Utc>>,
 }
 
 /// The outcome of one rescue batch, which runs in one transaction.
@@ -18964,6 +18968,9 @@ impl QueueStorage {
         let cutoff = Utc::now()
             - TimeDelta::from_std(staleness)
                 .map_err(|err| AwaError::Validation(format!("invalid staleness: {err}")))?;
+        let cutoff = options
+            .heartbeated_before
+            .map_or(cutoff, |before| cutoff.min(before));
         // #169 B1: the staleness predicate prefers
         // `attempt_state.heartbeat_at` (receipts-mode source of truth,
         // where heartbeat_batch writes go) and falls back to

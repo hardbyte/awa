@@ -411,7 +411,6 @@ struct RescueSweep {
     cursors: HashMap<i32, Vec<RescueSweepCursor>>,
     idle_slots: Vec<i32>,
     last_revisit: Option<Instant>,
-    batches_started: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1002,6 +1001,9 @@ pub struct MaintenanceService {
     rescue_owner_evidence: std::sync::Mutex<RescueOwnerEvidence>,
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
+    /// Batches each rescue kind has started under this service, across
+    /// passes, for the slot-order rotation.
+    rescue_batches_started: std::sync::Mutex<HashMap<RescueKind, usize>>,
     rescue_others_first_offset: AtomicUsize,
     promote_interval: Duration,
     cleanup_interval: Duration,
@@ -1319,6 +1321,7 @@ impl MaintenanceService {
             rescue_owner_evidence: std::sync::Mutex::new(RescueOwnerEvidence::default()),
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
+            rescue_batches_started: std::sync::Mutex::new(HashMap::new()),
             rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
@@ -2297,16 +2300,25 @@ impl MaintenanceService {
             .unwrap_or_default();
         sweep.revisit(started, interval, origin);
         let pass_end = loop {
-            let slot_order = if sweep.batches_started % RESCUE_OTHERS_FIRST_EVERY
-                == RESCUE_OTHERS_FIRST_EVERY - 1
-            {
-                RescueSlotOrder::OthersFirst(
-                    self.rescue_others_first_offset
-                        .fetch_add(1, Ordering::Relaxed),
-                )
-            } else {
-                RescueSlotOrder::OldestFirst
+            let batch_number = {
+                let mut started = self
+                    .rescue_batches_started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let started = started.entry(kind).or_default();
+                let batch_number = *started;
+                *started = started.wrapping_add(1);
+                batch_number
             };
+            let slot_order =
+                if batch_number % RESCUE_OTHERS_FIRST_EVERY == RESCUE_OTHERS_FIRST_EVERY - 1 {
+                    RescueSlotOrder::OthersFirst(
+                        self.rescue_others_first_offset
+                            .fetch_add(1, Ordering::Relaxed),
+                    )
+                } else {
+                    RescueSlotOrder::OldestFirst
+                };
             let options = RescueBatchOptions {
                 slot_order,
                 skip_slots: sweep.idle_slots.clone(),
@@ -2319,26 +2331,21 @@ impl MaintenanceService {
                             RescueKind::Callback => false,
                         }))
                 .then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
+                // Follow-up batches take only claims last heartbeated
+                // before a runtime known to be gone stopped reporting.
+                heartbeated_before: if batches == 0 {
+                    first_heartbeat_cutoff
+                } else {
+                    bulk_heartbeat_cutoff
+                },
             };
             let outcome = match kind {
                 RescueKind::Heartbeat => {
-                    // Follow-up batches take only claims last heartbeated
-                    // before a runtime known to be gone stopped reporting.
-                    let cutoff = if batches == 0 {
-                        first_heartbeat_cutoff
-                    } else {
-                        bulk_heartbeat_cutoff
-                    };
-                    let staleness = cutoff
-                        .and_then(|cutoff| (Utc::now() - cutoff).to_std().ok())
-                        .map_or(self.heartbeat_staleness, |since_cutoff| {
-                            since_cutoff.max(self.heartbeat_staleness)
-                        });
                     runtime
                         .store
                         .rescue_stale_heartbeats_batch(
                             &self.pool,
-                            staleness,
+                            self.heartbeat_staleness,
                             &dlq_enabled,
                             &options,
                         )
@@ -2358,7 +2365,6 @@ impl MaintenanceService {
                 }
             };
             batches += 1;
-            sweep.batches_started = sweep.batches_started.wrapping_add(1);
             let RescueBatch {
                 rescued,
                 saturated,
@@ -5740,6 +5746,54 @@ mod tests {
                 )
                 .await
         );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        pool.close().await;
+    }
+
+    /// Passes that do not re-arm still share the slot-order rotation: every
+    /// fourth batch of a kind visits the other claim slots first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_slot_order_rotates_across_passes_that_do_not_rearm() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.expect("migrations");
+        let config = QueueStorageConfig::default();
+        let store = QueueStorage::new(config.clone()).expect("queue storage");
+        store.install(&pool).await.expect("install");
+        let runtime =
+            QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("runtime");
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime.clone()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .rescue_pass_max_rows(0);
+        for pass in 1..=2 * RESCUE_OTHERS_FIRST_EVERY {
+            assert!(
+                !service
+                    .rescue_queue_storage_pass(
+                        RescueKind::Deadline,
+                        &runtime,
+                        false,
+                        RescueTickOrigin::Ordinary,
+                    )
+                    .await
+            );
+            assert_eq!(
+                service.rescue_others_first_offset.load(Ordering::Relaxed),
+                pass / RESCUE_OTHERS_FIRST_EVERY,
+                "others-first batches after {pass} one-batch passes"
+            );
+        }
         assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
         pool.close().await;
     }

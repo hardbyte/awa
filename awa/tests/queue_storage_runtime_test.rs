@@ -9563,6 +9563,103 @@ async fn test_rescue_batch_continues_past_closed_scan_windows() {
     }
 }
 
+/// A stale-heartbeat batch given `heartbeated_before` leaves an attempt
+/// heartbeated after that instant alone, however long the batch waits for a
+/// connection before it reads the clock. The attempt is stale by the
+/// staleness alone, so a batch without the cutoff takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rescue_stale_heartbeat_cutoff_holds_while_the_transaction_waits() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_rescue_heartbeat_cutoff";
+    let queue = "rescue_heartbeat_cutoff";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claims = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claims.len(), 1);
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_id,
+        claims[0].job.run_lease,
+        Duration::from_secs(3600),
+    )
+    .await;
+    let heartbeat_at: DateTime<Utc> = sqlx::query_scalar(audited_sql(format!(
+        "INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+         VALUES ($1, $2, clock_timestamp() - interval '10 seconds', clock_timestamp())
+         RETURNING heartbeat_at"
+    )))
+    .bind(job_id)
+    .bind(claims[0].job.run_lease)
+    .fetch_one(&pool)
+    .await
+    .expect("last heartbeat");
+    let wait = Duration::from_secs(2);
+    let cutoff = heartbeat_at - chrono::Duration::milliseconds(500);
+    let staleness = Duration::from_secs(1);
+
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("single-connection pool");
+    let held = single.acquire().await.expect("hold the only connection");
+    let release = async {
+        tokio::time::sleep(wait).await;
+        drop(held);
+    };
+    let with_cutoff = awa::model::RescueBatchOptions {
+        heartbeated_before: Some(cutoff),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let (batch, ()) = tokio::join!(
+        store.rescue_stale_heartbeats_batch(&single, staleness, &|_| false, &with_cutoff),
+        release
+    );
+    assert!(
+        started.elapsed() >= wait,
+        "the batch waited for its connection"
+    );
+    assert!(
+        batch.expect("batch with cutoff").rescued.is_empty(),
+        "an attempt heartbeated after the cutoff was rescued once the batch had waited {wait:?}"
+    );
+
+    let batch = store
+        .rescue_stale_heartbeats_batch(&single, staleness, &|_| false, &Default::default())
+        .await
+        .expect("batch without cutoff");
+    assert_eq!(
+        batch.rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    single.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
     let (_db_guard, pool) = setup_pool(10).await;
