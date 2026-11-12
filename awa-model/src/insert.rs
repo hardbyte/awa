@@ -20,8 +20,9 @@ use sqlx::{PgExecutor, PgPool};
 // `insert_many_copy` and `insert_many_skip_unique_conflicts` use
 // `awa.insert_jobs_compat_batch` (migration v055), which does the lane-independent work first (job ids, unique claims,
 // payloads) and then registers and reserves its lanes one at a time in
-// canonical order, so a lane is held only across its registration,
-// reservation, the ready-row writes and the commit.
+// canonical order. Each lane's lock is taken when the batch reaches that
+// lane rather than at the batch's first ready row, and like every enqueue
+// lock it is held until the transaction ends.
 //
 // Generic `insert_many` always uses the per-row path, as does
 // `insert_many_copy` on a schema before v055: rows are sorted by the
