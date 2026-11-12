@@ -18,7 +18,7 @@ These links are curated for agents. Each target is the Markdown representation o
 ## Concepts
 
 - [How AWA works](concepts/index.md): AWA is a library and a PostgreSQL schema, not a separate broker. Producers, workers and operator tools all coordinate through the database, so a job is as durable as the transaction that wrote it.
-- [Lanes and claiming](concepts/lanes-and-claiming/index.md): Every runnable job sits in a lane: an ordered sequence for one (queue, priority, enqueueshard). A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed.
+- [Lanes and claiming](concepts/lanes-and-claiming/index.md): Every runnable job sits in a lane: an ordered sequence for one (queue, priority, enqueueshard). A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed and.
 - [Claims, receipts and leases](concepts/claims-receipts-and-leases/index.md): A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an.
 - [Rings: rotation and prune](concepts/rings/index.md): A busy job queue writes and discards rows all day. In an ordinary table every deleted or updated row leaves a dead row behind for vacuum to clean up, and one long-running transaction anywhere in the database stops vacuum from cleaning any.
 - [Job lifecycle](concepts/job-lifecycle/index.md): A job moves through durable states in PostgreSQL. The handler returns the next outcome; AWA validates that the current worker still owns the claim before applying it.

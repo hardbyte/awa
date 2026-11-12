@@ -2,7 +2,7 @@
 
 # Lanes and claiming
 
-Every runnable job sits in a **lane**: an ordered sequence for one `(queue, priority, enqueue_shard)`. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed, and waits for a worker unless it was cancelled first.
+Every runnable job sits in a **lane**: an ordered sequence for one `(queue, priority, enqueue_shard)`. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed and waits for a worker, except jobs cancelled before they were claimed and, for a moment after a claim commits, the jobs it just took: the claim moves the cursor past them in a separate step.
 
 <div class="awa-diagram" markdown>
 ![Three lanes of one queue, each a numbered sequence with a claim cursor and an enqueue head](../../assets/how-it-works/lanes.svg)

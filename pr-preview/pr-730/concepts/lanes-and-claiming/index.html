@@ -2395,7 +2395,7 @@
 
 
 <h1 id="lanes-and-claiming">Lanes and claiming<a class="headerlink" href="#lanes-and-claiming" title="Permanent link">&para;</a></h1>
-<p>Every runnable job sits in a <strong>lane</strong>: an ordered sequence for one <code>(queue, priority, enqueue_shard)</code>. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed, and waits for a worker unless it was cancelled first.</p>
+<p>Every runnable job sits in a <strong>lane</strong>: an ordered sequence for one <code>(queue, priority, enqueue_shard)</code>. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed and waits for a worker, except jobs cancelled before they were claimed and, for a moment after a claim commits, the jobs it just took: the claim moves the cursor past them in a separate step.</p>
 <div class="awa-diagram">
 <p><img alt="Three lanes of one queue, each a numbered sequence with a claim cursor and an enqueue head" src="../../assets/how-it-works/lanes.svg" /></p>
 </div>
