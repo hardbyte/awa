@@ -1,6 +1,6 @@
 # Claims, receipts and leases
 
-A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: most attempts only append rows, and only an attempt that waits for an external callback gets a row that is updated in place.
+A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that waits for an external callback gets a lease.
 
 ## `run_lease`: the attempt's number
 
@@ -32,7 +32,9 @@ The common path, claim then finish, therefore only appends rows to partitions th
 
 ## Heartbeats
 
-While a handler runs, its worker heartbeats each attempt it holds, every `heartbeat_interval` (30 s by default). Heartbeats come from the worker's runtime, not from the handler, so a handler that blocks or computes for a long time still keeps its attempt alive. A heartbeat proves the process is alive; it does not extend the queue's `deadline_duration`, which bounds the attempt however healthy the worker is.
+While a handler runs, its worker heartbeats each attempt it holds, every `heartbeat_interval` (30 s by default). Heartbeats come from a task on the worker's async runtime, not from the handler. A Python handler that blocks, or a Rust handler that awaits a long operation, still keeps its attempt alive. A Rust handler that blocks the runtime's threads stops heartbeats too and its attempt can be rescued while it runs, so run blocking work with `spawn_blocking` and give it a timeout.
+
+A heartbeat proves the process is alive; it does not extend the queue's `deadline_duration`, which bounds the attempt however healthy the worker is. A queue with `deadline_duration` set to zero has no deadline, and a hung handler holds its attempt for as long as its worker keeps heartbeating.
 
 ## Rescue
 
@@ -41,7 +43,7 @@ The maintenance leader closes attempts that can no longer finish on their own:
 | Rescue | Triggers when | Default |
 | --- | --- | --- |
 | Stale heartbeat | the attempt's last heartbeat, or its claim if it never heartbeated, is older than `heartbeat_staleness` | 90 s |
-| Deadline | the attempt has run longer than the queue's `deadline_duration` | per queue |
+| Deadline | the attempt has run longer than the queue's `deadline_duration`, unless that is zero | per queue |
 | Callback timeout | a callback wait passed its timeout | per callback |
 
 Rescue closes the attempt and then sends the job down the normal path: back to deferred jobs for a retry if attempts remain, otherwise to `failed` or the dead-letter queue. The rescued attempt counts against `max_attempts`, which is how a job that crashes its worker every time eventually stops; see [poison jobs](job-lifecycle.md#poison-jobs).

@@ -1,6 +1,6 @@
 # Lanes and claiming
 
-Every runnable job sits in a **lane**: an ordered sequence for one `(queue, priority, enqueue_shard)`. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed and waiting.
+Every runnable job sits in a **lane**: an ordered sequence for one `(queue, priority, enqueue_shard)`. A lane has two cursors. Producers append at the enqueue head; workers take jobs from the claim cursor. Everything between them is committed, and waits for a worker unless it was cancelled first.
 
 <div class="awa-diagram" markdown>
 ![Three lanes of one queue, each a numbered sequence with a claim cursor and an enqueue head](../assets/how-it-works/lanes.svg)
@@ -20,17 +20,18 @@ A worker asks for up to a batch of jobs from the queues it serves. For each lane
 
 1. locks the lane's claim cursor with `SKIP LOCKED`, so a worker never waits behind another worker on the same lane, it moves on;
 2. reads the next committed jobs after the cursor;
-3. writes [claim receipts](claims-receipts-and-leases.md) for them and advances the cursor past them.
+3. writes [claim receipts](claims-receipts-and-leases.md) for them, or leases when `lease_claim_receipts` is off, and advances the cursor past them.
 
 Claiming reads ready rows by position and never rewrites them. A ready row is written once and stays unchanged until its slot is [truncated](rings.md); the cursor alone records how far the lane has been consumed.
 
 ## Priority and ordering
 
-Priority runs from 1 (first) to 4. A worker prefers the lane whose head has the best **effective** priority, which improves the longer the head job has waited, so low-priority work cannot starve. See [Job priority and aging](../configuration.md#job-priority-and-aging). Within one lane, jobs come out in sequence order.
+Priority runs from 1 (first) to 4. A worker prefers the lane whose head has the best **effective** priority, which improves the longer the head job has waited, so low-priority work cannot starve unless the queue turns aging off. See [Job priority and aging](../configuration.md#job-priority-and-aging). Within one lane, jobs come out in sequence order.
 
 Ordering is only promised within a lane:
 
-- Two jobs on the same queue and priority, enqueued by separate transactions, come out in commit order when the queue has one shard.
+- Two jobs on the same queue and priority, enqueued ready to run by separate transactions, come out in commit order when the queue has one shard.
+- A scheduled, snoozed or retrying job joins its lane when it is promoted, behind whatever was enqueued before then.
 - With several enqueue shards, each shard is its own lane. Order holds within a shard, not across shards.
 - Jobs at different priorities are ordered by effective priority, not by when they were enqueued.
 
