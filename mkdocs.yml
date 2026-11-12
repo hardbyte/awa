@@ -88,7 +88,11 @@ markdown_extensions:
       base_path:
         - .
       check_paths: true
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.tasklist:
@@ -103,6 +107,9 @@ nav:
       - CLI: start/cli.md
   - Concepts:
       - How AWA works: concepts/index.md
+      - Lanes and claiming: concepts/lanes-and-claiming.md
+      - Claims, receipts and leases: concepts/claims-receipts-and-leases.md
+      - "Rings: rotation and prune": concepts/rings.md
       - Job lifecycle: concepts/job-lifecycle.md
       - Transactional enqueue: concepts/transactional-enqueue.md
       - Interactive failure lab: concepts/failure-lab.md

@@ -8,7 +8,7 @@ Awa keeps application data and background work in one transactional system of re
 
 The diagram is the useful boundary: application processes produce work, worker processes execute it, and PostgreSQL is authoritative for both job state and coordination. The admin surface observes and controls that system; it is not part of the dispatch hot path.
 
-For migration details see [Migrations](migrations.md). For user-facing knobs see [Configuration](configuration.md).
+This page is the reference description. For a visual walkthrough start with [How AWA works](concepts/index.md), [lanes and claiming](concepts/lanes-and-claiming.md), [claims, receipts and leases](concepts/claims-receipts-and-leases.md) and [rings](concepts/rings.md). For migration details see [Migrations](migrations.md). For user-facing knobs see [Configuration](configuration.md).
 
 ## Terms
 
