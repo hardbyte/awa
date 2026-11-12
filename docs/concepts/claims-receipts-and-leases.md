@@ -1,6 +1,6 @@
 # Claims, receipts and leases
 
-A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that registers an external callback gets a lease.
+A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that registers an external callback gets a lease, unless `lease_claim_receipts` is turned off and every claim writes one.
 
 ## `run_lease`: the attempt's number
 
