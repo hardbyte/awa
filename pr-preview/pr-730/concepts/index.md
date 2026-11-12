@@ -12,7 +12,7 @@ AWA is a library and a PostgreSQL schema, not a separate broker. Producers, work
 
 1. **Enqueue.** A producer inserts the job, usually in the same transaction as the business write that caused it. A job that is due now is appended to a ready [lane](lanes-and-claiming/index.md); one that is due later waits in deferred jobs.
 2. **Claim.** A worker takes the next job from the head of a lane and records a [claim receipt](claims-receipts-and-leases/index.md). The claim increments the job's `run_lease`, the number that identifies this attempt.
-3. **Run.** The handler runs while the worker heartbeats the attempt. If the handler waits for an external callback, the attempt also gets a lease row that holds the callback state.
+3. **Run.** The handler runs while the worker heartbeats the attempt. If the handler registers an external callback, the attempt also gets a lease row that holds the callback state.
 4. **Finish.** Completion, failure, cancellation, retry or snooze is written only if the attempt's `run_lease` is still current. A retry or snooze goes back to deferred jobs.
 5. **Reclaim.** The rows a job left behind sit in ring partitions. Once every job in an old slot has been claimed or cancelled and every attempt claimed from it has ended, the maintenance leader [truncates the whole slot](rings/index.md) instead of deleting rows one at a time.
 
@@ -26,7 +26,7 @@ Hot storage is split into three rings of partitions, each rotated and pruned ind
 | --- | --- | --: |
 | Queue | ready jobs and the terminal history of jobs claimed from them | 16 |
 | Claim | claim receipts and the evidence that each attempt ended | 8 |
-| Lease | leases for attempts waiting on an external callback, or for every claim when `lease_claim_receipts` is off | 8 |
+| Lease | leases for attempts that register an external callback, or for every claim when `lease_claim_receipts` is off | 8 |
 
 Deferred jobs, the dead-letter queue and the small control tables (lane cursors, ring cursors, runtime snapshots) are ordinary tables outside the rings.
 

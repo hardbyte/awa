@@ -2417,7 +2417,7 @@
 
 
 <h1 id="claims-receipts-and-leases">Claims, receipts and leases<a class="headerlink" href="#claims-receipts-and-leases" title="Permanent link">&para;</a></h1>
-<p>A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that waits for an external callback gets a lease.</p>
+<p>A claim hands one attempt of a job to one worker. AWA records that ownership with as little storage as the attempt needs: a short attempt only appends rows, a longer one also keeps one small row for its heartbeat and progress, and only an attempt that registers an external callback gets a lease.</p>
 <h2 id="run_lease-the-attempts-number"><code>run_lease</code>: the attempt's number<a class="headerlink" href="#run_lease-the-attempts-number" title="Permanent link">&para;</a></h2>
 <p>Every claim increments the job's <code>run_lease</code>. Every later write for that attempt (heartbeat, progress, completion, retry, snooze, cancel, callback) names the job and its <code>run_lease</code>, and is applied only if that attempt is still open. A write for a closed attempt changes nothing.</p>
 <div class="awa-diagram">
@@ -2427,11 +2427,11 @@
 <p><code>run_lease</code> protects the database, not the outside world. Anything worker A did before it stalled, such as sending an email or charging a card, has still happened. Make those effects idempotent; <a href="../transactional-enqueue/">transactional enqueue</a> and the <a href="../failure-lab/">failure lab</a> show how.</p>
 <h2 id="what-an-attempt-writes">What an attempt writes<a class="headerlink" href="#what-an-attempt-writes" title="Permanent link">&para;</a></h2>
 <div class="awa-diagram">
-<p><img alt="Rows written by one attempt: a receipt at claim, attempt state on heartbeat and progress, a lease while waiting for a callback, and terminal history at finish" src="../../assets/how-it-works/attempt-records.svg" /></p>
+<p><img alt="Rows written by one attempt: a receipt at claim, attempt state on heartbeat and progress, a lease once a callback is registered, and terminal history at finish" src="../../assets/how-it-works/attempt-records.svg" /></p>
 </div>
 <p><strong>Claim receipt.</strong> The claim appends one receipt row per claim batch to the current slot of the claim ring, listing every job, <code>run_lease</code> and receipt id in the batch. It is never updated. When an attempt ends, closure evidence is appended in the same claim slot: successful short jobs share one closure batch row per completion batch, and other outcomes, rescue and cancellation append a closure row of their own. An attempt is open while its receipt has neither.</p>
 <p><strong>Attempt state.</strong> The first heartbeat or progress update creates a small row for the attempt, and later ones update it. It holds the heartbeat time and the latest progress, and is deleted when the attempt finishes. A job that finishes before its first heartbeat never creates one.</p>
-<p><strong>Lease.</strong> An attempt that registers a callback and waits for it needs state that changes while no handler is running: the callback id, its timeout and the waiting state. That attempt gets a lease row in the lease ring, which the callback or a timeout later resolves. With <code>lease_claim_receipts</code> turned off, every claim writes a lease instead of a receipt.</p>
+<p><strong>Lease.</strong> An attempt that waits for a callback needs state that changes while no handler is running: the callback id, its timeout and the waiting state. Registering the callback creates a lease row in the lease ring, while the handler is still running, and the callback or a timeout later resolves it. With <code>lease_claim_receipts</code> turned off, every claim writes a lease instead of a receipt.</p>
 <p><strong>Terminal history.</strong> Finishing appends the outcome to the queue ring, in the same slot as the job's ready row. Successful short jobs share one compact row per completion batch. Read finished jobs through <code>terminal_jobs</code> or the admin API, not the physical tables.</p>
 <p>The common path, claim then finish, therefore only appends rows to partitions that are later truncated whole. That keeps the hot tables free of dead rows; see <a href="../rings/">rings</a>.</p>
 <h2 id="heartbeats">Heartbeats<a class="headerlink" href="#heartbeats" title="Permanent link">&para;</a></h2>
