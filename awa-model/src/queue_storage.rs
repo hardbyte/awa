@@ -19052,6 +19052,7 @@ impl QueueStorage {
         let mut excluded = BTreeSet::new();
         let mut selected: Option<BTreeSet<(i64, i64)>> = None;
         let mut first_selection_full = false;
+        let mut first_receipt_scan: Option<(bool, Vec<i32>)> = None;
         loop {
             let (excluded_job_ids, excluded_run_leases): (Vec<_>, Vec<_>) =
                 excluded.iter().copied().unzip();
@@ -19138,10 +19139,20 @@ impl QueueStorage {
             saturated |= receipts.saturated;
             let ReceiptRescueBatch {
                 rescued: rescued_receipts,
-                idle_slots,
+                mut idle_slots,
                 scan_progress,
                 ..
             } = receipts;
+            // A retry scans only the attempts the first selection found, so
+            // the window's fullness and the slots it found empty come from
+            // the first selection.
+            match &first_receipt_scan {
+                None => first_receipt_scan = Some((saturated, idle_slots.clone())),
+                Some((first_saturated, first_idle_slots)) => {
+                    saturated |= *first_saturated;
+                    idle_slots.clone_from(first_idle_slots);
+                }
+            }
 
             selected.get_or_insert_with(|| {
                 deleted
@@ -19261,6 +19272,7 @@ impl QueueStorage {
         let mut excluded = BTreeSet::new();
         let mut selected: Option<BTreeSet<(i64, i64)>> = None;
         let mut first_selection_full = false;
+        let mut first_receipt_scan: Option<(bool, Vec<i32>)> = None;
         loop {
             let (excluded_job_ids, excluded_run_leases): (Vec<_>, Vec<_>) =
                 excluded.iter().copied().unzip();
@@ -19349,10 +19361,20 @@ impl QueueStorage {
             saturated |= receipts.saturated;
             let ReceiptRescueBatch {
                 rescued: receipt_deleted,
-                idle_slots,
+                mut idle_slots,
                 scan_progress,
                 ..
             } = receipts;
+            // A retry scans only the attempts the first selection found, so
+            // the window's fullness and the slots it found empty come from
+            // the first selection.
+            match &first_receipt_scan {
+                None => first_receipt_scan = Some((saturated, idle_slots.clone())),
+                Some((first_saturated, first_idle_slots)) => {
+                    saturated |= *first_saturated;
+                    idle_slots.clone_from(first_idle_slots);
+                }
+            }
 
             selected.get_or_insert_with(|| {
                 deleted
