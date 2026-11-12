@@ -2169,6 +2169,7 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
     use chrono::{TimeDelta, Utc};
     use uuid::Uuid;
 
+    let _guard = test_lock().lock().await;
     let client = setup().await;
 
     let fresh_id = Uuid::new_v4();
