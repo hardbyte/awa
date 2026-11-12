@@ -780,14 +780,14 @@ mod tests {
         assert!(!control.allowed());
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let value: Option<serde_json::Value> = sqlx::query_scalar(
+                let value: Option<Option<serde_json::Value>> = sqlx::query_scalar(
                     "SELECT observation FROM awa.runtime_control_observations WHERE instance_id=$1",
                 )
                 .bind(id)
-                .fetch_one(&admin)
+                .fetch_optional(&admin)
                 .await
                 .unwrap();
-                if value.is_some_and(|v| {
+                if value.flatten().is_some_and(|v| {
                     v["observed_revision"] == halt.revision && v["state"] == "halted"
                 }) {
                     break;

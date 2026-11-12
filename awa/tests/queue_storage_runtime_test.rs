@@ -6626,6 +6626,97 @@ async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_w
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_flush_progress_waits_for_a_locked_receipt_attempt() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_flush_progress_locked";
+    let schema = "awa_qs_flush_progress_locked";
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: true,
+                claim_slot_count: 2,
+            },
+        )
+        .await,
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 78 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim receipt-backed job")
+        .into_iter()
+        .next()
+        .expect("claimed job");
+    assert!(claim.claim.lease_claim_receipt);
+    let run_lease = claim.job.run_lease;
+
+    let mut attempt_lock = pool.begin().await.expect("begin attempt lock tx");
+    sqlx::query(
+        r#"
+        SELECT pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended(
+                format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint),
+                0
+            )
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(attempt_lock.as_mut())
+    .await
+    .expect("hold the attempt lock");
+
+    let flush = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            store
+                .flush_progress(&pool, job_id, run_lease, serde_json::json!({"step": 3}))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !flush.is_finished(),
+        "an explicit flush must wait for the attempt lock rather than skip the attempt"
+    );
+    attempt_lock
+        .commit()
+        .await
+        .expect("release the attempt lock");
+    flush
+        .await
+        .expect("flush task")
+        .expect("flush progress after the lock is released");
+
+    let progress: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+        "SELECT progress FROM {schema}.attempt_state WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(run_lease)
+    .fetch_optional(&pool)
+    .await
+    .expect("read attempt state");
+    assert_eq!(progress, Some(serde_json::json!({"step": 3})));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_rescue_skips_attempt_locked_for_completion() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_rescue_advisory";

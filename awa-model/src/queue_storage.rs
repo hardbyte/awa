@@ -11251,10 +11251,14 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
+    /// With `skip_locked`, attempts whose lock another transaction holds are
+    /// left out, as a heartbeat batch wants. Without it the call waits for
+    /// each attempt's lock, so an explicit flush is never dropped.
     async fn upsert_attempt_state_progress_from_receipts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         jobs: &[(i64, i64, serde_json::Value)],
+        skip_locked: bool,
     ) -> Result<usize, AwaError> {
         if jobs.is_empty() {
             return Ok(0);
@@ -11264,14 +11268,23 @@ impl QueueStorage {
             .iter()
             .map(|(job_id, run_lease, _)| (*job_id, *run_lease))
             .collect();
-        let locked: HashSet<_> = self
-            .try_lock_receipt_attempt_keys_tx(tx, &receipt_jobs)
-            .await?
-            .into_iter()
-            .collect();
+        let locked: Option<HashSet<_>> = if skip_locked {
+            Some(
+                self.try_lock_receipt_attempt_keys_tx(tx, &receipt_jobs)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let jobs: Vec<_> = jobs
             .iter()
-            .filter(|(job_id, run_lease, _)| locked.contains(&(*job_id, *run_lease)))
+            .filter(|(job_id, run_lease, _)| {
+                locked
+                    .as_ref()
+                    .is_none_or(|locked| locked.contains(&(*job_id, *run_lease)))
+            })
             .collect();
         if jobs.is_empty() {
             return Ok(0);
@@ -15106,6 +15119,7 @@ impl QueueStorage {
             self.upsert_attempt_state_progress_from_receipts_tx(
                 &mut tx,
                 &[(job_id, run_lease, progress.clone())],
+                false,
             )
             .await?;
         }
@@ -15349,7 +15363,7 @@ impl QueueStorage {
             // anti-joined against durable closure evidence so it picks
             // up every open claim regardless of whether
             // `materialize_claims` has fanned it out to `leases` yet.
-            self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
+            self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs, true)
                 .await?
         } else {
             // Prelock independently so a finalizer cannot stall the entire
