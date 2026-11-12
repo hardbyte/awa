@@ -568,17 +568,18 @@ async fn concurrent_first_touch_of_one_lane_by_two_roles() -> TestResult {
     let mut blocked = false;
     for _ in 0..100 {
         blocked = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
-             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))",
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = $1 AND wait_event_type = 'Lock')",
         )
-        .fetch_one(&cluster.owner)
+        .bind(&cluster.database)
+        .fetch_one(&cluster.admin)
         .await?;
         if blocked {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(blocked, "B's first touch should wait on A's lane lock");
+    assert!(blocked, "B's first touch should wait on A's lane");
     holding.commit().await?;
     assert_eq!(waiting.await??, 1);
 

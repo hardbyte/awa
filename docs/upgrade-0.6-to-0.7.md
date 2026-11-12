@@ -53,6 +53,10 @@ External migration runners apply the generated `awa migrate --sql --from 52
 --to 53` bundle, which does not repair existing lane sequences, then run
 `awa storage lane-sequences --repair` as the migration role itself.
 
+### New queue lanes during the roll
+
+When `QueueStorage` is the first to use a `(queue, priority)` lane, through a batch enqueue or a worker promoting scheduled or retried jobs, it writes the lane's `queue_lanes` row before taking its provisioning lock, the order SQL inserts already use. 0.6.15 and earlier, and 0.7 builds before this fix, take them the other way round. Until every `QueueStorage` process is upgraded, an older one and any other producer that are both first to use the same lane can still deadlock, and one transaction fails with `40P01`. Lanes that already exist are unaffected. To avoid it during the roll, create the lanes of a queue or priority before traffic first reaches it with `awa storage prepare-queue`, or retry the failed transaction. No schema change is involved.
+
 ## Custom-schema discovery during migration
 
 Migration bundles discover custom substrates using catalog metadata without

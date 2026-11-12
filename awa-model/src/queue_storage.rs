@@ -5206,6 +5206,22 @@ impl QueueStorage {
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
         let schema = self.schema();
+        // The lane row comes before the lane lock, the order every producer
+        // takes them in: SQL inserts write the row, then take the lock in the
+        // head-table trigger that provisions the lane's sequences.
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.queue_lanes (queue, priority)
+            VALUES ($1, $2)
+            ON CONFLICT (queue, priority) DO NOTHING
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
         let provisioner_callable = if self.lane_provisioner_present.load(Ordering::Relaxed) {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -5236,19 +5252,6 @@ impl QueueStorage {
             self.mark_lane_ensured(queue, priority, enqueue_shard);
             return Ok(());
         }
-
-        sqlx::query(audited_sql(format!(
-            r#"
-            INSERT INTO {schema}.queue_lanes (queue, priority)
-            VALUES ($1, $2)
-            ON CONFLICT (queue, priority) DO NOTHING
-            "#
-        )))
-        .bind(queue)
-        .bind(priority)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
 
         // The head tables' BEFORE INSERT triggers run even for a row that
         // ON CONFLICT then skips, and they read and set the lane's sequence.
