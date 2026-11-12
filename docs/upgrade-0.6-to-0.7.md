@@ -319,6 +319,14 @@ Without `EXECUTE`, `insert_many_copy` keeps the per-row path and `insert_many_sk
 
 External migration runners apply the complete `awa migrate --sql --from 54 --to 55` bundle, which refreshes trusted queue-storage discovery before it replaces the function.
 
+## v056: claim batch index recognition
+
+v056 replaces `<schema>.ensure_claim_batch_job_index(slot)` in the default and every discovered custom queue-storage schema. The v054 function counted any valid GIN index whose definition named `job_ids` as the claim batch index, a partial one included, and treated another index or relation that already had the index's name as the index, so claim prune could skip building the real one. The function now accepts only a valid, non-partial GIN index on `job_ids` alone. When something else already has the name `lease_claim_batches_<slot>_job_ids_idx`, it raises a warning naming it, returns false and leaves it in place; drop or rename it and claim prune builds the index the next time it empties that slot.
+
+The migration also fixes who may execute the function after a refresh by a migration role that owns it but may only `SET ROLE` to the table owner (PostgreSQL 16+ membership `WITH INHERIT FALSE`). The refresh handed the function to the table owner first, after which the migration role could no longer revoke or grant on it, PostgreSQL only warned, and `EXECUTE` stayed with `PUBLIC`. It now resets `EXECUTE` after the transfer, acting as the new owner when it cannot as itself, so exactly the roles holding `TRUNCATE` on `lease_claim_batches` can execute it. Migrations run with the owner as the effective role, as [database roles](security/database-roles.md) describes, were not affected.
+
+Like v054 it replaces functions only: it builds and drops no index and takes no lock on any `awa` or queue-storage table. Binaries before v056 call the new function unchanged, and an index the v054 function built is still recognised. A database coming from 0.6.16 already has this function from its `claim_batch_job_index` schema patch. External migration runners apply the complete `awa migrate --sql --from 55 --to 56` bundle, which defines the helper before the tail installs the function.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

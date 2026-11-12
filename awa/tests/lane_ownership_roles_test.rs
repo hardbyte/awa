@@ -867,6 +867,163 @@ async fn set_only_schema_owner_membership_repairs_legacy_lanes_and_restores_role
     cluster.teardown().await
 }
 
+/// Who may execute the default schema's `ensure_claim_batch_job_index`.
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct ClaimBatchIndexAcl {
+    owner: String,
+    public: bool,
+    runtime: bool,
+    migrator: bool,
+}
+
+async fn claim_batch_job_index_function_acl(
+    cluster: &Cluster,
+) -> Result<ClaimBatchIndexAcl, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT pg_get_userbyid(routine.proowner)::text AS owner, \
+                has_function_privilege('public', routine.oid, 'EXECUTE') AS public, \
+                has_function_privilege($1, routine.oid, 'EXECUTE') AS runtime, \
+                has_function_privilege($2, routine.oid, 'EXECUTE') AS migrator \
+         FROM pg_proc AS routine \
+         WHERE routine.oid = to_regprocedure('awa.ensure_claim_batch_job_index(integer)')",
+    )
+    .bind(&cluster.runtime_name)
+    .bind(&cluster.migrator_name)
+    .fetch_one(&cluster.owner)
+    .await
+}
+
+/// Give `ensure_claim_batch_job_index` to the migration role, executable by
+/// `PUBLIC`, as a refresh by the migration role acting as itself would
+/// create it. Needs the migration role to hold the owner's privileges.
+async fn hand_claim_batch_job_index_to_migrator(cluster: &Cluster) -> TestResult {
+    cluster
+        .migrator
+        .execute(sqlx::raw_sql(sql(format!(
+            "ALTER FUNCTION awa.ensure_claim_batch_job_index(integer) OWNER TO {migrator}; \
+             GRANT EXECUTE ON FUNCTION awa.ensure_claim_batch_job_index(integer) TO PUBLIC",
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    Ok(())
+}
+
+/// `ensure_claim_batch_job_index` ends up owned by the table owner and
+/// executable by exactly the roles holding `TRUNCATE` on
+/// `lease_claim_batches`, never `PUBLIC`, however the migration role refreshes
+/// it: as itself with ordinary membership in the owner, as itself with
+/// SET-only membership (PostgreSQL 16+: it may `SET ROLE` to the owner but
+/// does not inherit its privileges), and through the migrations that install
+/// it with the owner as effective role, as the database-roles guide says. The
+/// migration role holds `TRUNCATE` itself, so it keeps `EXECUTE` after handing
+/// the function over, even when it no longer inherits the owner's.
+#[tokio::test]
+async fn set_only_schema_owner_membership_resets_claim_batch_job_index_execute() -> TestResult {
+    let cluster = Cluster::new(Schema::Current, false).await?;
+    let server_version: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&cluster.owner)
+            .await?;
+    if server_version < 160_000 {
+        return cluster.teardown().await;
+    }
+    let expected = ClaimBatchIndexAcl {
+        owner: cluster.owner_name.clone(),
+        public: false,
+        runtime: true,
+        migrator: true,
+    };
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        expected
+    );
+
+    cluster
+        .owner
+        .execute(sqlx::raw_sql(sql(format!(
+            "GRANT USAGE, CREATE ON SCHEMA awa TO {migrator}; \
+             GRANT TRUNCATE ON awa.lease_claim_batches TO {migrator}; \
+             GRANT EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(text) TO {migrator}",
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    let refresh = "SELECT awa.refresh_claim_batch_job_index_helper('awa')";
+
+    // Ordinary membership: the migration role holds the owner's privileges.
+    hand_claim_batch_job_index_to_migrator(&cluster).await?;
+    sqlx::query(refresh).execute(&cluster.migrator).await?;
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        expected,
+        "a refresh by a migration role that inherits the owner"
+    );
+
+    // SET-only membership.
+    hand_claim_batch_job_index_to_migrator(&cluster).await?;
+    cluster
+        .admin
+        .execute(sqlx::raw_sql(sql(format!(
+            "GRANT {owner} TO {migrator} WITH INHERIT FALSE; \
+             GRANT {owner} TO {migrator} WITH SET TRUE",
+            owner = cluster.owner_name,
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    let mut conn = cluster.migrator.acquire().await?;
+    let (inherits_owner, can_set_owner): (bool, bool) = sqlx::query_as(
+        "SELECT pg_has_role(current_user, $1, 'USAGE'), pg_has_role(current_user, $1, 'SET')",
+    )
+    .bind(&cluster.owner_name)
+    .fetch_one(&mut *conn)
+    .await?;
+    assert!(!inherits_owner);
+    assert!(can_set_owner);
+    let role_query = "SELECT current_user::text, current_setting('role')";
+    let role_before: (String, String) = sqlx::query_as(role_query).fetch_one(&mut *conn).await?;
+    sqlx::query(refresh).execute(&mut *conn).await?;
+    let role_after: (String, String) = sqlx::query_as(role_query).fetch_one(&mut *conn).await?;
+    assert_eq!(
+        role_after, role_before,
+        "the refresh restores the caller's role"
+    );
+    drop(conn);
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        expected,
+        "a refresh by a migration role that may only SET ROLE to the owner"
+    );
+
+    // The migrations from v054 on, with the owner as the effective role. The
+    // migration preflight refuses a schema another role may create in.
+    cluster
+        .owner
+        .execute(sqlx::raw_sql(sql(format!(
+            "REVOKE CREATE ON SCHEMA awa FROM {migrator}; \
+             DROP FUNCTION awa.ensure_claim_batch_job_index(integer); \
+             DELETE FROM awa.schema_version WHERE version >= 54",
+            migrator = cluster.migrator_name
+        ))))
+        .await?;
+    let migrate_pool = cluster.migrator_as_owner().await?;
+    migrations::run(&migrate_pool).await?;
+    let role_after: (String, String) = sqlx::query_as(role_query).fetch_one(&migrate_pool).await?;
+    let version: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+        .fetch_one(&migrate_pool)
+        .await?;
+    migrate_pool.close().await;
+    assert_eq!(
+        role_after,
+        (cluster.owner_name.clone(), cluster.owner_name.clone())
+    );
+    assert_eq!(version, migrations::CURRENT_VERSION);
+    assert_eq!(
+        claim_batch_job_index_function_acl(&cluster).await?,
+        expected,
+        "the migrations applied by the migration role as the owner"
+    );
+    cluster.teardown().await
+}
+
 /// Reassigning a lane sequence waits on any open enqueue or claim on the lane,
 /// so the repair bounds that wait and holds each sequence's lock only for its
 /// own short transaction. A held sequence is skipped and reported; the rest
