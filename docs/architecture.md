@@ -227,7 +227,7 @@ The common safety pattern is:
 3. Prove cheap skip gates before the exclusive-lock path. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.
 4. Take child-table `ACCESS EXCLUSIVE` locks with a short transaction-local `lock_timeout` so maintenance gives up promptly under contention.
 5. Recheck the skip gates after acquiring the partition locks so rows that committed while the lock waited are visible before truncate.
-6. `TRUNCATE` only partitions that are proven inactive.
+6. `TRUNCATE` only partitions that are proven inactive, and of those only the ones that hold storage beyond an empty table's metadata (any heap, TOAST, free-space-map or visibility-map page, or index pages beyond an empty btree, GiST or BRIN index). Every child of the slot is still locked; a child with no heap page holds no row, so leaving it keeps its relfilenode without changing what the slot holds when it is reused.
 
 This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.
 

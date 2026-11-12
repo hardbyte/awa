@@ -649,6 +649,34 @@ async fn strong_locks_held_by(pool: &PgPool, role: &str, relation_ids: &[i64]) -
     .unwrap()
 }
 
+/// The locks the `replica_identity` patch takes on the tables it alters, as
+/// formatted by `strong_locks_held_by`.
+fn replica_identity_lock(lock: &str) -> bool {
+    let Some((relation, mode)) = lock.rsplit_once(' ') else {
+        return false;
+    };
+    if relation == "awa.idx_awa_jobs_unique" {
+        return mode == "ShareLock";
+    }
+    let Some((schema, table)) = relation.split_once('.') else {
+        return false;
+    };
+    let delta = table
+        .strip_prefix("queue_terminal_count_deltas")
+        .is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix('_').is_some_and(|slot| {
+                    !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit())
+                })
+        });
+    let awa_table = schema == "awa"
+        && matches!(
+            table,
+            "admin_dirty_queue_marks" | "admin_dirty_kind_marks" | "job_unique_claims"
+        );
+    mode == "AccessExclusiveLock" && (delta || awa_table)
+}
+
 async fn lane_patch_applied(pool: &PgPool) -> migrations::SchemaPatchStatus {
     migrations::schema_patch_status(pool)
         .await
@@ -759,11 +787,12 @@ async fn released_patch_upgrade_and_rollback() {
                 "insert_jobs_compat_batch",
                 "prune_controls",
                 "runtime_maintenance_eligibility",
-                "correlated_claim_tombstones"
+                "correlated_claim_tombstones",
+                "replica_identity"
             ],
             "a released 0.6.15 deployment needs the claim batch index fix, the bounded-wait \
-             batch function, prune controls, the maintenance eligibility table and the \
-             correlated tombstone checks"
+             batch function, prune controls, the maintenance eligibility table, the \
+             correlated tombstone checks and replica identities"
         );
     }
 
@@ -832,7 +861,7 @@ async fn released_patch_upgrade_and_rollback() {
     if released_version == "0.6.9" {
         assert!(patch_sql.contains("R__prepared_lane_sequences"));
     } else {
-        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 5);
+        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 6);
         assert!(!patch_sql.contains("R__prepared_lane_sequences"));
         assert!(
             patch_sql.contains("R__claim_batch_job_index"),
@@ -841,6 +870,7 @@ async fn released_patch_upgrade_and_rollback() {
         assert!(patch_sql.contains("R__insert_jobs_compat_batch"));
         assert!(patch_sql.contains("R__runtime_maintenance_eligibility"));
         assert!(patch_sql.contains("R__correlated_claim_tombstones"));
+        assert!(patch_sql.contains("R__replica_identity"));
     }
     assert!(
         !patch_sql.contains("-- Migration V"),
@@ -878,11 +908,19 @@ async fn released_patch_upgrade_and_rollback() {
         .unwrap();
         tx.rollback().await.unwrap();
         owner.close().await;
+        let (identity_locks, other_locks): (Vec<String>, Vec<String>) = locks
+            .into_iter()
+            .partition(|lock| replica_identity_lock(lock));
         assert!(
-            locks.is_empty(),
-            "the patch locked pre-existing awa or queue-storage relations: {locks:?}"
+            other_locks.is_empty(),
+            "the patch locked pre-existing awa or queue-storage relations beyond the \
+             replica identity targets: {other_locks:?}"
         );
-        locks
+        assert!(
+            identity_locks.contains(&"awa.job_unique_claims AccessExclusiveLock".to_string()),
+            "the replica_identity patch alters awa.job_unique_claims: {identity_locks:?}"
+        );
+        identity_locks
     };
 
     let positions_before = lane_positions(&fixture.admin).await;
@@ -970,10 +1008,16 @@ async fn released_patch_upgrade_and_rollback() {
         "the patch must run under traffic: {enqueued_during} enqueued while awa migrate ran \
          and {in_flight_count} jobs in flight when it started"
     );
+    let unexpected_locks: Vec<&String> = sampled_locks
+        .iter()
+        .filter(|lock| !replica_identity_lock(lock))
+        .collect();
     assert!(
-        sampled_locks.is_empty(),
-        "awa migrate strongly locked pre-existing relations: {sampled_locks:?}"
+        unexpected_locks.is_empty(),
+        "awa migrate strongly locked pre-existing relations beyond the replica identity \
+         targets: {unexpected_locks:?}"
     );
+    let unexpected_lock_count = unexpected_locks.len();
     for expected in [
         "Schema: v40 (unchanged)".to_string(),
         format!(
@@ -989,6 +1033,7 @@ async fn released_patch_upgrade_and_rollback() {
         "Schema patch prune_controls: applied".to_string(),
         "Schema patch runtime_maintenance_eligibility: applied".to_string(),
         "Schema patch correlated_claim_tombstones: applied".to_string(),
+        "Schema patch replica_identity: applied".to_string(),
         format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
     ] {
         assert!(
@@ -1458,7 +1503,7 @@ async fn released_patch_upgrade_and_rollback() {
         "patch_relation_locks": patch_relation_locks,
         "migrate_relation_ids": migrate_relation_ids,
         "sampled_relation_locks": sampled_locks,
-        "unexpected_relation_locks_sampled": sampled_locks.len(),
+        "unexpected_relation_locks_sampled": unexpected_lock_count,
         "enqueued_during_migrate": enqueued_during,
         "completed_during_migrate": completed_during,
         "in_flight_at_migrate": in_flight_count,

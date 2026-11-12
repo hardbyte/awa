@@ -586,6 +586,17 @@ Fix:
   SELECT awa.active_queue_storage_schema();
   ```
 
+### `cannot delete from table ... because it does not have a replica identity`
+
+```text
+cannot delete from table "admin_dirty_queue_marks" because it does not
+have a replica identity and publishes deletes
+```
+
+The awa schema is in a logical-replication publication (`CREATE PUBLICATION ... FOR ALL TABLES`, which Debezium creates by default, or `FOR TABLES IN SCHEMA awa`) and the database lacks the `replica_identity` schema patch, so some awa tables have no primary key or replica identity. PostgreSQL then rejects every `UPDATE` and `DELETE` on those tables: the admin dirty-mark drain fails on each maintenance tick, so queue and kind counts go stale, and unique-claim release fails.
+
+Fix: run `awa migrate` with 0.6.18 or later, which applies the patch; it takes a brief `ACCESS EXCLUSIVE` lock on each table it changes (see the [upgrade guide](upgrade-0.6.17-to-0.6.18.md#replica-identity-locks)). Independently, prefer keeping the awa schema out of the publication; see [logical replication and CDC](deploying-on-managed-postgres.md#logical-replication-and-cdc).
+
 ### `register at least one worker before starting the runtime`
 
 Cause:
