@@ -409,6 +409,7 @@ impl JobExecutor {
                         claim,
                     )
                 }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
@@ -519,6 +520,9 @@ impl JobExecutor {
                 }
             }
 
+            // The handler's progress snapshot is final: the finalize settles it,
+            // so heartbeats stop flushing progress for this attempt.
+            in_flight.mark_finalizing((job_id, job_run_lease));
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
             let finalize_permit = match result {
                 Some(_) => tokio::select! {

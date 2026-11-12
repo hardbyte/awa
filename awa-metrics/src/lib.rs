@@ -67,6 +67,8 @@ pub mod names {
     pub const COMPLETION_FLUSH_DURATION: &str = "awa.completion.flush_duration";
     pub const HEARTBEAT_BATCHES: &str = "awa.heartbeat.batches";
     pub const MAINTENANCE_RESCUES: &str = "awa.maintenance.rescues";
+    pub const MAINTENANCE_RESCUE_PASS_SIZE: &str = "awa.maintenance.rescue.pass_size";
+    pub const MAINTENANCE_RESCUE_OLDEST_AGE: &str = "awa.maintenance.rescue.oldest_attempt_age";
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
@@ -204,6 +206,14 @@ pub struct AwaMetrics {
     pub heartbeat_batches: Counter<u64>,
     /// Total maintenance rescue operations.
     pub maintenance_rescues: Counter<u64>,
+    /// Attempts rescued per queue-storage rescue pass, attributed by
+    /// `awa.rescue.kind` and why the pass stopped (`awa.rescue.pass_end`).
+    pub maintenance_rescue_pass_size: Histogram<u64>,
+    /// Age of the oldest attempt the latest queue-storage rescue pass
+    /// rescued, per `awa.rescue.kind`; 0 when it rescued nothing. Rescue
+    /// works oldest claim first, so a value well above the heartbeat
+    /// staleness or deadline means a backlog of abandoned claims.
+    pub maintenance_rescue_oldest_attempt_age_seconds: Gauge<f64>,
     /// Total jobs parked for external callback.
     pub jobs_waiting_external: Counter<u64>,
     /// Current queue depth per state — how many jobs are in each state per queue.
@@ -507,6 +517,19 @@ impl AwaMetrics {
                 .u64_counter(names::MAINTENANCE_RESCUES)
                 .with_description("Number of jobs rescued by maintenance")
                 .with_unit("{job}")
+                .build(),
+            maintenance_rescue_pass_size: meter
+                .u64_histogram(names::MAINTENANCE_RESCUE_PASS_SIZE)
+                .with_description("Attempts rescued per queue-storage rescue pass")
+                .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
+                .build(),
+            maintenance_rescue_oldest_attempt_age_seconds: meter
+                .f64_gauge(names::MAINTENANCE_RESCUE_OLDEST_AGE)
+                .with_description(
+                    "Age of the oldest attempt rescued by the latest queue-storage rescue pass",
+                )
+                .with_unit("s")
                 .build(),
             jobs_waiting_external: meter
                 .u64_counter(names::JOB_WAITING_EXTERNAL)
@@ -906,6 +929,28 @@ impl AwaMetrics {
         self.completion_flush_batch_size.record(batch_size, &attrs);
         self.completion_flush_duration_seconds
             .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record one queue-storage rescue pass: how many attempts it rescued,
+    /// why it stopped, and the age of the oldest attempt it rescued.
+    pub fn record_rescue_pass(
+        &self,
+        kind: &'static str,
+        pass_end: &'static str,
+        rescued: u64,
+        oldest_attempt_age: Duration,
+    ) {
+        self.maintenance_rescue_pass_size.record(
+            rescued,
+            &[
+                opentelemetry::KeyValue::new("awa.rescue.kind", kind),
+                opentelemetry::KeyValue::new("awa.rescue.pass_end", pass_end),
+            ],
+        );
+        self.maintenance_rescue_oldest_attempt_age_seconds.record(
+            oldest_attempt_age.as_secs_f64(),
+            &[opentelemetry::KeyValue::new("awa.rescue.kind", kind)],
+        );
     }
 
     /// Record a scheduled/retryable promotion batch.
@@ -1701,7 +1746,7 @@ mod tests {
                 &JOB_DURATION_BUCKETS_SECONDS,
             ),
         ];
-        let counts: [(&str, &Histogram<u64>); 7] = [
+        let counts: [(&str, &Histogram<u64>); 8] = [
             (names::ENQUEUE_BATCH_SIZE, &metrics.enqueue_batch_size),
             (
                 names::DISPATCH_CAPACITY_AVAILABLE,
@@ -1715,6 +1760,10 @@ mod tests {
             (
                 names::MAINTENANCE_PROMOTE_BATCH_SIZE,
                 &metrics.promotion_batch_size,
+            ),
+            (
+                names::MAINTENANCE_RESCUE_PASS_SIZE,
+                &metrics.maintenance_rescue_pass_size,
             ),
             (
                 names::MAINTENANCE_ROTATE_SKIPPED_ROWS,
