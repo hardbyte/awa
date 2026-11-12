@@ -873,5 +873,14 @@ async fn test_queue_worker_gauges_report_slots_in_use_and_capacity() {
     assert_eq!(in_use.last(), Some(&0), "in use samples: {in_use:?}");
 
     client.shutdown(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+    let capacity = queue_gauge_values(&exporter, "awa.queue.worker.capacity", queue);
+    assert_eq!(
+        capacity.last(),
+        Some(&0),
+        "a stopped runtime offers no capacity: {capacity:?}"
+    );
     let _ = meter_provider.shutdown();
 }

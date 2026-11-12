@@ -2279,6 +2279,10 @@ impl Client {
             let _ = handle.await;
         }
 
+        for (queue, _) in &self.queues {
+            self.metrics.record_queue_workers(queue, 0, 0);
+        }
+
         info!("Awa worker runtime stopped");
     }
 

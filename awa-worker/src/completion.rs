@@ -464,6 +464,9 @@ async fn collect_batches<T, F: FlushBatch<T>>(
                         Some(request) => {
                             deadline = Instant::now() + flush_interval;
                             pending.push(request);
+                            if pending.len() >= batch_size {
+                                flusher.flush(&mut pending).await;
+                            }
                         }
                         None => break,
                     }
@@ -881,6 +884,40 @@ mod tests {
                 *flushed_at - first_arrival
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_of_one_flushes_each_request_as_it_arrives() {
+        let (tx, mut rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let flusher = Arc::new(RecordingFlusher::default());
+        let batcher = tokio::spawn({
+            let cancel = cancel.clone();
+            let flusher = flusher.clone();
+            async move {
+                collect_batches(
+                    &mut rx,
+                    &cancel,
+                    1,
+                    Duration::from_secs(60),
+                    flusher.as_ref(),
+                )
+                .await;
+            }
+        });
+
+        for _ in 0..3 {
+            let sent_at = tokio::time::Instant::now();
+            tx.send(sent_at).await.unwrap();
+            tokio::task::yield_now().await;
+            let flushes = flusher.flushes.lock().unwrap();
+            let (flushed_at, batch) = flushes.last().expect("request was not flushed");
+            assert_eq!(batch.as_slice(), &[sent_at]);
+            assert_eq!(*flushed_at, sent_at);
+        }
+        cancel.cancel();
+        batcher.await.unwrap();
+        assert_eq!(flusher.flushes.lock().unwrap().len(), 3);
     }
 
     async fn assert_remaining_budget_after_acknowledgement(response: Result<bool, AwaError>) {
