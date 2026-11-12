@@ -34,7 +34,7 @@
 //!                                 separately (insert_many mode only)
 //!   AWA_LANE_BENCH_WITHOUT_BATCH_FUNCTION
 //!                                 0|1: drop `awa.insert_jobs_compat_batch`
-//!                                 and its v055 version row first, so
+//!                                 and the version rows from v055 first, so
 //!                                 insert_many_copy measures its per-row path
 //!                                 (the next migration run puts the function
 //!                                 back)
@@ -799,7 +799,7 @@ async fn test_enqueue_lane_contention_matrix() {
             "DROP FUNCTION IF EXISTS awa.insert_jobs_compat_batch(text[], text[], jsonb[], \
              text[], smallint[], smallint[], timestamptz[], jsonb[], jsonb[], bytea[], text[], \
              text[], boolean); \
-             DELETE FROM awa.schema_version WHERE version = 55",
+             DELETE FROM awa.schema_version WHERE version >= 55",
         )
         .execute(&pool)
         .await

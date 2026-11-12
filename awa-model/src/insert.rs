@@ -22,7 +22,12 @@ use sqlx::{PgExecutor, PgPool};
 // payloads) and then registers and reserves its lanes one at a time in
 // canonical order. Each lane's lock is taken when the batch reaches that
 // lane rather than at the batch's first ready row, and like every enqueue
-// lock it is held until the transaction ends.
+// lock it is held until the transaction ends. From migration v057, while it
+// holds claims or lanes it waits at most 500 ms (or half of its session's
+// `deadlock_timeout`, if lower) for another; a longer wait releases them all
+// and retries, so a per-row producer that holds a lane and waits for one of
+// the batch's keys usually proceeds instead of deadlocking with it. After 2 s
+// of retries it makes one last attempt with ordinary lock waits.
 //
 // Generic `insert_many` always uses the per-row path, as does
 // `insert_many_copy` on a schema before v055: rows are sorted by the

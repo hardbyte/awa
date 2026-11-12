@@ -154,6 +154,8 @@ The TLA+ storage model treats `EnqueueReady` and `EnqueueDeferred` as logical pe
 
 Uniqueness itself is intentionally outside this storage model: duplicate rejection is covered by Rust integration tests around `job_unique_claims`. The model's enqueue preconditions start after a job has been admitted to the storage state, so batching uniqueness claims changes implementation granularity rather than the modeled lifecycle, lane, lease, or prune invariants.
 
+`awa.insert_jobs_compat_batch` takes a batch's unique claims before its lanes and, for a bounded phase, gives way to a per-row producer by limiting each lock wait and rolling back to retry. `AwaUniqueClaimLockOrder` checks the claim-before-lane and key orders, and `AwaStorageLockOrder` deliberately excludes lock timeouts and aborts, so the give-way protocol is covered by `awa/tests/insert_many_batch_test.rs` rather than TLC.
+
 ## Partitioned queue routing note
 
 `PartitionedQueue` lives in `awa-model/src/partitioned_queue.rs`, is re-exported by `awa` and `awa-worker`, and is wrapped for Python as `awa.PartitionedQueue`. It maps one logical queue to a caller-declared list of ordinary physical queue names. The worker builder expands that list into ordinary `QueueConfig` declarations; producer helpers stamp the selected physical queue onto `InsertOpts`.
