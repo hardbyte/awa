@@ -1652,6 +1652,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v058-lane-row-before-lane-lock" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v058: lane row before lane lock
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2648,6 +2659,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v058-lane-row-before-lane-lock" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v058: lane row before lane lock
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3143,6 +3165,9 @@ workers report not ready until the migration runs, as for any version bump.</p>
 <li>The lane lock is still taken when the batch reaches the lane and held until the transaction ends.</li>
 </ul>
 <p>Binaries before v057 that call the function pass the same arguments, so they can run before or after the migration, and rolling binaries back needs no schema change. A database coming from 0.6.16 already has this body from its <code>insert_jobs_compat_batch</code> schema patch, and v057 replaces it in place. External migration runners apply the complete <code>awa migrate --sql --from 56 --to 57</code> bundle, which refreshes trusted queue-storage discovery before it replaces the function.</p>
+<h2 id="v058-lane-row-before-lane-lock">v058: lane row before lane lock<a class="headerlink" href="#v058-lane-row-before-lane-lock" title="Permanent link">&para;</a></h2>
+<p>v058 replaces <code>&lt;schema&gt;.provision_lane</code> in the default and every discovered custom queue-storage schema. The v053 function took the lane's advisory lock and then inserted its <code>queue_lanes</code> row, while producers and <code>QueueStorage</code> insert the row first and take the lock after it. A <code>provision_lane</code> call and a producer that were both first to use the same new <code>(queue, priority)</code> could each wait for the other until PostgreSQL aborted one with <code>deadlock detected</code> (<code>40P01</code>). The function now inserts the row first.</p>
+<p>It replaces functions only and takes no lock on any <code>awa</code> or queue-storage table. Binaries before v058 call the function with the same arguments, so they can run before or after the migration.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
