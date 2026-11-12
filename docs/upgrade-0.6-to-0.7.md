@@ -354,6 +354,12 @@ What callers see:
 
 Binaries before v057 that call the function pass the same arguments, so they can run before or after the migration, and rolling binaries back needs no schema change. A database coming from 0.6.16 already has this body from its `insert_jobs_compat_batch` schema patch, and v057 replaces it in place. External migration runners apply the complete `awa migrate --sql --from 56 --to 57` bundle, which refreshes trusted queue-storage discovery before it replaces the function.
 
+## v058: lane row before lane lock
+
+v058 replaces `<schema>.provision_lane` in the default and every discovered custom queue-storage schema. The v053 function took the lane's advisory lock and then inserted its `queue_lanes` row, while producers and `QueueStorage` insert the row first and take the lock after it. A `provision_lane` call and a producer that were both first to use the same new `(queue, priority)` could each wait for the other until PostgreSQL aborted one with `deadlock detected` (`40P01`). The function now inserts the row first.
+
+It replaces functions only and takes no lock on any `awa` or queue-storage table. Binaries before v058 call the function with the same arguments, so they can run before or after the migration.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

@@ -726,3 +726,71 @@ async fn per_row_inserts_create_lanes_without_deadlock() {
 async fn insert_many_copies_create_lanes_without_deadlock() {
     assert_lane_creators_do_not_deadlock(LaneCreator::Copy, LaneCreator::Copy).await;
 }
+
+/// A direct `provision_lane` call that meets a producer's uncommitted lane row
+/// waits for it without holding the lane lock, which the producer takes next.
+#[tokio::test]
+async fn provision_lane_writes_the_lane_row_before_the_lane_lock() {
+    let _guard = LANE_LOCK_TEST_GUARD.lock().await;
+    let (pool, _config) = setup_queue_storage().await;
+
+    let queue = format!("provision_row_first_{}", Uuid::new_v4().simple());
+    let provisioning = provisioning_lock_key(&pool, &queue).await;
+
+    let mut producer = pool.begin().await.expect("begin producer transaction");
+    sqlx::query("INSERT INTO awa.queue_lanes (queue, priority) VALUES ($1, 2)")
+        .bind(&queue)
+        .execute(&mut *producer)
+        .await
+        .expect("write the lane row");
+
+    let provision = {
+        let pool = pool.clone();
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            sqlx::query("SELECT awa.provision_lane($1, 2::smallint, 0::smallint)")
+                .bind(queue)
+                .execute(&pool)
+                .await
+        })
+    };
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE wait_event_type = 'Lock'
+                  AND query LIKE 'SELECT awa.provision_lane(%'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("poll pg_stat_activity");
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "provision_lane never waited for the producer's lane row"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(provisioning)
+        .fetch_one(&mut *producer)
+        .await
+        .expect("try the lane lock");
+    assert!(
+        acquired,
+        "provision_lane must not hold the lane lock while it waits for the lane row"
+    );
+    producer.commit().await.expect("commit producer");
+    provision
+        .await
+        .expect("provision task")
+        .expect("provision_lane after the producer commits");
+}

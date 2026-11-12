@@ -325,12 +325,21 @@ BEGIN
         SET search_path = pg_catalog, pg_temp
         AS $func$
         BEGIN
-            -- Validates the lane and takes its lock before any row is written.
-            PERFORM %1$I.provision_lane_sequences(p_queue, p_priority, p_enqueue_shard);
+            IF p_queue IS NULL
+               OR p_priority IS NULL
+               OR p_enqueue_shard IS NULL OR p_enqueue_shard NOT BETWEEN 0 AND 63 THEN
+                RAISE EXCEPTION 'invalid queue lane: queue %%, priority %%, enqueue shard %%',
+                    quote_nullable(p_queue), p_priority, p_enqueue_shard
+                    USING ERRCODE = '22023';
+            END IF;
 
+            -- The lane row comes before the lane lock, the order every
+            -- producer takes them in.
             INSERT INTO %1$I.queue_lanes (queue, priority)
             VALUES (p_queue, p_priority)
             ON CONFLICT (queue, priority) DO NOTHING;
+
+            PERFORM %1$I.provision_lane_sequences(p_queue, p_priority, p_enqueue_shard);
 
             -- The head triggers fire before ON CONFLICT and set the lane's
             -- sequence, so rows that already exist are skipped outright.
