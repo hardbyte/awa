@@ -10,7 +10,10 @@
 //! `payload` is `{"job_id": <i64>, "run_lease": <i64>}`. This listener
 //! parses that, looks the pair up in the shared `InFlightRegistry`, and
 //! — if a local worker is running the matching attempt — sets the
-//! `Arc<AtomicBool>` cancel flag the handler's `JobContext` holds.
+//! `Arc<AtomicBool>` cancel flag the handler's `JobContext` holds. A cancel
+//! for an attempt that has not registered yet is kept for a bounded time, so
+//! an attempt claimed before the cancel committed but dispatched after it
+//! is not run at all.
 //!
 //! If `PgListener::connect_with` or `listen()` fail, the listener logs a
 //! warning and exits; admin cancels silently fall back to heartbeat /
@@ -22,7 +25,6 @@ use crate::runtime::InFlightMap;
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
-use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -86,9 +88,17 @@ impl CancelListener {
                     debug!("Cancel listener shutting down");
                     return;
                 }
-                notification = listener.recv() => {
+                notification = listener.try_recv() => {
                     match notification {
-                        Ok(n) => self.handle_notification(n.payload()),
+                        Ok(Some(n)) => self.handle_notification(n.payload()),
+                        // The next `try_recv` reconnects and listens again.
+                        // Notifications are not queued for a listener that is
+                        // gone, so a cancel committed in the gap reaches its
+                        // handler only through the completion-time check.
+                        Ok(None) => warn!(
+                            "PG cancel listener connection lost; reconnecting. Admin cancels \
+                             committed before it is back will not wake their handlers"
+                        ),
                         Err(err) => {
                             warn!(error = %err, "PG cancel listener error; will retry");
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -99,7 +109,7 @@ impl CancelListener {
         }
     }
 
-    fn handle_notification(&self, payload: &str) {
+    pub(crate) fn handle_notification(&self, payload: &str) {
         let parsed: CancelPayload = match serde_json::from_str(payload) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -112,8 +122,14 @@ impl CancelListener {
             }
         };
 
-        if let Some(flag) = self.in_flight.get_cancel((parsed.job_id, parsed.run_lease)) {
-            flag.store(true, Ordering::SeqCst);
+        // The cancel names an attempt whose claim has committed. A local
+        // attempt may not have registered yet: the dispatcher still has
+        // round-trips to make after the claim. The registry keeps the cancel
+        // for it, so the attempt starts already cancelled.
+        if self
+            .in_flight
+            .signal_cancel((parsed.job_id, parsed.run_lease))
+        {
             debug!(
                 job_id = parsed.job_id,
                 run_lease = parsed.run_lease,

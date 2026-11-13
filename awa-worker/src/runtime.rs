@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use awa_model::queue_storage::ClaimHeartbeatRef;
 
@@ -14,6 +15,16 @@ pub(crate) type InFlightKey = (i64, RunLease);
 pub(crate) type InFlightMap = Arc<InFlightRegistry>;
 type CancelFlag = Arc<AtomicBool>;
 type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
+type CancelledShard = Mutex<HashMap<InFlightKey, Instant>>;
+
+/// How long an operator cancel for an attempt that is not registered here is
+/// kept for it. The cancel names an attempt whose claim has committed, so the
+/// only attempt it can still meet here is one between claim commit and
+/// registration; that gap is bounded by pool waits after the claim.
+const UNREGISTERED_CANCEL_TTL: Duration = Duration::from_secs(300);
+/// Every runtime hears every cancel in the fleet, nearly all for attempts it
+/// does not run, so the kept set is bounded per shard as well as by age.
+const UNREGISTERED_CANCELS_PER_SHARD: usize = 256;
 
 /// Per-job in-flight state: cancellation flag + progress buffer.
 pub(crate) struct InFlightState {
@@ -140,27 +151,82 @@ impl ProgressState {
 
 pub(crate) struct InFlightRegistry {
     shards: Box<[InFlightShard]>,
+    /// Operator cancels that arrived before their attempt registered, by
+    /// attempt, with when they arrived. Same sharding as `shards`; a shard's
+    /// entry here is only read or written under that shard's write lock.
+    cancelled: Box<[CancelledShard]>,
 }
 
 impl Default for InFlightRegistry {
     fn default() -> Self {
         let mut shards = Vec::with_capacity(IN_FLIGHT_SHARDS);
+        let mut cancelled = Vec::with_capacity(IN_FLIGHT_SHARDS);
         for _ in 0..IN_FLIGHT_SHARDS {
             shards.push(RwLock::new(HashMap::new()));
+            cancelled.push(Mutex::new(HashMap::new()));
         }
         Self {
             shards: shards.into_boxed_slice(),
+            cancelled: cancelled.into_boxed_slice(),
         }
     }
 }
 
 impl InFlightRegistry {
-    pub fn insert(&self, key: InFlightKey, state: InFlightState) {
-        let mut guard = self
-            .shard_for(&key)
+    /// Registers an attempt. Returns true when an operator cancel for it
+    /// arrived before it registered; its cancel flag is then already set.
+    pub fn insert(&self, key: InFlightKey, state: InFlightState) -> bool {
+        let index = self.shard_index(&key);
+        let mut guard = self.shards[index]
             .write()
             .expect("in_flight shard poisoned");
+        let cancelled = self.cancelled[index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key)
+            .is_some_and(|at| at.elapsed() <= UNREGISTERED_CANCEL_TTL);
+        if cancelled {
+            state
+                .cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         guard.insert(key, state);
+        cancelled
+    }
+
+    /// Delivers an operator cancel. A registered attempt has its cancel flag
+    /// set; otherwise the cancel is kept so the attempt sees it if it
+    /// registers later. Returns whether the attempt was registered.
+    pub fn signal_cancel(&self, key: InFlightKey) -> bool {
+        let index = self.shard_index(&key);
+        // The write lock orders this against `insert`: the attempt either
+        // registered first and is flagged here, or registers afterwards and
+        // finds the kept cancel.
+        let guard = self.shards[index]
+            .write()
+            .expect("in_flight shard poisoned");
+        if let Some(state) = guard.get(&key) {
+            state
+                .cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return true;
+        }
+        let mut cancelled = self.cancelled[index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        cancelled.retain(|_, at| now.duration_since(*at) <= UNREGISTERED_CANCEL_TTL);
+        if cancelled.len() >= UNREGISTERED_CANCELS_PER_SHARD {
+            if let Some(oldest) = cancelled
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| *key)
+            {
+                cancelled.remove(&oldest);
+            }
+        }
+        cancelled.insert(key, now);
+        false
     }
 
     pub fn remove(&self, key: InFlightKey) -> Option<InFlightState> {
@@ -281,10 +347,13 @@ impl InFlightRegistry {
     }
 
     fn shard_for(&self, key: &InFlightKey) -> &InFlightShard {
+        &self.shards[self.shard_index(key)]
+    }
+
+    fn shard_index(&self, key: &InFlightKey) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % self.shards.len();
-        &self.shards[idx]
+        (hasher.finish() as usize) % self.shards.len()
     }
 }
 
@@ -318,5 +387,58 @@ mod tests {
         let state = progress.lock().expect("progress lock poisoned");
         assert_eq!(state.acked_generation, 2);
         assert!(state.in_flight.is_none());
+    }
+
+    fn idle_state() -> InFlightState {
+        InFlightState {
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(std::sync::Mutex::new(ProgressState::new(None))),
+            claim: None,
+            finalizing: false,
+        }
+    }
+
+    #[test]
+    fn cancel_before_registration_reaches_only_that_attempt() {
+        let registry = InFlightRegistry::default();
+        assert!(!registry.signal_cancel((7, 3)));
+
+        let other = idle_state();
+        let other_flag = other.cancel.clone();
+        assert!(!registry.insert((7, 4), other));
+        assert!(!other_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        let cancelled = idle_state();
+        let flag = cancelled.cancel.clone();
+        assert!(registry.insert((7, 3), cancelled));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The kept cancel is consumed by its registration.
+        registry.remove((7, 3));
+        assert!(!registry.insert((7, 3), idle_state()));
+    }
+
+    #[test]
+    fn cancel_after_registration_sets_the_flag() {
+        let registry = InFlightRegistry::default();
+        let state = idle_state();
+        let flag = state.cancel.clone();
+        assert!(!registry.insert((9, 1), state));
+        assert!(registry.signal_cancel((9, 1)));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn kept_cancels_are_bounded_per_shard() {
+        let registry = InFlightRegistry::default();
+        for job_id in 0..(IN_FLIGHT_SHARDS * UNREGISTERED_CANCELS_PER_SHARD * 4) as i64 {
+            registry.signal_cancel((job_id, 1));
+        }
+        for shard in &*registry.cancelled {
+            assert!(shard.lock().unwrap().len() <= UNREGISTERED_CANCELS_PER_SHARD);
+        }
+        // The newest cancel is still kept.
+        let newest = (IN_FLIGHT_SHARDS * UNREGISTERED_CANCELS_PER_SHARD * 4) as i64 - 1;
+        assert!(registry.insert((newest, 1), idle_state()));
     }
 }
