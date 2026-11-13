@@ -2,6 +2,8 @@
 
 Evidence supporting proposed [ADR-052](../adr/052-runtime-halt.md). No controls or parameter choices described by the ADR have been implemented or tested by this audit.
 
+The audit is pinned to the commits below. Since then, 0.6.16 added a schema patch registry to the 0.6 migration runner and shipped the `maintenance.prune` control as its `prune_controls` patch; 0.6.17 moved promotion and rescue into their own maintenance loop (ADR-051); and `main` gained migrations v053 to v059. Line references describe the pinned commits.
+
 A check of a plain control table inside `claim_ready_runtime` is a plausible enforcement point for queue-storage runtime claims, but is not a complete dispatch halt. Canonical dispatch bypasses that function on both audited branches; main also has callable per-slot claim functions. A database read can avoid a client polling interval, but does not establish a barrier against claims already in progress or handler launches after the halt commits.
 
 This source audit pins main to [`d16ef5c4572cb96b25a8f26ad85bd5915ab76f64`](https://github.com/hardbyte/awa/commit/d16ef5c4572cb96b25a8f26ad85bd5915ab76f64) and `release/0.6.x` to [`8cec9e45a45735c300a89c98dc96573589100386`](https://github.com/hardbyte/awa/commit/8cec9e45a45735c300a89c98dc96573589100386). It inspects source, not a running halt implementation or a mixed-version rehearsal. The prospective patch examples below are separate commits, not evidence that the pinned release contains their behavior.
