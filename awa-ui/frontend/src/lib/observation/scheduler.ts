@@ -41,6 +41,17 @@ interface Entry {
   error: boolean;
 }
 
+/** Whether a failed read would fail the same way if repeated, so the view
+ * waits for an explicit refresh. A 4xx refuses the request itself (a bad
+ * filter, a missing resource or route), except a request timeout and 429,
+ * which the backend-wide cooldown paces instead. 401 and 403 halt every view
+ * until a refresh, so they are left to that. */
+function refusesRepeat(error: unknown) {
+  if (error instanceof ReadProtocolError) return true;
+  if (!(error instanceof HttpError)) return false;
+  return error.status >= 400 && error.status < 500 && ![401, 403, 408, 429].includes(error.status);
+}
+
 /** Bounded exact-key demand. Polling, independent reconciliation and explicit
  * marks share this dispatcher; there is no second automatic fetch loop. */
 export class RefreshScheduler {
@@ -207,7 +218,7 @@ export class RefreshScheduler {
         entry.dirty = true;
         if (!controller.signal.aborted || error instanceof ReadTimeoutError) {
           this.failure(error); entry.error = true;
-          entry.blocked = error instanceof ReadProtocolError || (error instanceof HttpError && [400, 413, 415, 422].includes(error.status));
+          entry.blocked = refusesRepeat(error);
           this.syncWatchdog(entry);
           entry.manual ||= !!demand.manualOnly;
           entry.failures = Math.min(entry.failures + 1, 6);

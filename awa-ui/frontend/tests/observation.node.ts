@@ -150,6 +150,28 @@ test("auth and protocol failures stop loops; failed network reads retain paced d
   assert.equal(invalid.nextWakeAt(), null);
 });
 
+test("a refused 4xx blocks its view until an explicit refresh; 429 and request timeouts keep paced demand", async () => {
+  for (const status of [400, 404, 405, 410, 422]) {
+    let now = 0; let reads = 0;
+    const scheduler = new RefreshScheduler({}, () => now, () => 1); scheduler.setReady(true);
+    scheduler.attach(demand("jobs", async () => { reads++; throw new HttpError("refused", status); }));
+    scheduler.tick(); await settle(); assert.equal(reads, 1, `${status}`);
+    now = 600_000; scheduler.mark(); scheduler.tick(); await settle();
+    assert.equal(reads, 1, `${status} must not be retried automatically`);
+    assert.equal(scheduler.nextWakeAt(), null, `${status}`);
+    scheduler.mark("jobs", true); scheduler.tick(); await settle(); assert.equal(reads, 2, `${status}`);
+  }
+  for (const status of [408, 429]) {
+    let now = 0; let reads = 0;
+    const scheduler = new RefreshScheduler({}, () => now, () => 1); scheduler.setReady(true);
+    scheduler.attach(demand("jobs", async () => { reads++; const error = new HttpError("busy", status, 10_000); scheduler.failure(error); throw error; }));
+    scheduler.tick(); await settle(); assert.equal(reads, 1); assert.notEqual(scheduler.nextWakeAt(), null, `${status}`);
+    // The poll deadline marks the view at 10s; its debounce admits the read.
+    now = 10_000; scheduler.tick(); now += 100; scheduler.tick(); await settle();
+    assert.equal(reads, 2, `${status} resumes without a refresh`);
+  }
+});
+
 test("known-absent optional views stop automatic reads and can be explicitly reprobed", async () => {
   let now = 0; let reads = 0;
   const scheduler = new RefreshScheduler({}, () => now); scheduler.setReady(true);
