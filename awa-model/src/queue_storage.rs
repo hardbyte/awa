@@ -10,9 +10,7 @@ use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::Acquire;
 use sqlx::{FromRow, PgPool, Postgres, Row};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -133,6 +131,15 @@ pub fn ordering_key_hash64(ordering_key: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME).wrapping_add(*byte as u128) & MASK;
     }
     hash as u64
+}
+
+/// SplitMix64 finalizer over an [`ordering_key_hash64`] value, used to pick
+/// a queue stripe.
+fn stripe_hash(hash: u64) -> u64 {
+    let mut z = hash;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Deterministically map an ordering key to a shard in `[0, shards)`.
@@ -4007,6 +4014,10 @@ impl DeferredJobRow {
 pub struct QueueStorage {
     config: QueueStorageConfig,
     next_stripe_probe: AtomicUsize,
+    /// Stripe for the next enqueued job that has neither an ordering key
+    /// nor a unique key. Randomly seeded so single-job producers spread
+    /// across stripes instead of all starting at stripe 0.
+    next_enqueue_stripe: AtomicUsize,
     /// Per-store rotor that selects the enqueue shard for the next batch.
     /// Rotated once per `shard_for_enqueue` call so producers spread their
     /// writes across the per-`(queue, priority)` shard rows.
@@ -4084,6 +4095,7 @@ impl QueueStorage {
         Ok(Self {
             config,
             next_stripe_probe: AtomicUsize::new(0),
+            next_enqueue_stripe: AtomicUsize::new(Uuid::new_v4().as_u128() as usize),
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             claimer_gates: Mutex::new(HashMap::new()),
@@ -4273,12 +4285,19 @@ impl QueueStorage {
         format!("{queue}{QUEUE_STRIPE_DELIMITER}{stripe}")
     }
 
+    /// Physical queues that hold jobs for `queue`: each stripe, then the
+    /// unstriped queue itself. Producers that do not stripe (the SQL compat
+    /// insert path, cron, a store configured with one stripe) write the
+    /// unstriped queue, so a striped store reads it as well. The striped
+    /// claim loops probe this list round-robin, so the unstriped queue
+    /// takes one turn in `stripes + 1`.
     pub(crate) fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
         if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
             return vec![queue.to_string()];
         }
         (0..self.queue_stripe_count())
             .map(|stripe| self.physical_queue_for_stripe(queue, stripe))
+            .chain(std::iter::once(queue.to_string()))
             .collect()
     }
 
@@ -4299,22 +4318,34 @@ impl QueueStorage {
             .unwrap_or(queue)
     }
 
+    /// Physical stripe for a job enqueued to `queue`.
+    ///
+    /// A job with an `ordering_key` goes to the stripe its key hashes to,
+    /// so jobs sharing a key share a stripe and keep their claim order;
+    /// otherwise a `unique_key` picks the stripe the same way. The stripe
+    /// uses [`stripe_hash`] of [`ordering_key_hash64`] and the enqueue
+    /// shard ([`shard_for_ordering_key`]) uses the raw hash modulo the shard
+    /// count, so the keys on one stripe still spread across every shard.
+    /// A job with neither key takes `spread` when given (a job id),
+    /// else the next value of the store's enqueue-stripe counter.
     fn queue_stripe_for_enqueue(
         &self,
         queue: &str,
-        unique_key: &Option<Vec<u8>>,
-        salt: i64,
+        ordering_key: Option<&[u8]>,
+        unique_key: Option<&[u8]>,
+        spread: Option<i64>,
     ) -> String {
         if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
             return queue.to_string();
         }
 
-        let stripe = if let Some(key) = unique_key {
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            (hasher.finish() as usize) % self.queue_stripe_count()
-        } else {
-            salt.rem_euclid(self.queue_stripe_count() as i64) as usize
+        let stripes = self.queue_stripe_count();
+        let stripe = match ordering_key.or(unique_key) {
+            Some(key) => (stripe_hash(ordering_key_hash64(key)) % stripes as u64) as usize,
+            None => match spread {
+                Some(value) => value.rem_euclid(stripes as i64) as usize,
+                None => self.next_enqueue_stripe.fetch_add(1, Ordering::Relaxed) % stripes,
+            },
         };
         self.physical_queue_for_stripe(queue, stripe)
     }
@@ -7561,11 +7592,15 @@ impl QueueStorage {
         let mut ready_rows = Vec::new();
         let mut deferred_rows = Vec::new();
 
-        for (idx, job) in jobs.iter().enumerate() {
+        for job in jobs {
             let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
             let payload = Self::payload_from_parts(prepared.metadata, prepared.tags, None, None)?;
-            let queue =
-                self.queue_stripe_for_enqueue(&prepared.queue, &prepared.unique_key, idx as i64);
+            let queue = self.queue_stripe_for_enqueue(
+                &prepared.queue,
+                prepared.ordering_key.as_deref(),
+                prepared.unique_key.as_deref(),
+                None,
+            );
 
             let ready_row = RuntimeReadyRow {
                 job_id: None,
@@ -7671,11 +7706,15 @@ impl QueueStorage {
         let mut ready_rows = Vec::new();
         let mut deferred_rows = Vec::new();
 
-        for (idx, job) in jobs.iter().enumerate() {
+        for job in jobs {
             let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
             let payload = Self::payload_from_parts(prepared.metadata, prepared.tags, None, None)?;
-            let queue =
-                self.queue_stripe_for_enqueue(&prepared.queue, &prepared.unique_key, idx as i64);
+            let queue = self.queue_stripe_for_enqueue(
+                &prepared.queue,
+                prepared.ordering_key.as_deref(),
+                prepared.unique_key.as_deref(),
+                None,
+            );
 
             let ready_row = RuntimeReadyRow {
                 job_id: None,
@@ -11967,7 +12006,13 @@ impl QueueStorage {
             && requested_queue != old_queue
             && requested_queue != old_logical_queue
         {
-            self.queue_stripe_for_enqueue(requested_queue, &row.unique_key, row.job_id)
+            // Stored rows do not retain the ordering key.
+            self.queue_stripe_for_enqueue(
+                requested_queue,
+                None,
+                row.unique_key.as_deref(),
+                Some(row.job_id),
+            )
         } else {
             old_queue.clone()
         };
@@ -12083,7 +12128,13 @@ impl QueueStorage {
             && requested_queue != old_queue
             && requested_queue != old_logical_queue
         {
-            self.queue_stripe_for_enqueue(requested_queue, &ready.unique_key, ready.job_id)
+            // Stored rows do not retain the ordering key.
+            self.queue_stripe_for_enqueue(
+                requested_queue,
+                None,
+                ready.unique_key.as_deref(),
+                Some(ready.job_id),
+            )
         } else {
             old_queue.clone()
         };
