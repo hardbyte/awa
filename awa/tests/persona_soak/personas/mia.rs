@@ -85,8 +85,8 @@ impl Worker for MiaWorker {
             return Err(JobError::retryable_msg("interrupted"));
         }
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Mia, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }

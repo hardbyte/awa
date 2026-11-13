@@ -71,7 +71,26 @@ pub fn tune(builder: ClientBuilder, shared: &Shared) -> ClientBuilder {
     }
 }
 
-const DEFAULT_ROTATE_INTERVAL: Duration = Duration::from_millis(1_000);
+/// Rotation interval of every ring the run does not set on its own: one second, or four
+/// with `AWA_PRESSURE_ROTATE_MULTIPLIER=4`.
+fn base_rotate_interval() -> Duration {
+    super::config::pressure_rotation_interval().expect("valid AWA_PRESSURE_ROTATE_MULTIPLIER")
+}
+
+/// Applies `AWA_PRESSURE_ROTATE_MULTIPLIER` to the queue, lease and claim rings of a
+/// runtime, including one in a process of its own.
+pub fn pressure_rotation_timings(
+    builder: ClientBuilder,
+    storage: QueueStorageConfig,
+) -> ClientBuilder {
+    let interval = base_rotate_interval();
+    if interval == Duration::from_secs(1) {
+        return builder;
+    }
+    builder
+        .queue_storage(storage, interval, interval)
+        .claim_rotate_interval(interval)
+}
 
 /// Selects `config` with the run's rotation intervals. A runtime with a storage
 /// configuration of its own calls this after [`tune`], which would otherwise replace it.
@@ -80,21 +99,14 @@ pub fn storage(
     shared: &Shared,
     config: QueueStorageConfig,
 ) -> ClientBuilder {
+    let base = base_rotate_interval();
     builder
         .queue_storage(
             config,
-            shared
-                .config
-                .queue_rotate_interval
-                .unwrap_or(DEFAULT_ROTATE_INTERVAL),
-            DEFAULT_ROTATE_INTERVAL,
+            shared.config.queue_rotate_interval.unwrap_or(base),
+            base,
         )
-        .claim_rotate_interval(
-            shared
-                .config
-                .claim_rotate_interval
-                .unwrap_or(DEFAULT_ROTATE_INTERVAL),
-        )
+        .claim_rotate_interval(shared.config.claim_rotate_interval.unwrap_or(base))
 }
 
 /// The timings of [`tune`] that do not depend on the run, for runtimes that live in a
@@ -104,6 +116,7 @@ pub fn timings(
     heartbeat_interval: Duration,
     heartbeat_staleness: Duration,
 ) -> ClientBuilder {
+    let builder = pressure_rotation_timings(builder, QueueStorageConfig::default());
     builder
         .heartbeat_interval(heartbeat_interval)
         .heartbeat_staleness(heartbeat_staleness)

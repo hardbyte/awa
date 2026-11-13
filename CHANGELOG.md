@@ -8,6 +8,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - The schema stays at v40. `awa migrate` applies one new repeatable patch, `replica_identity`. Unlike the earlier 0.6 patches it takes table locks: `ACCESS EXCLUSIVE` on each table it changes (`awa.admin_dirty_queue_marks`, `awa.admin_dirty_kind_marks`, `awa.job_unique_claims` and each `queue_terminal_count_deltas` table and partition), plus `SHARE` on `idx_awa_jobs_unique`, held until the patch commits, which is milliseconds once granted. Each lock wait is bounded by the session's `lock_timeout`, or 300 ms when none is set; a timeout fails the patch with `55P03` and changes nothing, so run `awa migrate` again. A re-run after success takes no lock. External migration runners apply `R__replica_identity.sql` after `V40` and after the other `R__` scripts, as the owner of the awa and queue-storage tables. 0.6.17 binaries run unchanged on the patched schema, so binaries and the patch can roll in either order. See the [upgrade guide](docs/upgrade-0.6.17-to-0.6.18.md).
 
+### Added
+
+- Python `Job.run_lease` exposes the attempt's lease identifier, read-only, for diagnostic correlation.
+
 ### Changed
 
 - Ring prune truncates only the children of the sealed slot that hold storage (0.6 port of #512). Queue, lease and claim prune take the same locks on every child of the slot, in the same order, as in 0.6.17, then `TRUNCATE` only the children with heap, TOAST, free-space-map or visibility-map pages, or index pages beyond an empty btree, GiST or BRIN index. A child that never held a row keeps its relfilenode, so a prune no longer swaps relfilenodes and writes WAL and catalog rows for empty partitions, such as the receipt children of a schema without receipts. A child emptied by `DELETE` and `VACUUM` that kept expanded indexes or TOAST is still truncated. The empty-slot fast path is unchanged. No configuration or schema change.

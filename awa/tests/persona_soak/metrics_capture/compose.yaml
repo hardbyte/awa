@@ -1,0 +1,18 @@
+name: ${AWA_SOAK_METRICS_PROJECT:?set a unique owned project name}
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    pull_policy: never
+    command: ["--config=/etc/otelcol/config.yaml"]
+    restart: "no"
+    user: "${AWA_SOAK_METRICS_UID:?set the output owner UID}:${AWA_SOAK_METRICS_GID:?set the output owner GID}"
+    volumes:
+      - ./collector.yaml:/etc/otelcol/config.yaml:ro
+      - ${AWA_SOAK_METRICS_DIR:?set an absolute private capture directory}/collector:/data:rw
+    ports:
+      - "127.0.0.1:${AWA_SOAK_METRICS_GRPC_PORT:?set an owned port}:4317"
+      - "127.0.0.1:${AWA_SOAK_METRICS_PROM_PORT:?set an owned port}:8889"
+    mem_limit: 512m
+    cpus: 0.5
+    labels:
+      awa.gate.observer: "true"
