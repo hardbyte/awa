@@ -503,6 +503,37 @@ async fn short_ordering_keys_spread_across_stripes() {
 }
 
 #[tokio::test]
+async fn equal_length_prefixed_keys_spread_across_stripes() {
+    let pool = connect().await;
+    let schema = "stripe_routing_prefixed_keys";
+    let store = fresh_store(&pool, schema, 4).await;
+    let queue = "stripe_prefixed_keys";
+    let jobs: Vec<_> = (1..=100)
+        .map(|seq| job(queue, seq, Some(&format!("tenant-{seq}"))))
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &jobs)
+        .await
+        .expect("keyed enqueue");
+
+    let mut per_stripe: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, physical, _) in placement(&pool, schema).await {
+        *per_stripe.entry(physical).or_default() += 1;
+    }
+    assert_eq!(
+        per_stripe.len(),
+        4,
+        "prefixed keys use every stripe: {per_stripe:?}"
+    );
+    for (stripe, count) in &per_stripe {
+        assert!(
+            (15..=35).contains(count),
+            "{stripe} holds {count} of 100 prefixed keys"
+        );
+    }
+}
+
+#[tokio::test]
 async fn keys_on_one_stripe_still_use_every_enqueue_shard() {
     let pool = connect().await;
     let schema = "stripe_routing_shards";
