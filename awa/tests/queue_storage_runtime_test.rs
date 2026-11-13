@@ -23149,7 +23149,6 @@ async fn test_prune_wins_against_overlapping_short_readers() {
 /// sealed slot's children keeps every upgrade attempt waiting until it gives
 /// up, so prune can only win if claims stop touching the slot it retires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "needs the live_slot_claims claim functions (#721)"]
 async fn test_prune_wins_against_overlapping_claim_transactions() {
     let (_db_guard, pool) = setup_pool(12).await;
     let schema = "awa_qs_prune_overlapping_claims";
@@ -23753,15 +23752,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
     // Retry, fail and snooze still find the attempt by job id alone, which
     // reads every claim and done child; they run once per failed attempt
     // rather than on every claim and heartbeat.
-    // Claims run the claim function a schema patch installs; until the
-    // live_slot_claims patch, it reads every slot's children.
-    let not_yet_slot_addressed = [
-        "retry",
-        "fail",
-        "snooze",
-        "claim (deadline)",
-        "claim (compact)",
-    ];
+    let not_yet_slot_addressed = ["retry", "fail", "snooze"];
     let hot_blocked: Vec<_> = all_blocked
         .iter()
         .filter(|name| !not_yet_slot_addressed.contains(name))
@@ -24041,5 +24032,454 @@ async fn test_prune_brin_fsm_baseline_follows_block_size() {
             extra_is_used,
             "one extra FSM page at block_size={block_size}"
         );
+    }
+}
+
+/// The 0.6.17 `claim_ready_runtime` with receipts, for schema `__SCHEMA__`.
+const RELEASED_CLAIM_BODY: &str =
+    include_str!("../../awa-model/tests/fixtures/claim_ready_runtime_0_6_17.sql");
+
+async fn claim_cursor_value(pool: &sqlx::PgPool, schema: &str, queue: &str, priority: i16) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT {schema}.sequence_next_value(seq_name) FROM {schema}.queue_claim_heads
+         WHERE queue = $1 AND priority = $2 AND enqueue_shard = 0"
+    ))
+    .bind(queue)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .expect("read the claim cursor")
+}
+
+/// Replace `schema`'s dispatcher with one that, while the retired slot is
+/// left out, routes past a cursor no segment covers and claims past gaps in
+/// the lane's sequences.
+async fn install_dispatcher_without_cover_check(pool: &sqlx::PgPool, schema: &str) {
+    let mut body: String = sqlx::query_scalar(&format!(
+        "SELECT pg_get_functiondef('{schema}.claim_ready_runtime(text,bigint,float8,float8)'::regprocedure)"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read the dispatcher");
+    for (old, new) in [
+        ("candidate.first_lane_seq <= cursors.claim_seq", "TRUE"),
+        ("candidate.first_lane_seq <= v_lane_claim_seq", "TRUE"),
+        ("v_excluded IS NOT NULL,", "FALSE,"),
+    ] {
+        assert!(body.contains(old), "the dispatcher has {old}");
+        body = body.replace(old, new);
+    }
+    sqlx::raw_sql(&body)
+        .execute(pool)
+        .await
+        .expect("install the dispatcher without the cover check");
+}
+
+/// A job whose enqueue reserved its lane sequence while slot 0 was current
+/// commits into slot 0 only after prune has taken slot 0's retire barrier,
+/// and a later job of the same lane is ready in the current slot (#721).
+/// Prune's pending-ready check ran before the late commit, so the late row
+/// is safe only while the lane's claim cursor stays at or before it: claims
+/// that leave slot 0 out must not claim the later job past it. Without that
+/// check the cursor passes the late row and prune truncates it unclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_claims_keep_the_cursor_before_a_late_row_in_the_retired_slot() {
+    for cover_check in [false, true] {
+        let (_db_guard, pool) = setup_pool(8).await;
+        let schema = "awa_qs_retired_slot_late_row";
+        let store = create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                ..Default::default()
+            },
+        )
+        .await;
+        if !cover_check {
+            install_dispatcher_without_cover_check(&pool, schema).await;
+        }
+        let queue = "qs_retired_slot_late_row";
+        store.enqueue_batch(&pool, queue, 2, 1).await.unwrap();
+        let first = store
+            .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        store.complete_runtime_batch(&pool, &first).await.unwrap();
+
+        // The late job reserves its lane sequence in slot 0 and stays open
+        // while the ring rotates until slot 0 is the one prune retires.
+        let mut late_tx = pool.begin().await.unwrap();
+        let late_job: i64 = sqlx::query_scalar(
+            "SELECT (awa.insert_job_compat('late_row', $1, '{}'::jsonb, 'available', 2::smallint)).id",
+        )
+        .bind(queue)
+        .fetch_one(late_tx.as_mut())
+        .await
+        .unwrap();
+        for slot in 1..=3 {
+            assert!(matches!(
+                store.rotate(&pool).await.unwrap(),
+                RotateOutcome::Rotated { slot: rotated, .. } if rotated == slot
+            ));
+        }
+        // Prune has seen no pending row in slot 0 and holds its barrier.
+        let mut prune_tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(format('awa.queue_storage.retire:%s:queue:%s', $1::text, 0), 0))",
+        )
+        .bind(schema)
+        .execute(prune_tx.as_mut())
+        .await
+        .unwrap();
+        late_tx.commit().await.unwrap();
+        let late_seq: i64 = sqlx::query_scalar(&format!(
+            "SELECT lane_seq FROM {schema}.ready_entries_0 WHERE job_id = $1"
+        ))
+        .bind(late_job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        store.enqueue_batch(&pool, queue, 2, 1).await.unwrap();
+
+        let mut claimed_while_retiring = Vec::new();
+        for _ in 0..3 {
+            let claimed = store
+                .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(300))
+                .await
+                .unwrap();
+            claimed_while_retiring.extend(claimed.iter().map(|job| job.job.id));
+            store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+        }
+        let cursor = claim_cursor_value(&pool, schema, queue, 2).await;
+        prune_tx.rollback().await.unwrap();
+        let outcome = store.prune_oldest(&pool, Duration::ZERO).await.unwrap();
+
+        let mut claimed_after = Vec::new();
+        for _ in 0..5 {
+            let claimed = store
+                .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(300))
+                .await
+                .unwrap();
+            claimed_after.extend(claimed.iter().map(|job| job.job.id));
+            store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+        }
+        let late_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT (SELECT count(*) FROM {schema}.ready_entries WHERE job_id = $1)
+                  + (SELECT count(*) FROM {schema}.done_entries WHERE job_id = $1)"
+        ))
+        .bind(late_job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let lost = late_rows == 0 && !claimed_after.contains(&late_job);
+        eprintln!(
+            "cover_check={cover_check} late_seq={late_seq} cursor={cursor} \
+             claimed_while_retiring={claimed_while_retiring:?} prune={outcome:?} \
+             claimed_after={claimed_after:?} lost={lost}"
+        );
+        if cover_check {
+            assert!(
+                claimed_while_retiring.is_empty(),
+                "nothing is claimed past the late row while slot 0 is left out"
+            );
+            assert!(
+                cursor <= late_seq,
+                "cursor {cursor} passed the late row {late_seq}"
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    PruneOutcome::SkippedActive {
+                        slot: 0,
+                        reason: SkipReason::QueuePendingReady,
+                        ..
+                    }
+                ),
+                "prune sees the late row: {outcome:?}"
+            );
+            assert_eq!(
+                claimed_after.first(),
+                Some(&late_job),
+                "the late job is claimed first once the barrier is gone"
+            );
+        } else {
+            assert!(lost, "without the cover check the late job is lost");
+        }
+    }
+}
+
+fn bench_env<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+async fn bench_backlog(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum({schema}.sequence_next_value(e.seq_name)
+                         - {schema}.sequence_next_value(c.seq_name)), 0)::bigint
+         FROM {schema}.queue_claim_heads c JOIN {schema}.queue_enqueue_heads e
+           ON e.queue = c.queue AND e.priority = c.priority AND e.enqueue_shard = c.enqueue_shard
+         WHERE c.queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn bench_drain(store: &Arc<QueueStorage>, pool: &sqlx::PgPool, queue: &str) {
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let (store, pool, queue) = (store.clone(), pool.clone(), queue.to_string());
+        tasks.push(tokio::spawn(async move {
+            let mut empty = 0;
+            while empty < 20 {
+                let claimed = store
+                    .claim_runtime_batch(&pool, &queue, 500, Duration::from_secs(300))
+                    .await
+                    .unwrap();
+                if claimed.is_empty() {
+                    empty += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                } else {
+                    empty = 0;
+                    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+/// Relation locks one claim transaction holds in `schema`.
+async fn bench_claim_locks(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(&format!(
+        "SELECT * FROM {schema}.claim_ready_runtime($1, 1, 300, 0)"
+    ))
+    .bind(queue)
+    .fetch_all(tx.as_mut())
+    .await
+    .unwrap();
+    let locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+         WHERE l.pid = pg_backend_pid() AND l.locktype = 'relation'
+           AND c.relnamespace = $1::regnamespace",
+    )
+    .bind(schema)
+    .fetch_one(tx.as_mut())
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    locks
+}
+
+/// Claim throughput and latency of the 0.6.17 claim function (`released`)
+/// against the per-slot claim functions (`live_slots`), #721. Each worker
+/// claims one deadline-backed job at a time and completes it. Bodies are
+/// interleaved within each round, rotating the order every round.
+///
+/// `AWA_BENCH_FIXTURE=steady` keeps rows in two slots; `full` fills every
+/// queue slot with `AWA_BENCH_FULL_ROWS` claimed rows first. Other knobs:
+/// `AWA_BENCH_ROUNDS`, `AWA_BENCH_SECS`, `AWA_BENCH_WORKERS` (comma list),
+/// `AWA_BENCH_BODIES`, `AWA_BENCH_LANES`. One line per measurement:
+/// `BENCH fixture=.. round=.. body=.. workers=.. calls_per_s=.. jobs_per_s=..
+/// p50_ms=.. p99_ms=.. locks_per_claim=.. lockmgr_wait_share=..`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark"]
+async fn bench_claim_latency_by_claim_body() {
+    let rounds: usize = bench_env("AWA_BENCH_ROUNDS", 5);
+    let secs: u64 = bench_env("AWA_BENCH_SECS", 8);
+    let fixture = std::env::var("AWA_BENCH_FIXTURE").unwrap_or_else(|_| "steady".into());
+    let full_rows: i64 = bench_env("AWA_BENCH_FULL_ROWS", 100_000);
+    let lanes: i16 = bench_env("AWA_BENCH_LANES", 4);
+    let worker_list: Vec<usize> = std::env::var("AWA_BENCH_WORKERS")
+        .unwrap_or_else(|_| "4,16,64".into())
+        .split(',')
+        .map(|workers| workers.parse().unwrap())
+        .collect();
+    let body_list: Vec<String> = std::env::var("AWA_BENCH_BODIES")
+        .unwrap_or_else(|_| "released,live_slots".into())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let max_workers = *worker_list.iter().max().unwrap();
+    let (_db_guard, pool) = setup_pool(max_workers as u32 + 6).await;
+    let schema = "awa_qs_bench_claim_body";
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    let queue = "qs_bench_claim_body";
+    let install = |body: String| {
+        let pool = pool.clone();
+        async move {
+            let sql = match body.as_str() {
+                "released" => RELEASED_CLAIM_BODY.replace("__SCHEMA__", schema),
+                "live_slots" => {
+                    format!("SELECT awa.refresh_claim_functions('{schema}', TRUE)")
+                }
+                other => panic!("unknown claim body {other}"),
+            };
+            sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        }
+    };
+
+    if fixture == "full" {
+        let slot_count: i32 =
+            sqlx::query_scalar(&format!("SELECT slot_count FROM {schema}.queue_ring_state"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        for slot in 0..slot_count {
+            let per_lane = full_rows / lanes as i64;
+            let mut done = 0;
+            while done < per_lane {
+                let chunk = (per_lane - done).min(10_000);
+                for priority in 1..=lanes {
+                    store
+                        .enqueue_batch(&pool, queue, priority, chunk)
+                        .await
+                        .unwrap();
+                }
+                done += chunk;
+            }
+            bench_drain(&store, &pool, queue).await;
+            if slot < slot_count - 1 {
+                store.rotate(&pool).await.unwrap();
+            }
+        }
+    } else {
+        for _ in 0..2 {
+            for priority in 1..=lanes {
+                store
+                    .enqueue_batch(&pool, queue, priority, 10_000)
+                    .await
+                    .unwrap();
+            }
+            bench_drain(&store, &pool, queue).await;
+            for priority in 1..=lanes {
+                store
+                    .enqueue_batch(&pool, queue, priority, 5_000)
+                    .await
+                    .unwrap();
+            }
+            store.rotate(&pool).await.unwrap();
+        }
+    }
+    for table in [
+        "ready_entries",
+        "ready_segments",
+        "ready_claim_attempt_batches",
+        "ready_tombstones",
+    ] {
+        sqlx::query(&format!("VACUUM ANALYZE {schema}.{table}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    for round in 0..rounds {
+        for &workers in &worker_list {
+            let mut order = body_list.clone();
+            order.rotate_left(round % body_list.len());
+            for body in &order {
+                install(body.clone()).await;
+                while bench_backlog(&pool, schema, queue).await < 120_000 {
+                    for priority in 1..=lanes {
+                        store
+                            .enqueue_batch(&pool, queue, priority, 5_000)
+                            .await
+                            .unwrap();
+                    }
+                }
+                let stop = Arc::new(AtomicBool::new(false));
+                let lock_waits = Arc::new(AtomicUsize::new(0));
+                let active = Arc::new(AtomicUsize::new(0));
+                let sampler = {
+                    let (pool, stop, lock_waits, active) = (
+                        pool.clone(),
+                        stop.clone(),
+                        lock_waits.clone(),
+                        active.clone(),
+                    );
+                    tokio::spawn(async move {
+                        while !stop.load(Ordering::Relaxed) {
+                            let (busy, waiting): (i64, i64) = sqlx::query_as(
+                                "SELECT count(*) FILTER (WHERE state = 'active'),
+                                        count(*) FILTER (WHERE state = 'active' AND wait_event = 'LockManager')
+                                 FROM pg_stat_activity
+                                 WHERE datname = current_database() AND pid <> pg_backend_pid()",
+                            )
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                            active.fetch_add(busy as usize, Ordering::Relaxed);
+                            lock_waits.fetch_add(waiting as usize, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                };
+                let mut tasks = Vec::new();
+                for _ in 0..workers {
+                    let (pool, store, stop) = (pool.clone(), store.clone(), stop.clone());
+                    tasks.push(tokio::spawn(async move {
+                        let mut latencies = Vec::new();
+                        let mut jobs = 0usize;
+                        while !stop.load(Ordering::Relaxed) {
+                            let started = Instant::now();
+                            let claimed = store
+                                .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+                                .await
+                                .unwrap();
+                            latencies.push(started.elapsed());
+                            if !claimed.is_empty() {
+                                jobs += claimed.len();
+                                store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+                            }
+                        }
+                        (latencies, jobs)
+                    }));
+                }
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                stop.store(true, Ordering::Relaxed);
+                let mut latencies = Vec::new();
+                let mut jobs = 0;
+                for task in tasks {
+                    let (task_latencies, task_jobs) = task.await.unwrap();
+                    latencies.extend(task_latencies);
+                    jobs += task_jobs;
+                }
+                sampler.await.unwrap();
+                latencies.sort_unstable();
+                let pick = |q: f64| {
+                    latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)]
+                };
+                let locks = bench_claim_locks(&pool, schema, queue).await;
+                println!(
+                    "BENCH fixture={fixture} round={round} body={body} workers={workers} \
+                     calls_per_s={:.0} jobs_per_s={:.0} p50_ms={:.3} p99_ms={:.3} \
+                     locks_per_claim={locks} lockmgr_wait_share={:.3}",
+                    latencies.len() as f64 / secs as f64,
+                    jobs as f64 / secs as f64,
+                    pick(0.50).as_secs_f64() * 1000.0,
+                    pick(0.99).as_secs_f64() * 1000.0,
+                    lock_waits.load(Ordering::Relaxed) as f64
+                        / active.load(Ordering::Relaxed).max(1) as f64,
+                );
+            }
+        }
     }
 }
