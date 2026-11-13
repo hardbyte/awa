@@ -21,4 +21,9 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/check-commit-metadata.py "$BASE_SHA" "$HEAD_SHA"
+        # The base branch's checker runs, so a PR cannot relax the rules that judge it.
+        run: |
+          checker="$RUNNER_TEMP/check-commit-metadata.py"
+          git show "$BASE_SHA:scripts/check-commit-metadata.py" > "$checker" 2>/dev/null \
+            || cp scripts/check-commit-metadata.py "$checker"
+          python3 "$checker" "$BASE_SHA" "$HEAD_SHA"
