@@ -74,9 +74,9 @@ The Python client defaults to `max_connections=10`. `awa serve` defaults to a po
 
 Each pooled connection is a Postgres backend with its own relation, plan and function caches, and those caches only grow while the backend lives. Queue storage has several hundred partitions and indexes, and the claim path runs per-slot functions, so a backend that has run claims, completions and maintenance holds tens of MB of backend-local memory. Postgres memory for an Awa process is roughly the number of open backends times that size.
 
-The pool keeps every connection it opened at the busiest moment. sqlx hands out idle connections oldest first, so even an idle runtime, which acquires a connection several times a second for polling and maintenance, touches every pooled connection within seconds. As a result `idle_timeout` never closes any of them, and each one ends up having run every statement Awa issues.
+The pool keeps every connection it opened at the busiest moment. sqlx hands out the connection that has been idle longest (its idle connections form a FIFO queue), so even an idle runtime, which acquires a connection several times a second for polling and maintenance, touches every pooled connection within seconds. As a result `idle_timeout` never closes any of them, and each one ends up having run every statement Awa issues.
 
-To return memory after busy periods, set `max_lifetime` on the pool. A connection past its lifetime is closed when it is next released, and the pool only opens a replacement when concurrent demand needs one, so an idle process shrinks to the few connections it actually uses:
+To return memory after busy periods, set `max_lifetime` on the pool. A connection past its lifetime is closed when it is next released or when the pool's reaper finds it idle, and the pool only opens a replacement when concurrent demand needs one, so an idle process shrinks to the few connections it actually uses:
 
 ```rust
 let pool = PgPoolOptions::new()

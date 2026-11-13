@@ -4615,13 +4615,8 @@ impl QueueStorage {
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        // The install touches every substrate relation and compiles the claim
-        // functions, and the backend that runs it keeps those relation, plan and
-        // function caches for as long as it lives. Run it on a connection taken
-        // out of the pool and close it afterwards, so a pooled backend does not
-        // carry install-sized caches for the rest of the process. Detach rather
-        // than mark the connection to close on drop: the close then completes
-        // inline even if the caller drops its runtime right after (see #408).
+        // Runs on a connection detached from the pool, closed inline after
+        // the install and the tag-index pass.
         let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?.detach();
         let mut install_tx = install_conn.begin().await.map_err(map_sqlx_error)?;
 
@@ -4922,8 +4917,7 @@ impl QueueStorage {
                 Ok(()) => {
                     // Best-effort (ADR-049): empty partitions get their tag
                     // index on the spot; populated ones wait for the migrator's
-                    // `awa storage build-tag-index`. Same connection: it walks
-                    // every partition too.
+                    // `awa storage build-tag-index`.
                     if let Err(error) =
                         crate::tag_index::index_empty_partitions(&mut install_conn).await
                     {
@@ -20253,10 +20247,7 @@ impl QueueStorage {
     }
 
     // Statements whose text names one ring child (probes, prune locks and
-    // truncates) run on whichever pooled connection is free, and there is one
-    // text per child. Prepared, each would sit in the per-connection statement
-    // cache of every connection that ever ran it, holding a server-side plan
-    // in that backend. They are cheap to plan, so send them unprepared.
+    // truncates) are sent unprepared.
     async fn relation_has_rows_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         relation: &str,

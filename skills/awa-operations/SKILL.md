@@ -385,7 +385,7 @@ lock. Size for steady-state completion rate, not burst.
   for enqueue wakeups and one for admin cancels; the leader holds one
   advisory-lock connection. Every pooled connection is a backend holding tens
   of MB of caches once warm, and `idle_timeout` never closes one in a running
-  process (sqlx reuses idle connections oldest first, so each stays in use).
+  process (sqlx reuses the longest-idle connection first, so each stays in use).
   Set `max_lifetime` (for example 5 minutes) so idle processes shrink; never
   set `statement_cache_capacity(0)`, which leaks prepared statements in sqlx 0.9.
 - **DDL creds.** Migrations and custom-schema prep need DDL-capable credentials.

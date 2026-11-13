@@ -522,12 +522,7 @@ async fn run_migration_transaction(
     options: &MigrateOptions,
     lock_key: i64,
 ) -> Result<i32, AwaError> {
-    // The backend that applies the migrations keeps relation, plan and
-    // function caches for every object they touched for as long as it lives
-    // (tens of MB once the queue-storage substrate is installed). Take the
-    // connection out of the pool and close it afterwards so no pooled backend
-    // carries them; detached for the same reason as
-    // [`warm_admin_metadata_cache`].
+    // Runs on a connection detached from the pool, closed afterwards.
     let mut conn = pool.acquire().await?.detach();
     let result: Result<i32, AwaError> = async {
         let mut tx = conn.begin().await?;
