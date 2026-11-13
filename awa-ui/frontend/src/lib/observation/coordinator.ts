@@ -22,7 +22,9 @@ export function refreshAll() {
   requestProbe();
   // Catalog reads retain their existing policy; capabilities are observed
   // passively and refreshed exclusively by this coordinator.
-  void queryClient.invalidateQueries({ queryKey: ["kinds"] });
+  for (const queryKey of [["kinds"], ["distinct-kinds"], ["distinct-queues"]]) {
+    void queryClient.invalidateQueries({ queryKey });
+  }
 }
 
 /** One timer exists only while visible managed demand needs service. A metadata
