@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Errors returned when building a worker client.
@@ -105,6 +105,18 @@ pub enum QueueCapacity {
     },
 }
 
+/// The most worker slots a queue can hold at once in this runtime.
+///
+/// Hard-reserved mode: `max_workers`. Weighted mode: `min_workers` plus the
+/// whole overflow pool, which the queue can hold while no other queue wants
+/// overflow; under contention its fair share of the pool is smaller.
+fn queue_worker_capacity(config: &QueueConfig, overflow_pool: Option<&OverflowPool>) -> u32 {
+    match overflow_pool {
+        Some(pool) => config.min_workers.saturating_add(pool.total()),
+        None => config.max_workers,
+    }
+}
+
 /// Temporary execution role used during a storage transition.
 ///
 /// This is not intended as a long-term “run either backend forever” feature.
@@ -156,6 +168,8 @@ pub struct ClientBuilder {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Vec<PeriodicJob>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     global_max_workers: Option<u32>,
@@ -179,6 +193,7 @@ pub struct ClientBuilder {
     storage: RuntimeStorage,
     ring_rotation_cadence: RingRotationCadence,
     claim_rotate_interval: Option<Duration>,
+    prune_lock_timeout: Option<Duration>,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
     health_addr: Option<SocketAddr>,
@@ -219,6 +234,8 @@ impl ClientBuilder {
             heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
+            rescue_pass_budget: None,
+            rescue_pass_max_rows: None,
             periodic_jobs: Vec::new(),
             periodic_reconciliation: None,
             global_max_workers: None,
@@ -242,6 +259,7 @@ impl ClientBuilder {
             storage,
             ring_rotation_cadence: RingRotationCadence::DEFAULT,
             claim_rotate_interval: None,
+            prune_lock_timeout: None,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
             health_addr: None,
@@ -349,10 +367,11 @@ impl ClientBuilder {
     /// `Started` dispatch is scheduled after the claim commits and before the
     /// worker handler is invoked. Outcome handlers run only after the
     /// corresponding DB state transition commits. Hooks are best-effort
-    /// in-process notifications, not a durable workflow mechanism; because
-    /// they run in detached tasks, a very short job can complete before a
-    /// `Started` handler finishes. Capture any shared dependencies you need in
-    /// the closure environment.
+    /// in-process notifications, not a durable workflow mechanism. `Started`
+    /// runs alongside the handler, so a very short job can complete before a
+    /// `Started` handler finishes. Each attempt's hooks hold a finalizer slot
+    /// until they return, so hooks slower than job throughput slow claiming.
+    /// Capture any shared dependencies you need in the closure environment.
     pub fn on_event<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -815,6 +834,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches of
+    /// 500 attempts, each in its own transaction (default: 1s, capped at half
+    /// the rescue interval). While a backlog remains the next pass runs
+    /// a second later. `Duration::ZERO` keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = Some(budget);
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). With a pass a second while a backlog remains,
+    /// this bounds the number rescued per second per kind, allowing one
+    /// final batch beyond the cap. Zero disables follow-up batches and early
+    /// re-arms. Retried attempts retain their normal backoff; their due times
+    /// can cluster, so this does not cap the promotion rate.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = Some(max_rows);
+        self
+    }
+
     /// Set the leader election retry interval (default: 10s).
     ///
     /// Controls how often a non-leader instance retries acquiring the maintenance
@@ -978,6 +1017,35 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the PostgreSQL `lock_timeout` the maintenance leader applies to
+    /// the exclusive-lock steps of queue, lease and claim ring prune and of
+    /// terminal-delta rollup (default 10 ms).
+    ///
+    /// Queue ring prune waits only on its `ready_segments` lock; its other
+    /// partition locks use `NOWAIT`, so a reader holding one of them makes it
+    /// `blocked` immediately whatever the timeout.
+    ///
+    /// Each lock acquisition gets its own timeout; this does not bound the
+    /// whole prune. A lock timeout rolls back the prune and records `blocked`
+    /// in `awa.maintenance.prune.attempts`; the maintenance loop retries on a
+    /// later tick. The short default keeps the pending `ACCESS EXCLUSIVE`
+    /// request from stalling claims and enqueues behind it.
+    /// Raise it when `blocked` outcomes persist and the rings stop recycling
+    /// because short-lived readers (admin queries, dashboards) repeatedly hold
+    /// the ring partitions at the moment prune tries. Keep it well below
+    /// PostgreSQL's `deadlock_timeout` (default 1 s), so that a waiting prune
+    /// is abandoned before deadlock detection can pick a claim as the victim,
+    /// and below any `statement_timeout`; [`Self::start`] logs a warning when
+    /// it is not. A zero timeout, or one above
+    /// PostgreSQL's `lock_timeout` maximum (`i32::MAX` ms), makes
+    /// [`Self::build`] fail. Only takes effect when queue storage is active.
+    /// May be set before or after [`Self::queue_storage`]; retained across
+    /// storage configuration changes.
+    pub fn prune_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.prune_lock_timeout = Some(timeout);
+        self
+    }
+
     /// Override when a maintenance tick may seal the current slot of the
     /// queue, lease and claim rings (default
     /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling
@@ -1090,6 +1158,11 @@ impl ClientBuilder {
             runtime.rotation_cadence = cadence;
             if let Some(interval) = self.claim_rotate_interval {
                 runtime.claim_rotate_interval = interval;
+            }
+            if let Some(timeout) = self.prune_lock_timeout {
+                runtime
+                    .set_prune_lock_timeout(timeout)
+                    .map_err(|err| BuildError::InvalidQueueStorage(err.to_string()))?;
             }
         }
 
@@ -1235,6 +1308,8 @@ impl ClientBuilder {
             heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
+            rescue_pass_budget: self.rescue_pass_budget,
+            rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
             periodic_reconciliation: self.periodic_reconciliation,
             periodic_manifest,
@@ -1335,6 +1410,8 @@ pub struct Client {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     periodic_manifest: Option<Arc<awa_model::cron_reconciliation::PeriodicManifest>>,
@@ -1680,6 +1757,38 @@ impl Client {
         reporter.publish_snapshot().await;
     }
 
+    async fn warn_on_unsafe_prune_lock_timeout(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+        let timeout = runtime.store.prune_lock_timeout();
+        let timeout_ms = timeout.as_millis().max(1) as u64;
+        let risks = match crate::storage::check_prune_lock_timeout(&self.pool, timeout).await {
+            Ok(risks) => risks,
+            Err(err) => {
+                debug!(error = %err, "Could not read lock settings to check the prune lock timeout");
+                return;
+            }
+        };
+        for risk in risks {
+            match risk {
+                crate::storage::PruneLockTimeoutRisk::DeadlockTimeout { limit_ms } => warn!(
+                    prune_lock_timeout_ms = timeout_ms,
+                    deadlock_timeout_ms = limit_ms,
+                    "Prune lock timeout is at or above deadlock_timeout; a waiting prune can \
+                     make PostgreSQL run deadlock detection and cancel a concurrent claim. \
+                     Keep the timeout well below deadlock_timeout"
+                ),
+                crate::storage::PruneLockTimeoutRisk::StatementTimeout { limit_ms } => warn!(
+                    prune_lock_timeout_ms = timeout_ms,
+                    statement_timeout_ms = limit_ms,
+                    "Prune lock timeout is at or above statement_timeout; prune is cancelled \
+                     by the statement timeout and fails instead of reporting blocked"
+                ),
+            }
+        }
+    }
+
     async fn log_transition_startup_status(
         &self,
         effective_storage: &RuntimeStorage,
@@ -1753,6 +1862,7 @@ impl Client {
 
         self.log_transition_startup_status(&effective_storage)
             .await?;
+        self.warn_on_unsafe_prune_lock_timeout().await;
 
         admin::sync_queue_descriptors(
             &self.pool,
@@ -1919,6 +2029,12 @@ impl Client {
         }
         if let Some(interval) = self.callback_rescue_interval {
             maintenance = maintenance.callback_rescue_interval(interval);
+        }
+        if let Some(budget) = self.rescue_pass_budget {
+            maintenance = maintenance.rescue_pass_budget(budget);
+        }
+        if let Some(max_rows) = self.rescue_pass_max_rows {
+            maintenance = maintenance.rescue_pass_max_rows(max_rows);
         }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
@@ -2161,6 +2277,10 @@ impl Client {
         };
         for handle in service_handles {
             let _ = handle.await;
+        }
+
+        for (queue, _) in &self.queues {
+            self.metrics.record_queue_workers(queue, 0, 0);
         }
 
         info!("Awa worker runtime stopped");
@@ -2745,7 +2865,21 @@ impl RuntimeReporterState {
         }
     }
 
+    /// Sample each queue's worker slots in use and its capacity.
+    fn record_queue_worker_metrics(&self) {
+        for (queue, config) in &self.queues {
+            let in_use = self
+                .queue_in_flight
+                .get(queue)
+                .map(|counter| counter.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            let capacity = queue_worker_capacity(config, self.overflow_pool.as_deref());
+            self.metrics.record_queue_workers(queue, in_use, capacity);
+        }
+    }
+
     async fn publish_snapshot(&self) {
+        self.record_queue_worker_metrics();
         let queue_descriptors = self.declared_queue_descriptors();
         let kind_descriptors = self.declared_job_kind_descriptors();
 
@@ -2879,6 +3013,18 @@ mod tests {
         assert_eq!(config.claim_batch_size, 512);
     }
 
+    #[test]
+    fn queue_worker_capacity_follows_the_concurrency_mode() {
+        let config = QueueConfig {
+            max_workers: 7,
+            min_workers: 2,
+            ..Default::default()
+        };
+        assert_eq!(queue_worker_capacity(&config, None), 7);
+        let overflow = OverflowPool::new(10, HashMap::from([("q".to_string(), 1)]));
+        assert_eq!(queue_worker_capacity(&config, Some(&overflow)), 12);
+    }
+
     #[tokio::test]
     async fn rotation_builder_options_are_independent_of_storage_call_order() {
         let cadence = RingRotationCadence::EAGER
@@ -2969,6 +3115,115 @@ mod tests {
             .build()
             .unwrap();
         assert!(client.storage.queue_storage().is_none());
+    }
+
+    #[tokio::test]
+    async fn prune_lock_timeout_reaches_the_store_in_either_builder_order() {
+        let timeout = Duration::from_millis(750);
+        for configure_first in [true, false] {
+            let mut builder = Client::builder(lazy_pool()).queue("q", QueueConfig::default());
+            if configure_first {
+                builder = builder.prune_lock_timeout(timeout);
+            }
+            builder = builder.queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            );
+            if !configure_first {
+                builder = builder.prune_lock_timeout(timeout);
+            }
+            let client = builder.build().unwrap();
+            let store = client.storage.queue_storage_store().unwrap();
+            assert_eq!(store.prune_lock_timeout(), timeout);
+        }
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage_store()
+                .unwrap()
+                .prune_lock_timeout(),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_lock_timeout_check_reads_the_session_limits() {
+        use crate::storage::{check_prune_lock_timeout, PruneLockTimeoutRisk};
+
+        let url = database_url();
+        ensure_database_exists(&url).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET deadlock_timeout = '200ms'")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("SET statement_timeout = '3s'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect with session limits");
+
+        assert!(check_prune_lock_timeout(&pool, Duration::from_millis(100))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            check_prune_lock_timeout(&pool, Duration::from_millis(300))
+                .await
+                .unwrap(),
+            vec![PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 }]
+        );
+        assert_eq!(
+            check_prune_lock_timeout(&pool, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            vec![
+                PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 },
+                PruneLockTimeoutRisk::StatementTimeout { limit_ms: 3000 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_range_prune_lock_timeout_is_rejected_at_build() {
+        for timeout in [Duration::ZERO, Duration::from_millis(i32::MAX as u64 + 1)] {
+            let result = Client::builder(lazy_pool())
+                .queue("q", QueueConfig::default())
+                .prune_lock_timeout(timeout)
+                .build();
+            assert!(
+                matches!(result, Err(BuildError::InvalidQueueStorage(ref message)) if message.contains("prune lock timeout")),
+                "{timeout:?}: {:?}",
+                result.err()
+            );
+        }
+
+        let at_maximum = Duration::from_millis(i32::MAX as u64);
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .prune_lock_timeout(at_maximum)
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage_store()
+                .unwrap()
+                .prune_lock_timeout(),
+            at_maximum
+        );
     }
 
     #[tokio::test]

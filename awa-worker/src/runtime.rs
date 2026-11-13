@@ -23,6 +23,9 @@ pub(crate) struct InFlightState {
     /// queue storage with one; lets the heartbeat address the claim batch
     /// directly.
     pub claim: Option<ClaimHeartbeatRef>,
+    /// The handler has returned and the attempt waits for its finalize. It is
+    /// still heartbeated, but its progress is settled by the finalize.
+    pub finalizing: bool,
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -163,7 +166,7 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    /// Every in-flight attempt with its compact claim identity, if any.
+    /// Every attempt to heartbeat, with its compact claim identity, if any.
     pub fn claim_refs(&self) -> Vec<(InFlightKey, Option<ClaimHeartbeatRef>)> {
         let mut refs = Vec::new();
         for shard in &*self.shards {
@@ -171,6 +174,18 @@ impl InFlightRegistry {
             refs.extend(guard.iter().map(|(key, state)| (*key, state.claim)));
         }
         refs
+    }
+
+    /// The handler has returned: keep heartbeating the attempt until its
+    /// finalize is done, and stop flushing its progress.
+    pub fn mark_finalizing(&self, key: InFlightKey) {
+        let mut guard = self
+            .shard_for(&key)
+            .write()
+            .expect("in_flight shard poisoned");
+        if let Some(state) = guard.get_mut(&key) {
+            state.finalizing = true;
+        }
     }
 
     pub fn flags(&self) -> Vec<CancelFlag> {
@@ -192,6 +207,9 @@ impl InFlightRegistry {
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
             for (&(job_id, run_lease), state) in guard.iter() {
+                if state.finalizing {
+                    continue;
+                }
                 let mut progress = state.progress.lock().expect("progress lock poisoned");
                 if progress.has_pending() && progress.in_flight.is_none() {
                     if let Some(ref value) = progress.latest {
@@ -278,6 +296,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: progress.clone(),
                 claim: None,
+                finalizing: false,
             },
         );
 

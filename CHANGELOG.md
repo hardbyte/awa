@@ -66,6 +66,21 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `dead_lettered` is refused** while a runtime older than 0.7.0-alpha.2 is
   live, because an older runner can't read them.
 
+### Forward-ported from 0.6.14
+
+- Everything [0.6.14](https://github.com/hardbyte/awa/releases/tag/v0.6.14) shipped that this branch did not already have; see its release notes for the details. Promotion runs each enqueue lane in its own transaction, hands a busy lane to a dedicated waiter, and wakes claimers after the lanes commit; `awa.maintenance.promote.lane_contention` counts the hand-offs. Rescue skips an attempt whose retained ready bodies are ambiguous instead of stopping rescue of every other attempt. Lifecycle events no longer re-read a completed job, and a failed re-read no longer fails a committed callback wait. Admin job lists and kind counts find their candidates in read phases that release partition locks between them, and probe receipt closures more cheaply; a job list still loads each candidate with a point read, which holds `ACCESS SHARE` on every ready, lease and claim partition for the length of that read. `awa migrate` rejects `--sql` combined with `--extract-to`. The persona soak suite (`awa/tests/persona_soak_test.rs`, `scripts/persona-soak.sh`) is added.
+
+### Forward-ported from 0.6.15
+
+- Everything [0.6.15](https://github.com/hardbyte/awa/releases/tag/v0.6.15) shipped that this branch did not already have; see its release notes for the details. Lifecycle hooks hold their attempt's finalizer slot until they return, so hooks slower than job throughput slow claiming instead of growing worker memory, and maintenance keeps at most 1,024 detached `Rescued` and duplicate `Cancelled` hook tasks per worker. By-job lookups of compact receipt claims use a GIN index on `lease_claim_batches.job_ids` that claim prune builds on each partition as it empties it (migration v054). Compatibility COPY inserts go through `awa.insert_jobs_compat_batch` (migration v055), which takes each queue lane's enqueue lock only when it writes that lane rather than at the batch's first ready row (the lock is still held until the transaction ends), and the new `insert_many_skip_unique_conflicts` inserts a batch through it while skipping claimed unique keys. Rescue reaches stale attempts behind a full batch of ambiguous ones, `Completed` events and follow-ups carry the completed job without the attempt's heartbeat and deadline, slot-scoped admin receipt reads stay off other slots' closure partitions, and unfiltered receipt job lists select candidate IDs before loading bodies. v054 and v055 add functions only and take no table locks; a database coming from 0.6.15 already has both functions from its schema patches. See [v054](docs/upgrade-0.6-to-0.7.md#v054-claim-batch-job-index) and [v055](docs/upgrade-0.6-to-0.7.md#v055-batch-compatibility-insert) in the upgrade guide.
+
+### Forward-ported from 0.6.16
+
+- Queue-storage rescue drains a large backlog of abandoned claims in bounded time. A killed runtime leaves every attempt it claimed open, and until they close, queue prune skips the queue slots they reference and claim prune skips their claim slots, so neither ring can wrap. A rescue pass takes 500-attempt batches, each in its own transaction, until a batch comes back short, `rescue_pass_budget` (default 1 s, at most half the rescue interval) is spent, or it has rescued `rescue_pass_max_rows` (default 5,000), and while a backlog remains the next pass runs a second later. `ClientBuilder::rescue_pass_budget` and `rescue_pass_max_rows` (Python `rescue_pass_budget_ms` and `rescue_pass_max_rows`) set both; zero for either keeps one batch per interval. Deadline and callback rescue act on their expired deadlines; stale-heartbeat rescue takes more than one batch per pass only once runtime snapshots show the claims' owners gone. Rescue's cursor scans seek to their cursor through the index, including the compact deadline-batch scan that 0.6 does not have, and rescue transactions run without JIT. `awa.maintenance.rescue.pass_size` (by `awa.rescue.kind` and `awa.rescue.pass_end`) and `awa.maintenance.rescue.oldest_attempt_age` show a drain in progress. Heartbeats no longer queue behind a completion: an attempt whose closer holds its lock is skipped, lease and progress writes skip rows a finalizer has locked and retry them on the next pass, and a finished attempt stops flushing progress once its handler returns. A point read of a failed job that starts while queue prune moves its row out of the slot being pruned is covered by a test; on this branch the read already locks the ring before it takes its snapshot. See [draining a backlog of abandoned claims](docs/configuration.md#rescue-backlog).
+- Claim prune no longer treats a partial GIN index on `lease_claim_batches.job_ids` as the claim batch index (migration v056). It recognises only a valid, non-partial GIN index on `job_ids` alone. When another index or relation already has the index's name, `ensure_claim_batch_job_index` leaves it in place, returns false and raises a warning naming it, instead of reporting the slot indexed; the slot keeps scanning until an operator drops or renames it. Refreshing the function as a migration role that owns it but may only `SET ROLE` to the table owner (PostgreSQL 16+ membership `WITH INHERIT FALSE`) no longer leaves `EXECUTE` with `PUBLIC`: the refresh resets `EXECUTE` after it hands the function to the table owner, acting as the new owner when it cannot as itself. Migrations run with the owner as the effective role, as documented, were not affected. v056 replaces functions only and takes no table locks. See [v056](docs/upgrade-0.6-to-0.7.md#v056-claim-batch-index-recognition).
+- Creating a new queue lane through `QueueStorage` (its batch enqueues, and workers promoting scheduled or retried jobs) no longer deadlocks with a concurrent `insert`, `insert_many` or `insert_many_copy` that is also the first to use the same `(queue, priority)` (#692). `QueueStorage` took the lane's provisioning lock before writing its `queue_lanes` row, while SQL inserts write the row first and take the lock in the head-table trigger that creates the lane's sequences, so each transaction waited on the other and one failed with `40P01`. `QueueStorage` now writes the row first too, and so does the `provision_lane` function it calls (migration v058, [v058](docs/upgrade-0.6-to-0.7.md#v058-lane-row-before-lane-lock)). Lanes that already existed were never affected. `QueueStorage` processes on 0.6.15 or earlier, or on an earlier 0.7 build, keep the old order until they are upgraded.
+- `insert_many_copy` and `insert_many_skip_unique_conflicts` no longer deadlock with per-row producers (generic `insert_many`, single-job inserts, binaries before v055) that share their unique keys or lanes (migration v057). With the v055 function, when a per-row transaction held a lane and then inserted a key a waiting batch had claimed, PostgreSQL aborted one of the two with `deadlock detected` (`40P01`). The batch function now waits at most 500 ms (or half of its session's `deadlock_timeout`, if lower) while it holds claims or lanes: on a longer wait it releases them and tries again, so the per-row transaction proceeds and the batch then treats the keys it committed as already claimed. The same applies to a transaction that enqueues lanes in separate statements in the opposite order to a batch. This covers per-row sessions whose `deadlock_timeout` is above 500 ms, as PostgreSQL's default of 1 s is, and batches whose unique claims insert within that budget (10,000 to 20,000 keys on a fast server, fewer on a slow or busy one); larger batches behave as before. The protection lasts for 2 s of retries; then the batch makes one last attempt with ordinary lock waits. A per-row transaction that holds a lane for longer than that before it inserts one of the batch's keys can therefore still deadlock with it. A cycle through a lock the batch's own transaction took in an earlier statement also ends in `deadlock detected`, after about 3 to 4 s instead of 1 to 2 s, and usually aborts the batch's transaction. The caller's `lock_timeout` applies to each lock wait, as before. Results and the lane lock window are unchanged. v057 is one function replacement with no table locks, and producers that already call the function get the fix as soon as it commits. See [v057](docs/upgrade-0.6-to-0.7.md#v057-batch-inserts-give-way-to-per-row-producers).
+
 ### Added
 
 - **One job filter ([ADR-049](docs/adr/049-job-filter-and-indexed-tags.md),
@@ -84,6 +99,29 @@ Notable changes between releases. Detailed migration notes for storage transitio
   finding jobs by tag an indexed lookup in every state, including
   dead-lettered. Postgres maintains it for every binary; untagged jobs add
   nothing to it.
+- **Per-queue worker utilization metrics (#733).** Every runtime samples `awa.queue.worker.in_use` (worker slots held by a running handler or one waiting for finalizer capacity) and `awa.queue.worker.capacity` (`max_workers`, or in weighted mode `min_workers` plus the overflow pool) for each queue on each runtime snapshot, so a dashboard can plot utilization as in-use ÷ capacity. Waits grow steeply once utilization stays above about 0.8; see [sizing workers from utilization](docs/configuration.md#sizing-workers-from-utilization). The overview Grafana dashboard has a **Worker utilization by queue** panel.
+- **The queue-storage prune `lock_timeout` is configurable, and prune
+  attempts are counted by outcome for every ring.** Prune (queue, lease and
+  claim rings) and terminal-delta rollup take their exclusive locks under a
+  10 ms `lock_timeout` that could only be changed through the hidden
+  `QueueStorage::with_prune_lock_timeout`. When short readers of the ring
+  partitions held a conflicting lock at that instant, prune reported
+  `blocked` every tick and the rings stopped recycling. Set it with
+  `ClientBuilder::prune_lock_timeout` (Rust) or
+  `queue_storage_prune_lock_timeout_ms` on `client.start()` (Python); the
+  timeout applies separately to each lock acquisition, not to the whole prune;
+  queue prune takes its other initial partition locks with `NOWAIT`. Later
+  statements also run under the timeout. The
+  default stays 10 ms and zero or a value above PostgreSQL's `lock_timeout`
+  maximum is rejected. Start logs a warning when the value is at or above the
+  connection's `deadlock_timeout` (prune waiting that long can make deadlock
+  detection cancel a claim instead) or `statement_timeout`. `with_prune_lock_timeout` is now
+  public, with `set_prune_lock_timeout` and `prune_lock_timeout()`.
+  `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
+  gains `backed_off` (prune skipped by the post-`skipped_active` backoff) and
+  `error` (prune failed with a database error) alongside the existing
+  `pruned`, `noop`, `blocked`, `skipped_active` and `already_pruned`. See
+  [Configuration](docs/configuration.md#what-the-knobs-mean).
 
 ### Changed
 
@@ -94,6 +132,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `($n IS NULL OR …)` and degraded to minutes once Postgres switched it to a
   generic plan; at 50,000 retained jobs a rare-tag lookup now takes tens of
   milliseconds instead of more than two minutes.
+- **Automatic retries spread wider (#733, migration v059).** `awa.backoff_duration` drew the delay before a retry from `2^attempt` seconds plus 0 to 25%, so jobs that failed together retried close together and hit a recovering dependency at once. The delay is now `2^attempt` seconds times a random factor in [0.5, 1.5), capped at 24 hours as before: the mean is the base delay (previously 12.5% above it), the shortest possible delay halves, and in a simulation of 10,000 jobs failing together the peak retry rate for each attempt falls by about 3.5×. v059 is one function replacement with no table locks, and binaries before it use the new delays as soon as it commits. See [v059](docs/upgrade-0.6-to-0.7.md#v059-wider-retry-jitter).
 
 ### Fixed
 
@@ -118,7 +157,137 @@ Notable changes between releases. Detailed migration notes for storage transitio
   batch operation needs a preview of the form's current filter and a
   confirmation stating its scope and count, and the jobs page offers the
   batch link only for a search that narrows the population.
+- **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.
+- **A queue lane is usable by every runtime role, whichever role creates it
+  first (migration v053).** A lane's enqueue and claim sequences belonged to
+  the role that first enqueued into, claimed from or promoted into it, so with
+  several runtime roles sharing a group role, any role other than the creator
+  whose default privileges did not cover it failed with `permission denied for
+  sequence`. That included the maintenance leader promoting into a shard
+  created after `enqueue_shards` was raised. Lanes are now created through two
+  `SECURITY DEFINER` functions per queue-storage schema, `provision_lane` and
+  `provision_lane_sequences`, owned by the schema owner. Each new sequence gets
+  the privileges of the head table it backs, explicitly rather than through
+  default privileges. A runtime without schema `CREATE` can therefore create
+  lanes itself, and `awa storage prepare-queue` is optional and may run as any
+  runtime role. After v053 commits, `awa migrate` gives existing lane
+  sequences to the schema owner and adds their missing grants, one sequence per
+  transaction with a 300 ms lock wait, and only where it is allowed to, trying
+  the effective role and then the login role. A sequence an open transaction
+  holds is skipped and reported as busy; one it may not change is reported
+  with the roles that can repair it. Neither fails the migration. The new
+  read-only `awa storage lane-sequences` (or
+  `awa.lane_sequence_problems(schema)`) lists what remains, with the statements
+  to run and the roles to run them as, and exits 2 while any remain;
+  `--repair` (or `awa.repair_lane_sequence(schema, sequence)` per sequence)
+  repairs what the connected role may. `awa migrate` prints a summary of the leftovers. A binary
+  running ahead of v053 detects that `provision_lane` is missing and creates
+  lanes as before, and older binaries create correctly owned lanes once v053
+  has refreshed the helpers they call. See "Lane ownership and v053" in the
+  0.6 to 0.7 upgrade guide.
 
+- Retry queue-storage worker finalization after transient lock contention within
+  its 120-second running-work budget, preserving the saved handler outcome.
+  Waiting for an accepted completion batch pauses that budget; admission,
+  direct writes, post-acknowledgement reads and retries use the remaining time.
+  Keep attempt heartbeats active until finalization settles while releasing
+  handler capacity. Runtime shutdown retains its existing drain limit. Direct
+  store APIs still return contention errors for caller retries.
+
+- Schema-only admin clients use installed ready-slot numbers for point reads, cancellation and retained-body recovery, including rings larger than the default.
+- Keep committed claims out of physical priority aging before its batch limit,
+  even before their cursor advances. Active point and callback reads recover
+  retained tombstoned bodies left by older aging. Recovery, cancellation and
+  completion by ID hydrate those bodies and retire unclaimed copies of the same
+  attempt, preserving original-priority metadata and rejecting ambiguous
+  historical bodies. Emitted-lane evidence takes precedence over colliding live
+  replacements, and their recovered terminal bodies remain self-contained
+  through retry. Cancellation prefers an active attempt over its historical
+  available replacement. Historical receipt evidence remains usable after
+  reopening a custom store in legacy mode. Without that evidence, legacy or
+  backfilled claims retain a compatibility fallback that cannot reliably
+  identify the original physical lane in this historical collision.
+  Repair runs only when a transition hydrates a retained tombstoned body;
+  worker completion using its carried job body can leave an old replacement
+  claimable. Updated aging callers prevent new replacements, but cannot fence
+  an older process explicitly calling physical aging during a rolling upgrade.
+  Repair takes claim-head row locks without waiting. Rescue batches defer
+  busy historical attempts while progressing other attempts; receipt rescue
+  cursors keep deferred attempts eligible. Worker completion batches isolate
+  lock contention to the affected requests. Direct store completion and
+  single-attempt store mutations still fail on contention and must retry. It adds
+  weak relation locks and tombstone writes only on this recovery path. Fresh rechecks rely on READ
+  COMMITTED isolation.
+
+- Preserve recovered bodies and physical lane priority when manually moving
+  historical aged terminal failures to the DLQ, so later DLQ retry retains
+  arguments, attempt limits and priority provenance. Terminal counters are
+  decremented at their original stored priority; automatic rescue-to-DLQ
+  policy keeps the effective priority.
+
+- Recover retained terminal bodies from the exact prior attempt when older
+  workers stored an aged effective priority in a narrow terminal key. Live
+  moved-lane metadata supplies defaults without replacing stored terminal
+  metadata, errors, tags or progress. Manual terminal retry restarts aging from
+  the physical lane; counter removal keeps the stored terminal key and failed
+  carry derives replacement counters from its inserted rows. The installed
+  `terminal_jobs` SQL view is unchanged for older mismatched-priority rows;
+  bodies whose ready backing was already pruned cannot be reconstructed.
+- Exclude tombstoned source lanes and require the prior run lease when
+  hydrating rescued attempts, retaining physical priority only for terminal
+  identity. Deferred retry and DLQ policy keep effective priority. The lookup
+  reads only validated referenced tombstone children; this adds read locks.
+
+- Preserve the original job body when manually retrying a priority-aged attempt
+  that exhausted its retries during rescue. Retained failed reads and failed-row
+  carry through pruning now use the physical ready-lane identity.
+
+- Close read connections if their transaction start is cancelled or fails before
+  SQLx acknowledges it, so later reads cannot inherit an untracked transaction.
+
+- **Point reads show the live queue and priority after a lane move.** Retained
+  ready rows from before a priority or queue change could win a read's tie
+  after the ring wrapped, returning the old fields even though the batch
+  operation succeeded. Point reads now exclude tombstoned source rows.
+
+- **Callback completion, `get_job` and lifecycle events find running jobs
+  that priority aging promoted** (the Rust side of
+  [#569](https://github.com/hardbyte/awa/issues/569)). Claims and leases
+  record a job's aged effective priority while its ready row keeps the lane
+  priority, and the job and admin reads joined them on priority. With aging on (the
+  default, every 60 s), a job that waited past a minute before it was claimed
+  could not be completed by callback with an expected kind, failed the
+  mixed-transition callback routing check, and read back from `get_job` in
+  the wrong state. Admin job lists, kind counts and cancellation by unique
+  key also missed those running jobs. They now match the attempt (`job_id` and `run_lease`),
+  skipping the tombstoned source row a lane move leaves behind.
+- **`get_job` no longer misses a job that moves while it reads.** It read
+  ready, deferred, leased, claimed, completed and DLQ rows in separate
+  statements, so a job promoted, claimed or completed between two of them
+  could read as missing; the weekly mixed-version rehearsal hit this on
+  2026-11-01. It now reads all of them from one read-only snapshot, after
+  locking the ready, lease and claim rings so prune cannot truncate a partition the
+  snapshot still needs.
+- **Ring prune and terminal-count rollup report `Blocked` when any of their
+  statements times out on a lock.** Prune sets a short `lock_timeout` (10 ms
+  by default) before it takes `ACCESS EXCLUSIVE` on a slot's partitions, but
+  only those `LOCK TABLE` statements and the final `TRUNCATE` turned a
+  timeout into `PruneOutcome::Blocked`. The timeout covers every later
+  statement in the transaction too: the post-lock liveness checks read the
+  lease and claim partitions, the failed-row carry inserts into the current
+  slot's `done_entries` and terminal-count deltas, and the fold appends
+  `queue_terminal_rollup_deltas` and deletes `queue_terminal_live_counts`
+  rows. When one of those waited out the timeout, for example behind
+  autovacuum truncating a relation or a hosted Postgres's own background
+  workers, prune failed with a `lock_not_available` (`55P03`) database error,
+  was logged as an error and skipped the prune backoff. A lock timeout in any
+  statement after a queue, lease or claim prune, or a terminal-count rollup
+  slot, sets its `lock_timeout` now rolls the whole transaction back and
+  reports `Blocked`
+  (`blocked_slots` for rollup), so maintenance backs off and retries; nothing
+  the attempt wrote survives the rollback. A rollup pass stops at its first
+  blocked slot rather than waiting out the timeout again on each remaining
+  one.
 - **Batch enqueues take their lane locks in one order, so they no longer
   deadlock with each other.** On queue storage every enqueue holds a
   transaction-scoped advisory lock on its `(queue, priority, shard)` lane
