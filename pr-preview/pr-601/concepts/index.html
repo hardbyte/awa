@@ -16,7 +16,7 @@
         <link rel="prev" href="../start/cli/">
       
       
-        <link rel="next" href="job-lifecycle/">
+        <link rel="next" href="lanes-and-claiming/">
       
       
         
@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -689,6 +688,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -744,6 +753,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2121,10 +2270,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-execution-loop" class="md-nav__link">
+  <a href="#the-path-of-one-job" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The execution loop
+        The path of one job
       
     </span>
   </a>
@@ -2132,10 +2281,43 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#storage-and-runtime-are-separate-responsibilities" class="md-nav__link">
+  <a href="#three-rings" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Storage and runtime are separate responsibilities
+        Three rings
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#one-maintenance-leader" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One maintenance leader
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#read-next" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Read next
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#crates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Crates
       
     </span>
   </a>
@@ -2171,30 +2353,100 @@
 
 
 <h1 id="how-awa-works">How AWA works<a class="headerlink" href="#how-awa-works" title="Permanent link">&para;</a></h1>
-<p>AWA is a library and schema, not a separate broker service. Producers, workers, and operational tools coordinate through PostgreSQL.</p>
+<p>AWA is a library and a PostgreSQL schema, not a separate broker. Producers, workers and operator tools all coordinate through the database, so a job is as durable as the transaction that wrote it.</p>
 <div class="awa-diagram">
-<p><img alt="AWA producers, PostgreSQL storage, workers, and operator tools" src="../assets/architecture-flow.svg" /></p>
+<p><img alt="The path of one AWA job: enqueue into a ready lane, claim with a receipt, finish into terminal history, with a maintenance leader promoting, rescuing and reclaiming" src="../assets/how-it-works/job-path.svg" /></p>
 </div>
-<h2 id="the-execution-loop">The execution loop<a class="headerlink" href="#the-execution-loop" title="Permanent link">&para;</a></h2>
+<h2 id="the-path-of-one-job">The path of one job<a class="headerlink" href="#the-path-of-one-job" title="Permanent link">&para;</a></h2>
 <ol>
-<li>A producer serializes typed arguments and inserts a job, optionally inside an application transaction.</li>
-<li>A worker asks PostgreSQL for runnable work in a configured queue.</li>
-<li>A claim records the attempt and establishes an ownership token. Other workers skip the claimed row.</li>
-<li>The worker heartbeats while the handler runs.</li>
-<li>Completion is accepted only while the worker still owns the claim. A retry, snooze, callback wait, failure, or completion becomes durable state.</li>
-<li>If heartbeats stop, another worker can rescue the expired claim and run the job again.</li>
+<li><strong>Enqueue.</strong> A producer inserts the job, usually in the same transaction as the business write that caused it. A job that is due now is appended to a ready <a href="lanes-and-claiming/">lane</a>; one that is due later waits in deferred jobs.</li>
+<li><strong>Claim.</strong> A worker takes the next job from the head of a lane and records a <a href="claims-receipts-and-leases/">claim receipt</a>. The claim increments the job's <code>run_lease</code>, the number that identifies this attempt.</li>
+<li><strong>Run.</strong> The handler runs while the worker heartbeats the attempt. If the handler registers an external callback, the attempt also gets a lease row that holds the callback state.</li>
+<li><strong>Finish.</strong> Completion, failure, cancellation, retry or snooze is written only if the attempt's <code>run_lease</code> is still current. A retry or snooze goes back to deferred jobs.</li>
+<li><strong>Reclaim.</strong> The rows a job left behind sit in ring partitions. Once every job in an old slot has been claimed or cancelled and every attempt claimed from it has ended, the maintenance leader <a href="rings/">truncates the whole slot</a> instead of deleting rows one at a time.</li>
 </ol>
-<p>This produces an <strong>at-least-once</strong> contract. The ownership guard prevents a stale worker from overwriting a newer attempt, but it cannot make an external side effect exactly once.</p>
-<h2 id="storage-and-runtime-are-separate-responsibilities">Storage and runtime are separate responsibilities<a class="headerlink" href="#storage-and-runtime-are-separate-responsibilities" title="Permanent link">&para;</a></h2>
+<p>If a worker stops heartbeating, the maintenance leader rescues its attempts. Each job runs again if it has attempts left, and otherwise fails or moves to the dead-letter queue. That makes delivery <strong>at least once</strong>: <code>run_lease</code> stops a stale worker from overwriting a newer attempt, but it cannot undo a side effect the stale worker already caused. Handlers that call external systems need an idempotency key; see the <a href="failure-lab/">failure lab</a>.</p>
+<h2 id="three-rings">Three rings<a class="headerlink" href="#three-rings" title="Permanent link">&para;</a></h2>
+<p>Hot storage is split into three rings of partitions, each rotated and pruned independently:</p>
+<table>
+<thead>
+<tr>
+<th>Ring</th>
+<th>Holds</th>
+<th style="text-align: right;">Default slots</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue</td>
+<td>ready jobs and the terminal history of jobs claimed from them</td>
+<td style="text-align: right;">16</td>
+</tr>
+<tr>
+<td>Claim</td>
+<td>claim receipts and the evidence that each attempt ended</td>
+<td style="text-align: right;">8</td>
+</tr>
+<tr>
+<td>Lease</td>
+<td>leases for attempts that register an external callback, or for every claim when <code>lease_claim_receipts</code> is off</td>
+<td style="text-align: right;">8</td>
+</tr>
+</tbody>
+</table>
+<p>Deferred jobs, the dead-letter queue and the small control tables (lane cursors, ring cursors, runtime snapshots) are ordinary tables outside the rings.</p>
+<h2 id="one-maintenance-leader">One maintenance leader<a class="headerlink" href="#one-maintenance-leader" title="Permanent link">&para;</a></h2>
+<p>Every worker process dispatches and heartbeats its own attempts. One of them also holds a PostgreSQL advisory lock that makes it the maintenance leader. The leader promotes deferred jobs that are due, rescues abandoned attempts, rotates and prunes the rings, runs cron schedules and publishes queue health. If its connection drops, PostgreSQL releases the lock and another worker takes over from the state in the database.</p>
+<h2 id="read-next">Read next<a class="headerlink" href="#read-next" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>What it explains</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="lanes-and-claiming/">Lanes and claiming</a></td>
+<td>How jobs are ordered, how a producer's commit makes them visible, and how workers pick the next one</td>
+</tr>
+<tr>
+<td><a href="claims-receipts-and-leases/">Claims, receipts and leases</a></td>
+<td>What a claim writes, how heartbeats and rescue work, and how <code>run_lease</code> fences out stale workers</td>
+</tr>
+<tr>
+<td><a href="rings/">Rings: rotation and prune</a></td>
+<td>How storage is reclaimed without vacuuming hot tables, and what stops a ring from moving</td>
+</tr>
+<tr>
+<td><a href="batching/">Batching</a></td>
+<td>Where AWA handles jobs in groups to cut round trips and commits, and the settings for each</td>
+</tr>
+<tr>
+<td><a href="scaling-a-hot-queue/">Scaling a hot queue</a></td>
+<td>Shards, partitions, stripes and claimers: what each splits and what ordering it gives up</td>
+</tr>
+<tr>
+<td><a href="job-lifecycle/">Job lifecycle</a></td>
+<td>Every state a job can be in and how handlers move it between them</td>
+</tr>
+<tr>
+<td><a href="transactional-enqueue/">Transactional enqueue</a></td>
+<td>Committing a job with the business write that caused it</td>
+</tr>
+<tr>
+<td><a href="../architecture/">Architecture</a></td>
+<td>The reference description of every table, invariant and maintenance path</td>
+</tr>
+</tbody>
+</table>
+<h2 id="crates">Crates<a class="headerlink" href="#crates" title="Permanent link">&para;</a></h2>
 <ul>
-<li><code>awa-model</code> owns the schema, migrations, typed records, enqueue operations, and admin queries.</li>
-<li><code>awa-worker</code> owns claiming, execution, heartbeats, retry scheduling, and graceful shutdown.</li>
-<li><code>awa</code> is the Rust facade that joins those pieces.</li>
-<li><code>awa-pg</code> exposes the same model and worker runtime to Python.</li>
-<li><code>awa-cli</code> and the web UI provide migrations and operational inspection.</li>
+<li><code>awa-model</code> owns the schema, migrations, typed records, enqueue operations and admin queries.</li>
+<li><code>awa-worker</code> owns claiming, execution, heartbeats, retries, maintenance and graceful shutdown.</li>
+<li><code>awa</code> is the Rust facade that joins them; <code>awa-pg</code> exposes the same model and worker runtime to Python.</li>
+<li><code>awa-cli</code> and the web UI provide migrations and operator tools.</li>
 </ul>
-<p>See the detailed <a href="../architecture/">architecture</a> and <a href="../queue-storage-substrate/">queue storage substrate</a> when you need implementation-level invariants.</p>
-<p>Explore these boundaries in the <a href="failure-lab/">interactive failure lab</a>: stop a worker after it sends a receipt, recover the job, and compare receipts with and without a provider idempotency key.</p>
 
 
 
@@ -2250,13 +2502,13 @@
         
         
           
-          <a href="job-lifecycle/" class="md-footer__link md-footer__link--next" aria-label="Next: Job lifecycle">
+          <a href="lanes-and-claiming/" class="md-footer__link md-footer__link--next" aria-label="Next: Lanes and claiming">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                Job lifecycle
+                Lanes and claiming
               </div>
             </div>
             <div class="md-footer__button md-icon">
