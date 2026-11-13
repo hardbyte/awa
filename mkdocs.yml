@@ -136,6 +136,7 @@ nav:
           - Upgrade 0.5 to 0.6: upgrade-0.5-to-0.6.md
           - Upgrade 0.6 to 0.7: upgrade-0.6-to-0.7.md
       - Observability: grafana/README.md
+      - Admin dashboard observation: admin-observation.md
       - Troubleshooting: troubleshooting.md
   - Security:
       - Security overview: security.md

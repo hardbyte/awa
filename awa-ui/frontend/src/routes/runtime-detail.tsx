@@ -1,8 +1,7 @@
-import { useQuery } from "@tanstack/react-query";
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { fetchRuntime } from "@/lib/api";
 import type { RuntimeInstance, RuntimeOverview } from "@/lib/api";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 import { Copyable } from "@/components/CopyButton";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
@@ -54,17 +53,15 @@ function attentionItems(instance: RuntimeInstance): string[] {
 
 export function RuntimeInstancePage() {
   const { instanceId } = useParams({ strict: false });
-  const poll = usePollInterval();
-  const runtimeQuery = useQuery<RuntimeOverview>({
+  const runtimeQuery = useManagedQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   if (runtimeQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading runtime instance…</p>;
   }
-  if (runtimeQuery.error) {
+  if (runtimeQuery.error && runtimeQuery.data === undefined) {
     return <p className="text-sm text-danger">Error: {String(runtimeQuery.error)}</p>;
   }
 

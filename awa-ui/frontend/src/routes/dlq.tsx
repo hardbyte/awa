@@ -1,5 +1,5 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -29,7 +29,7 @@ import {
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
-import { usePollInterval } from "@/hooks/use-poll-interval";
+import { listMatchesFilter, nextPageAnchor } from "@/lib/query";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
 /// negatives, zero, and floats. Returns `undefined` on invalid input so
@@ -59,7 +59,6 @@ export function DlqPage() {
   const filters = useDlqFilters();
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
-  const poll = usePollInterval();
 
   const searchFilters = parseSearch(filters.search);
   // A term that doesn't parse is left out of a request, so it would widen
@@ -78,19 +77,15 @@ export function DlqPage() {
     limit: filters.limit,
   };
 
-  const dlqQuery = useQuery<DlqRow[]>({
+  const dlqQuery = useManagedQuery<DlqRow[]>({
     queryKey: ["dlq", params],
     queryFn: () => fetchDlq(params),
     enabled: !searchError,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
-  const depthQuery = useQuery({
+  const depthQuery = useManagedQuery({
     queryKey: ["dlq-depth"],
     queryFn: fetchDlqDepth,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
   const retryFilterMutation = useMutation({
@@ -136,8 +131,10 @@ export function DlqPage() {
   // As on the jobs page: cached rows for the wider search stay hidden.
   const rows = searchError ? [] : dlqQuery.data ?? [];
   const hasActiveFilter = Object.keys(searchFilters).length > 0;
-  // Bulk actions are judged from the list beside them, so they wait for one.
-  const listUnavailable = dlqQuery.isPending || dlqQuery.isError;
+  // Bulk actions are judged from the list beside them, so they wait for this
+  // filter's rows; the previous filter's placeholder rows don't count.
+  const listUnavailable = !listMatchesFilter(dlqQuery);
+  const nextAnchor = nextPageAnchor(rows, filters.limit, dlqQuery);
 
   const setUrlParams = useCallback(
     (updates: Record<string, string | undefined>) => {
@@ -164,6 +161,7 @@ export function DlqPage() {
 
   return (
     <div className="space-y-4 p-4">
+      {dlqQuery.isPlaceholderData && <p role="status">Previous filter results are shown while the new read finishes.</p>}
       <div className="flex items-center justify-between">
         <Heading>Dead Letter Queue</Heading>
         {depthQuery.data && (
@@ -274,8 +272,9 @@ export function DlqPage() {
           <Button
             intent="outline"
             size="xs"
+            isDisabled={!nextAnchor}
             onPress={() => {
-              const last = rows[rows.length - 1];
+              const last = nextAnchor;
               if (last) {
                 // Emit the full (dlq_at, id) cursor so pagination matches
                 // the backend sort order even when older failed rows are
