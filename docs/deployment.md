@@ -43,7 +43,7 @@ Current Rust and Python worker starts default to the correct effective engine fo
 
 Practical starting point, based on the current runtime internals:
 
-- each active queue claimer keeps one `LISTEN` connection open for wakeups (`sum(queue.claimers)`, which equals `queue_count` with default claimers)
+- one `LISTEN` connection carries enqueue wakeups for every queue in the process
 - one cancel listener keeps a `LISTEN` connection open for admin-cancel notifications
 - the elected leader holds one advisory-lock connection while it remains leader
 - claim, heartbeat, completion, cleanup, and handler SQL all share the same pool
@@ -69,6 +69,26 @@ Examples:
 - combined API + worker process: either use separate pools or size for both workloads explicitly
 
 The Python client defaults to `max_connections=10`. `awa serve` defaults to a pool of `10` connections (configurable via `--pool-max` / `AWA_POOL_MAX`). Other CLI subcommands use a single connection.
+
+### Idle connections and Postgres memory
+
+Each pooled connection is a Postgres backend with its own relation, plan and function caches, and those caches only grow while the backend lives. Queue storage has several hundred partitions and indexes, and the claim path runs per-slot functions, so a backend that has run claims, completions and maintenance holds tens of MB of backend-local memory. Postgres memory for an Awa process is roughly the number of open backends times that size.
+
+The pool keeps every connection it opened at the busiest moment. sqlx hands out idle connections oldest first, so even an idle runtime, which acquires a connection several times a second for polling and maintenance, touches every pooled connection within seconds. As a result `idle_timeout` never closes any of them, and each one ends up having run every statement Awa issues.
+
+To return memory after busy periods, set `max_lifetime` on the pool. A connection past its lifetime is closed when it is next released, and the pool only opens a replacement when concurrent demand needs one, so an idle process shrinks to the few connections it actually uses:
+
+```rust
+let pool = PgPoolOptions::new()
+    .max_connections(20)
+    .max_lifetime(Duration::from_secs(300))
+    .connect(&database_url)
+    .await?;
+```
+
+sqlx's default lifetime is 30 minutes. Shorter lifetimes reconnect more often; at a few minutes the reconnect cost is negligible next to the memory returned.
+
+Do not disable the statement cache with `PgConnectOptions::statement_cache_capacity(0)` to save memory. In sqlx 0.9 every query then leaves a named prepared statement on the server that is never closed, and backend memory grows without bound.
 
 ## Primary Database Hygiene
 
