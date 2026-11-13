@@ -432,8 +432,9 @@ for each step.
   runtime role keeps working; only the migration is refused. Before upgrading,
   remove `TRIGGER` from runtime-role grants, which `GRANT ALL ON ALL TABLES`
   includes, remove runtime roles' `CREATE` on the schema, and remove triggers
-  of your own from awa tables. Revoking a running 0.6 fleet's `CREATE` needs
-  the order in the upgrade guide.
+  of your own from awa tables. A running 0.6 fleet keeps running if
+  `awa migrate` from a 0.6.x CLI, 0.6.14 or later, has applied its lane schema patches
+  before the `CREATE` revoke; see the upgrade guide.
 - **External migration runners.** Generate the pending SQL with an upgraded
   binary, for example `awa migrate --pending --extract-to ./pending`, apply
   complete bundles, and keep the files already applied unchanged. Apply
