@@ -96,7 +96,8 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
         ))
         .fetch_one(&owner_pool)
         .await?;
-        assert_eq!(lane_count, 16);
+        // The unstriped queue and two stripes, four priorities, two shards.
+        assert_eq!(lane_count, 24);
         assert!(store
             .prepare_queue(&owner_pool, "invalid", 0)
             .await
