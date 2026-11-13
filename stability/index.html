@@ -1062,6 +1062,8 @@
       
         
       
+        
+      
     
     
     
@@ -1187,6 +1189,34 @@
     
   
     Job output
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../finding-jobs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Finding jobs
   
 
     
@@ -2158,6 +2188,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#job-filters-adr-049" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Job filters (ADR-049)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#periodic-ownership-v045" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2479,6 +2520,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#job-filters-adr-049" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Job filters (ADR-049)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#periodic-ownership-v045" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2677,6 +2729,32 @@ artifacts</strong> (<a href="https://github.com/hardbyte/awa/issues/367">#367</a
 <p>Every stable release's changelog lists breaking changes against this document's surface list.
 If a change breaks something <em>not</em> listed here, it is not a breaking change — but if that
 surprises users repeatedly, the fix is to amend this document, not to argue.</p>
+<h3 id="job-filters-adr-049">Job filters (ADR-049)<a class="headerlink" href="#job-filters-adr-049" title="Permanent link">&para;</a></h3>
+<p><code>JobFilter</code>'s JSON keeps ADR-030's keys. What holds across versions, and what
+checks it:</p>
+<ul>
+<li><strong>0.6 readers fail closed on extended filters.</strong> Several tags or states
+  travel as a list under <code>tag</code> or <code>state</code>, which 0.6's <code>BatchOperationFilter</code>
+  (<code>tag: Option&lt;String&gt;</code>, <code>state: Option&lt;JobState&gt;</code>) rejects. A unit test in
+  <code>awa-model/src/filter.rs</code> reads the new shape with a copy of that type.
+  DLQ retry and purge by the full filter use <code>/api/dlq/retry-matching</code> and
+  <code>/purge-matching</code>, which a 0.6 server answers with 405 (<code>/dlq/{id}</code> takes
+  only GET and DELETE there); a released v0.6.9 server was checked by hand,
+  not by CI. The 0.6 paths accept only the 0.6 body, so no body means more
+  on an older server than on this one (<code>admin_api_test</code>,
+  <code>test_dlq_bulk_bodies_never_mean_more_on_an_older_server</code>). No rehearsal
+  runs a released 0.6 runner against list-valued filters.</li>
+<li><strong>Extended batch filters wait for the fleet.</strong> A batch operation with
+  several tags or states, or <code>dead_lettered</code>, is refused while any live
+  runtime reports a version older than 0.7.0-alpha.2
+  (<code>extended_filters_wait_for_the_fleet</code> in <code>awa/tests/job_filter_test.rs</code>,
+  using a recorded runtime row rather than a running 0.6 binary).</li>
+<li><strong>Stored ADR-030 filters still load.</strong> Rows a 0.6 <code>BatchOperationFilter</code>
+  wrote, including explicit nulls, deserialize as <code>JobFilter</code>.</li>
+<li><strong>Tag indexes are invisible to older binaries.</strong> They are partial GIN
+  indexes Postgres maintains on every write; no binary reads or writes them
+  directly, and no migration adds them.</li>
+</ul>
 <h3 id="periodic-ownership-v045">Periodic ownership (v045)<a class="headerlink" href="#periodic-ownership-v045" title="Permanent link">&para;</a></h3>
 <p>The opt-in owner protocol leaves unowned additive registration unchanged. Its
 mixed-version guarantee covers the released 0.6.7 automatic cron enqueue and

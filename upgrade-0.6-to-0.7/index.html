@@ -1062,6 +1062,8 @@
       
         
       
+        
+      
     
     
     
@@ -1187,6 +1189,34 @@
     
   
     Job output
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../finding-jobs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Finding jobs
   
 
     
@@ -1828,6 +1858,17 @@
     <span class="md-ellipsis">
       
         v060: correlated claim tombstone checks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tag-indexes-adr-049" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tag indexes (ADR-049)
       
     </span>
   </a>
@@ -2864,6 +2905,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#tag-indexes-adr-049" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tag indexes (ADR-049)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3347,6 +3399,31 @@ workers report not ready until the migration runs, as for any version bump.</p>
 <p>A claim checks each candidate row against <code>ready_tombstones</code>, which records rows that were cancelled, retried or moved before they were claimed. For a small batch PostgreSQL could plan that <code>EXISTS</code> check as a hashed subplan that reads the slot's whole tombstone partition on every claim, although the lookup index exists, so the cost of each claim grew with churn in the slot. The check now carries <code>OFFSET 0</code>, which keeps it correlated: one index probe per candidate row.</p>
 <p>v060 rewrites <code>&lt;schema&gt;.claim_ready_runtime</code> and each <code>&lt;schema&gt;.claim_ready_slot_&lt;n&gt;</code> in the default and every discovered custom queue-storage schema from their own definitions, so signatures, owners, privileges and settings are unchanged. A function that already carries the check is left alone, so a replay, a fresh install and a database coming from 0.6.17 (whose <code>correlated_claim_tombstones</code> schema patch made the same change) are no-ops. It reinstalls no table or trigger and takes no lock on any <code>awa</code> or queue-storage table; a claim in flight finishes on the old body.</p>
 <p>Binaries before v060 call the same functions with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete <code>awa migrate --sql --from 59 --to 60</code> bundle as the owner of the claim functions, or as a role that can <code>SET ROLE</code> to it.</p>
+<h2 id="tag-indexes-adr-049">Tag indexes (ADR-049)<a class="headerlink" href="#tag-indexes-adr-049" title="Permanent link">&para;</a></h2>
+<p>Tags become the indexed way to find jobs on queue storage. There is no
+migration: new schemas, and the empty partitions of existing ones, get their
+indexes when <code>awa migrate</code> or schema preparation runs. For the populated
+partitions of an existing schema, run as the migrator after upgrading:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa storage build-tag-index --wait
+</span></code></pre></div>
+<p>Each ring partition is indexed once pruning empties it, so <code>--wait</code> finishes
+within one ring cycle. <code>--now</code> builds populated partitions immediately with
+<code>CREATE INDEX CONCURRENTLY</code>, at the cost of holding back vacuum and blocking
+pruning of each partition while it builds. Tag lookups work throughout and
+scan any partition that has no index yet. See <a href="../finding-jobs/">Finding jobs</a>.</p>
+<p>A batch operation whose filter uses several tags, several states or
+<code>dead_lettered</code> is refused until every live runtime is 0.7.0-alpha.2 or
+later. Several tags or states travel as a list under <code>tag</code> or <code>state</code>,
+which a 0.6 server or runner refuses rather than ignoring, and DLQ retry and
+purge by the full filter go to new endpoints (<code>/api/dlq/retry-matching</code>,
+<code>/api/dlq/purge-matching</code>) that a 0.6 server answers with 405. A browser
+holding the new admin UI during a rolling deploy therefore gets an error
+from an old replica, never a wider operation. Scripts that call the 0.6
+<code>/api/dlq/bulk-retry</code> and <code>/bulk-purge</code> bodies keep working unchanged.</p>
+<p>A batch operation now needs a kind, queue, tag, ids or created bound, as a
+DLQ purge does, unless it sets <code>allow_all</code>. A script that submits one with
+only a state, such as <code>{"state": "available"}</code>, changed every job in that
+state on 0.6 and is refused on 0.7.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
@@ -3368,9 +3445,9 @@ needs a canonical implementation, and gives operators one unambiguous instructio
 <h2 id="if-you-are-on-06-not-yet-finalized">If you are on 0.6, not yet finalized<a class="headerlink" href="#if-you-are-on-06-not-yet-finalized" title="Permanent link">&para;</a></h2>
 <p>Complete the staged transition <strong>on your 0.6 binaries</strong> first
 (full procedure: <a href="../upgrade-0.5-to-0.6/">Upgrade 0.5 to 0.6</a>):</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
 </span></code></pre></div>
 <p>For a stopped fleet, a CLI containing #457 can replace the middle command
 with <code>awa storage enter-mixed-transition --quiesced</code>; follow the

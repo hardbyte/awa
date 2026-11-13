@@ -1056,6 +1056,8 @@
       
         
       
+        
+      
     
     
     
@@ -1181,6 +1183,34 @@
     
   
     Job output
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../finding-jobs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Finding jobs
   
 
     
@@ -2654,7 +2684,7 @@
 <li><strong>No <code>#[non_exhaustive]</code>.</strong> That would also forbid <code>..Default::default()</code>, which is how every existing caller builds a filter. Instead, the documented way to construct one is <code>JobFilter { kind: ..., ..Default::default() }</code> or the builder methods. A field added later then breaks no caller that follows it.</li>
 <li><strong>The JSON shape stays ADR-030's, and fails closed on older readers.</strong> <code>tag</code> and <code>state</code> take one value or a list: <code>"tag": "a"</code>, <code>"tag": ["a", "b"]</code>. There are no <code>tags</code> or <code>states</code> keys. A 0.6 server or runner ignores a key it doesn't know, so a new key would be dropped and the filter widened, but it refuses a list where it expects one value. A filter with several tags or states therefore fails on an older reader instead of acting on more jobs. <code>dead_lettered</code> is the one new key an older reader drops; batch operations refuse <code>dead_lettered: true</code> and <code>false</code> changes nothing for them, so dropping it widens nothing.</li>
 <li><strong>Deserialization is strict.</strong> An unknown field is an error, not an ignored key, so a typo can't widen a stored batch operation.</li>
-<li><strong>The DLQ bulk endpoints nest the filter.</strong> Their 0.6 bodies are flat <code>kind</code>, <code>queue</code> and <code>tag</code>. The full filter goes under <code>filter</code>, which a 0.6 server ignores, then refuses the request as having no filter. The flat fields still work, and a body may use one form or the other, not both.</li>
+<li><strong>The full DLQ filter has its own endpoints.</strong> The 0.6 bodies of <code>bulk-retry</code> and <code>bulk-purge</code> are flat <code>kind</code>, <code>queue</code> and <code>tag</code>, and a 0.6 server ignores fields it doesn't know. A filter nested in those bodies would be ignored there, and beside <code>all: true</code> would act on the whole DLQ. So the full filter goes to <code>retry-matching</code> and <code>purge-matching</code>, which a 0.6 server answers with 405, and the old paths keep only their 0.6 body. <code>all</code> is accepted only with an empty filter. (Amended after review; the first version nested the filter on the old paths.)</li>
 <li><strong>New fields wait for the fleet.</strong> Submitting a batch operation whose filter has several tags or states, or <code>dead_lettered</code>, is refused while any live runtime reports a version older than 0.7.0-alpha.2, the first release with this ADR. An older runner would fail to load the filter; the check turns that failure into a clear error at submission.</li>
 </ul>
 <p><code>BatchOperationFilter</code> becomes an alias of <code>JobFilter</code>, so batch operations accept the new fields once the fleet is upgraded.</p>
@@ -2710,6 +2740,7 @@
 </ul>
 <p>The compiler includes only the branches where the filter's states, intersected with the consumer's eligible states, can occur.
 - <strong>SQL narrows; the loader decides.</strong> The branches aren't provably disjoint while a claim is in flight. The available branch compares lane sequences against a cursor that sits outside MVCC (ADR-044). So a claimed job can appear in neither branch, or in two, until its claim and cursor both settle. The compiler therefore returns candidate ids, de-duplicated and ordered, with a bounded over-fetch.
+- <strong>Each branch is read as its own phase.</strong> A listing or batch scan runs one candidate statement per branch, each with its own order and limit, in one <code>REPEATABLE READ, READ ONLY</code> transaction, and merges their ids. Rolling back to a savepoint after each phase releases the locks it took on its partitions while keeping the snapshot, so prune's exclusive locks wait behind one branch's read rather than behind every retained partition for the whole read. The count stays one statement.
 - <strong>Rows load in a batch.</strong> The batched loader reads the page's candidates with <code>job_id = ANY($1)</code>, seven queries per page. It picks each job's current row by the rule <code>get_job</code> uses, which is <code>get_job</code> with one id, and re-checks the filter against that row. The compiler fetches further only while the page is short.
 - <strong>Within a page, each job appears once, in its current state.</strong> A job in the middle of a claim may be missed or shown in its previous state. That's the same advisory sense in which ADR-030 calls the preview advisory. Keyset paging on ids never repeats a job across pages, but a job can change state between pages.
 - <strong>The count is capped and timed out.</strong> <code>count_jobs</code> reads at most 10,001 candidates from each branch and counts the distinct ids across all of them. It reports "10,000+" when that distinct count passes 10,000, or when any branch reached its limit, since that branch alone has more. It runs under a server-side <code>statement_timeout</code>. List reads get the same timeout. The UI fetches the count when the filter changes, debounced, and doesn't poll it.
@@ -2765,7 +2796,7 @@
 <li><strong>It can lose a deadlock.</strong> A build that loses one leaves an invalid index, which the next run repairs.</li>
 </ul>
 </li>
-<li><strong>It's resumable.</strong> Each index has a pinned name (<code>{partition}_tags_idx</code>). An existing invalid index is rebuilt with <code>REINDEX INDEX CONCURRENTLY</code>, never skipped by <code>IF NOT EXISTS</code>. Lock attempts use <code>lock_timeout</code> and retry. <code>awa storage status</code> reports how many partitions are indexed.</li>
+<li><strong>It's resumable.</strong> Each index has a pinned name (<code>{partition}_tags_idx</code>). An existing invalid index is rebuilt with <code>REINDEX INDEX CONCURRENTLY</code>, never skipped by <code>IF NOT EXISTS</code>. A busy empty partition is retried on a later pass. Concurrent builds run on their own connection with no lock or statement timeout: one waits for every older transaction, and a timeout would abort it part-way and leave an invalid index that writes still maintain. <code>awa storage status</code> reports how many partitions are indexed.</li>
 <li><strong>Callers can trigger it.</strong> It runs from the CLI or from Rust as <code>tag_index::build_tag_indexes</code>. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.</li>
 <li><strong>Lookups stay correct during the build.</strong> Until the build finishes, the planner uses the indexes that exist and scans the partitions that have none.</li>
 </ul>
@@ -2856,7 +2887,7 @@
 <h2 id="rollout">Rollout<a class="headerlink" href="#rollout" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>No schema migration.</strong> Binaries before and after this ADR read and write the same tables, and the indexes are invisible to them.</li>
-<li><strong>A binary from this ADR on uses the new compiler</strong> whether or not the indexes exist. Without them, a tag predicate scans in SQL, which is still one statement and one batched load per page instead of a loop of per-row loads.</li>
+<li><strong>A binary from this ADR on uses the new compiler</strong> whether or not the indexes exist. Without them, a tag predicate scans in SQL, which is still one candidate read and one batched load per page instead of a loop of per-row loads.</li>
 <li><strong>Older readers fail closed.</strong> A filter with several tags or states reaches a 0.6 server or runner as a list where it expects one value, which it refuses. A DLQ bulk body reaches a 0.6 server as an empty filter, which it refuses. So a client newer than the server it calls, such as a browser holding the new admin UI during a rolling deploy, gets an error rather than a wider operation.</li>
 <li><strong>Filters with new fields wait for the fleet.</strong> Batch operations whose filter has several tags or states, or <code>dead_lettered</code>, are refused until no live runtime is older than this ADR.</li>
 </ul>
