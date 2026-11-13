@@ -14,14 +14,14 @@ One busy queue can outgrow the coordination around a single [lane](lanes-and-cla
 | --- | --- | --- | --- |
 | `enqueue_shards` | one queue into several lanes per priority | FIFO within each shard; per key with an ordering key | per queue, in `awa.queue_meta` |
 | `PartitionedQueue` | one workload into several ordinary queues, each with its own capacity, rate limit and metrics | FIFO per key within a partition | in producer and worker code |
-| `queue_stripe_count` | every logical queue into physical stripes `queue#0`, `queue#1`, … | order only within a stripe | storage configuration, for the whole fleet |
+| `queue_stripe_count` | every logical queue into physical stripes `queue#0`, `queue#1`, … | order only within a stripe; jobs sharing an `ordering_key` share a stripe | storage configuration, for the whole fleet |
 | `claimers` | nothing: adds claim loops over the same lanes in one runtime | unchanged | per queue, in `QueueConfig` |
 
 **Enqueue shards** keep one queue name for operators and spread it over up to 64 lanes per priority. A producer picks a shard by hashing the job's ordering key, so jobs with the same key stay in order; without a key, each producer moves to the next shard for each batch. Lowering the shard count is safe at any time. See [Sharding the enqueue head](../configuration.md#sharding-the-enqueue-head-per-queue).
 
 **`PartitionedQueue`** spreads one logical workload over physical queues named `email`, `email__p1`, `email__p2` and so on. Each partition is a complete queue, so worker capacity and rate limits apply per partition: four partitions of 32 workers allow 128. It also routes by key, keeping jobs with the same key in one partition and in order. See [Partitioned queues](../configuration.md#partitioned-queues).
 
-**Queue stripes** are a storage-engine setting that splits every queue the same way, for fleets of many small replicas contending on one queue. Producers that write to queue storage directly must use the same stripe count as the workers, or their jobs land in a queue the workers never claim from.
+**Queue stripes** are a storage-engine setting that splits every queue the same way, for fleets of many small replicas contending on one queue. Producers that write to queue storage directly should use the same stripe count as the workers. Workers also claim from the unstriped `queue`, which SQL compatibility inserts and unstriped producers write, but jobs there do not share the stripes' load spreading, and an `ordering_key` keeps its order only across producers with the same stripe count.
 
 **Claimers** add claim loops inside one runtime. They share the queue's worker permits and rate limit, so they help only when a single loop cannot keep the workers busy. They add transactions without adding lanes, and in measured hot-queue shapes more claimers made tail latency worse.
 
