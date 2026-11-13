@@ -6887,6 +6887,15 @@ impl QueueStorage {
             .clamp(1, max_claimers.max(1)))
     }
 
+    /// Whether a claim of `queue` could find a ready row, from the same
+    /// head-table read as the claimer signal. `false` is exact: every lane's
+    /// claim cursor has reached its enqueue cursor, so no ready row is
+    /// committed or reserved. `true` is an upper bound and may be stale (see
+    /// [`Self::queue_claimer_signal`]); the caller still claims to find out.
+    pub async fn queue_may_have_ready(&self, pool: &PgPool, queue: &str) -> Result<bool, AwaError> {
+        Ok(self.queue_claimer_signal(pool, queue).await?.available > 0)
+    }
+
     /// Cheap, dispatcher-grade available-count signal.
     ///
     /// Sums `enqueue_cursor - claim_cursor` across the queue's
