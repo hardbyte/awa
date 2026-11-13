@@ -104,39 +104,18 @@ schema owner:
     REVOKE TRIGGER, REFERENCES ON TABLES FROM awa_runtime;
   ```
 
-- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
-  runtimes created lane sequences themselves, so they needed `CREATE`.
-  Sequences they own are accepted; the `CREATE` grant is not, because it lets
-  the runtime add objects while a migration runs. Until the migration refreshes
-  them, the 0.6 lane helpers and enqueue-head triggers run
-  `CREATE SEQUENCE IF NOT EXISTS` on every reservation, and that checks
-  `CREATE` even for a sequence that exists, so revoking the grant makes running
-  0.6 producers and workers fail with `42501` until the migration commits.
-  Provisioning lanes in advance does not avoid this. Take a short pause:
+- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** Before the 0.6.14 schema patch, 0.6 runtimes created lane sequences themselves, so they needed `CREATE`. Sequences they own are accepted; the `CREATE` grant is not, because it lets the runtime add objects while a migration runs. Remove it while 0.6 producers and workers keep running:
 
-  1. Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
-     enqueue or claim runs.
-  2. Revoke the grant and commit:
+  1. Run `awa migrate` with a 0.6.14 or later CLI, with the schema owner as the effective role. The schema stays at v40. Its `prepared_lane_sequences` patch makes the lane helpers and head-table triggers skip `CREATE SEQUENCE` when the lane's sequence exists, and its `definer_lane_provisioning` patch creates a missing lane's sequences through the schema owner's `SECURITY DEFINER` functions, so no runtime role needs `CREATE`. The patches only replace functions, in `awa` and every other queue-storage schema, and earlier 0.6 binaries call the patched helpers with the same arguments. External migration runners apply the `R__` patches as the [0.6.13 to 0.6.14 upgrade guide](https://github.com/hardbyte/awa/blob/v0.6.14/docs/upgrade-0.6.13-to-0.6.14.md#external-migration-runners) describes.
+  2. Revoke the grant in each queue-storage schema:
 
      ```sql
      REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
      ```
 
-  3. Run `awa migrate` as the migrator. The bundle refreshes the lane helpers
-     to use provisioned sequences without `CREATE` (v049).
-  4. Provision any lanes the 0.7 runtimes will need, as the migrator:
+  3. Continue with the 0.7 migration.
 
-     ```bash
-     PGOPTIONS='-c role=awa_owner' \
-       awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
-       --queue <queue> --enqueue-shards <n>
-     ```
-
-  5. Start the 0.7 runtimes.
-
-  An uninterrupted path would need the revoke and the helper refresh to become
-  visible to every session at once; that has not been verified, so do not
-  combine them into one transaction as a substitute for the pause.
+  Revoking before the patches makes running 0.6 producers and workers fail with `42501`: the unpatched helpers run `CREATE SEQUENCE IF NOT EXISTS` on every reservation, which checks `CREATE` even for a sequence that exists. The 0.6 release branch's `awa/tests/patch_upgrade_rehearsal_test.rs` applies the patches under a released 0.6.9 or 0.6.15 fleet, provisions its queues, grants sequence privileges and revokes `CREATE` from its runtime role, then checks that restarted released workers complete every job and a released producer creates a new queue's lanes through the schema owner's functions.
 
 - **A custom schema prepared by a runtime or another role.** A worker that
   auto-prepares a schema, or a DBA who ran the preparation as another user,
