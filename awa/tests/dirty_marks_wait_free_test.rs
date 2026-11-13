@@ -546,8 +546,11 @@ async fn schema_patch_is_applied_once_by_migrate() {
     let pending = awa_model::migrations::pending_schema_patches(&pool)
         .await
         .unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].name, "wait_free_dirty_marks");
+    // The recreated mark tables need their replica identity again.
+    assert_eq!(
+        pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
+        ["wait_free_dirty_marks", "replica_identity"]
+    );
 
     awa_model::migrations::run(&pool).await.unwrap();
     assert!(awa_model::migrations::pending_schema_patches(&pool)

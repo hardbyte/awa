@@ -287,7 +287,9 @@ impl CronJobRow {
 
 /// Upsert a periodic job schedule into `awa.cron_jobs`.
 ///
-/// Additive only — never deletes rows not in the input set.
+/// Additive only — never deletes rows not in the input set. A declaration
+/// identical to the stored row writes nothing, so runtimes that sync the same
+/// schedules on a timer do not rewrite the row or move `updated_at`.
 pub async fn upsert_cron_job<'e, E>(executor: E, job: &PeriodicJob) -> Result<(), AwaError>
 where
     E: PgExecutor<'e>,
@@ -308,6 +310,13 @@ where
             metadata = EXCLUDED.metadata,
             missed_fire_policy = EXCLUDED.missed_fire_policy,
             updated_at = now()
+        WHERE (cron_jobs.cron_expr, cron_jobs.timezone, cron_jobs.kind, cron_jobs.queue,
+               cron_jobs.args, cron_jobs.priority, cron_jobs.max_attempts, cron_jobs.tags,
+               cron_jobs.metadata, cron_jobs.missed_fire_policy)
+            IS DISTINCT FROM
+              (EXCLUDED.cron_expr, EXCLUDED.timezone, EXCLUDED.kind, EXCLUDED.queue,
+               EXCLUDED.args, EXCLUDED.priority, EXCLUDED.max_attempts, EXCLUDED.tags,
+               EXCLUDED.metadata, EXCLUDED.missed_fire_policy)
         "#,
     )
     .bind(&job.name)

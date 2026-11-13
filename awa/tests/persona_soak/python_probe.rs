@@ -193,6 +193,15 @@ mod tests {
             .expect("probe test pool")
     }
 
+    /// Stands in for the probe process: a graceful close, then exit. `Pool::close`
+    /// can return with a connection in its idle queue when that connection's
+    /// release was still in flight, and only dropping the last pool handle (the
+    /// process exiting) closes that socket.
+    async fn exit(pool: PgPool) {
+        pool.close().await;
+        drop(pool);
+    }
+
     fn name() -> String {
         format!("probe_test_{}", uuid::Uuid::new_v4().simple())
     }
@@ -214,7 +223,7 @@ mod tests {
         evidence.observe(Phase::Migrating, Ok(migrating));
         tx.commit().await.unwrap();
         evidence.observe(Phase::Ready, sessions(&observer, &application).await);
-        client.close().await;
+        exit(client).await;
         evidence.record_exit(Phase::Closed, true);
         // An acknowledged close can precede the server removing its backend.
         let deadline =

@@ -326,6 +326,8 @@ pub struct PyQueueStat {
     #[pyo3(get)]
     pub available: i64,
     #[pyo3(get)]
+    pub available_is_estimate: bool,
+    #[pyo3(get)]
     pub retryable: i64,
     #[pyo3(get)]
     pub running: i64,
@@ -407,6 +409,7 @@ enum RuntimeLifecycle {
     Idle,
     InstallingQueueStorage,
     Running,
+    ShuttingDown,
 }
 
 fn set_runtime_lifecycle(lifecycle: &Mutex<RuntimeLifecycle>, state: RuntimeLifecycle) {
@@ -426,6 +429,9 @@ fn begin_queue_storage_install(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<
         RuntimeLifecycle::Running => Err(state_error(
             "cannot install queue storage while the worker runtime is running",
         )),
+        RuntimeLifecycle::ShuttingDown => Err(state_error(
+            "cannot install queue storage while the worker runtime is shutting down",
+        )),
     }
 }
 
@@ -440,6 +446,21 @@ fn begin_runtime_start(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
             "cannot start the worker runtime while queue storage installation is in progress",
         )),
         RuntimeLifecycle::Running => Err(state_error("worker runtime is already running")),
+        RuntimeLifecycle::ShuttingDown => Err(state_error("worker runtime is shutting down")),
+    }
+}
+
+fn begin_runtime_shutdown(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
+    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    match *guard {
+        RuntimeLifecycle::Idle | RuntimeLifecycle::Running => {
+            *guard = RuntimeLifecycle::ShuttingDown;
+            Ok(())
+        }
+        RuntimeLifecycle::InstallingQueueStorage => Err(state_error(
+            "cannot shut down the worker runtime while queue storage installation is in progress",
+        )),
+        RuntimeLifecycle::ShuttingDown => Err(state_error("worker runtime is shutting down")),
     }
 }
 
@@ -453,6 +474,8 @@ pub struct PyClient {
     job_kind_descriptors: Arc<Mutex<HashMap<String, JobKindDescriptor>>>,
     lifecycle: Arc<Mutex<RuntimeLifecycle>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
+    handler_registry: Py<PyAny>,
+    runtime_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cached `AwaMetrics` handle. `AwaMetrics::from_global()` builds the
     /// full instrument set on every call; on hot paths (per-batch
     /// `enqueue_many_copy` recording in particular) we keep one instance
@@ -492,6 +515,12 @@ impl PyClient {
             job_kind_descriptors: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(RuntimeLifecycle::Idle)),
             runtime: Arc::new(Mutex::new(None)),
+            handler_registry: py
+                .import("awa._handler_task")?
+                .getattr("HandlerRegistry")?
+                .call0()?
+                .unbind(),
+            runtime_lock: Arc::new(tokio::sync::Mutex::new(())),
             metrics: awa_worker::AwaMetrics::from_global(),
         })
     }
@@ -1206,6 +1235,7 @@ impl PyClient {
                             total_queued: stat.total_queued,
                             scheduled: stat.scheduled,
                             available: stat.available,
+                            available_is_estimate: stat.available_is_estimate,
                             retryable: stat.retryable,
                             running: stat.running,
                             failed: stat.failed,
@@ -1666,7 +1696,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, terminal_count_rollup_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_stripe_count=1, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=1000, queue_storage_claim_rotate_interval_ms=None, queue_storage_prune_lock_timeout_ms=None, storage_transition_role=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, maintenance_leader=true, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, rescue_pass_budget_ms=None, rescue_pass_max_rows=None, terminal_count_rollup_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_stripe_count=1, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=1000, queue_storage_claim_rotate_interval_ms=None, queue_storage_prune_lock_timeout_ms=None, storage_transition_role=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -1679,12 +1709,15 @@ impl PyClient {
         descriptor_retention_days: Option<f64>,
         cleanup_batch_size: Option<i64>,
         leader_election_interval_ms: Option<u64>,
+        maintenance_leader: bool,
         heartbeat_interval_ms: Option<u64>,
         promote_interval_ms: Option<u64>,
         heartbeat_rescue_interval_ms: Option<u64>,
         heartbeat_staleness_ms: Option<u64>,
         deadline_rescue_interval_ms: Option<u64>,
         callback_rescue_interval_ms: Option<u64>,
+        rescue_pass_budget_ms: Option<u64>,
+        rescue_pass_max_rows: Option<usize>,
         terminal_count_rollup_interval_ms: Option<u64>,
         queue_storage_schema: Option<String>,
         queue_storage_queue_slot_count: u32,
@@ -1786,6 +1819,7 @@ impl PyClient {
         if let Some(ms) = leader_election_interval_ms {
             builder = builder.leader_election_interval(Duration::from_millis(ms));
         }
+        builder = builder.maintenance_leader(maintenance_leader);
         if let Some(ms) = heartbeat_interval_ms {
             builder = builder.heartbeat_interval(Duration::from_millis(ms));
         }
@@ -1803,6 +1837,12 @@ impl PyClient {
         }
         if let Some(ms) = callback_rescue_interval_ms {
             builder = builder.callback_rescue_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = rescue_pass_budget_ms {
+            builder = builder.rescue_pass_budget(Duration::from_millis(ms));
+        }
+        if let Some(max_rows) = rescue_pass_max_rows {
+            builder = builder.rescue_pass_max_rows(max_rows);
         }
         if let Some(ms) = terminal_count_rollup_interval_ms {
             if ms == 0 {
@@ -1885,7 +1925,8 @@ impl PyClient {
         )?);
 
         for entry in &entries {
-            builder = builder.register_worker(PythonWorker::from_entry(entry));
+            builder =
+                builder.register_worker(PythonWorker::from_entry(entry, &self.handler_registry));
         }
 
         // Register periodic jobs
@@ -1920,8 +1961,19 @@ impl PyClient {
 
         let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
+        let runtime_lock = self.runtime_lock.clone();
+        let handler_registry = self.handler_registry.clone_ref(py);
         crate::async_bridge::future_into_py(py, async move {
+            let _operation = runtime_lock
+                .try_lock()
+                .map_err(|_| state_error("worker runtime is already running or shutting down"))?;
             begin_runtime_start(&lifecycle)?;
+            if let Err(err) =
+                Python::attach(|py| handler_registry.call_method0(py, "reopen").map(|_| ()))
+            {
+                set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+                return Err(err);
+            }
             let runtime = match builder.build() {
                 Ok(runtime) => Arc::new(runtime),
                 Err(err) => {
@@ -1945,14 +1997,30 @@ impl PyClient {
     fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
         let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
-        crate::async_bridge::future_into_py(py, async move {
+        let handler_registry = self.handler_registry.clone_ref(py);
+        let runtime_lock = self.runtime_lock.clone();
+        let locals = crate::async_bridge::get_current_locals(py)?;
+        let shutdown = crate::async_bridge::future_into_py(py, async move {
+            let _operation = runtime_lock.lock().await;
+            begin_runtime_shutdown(&lifecycle)?;
             let runtime = runtime_store.lock().expect("runtime mutex poisoned").take();
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
+            let cleanup = Python::attach(|py| {
+                let drain = handler_registry.call_method0(py, "drain")?;
+                pyo3_async_runtimes::into_future_with_locals(&locals, drain.into_bound(py))
+            });
+            let result = match cleanup {
+                Ok(cleanup) => cleanup.await.map(|_| ()),
+                Err(err) => Err(err),
+            };
             set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
-            Ok(())
-        })
+            result
+        })?;
+        // Once accepted, shutdown owns cleanup even if its Python waiter is
+        // cancelled. The tracked native bridge still owns interpreter safety.
+        py.import("asyncio")?.call_method1("shield", (shutdown,))
     }
 
     // ── External callback completion (async + sync) ─────────────────
@@ -2760,6 +2828,7 @@ impl PyClient {
                         total_queued: s.total_queued,
                         scheduled: s.scheduled,
                         available: s.available,
+                        available_is_estimate: s.available_is_estimate,
                         retryable: s.retryable,
                         running: s.running,
                         failed: s.failed,

@@ -552,6 +552,9 @@ async fn test_insert_many() {
 #[tokio::test]
 async fn test_insert_many_exceeding_bind_parameter_limit() {
     const JOB_COUNT: usize = 6_000;
+    // A concurrent test that activates queue storage would route part of the
+    // batch away from the canonical tables this test reads back.
+    let _guard = test_lock().lock().await;
     let client = setup_with_connections(4).await;
     let queue = "integ_insert_many_bind_limit";
     clean_queue(client.pool(), queue).await;
@@ -2219,6 +2222,7 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         maintenance_alive: true,
         shutting_down: false,
         leader: false,
+        maintenance_leader: true,
         global_max_workers: None,
         queues: vec![],
         queue_descriptor_hashes: std::collections::HashMap::new(),

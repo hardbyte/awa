@@ -103,6 +103,9 @@ export function RuntimeInstancePage() {
         <Heading level={2}>{instanceLabel(instance)}</Heading>
         <RuntimeHealthBadge instance={instance} />
         {instance.leader && <Badge intent="primary">Leader</Badge>}
+        {instance.maintenance_leader === false && (
+          <Badge intent="secondary">Never leads</Badge>
+        )}
         <PostgresBadge connected={instance.postgres_connected} />
         <ShutdownBadge shuttingDown={instance.shutting_down} />
       </div>

@@ -14,6 +14,8 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | T4 | `kill -9` crash recovery | ✓ |  |
 | T5 | Deadline rescue (hung job) | ✓ |  |
 | T5a | Poison jobs (handler panic, crash loop, deadline loop) stop at `max_attempts` on both engines | ✓ |  |
+| T5b | Rescue drains a backlog of abandoned claims in bounded passes without rescuing live claims, and the queue and claim rings then rotate past the pinned slots | ✓ |  |
+| T5c | Ring prune wins against overlapping short readers, sees a lease committed while it waits to truncate, and does not deadlock with rescue or a read-then-write transaction on the claim ring | ✓ |  |
 | T6 | Transactional atomicity | ✓ |  |
 | T7 | Transactional atomicity (Python) |  | ✓ |
 | T8 | Uniqueness under contention | ✓ | ✓ |
@@ -59,6 +61,7 @@ Tests run against real Postgres 15+ (not managed services) using a dedicated tes
 | # | Test | Rust | Py |
 | --- | --- | --- | --- |
 | T13 | Queue pause/resume | ✓ |  |
+| T13a | Durable `maintenance.prune` halt survives a leader handoff and keeps job accounting exact; resume names the current halt | ✓ |  |
 | T22 | Pool exhaustion resilience | ✓ |  |
 | T26 | Migration idempotency | ✓ |  |
 | T27 | Admin ops under load | ✓ |  |
@@ -167,6 +170,7 @@ _HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not 
 | --- | --- | --- | --- |
 | T47-T57a | COPY: empty, single, 1000, special chars, tags, unique, atomic | ✓ | ✓ |
 | QSC1-QSC2 | Queue storage COPY producer: ready/deferred direct COPY, unique-conflict rollback | ✓ | ✓ |
+| QSC3 | Batch inserts give way to per-row producers that share their unique keys or lanes, and every producer pair creates a new lane without deadlock | ✓ |  |
 
 ### Rate Limiting & Weighted Concurrency
 
@@ -241,9 +245,10 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA9 | AwaShardedPrune | Cross-shard ready/terminal prune matching by `enqueue_shard` |
 | TLA10 | AwaSegmentedStorageRaces | Claim-vs-rotate/prune race exposure and checked-commit safety |
 | TLA11 | AwaSegmentedStorageTrace | Runtime trace acceptance for snooze, receipt rescue, cancel, callback wait, DLQ retry, and DLQ purge paths |
-| TLA12 | AwaStorageLockOrder | Postgres lock ordering across claim, complete, cancel, rescue, rotate, and prune |
+| TLA12 | AwaStorageLockOrder | Postgres lock ordering across enqueue, new-lane provisioning, claim, complete, cancel, rescue, rotate, and prune |
 | TLA13 | AwaStorageTransition | Storage-transition prepare, mixed-entry, finalize, and abort gates |
 | TLA14 | AwaDeadTupleContract | Hot-table reclaim-kind and partition-truncate contract |
+| TLA15 | AwaQueuePruneTwoPhase | Queue prune's writer lock, exclusive upgrade and recheck against a claim that commits during the upgrade |
 
 The formal suite includes passing configs and expected-counterexample configs. The expected-counterexample configs keep historical bugs executable: old dispatch claim, old view trigger, naive segment race, old storage-transition gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs use a `TraceIncomplete` invariant as a positive witness: a valid trace violates that invariant after TLC consumes every event.
 
@@ -360,6 +365,7 @@ Environment:
 | `AWA_SOAK_MEMORY_SLOPE_MIB_PER_100K`, `AWA_SOAK_MEMORY_WARMUP_SECONDS`, `AWA_SOAK_MEMORY_MIN_EXECUTIONS`, `AWA_SOAK_MEMORY_SAMPLE_SECONDS` | the memory growth gate. The resident memory of the soak process, which hosts every Rust runtime, is sampled every `AWA_SOAK_MEMORY_SAMPLE_SECONDS` (default 5) into `memory.csv` with the executions so far. After `AWA_SOAK_MEMORY_WARMUP_SECONDS` of load (default 120), the least-squares slope of resident memory over executions must stay below `AWA_SOAK_MEMORY_SLOPE_MIB_PER_100K` (default 64 MiB per 100k executions), or the run fails with `memory_growth`; with fewer than `AWA_SOAK_MEMORY_MIN_EXECUTIONS` executions after the warm-up (default 20000) the gate is reported as not evaluated |
 | `AWA_SOAK_COMPLETION_STALL_SECONDS` | halfway through the load, holds the queue-storage completion tables (`lease_claim_closures`, `receipt_completion_batches`) in `SHARE` mode for this many seconds, so completions cannot commit while claims and handlers carry on; resident memory may rise by at most `AWA_SOAK_COMPLETION_STALL_MEMORY_MIB` (default 128) from the stall until as long again after it (`memory_growth_under_stall`), and that window is left out of the growth slope. Stalls over about 45 s also trip the promotion-overdue check, since promotion waits on the same tables. Default 0, off |
 | `AWA_SOAK_RESCUE_INTERVAL_SECONDS` | heartbeat and deadline rescue interval of every runtime; unset keeps the harness's 3 s and 2 s, the library default for heartbeat rescue is 30 s |
+| `AWA_SOAK_QUEUE_ROTATE_MS`, `AWA_SOAK_CLAIM_ROTATE_MS`, `AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS` | queue and claim ring rotation intervals and the prune lock timeout of every in-process runtime; unset keeps the library's 1000, 1000 and 10. Setting either interval fixes the other at 1000 unless it is set too. The python and claim-and-abandon processes keep the library defaults, so leave those personas out when comparing cadences |
 | `AWA_SOAK_SHARDOPS_SCALE`, `AWA_SOAK_SHARDOPS_SCHEMA_CREATE` | the shard operator's rate multiplier, independent of `AWA_SOAK_SCALE` (default 1), and whether its application roles may create objects in the schema (default 1: lanes are created on the fly; 0 withholds schema `CREATE` and the operator provisions every lane before raising a count) |
 | `AWA_SOAK_SHARED_CREATOR_GRANTS` | default `0`; `1` shares application-created objects for comparisons with older binaries and requires schema `CREATE`. Keep it off when checking application-role privileges. |
 | `AWA_SOAK_UI_POOL_MAX`, `AWA_SOAK_ADMIN_READ_SECONDS` | the admin server's database pool size (default 10) and the seconds between the operator persona's admin read queries (default 2); lower the load on a slow server by shrinking the pool and stretching the interval |
@@ -371,7 +377,7 @@ Environment:
 | `AWA_SOAK_SCALE` | multiplies rates, burst sizes and queue counts, default 1 |
 | `AWA_SOAK_DRAIN_GRACE_SECONDS` | how long to wait for the system to quiesce after load stops, default 120 |
 | `AWA_SOAK_PG_LOG` / `AWA_SOAK_PG_CONTAINER` / `AWA_SOAK_PG_CONTAINER_LOG` | where to read the server log for the crash scan: a file on this host, or a Docker container (with an optional log path inside it, otherwise `docker logs`) |
-| `AWA_SOAK_REPORT_DIR` | where `report.md`, `report.json` and, for a failed run, `reproducer.md` are written |
+| `AWA_SOAK_REPORT_DIR` | where `report.md`, `report.json` and, for a failed run, `reproducer.md` are written |; `maintenance-metrics.jsonl` holds the `awa.maintenance.*` metrics of the in-process runtimes as cumulative data points exported every 10 s (prune and rotate attempts by ring and outcome, branch durations and overruns, promotion lane contention)
 | `AWA_SOAK_STALL_SECONDS`, `AWA_SOAK_PROMOTION_OVERDUE_SECONDS`, `AWA_SOAK_CHAOS_SLACK_SECONDS` | oracle thresholds |
 
 The report records the engine, server version, `max_connections`, connections at start and the per-persona connection budget. A failed run leaves `reproducer.md` with the seed, personas and duration, the violating rows, the timeline around each violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18 image) in private containers on separate ports and removes them afterwards.

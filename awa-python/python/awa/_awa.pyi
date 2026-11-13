@@ -62,6 +62,8 @@ class QueueStat:
     @property
     def available(self) -> int: ...
     @property
+    def available_is_estimate(self) -> bool: ...
+    @property
     def retryable(self) -> int: ...
     @property
     def running(self) -> int: ...
@@ -568,12 +570,15 @@ class Client:
         descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
+        maintenance_leader: bool = True,
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        rescue_pass_budget_ms: int | None = None,
+        rescue_pass_max_rows: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = 16,

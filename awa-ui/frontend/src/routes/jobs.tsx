@@ -24,6 +24,7 @@ import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { AvailableCount } from "@/components/AvailableCount";
 import {
   Table,
   TableHeader,
@@ -258,7 +259,7 @@ export function JobsPage() {
   };
 
   const total = statsQuery.data
-    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
+    ? Object.values(statsQuery.data.counts).reduce((a, b) => a + b, 0)
     : undefined;
 
   const lastJob = jobs[jobs.length - 1];
@@ -291,7 +292,7 @@ export function JobsPage() {
             <span className="text-sm text-muted-fg">{queueStats.description}</span>
           )}
           <span className="text-sm text-muted-fg">
-            {queueStats.available} available &middot;{" "}
+            <AvailableCount count={queueStats.available} isEstimate={queueStats.available_is_estimate} /> available &middot;{" "}
             {queueStats.running} running &middot;{" "}
             <span className={queueStats.failed > 0 ? "text-danger" : ""}>
               {queueStats.failed} failed
@@ -334,7 +335,7 @@ export function JobsPage() {
       {/* Compact state filter pills + search on same row */}
       <div className="flex flex-wrap items-center gap-2">
         {STATES.map((s) => {
-          const count = s === "all" ? total : statsQuery.data?.[s];
+          const count = s === "all" ? total : statsQuery.data?.counts[s];
           const isActive = filters.state === s;
           return (
             <button

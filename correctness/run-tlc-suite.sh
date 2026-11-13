@@ -17,6 +17,8 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 SUITE='
+AwaAsyncClaimCursor.tla        ;; -                                      ;; pass ;; evidence-guarded async claim replay
+AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; NoSkippedJob is violated ;; lost claim on promoted standby witness
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
@@ -32,10 +34,16 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; Dlq
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldStripedClaimDeadlock.cfg ;; NoDeadlock is violated ;; old striped-claim order witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg ;; NoDeadlock is violated ;; old QueueStorage lane-provisioning order witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg ;; NoDeadlock is violated ;; old claim-prune slot-row order against rescue witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + #456 reschedule drain
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence
 AwaQuiescedTransition.tla      ;; AwaQuiescedTransitionUnlocked.cfg       ;; QuiescedAtFlip is violated ;; unlocked liveness check race
+AwaQueuePruneTwoPhase.tla      ;; -                                       ;; pass ;; two-phase queue prune against a lease claim
+AwaQueuePruneTwoPhase.tla      ;; AwaQueuePruneTwoPhaseReceiptBarrier.cfg ;; pass ;; receipt claims are fenced by the writer freeze alone
+AwaQueuePruneTwoPhase.tla      ;; AwaQueuePruneTwoPhaseNoRecheck.cfg      ;; TruncatedSlotIsFinished is violated ;; lease claim committing during the upgrade witness
 AwaStorageTransition.tla       ;; AwaStorageTransitionCurrentGate.cfg     ;; MixedHasQueueExecutor is violated ;; pre-v014 capability-gate witness
 AwaStorageTransition.tla       ;; AwaStorageTransitionRescheduleStaysCanonical.cfg ;; MixedTransitionCanReduceCanonicalBacklog is violated ;; pre-#456 canonical re-schedule wedge witness
 AwaMigratedRescheduleUnique.tla ;; -                                      ;; pass ;; migrated re-schedule duplicate cancellation

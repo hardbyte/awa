@@ -8,7 +8,7 @@ Awa workers are stateless. Queue state lives in Postgres. A worker process typic
 
 - one dispatcher per configured queue
 - one heartbeat loop
-- one maintenance loop
+- the maintenance service: on the leader, a recovery loop (promotion and rescue) and a hygiene loop (cleanup, cron sync, rotation and the rest)
 - one elected leader per database for rescue, promotion, cleanup, and cron evaluation
 
 That means you scale by running more worker processes, not by adding local state.

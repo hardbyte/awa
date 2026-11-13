@@ -14,6 +14,23 @@ use std::time::{Duration, Instant};
 const MAINTENANCE_LEADER_LOCK_KEY: i64 = 0x4157_415f_4d41_494e;
 const RUNTIME_FLEETS: [&str; 6] = ["mia", "tom", "priya", "sam", "sam-stripe", "fanout"];
 
+/// Up to `$1` random runtime sessions. Producers, operators, the oracle, chaos
+/// itself, the claim-and-abandon persona and the shard-ops control sessions are
+/// left alone: they are the harness, not the system under test.
+macro_rules! runtime_victims_sql {
+    () => {
+        "SELECT pid FROM pg_stat_activity
+         WHERE application_name LIKE 'soak\\_%' AND application_name NOT LIKE '%producer%'
+           AND application_name NOT LIKE '%operator%' AND application_name NOT LIKE '%oracle%'
+           AND application_name NOT LIKE '%chaos%' AND application_name NOT LIKE 'soak\\_abandon\\_%'
+           AND application_name NOT IN
+               ('soak_shardops_owner', 'soak_shardops_migrator', 'soak_shardops_admin')
+           AND backend_type = 'client backend'
+           AND pid <> pg_backend_pid()
+         ORDER BY random() LIMIT $1"
+    };
+}
+
 async fn kill_runtime(shared: &Arc<Shared>, rng: &mut Rng) {
     let Some(&name) = rng.pick(&RUNTIME_FLEETS) else {
         return;
@@ -92,17 +109,11 @@ async fn terminate_leader(shared: &Arc<Shared>, pool: &PgPool) {
 
 async fn terminate_runtime_connections(shared: &Arc<Shared>, pool: &PgPool, rng: &mut Rng) {
     let count = rng.range(3, 12) as i64;
-    let terminated: Result<Vec<(i32,)>, _> = sqlx::query_as(
-        "SELECT pid FROM (
-             SELECT pid FROM pg_stat_activity
-             WHERE application_name LIKE 'soak\\_%' AND application_name NOT LIKE '%producer%'
-               AND application_name NOT LIKE '%operator%' AND application_name NOT LIKE '%oracle%'
-               AND application_name NOT LIKE '%chaos%' AND application_name NOT LIKE 'soak\\_abandon\\_%'
-               AND backend_type = 'client backend'
-               AND pid <> pg_backend_pid()
-             ORDER BY random() LIMIT $1
-         ) victims WHERE pg_terminate_backend(pid)",
-    )
+    let terminated: Result<Vec<(i32,)>, _> = sqlx::query_as(concat!(
+        "SELECT pid FROM (",
+        runtime_victims_sql!(),
+        ") victims WHERE pg_terminate_backend(pid)"
+    ))
     .bind(count)
     .fetch_all(pool)
     .await;
@@ -239,4 +250,51 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     }
     pool.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::persona_soak::db::connect_pool;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn runtime_termination_spares_the_shard_ops_control_sessions() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string());
+        let mut sessions = Vec::new();
+        for application in [
+            "soak_shardops_owner",
+            "soak_shardops_migrator",
+            "soak_shardops_admin",
+            "soak_shardops-a_0",
+        ] {
+            let pool = connect_pool(&url, application, 1).await.expect("session");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&pool)
+                .await
+                .expect("backend pid");
+            sessions.push((application, pid, pool));
+        }
+        let probe = connect_pool(&url, "chaos_victim_probe", 1)
+            .await
+            .expect("probe");
+        let victims: HashSet<i32> = sqlx::query_scalar(runtime_victims_sql!())
+            .bind(i64::from(i32::MAX))
+            .fetch_all(&probe)
+            .await
+            .expect("select victims")
+            .into_iter()
+            .collect();
+        for (application, pid, _) in &sessions {
+            assert_eq!(
+                victims.contains(pid),
+                *application == "soak_shardops-a_0",
+                "{application}"
+            );
+        }
+        probe.close().await;
+        for (_, _, pool) in sessions {
+            pool.close().await;
+        }
+    }
 }

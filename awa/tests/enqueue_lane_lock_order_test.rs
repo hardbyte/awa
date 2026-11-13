@@ -11,14 +11,21 @@
 //! with the lanes in the opposite input order is then observed waiting on the
 //! first lane's lock through `pg_locks`, and only then is the gate released.
 //!
+//! The first producer to use a lane also writes its `queue_lanes` row and
+//! takes its provisioning lock, and every producer must take the row first.
+//! Those tests stall the first producer inside the lane's sequence creation
+//! with a gate transaction holding an uncommitted sequence of the same name.
+//!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test enqueue_lane_lock_order_test -- --nocapture`
 
 use awa::model::{
-    insert_many, insert_many_copy_from_pool, AwaError, QueueStorage, QueueStorageConfig,
+    insert_many, insert_many_copy_from_pool, insert_many_skip_unique_conflicts, insert_with,
+    AwaError, QueueStorage, QueueStorageConfig,
 };
-use awa::{InsertOpts, InsertParams, JobRow, UniqueOpts};
+use awa::{InsertOpts, InsertParams, JobArgs, JobRow, UniqueOpts};
 use awa_testing::setup;
+use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -32,6 +39,7 @@ const WAIT_DEADLINE: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone, Copy)]
 enum Producer {
     InsertMany,
+    SkipUniqueConflicts,
     Copy,
     CopyLarge,
     CopyUnique,
@@ -48,6 +56,7 @@ impl Producer {
     async fn run(self, pool: &PgPool, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError> {
         match self {
             Producer::InsertMany => insert_many(pool, jobs).await,
+            Producer::SkipUniqueConflicts => insert_many_skip_unique_conflicts(pool, jobs).await,
             Producer::Copy | Producer::CopyLarge | Producer::CopyUnique => {
                 insert_many_copy_from_pool(pool, jobs).await
             }
@@ -250,6 +259,11 @@ async fn insert_many_takes_lane_locks_in_canonical_order() {
 }
 
 #[tokio::test]
+async fn insert_many_skip_unique_conflicts_takes_lane_locks_in_canonical_order() {
+    assert_producer_does_not_deadlock_with_queue_storage_batch(Producer::SkipUniqueConflicts).await;
+}
+
+#[tokio::test]
 async fn insert_many_copy_takes_lane_locks_in_canonical_order() {
     assert_producer_does_not_deadlock_with_queue_storage_batch(Producer::Copy).await;
 }
@@ -280,6 +294,74 @@ fn ordering_key_per_shard(shards: i16) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Key of the advisory lock `reserve_enqueue_seq` holds for one lane.
+async fn lane_reservation_lock_key(pool: &PgPool, queue: &str, priority: i16, shard: i16) -> i64 {
+    sqlx::query_scalar(
+        r#"
+        SELECT hashtextextended(
+            format('%I.%I', 'awa', awa.queue_lane_sequence_name('queue_enqueue_seq', $1, $2, $3)),
+            0
+        )
+        "#,
+    )
+    .bind(queue)
+    .bind(priority)
+    .bind(shard)
+    .fetch_one(pool)
+    .await
+    .expect("derive lane reservation lock key")
+}
+
+/// The backend waiting for the advisory lock `key`, once there is one.
+async fn advisory_waiter_pid(pool: &PgPool, key: i64) -> i32 {
+    let started = Instant::now();
+    loop {
+        let pid: Option<i32> = sqlx::query_scalar(
+            r#"
+            SELECT pid
+            FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND NOT granted
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND ((classid::bigint << 32) | objid::bigint) = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .expect("poll pg_locks");
+        if let Some(pid) = pid {
+            return pid;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "no backend started waiting for advisory lock {key}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn granted_advisory_keys(pool: &PgPool, pid: i32) -> std::collections::BTreeSet<i64> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT (classid::bigint << 32) | objid::bigint
+        FROM pg_locks
+        WHERE locktype = 'advisory' AND granted AND pid = $1
+        "#,
+    )
+    .bind(pid)
+    .fetch_all(pool)
+    .await
+    .expect("read granted advisory locks")
+    .into_iter()
+    .collect()
+}
+
+/// A batch over sharded lanes reserves them in `(queue, priority, shard)`
+/// order, whatever order its rows arrive in. A gate holds one lane in the
+/// middle of that order; the producer must be parked on it holding exactly the
+/// lanes before it.
 async fn assert_batch_reserves_lanes_in_canonical_order(producer: Producer) {
     let _guard = LANE_LOCK_TEST_GUARD.lock().await;
     let (pool, _config) = setup_queue_storage().await;
@@ -307,6 +389,7 @@ async fn assert_batch_reserves_lanes_in_canonical_order(producer: Producer) {
 
     let keys = ordering_key_per_shard(shards);
     let mut jobs = Vec::new();
+    let mut lanes = std::collections::BTreeSet::new();
     let rounds = match producer {
         Producer::CopyLarge => 700,
         _ => 12,
@@ -315,61 +398,123 @@ async fn assert_batch_reserves_lanes_in_canonical_order(producer: Producer) {
         for queue in &queues {
             let mut params = job(queue, round, false);
             params.opts.priority = if round % 5 == 0 { 1 } else { 2 };
-            // Keyed rows spread over every shard; every third row has no key.
-            if round % 3 != 0 {
-                params.opts.ordering_key = Some(keys[(round + queue.len()) % keys.len()].clone());
-            }
+            // Every row is keyed, so its shard, and so its lane, is known here.
+            let shard = (round + queue.len()) % keys.len();
+            params.opts.ordering_key = Some(keys[shard].clone());
+            lanes.insert((
+                queue.as_bytes().to_vec(),
+                params.opts.priority,
+                shard as i16,
+                queue.clone(),
+            ));
             jobs.push(params);
         }
     }
+    assert!(lanes.len() >= 6, "the batch must span many lanes");
 
-    let inserted = producer.run(&pool, &jobs).await.expect("insert batch");
+    let canonical: Vec<(String, i16, i16)> = lanes
+        .into_iter()
+        .map(|(_, priority, shard, queue)| (queue, priority, shard))
+        .collect();
+    let mut canonical_keys = Vec::new();
+    for (queue, priority, shard) in &canonical {
+        canonical_keys.push(lane_reservation_lock_key(&pool, queue, *priority, *shard).await);
+    }
+
+    // Provision the lanes so the gate lock is the only thing the producer waits for.
+    for (index, queue) in queues.iter().enumerate() {
+        let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+        for (priority, shard) in [
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+        ] {
+            let mut params = job(queue, 10_000 + index, false);
+            params.opts.priority = priority;
+            params.opts.ordering_key = Some(keys[shard as usize].clone());
+            store
+                .enqueue_params_batch(&pool, &[params])
+                .await
+                .expect("provision lane");
+        }
+    }
+
+    let gated = canonical.len() / 2;
+    let mut gate = pool.begin().await.expect("begin gate transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(canonical_keys[gated])
+        .execute(&mut *gate)
+        .await
+        .expect("take gate lock");
+
+    let competing = {
+        let pool = pool.clone();
+        let jobs = jobs.clone();
+        tokio::spawn(async move { producer.run(&pool, &jobs).await })
+    };
+    let waiter = advisory_waiter_pid(&pool, canonical_keys[gated]).await;
+    let held = granted_advisory_keys(&pool, waiter).await;
+    let expected: std::collections::BTreeSet<i64> =
+        canonical_keys[..gated].iter().copied().collect();
+    assert_eq!(
+        held,
+        expected,
+        "a batch parked on lane {gated} of {} must hold the lanes before it and no later one",
+        canonical.len()
+    );
+
+    gate.commit().await.expect("release gate");
+    let inserted = tokio::time::timeout(WAIT_DEADLINE, competing)
+        .await
+        .expect("producer finished")
+        .expect("producer task")
+        .expect("insert batch");
+
+    // Lane ordering must not leak into the result: rows come back in input order.
     assert_eq!(inserted.len(), jobs.len());
     for (row, params) in inserted.iter().zip(&jobs) {
         assert_eq!(row.queue, params.opts.queue);
         assert_eq!(row.args, params.args);
     }
 
-    // Job ids are allocated as each row reaches `insert_job_compat`, so id
-    // order is lock order.
-    let lane_by_job: std::collections::HashMap<i64, (String, i16, i16)> =
-        sqlx::query_as::<_, (i64, String, i16, i16)>(
-            "SELECT job_id, queue, priority, enqueue_shard FROM awa.ready_entries WHERE job_id = ANY($1)",
+    // Within a lane, lane_seq follows input order.
+    let lane_by_job: std::collections::HashMap<i64, (String, i16, i16, i64)> =
+        sqlx::query_as::<_, (i64, String, i16, i16, i64)>(
+            "SELECT job_id, queue, priority, enqueue_shard, lane_seq FROM awa.ready_entries WHERE job_id = ANY($1)",
         )
         .bind(inserted.iter().map(|row| row.id).collect::<Vec<_>>())
         .fetch_all(&pool)
         .await
         .expect("read lanes")
         .into_iter()
-        .map(|(job_id, queue, priority, shard)| (job_id, (queue, priority, shard)))
+        .map(|(job_id, queue, priority, shard, lane_seq)| {
+            (job_id, (queue, priority, shard, lane_seq))
+        })
         .collect();
     assert_eq!(lane_by_job.len(), jobs.len());
-
-    let mut by_lock_order: Vec<(i64, usize)> = inserted
-        .iter()
-        .enumerate()
-        .map(|(position, row)| (row.id, position))
-        .collect();
-    by_lock_order.sort_unstable();
-    let lock_order: Vec<(&(String, i16, i16), usize)> = by_lock_order
-        .iter()
-        .map(|(job_id, position)| (&lane_by_job[job_id], *position))
-        .collect();
-    for pair in lock_order.windows(2) {
-        let (lane, position) = pair[0];
-        let (next_lane, next_position) = pair[1];
-        assert!(
-            lane.0.as_bytes() < next_lane.0.as_bytes()
-                || (lane.0 == next_lane.0 && (lane.1, lane.2) < (next_lane.1, next_lane.2))
-                || (lane == next_lane && position < next_position),
-            "lane {lane:?} (input {position}) was locked before lane {next_lane:?} (input {next_position})"
-        );
+    let mut last_seq_by_lane: std::collections::HashMap<(String, i16, i16), i64> =
+        std::collections::HashMap::new();
+    for row in &inserted {
+        let (queue, priority, shard, lane_seq) = lane_by_job[&row.id].clone();
+        if let Some(previous) = last_seq_by_lane.insert((queue, priority, shard), lane_seq) {
+            assert_eq!(lane_seq, previous + 1, "lane_seq must follow input order");
+        }
     }
 }
 
 #[tokio::test]
 async fn insert_many_reserves_sharded_lanes_in_canonical_order() {
     assert_batch_reserves_lanes_in_canonical_order(Producer::InsertMany).await;
+}
+
+#[tokio::test]
+async fn insert_many_skip_unique_conflicts_reserves_sharded_lanes_in_canonical_order() {
+    assert_batch_reserves_lanes_in_canonical_order(Producer::SkipUniqueConflicts).await;
 }
 
 #[tokio::test]
@@ -380,4 +525,202 @@ async fn insert_many_copy_reserves_sharded_lanes_in_canonical_order() {
 #[tokio::test]
 async fn insert_many_copy_csv_reserves_sharded_lanes_in_canonical_order() {
     assert_batch_reserves_lanes_in_canonical_order(Producer::CopyLarge).await;
+}
+
+/// Producers that can be the first to use a lane.
+#[derive(Debug, Clone, Copy)]
+enum LaneCreator {
+    QueueStorageBatch,
+    PerRowInsert,
+    InsertMany,
+    Copy,
+}
+
+#[derive(Debug, Serialize, JobArgs)]
+struct LaneCreationJob {
+    queue: String,
+    seq: usize,
+}
+
+impl LaneCreator {
+    async fn run(self, pool: &PgPool, jobs: &[InsertParams]) -> Result<usize, AwaError> {
+        match self {
+            LaneCreator::QueueStorageBatch => {
+                let store = QueueStorage::new(QueueStorageConfig::default())?;
+                store.enqueue_params_batch(pool, jobs).await
+            }
+            LaneCreator::PerRowInsert => {
+                let mut tx = pool.begin().await?;
+                for params in jobs {
+                    let args = LaneCreationJob {
+                        queue: params.opts.queue.clone(),
+                        seq: params.args["seq"].as_u64().expect("seq arg") as usize,
+                    };
+                    insert_with(&mut *tx, &args, params.opts.clone()).await?;
+                }
+                tx.commit().await?;
+                Ok(jobs.len())
+            }
+            LaneCreator::InsertMany => insert_many(pool, jobs).await.map(|rows| rows.len()),
+            LaneCreator::Copy => insert_many_copy_from_pool(pool, jobs)
+                .await
+                .map(|rows| rows.len()),
+        }
+    }
+}
+
+/// Wait until a backend of the pool tagged `application_name` is blocked on a
+/// heavyweight lock.
+async fn wait_for_lock_waiter(pool: &PgPool, application_name: &str) {
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE application_name = $1
+                  AND state = 'active'
+                  AND wait_event_type = 'Lock'
+            )
+            "#,
+        )
+        .bind(application_name)
+        .fetch_one(pool)
+        .await
+        .expect("poll pg_stat_activity");
+        if waiting {
+            return;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "no {application_name} backend started waiting on a lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Run `creator` on its own pool, tagged `application_name`.
+async fn spawn_lane_creator(
+    creator: LaneCreator,
+    application_name: &str,
+    jobs: Vec<InsertParams>,
+) -> tokio::task::JoinHandle<Result<usize, AwaError>> {
+    let producer_pool =
+        setup::pool_with_url(&setup::database_url_with_app_name(application_name), 2).await;
+    tokio::spawn(async move { creator.run(&producer_pool, &jobs).await })
+}
+
+/// Two producers create the same two new lanes, A then B. A gate transaction
+/// holds an uncommitted copy of lane A's enqueue sequence, so the first
+/// producer stalls inside lane A's provisioning, after it has taken whatever
+/// it takes before creating the sequence. The second producer is then observed
+/// blocked on lane A before the gate rolls back. Both producers must commit.
+async fn assert_lane_creators_do_not_deadlock(first: LaneCreator, second: LaneCreator) {
+    let _guard = LANE_LOCK_TEST_GUARD.lock().await;
+    let (pool, _config) = setup_queue_storage().await;
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let first_queue = format!("lane_create_a_{suffix}");
+    let second_queue = format!("lane_create_b_{suffix}");
+
+    let sequence_name: String = sqlx::query_scalar(
+        "SELECT awa.queue_lane_sequence_name('queue_enqueue_seq', $1, 2::smallint, 0::smallint)",
+    )
+    .bind(&first_queue)
+    .fetch_one(&pool)
+    .await
+    .expect("derive lane sequence name");
+    let mut gate = pool.begin().await.expect("begin gate transaction");
+    sqlx::query(&format!(
+        "CREATE SEQUENCE awa.\"{sequence_name}\" AS bigint START WITH 1 MINVALUE 1 CACHE 1"
+    ))
+    .execute(&mut *gate)
+    .await
+    .expect("gate lane sequence");
+
+    let jobs: Vec<InsertParams> = [&first_queue, &second_queue]
+        .into_iter()
+        .flat_map(|queue| (0..2).map(move |seq| job(queue, seq, false)))
+        .collect();
+
+    let first_name = format!("lane_first_{suffix}");
+    let first_task = spawn_lane_creator(first, &first_name, jobs.clone()).await;
+    wait_for_lock_waiter(&pool, &first_name).await;
+
+    let second_name = format!("lane_second_{suffix}");
+    let second_task = spawn_lane_creator(second, &second_name, jobs).await;
+    wait_for_lock_waiter(&pool, &second_name).await;
+
+    gate.rollback().await.expect("release gate");
+
+    let first_result = tokio::time::timeout(WAIT_DEADLINE, first_task)
+        .await
+        .expect("first producer finished")
+        .expect("first producer task");
+    let second_result = tokio::time::timeout(WAIT_DEADLINE, second_task)
+        .await
+        .expect("second producer finished")
+        .expect("second producer task");
+    assert_eq!(
+        first_result.unwrap_or_else(|err| panic!("{first:?} after {second:?}: {err}")),
+        4
+    );
+    assert_eq!(
+        second_result.unwrap_or_else(|err| panic!("{second:?} after {first:?}: {err}")),
+        4
+    );
+
+    for queue in [&first_queue, &second_queue] {
+        let stored: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM awa.ready_entries WHERE queue = $1")
+                .bind(queue)
+                .fetch_one(&pool)
+                .await
+                .expect("count stored jobs");
+        assert_eq!(stored, 4, "queue {queue}");
+    }
+}
+
+#[tokio::test]
+async fn queue_storage_batch_and_per_row_insert_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::QueueStorageBatch, LaneCreator::PerRowInsert)
+        .await;
+}
+
+#[tokio::test]
+async fn queue_storage_batch_and_insert_many_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::QueueStorageBatch, LaneCreator::InsertMany)
+        .await;
+}
+
+#[tokio::test]
+async fn queue_storage_batch_and_insert_many_copy_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::QueueStorageBatch, LaneCreator::Copy).await;
+}
+
+#[tokio::test]
+async fn per_row_insert_and_queue_storage_batch_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::PerRowInsert, LaneCreator::QueueStorageBatch)
+        .await;
+}
+
+#[tokio::test]
+async fn queue_storage_batches_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(
+        LaneCreator::QueueStorageBatch,
+        LaneCreator::QueueStorageBatch,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn per_row_inserts_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::PerRowInsert, LaneCreator::PerRowInsert)
+        .await;
+}
+
+#[tokio::test]
+async fn insert_many_copies_create_lanes_without_deadlock() {
+    assert_lane_creators_do_not_deadlock(LaneCreator::Copy, LaneCreator::Copy).await;
 }

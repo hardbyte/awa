@@ -7,6 +7,7 @@ use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, 
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
+use crate::runtime_control::{MaintenanceBranch, PruneControl};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
@@ -143,10 +144,13 @@ pub struct ClientBuilder {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
+    maintenance_leader: bool,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
     completed_retention: Option<Duration>,
@@ -202,10 +206,13 @@ impl ClientBuilder {
             heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
+            rescue_pass_budget: None,
+            rescue_pass_max_rows: None,
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
             leader_check_interval: None,
+            maintenance_leader: true,
             priority_aging_interval: None,
             terminal_count_rollup_interval: None,
             completed_retention: None,
@@ -321,10 +328,11 @@ impl ClientBuilder {
     /// `Started` dispatch is scheduled after the claim commits and before the
     /// worker handler is invoked. Outcome handlers run only after the
     /// corresponding DB state transition commits. Hooks are best-effort
-    /// in-process notifications, not a durable workflow mechanism; because
-    /// they run in detached tasks, a very short job can complete before a
-    /// `Started` handler finishes. Capture any shared dependencies you need in
-    /// the closure environment.
+    /// in-process notifications, not a durable workflow mechanism. `Started`
+    /// runs alongside the handler, so a very short job can complete before a
+    /// `Started` handler finishes. Each attempt's hooks hold a finalizer slot
+    /// until they return, so hooks slower than job throughput slow claiming.
+    /// Capture any shared dependencies you need in the closure environment.
     pub fn on_event<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -761,6 +769,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches of
+    /// 500 attempts, each in its own transaction (default: 1s, capped at half
+    /// the rescue interval). While a backlog remains the next pass runs
+    /// a second later. `Duration::ZERO` keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = Some(budget);
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). With a pass a second while a backlog remains,
+    /// this bounds the number rescued per second per kind, allowing one
+    /// final batch beyond the cap. Zero disables follow-up batches and early
+    /// re-arms. Retried attempts retain their normal backoff; their due times
+    /// can cluster, so this does not cap the promotion rate.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = Some(max_rows);
+        self
+    }
+
     /// Set the leader election retry interval (default: 10s).
     ///
     /// Controls how often a non-leader instance retries acquiring the maintenance
@@ -773,6 +801,26 @@ impl ClientBuilder {
     /// Set the leader connection health-check interval (default: 30s).
     pub fn leader_check_interval(mut self, interval: Duration) -> Self {
         self.leader_check_interval = Some(interval);
+        self
+    }
+
+    /// Set whether this runtime contends for maintenance leadership
+    /// (default: true).
+    ///
+    /// With `false` the runtime never takes the maintenance advisory lock, so
+    /// it never promotes, rescues, rotates or cleans up for the fleet. It
+    /// still claims and executes jobs, heartbeats them, publishes runtime
+    /// snapshots and reports runtime-control observations, and it keeps its
+    /// own periodic job declarations synced so whichever runtime leads
+    /// evaluates them. Maintenance settings on this builder, such as
+    /// retention and rescue intervals, only take effect on a runtime that
+    /// leads, so configure them on the runtimes that may lead.
+    ///
+    /// At least one live runtime must keep the default, or no maintenance
+    /// runs. An opted-out runtime logs a warning and records
+    /// `awa.maintenance.leader_eligible_runtimes = 0` while it sees none.
+    pub fn maintenance_leader(mut self, eligible: bool) -> Self {
+        self.maintenance_leader = eligible;
         self
     }
 
@@ -1117,6 +1165,8 @@ impl ClientBuilder {
             heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
+            rescue_pass_budget: self.rescue_pass_budget,
+            rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
@@ -1134,6 +1184,8 @@ impl ClientBuilder {
             metrics,
             leader_election_interval: self.leader_election_interval,
             leader_check_interval: self.leader_check_interval,
+            maintenance_leader: self.maintenance_leader,
+            leader_visibility: Arc::new(LeaderVisibility::default()),
             priority_aging_interval: self.priority_aging_interval,
             terminal_count_rollup_interval: self.terminal_count_rollup_interval,
             completed_retention: self.completed_retention,
@@ -1153,6 +1205,7 @@ impl ClientBuilder {
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
             runtime_instance_id: Uuid::new_v4(),
+            runtime_control: Arc::new(PruneControl::default()),
             runtime_started_at: Utc::now(),
             runtime_hostname: std::env::var("HOSTNAME").ok(),
             runtime_pid: std::process::id() as i32,
@@ -1213,6 +1266,8 @@ pub struct Client {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
@@ -1237,6 +1292,8 @@ pub struct Client {
     metrics: crate::metrics::AwaMetrics,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
+    maintenance_leader: bool,
+    leader_visibility: Arc<LeaderVisibility>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
     completed_retention: Option<Duration>,
@@ -1256,6 +1313,7 @@ pub struct Client {
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
     runtime_instance_id: Uuid,
+    runtime_control: Arc<PruneControl>,
     runtime_started_at: DateTime<Utc>,
     runtime_hostname: Option<String>,
     runtime_pid: i32,
@@ -1288,6 +1346,24 @@ struct RuntimeReporterState {
     queue_storage_capable: bool,
     transition_role: TransitionWorkerRole,
     metrics: crate::metrics::AwaMetrics,
+    runtime_control: Arc<PruneControl>,
+    maintenance_leader: bool,
+    leader_visibility: Arc<LeaderVisibility>,
+}
+
+/// What an opted-out runtime last saw of the runtimes that may lead, so it
+/// warns when that count reaches zero rather than on every snapshot.
+struct LeaderVisibility {
+    /// Eligible runtimes seen by the previous check; -1 before the first.
+    last_eligible: std::sync::atomic::AtomicI64,
+}
+
+impl Default for LeaderVisibility {
+    fn default() -> Self {
+        Self {
+            last_eligible: std::sync::atomic::AtomicI64::new(-1),
+        }
+    }
 }
 
 /// Best-effort extraction of the most recent error message from a job's
@@ -1383,17 +1459,6 @@ impl Client {
                     }
                 }
 
-                // Fresh-install auto-finalize: state=canonical with no
-                // operator commands run yet means a brand-new cluster
-                // shouldn't have to step through prepare → enter-mixed-
-                // transition → finalize manually. Install the queue-
-                // storage schema (idempotent — concurrent workers are
-                // safe), then ask the SQL gate to advance state directly
-                // to `active` if the fresh-install conditions hold (no
-                // canonical jobs, no live workers, prepared_engine
-                // still NULL). Returns FALSE on any non-fresh DB; the
-                // caller then falls back to the canonical-storage path
-                // and the staged transition is unaffected.
                 if status.state == "canonical" && status.prepared_engine.is_none() {
                     let configured_schema = runtime.store.schema().to_string();
                     if !transition::queue_storage_schema_ready(&self.pool, &configured_schema)
@@ -1409,20 +1474,12 @@ impl Client {
                     if promoted {
                         return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
                     }
-                    // Another worker promoted concurrently while we
-                    // were installing the schema — re-fetch and use
-                    // the now-current state.
                     let refetched = transition::status(&self.pool).await?;
                     if matches!(refetched.state.as_str(), "mixed_transition" | "active")
                         && refetched.active_engine == "queue_storage"
                     {
                         return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
                     }
-                    // Function returned FALSE because conditions weren't
-                    // met (canonical jobs exist, or another runtime is
-                    // live but in canonical-only mode). Fall through to
-                    // the canonical path; operators will need the
-                    // staged transition.
                 }
 
                 if matches!(status.state.as_str(), "mixed_transition" | "active")
@@ -1489,6 +1546,7 @@ impl Client {
             global_max_workers: self.global_max_workers,
             dlq_policy: self.dlq_policy.clone(),
             instance_id: self.runtime_instance_id,
+            runtime_control: self.runtime_control.clone(),
             started_at: self.runtime_started_at,
             hostname: self.runtime_hostname.clone(),
             pid: self.runtime_pid,
@@ -1498,6 +1556,8 @@ impl Client {
             queue_storage_capable: self.storage.queue_storage().is_some(),
             transition_role: self.transition_role,
             metrics: self.metrics.clone(),
+            maintenance_leader: self.maintenance_leader,
+            leader_visibility: self.leader_visibility.clone(),
         }
     }
 
@@ -1506,12 +1566,37 @@ impl Client {
         reporter.publish_snapshot().await;
     }
 
+    async fn warn_on_unreported_leader_opt_out(&self) {
+        if self.maintenance_leader {
+            return;
+        }
+        match admin::maintenance_eligibility_reportable(&self.pool).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "This runtime does not contend for maintenance leadership, but status reports it as \
+                 eligible: apply the runtime_maintenance_eligibility schema patch (awa migrate) and \
+                 grant this role SELECT, INSERT and DELETE on awa.runtime_maintenance_eligibility"
+            ),
+            Err(err) => warn!(
+                error = %err,
+                "Could not check whether this runtime's maintenance leadership opt-out is reported"
+            ),
+        }
+    }
+
     async fn warn_on_unsafe_prune_lock_timeout(&self) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
-        let timeout = runtime.store.prune_lock_timeout();
-        let risks = match crate::storage::check_prune_lock_timeout(&self.pool, timeout).await {
+        let timeout = runtime.store.prune_lock_wait_ceiling();
+        let statement_wait = runtime.store.prune_lock_statement_wait_ceiling();
+        let risks = match crate::storage::check_prune_lock_timeout(
+            &self.pool,
+            timeout,
+            statement_wait,
+        )
+        .await
+        {
             Ok(risks) => risks,
             Err(err) => {
                 debug!(error = %err, "Could not read lock settings to check the prune lock timeout");
@@ -1521,17 +1606,20 @@ impl Client {
         for risk in risks {
             match risk {
                 crate::storage::PruneLockTimeoutRisk::DeadlockTimeout { limit_ms } => warn!(
-                    prune_lock_timeout_ms = timeout.as_millis() as u64,
+                    prune_lock_wait_ceiling_ms = timeout.as_millis() as u64,
                     deadlock_timeout_ms = limit_ms,
-                    "Prune lock timeout is at or above deadlock_timeout; a waiting prune can \
+                    "Prune's longest lock wait is at or above deadlock_timeout; a waiting prune can \
                      make PostgreSQL run deadlock detection and cancel a concurrent claim. \
-                     Keep the timeout well below deadlock_timeout"
+                     Keep the prune lock timeout and its 320 ms retry ceiling well below \
+                     deadlock_timeout"
                 ),
                 crate::storage::PruneLockTimeoutRisk::StatementTimeout { limit_ms } => warn!(
-                    prune_lock_timeout_ms = timeout.as_millis() as u64,
+                    prune_lock_statement_wait_ms = statement_wait.as_millis() as u64,
                     statement_timeout_ms = limit_ms,
-                    "Prune lock timeout is at or above statement_timeout; prune is cancelled \
-                     by the statement timeout and fails instead of reporting blocked"
+                    "A prune lock statement can wait as long as statement_timeout, because the \
+                     lock timeout applies to each of the eight partitions it locks; prune is \
+                     then cancelled by the statement timeout and fails instead of reporting \
+                     blocked"
                 ),
             }
         }
@@ -1587,6 +1675,9 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
+        if let Err(err) = self.runtime_control.observe_pool(&self.pool).await {
+            warn!(error = %err, "Initial prune control read unavailable; reclamation stays closed");
+        }
         let effective_storage = self.resolve_effective_storage().await?;
         {
             let mut guard = self.effective_storage.write().await;
@@ -1596,19 +1687,27 @@ impl Client {
         self.log_transition_startup_status(&effective_storage)
             .await?;
         self.warn_on_unsafe_prune_lock_timeout().await;
+        self.warn_on_unreported_leader_opt_out().await;
 
-        admin::sync_queue_descriptors(
-            &self.pool,
-            &self.declared_queue_descriptors(),
-            self.runtime_snapshot_interval,
-        )
-        .await?;
-        admin::sync_job_kind_descriptors(
-            &self.pool,
-            &self.declared_job_kind_descriptors(),
-            self.runtime_snapshot_interval,
-        )
-        .await?;
+        if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
+            admission
+                .run_result(async {
+                    admin::sync_queue_descriptors(
+                        &self.pool,
+                        &self.declared_queue_descriptors(),
+                        self.runtime_snapshot_interval,
+                    )
+                    .await?;
+                    admin::sync_job_kind_descriptors(
+                        &self.pool,
+                        &self.declared_job_kind_descriptors(),
+                        self.runtime_snapshot_interval,
+                    )
+                    .await?;
+                    Ok::<(), awa_model::AwaError>(())
+                })
+                .await?;
+        }
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -1640,6 +1739,8 @@ impl Client {
             effective_storage.clone(),
             self.dlq_policy.clone(),
             self.finalizers.clone(),
+            self.service_cancel.clone(),
+            runtime_worker_capacity,
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
@@ -1699,6 +1800,7 @@ impl Client {
                 _ => None,
             },
         )
+        .runtime_control(self.runtime_control.clone(), self.runtime_instance_id)
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);
@@ -1712,12 +1814,19 @@ impl Client {
         if let Some(interval) = self.callback_rescue_interval {
             maintenance = maintenance.callback_rescue_interval(interval);
         }
+        if let Some(budget) = self.rescue_pass_budget {
+            maintenance = maintenance.rescue_pass_budget(budget);
+        }
+        if let Some(max_rows) = self.rescue_pass_max_rows {
+            maintenance = maintenance.rescue_pass_max_rows(max_rows);
+        }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
         }
         if let Some(interval) = self.leader_check_interval {
             maintenance = maintenance.leader_check_interval(interval);
         }
+        maintenance = maintenance.leader_eligible(self.maintenance_leader);
         if let Some(interval) = self.priority_aging_interval {
             maintenance = maintenance.priority_aging_interval(interval);
         }
@@ -2292,6 +2401,42 @@ impl Client {
 }
 
 impl RuntimeReporterState {
+    /// Count the other live runtimes that may take maintenance leadership,
+    /// and warn when there are none: with this runtime opted out, nothing
+    /// visible would promote, rescue or clean up.
+    async fn check_eligible_leaders(&self) {
+        let instances = match admin::list_runtime_instances(&self.pool).await {
+            Ok(instances) => instances,
+            Err(err) => {
+                warn!(error = %err, "Could not read runtime snapshots to find eligible maintenance leaders");
+                return;
+            }
+        };
+        let eligible = instances
+            .iter()
+            .filter(|instance| {
+                instance.instance_id != self.instance_id && instance.can_take_leadership()
+            })
+            .count() as i64;
+        self.metrics
+            .record_maintenance_leader_eligible_runtimes(eligible);
+        let previous = self
+            .leader_visibility
+            .last_eligible
+            .swap(eligible, Ordering::SeqCst);
+        if eligible == 0 && previous != 0 {
+            warn!(
+                "This runtime does not contend for maintenance leadership and no live runtime that \
+                 may lead is visible; promotion, rescue and cleanup stop until one starts"
+            );
+        } else if eligible > 0 && previous == 0 {
+            info!(
+                eligible_runtimes = eligible,
+                "A runtime that may take maintenance leadership is visible again"
+            );
+        }
+    }
+
     async fn storage_capability(&self) -> StorageCapability {
         if !self.queue_storage_capable {
             return StorageCapability::Canonical;
@@ -2459,6 +2604,7 @@ impl RuntimeReporterState {
             maintenance_alive,
             shutting_down,
             leader,
+            maintenance_leader: self.maintenance_leader,
             global_max_workers: self.global_max_workers,
             queues,
             queue_descriptor_hashes: self.queue_descriptor_hashes(),
@@ -2467,20 +2613,37 @@ impl RuntimeReporterState {
     }
 
     async fn publish_snapshot(&self) {
+        if !self.leader.load(Ordering::SeqCst) {
+            if let Err(err) = self.runtime_control.observe_pool(&self.pool).await {
+                warn!(error = %err, "Reporter control read failed");
+            }
+        }
         let queue_descriptors = self.declared_queue_descriptors();
         let kind_descriptors = self.declared_job_kind_descriptors();
 
-        if let Err(err) =
-            admin::sync_queue_descriptors(&self.pool, &queue_descriptors, self.snapshot_interval)
-                .await
-        {
-            warn!(error = %err, "Failed to sync queue descriptors");
-        }
-        if let Err(err) =
-            admin::sync_job_kind_descriptors(&self.pool, &kind_descriptors, self.snapshot_interval)
-                .await
-        {
-            warn!(error = %err, "Failed to sync job kind descriptors");
+        if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
+            admission
+                .run(async {
+                    if let Err(err) = admin::sync_queue_descriptors(
+                        &self.pool,
+                        &queue_descriptors,
+                        self.snapshot_interval,
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "Failed to sync queue descriptors");
+                    }
+                    if let Err(err) = admin::sync_job_kind_descriptors(
+                        &self.pool,
+                        &kind_descriptors,
+                        self.snapshot_interval,
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "Failed to sync job kind descriptors");
+                    }
+                })
+                .await;
         }
 
         // Emit OTel info gauges for every declared descriptor. One series per
@@ -2511,6 +2674,21 @@ impl RuntimeReporterState {
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
+        }
+        self.metrics
+            .record_maintenance_leader_eligible(self.maintenance_leader);
+        if !self.maintenance_leader {
+            self.check_eligible_leaders().await;
+        }
+
+        if !self.leader.load(Ordering::SeqCst) {
+            if let Err(err) = self
+                .runtime_control
+                .publish_pool(&self.pool, self.instance_id)
+                .await
+            {
+                warn!(error = %err, "Failed to publish prune control observation");
+            }
         }
 
         if self.queue_storage_capable {
@@ -2985,18 +3163,26 @@ mod tests {
             .await
             .expect("connect with session limits");
 
-        assert!(check_prune_lock_timeout(&pool, Duration::from_millis(100))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(check_prune_lock_timeout(
+            &pool,
+            Duration::from_millis(100),
+            Duration::from_millis(100)
+        )
+        .await
+        .unwrap()
+        .is_empty());
         assert_eq!(
-            check_prune_lock_timeout(&pool, Duration::from_millis(300))
-                .await
-                .unwrap(),
+            check_prune_lock_timeout(
+                &pool,
+                Duration::from_millis(300),
+                Duration::from_millis(300)
+            )
+            .await
+            .unwrap(),
             vec![PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 }]
         );
         assert_eq!(
-            check_prune_lock_timeout(&pool, Duration::from_secs(5))
+            check_prune_lock_timeout(&pool, Duration::from_secs(5), Duration::from_secs(5))
                 .await
                 .unwrap(),
             vec![

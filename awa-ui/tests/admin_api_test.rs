@@ -366,12 +366,21 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
         .await
         .unwrap();
     let stats = get_json(&app, "/api/stats").await;
-    let available = stats["available"].as_i64().unwrap_or(0);
-    let scheduled = stats["scheduled"].as_i64().unwrap_or(0);
-    let retryable = stats["retryable"].as_i64().unwrap_or(0);
-    assert_eq!(available, baseline["available"].as_i64().unwrap_or(0) + 1);
-    assert_eq!(scheduled, baseline["scheduled"].as_i64().unwrap_or(0) + 1);
-    assert_eq!(retryable, baseline["retryable"].as_i64().unwrap_or(0) + 1);
+    let count =
+        |stats: &serde_json::Value, state: &str| stats["counts"][state].as_i64().unwrap_or(0);
+    assert_eq!(
+        count(&stats, "available"),
+        count(&baseline, "available") + 1
+    );
+    assert_eq!(
+        count(&stats, "scheduled"),
+        count(&baseline, "scheduled") + 1
+    );
+    assert_eq!(
+        count(&stats, "retryable"),
+        count(&baseline, "retryable") + 1
+    );
+    assert_eq!(stats["available_is_estimate"], false);
 
     let kinds = get_json(&app, "/api/stats/kinds").await;
     let kinds = kinds.as_array().expect("kinds payload should be an array");

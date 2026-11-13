@@ -53,7 +53,7 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 ### API Endpoints
 
 ```
-GET  /api/stats                         Dashboard summary (state counts)
+GET  /api/stats                         Dashboard summary (`{counts, available_is_estimate}`)
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
 GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=

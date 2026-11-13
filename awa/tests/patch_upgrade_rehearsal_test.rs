@@ -1,14 +1,14 @@
-//! Released-artifact rehearsal of the 0.6.9 -> 0.6.10 -> 0.6.9 patch upgrade.
+//! Released-artifact rehearsal of a released -> candidate -> released patch upgrade.
 //!
 //! The journey an operator follows, as a release gate:
 //!
-//! 1. Install with the released 0.6.9 CLI as the migration owner, activate
-//!    queue storage in a custom schema, and run released 0.6.9 workers and
-//!    producers as a separate runtime role with the grants a working 0.6.9
+//! 1. Install with the released CLI as the migration owner, activate
+//!    queue storage in a custom schema, and run released workers and
+//!    producers as a separate runtime role with the grants a working released
 //!    deployment needs (schema `CREATE` included), banking a backlog.
 //! 2. Run the candidate `awa migrate` as the owner while that traffic
-//!    continues. The patch takes no lock on any queue-storage or `awa` table,
-//!    keeps every lane sequence position, and leaves routing unchanged.
+//!    continues. No pre-existing awa or queue-storage relation may be locked.
+//!    Lane positions and routing stay unchanged.
 //! 3. Run candidate and released workers together, with retries, scheduled
 //!    jobs, slow jobs in flight and a hard-killed released worker.
 //! 4. Roll back to released binaries only, including a re-run of the released
@@ -22,8 +22,9 @@
 //! on a later attempt, and per-queue counts match what was enqueued.
 //!
 //! Needs a superuser `DATABASE_URL` (it creates roles and a database) and:
-//! - `AWA_RELEASED_CLI`: the released 0.6.9 `awa` binary (the `awa-cli` wheel)
-//! - `AWA_RELEASED_PYTHON`: a Python with the released `awa-pg` 0.6.9 wheel
+//! - `AWA_RELEASED_VERSION` (optional): `0.6.9` (default) or `0.6.15`
+//! - `AWA_RELEASED_CLI`: the matching released `awa` binary (`awa-cli` wheel)
+//! - `AWA_RELEASED_PYTHON`: a Python with the matching released `awa-pg` wheel
 //! - `AWA_CANDIDATE_CLI` (optional): the candidate `awa`; defaults to
 //!   `target/debug/awa`, so build it with `cargo build -p awa-cli` first.
 //!
@@ -31,7 +32,7 @@
 //! still readable when the final accounting runs.
 
 use async_trait::async_trait;
-use awa::model::{admin, migrations, JobState, QueueStorage, QueueStorageConfig};
+use awa::model::{admin, migrations, runtime_control, JobState, QueueStorage, QueueStorageConfig};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -54,7 +55,7 @@ const PROVISIONED: &str = "rh_provisioned";
 const UNPROVISIONED: &str = "rh_unprovisioned";
 const PASSWORD: &str = "rehearsal";
 const RING_ROTATION: Duration = Duration::from_secs(3600);
-/// Long enough for jobs scheduled under 0.6.9 to come due after the patch.
+/// Long enough for jobs scheduled under released binaries to come due after the patch.
 const SCHEDULE_DELAY: Duration = Duration::from_secs(45);
 
 // ── environment ────────────────────────────────────────────────────────
@@ -80,6 +81,15 @@ fn env_path(var: &str) -> PathBuf {
     } else {
         workspace_root().join(path)
     }
+}
+
+fn released_version() -> String {
+    let version = std::env::var("AWA_RELEASED_VERSION").unwrap_or_else(|_| "0.6.9".to_string());
+    assert!(
+        matches!(version.as_str(), "0.6.9" | "0.6.15"),
+        "AWA_RELEASED_VERSION must be 0.6.9 or 0.6.15"
+    );
+    version
 }
 
 fn candidate_cli() -> PathBuf {
@@ -226,6 +236,7 @@ fn candidate_client(runtime: &PgPool, log: &EventLog, source: &str, queues: &[&s
         .heartbeat_staleness(Duration::from_secs(2))
         .promote_interval(Duration::from_millis(100))
         .leader_election_interval(Duration::from_millis(200))
+        .runtime_snapshot_interval(Duration::from_millis(100))
         .register_worker(CandidateWorker {
             source: source.to_string(),
             log: log.clone(),
@@ -280,7 +291,7 @@ async fn candidate_produce(
     }
 }
 
-// ── released (0.6.9 wheel) helpers ─────────────────────────────────────
+// ── released-wheel helpers ─────────────────────────────────────
 
 struct ReleasedWorker {
     child: Child,
@@ -324,14 +335,16 @@ async fn spawn_released_worker(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let reader_log = log.clone();
     let reader_source = source.clone();
+    let expected_version = format!("version={}", released_version());
     let reader = tokio::spawn(async move {
         let mut ready_tx = Some(ready_tx);
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if line.starts_with("READY") {
                 assert!(
-                    line.contains("version=0.6.9"),
-                    "the released worker must be the 0.6.9 wheel: {line}"
+                    line.split_whitespace()
+                        .any(|field| field == expected_version),
+                    "the released worker must report {expected_version}: {line}"
                 );
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(());
@@ -517,7 +530,7 @@ impl Fixture {
     }
 }
 
-/// The grants a working 0.6.9 deployment gives its runtime role: the
+/// The grants a working released deployment gives its runtime role: the
 /// documented DML/sequence/function grants, plus schema `CREATE`, which the
 /// 0.6.9 lane helpers need to create lane sequences lazily.
 async fn grant_released_runtime(fixture: &Fixture) {
@@ -601,9 +614,21 @@ async fn lane_positions(pool: &PgPool) -> BTreeMap<(String, i16, i16), (i64, i64
         .collect()
 }
 
-/// Relation locks stronger than `RowExclusiveLock` held by `role` on `awa` or
-/// queue-storage relations.
-async fn strong_locks_held_by(pool: &PgPool, role: &str) -> Vec<String> {
+async fn existing_relation_ids(pool: &PgPool) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT c.oid::bigint FROM pg_class AS c \
+         JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+         WHERE n.nspname IN ('awa', $1) ORDER BY c.oid",
+    )
+    .bind(SCHEMA)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Relation locks stronger than `RowExclusiveLock` held by `role` on the
+/// pre-existing `awa` or queue-storage relations.
+async fn strong_locks_held_by(pool: &PgPool, role: &str, relation_ids: &[i64]) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) \
          FROM pg_locks AS l \
@@ -612,14 +637,44 @@ async fn strong_locks_held_by(pool: &PgPool, role: &str) -> Vec<String> {
          JOIN pg_namespace AS n ON n.oid = c.relnamespace \
          WHERE a.usename = $1 AND l.locktype = 'relation' \
            AND n.nspname IN ('awa', $2) \
+           AND l.relation::bigint = ANY($3) \
            AND l.mode IN ('ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', \
                           'ExclusiveLock', 'AccessExclusiveLock')",
     )
     .bind(role)
     .bind(SCHEMA)
+    .bind(relation_ids)
     .fetch_all(pool)
     .await
     .unwrap()
+}
+
+/// The locks the `replica_identity` patch takes on the tables it alters, as
+/// formatted by `strong_locks_held_by`.
+fn replica_identity_lock(lock: &str) -> bool {
+    let Some((relation, mode)) = lock.rsplit_once(' ') else {
+        return false;
+    };
+    if relation == "awa.idx_awa_jobs_unique" {
+        return mode == "ShareLock";
+    }
+    let Some((schema, table)) = relation.split_once('.') else {
+        return false;
+    };
+    let delta = table
+        .strip_prefix("queue_terminal_count_deltas")
+        .is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix('_').is_some_and(|slot| {
+                    !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit())
+                })
+        });
+    let awa_table = schema == "awa"
+        && matches!(
+            table,
+            "admin_dirty_queue_marks" | "admin_dirty_kind_marks" | "job_unique_claims"
+        );
+    mode == "AccessExclusiveLock" && (delta || awa_table)
 }
 
 async fn lane_patch_applied(pool: &PgPool) -> migrations::SchemaPatchStatus {
@@ -669,8 +724,9 @@ async fn wait_for_drain(log: &EventLog, timeout: Duration) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "release gate: needs AWA_RELEASED_CLI and AWA_RELEASED_PYTHON (0.6.9)"]
-async fn released_0_6_9_patch_upgrade_and_rollback() {
+#[ignore = "release gate: needs matching AWA_RELEASED_CLI and AWA_RELEASED_PYTHON artifacts"]
+async fn released_patch_upgrade_and_rollback() {
+    let released_version = released_version();
     let released_cli = env_path("AWA_RELEASED_CLI");
     let candidate_cli = candidate_cli();
     assert!(
@@ -681,15 +737,15 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
     let (_, version, _) = run_cli(&released_cli, "postgres://unused", &["--version"]).await;
     assert_eq!(
         version.trim(),
-        "awa 0.6.9",
-        "AWA_RELEASED_CLI must be 0.6.9"
+        format!("awa {released_version}"),
+        "AWA_RELEASED_CLI must match AWA_RELEASED_VERSION"
     );
 
     let fixture = Fixture::create().await;
     let log = EventLog::default();
     let mut killed_sources = HashSet::new();
 
-    // ── 1. 0.6.9 install and traffic ───────────────────────────────────
+    // ── 1. released install and traffic ───────────────────────────────────
     cli_ok(&released_cli, &fixture.owner_url, &["migrate"]).await;
     for args in [
         &[
@@ -713,10 +769,32 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
     }
     grant_released_runtime(&fixture).await;
     let before = lane_patch_applied(&fixture.admin).await;
-    assert!(!before.applied, "a 0.6.9 install lacks the lane patch");
-    assert!(before
-        .needs_repair
-        .contains(&format!("lane helpers in schema {SCHEMA}")));
+    if released_version == "0.6.9" {
+        assert!(!before.applied, "a 0.6.9 install lacks the lane patch");
+        assert!(before
+            .needs_repair
+            .contains(&format!("lane helpers in schema {SCHEMA}")));
+    } else {
+        assert!(before.applied, "0.6.15 already contains the lane patch");
+        assert!(before.needs_repair.is_empty());
+        let pending = migrations::pending_schema_patches(&fixture.admin)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
+            [
+                "claim_batch_job_index",
+                "insert_jobs_compat_batch",
+                "prune_controls",
+                "runtime_maintenance_eligibility",
+                "correlated_claim_tombstones",
+                "replica_identity"
+            ],
+            "a released 0.6.15 deployment needs the claim batch index fix, the bounded-wait \
+             batch function, prune controls, the maintenance eligibility table, the \
+             correlated tombstone checks and replica identities"
+        );
+    }
 
     let worker_a = spawn_released_worker(&fixture.runtime_url, &log, &[MAIN]).await;
     let worker_b = spawn_released_worker(&fixture.runtime_url, &log, &[MAIN]).await;
@@ -772,47 +850,78 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
     .await;
 
     // ── 2. candidate patch under traffic ───────────────────────────────
-    // Lock audit: the exported patch, in one owner transaction, holds no
-    // lock above RowExclusive on any awa or queue-storage relation.
+    // Audit the complete exported patch in one owner transaction.
     let patch_sql = cli_ok(
         &candidate_cli,
         &fixture.owner_url,
         &["migrate", "--sql", "--pending", "--no-transaction"],
     )
     .await;
-    assert!(patch_sql.contains("R__prepared_lane_sequences"));
+    assert!(patch_sql.contains("R__prune_controls"));
+    if released_version == "0.6.9" {
+        assert!(patch_sql.contains("R__prepared_lane_sequences"));
+    } else {
+        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 6);
+        assert!(!patch_sql.contains("R__prepared_lane_sequences"));
+        assert!(
+            patch_sql.contains("R__claim_batch_job_index"),
+            "0.6.15's claim batch index function is replaced"
+        );
+        assert!(patch_sql.contains("R__insert_jobs_compat_batch"));
+        assert!(patch_sql.contains("R__runtime_maintenance_eligibility"));
+        assert!(patch_sql.contains("R__correlated_claim_tombstones"));
+        assert!(patch_sql.contains("R__replica_identity"));
+    }
     assert!(
         !patch_sql.contains("-- Migration V"),
         "a v40 database needs only the patch"
     );
-    {
+    let patch_relation_ids = existing_relation_ids(&fixture.admin).await;
+    assert!(!patch_relation_ids.is_empty());
+    let patch_relation_locks = {
         let owner = PgPoolOptions::new()
             .max_connections(1)
             .connect(&fixture.owner_url)
             .await
             .unwrap();
         let mut tx = owner.begin().await.unwrap();
+        let patch_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
         sqlx::raw_sql(&patch_sql).execute(&mut *tx).await.unwrap();
         let locks: Vec<String> = sqlx::query_scalar(
             "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) \
              FROM pg_locks AS l \
              JOIN pg_class AS c ON c.oid = l.relation \
              JOIN pg_namespace AS n ON n.oid = c.relnamespace \
-             WHERE l.pid = pg_backend_pid() AND l.locktype = 'relation' \
-               AND n.nspname IN ('awa', $1)",
+             WHERE l.pid = $1 AND l.locktype = 'relation' \
+               AND n.nspname IN ('awa', $2) \
+               AND l.relation::bigint = ANY($3) \
+             ORDER BY n.nspname, c.relname, l.mode",
         )
+        .bind(patch_backend_pid)
         .bind(SCHEMA)
-        .fetch_all(&mut *tx)
+        .bind(&patch_relation_ids)
+        .fetch_all(&fixture.admin)
         .await
         .unwrap();
         tx.rollback().await.unwrap();
         owner.close().await;
-        assert_eq!(
-            locks,
-            Vec::<String>::new(),
-            "the patch must not lock awa or queue-storage relations"
+        let (identity_locks, other_locks): (Vec<String>, Vec<String>) = locks
+            .into_iter()
+            .partition(|lock| replica_identity_lock(lock));
+        assert!(
+            other_locks.is_empty(),
+            "the patch locked pre-existing awa or queue-storage relations beyond the \
+             replica identity targets: {other_locks:?}"
         );
-    }
+        assert!(
+            identity_locks.contains(&"awa.job_unique_claims AccessExclusiveLock".to_string()),
+            "the replica_identity patch alters awa.job_unique_claims: {identity_locks:?}"
+        );
+        identity_locks
+    };
 
     let positions_before = lane_positions(&fixture.admin).await;
     let banked_before: Vec<_> = positions_before
@@ -847,6 +956,9 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         || log.snapshot().iter().any(concurrent),
     )
     .await;
+    let migrate_relation_ids = existing_relation_ids(&fixture.admin).await;
+    assert!(!migrate_relation_ids.is_empty());
+    let sampler_relation_ids = migrate_relation_ids.clone();
     let sampler_pool = fixture.admin.clone();
     let owner_role = fixture.owner.clone();
     let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -854,7 +966,9 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
     let sampler = tokio::spawn(async move {
         let mut seen = Vec::new();
         while sampler_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            seen.extend(strong_locks_held_by(&sampler_pool, &owner_role).await);
+            seen.extend(
+                strong_locks_held_by(&sampler_pool, &owner_role, &sampler_relation_ids).await,
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         seen
@@ -894,16 +1008,32 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         "the patch must run under traffic: {enqueued_during} enqueued while awa migrate ran \
          and {in_flight_count} jobs in flight when it started"
     );
-    assert_eq!(
-        sampled_locks,
-        Vec::<String>::new(),
-        "awa migrate took strong relation locks"
+    let unexpected_locks: Vec<&String> = sampled_locks
+        .iter()
+        .filter(|lock| !replica_identity_lock(lock))
+        .collect();
+    assert!(
+        unexpected_locks.is_empty(),
+        "awa migrate strongly locked pre-existing relations beyond the replica identity \
+         targets: {unexpected_locks:?}"
     );
+    let unexpected_lock_count = unexpected_locks.len();
     for expected in [
         "Schema: v40 (unchanged)".to_string(),
-        "Schema patch prepared_lane_sequences: applied".to_string(),
-        "lane helpers in schema awa".to_string(),
-        format!("lane helpers in schema {SCHEMA}"),
+        format!(
+            "Schema patch prepared_lane_sequences: {}",
+            if released_version == "0.6.9" {
+                "applied"
+            } else {
+                "already present"
+            }
+        ),
+        "Schema patch claim_batch_job_index: applied".to_string(),
+        "Schema patch insert_jobs_compat_batch: applied".to_string(),
+        "Schema patch prune_controls: applied".to_string(),
+        "Schema patch runtime_maintenance_eligibility: applied".to_string(),
+        "Schema patch correlated_claim_tombstones: applied".to_string(),
+        "Schema patch replica_identity: applied".to_string(),
         format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
     ] {
         assert!(
@@ -911,7 +1041,16 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
             "missing {expected:?} in:\n{migrate_out}"
         );
     }
+    if released_version == "0.6.9" {
+        assert!(migrate_out.contains("lane helpers in schema awa"));
+        assert!(migrate_out.contains(&format!("lane helpers in schema {SCHEMA}")));
+    }
     assert!(lane_patch_applied(&fixture.admin).await.applied);
+    assert!(migrations::schema_patch_status(&fixture.admin)
+        .await
+        .unwrap()
+        .iter()
+        .all(|patch| patch.applied && patch.needs_repair.is_empty()));
     producer
         .await
         .unwrap()
@@ -949,6 +1088,72 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         &[MAIN, BANKED, NEW_AFTER_PATCH],
     );
     candidate_a.start().await.expect("candidate workers start");
+    let released_pids = [
+        worker_a.child.id().unwrap() as i32,
+        worker_b.child.id().unwrap() as i32,
+    ];
+    let halt = runtime_control::halt(
+        &fixture.admin,
+        runtime_control::PRUNE_SCOPE,
+        "mixed released-fleet rehearsal",
+        "drain",
+    )
+    .await
+    .unwrap();
+    let halt_id = halt.halt_id.unwrap();
+    let control_deadline = Instant::now() + Duration::from_secs(30);
+    let mixed_fleet_control_status = loop {
+        let status = runtime_control::status(&fixture.admin).await.unwrap();
+        let released: Vec<_> = status
+            .runtimes
+            .iter()
+            .filter(|runtime| released_pids.contains(&runtime.pid) && runtime.live)
+            .collect();
+        let candidate_observes = status.runtimes.iter().any(|runtime| {
+            runtime.live
+                && !released_pids.contains(&runtime.pid)
+                && runtime.observes_current_request
+        });
+        if released.len() == 2
+            && released.iter().any(|runtime| runtime.leader)
+            && released.iter().any(|runtime| !runtime.leader)
+            && candidate_observes
+        {
+            assert_eq!(status.requested.halt_id, Some(halt_id));
+            assert_eq!(
+                status.state,
+                runtime_control::RuntimeControlState::Unconfirmed
+            );
+            for runtime in released {
+                assert_eq!(runtime.version, released_version);
+                assert!(runtime.observation.is_none());
+                assert!(status
+                    .unobserving_runtimes
+                    .iter()
+                    .any(|unobserving| unobserving.instance_id == runtime.instance_id));
+            }
+            break serde_json::to_value(&status).unwrap();
+        }
+        assert!(
+            Instant::now() < control_deadline,
+            "released leader and nonleader must remain visible during the halt: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let resumed = runtime_control::resume(&fixture.admin, runtime_control::PRUNE_SCOPE, halt_id)
+        .await
+        .unwrap();
+    assert!(resumed.halt_id.is_none());
+    let resumed_status = runtime_control::status(&fixture.admin).await.unwrap();
+    assert_eq!(
+        resumed_status.state,
+        runtime_control::RuntimeControlState::Degraded
+    );
+    assert!(resumed_status.requested.halt_id.is_none());
+    assert!(released_pids.iter().all(|pid| resumed_status
+        .unobserving_runtimes
+        .iter()
+        .any(|runtime| runtime.pid == *pid && runtime.live)));
     candidate_produce(
         &runtime,
         &log,
@@ -1012,8 +1217,12 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
     let rollback_migrate = cli_ok(&released_cli, &fixture.owner_url, &["migrate"]).await;
     assert!(rollback_migrate.contains("Migrations applied successfully"));
     assert!(
-        lane_patch_applied(&fixture.admin).await.applied,
-        "the released binaries must leave the patch installed"
+        migrations::schema_patch_status(&fixture.admin)
+            .await
+            .unwrap()
+            .iter()
+            .all(|patch| patch.applied && patch.needs_repair.is_empty()),
+        "the released binaries must leave every candidate patch installed"
     );
     killed_sources.insert(worker_b.kill().await);
     let worker_d = spawn_released_worker(
@@ -1043,7 +1252,7 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         .unwrap_or_else(|error| panic!("released enqueue on {queue} after rollback: {error}"));
     }
     wait_for_drain(&log, Duration::from_secs(120)).await;
-    // A 0.6.9 admin process reads the patched schema as the runtime role.
+    // A released admin process reads the patched schema as the runtime role.
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(NEW_AFTER_ROLLBACK), "{stats}");
 
@@ -1244,7 +1453,7 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
             "queue {queue}"
         );
     }
-    // Jobs scheduled under 0.6.9 ran once due, after the patch.
+    // Jobs scheduled under released binaries ran once due, after the patch.
     let patched_at = migrate_started + migrate_elapsed;
     let scheduled: Vec<&Event> = enqueued
         .values()
@@ -1275,10 +1484,10 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         .await
         .unwrap();
     let report = serde_json::json!({
-        "cell": "released_0_6_9_patch_upgrade_and_rollback",
+        "cell": "released_patch_upgrade_and_rollback",
         "result": "pass",
         "candidate_version": env!("CARGO_PKG_VERSION"),
-        "released_version": "0.6.9",
+        "released_version": released_version,
         "postgres": server_version,
         "schema": SCHEMA,
         "jobs_enqueued": enqueued.len(),
@@ -1288,7 +1497,13 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         "workers_killed": killed_sources.len(),
         "migrate_ms": migrate_elapsed.as_millis() as u64,
         "migrate_output": migrate_out,
+        "mixed_fleet_control_status": mixed_fleet_control_status,
         "strong_locks_sampled": sampled_locks.len(),
+        "patch_relation_ids": patch_relation_ids,
+        "patch_relation_locks": patch_relation_locks,
+        "migrate_relation_ids": migrate_relation_ids,
+        "sampled_relation_locks": sampled_locks,
+        "unexpected_relation_locks_sampled": unexpected_lock_count,
         "enqueued_during_migrate": enqueued_during,
         "completed_during_migrate": completed_during,
         "in_flight_at_migrate": in_flight_count,
@@ -1298,7 +1513,7 @@ async fn released_0_6_9_patch_upgrade_and_rollback() {
         let dir = PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("patch-upgrade-0.6.9.json"),
+            dir.join(format!("patch-upgrade-{released_version}.json")),
             serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();

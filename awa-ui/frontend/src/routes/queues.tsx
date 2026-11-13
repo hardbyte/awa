@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
+import { AvailableCount } from "@/components/AvailableCount";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
 import {
@@ -192,7 +193,9 @@ export function QueuesPage() {
                 <span className="text-muted-fg">Scheduled</span>
                 <span>{q.scheduled.toLocaleString()}</span>
                 <span className="text-muted-fg">Available</span>
-                <span>{q.available.toLocaleString()}</span>
+                <span>
+                  <AvailableCount count={q.available} isEstimate={q.available_is_estimate} />
+                </span>
                 <span className="text-muted-fg">Retryable</span>
                 <span>{q.retryable.toLocaleString()}</span>
                 <span className="text-muted-fg">Running</span>

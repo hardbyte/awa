@@ -164,6 +164,11 @@ pub struct SoakConfig {
     pub completion_stall: Duration,
     /// Largest accepted rise of resident memory, in MiB, during and after that stall.
     pub completion_stall_memory_limit_mib: f64,
+    /// Queue and claim ring rotation intervals and the prune lock timeout of every
+    /// in-process runtime. Unset keeps the library defaults.
+    pub queue_rotate_interval: Option<Duration>,
+    pub claim_rotate_interval: Option<Duration>,
+    pub prune_lock_timeout: Option<Duration>,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -293,6 +298,12 @@ impl SoakConfig {
             ),
             completion_stall_memory_limit_mib: env_parse("AWA_SOAK_COMPLETION_STALL_MEMORY_MIB")
                 .unwrap_or(128.0),
+            queue_rotate_interval: env_parse::<u64>("AWA_SOAK_QUEUE_ROTATE_MS")
+                .map(Duration::from_millis),
+            claim_rotate_interval: env_parse::<u64>("AWA_SOAK_CLAIM_ROTATE_MS")
+                .map(Duration::from_millis),
+            prune_lock_timeout: env_parse::<u64>("AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS")
+                .map(Duration::from_millis),
         })
     }
 

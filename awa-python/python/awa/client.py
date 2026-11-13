@@ -626,6 +626,16 @@ class AsyncClient:
     async def shutdown(self, timeout_ms: int = 2000) -> None:
         """Graceful shutdown: stop workers and drain in-flight jobs.
 
+        Running jobs first observe ``job.is_cancelled()``. When the timeout
+        expires, abandoned Python handlers receive an asyncio cancellation
+        request. Use ``finally`` for resource cleanup and allow
+        ``asyncio.CancelledError`` to propagate. Cancellation is cooperative;
+        it cannot stop blocking code, threads, or separately spawned tasks.
+        After the worker timeout, shutdown allows up to one additional second
+        for Python cancellation cleanup. It warns and returns if handlers
+        still have not finished. Cancelling the shutdown waiter does not stop
+        the accepted shutdown or its cleanup.
+
         The connection pool remains open so you can still query the
         database after shutdown (e.g. to verify final state). Call
         :meth:`close` when you're done to release all connections.
@@ -698,6 +708,13 @@ class AsyncClient:
         queue: str = "default",
     ) -> Callable[[Callable[[Job[T]], Awaitable[Any]]], Callable[[Job[T]], Awaitable[Any]]]:
         """Register a task handler (decorator).
+
+        Handlers can check ``job.is_cancelled()`` for graceful cancellation.
+        If an attempt outlives its deadline grace, or shutdown aborts it after
+        its timeout, Awa also requests asyncio task cancellation. Release
+        resources in ``finally`` and propagate ``asyncio.CancelledError``.
+        This is cooperative: blocking code, spawned threads and child tasks
+        require their own lifetime management.
 
         Example::
 
@@ -852,12 +869,15 @@ class AsyncClient:
         descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
+        maintenance_leader: bool = True,
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        rescue_pass_budget_ms: int | None = None,
+        rescue_pass_max_rows: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
@@ -901,6 +921,11 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``rescue_pass_budget_ms`` (default 1000) and ``rescue_pass_max_rows``
+        (default 5000) bound how long one queue-storage rescue pass keeps
+        taking 500-attempt batches and how many attempts it rescues; see the
+        configuration guide's "Draining a backlog of abandoned claims".
+
         ``queue_storage_prune_lock_timeout_ms`` sets the PostgreSQL
         ``lock_timeout`` the maintenance leader uses when pruning the queue,
         lease and claim rings (default 10 ms). Each lock acquisition gets its
@@ -911,6 +936,14 @@ class AsyncClient:
         it when ``blocked`` outcomes persist, keeping it well below the
         server's ``deadlock_timeout`` and ``statement_timeout`` (a warning is
         logged at start otherwise). Must be > 0.
+
+        ``maintenance_leader=False`` keeps this runtime from ever contending
+        for maintenance leadership. It still claims and runs jobs, heartbeats,
+        publishes runtime snapshots and keeps its own periodic job
+        declarations synced, but never promotes, rescues or cleans up for the
+        fleet, and maintenance settings passed here only apply on a runtime
+        that leads. At least one live runtime must keep the default ``True``;
+        an opted-out runtime logs a warning while it sees none.
 
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
@@ -926,12 +959,15 @@ class AsyncClient:
             descriptor_retention_days=descriptor_retention_days,
             cleanup_batch_size=cleanup_batch_size,
             leader_election_interval_ms=leader_election_interval_ms,
+            maintenance_leader=maintenance_leader,
             heartbeat_interval_ms=heartbeat_interval_ms,
             promote_interval_ms=promote_interval_ms,
             heartbeat_rescue_interval_ms=heartbeat_rescue_interval_ms,
             heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
+            rescue_pass_budget_ms=rescue_pass_budget_ms,
+            rescue_pass_max_rows=rescue_pass_max_rows,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,

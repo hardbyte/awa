@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use awa_model::admin;
-use awa_model::job::JobState;
 use awa_model::AwaError;
 use moka::future::Cache;
 
@@ -18,7 +16,7 @@ use moka::future::Cache;
 /// response value.
 #[derive(Clone)]
 pub struct DashboardCache {
-    pub stats: Cache<(), HashMap<JobState, i64>>,
+    pub stats: Cache<(), admin::StateCounts>,
     pub queues: Cache<(), Vec<admin::QueueOverview>>,
     pub runtime: Cache<(), admin::RuntimeOverview>,
     pub queue_runtime: Cache<(), Vec<admin::QueueRuntimeSummary>>,

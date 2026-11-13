@@ -78,13 +78,17 @@ impl QueueRegistry {
     /// Looks a queue up by its physical name; striped queues (`name#N`) resolve to
     /// their logical queue.
     pub fn get(&self, name: &str) -> Option<Arc<QueueInfo>> {
-        let by_name = self.by_name.read().expect("registry lock");
-        let index = by_name.get(name).or_else(|| {
-            let (logical, suffix) = name.rsplit_once('#')?;
-            suffix.parse::<u32>().ok()?;
-            by_name.get(logical)
-        })?;
-        Some(self.queues.read().expect("registry lock")[*index as usize].clone())
+        // `register` takes `queues` before `by_name`; holding `by_name` while
+        // waiting for `queues` would deadlock against it.
+        let index = {
+            let by_name = self.by_name.read().expect("registry lock");
+            *by_name.get(name).or_else(|| {
+                let (logical, suffix) = name.rsplit_once('#')?;
+                suffix.parse::<u32>().ok()?;
+                by_name.get(logical)
+            })?
+        };
+        Some(self.queues.read().expect("registry lock")[index as usize].clone())
     }
 
     pub fn by_index(&self, index: u32) -> Option<Arc<QueueInfo>> {
@@ -127,5 +131,47 @@ impl Drop for InFlightGuard {
         if let Some(queue) = &self.queue {
             queue.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueueRegistry;
+    use crate::persona_soak::config::Persona;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn lookups_and_registrations_do_not_deadlock() {
+        let registry = Arc::new(QueueRegistry::default());
+        registry.register("awa_soak_registry_0", Persona::Mia, false);
+        let (done_tx, done_rx) = mpsc::channel();
+        let registering = {
+            let registry = registry.clone();
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                for index in 1..20_000 {
+                    registry.register(&format!("awa_soak_registry_{index}"), Persona::Mia, false);
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        let looking_up = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200_000 {
+                    assert!(registry.get("awa_soak_registry_0#1").is_some());
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("register and get finish without deadlocking");
+        }
+        registering.join().unwrap();
+        looking_up.join().unwrap();
     }
 }

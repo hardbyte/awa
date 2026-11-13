@@ -258,3 +258,58 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     producer_pool.close().await;
     Ok(())
 }
+
+/// Flags Mia's exhausted jobs on `queue`: the rows a DLQ operation filtered to that
+/// queue acts on. Returns how many were flagged.
+pub fn mark_exhausted_in_queue(shared: &Shared, queue: &str, flags: u32) -> usize {
+    let Some(queue) = shared.queues.get(queue) else {
+        return 0;
+    };
+    shared.ledger.mark_where(
+        |record| {
+            record.persona == Persona::Mia
+                && record.queue == queue.index
+                && record.has(flag::EXHAUSTED)
+        },
+        flags,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_exhausted_in_queue, DEADLINE_QUEUE, INFER_QUEUE, TRAIN_QUEUE};
+    use crate::persona_soak::config::{Persona, SoakConfig};
+    use crate::persona_soak::db::{Budget, ServerInfo};
+    use crate::persona_soak::ledger::{expect, flag, JobRecord};
+    use crate::persona_soak::shared::Shared;
+
+    #[test]
+    fn a_dlq_operation_flags_only_its_own_queue() {
+        let config = SoakConfig::for_test(
+            "postgres://postgres:test@localhost/awa_soak_dlq_marks".to_string(),
+        );
+        let info = ServerInfo::default();
+        let budget = Budget::new(&info, 0);
+        let shared = Shared::new(config, info, budget);
+        for (id, queue) in [(1, TRAIN_QUEUE), (2, INFER_QUEUE), (3, DEADLINE_QUEUE)] {
+            let index = shared.queues.register(queue, Persona::Mia, false).index;
+            shared.ledger.register(
+                id,
+                JobRecord::new(
+                    Persona::Mia,
+                    index,
+                    0,
+                    expect::ANY_TERMINAL,
+                    flag::EXHAUSTED,
+                ),
+            );
+        }
+        assert_eq!(
+            mark_exhausted_in_queue(&shared, TRAIN_QUEUE, flag::DLQ_PURGED),
+            1
+        );
+        assert!(shared.ledger.get(1).unwrap().has(flag::DLQ_PURGED));
+        assert!(!shared.ledger.get(2).unwrap().has(flag::DLQ_PURGED));
+        assert!(!shared.ledger.get(3).unwrap().has(flag::DLQ_PURGED));
+    }
+}

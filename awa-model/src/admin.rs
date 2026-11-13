@@ -2,12 +2,14 @@ use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
+use crate::read_transaction::{read_until_untruncated, GuardedSnapshot, TruncationGuard};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 use sqlx::Acquire;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
+use sqlx::Postgres;
 use std::cmp::max;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -353,6 +355,7 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                     AND tomb.priority = ready.priority
                     AND tomb.enqueue_shard = ready.enqueue_shard
                     AND tomb.lane_seq = ready.lane_seq
+                    OFFSET 0
               )
         ),
         current_jobs AS (
@@ -389,6 +392,7 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                    AND tomb.priority = ready.priority
                    AND tomb.enqueue_shard = ready.enqueue_shard
                    AND tomb.lane_seq = ready.lane_seq
+                   OFFSET 0
              )
             UNION ALL
             -- Receipt claims that have not materialised into `leases` are
@@ -430,6 +434,7 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                    AND tomb.priority = ready.priority
                    AND tomb.enqueue_shard = ready.enqueue_shard
                    AND tomb.lane_seq = ready.lane_seq
+                   OFFSET 0
              )
             WHERE claims.closed_at IS NULL
               AND NOT EXISTS (
@@ -499,6 +504,7 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
                    AND tomb.priority = ready.priority
                    AND tomb.enqueue_shard = ready.enqueue_shard
                    AND tomb.lane_seq = ready.lane_seq
+                   OFFSET 0
              )
             WHERE NOT EXISTS (
                   SELECT 1 FROM {schema}.lease_claim_closures AS cx
@@ -549,24 +555,43 @@ pub fn queue_storage_current_jobs_cte(schema: &str) -> String {
     )
 }
 
-/// Each queue's available rows, exactly, and the oldest of them, as
-/// `(queue, available, oldest_run_at)`.
+/// The most unclaimed rows [`queue_overviews`] and [`state_counts`] walk in one
+/// lane to count it exactly. A lane holding more is counted from its head
+/// sequences instead, so the cost of the admin views is bounded per lane
+/// rather than following the backlog.
+pub const AVAILABLE_LANE_EXACT_COUNT_CAP: i64 = 5_000;
+
+/// Each queue's available rows and the oldest of them, as
+/// `(queue, available, available_is_estimate, oldest_run_at)`.
 ///
 /// Each lane's unclaimed rows are found the way a claim finds them: through
 /// `ready_segments` from the lane's claim cursor, then along the ready
 /// primary key within each segment's ring slot. The ready key leads with the
 /// ring slot, so a lane range without it cannot use the index and would scan
-/// every retained ready row. The cost follows the backlog.
+/// every retained ready row.
 ///
-/// `oldest_run_at` is the earliest `run_at` among those rows, not the first
-/// row's: a queue move or priority aging appends an older job behind newer
-/// ones.
+/// A lane is walked for at most [`AVAILABLE_LANE_EXACT_COUNT_CAP`] rows, one
+/// more to detect overflow. Within the cap its count is exact. Past it the
+/// lane contributes `next_seq - claim_seq`, the head-sequence depth the worker
+/// queue gauges publish, which also counts tombstoned rows, and the queue's
+/// `available_is_estimate` is set.
+///
+/// `oldest_run_at` is the earliest `run_at` among the rows walked, not the
+/// first row's: a queue move or priority aging appends an older job behind
+/// newer ones. Beyond the cap it is the oldest among the first rows in lane
+/// order.
 fn queue_storage_available_by_queue_sql(schema: &str) -> String {
     format!(
         r#"
         SELECT
             heads.queue,
-            COALESCE(sum(lane.available), 0)::bigint AS available,
+            COALESCE(sum(
+                CASE WHEN lane.walked > {cap}
+                     THEN GREATEST(heads.next_seq - heads.claim_seq, 0)
+                     ELSE lane.walked
+                END
+            ), 0)::bigint AS available,
+            COALESCE(bool_or(lane.walked > {cap}), FALSE) AS available_is_estimate,
             min(lane.oldest_run_at) AS oldest_run_at
         FROM (
             SELECT
@@ -586,13 +611,34 @@ fn queue_storage_available_by_queue_sql(schema: &str) -> String {
         ) AS lane
         GROUP BY heads.queue
         "#,
+        cap = AVAILABLE_LANE_EXACT_COUNT_CAP,
         lane_rows = queue_storage_available_lane_rows_sql(
             schema,
             "heads",
-            "count(*)::bigint AS available, min(ready.run_at) AS oldest_run_at",
+            "count(*)::bigint AS walked, min(ready.run_at) AS oldest_run_at",
             "TRUE",
+            Some(LaneWalk {
+                direction: LaneWalkDirection::FromClaimCursor,
+                limit: AVAILABLE_LANE_EXACT_COUNT_CAP + 1,
+            }),
         ),
     )
+}
+
+/// Which end of a lane's backlog a bounded walk starts from.
+#[derive(Clone, Copy)]
+enum LaneWalkDirection {
+    /// Oldest first, from the lane's claim cursor.
+    FromClaimCursor,
+    /// Newest first, from the lane's enqueue head.
+    FromTail,
+}
+
+/// A bound on how many unclaimed rows a lane walk reads.
+#[derive(Clone, Copy)]
+struct LaneWalk {
+    direction: LaneWalkDirection,
+    limit: i64,
 }
 
 /// A `SELECT {columns} FROM ready_segments JOIN ready_entries` over the
@@ -600,12 +646,52 @@ fn queue_storage_available_by_queue_sql(schema: &str) -> String {
 /// `queue`, `priority`, `enqueue_shard`, `claim_seq` and `next_seq`) that
 /// satisfy `condition` on `ready`. See [`queue_storage_available_by_queue_sql`] for why it
 /// walks segments.
+///
+/// With a `walk`, only the first `limit` rows from its end of the lane are
+/// read, and `condition` applies to those rows rather than choosing them.
 fn queue_storage_available_lane_rows_sql(
     schema: &str,
     heads: &str,
     columns: &str,
     condition: &str,
+    walk: Option<LaneWalk>,
 ) -> String {
+    match walk {
+        None => queue_storage_lane_walk_sql(schema, heads, columns, condition, None),
+        Some(walk) => {
+            let walked = queue_storage_lane_walk_sql(schema, heads, "ready.*", "TRUE", Some(walk));
+            format!(
+                r#"
+            SELECT {columns}
+            FROM ({walked}) AS ready
+            WHERE ({condition})
+            "#
+            )
+        }
+    }
+}
+
+fn queue_storage_lane_walk_sql(
+    schema: &str,
+    heads: &str,
+    columns: &str,
+    condition: &str,
+    walk: Option<LaneWalk>,
+) -> String {
+    let (direction, ready_order, limit) = match walk {
+        None => ("", String::new(), String::new()),
+        Some(LaneWalk { direction, limit }) => {
+            let keyword = match direction {
+                LaneWalkDirection::FromClaimCursor => "ASC",
+                LaneWalkDirection::FromTail => "DESC",
+            };
+            (
+                keyword,
+                format!("ORDER BY ready.lane_seq {keyword}"),
+                format!("ORDER BY segment.next_lane_seq {keyword}, ready.lane_seq {keyword} LIMIT {limit}"),
+            )
+        }
+    };
     format!(
         r#"
             SELECT {columns}
@@ -616,6 +702,7 @@ fn queue_storage_available_lane_rows_sql(
                 SELECT
                     segment.ready_slot,
                     segment.ready_generation,
+                    segment.next_lane_seq,
                     GREATEST(segment.first_lane_seq, {heads}.claim_seq) AS from_seq,
                     LEAST(segment.next_lane_seq, {heads}.next_seq) AS to_seq
                 FROM {schema}.ready_segments AS segment
@@ -624,7 +711,7 @@ fn queue_storage_available_lane_rows_sql(
                   AND segment.enqueue_shard = {heads}.enqueue_shard
                   AND segment.next_lane_seq > {heads}.claim_seq
                   AND segment.first_lane_seq < {heads}.next_seq
-                ORDER BY segment.next_lane_seq
+                ORDER BY segment.next_lane_seq {direction}
             ) AS segment
             -- Each segment's rows along the ready key within its ring slot.
             -- OFFSET 0 keeps this a per-segment probe: flattened into a
@@ -640,9 +727,14 @@ fn queue_storage_available_lane_rows_sql(
                   AND ready.enqueue_shard = {heads}.enqueue_shard
                   AND ready.lane_seq >= segment.from_seq
                   AND ready.lane_seq < segment.to_seq
+                {ready_order}
                 OFFSET 0
             ) AS ready
             WHERE ({condition})
+              -- OFFSET 0 keeps the tombstone check a probe per row checked.
+              -- Flattened into an anti join, Postgres can sort and merge
+              -- the whole tombstone table against each lane's rows, so the
+              -- cost follows the tombstones rather than the rows walked.
               AND NOT EXISTS (
                   SELECT 1 FROM {schema}.ready_tombstones AS tomb
                   WHERE tomb.ready_slot = ready.ready_slot
@@ -651,7 +743,9 @@ fn queue_storage_available_lane_rows_sql(
                     AND tomb.priority = ready.priority
                     AND tomb.enqueue_shard = ready.enqueue_shard
                     AND tomb.lane_seq = ready.lane_seq
+                    OFFSET 0
               )
+            {limit}
         "#
     )
 }
@@ -660,7 +754,8 @@ fn queue_storage_available_lane_rows_sql(
 /// They come from the live-work tables the worker queue gauges read, never
 /// from `terminal_jobs`, whose completion batches expand and join back to
 /// `ready_entries`: the cost follows live work rather than retained history.
-/// `available` is exact, and `completed_last_hour` comes from completion-batch
+/// `available` is exact up to a per-lane cap (see
+/// [`queue_storage_available_by_queue_sql`]), and `completed_last_hour` comes from completion-batch
 /// sizes and completed `done_entries` rows.
 fn queue_storage_signals_cte(schema: &str) -> String {
     format!(
@@ -807,6 +902,7 @@ fn queue_storage_signals_cte(schema: &str) -> String {
             SELECT
                 queues.queue,
                 COALESCE(ready.available, 0)::bigint AS available,
+                COALESCE(ready.available_is_estimate, FALSE) AS available_is_estimate,
                 COALESCE(leases.running, 0)::bigint AS running,
                 COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
                 COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
@@ -844,6 +940,10 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
         "head_signal",
         "ready.created_at",
         &format!("ready.created_at >= {since}"),
+        Some(LaneWalk {
+            direction: LaneWalkDirection::FromTail,
+            limit: AVAILABLE_LANE_EXACT_COUNT_CAP,
+        }),
     );
     let open_running = crate::queue_storage::open_receipt_running_claims_sql(schema);
     format!(
@@ -892,6 +992,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
                    AND tomb.priority = ready.priority
                    AND tomb.enqueue_shard = ready.enqueue_shard
                    AND tomb.lane_seq = ready.lane_seq
+                   OFFSET 0
              )
             WHERE ready.created_at >= {since}
             UNION ALL
@@ -951,6 +1052,7 @@ fn queue_storage_recent_jobs_cte(schema: &str, since: &str) -> String {
                     AND tomb.ready_generation = batch.ready_generation
                     AND tomb.job_id = item.job_id
                     AND tomb.run_lease = item.run_lease
+                    OFFSET 0
               )
             UNION ALL
             SELECT created_at, 'failed'::awa.job_state
@@ -977,7 +1079,8 @@ enum KindCountSource {
 // Generate only this source's relations: unused CTEs would still acquire
 // relation locks during parse/plan before execution could discard them.
 fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) -> String {
-    let available = queue_storage_available_lane_rows_sql(schema, "heads", "ready.kind", "TRUE");
+    let available =
+        queue_storage_available_lane_rows_sql(schema, "heads", "ready.kind", "TRUE", None);
     match source {
         KindCountSource::Available => format!(
             r#"
@@ -1017,6 +1120,7 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
                    AND tomb.priority = ready.priority
                    AND tomb.enqueue_shard = ready.enqueue_shard
                    AND tomb.lane_seq = ready.lane_seq
+                   OFFSET 0
              )
             GROUP BY ready.kind, leases.queue
             "#
@@ -1077,6 +1181,7 @@ fn queue_storage_kind_count_source_sql(schema: &str, source: KindCountSource) ->
                   AND tomb.ready_generation = batch.ready_generation
                   AND tomb.job_id = item.job_id
                   AND tomb.run_lease = item.run_lease
+                  OFFSET 0
             )
             GROUP BY ready.kind, batch.queue
             "#
@@ -1212,6 +1317,7 @@ fn queue_storage_job_id_candidates_sql(
                 "TRUE{}",
                 predicates(None, Some("ready.kind"), "ready.queue", "ready.job_id")
             ),
+            None,
         );
         let head_queue = queue
             .as_ref()
@@ -1286,6 +1392,7 @@ fn queue_storage_job_id_candidates_sql(
                        AND tomb.priority = ready.priority
                        AND tomb.enqueue_shard = ready.enqueue_shard
                        AND tomb.lane_seq = ready.lane_seq
+                       OFFSET 0
                  )
                 WHERE TRUE{predicates}
                 ORDER BY leases.job_id DESC
@@ -1313,6 +1420,7 @@ fn queue_storage_job_id_candidates_sql(
                             AND tomb.priority = ready.priority
                             AND tomb.enqueue_shard = ready.enqueue_shard
                             AND tomb.lane_seq = ready.lane_seq
+                            OFFSET 0
                       )
                     LIMIT 1
                 ) AS created
@@ -1395,6 +1503,7 @@ fn queue_storage_job_id_candidates_sql(
                             AND tomb.ready_generation = member.ready_generation
                             AND tomb.job_id = member.job_id
                             AND tomb.run_lease = member.run_lease
+                            OFFSET 0
                       )
                     LIMIT 1
                 ) AS live
@@ -1466,6 +1575,79 @@ async fn fetch_queue_storage_job_candidates(
     Ok(ids)
 }
 
+/// Candidate ids for one page of [`list_jobs`], read from one snapshot, and
+/// whether no ring partition was truncated while that snapshot was in use.
+async fn queue_storage_job_candidate_ids(
+    store: &QueueStorage,
+    pool: &PgPool,
+    filter: &ListJobsFilter,
+    cursor: Option<i64>,
+    candidate_limit: i64,
+    guard: TruncationGuard,
+) -> Result<(BTreeSet<i64>, bool), AwaError> {
+    // Every candidate phase sees the same MVCC snapshot. Each phase
+    // releases its own read locks before the next one opens more tables.
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+    let snapshot =
+        GuardedSnapshot::before_begin(&mut begin_guard.connection, store.schema(), guard).await?;
+    let mut tx = sqlx::Connection::begin_with(
+        &mut *begin_guard.connection,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .await?;
+    begin_guard.begin_pending = false;
+    snapshot.after_begin(tx.as_mut(), store.schema()).await?;
+    sqlx::query("SET LOCAL jit = off")
+        .execute(tx.as_mut())
+        .await?;
+    let states = filter.state.map_or_else(
+        || {
+            vec![
+                JobState::Available,
+                JobState::Scheduled,
+                JobState::Retryable,
+                JobState::Running,
+                JobState::WaitingExternal,
+                JobState::Completed,
+                JobState::Failed,
+                JobState::Cancelled,
+            ]
+        },
+        |state| vec![state],
+    );
+    let mut ids = BTreeSet::new();
+    for state in states {
+        let mut phase_filter = filter.clone();
+        phase_filter.state = Some(state);
+        let (sql, binds) = queue_storage_job_id_candidates_sql(
+            store.schema(),
+            &phase_filter,
+            cursor,
+            candidate_limit,
+            JobCandidateSource::States,
+        );
+        ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
+    }
+    if filter.state.is_none_or(|state| state == JobState::Running) {
+        for slot in queue_storage_populated_claim_slots(&mut tx, store).await? {
+            let (sql, binds) = queue_storage_job_id_candidates_sql(
+                store.schema(),
+                filter,
+                cursor,
+                candidate_limit,
+                JobCandidateSource::Receipts(slot),
+            );
+            ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
+        }
+    }
+    tx.commit().await?;
+    let untruncated = snapshot
+        .untruncated(&mut begin_guard.connection, store.schema())
+        .await?;
+    drop(begin_guard);
+    Ok((ids, untruncated))
+}
+
 async fn list_queue_storage_jobs(
     store: &QueueStorage,
     pool: &PgPool,
@@ -1482,60 +1664,10 @@ async fn list_queue_storage_jobs(
     let mut cursor = filter.before_id;
 
     loop {
-        // Every candidate phase sees the same MVCC snapshot. Each phase
-        // releases its own read locks before the next one opens more tables.
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin_with(
-            &mut *begin_guard.connection,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        )
+        let ids = read_until_untruncated(|guard| {
+            queue_storage_job_candidate_ids(store, pool, filter, cursor, candidate_limit, guard)
+        })
         .await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        let states = filter.state.map_or_else(
-            || {
-                vec![
-                    JobState::Available,
-                    JobState::Scheduled,
-                    JobState::Retryable,
-                    JobState::Running,
-                    JobState::WaitingExternal,
-                    JobState::Completed,
-                    JobState::Failed,
-                    JobState::Cancelled,
-                ]
-            },
-            |state| vec![state],
-        );
-        let mut ids = BTreeSet::new();
-        for state in states {
-            let mut phase_filter = filter.clone();
-            phase_filter.state = Some(state);
-            let (sql, binds) = queue_storage_job_id_candidates_sql(
-                store.schema(),
-                &phase_filter,
-                cursor,
-                candidate_limit,
-                JobCandidateSource::States,
-            );
-            ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
-        }
-        if filter.state.is_none_or(|state| state == JobState::Running) {
-            for slot in queue_storage_populated_claim_slots(&mut tx, store).await? {
-                let (sql, binds) = queue_storage_job_id_candidates_sql(
-                    store.schema(),
-                    filter,
-                    cursor,
-                    candidate_limit,
-                    JobCandidateSource::Receipts(slot),
-                );
-                ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
-            }
-        }
-        tx.commit().await?;
-        drop(begin_guard);
         let ids: Vec<i64> = ids
             .into_iter()
             .rev()
@@ -1842,6 +1974,7 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
                   AND tomb.priority = ready.priority
                   AND tomb.enqueue_shard = ready.enqueue_shard
                   AND tomb.lane_seq = ready.lane_seq
+                  OFFSET 0
             )
             UNION ALL
             SELECT job_id
@@ -1872,6 +2005,7 @@ fn unique_key_candidate_sql(schema: &str, scoped: bool) -> String {
                         AND tomb.priority = ready.priority
                         AND tomb.enqueue_shard = ready.enqueue_shard
                         AND tomb.lane_seq = ready.lane_seq
+                        OFFSET 0
                   )
                   AND ready.unique_key = $1
                 OFFSET 0
@@ -1946,6 +2080,7 @@ fn scoped_unique_key_candidate_sql(schema: &str) -> String {
                     AND tomb.priority = keyed.priority
                     AND tomb.enqueue_shard = keyed.enqueue_shard
                     AND tomb.lane_seq = keyed.lane_seq
+                    OFFSET 0
               )
             UNION ALL
             SELECT job_id
@@ -2748,11 +2883,18 @@ pub struct QueueOverview {
     pub total_queued: i64,
     pub scheduled: i64,
     pub available: i64,
+    /// `available` is a head-sequence estimate for at least one lane whose
+    /// backlog exceeds [`AVAILABLE_LANE_EXACT_COUNT_CAP`]; otherwise it is exact.
+    pub available_is_estimate: bool,
     pub retryable: i64,
     pub running: i64,
     pub failed: i64,
     pub waiting_external: i64,
     pub completed_last_hour: i64,
+    /// Seconds since the earliest `run_at` among the available rows counted.
+    /// While `available_is_estimate` is set this is a lower bound: a job
+    /// moved or aged into a lane behind its first
+    /// [`AVAILABLE_LANE_EXACT_COUNT_CAP`] rows is not seen.
     pub lag_seconds: Option<f64>,
     pub paused: bool,
 }
@@ -2930,10 +3072,19 @@ pub struct RuntimeSnapshotInput {
     pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
+    /// Whether this runtime contends for maintenance leadership. Recorded in
+    /// `awa.runtime_maintenance_eligibility` only when false, and only once
+    /// the `runtime_maintenance_eligibility` schema patch is applied.
+    #[serde(default = "maintenance_leader_default")]
+    pub maintenance_leader: bool,
     pub global_max_workers: Option<u32>,
     pub queues: Vec<QueueRuntimeSnapshot>,
     pub queue_descriptor_hashes: HashMap<String, String>,
     pub job_kind_descriptor_hashes: HashMap<String, String>,
+}
+
+fn maintenance_leader_default() -> bool {
+    true
 }
 
 /// A worker runtime instance as exposed through the admin API.
@@ -2957,11 +3108,23 @@ pub struct RuntimeInstance {
     pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
+    /// Whether this runtime may become maintenance leader. False only for a
+    /// runtime started with `maintenance_leader(false)` on a database with
+    /// the `runtime_maintenance_eligibility` schema patch; runtimes from
+    /// before the option always contend, so they report true.
+    #[serde(default = "maintenance_leader_default")]
+    pub maintenance_leader: bool,
     pub global_max_workers: Option<u32>,
     pub queues: Vec<QueueRuntimeSnapshot>,
 }
 
 impl RuntimeInstance {
+    /// Whether this runtime could take maintenance leadership now: it is
+    /// live, not shutting down, and has not opted out.
+    pub fn can_take_leadership(&self) -> bool {
+        !self.stale && !self.shutting_down && self.maintenance_leader
+    }
+
     fn stale_cutoff(interval_ms: i64) -> Duration {
         let interval_ms = max(interval_ms, 1_000);
         Duration::milliseconds(max(interval_ms.saturating_mul(3), 30_000))
@@ -2998,6 +3161,7 @@ impl RuntimeInstance {
             maintenance_alive: row.maintenance_alive,
             shutting_down: row.shutting_down,
             leader: row.leader,
+            maintenance_leader: row.maintenance_leader,
             global_max_workers: row.global_max_workers.map(|v| v as u32),
             queues: row.queues.0,
         })
@@ -3012,6 +3176,10 @@ pub struct RuntimeOverview {
     pub stale_instances: usize,
     pub healthy_instances: usize,
     pub leader_instances: usize,
+    /// Live runtimes, not shutting down, that may become maintenance leader.
+    /// Zero while runtimes are live means none of them will take leadership.
+    #[serde(default)]
+    pub leader_eligible_instances: usize,
     pub instances: Vec<RuntimeInstance>,
 }
 
@@ -3082,18 +3250,36 @@ struct RuntimeInstanceRow {
     maintenance_alive: bool,
     shutting_down: bool,
     leader: bool,
+    maintenance_leader: bool,
     global_max_workers: Option<i32>,
     queues: Json<Vec<QueueRuntimeSnapshot>>,
 }
 
 /// Upsert a runtime observability snapshot for one worker instance.
-pub async fn upsert_runtime_snapshot<'e, E>(
-    executor: E,
+///
+/// A snapshot with `maintenance_leader: false` also records the opt-out in
+/// `awa.runtime_maintenance_eligibility` when that table exists and the role
+/// may insert into it; see [`maintenance_eligibility_reportable`]. Recording
+/// the opt-out is best-effort: a failure is logged and never stops the
+/// snapshot, which the fleet relies on to tell live runtimes from dead ones.
+pub async fn upsert_runtime_snapshot<'a, A>(
+    conn: A,
     snapshot: &RuntimeSnapshotInput,
 ) -> Result<(), AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
+    let mut conn = conn.acquire().await?;
+    // Recorded before the snapshot row, so a reader never sees a new
+    // opted-out runtime without its opt-out.
+    if !snapshot.maintenance_leader {
+        if let Err(err) = record_maintenance_opt_out(&mut conn, snapshot.instance_id).await {
+            tracing::warn!(
+                error = %err,
+                "Could not record this runtime's maintenance leadership opt-out"
+            );
+        }
+    }
     sqlx::query(
         r#"
         INSERT INTO awa.runtime_instances (
@@ -3162,10 +3348,109 @@ where
     .bind(Json(&snapshot.queues))
     .bind(Json(&snapshot.queue_descriptor_hashes))
     .bind(Json(&snapshot.job_kind_descriptor_hashes))
-    .execute(executor)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
+}
+
+/// Record that `instance_id` never contends for maintenance leadership, if
+/// the table exists and this role may insert into it.
+async fn record_maintenance_opt_out(
+    conn: &mut sqlx::PgConnection,
+    instance_id: Uuid,
+) -> Result<(), AwaError> {
+    if !eligibility_table_usable(conn, &["INSERT"]).await? {
+        return Ok(());
+    }
+    // No conflict target: naming `instance_id` would also need SELECT on it.
+    // The primary key is the table's only unique constraint.
+    sqlx::query(
+        "INSERT INTO awa.runtime_maintenance_eligibility (instance_id, maintenance_leader) \
+         VALUES ($1, false) ON CONFLICT DO NOTHING",
+    )
+    .bind(instance_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Whether `awa.runtime_maintenance_eligibility` exists and this role holds
+/// every one of `privileges` on it. The table comes from a schema patch, so a
+/// binary may run against a database without it, or with a role that was
+/// never granted it; both read as "every runtime is eligible".
+pub(crate) async fn eligibility_table_usable(
+    conn: &mut sqlx::PgConnection,
+    privileges: &[&str],
+) -> Result<bool, AwaError> {
+    // has_table_privilege with a comma-separated list is true when *any* of
+    // them is held, so each privilege is checked on its own.
+    let usable: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa.runtime_maintenance_eligibility') IS NOT NULL \
+           AND (SELECT bool_and(has_table_privilege('awa.runtime_maintenance_eligibility', privilege)) \
+                FROM unnest($1::text[]) AS privilege)",
+    )
+    .bind(privileges)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(usable)
+}
+
+/// SQL for whether the `awa.runtime_instances` row aliased `runtime` may lead,
+/// for the tables this role can read.
+pub(crate) async fn maintenance_leader_sql(
+    conn: &mut sqlx::PgConnection,
+) -> Result<&'static str, AwaError> {
+    Ok(if eligibility_table_usable(conn, &["SELECT"]).await? {
+        "NOT EXISTS (SELECT 1 FROM awa.runtime_maintenance_eligibility AS eligibility \
+                     WHERE eligibility.instance_id = runtime.instance_id \
+                       AND NOT eligibility.maintenance_leader)"
+    } else {
+        "true"
+    })
+}
+
+/// Whether a runtime that opts out of maintenance leadership can have that
+/// opt-out recorded and seen: the `runtime_maintenance_eligibility` schema
+/// patch is applied and this role may insert into its table and read it.
+/// Without `SELECT` the role's own reads, including its check for other
+/// runtimes that may lead, treat every runtime as eligible. When false the
+/// runtime still never leads, but it reads, and may be reported, as eligible.
+pub async fn maintenance_eligibility_reportable<'a, A>(conn: A) -> Result<bool, AwaError>
+where
+    A: Acquire<'a, Database = Postgres>,
+{
+    let mut conn = conn.acquire().await?;
+    eligibility_table_usable(&mut conn, &["INSERT", "SELECT"]).await
+}
+
+/// Delete eligibility rows whose runtime snapshot row has gone. Rows younger
+/// than `min_age` are kept, so a runtime's opt-out recorded just before its
+/// first snapshot is not swept. Returns the number of rows deleted, or zero
+/// when the table is absent or this role may not delete from it.
+pub async fn cleanup_runtime_maintenance_eligibility<'a, A>(
+    conn: A,
+    min_age: Duration,
+) -> Result<u64, AwaError>
+where
+    A: Acquire<'a, Database = Postgres>,
+{
+    let mut conn = conn.acquire().await?;
+    // The WHERE clause reads the table's columns, which needs SELECT too.
+    if !eligibility_table_usable(&mut conn, &["DELETE", "SELECT"]).await? {
+        return Ok(0);
+    }
+    let seconds = max(min_age.num_seconds(), 1);
+    let result = sqlx::query(
+        "DELETE FROM awa.runtime_maintenance_eligibility AS eligibility \
+         WHERE eligibility.recorded_at < now() - make_interval(secs => $1) \
+           AND NOT EXISTS (SELECT 1 FROM awa.runtime_instances AS runtime \
+                           WHERE runtime.instance_id = eligibility.instance_id)",
+    )
+    .bind(seconds)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Opportunistically delete long-stale runtime snapshot rows.
@@ -3220,36 +3505,39 @@ where
 }
 
 /// List all runtime instances ordered with leader/live instances first.
-pub async fn list_runtime_instances<'e, E>(executor: E) -> Result<Vec<RuntimeInstance>, AwaError>
+pub async fn list_runtime_instances<'a, A>(conn: A) -> Result<Vec<RuntimeInstance>, AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
-    let rows = sqlx::query_as::<_, RuntimeInstanceRow>(
+    let mut conn = conn.acquire().await?;
+    let maintenance_leader = maintenance_leader_sql(&mut conn).await?;
+    let rows = sqlx::query_as::<_, RuntimeInstanceRow>(&format!(
         r#"
         SELECT
-            instance_id,
-            hostname,
-            pid,
-            version,
-            storage_capability,
-            transition_role,
-            started_at,
-            last_seen_at,
-            snapshot_interval_ms,
-            healthy,
-            postgres_connected,
-            poll_loop_alive,
-            heartbeat_alive,
-            maintenance_alive,
-            shutting_down,
-            leader,
-            global_max_workers,
-            queues
-        FROM awa.runtime_instances
-        ORDER BY leader DESC, last_seen_at DESC, started_at DESC
-        "#,
-    )
-    .fetch_all(executor)
+            runtime.instance_id,
+            runtime.hostname,
+            runtime.pid,
+            runtime.version,
+            runtime.storage_capability,
+            runtime.transition_role,
+            runtime.started_at,
+            runtime.last_seen_at,
+            runtime.snapshot_interval_ms,
+            runtime.healthy,
+            runtime.postgres_connected,
+            runtime.poll_loop_alive,
+            runtime.heartbeat_alive,
+            runtime.maintenance_alive,
+            runtime.shutting_down,
+            runtime.leader,
+            {maintenance_leader} AS maintenance_leader,
+            runtime.global_max_workers,
+            runtime.queues
+        FROM awa.runtime_instances AS runtime
+        ORDER BY runtime.leader DESC, runtime.last_seen_at DESC, runtime.started_at DESC
+        "#
+    ))
+    .fetch_all(&mut *conn)
     .await?;
 
     let now = Utc::now();
@@ -3259,16 +3547,17 @@ where
 }
 
 /// Cluster runtime overview with instance list.
-pub async fn runtime_overview<'e, E>(executor: E) -> Result<RuntimeOverview, AwaError>
+pub async fn runtime_overview<'a, A>(conn: A) -> Result<RuntimeOverview, AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
-    let instances = list_runtime_instances(executor).await?;
+    let instances = list_runtime_instances(conn).await?;
     let total_instances = instances.len();
     let stale_instances = instances.iter().filter(|i| i.stale).count();
     let live_instances = total_instances.saturating_sub(stale_instances);
     let healthy_instances = instances.iter().filter(|i| !i.stale && i.healthy).count();
     let leader_instances = instances.iter().filter(|i| !i.stale && i.leader).count();
+    let leader_eligible_instances = instances.iter().filter(|i| i.can_take_leadership()).count();
 
     Ok(RuntimeOverview {
         total_instances,
@@ -3276,16 +3565,17 @@ where
         stale_instances,
         healthy_instances,
         leader_instances,
+        leader_eligible_instances,
         instances,
     })
 }
 
 /// Queue runtime/config summary aggregated across worker snapshots.
-pub async fn queue_runtime_summary<'e, E>(executor: E) -> Result<Vec<QueueRuntimeSummary>, AwaError>
+pub async fn queue_runtime_summary<'a, A>(conn: A) -> Result<Vec<QueueRuntimeSummary>, AwaError>
 where
-    E: PgExecutor<'e>,
+    A: Acquire<'a, Database = Postgres>,
 {
-    let instances = list_runtime_instances(executor).await?;
+    let instances = list_runtime_instances(conn).await?;
     let mut by_queue: HashMap<String, Vec<(bool, bool, QueueRuntimeSnapshot)>> = HashMap::new();
 
     for instance in instances {
@@ -3424,6 +3714,7 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
                     AS total_queued,
                 COALESCE(sg.scheduled, 0) AS scheduled,
                 COALESCE(sg.available, 0) AS available,
+                COALESCE(sg.available_is_estimate, FALSE) AS available_is_estimate,
                 COALESCE(sg.retryable, 0) AS retryable,
                 COALESCE(sg.running, 0) AS running,
                 COALESCE(sg.failed, 0) AS failed,
@@ -3443,7 +3734,11 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
 
         // JIT compiles this statement for longer than it runs.
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL READ COMMITTED",
+        )
+        .await?;
         begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
@@ -3522,6 +3817,7 @@ pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaErr
             COALESCE(qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external, 0) AS total_queued,
             COALESCE(qs.scheduled, 0) AS scheduled,
             COALESCE(qs.available, 0) AS available,
+            FALSE AS available_is_estimate,
             COALESCE(qs.retryable, 0) AS retryable,
             COALESCE(qs.running, 0) AS running,
             COALESCE(qs.failed, 0) AS failed,
@@ -3882,16 +4178,36 @@ pub async fn dump_run(
     })
 }
 
+/// Job counts by state, as [`state_counts`] returns them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StateCounts {
+    pub counts: HashMap<JobState, i64>,
+    /// `counts[Available]` is a head-sequence estimate for at least one lane
+    /// holding more than [`AVAILABLE_LANE_EXACT_COUNT_CAP`] unclaimed rows;
+    /// otherwise it is exact.
+    pub available_is_estimate: bool,
+}
+
+impl StateCounts {
+    /// The count for `state`, zero if the state has no row.
+    pub fn count(&self, state: JobState) -> i64 {
+        self.counts.get(&state).copied().unwrap_or(0)
+    }
+}
+
 /// Count jobs grouped by state.
 ///
-/// Reads from the `queue_state_counts` cache table.
-pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaError> {
+/// Reads from the `queue_state_counts` cache table. On queue storage,
+/// `available` is exact up to [`AVAILABLE_LANE_EXACT_COUNT_CAP`] unclaimed
+/// rows per lane, and `available_is_estimate` says when it is not.
+pub async fn state_counts(pool: &PgPool) -> Result<StateCounts, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
             SELECT
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
-                COALESCE((SELECT sum(available)::bigint FROM ({available}) AS lanes), 0) AS available,
+                COALESCE(avail.available, 0) AS available,
+                COALESCE(avail.available_is_estimate, FALSE) AS available_is_estimate,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM ({open_running}) AS open_running), 0) AS running,
                 -- A completion batch carries its size, so completed jobs are
@@ -3906,6 +4222,12 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'cancelled'), 0) AS cancelled,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
+            FROM (
+                SELECT
+                    sum(available)::bigint AS available,
+                    bool_or(available_is_estimate) AS available_is_estimate
+                FROM ({available}) AS lanes
+            ) AS avail
             "#,
             available = queue_storage_available_by_queue_sql(store.schema()),
             open_running = crate::queue_storage::open_receipt_running_claims_sql(store.schema()),
@@ -3915,16 +4237,21 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
         let (
             scheduled,
             available,
+            available_is_estimate,
             running,
             completed,
             retryable,
             failed,
             cancelled,
             waiting_external,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64) = {
+        ): (i64, i64, bool, i64, i64, i64, i64, i64, i64) = {
             // As in `queue_overviews`: compiling costs more than running.
             let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-            let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+            let mut tx = sqlx::Connection::begin_with(
+                &mut *begin_guard.connection,
+                "BEGIN ISOLATION LEVEL READ COMMITTED",
+            )
+            .await?;
             begin_guard.begin_pending = false;
             sqlx::query("SET LOCAL jit = off")
                 .execute(tx.as_mut())
@@ -3935,16 +4262,19 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             counts
         };
 
-        return Ok(HashMap::from([
-            (JobState::Scheduled, scheduled),
-            (JobState::Available, available),
-            (JobState::Running, running),
-            (JobState::Completed, completed),
-            (JobState::Retryable, retryable),
-            (JobState::Failed, failed),
-            (JobState::Cancelled, cancelled),
-            (JobState::WaitingExternal, waiting_external),
-        ]));
+        return Ok(StateCounts {
+            counts: HashMap::from([
+                (JobState::Scheduled, scheduled),
+                (JobState::Available, available),
+                (JobState::Running, running),
+                (JobState::Completed, completed),
+                (JobState::Retryable, retryable),
+                (JobState::Failed, failed),
+                (JobState::Cancelled, cancelled),
+                (JobState::WaitingExternal, waiting_external),
+            ]),
+            available_is_estimate,
+        });
     }
 
     // Single scan of queue_state_counts — sums all columns in one pass
@@ -3978,7 +4308,10 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().collect())
+    Ok(StateCounts {
+        counts: rows.into_iter().collect(),
+        available_is_estimate: false,
+    })
 }
 
 #[derive(sqlx::FromRow)]
@@ -4138,6 +4471,7 @@ async fn queue_storage_running_kind_counts(
                         AND tomb.priority = ready.priority
                         AND tomb.enqueue_shard = ready.enqueue_shard
                         AND tomb.lane_seq = ready.lane_seq
+                        OFFSET 0
                   )
                 LIMIT 1
             ) AS created
@@ -4155,6 +4489,61 @@ async fn queue_storage_running_kind_counts(
         counts.extend(rows);
     }
     Ok(counts)
+}
+
+/// Kind overviews read from one snapshot, and whether no ring partition was
+/// truncated while that snapshot was in use.
+async fn queue_storage_job_kind_overviews(
+    store: &QueueStorage,
+    pool: &PgPool,
+    sql: &str,
+    guard: TruncationGuard,
+) -> Result<(Vec<JobKindOverview>, bool), AwaError> {
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
+    let snapshot =
+        GuardedSnapshot::before_begin(&mut begin_guard.connection, store.schema(), guard).await?;
+    let mut tx = sqlx::Connection::begin_with(
+        &mut *begin_guard.connection,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .await?;
+    begin_guard.begin_pending = false;
+    snapshot.after_begin(tx.as_mut(), store.schema()).await?;
+    // As in `queue_overviews`: compiling costs more than running.
+    sqlx::query("SET LOCAL jit = off")
+        .execute(tx.as_mut())
+        .await?;
+    let heads = queue_storage_kind_heads(&mut tx, store).await?;
+    let mut sources = queue_storage_base_kind_counts(&mut tx, store, heads).await?;
+    sources.extend(
+        queue_storage_running_kind_counts(&mut tx, store)
+            .await?
+            .into_iter()
+            .map(|(kind, queue, n)| (kind, queue, n, 0)),
+    );
+    let mut kinds = Vec::with_capacity(sources.len());
+    let mut queues = Vec::with_capacity(sources.len());
+    let mut counts = Vec::with_capacity(sources.len());
+    let mut recent_counts = Vec::with_capacity(sources.len());
+    for (kind, queue, count, recent) in sources {
+        kinds.push(kind);
+        queues.push(queue);
+        counts.push(count);
+        recent_counts.push(recent);
+    }
+    let rows = sqlx::query_as::<_, JobKindOverview>(sql)
+        .bind(kinds)
+        .bind(queues)
+        .bind(counts)
+        .bind(recent_counts)
+        .fetch_all(tx.as_mut())
+        .await?;
+    tx.commit().await?;
+    let untruncated = snapshot
+        .untruncated(&mut begin_guard.connection, store.schema())
+        .await?;
+    drop(begin_guard);
+    Ok((rows, untruncated))
 }
 
 /// Get job-kind overviews for all known kinds.
@@ -4211,45 +4600,10 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             kind_counts_cte = queue_storage_kind_counts_cte()
         );
 
-        // As in `queue_overviews`: compiling costs more than running.
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin_with(
-            &mut *begin_guard.connection,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        )
-        .await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        let heads = queue_storage_kind_heads(&mut tx, &store).await?;
-        let mut sources = queue_storage_base_kind_counts(&mut tx, &store, heads).await?;
-        sources.extend(
-            queue_storage_running_kind_counts(&mut tx, &store)
-                .await?
-                .into_iter()
-                .map(|(kind, queue, n)| (kind, queue, n, 0)),
-        );
-        let mut kinds = Vec::with_capacity(sources.len());
-        let mut queues = Vec::with_capacity(sources.len());
-        let mut counts = Vec::with_capacity(sources.len());
-        let mut recent_counts = Vec::with_capacity(sources.len());
-        for (kind, queue, count, recent) in sources {
-            kinds.push(kind);
-            queues.push(queue);
-            counts.push(count);
-            recent_counts.push(recent);
-        }
-        let rows = sqlx::query_as::<_, JobKindOverview>(&sql)
-            .bind(kinds)
-            .bind(queues)
-            .bind(counts)
-            .bind(recent_counts)
-            .fetch_all(tx.as_mut())
-            .await?;
-        tx.commit().await?;
-        drop(begin_guard);
-        return Ok(rows);
+        return read_until_untruncated(|guard| {
+            queue_storage_job_kind_overviews(&store, pool, &sql, guard)
+        })
+        .await;
     }
 
     let rows = sqlx::query_as::<_, JobKindOverview>(
@@ -4511,6 +4865,11 @@ pub struct StateTimeseriesBucket {
 }
 
 /// Return time-bucketed state counts over the last N minutes.
+///
+/// On queue storage the available buckets read at most
+/// [`AVAILABLE_LANE_EXACT_COUNT_CAP`] rows per lane, newest first. A lane
+/// that gained more available jobs than that inside the window is
+/// undercounted, with nothing in the result to mark it.
 pub async fn state_timeseries(
     pool: &PgPool,
     minutes: i32,
@@ -4528,7 +4887,11 @@ pub async fn state_timeseries(
             queue_storage_recent_jobs_cte(store.schema(), "$1")
         );
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection).await?;
+        let mut tx = sqlx::Connection::begin_with(
+            &mut *begin_guard.connection,
+            "BEGIN ISOLATION LEVEL READ COMMITTED",
+        )
+        .await?;
         begin_guard.begin_pending = false;
         sqlx::query("SET LOCAL jit = off")
             .execute(tx.as_mut())
@@ -5676,5 +6039,81 @@ fn apply_transform(job: &JobRow, payload_value: &serde_json::Value) -> serde_jso
             );
             payload_value.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{migrations, QueueStorageConfig};
+
+    /// Tombstone rows read by sequential scans, per relation. A scan of a
+    /// partition that was planned but never run, or is empty, reads none.
+    fn tombstone_rows_seq_scanned(plan: &serde_json::Value, found: &mut Vec<(String, u64)>) {
+        if plan["Node Type"] == "Seq Scan"
+            && plan["Relation Name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("ready_tombstones"))
+        {
+            let read = plan["Actual Loops"].as_u64().unwrap_or(0)
+                * (plan["Actual Rows"].as_u64().unwrap_or(0)
+                    + plan["Rows Removed by Filter"].as_u64().unwrap_or(0));
+            if read > 0 {
+                found.push((plan["Relation Name"].to_string(), read));
+            }
+        }
+        for child in plan["Plans"].as_array().into_iter().flatten() {
+            tombstone_rows_seq_scanned(child, found);
+        }
+    }
+
+    /// With many tombstones, an anti join over them sorts and merges the whole
+    /// table against each lane's rows. The count must probe them per row.
+    #[sqlx::test(migrations = false)]
+    async fn available_count_probes_tombstones_per_row(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        migrations::run(&pool).await?;
+        let schema = "tombstone_probe";
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        })?;
+        store.install(&pool).await?;
+        store
+            .enqueue_batch(&pool, "probe", 1, 4 * AVAILABLE_LANE_EXACT_COUNT_CAP)
+            .await?;
+        sqlx::raw_sql(&format!(
+            "INSERT INTO {schema}.ready_tombstones
+                 (ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id)
+             SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+             FROM {schema}.ready_entries WHERE lane_seq % 2 = 0;
+             ANALYZE {schema}.ready_entries;
+             ANALYZE {schema}.ready_tombstones;"
+        ))
+        .execute(&pool)
+        .await?;
+
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql("SET LOCAL work_mem = '125MB'; SET LOCAL random_page_cost = 1.2;")
+            .execute(&mut *tx)
+            .await?;
+        let sql = queue_storage_available_by_queue_sql(schema);
+        let explained: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.rollback().await?;
+
+        let mut scanned = Vec::new();
+        tombstone_rows_seq_scanned(&explained[0]["Plan"], &mut scanned);
+        assert!(
+            scanned.is_empty(),
+            "tombstones are read by sequential scans: {scanned:?}\n{explained:#}"
+        );
+        Ok(())
     }
 }

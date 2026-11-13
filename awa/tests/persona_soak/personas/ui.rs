@@ -571,10 +571,7 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
             5 => {
                 // Bulk actions on the DLQ by filter, as the DLQ page's toolbar does.
                 if rng.chance(50) {
-                    shared.ledger.mark_where(
-                        |record| record.persona == Persona::Mia && record.has(flag::EXHAUSTED),
-                        flag::DLQ_RETRIED,
-                    );
+                    mia::mark_exhausted_in_queue(&shared, mia::INFER_QUEUE, flag::DLQ_RETRIED);
                     http.post(
                         "/api/dlq/bulk-retry",
                         "/api/dlq/bulk-retry",
@@ -582,10 +579,7 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                     )
                     .await;
                 } else {
-                    shared.ledger.mark_where(
-                        |record| record.persona == Persona::Mia && record.has(flag::EXHAUSTED),
-                        flag::DLQ_PURGED,
-                    );
+                    mia::mark_exhausted_in_queue(&shared, mia::TRAIN_QUEUE, flag::DLQ_PURGED);
                     http.post(
                         "/api/dlq/bulk-purge",
                         "/api/dlq/bulk-purge",
@@ -594,7 +588,8 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                     .await;
                 }
             }
-            6 => {
+            // Tom declares the cron schedules; without Tom there are none to act on.
+            6 if shared.config.has(Persona::Tom) => {
                 let name = format!("soak_tom_cron_{}", rng.below(4));
                 let paused = http
                     .post(
@@ -616,7 +611,7 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                 )
                 .await;
             }
-            7 => {
+            7 if shared.config.has(Persona::Tom) => {
                 let name = format!("soak_tom_cron_{}", rng.below(4));
                 http.post(
                     "/api/cron/{name}/trigger",

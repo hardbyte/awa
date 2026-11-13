@@ -295,7 +295,7 @@ tx.commit().await?;
 awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
 ```
 
-Lifecycle hooks receive `Started` after a claim commits as the worker handler is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`, `Cancelled`) after the corresponding state transition commits. Hooks run in detached tasks, so they do not block job execution.
+Lifecycle hooks receive `Started` after a claim commits as the worker handler is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`, `Cancelled`) after the corresponding state transition commits. Hooks run alongside job execution and never delay a job's state transition, but each attempt's hooks hold a finalizer slot until they return, so hooks slower than job throughput slow claiming.
 
 Cancellation is cooperative for running handlers:
 
@@ -389,6 +389,10 @@ All coordination through Postgres. The Rust runtime owns dispatch, leases, heart
 | [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
 | [0.5 → 0.6 upgrade](docs/upgrade-0.5-to-0.6.md) | Step-by-step operator checklist for the staged storage transition |
 | [0.6.9 → 0.6.10 upgrade](docs/upgrade-0.6.9-to-0.6.10.md) | Rolling patch upgrade, rollback, and optional runtime privilege tightening |
+| [0.6.14 → 0.6.15 upgrade](docs/upgrade-0.6.14-to-0.6.15.md) | Rolling patch upgrade: bounded worker finalization, the claim batch index and the batch compatibility insert |
+| [0.6.15 → 0.6.16 upgrade](docs/upgrade-0.6.15-to-0.6.16.md) | Rolling patch upgrade: bounded rescue drains of abandoned claims, batch compatibility inserts that give way to per-row producers, new-lane provisioning order, the operator prune halt and its grants, and claim batch index fixes |
+| [0.6.16 → 0.6.17 upgrade](docs/upgrade-0.6.16-to-0.6.17.md) | Rolling patch upgrade: asynchronous claim commits, the maintenance eligibility table, the claim tombstone patch, the changed `/api/stats` and `state_counts` shape, and prune lock waits |
+| [0.6.17 → 0.6.18 upgrade](docs/upgrade-0.6.17-to-0.6.18.md) | Rolling patch upgrade: the replica identity patch and the table locks it takes, and prune truncating only partitions that hold rows |
 | [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
 | [HTTP workers and callbacks](docs/http-callbacks.md) | Serverless dispatch, callback receiver endpoints, signature verification |
 | [Lifecycle hooks](docs/lifecycle-hooks.md) | React to job start/finish/retry/callback events for metrics, alerting, cleanup |

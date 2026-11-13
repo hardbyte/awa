@@ -2,6 +2,7 @@ use crate::admin::{CallbackConfig, CallbackPollResult};
 use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
+use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
@@ -12,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_SCHEMA: &str = "awa";
@@ -23,16 +24,60 @@ const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
+/// Claim and claim-cursor transactions commit without waiting for the WAL
+/// flush. A claim lost to a server crash leaves its job claimable again, and
+/// any later synchronous commit flushes every earlier claim first.
+const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off";
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
+const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
 const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
 const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
+// Rescue cursor scans are estimated far above their real cost, enough to
+// JIT-compile them, which takes seconds against about 100 ms of execution.
+const RESCUE_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
+
+// Whether a ring child holds storage beyond the metadata an empty table keeps:
+// any heap, TOAST, free-space-map or visibility-map page, or index pages beyond
+// one btree/GiST page and three BRIN main-fork pages plus the BRIN FSM. Other
+// index methods count from their first page.
+const RECLAIMABLE_CHILD_STORAGE_SQL: &str = concat!(
+    r#"
+WITH heaps AS (
+    SELECT oid, reltoastrelid FROM pg_class
+    WHERE oid = $1::regclass AND relkind = 'r'
+), heap_relations AS (
+    SELECT oid FROM heaps
+    UNION ALL
+    SELECT reltoastrelid FROM heaps WHERE reltoastrelid <> 0
+), storage_relations AS (
+    SELECT oid, NULL::name AS amname FROM heap_relations
+    UNION ALL
+    SELECT i.indexrelid, am.amname FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_am am ON am.oid = c.relam
+    WHERE i.indrelid IN (SELECT oid FROM heap_relations)
+)
+SELECT EXISTS (
+    SELECT 1 FROM storage_relations
+    CROSS JOIN (SELECT current_setting('block_size')::bigint AS block_size) settings
+    WHERE pg_relation_size(oid, 'fsm') > block_size *
+          CASE amname WHEN 'brin' THEN "#,
+    brin_fsm_empty_pages_sql!(),
+    r#" ELSE 0 END
+       OR pg_relation_size(oid, 'vm') > 0
+       OR pg_relation_size(oid) > block_size *
+          CASE amname WHEN 'btree' THEN 1 WHEN 'gist' THEN 1
+                      WHEN 'brin' THEN 3 ELSE 0 END
+)
+"#
+);
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -147,6 +192,25 @@ pub struct ClaimedEntry {
     pub enqueue_shard: i16,
 }
 
+/// Whether a batch completion waits for each attempt's completion lock or
+/// leaves out attempts whose lock another transaction holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptLocks {
+    Wait,
+    Try,
+}
+
+/// The result of [`QueueStorage::complete_runtime_batch_isolating`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeBatchCompletion {
+    /// `(job_id, run_lease)` of attempts this batch completed.
+    pub updated: Vec<(i64, i64)>,
+    /// `(job_id, run_lease)` of attempts left out because another
+    /// transaction held their completion lock. They are neither completed
+    /// nor stale: the caller completes each on its own.
+    pub contended: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedRuntimeJob {
     pub claim: ClaimedEntry,
@@ -154,10 +218,53 @@ pub struct ClaimedRuntimeJob {
     pub unique_states: Option<String>,
 }
 
+/// Identity of a compact receipt claim for heartbeat purposes: addresses
+/// `lease_claim_batches` by primary key and the attempt by item index, so a
+/// heartbeat does not have to scan every open claim batch. Built with
+/// [`ClaimHeartbeatRef::from_claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClaimHeartbeatRef {
+    pub job_id: i64,
+    pub run_lease: i64,
+    pub claim_slot: i32,
+    pub claim_batch_id: i64,
+    pub claim_batch_index: i32,
+    pub receipt_id: i64,
+}
+
+impl ClaimHeartbeatRef {
+    /// The heartbeat identity of a compact receipt claim, or `None` for
+    /// legacy or row-local claims.
+    pub fn from_claim(job_id: i64, run_lease: i64, claim: &ClaimedEntry) -> Option<Self> {
+        if !claim.lease_claim_receipt {
+            return None;
+        }
+        Some(Self {
+            job_id,
+            run_lease,
+            claim_slot: claim.claim_slot,
+            claim_batch_id: claim.claim_batch_id?,
+            claim_batch_index: claim.claim_batch_index?,
+            receipt_id: claim.receipt_id?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct QueueClaimerLease {
     pub claimer_slot: i16,
     pub lease_epoch: i64,
+}
+
+/// How long a claim may reuse this instance's cached claimer lease before
+/// re-reading the lease row and the queue's claimer target.
+const CLAIMER_GATE_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy)]
+struct CachedClaimerGate {
+    checked_at: Instant,
+    lease: QueueClaimerLeaseRow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
@@ -343,6 +450,112 @@ pub enum PruneOutcome {
     },
 }
 
+/// Which claim slot a rescue batch visits first. A batch stops at its row
+/// limit, so whichever slot it visits first gets most of a busy batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RescueSlotOrder {
+    /// The oldest initialized claim slot, then the rest. The claim ring
+    /// cannot rotate back into that slot until its claims are closed.
+    #[default]
+    OldestFirst,
+    /// Every other slot, starting at this offset (modulo their count), then
+    /// the oldest, so a long drain of the oldest slot does not starve the rest.
+    OthersFirst(usize),
+}
+
+/// Options for one rescue batch ([`QueueStorage::rescue_stale_heartbeats_batch`]
+/// and its deadline and callback counterparts).
+#[derive(Debug, Clone, Default)]
+pub struct RescueBatchOptions {
+    pub slot_order: RescueSlotOrder,
+    /// Claim slots to leave out, typically ones an earlier batch of the same
+    /// pass found nothing in ([`RescueBatch::idle_slots`]).
+    pub skip_slots: Vec<i32>,
+    /// How many claims past its cursor each slot's stale-heartbeat or
+    /// row-local deadline walk examines (default 10,000). Every claim
+    /// examined costs its closure checks, so a batch that follows one that
+    /// filled up on a dense backlog can examine far fewer.
+    pub cursor_scan_limit: Option<usize>,
+}
+
+/// The outcome of one rescue batch, which runs in one transaction.
+#[derive(Debug, Default)]
+pub struct RescueBatch {
+    pub rescued: Vec<JobRow>,
+    /// A scan window or rescue quota was exhausted, so another bounded
+    /// batch may find eligible attempts.
+    pub saturated: bool,
+    /// Claim slots whose bounded scans completed without eligible attempts.
+    pub idle_slots: Vec<i32>,
+    /// Last cursor reached by each bounded receipt scan. A caller continuing
+    /// batches can stop a sweep once its cursor returns to its first window.
+    pub scan_progress: Vec<RescueScanProgress>,
+}
+
+/// Cursor progress from a bounded receipt rescue scan.
+#[derive(Debug, Clone)]
+pub struct RescueScanProgress {
+    pub slot: i32,
+    /// One cursor per representation, in a stable order. A slot is drained
+    /// only after every representation has completed its sweep.
+    pub cursors: Vec<RescueScanCursor>,
+}
+
+/// Progress of one independently ordered receipt representation.
+#[derive(Debug, Clone)]
+pub struct RescueScanCursor {
+    pub position: Option<(DateTime<Utc>, i64, i64)>,
+    pub saturated: bool,
+}
+
+/// Receipt claims one rescue batch took, and what it found on the way.
+#[derive(Default)]
+struct ReceiptRescueBatch {
+    rescued: Vec<DeletedLeaseRow>,
+    saturated: bool,
+    idle_slots: Vec<i32>,
+    scan_progress: Vec<RescueScanProgress>,
+}
+
+type ReceiptRescueScan = (
+    Vec<DeletedLeaseRow>,
+    bool,
+    Option<(DateTime<Utc>, i64, i64)>,
+);
+type ReceiptRescueScanRow = (
+    sqlx::types::Json<Vec<DeletedLeaseRow>>,
+    bool,
+    Option<DateTime<Utc>>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// Where a rescue sends an exhausted attempt on a queue whose DLQ is enabled.
+struct RescueDlq<'a> {
+    reason: &'static str,
+    enabled: &'a (dyn Fn(&str) -> bool + Sync),
+}
+
+/// Split rescued attempts by the state they left, keeping first-seen order,
+/// because each terminal or deferred insert releases unique claims for one
+/// previous state.
+fn group_by_previous_state<T>(
+    rows: Vec<(LeaseTransitionRow, T)>,
+) -> Vec<(JobState, Vec<(LeaseTransitionRow, T)>)> {
+    let mut groups: Vec<(JobState, Vec<(LeaseTransitionRow, T)>)> = Vec::new();
+    for (row, settled) in rows {
+        let state = row.state;
+        match groups
+            .iter_mut()
+            .find(|(group_state, _)| *group_state == state)
+        {
+            Some((_, group)) => group.push((row, settled)),
+            None => groups.push((state, vec![(row, settled)])),
+        }
+    }
+    groups
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TerminalDeltaRollupOutcome {
     pub rolled_slots: usize,
@@ -443,6 +656,15 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
+/// A lock timeout, or a deadlock in which the prune was the victim.
+fn is_prune_contention_error(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db_err)
+            if matches!(db_err.code().as_deref(), Some("55P03" | "40P01"))
+    )
+}
+
 async fn set_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     timeout: Duration,
@@ -457,15 +679,75 @@ async fn set_lock_timeout_tx(
     Ok(())
 }
 
+/// The longest single wait for prune's `ACCESS EXCLUSIVE` upgrade when the
+/// prune lock timeout is shorter than this.
+const PRUNE_LOCK_UPGRADE_CEILING: Duration = Duration::from_millis(320);
+
+/// Partitions of a queue ring slot that queue prune locks in one statement.
+const QUEUE_PRUNE_LOCKED_PARTITIONS: u32 = 8;
+
+/// The longest single wait of [`acquire_prune_exclusive_lock_tx`] for `base`.
+fn prune_lock_upgrade_ceiling(base: Duration) -> Duration {
+    base.max(PRUNE_LOCK_UPGRADE_CEILING)
+}
+
+/// Take `ACCESS EXCLUSIVE` on `tables` for a prune's truncate.
+///
+/// A pending `ACCESS EXCLUSIVE` request stalls every new reader of the
+/// tables, so each attempt waits a bounded time and then lets the readers
+/// through before the next, longer attempt. The first attempt waits `base`
+/// and each later one twice as long, up to [`prune_lock_upgrade_ceiling`].
+/// A deadlock reported for the request counts as contention: PostgreSQL
+/// raises it at once when a transaction that already reads one of the tables
+/// is waiting to write a table the prune holds in `SHARE ROW EXCLUSIVE`. The
+/// last failure is returned, and `lock_timeout` is back at `base` on success.
+async fn acquire_prune_exclusive_lock_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tables: &str,
+    base: Duration,
+) -> Result<(), AwaError> {
+    let ceiling = prune_lock_upgrade_ceiling(base);
+    let mut timeout = base;
+    loop {
+        sqlx::query("SAVEPOINT awa_prune_lock_upgrade")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(tx, timeout).await?;
+        let locked = sqlx::query(&format!("LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"))
+            .execute(tx.as_mut())
+            .await;
+        match locked {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT awa_prune_lock_upgrade")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return set_lock_timeout_tx(tx, base).await;
+            }
+            Err(err) if is_prune_contention_error(&err) && timeout < ceiling => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_lock_upgrade")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                tokio::time::sleep(base).await;
+                timeout = timeout.saturating_mul(2).min(ceiling);
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        }
+    }
+}
+
 /// Commit or roll back a maintenance transaction that has set the prune
 /// `lock_timeout`.
 ///
 /// The timeout applies to every later statement in the transaction, not only
 /// the explicit `LOCK TABLE`: an insert, update or read of another relation can
 /// also queue behind a conflicting lock (autovacuum's heap truncation takes
-/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere therefore rolls the
-/// whole transaction back and reports `blocked`, so the caller backs off and
-/// retries instead of surfacing an error.
+/// `ACCESS EXCLUSIVE`, for example). A lock timeout anywhere, or a deadlock
+/// that PostgreSQL resolves by cancelling the prune, therefore rolls the whole
+/// transaction back and reports `blocked`, so the caller backs off and retries
+/// instead of surfacing an error.
 async fn settle_prune_tx<T>(
     tx: sqlx::Transaction<'_, Postgres>,
     result: Result<T, AwaError>,
@@ -479,7 +761,7 @@ async fn settle_prune_tx<T>(
         Err(err) => {
             let _ = tx.rollback().await;
             match err {
-                AwaError::Database(ref db_err) if is_lock_contention_error(db_err) => Ok(blocked),
+                AwaError::Database(ref db_err) if is_prune_contention_error(db_err) => Ok(blocked),
                 err => Err(err),
             }
         }
@@ -866,20 +1148,20 @@ fn open_receipt_running_claims_sql_from(
         WHERE {batch_filter}NOT (
                   batches.receipt_ranges <@ COALESCE((
                       SELECT range_agg(closed)
-                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      FROM {closure_batch_rel} AS closure_batches
                       CROSS JOIN LATERAL unnest(closure_batches.receipt_ranges) AS closed
                       WHERE closure_batches.claim_slot = batches.claim_slot
                         AND closure_batches.receipt_ranges && batches.receipt_ranges
                   ), '{{}}'::int8multirange)
               )
           AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  SELECT 1 FROM {closure_rel} AS closures
                   WHERE closures.claim_slot = batches.claim_slot
                     AND closures.job_id = items.job_id
                     AND closures.run_lease = items.run_lease
               )
           AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  SELECT 1 FROM {closure_batch_rel} AS closure_batches
                   WHERE closure_batches.claim_slot = batches.claim_slot
                     AND closure_batches.receipt_ranges @> items.receipt_id
                   -- Keep the range lookup correlated: joining on claim_slot can
@@ -1238,6 +1520,7 @@ mod claim_cursor_advance_tests {
             enqueue_shard: 0,
             next_seq,
             only_if_current,
+            evidence: None,
         }
     }
 
@@ -1757,25 +2040,49 @@ struct ReadyRowIdentity {
 }
 
 /// Attempts a rescue pass leaves for a later pass, as `(job_id, run_lease)`.
-struct BusyRetained(Vec<(i64, i64)>);
+struct BusyRetained {
+    attempts: Vec<(i64, i64)>,
+    /// The attempts stay unresolvable until their retained bodies are
+    /// repaired, rather than until a lock is released.
+    unresolvable: bool,
+}
 
 impl BusyRetained {
-    fn exclude(self, excluded: &mut BTreeSet<(i64, i64)>) -> Result<(), AwaError> {
+    fn busy(attempts: Vec<(i64, i64)>) -> Self {
+        Self {
+            attempts,
+            unresolvable: false,
+        }
+    }
+
+    /// Leaves the attempts out of the rest of the pass. Busy attempts shrink
+    /// the pass's selection. Unresolvable attempts are replaced in it, so a
+    /// backlog of them, which every pass meets first, cannot fill each batch
+    /// and keep rescue from the attempts behind it.
+    fn exclude(
+        self,
+        excluded: &mut BTreeSet<(i64, i64)>,
+        selected: &mut Option<BTreeSet<(i64, i64)>>,
+    ) -> Result<(), AwaError> {
         let previous = excluded.len();
-        excluded.extend(self.0);
+        excluded.extend(self.attempts);
         if excluded.len() == previous {
             return Err(AwaError::Validation(
                 "queue storage retained attempt retry made no progress".to_string(),
             ));
         }
+        if self.unresolvable {
+            *selected = None;
+        }
         Ok(())
     }
 }
 
-/// A failure hydrating a deleted lease. `Ambiguous` names an attempt whose
-/// retained ready bodies rank equally, so none can be chosen for it.
+/// A failure hydrating deleted leases. `Ambiguous` names the attempts, as
+/// `(job_id, run_lease)`, whose retained ready bodies rank equally, so none
+/// can be chosen for them.
 enum HydrateError {
-    Ambiguous { job_id: i64, run_lease: i64 },
+    Ambiguous(Vec<(i64, i64)>),
     Awa(AwaError),
 }
 
@@ -1788,9 +2095,16 @@ impl From<AwaError> for HydrateError {
 impl From<HydrateError> for AwaError {
     fn from(err: HydrateError) -> Self {
         match err {
-            HydrateError::Ambiguous { job_id, run_lease } => AwaError::Validation(format!(
-                "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
-            )),
+            HydrateError::Ambiguous(attempts) => AwaError::Validation(match attempts.as_slice() {
+                [] => "queue storage ready body ambiguous for deleted lease".to_string(),
+                [(job_id, run_lease)] => format!(
+                    "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease}"
+                ),
+                [(job_id, run_lease), rest @ ..] => format!(
+                    "queue storage ready body ambiguous for deleted lease job {job_id} run_lease {run_lease} and {} more",
+                    rest.len()
+                ),
+            }),
             HydrateError::Awa(err) => err,
         }
     }
@@ -1853,12 +2167,32 @@ struct ClaimCursorAdvance {
     enqueue_shard: i16,
     next_seq: i64,
     only_if_current: Option<i64>,
+    /// Claim batch row that must exist for the advance to apply: the cursor
+    /// only moves past a lane position whose claim is visible on the server
+    /// the advance runs against.
+    evidence: Option<ClaimEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimEvidence {
+    ready_slot: i32,
+    ready_generation: i64,
+    lane_seq: i64,
+    /// `(job_id, run_lease)` of a claim written straight into `leases`. A
+    /// receipt claim, with or without a deadline, is proven by its
+    /// `ready_claim_attempt_batches` row instead.
+    legacy_attempt: Option<(i64, i64)>,
 }
 
 type ClaimCursorLaneKey = (String, i16, i16);
 type ConditionalClaimCursorAdvances = BTreeMap<i64, i64>;
-type GroupedClaimCursorAdvances =
-    BTreeMap<ClaimCursorLaneKey, (Option<i64>, ConditionalClaimCursorAdvances)>;
+type GroupedClaimCursorAdvances = BTreeMap<
+    ClaimCursorLaneKey,
+    (
+        Option<(i64, Option<ClaimEvidence>)>,
+        ConditionalClaimCursorAdvances,
+    ),
+>;
 type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
 struct CancelJobTxResult {
@@ -2117,6 +2451,62 @@ mod ready_segment_tests {
             unique_states: None,
             payload: serde_json::json!({}),
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
+        use super::{QueueStorageConfig, RuntimeReadyRow};
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: "awa_qs_segment_bind_limit".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store.install(&pool).await.unwrap();
+
+        // Distinct microsecond timestamps guarantee one segment per row.
+        // Reading the clock for every row can coalesce adjacent timestamps
+        // and fail to exercise the old 8,191-segment bind limit.
+        const JOBS: i64 = 9_000;
+        let first_run_at = Utc::now() - Duration::seconds(1);
+        let rows = (0..JOBS)
+            .map(|seq| RuntimeReadyRow {
+                kind: "segment_test".into(),
+                queue: "segment-q".into(),
+                args: serde_json::json!({"seq": seq}),
+                priority: 2,
+                attempt: 0,
+                run_lease: 0,
+                max_attempts: 25,
+                run_at: first_run_at + Duration::microseconds(seq),
+                attempted_at: None,
+                created_at: first_run_at,
+                unique_key: None,
+                unique_states: None,
+                payload: serde_json::json!({}),
+                ordering_key: None,
+            })
+            .collect();
+        assert_eq!(
+            store.enqueue_runtime_rows(&pool, rows).await.unwrap(),
+            JOBS as usize
+        );
+        let counts: (i64, i64) = sqlx::query_as(&format!(
+            "SELECT (SELECT count(*) FROM {}.ready_entries), \
+                    (SELECT count(*) FROM {}.ready_segments)",
+            store.schema(),
+            store.schema()
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (JOBS, JOBS));
+        let claimed = store
+            .claim_runtime_batch(&pool, "segment-q", 100, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 100);
     }
 
     #[test]
@@ -2382,7 +2772,7 @@ enum DueLaneRows<'a> {
     Oldest(i64),
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Deserialize, sqlx::FromRow)]
 struct DeletedLeaseRow {
     ready_slot: i32,
     ready_generation: i64,
@@ -2457,10 +2847,10 @@ fn select_claimed_ready_body<'a>(
     let mut best = candidates.iter().filter(|row| rank(row) == strongest);
     let ready = best.next().expect("ready body rank has a candidate");
     if best.next().is_some() {
-        return Err(HydrateError::Ambiguous {
-            job_id: reference.job_id,
-            run_lease: reference.run_lease,
-        });
+        return Err(HydrateError::Ambiguous(vec![(
+            reference.job_id,
+            reference.run_lease,
+        )]));
     }
     Ok((ready, has_emitted))
 }
@@ -2765,6 +3155,9 @@ pub struct QueueStorage {
     /// `reset()`. With the default `enqueue_shards = 1`, the cache holds 1
     /// and `pick_shard` returns 0 unconditionally.
     enqueue_shards_cache: Mutex<HashMap<String, i16>>,
+    /// This instance's claimer lease per queue, as last read or written, so a
+    /// claim does not re-read the lease and claimer target on every call.
+    claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
     /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
     /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
     /// queue_claim_heads) we have previously inserted. Skips the three
@@ -2823,6 +3216,7 @@ impl QueueStorage {
             next_stripe_probe: AtomicUsize::new(0),
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
+            claimer_gates: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
@@ -2877,6 +3271,29 @@ impl QueueStorage {
     /// The `lock_timeout` applied to prune's exclusive-lock steps.
     pub fn prune_lock_timeout(&self) -> Duration {
         self.prune_lock_timeout
+    }
+
+    /// The longest single lock wait of a prune.
+    ///
+    /// Queue and claim prune first wait [`Self::prune_lock_timeout`] for the
+    /// `ACCESS EXCLUSIVE` lock they truncate under, then retry with twice the
+    /// wait each time up to this value before reporting
+    /// [`PruneOutcome::Blocked`]. It is 320 ms, or the prune lock timeout
+    /// when that is longer.
+    pub fn prune_lock_wait_ceiling(&self) -> Duration {
+        prune_lock_upgrade_ceiling(self.prune_lock_timeout)
+    }
+
+    /// The longest a single prune lock statement can wait.
+    ///
+    /// `lock_timeout` applies to each relation a `LOCK TABLE` statement
+    /// acquires, and queue prune locks eight partitions in one statement, so
+    /// the statement can wait eight times [`Self::prune_lock_wait_ceiling`].
+    /// A `statement_timeout` at or below this can cancel the prune before
+    /// its lock timeout fires.
+    pub fn prune_lock_statement_wait_ceiling(&self) -> Duration {
+        self.prune_lock_wait_ceiling()
+            .saturating_mul(QUEUE_PRUNE_LOCKED_PARTITIONS)
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
@@ -3768,14 +4185,18 @@ impl QueueStorage {
 
         tx.commit().await.map_err(map_sqlx_error)?;
 
-        // queue_lanes was TRUNCATEd above and queue_meta may have a new
-        // shard configuration for the next round. Clear both caches so
-        // the next ensure_lane / shard_for_enqueue calls re-observe DB
-        // state.
+        // queue_lanes and queue_claimer_leases were TRUNCATEd above and
+        // queue_meta may have a new shard configuration for the next round.
+        // Clear the caches so the next ensure_lane / shard_for_enqueue /
+        // claim calls re-observe DB state.
         self.clear_lane_cache();
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
+            .clear();
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
             .clear();
         Ok(())
     }
@@ -3864,6 +4285,22 @@ impl QueueStorage {
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
         let schema = self.schema();
+        // The lane row comes before the lane lock, the order every producer
+        // takes them in: SQL inserts write the row, then take the lock in the
+        // head-table trigger that provisions the lane's sequences.
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_lanes (queue, priority)
+            VALUES ($1, $2)
+            ON CONFLICT (queue, priority) DO NOTHING
+            "#
+        ))
+        .bind(queue)
+        .bind(priority)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
         let provisioner_callable = if self.lane_provisioner_present.load(Ordering::Relaxed) {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -3894,19 +4331,6 @@ impl QueueStorage {
             self.mark_lane_ensured(queue, priority, enqueue_shard);
             return Ok(());
         }
-
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {schema}.queue_lanes (queue, priority)
-            VALUES ($1, $2)
-            ON CONFLICT (queue, priority) DO NOTHING
-            "#
-        ))
-        .bind(queue)
-        .bind(priority)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
 
         // The head tables' BEFORE INSERT triggers run even for a row that
         // ON CONFLICT then skips, and they read and set the lane's sequence.
@@ -4276,25 +4700,37 @@ impl QueueStorage {
     }
 
     fn claim_cursor_advances(rows: &[ReadyJobLeaseRow]) -> Vec<ClaimCursorAdvance> {
-        let mut next_by_lane: BTreeMap<ClaimCursorLaneKey, i64> = BTreeMap::new();
+        let mut last_by_lane: BTreeMap<ClaimCursorLaneKey, &ReadyJobLeaseRow> = BTreeMap::new();
         for row in rows {
             let key = (row.queue.clone(), row.lane_priority, row.enqueue_shard);
-            let next = row.lane_seq + 1;
-            next_by_lane
+            last_by_lane
                 .entry(key)
-                .and_modify(|current| *current = (*current).max(next))
-                .or_insert(next);
+                .and_modify(|current| {
+                    if row.lane_seq > current.lane_seq {
+                        *current = row;
+                    }
+                })
+                .or_insert(row);
         }
 
-        next_by_lane
+        last_by_lane
             .into_iter()
             .map(
-                |((queue, priority, enqueue_shard), next_seq)| ClaimCursorAdvance {
+                |((queue, priority, enqueue_shard), last)| ClaimCursorAdvance {
                     queue,
                     priority,
                     enqueue_shard,
-                    next_seq,
+                    next_seq: last.lane_seq + 1,
                     only_if_current: None,
+                    evidence: Some(ClaimEvidence {
+                        ready_slot: last.ready_slot,
+                        ready_generation: last.ready_generation,
+                        lane_seq: last.lane_seq,
+                        legacy_attempt: last
+                            .receipt_id
+                            .is_none()
+                            .then_some((last.job_id, last.run_lease)),
+                    }),
                 },
             )
             .collect()
@@ -4315,24 +4751,21 @@ impl QueueStorage {
                     .entry(only_if_current)
                     .and_modify(|next| *next = (*next).max(advance.next_seq))
                     .or_insert(advance.next_seq);
-            } else {
-                *unconditional = Some(
-                    unconditional
-                        .map(|next| next.max(advance.next_seq))
-                        .unwrap_or(advance.next_seq),
-                );
+            } else if unconditional.is_none_or(|(next, _)| advance.next_seq > next) {
+                *unconditional = Some((advance.next_seq, advance.evidence));
             }
         }
 
         let mut normalized = Vec::with_capacity(advances.len());
         for ((queue, priority, enqueue_shard), (unconditional, conditional)) in grouped {
-            if let Some(next_seq) = unconditional {
+            if let Some((next_seq, evidence)) = unconditional {
                 normalized.push(ClaimCursorAdvance {
                     queue,
                     priority,
                     enqueue_shard,
                     next_seq,
                     only_if_current: None,
+                    evidence,
                 });
                 continue;
             }
@@ -4344,11 +4777,42 @@ impl QueueStorage {
                     enqueue_shard,
                     next_seq,
                     only_if_current: Some(only_if_current),
+                    evidence: None,
                 });
             }
         }
 
         normalized
+    }
+
+    /// Replay the post-commit advance for an actual claim on the current server.
+    #[doc(hidden)]
+    pub async fn replay_claim_cursor_advance(
+        &self,
+        pool: &PgPool,
+        claimed: &ClaimedRuntimeJob,
+    ) -> Result<(), AwaError> {
+        let claim = &claimed.claim;
+        self.advance_claim_cursors_strict(
+            pool,
+            &[ClaimCursorAdvance {
+                queue: claim.queue.clone(),
+                priority: claim.priority,
+                enqueue_shard: claim.enqueue_shard,
+                next_seq: claim.lane_seq + 1,
+                only_if_current: None,
+                evidence: Some(ClaimEvidence {
+                    ready_slot: claim.ready_slot,
+                    ready_generation: claim.ready_generation,
+                    lane_seq: claim.lane_seq,
+                    legacy_attempt: claim
+                        .receipt_id
+                        .is_none()
+                        .then_some((claimed.job.id, claimed.job.run_lease)),
+                }),
+            }],
+        )
+        .await
     }
 
     async fn advance_claim_cursors(&self, pool: &PgPool, advances: &[ClaimCursorAdvance]) {
@@ -4391,7 +4855,10 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         for advance in advances {
             sqlx::query(&format!(
                 r#"
@@ -4405,8 +4872,30 @@ impl QueueStorage {
                 )
                 SELECT {schema}.set_sequence_next(seq_name, $4)
                 FROM head
-                WHERE $5::bigint IS NULL
-                   OR {schema}.sequence_next_value(seq_name) = $5
+                WHERE ($5::bigint IS NULL OR {schema}.sequence_next_value(seq_name) = $5)
+                  AND (
+                      $6::int IS NULL
+                      OR ($9::bigint IS NULL AND EXISTS (
+                          SELECT 1
+                          FROM {schema}.ready_claim_attempt_batches AS attempts
+                          WHERE attempts.ready_slot = $6
+                            AND attempts.ready_generation = $7
+                            AND attempts.queue = $1
+                            AND attempts.priority = $2
+                            AND attempts.enqueue_shard = $3
+                            AND attempts.first_lane_seq <= $8
+                            AND attempts.next_lane_seq > $8
+                            AND attempts.lane_ranges @> int8range($8, $8 + 1, '[)')
+                      ))
+                      OR EXISTS (
+                          SELECT 1 FROM {schema}.leases AS leases
+                          WHERE $9::bigint IS NOT NULL
+                            AND leases.job_id = $9 AND leases.run_lease = $10
+                            AND leases.ready_slot = $6 AND leases.ready_generation = $7
+                            AND leases.queue = $1 AND leases.enqueue_shard = $3
+                            AND leases.lane_seq = $8
+                      )
+                  )
                 "#
             ))
             .bind(&advance.queue)
@@ -4414,6 +4903,19 @@ impl QueueStorage {
             .bind(advance.enqueue_shard)
             .bind(advance.next_seq)
             .bind(advance.only_if_current)
+            .bind(advance.evidence.map(|evidence| evidence.ready_slot))
+            .bind(advance.evidence.map(|evidence| evidence.ready_generation))
+            .bind(advance.evidence.map(|evidence| evidence.lane_seq))
+            .bind(
+                advance
+                    .evidence
+                    .and_then(|evidence| evidence.legacy_attempt.map(|attempt| attempt.0)),
+            )
+            .bind(
+                advance
+                    .evidence
+                    .and_then(|evidence| evidence.legacy_attempt.map(|attempt| attempt.1)),
+            )
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -5839,7 +6341,10 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut claimed_rows = Vec::new();
         let stripe_queues = self.physical_queues_for_logical(queue);
         let start = self.stripe_probe_start(stripe_queues.len());
@@ -5962,7 +6467,10 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
         claimed.extend(
             self.claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration, aging_interval)
@@ -6152,6 +6660,27 @@ impl QueueStorage {
         }
 
         Ok(None)
+    }
+
+    #[doc(hidden)]
+    pub fn cached_claimer_lease_count(&self) -> usize {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .len()
+    }
+
+    fn cache_claimer_gate(&self, key: (String, Uuid), lease: QueueClaimerLeaseRow) {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .insert(
+                key,
+                CachedClaimerGate {
+                    checked_at: Instant::now(),
+                    lease,
+                },
+            );
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
@@ -6376,22 +6905,43 @@ impl QueueStorage {
         lease_ttl: Duration,
         idle_threshold: Duration,
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
-        let target_claimers = self
-            .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
-            .await?;
-
-        let Some(lease) = self
-            .acquire_queue_claimer_row(
-                pool,
-                queue,
-                instance_id,
-                target_claimers,
-                lease_ttl,
-                idle_threshold,
-            )
-            .await?
-        else {
-            return Ok(Vec::new());
+        let gate_key = (queue.to_string(), instance_id);
+        let cached_lease = self
+            .claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .get(&gate_key)
+            .filter(|gate| {
+                gate.checked_at.elapsed() < CLAIMER_GATE_CACHE_TTL
+                    && gate.lease.expires_at > Utc::now() + TimeDelta::seconds(1)
+            })
+            .map(|gate| gate.lease);
+        let lease = match cached_lease {
+            Some(lease) => lease,
+            None => {
+                let target_claimers = self
+                    .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
+                    .await?;
+                let Some(lease) = self
+                    .acquire_queue_claimer_row(
+                        pool,
+                        queue,
+                        instance_id,
+                        target_claimers,
+                        lease_ttl,
+                        idle_threshold,
+                    )
+                    .await?
+                else {
+                    self.claimer_gates
+                        .lock()
+                        .expect("claimer gate cache poisoned")
+                        .remove(&gate_key);
+                    return Ok(Vec::new());
+                };
+                self.cache_claimer_gate(gate_key.clone(), lease);
+                lease
+            }
         };
 
         let claimed = self
@@ -6404,10 +6954,27 @@ impl QueueStorage {
             )
             .await?;
 
-        if !claimed.is_empty() && lease.needs_refresh(Utc::now(), lease_ttl, idle_threshold) {
-            let _ = self
+        let now = Utc::now();
+        if !claimed.is_empty() && lease.needs_refresh(now, lease_ttl, idle_threshold) {
+            let still_owned = self
                 .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
                 .await?;
+            if still_owned {
+                let refreshed = QueueClaimerLeaseRow {
+                    last_claimed_at: now,
+                    expires_at: now
+                        + TimeDelta::from_std(lease_ttl).map_err(|err| {
+                            AwaError::Validation(format!("invalid claimer lease ttl: {err}"))
+                        })?,
+                    ..lease
+                };
+                self.cache_claimer_gate(gate_key, refreshed);
+            } else {
+                self.claimer_gates
+                    .lock()
+                    .expect("claimer gate cache poisoned")
+                    .remove(&gate_key);
+            }
         }
 
         Ok(claimed)
@@ -6550,10 +7117,31 @@ impl QueueStorage {
         &self,
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
-    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        locks: AttemptLocks,
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
         if claimed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RuntimeBatchCompletion::default());
         }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let (held, contended) = match locks {
+            AttemptLocks::Wait => (claimed.to_vec(), Vec::new()),
+            AttemptLocks::Try => match self.try_lock_runtime_attempts_tx(&mut tx, claimed).await {
+                Ok(split) => split,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            },
+        };
+        if held.is_empty() {
+            let _ = tx.rollback().await;
+            return Ok(RuntimeBatchCompletion {
+                updated: Vec::new(),
+                contended,
+            });
+        }
+        let claimed = held.as_slice();
 
         let schema = self.schema();
         let finalized_at = Utc::now();
@@ -6568,8 +7156,6 @@ impl QueueStorage {
                 .or_default()
                 .push(entry);
         }
-
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         // Without the per-job closure-row insert,
         // lease_claim_closure_batches become the idempotence evidence.
@@ -6868,7 +7454,10 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(rows)
+        Ok(RuntimeBatchCompletion {
+            updated: rows,
+            contended,
+        })
     }
 
     #[tracing::instrument(
@@ -6880,45 +7469,129 @@ impl QueueStorage {
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
     ) -> Result<Vec<(i64, i64)>, AwaError> {
+        Ok(self
+            .complete_runtime_batch_inner(pool, claimed, AttemptLocks::Wait)
+            .await?
+            .updated)
+    }
+
+    /// [`Self::complete_runtime_batch`] for a batch of unrelated attempts: an
+    /// attempt whose completion lock another transaction holds is left out
+    /// and returned in [`RuntimeBatchCompletion::contended`] instead of
+    /// holding up the rest of the batch. An application that calls
+    /// `admin::cancel_tx` inside its own transaction holds that lock until it
+    /// commits. The caller completes contended attempts on their own.
+    #[tracing::instrument(
+        skip(self, pool, claimed),
+        name = "queue_storage.complete_runtime_batch_isolating"
+    )]
+    pub async fn complete_runtime_batch_isolating(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
+        self.complete_runtime_batch_inner(pool, claimed, AttemptLocks::Try)
+            .await
+    }
+
+    async fn complete_runtime_batch_inner(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+        locks: AttemptLocks,
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
         if claimed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RuntimeBatchCompletion::default());
         }
 
         if self.lease_claim_receipts() && claimed.iter().all(Self::receipt_fast_complete_candidate)
         {
-            let mut updated = self
-                .complete_receipt_runtime_batch_fast(pool, claimed)
+            let mut outcome = self
+                .complete_receipt_runtime_batch_fast(pool, claimed, locks)
                 .await?;
-            if updated.len() == claimed.len() {
-                return Ok(updated);
+            if outcome.updated.len() + outcome.contended.len() == claimed.len() {
+                return Ok(outcome);
             }
 
-            let updated_pairs: BTreeSet<(i64, i64)> = updated.iter().copied().collect();
+            let settled: BTreeSet<(i64, i64)> = outcome
+                .updated
+                .iter()
+                .chain(outcome.contended.iter())
+                .copied()
+                .collect();
             let missed: Vec<_> = claimed
                 .iter()
-                .filter(|entry| !updated_pairs.contains(&(entry.job.id, entry.job.run_lease)))
+                .filter(|entry| !settled.contains(&(entry.job.id, entry.job.run_lease)))
                 .cloned()
                 .collect();
             if !missed.is_empty() {
-                updated.extend(self.complete_runtime_batch_slow(pool, &missed).await?);
+                let slow = self
+                    .complete_runtime_batch_slow(pool, &missed, locks)
+                    .await?;
+                outcome.updated.extend(slow.updated);
+                outcome.contended.extend(slow.contended);
             }
-            return Ok(updated);
+            return Ok(outcome);
         }
 
-        self.complete_runtime_batch_slow(pool, claimed).await
+        self.complete_runtime_batch_slow(pool, claimed, locks).await
     }
 
     async fn complete_runtime_batch_slow(
         &self,
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
-    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        locks: AttemptLocks,
+    ) -> Result<RuntimeBatchCompletion, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let result = self
-            .complete_runtime_batch_slow_in_tx(&mut tx, claimed)
+        // With `Try`, the attempts this transaction could lock stay locked to
+        // commit; the slow path's own `lock_receipt_attempts_tx` then takes
+        // them again, which does not wait on this transaction's own locks.
+        let (claimed, contended) = match locks {
+            AttemptLocks::Wait => (claimed.to_vec(), Vec::new()),
+            AttemptLocks::Try if self.lease_claim_receipts() => {
+                self.try_lock_runtime_attempts_tx(&mut tx, claimed).await?
+            }
+            AttemptLocks::Try => (claimed.to_vec(), Vec::new()),
+        };
+        let updated = self
+            .complete_runtime_batch_slow_in_tx(&mut tx, &claimed)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(result)
+        Ok(RuntimeBatchCompletion { updated, contended })
+    }
+
+    /// Try to take the completion lock of each attempt in `claimed` without
+    /// waiting. Returns the attempts this transaction now holds and the
+    /// `(job_id, run_lease)` pairs another transaction holds.
+    async fn try_lock_runtime_attempts_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<(Vec<ClaimedRuntimeJob>, Vec<(i64, i64)>), AwaError> {
+        let pairs: Vec<(i64, i64)> = claimed
+            .iter()
+            .map(|entry| (entry.job.id, entry.job.run_lease))
+            .collect();
+        let acquired: BTreeSet<(i64, i64)> = self
+            .try_lock_receipt_attempt_keys_tx(tx, &pairs)
+            .await?
+            .into_iter()
+            .collect();
+        let contended: BTreeSet<(i64, i64)> = pairs
+            .iter()
+            .filter(|pair| !acquired.contains(pair))
+            .copied()
+            .collect();
+        if contended.is_empty() {
+            return Ok((claimed.to_vec(), Vec::new()));
+        }
+        let held = claimed
+            .iter()
+            .filter(|entry| !contended.contains(&(entry.job.id, entry.job.run_lease)))
+            .cloned()
+            .collect();
+        Ok((held, contended.into_iter().collect()))
     }
 
     /// Same as [`Self::complete_runtime_batch_slow`] but runs on the caller's
@@ -6979,14 +7652,22 @@ impl QueueStorage {
                             .expect("receipt-backed slow completion requires receipt_id")
                     })
                     .collect();
+                let receipt_claim_batch_ids: Vec<Option<i64>> = receipt_claimed
+                    .iter()
+                    .map(|entry| entry.claim.claim_batch_id)
+                    .collect();
+                let receipt_claim_batch_indices: Vec<Option<i32>> = receipt_claimed
+                    .iter()
+                    .map(|entry| entry.claim.claim_batch_index)
+                    .collect();
                 let closure_rel = format!("{schema}.lease_claim_closures");
                 let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
                 let closed_evidence =
                     receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
                 let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
                     r#"
-                    WITH completed(claim_slot, job_id, run_lease, receipt_id) AS (
-                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bigint[])
+                    WITH completed(claim_slot, job_id, run_lease, receipt_id, claim_batch_id, claim_batch_index) AS (
+                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::int[])
                     ),
                     locked_row_claims AS (
                         SELECT claims.claim_slot, claims.job_id, claims.run_lease
@@ -7013,18 +7694,22 @@ impl QueueStorage {
                             items.job_id,
                             items.run_lease,
                             items.receipt_id
-                        FROM {schema}.lease_claim_batches AS claim_batches
-                        CROSS JOIN LATERAL unnest(
-                            claim_batches.job_ids,
-                            claim_batches.run_leases,
-                            claim_batches.receipt_ids
-                        ) AS items(job_id, run_lease, receipt_id)
-                        JOIN completed
-                          ON completed.claim_slot = claim_batches.claim_slot
-                         AND completed.job_id = items.job_id
-                         AND completed.run_lease = items.run_lease
-                         AND completed.receipt_id = items.receipt_id
-                        WHERE claim_batches.job_ids && $2::bigint[]
+                        FROM completed
+                        JOIN {schema}.lease_claim_batches AS claim_batches
+                          ON claim_batches.claim_slot = completed.claim_slot
+                         AND claim_batches.batch_id = completed.claim_batch_id
+                        CROSS JOIN LATERAL (
+                            SELECT
+                                claim_batches.job_ids[completed.claim_batch_index] AS job_id,
+                                claim_batches.run_leases[completed.claim_batch_index] AS run_lease,
+                                claim_batches.receipt_ids[completed.claim_batch_index] AS receipt_id
+                        ) AS items
+                        WHERE completed.claim_batch_id IS NOT NULL
+                          AND completed.claim_batch_index IS NOT NULL
+                          AND completed.claim_batch_index BETWEEN 1 AND claim_batches.claimed_count
+                          AND completed.job_id = items.job_id
+                          AND completed.run_lease = items.run_lease
+                          AND completed.receipt_id = items.receipt_id
                           AND NOT EXISTS (
                               SELECT 1
                               FROM {schema}.lease_claim_closures AS closures
@@ -7062,7 +7747,6 @@ impl QueueStorage {
                               WHERE dlq.job_id = items.job_id
                                 AND dlq.run_lease = items.run_lease
                           )
-                        FOR UPDATE OF claim_batches
                     ),
                     locked_claims AS (
                         SELECT claim_slot, job_id, run_lease FROM locked_row_claims
@@ -7154,6 +7838,8 @@ impl QueueStorage {
                 .bind(&receipt_job_ids)
                 .bind(&receipt_run_leases)
                 .bind(&receipt_receipt_ids)
+                .bind(&receipt_claim_batch_ids)
+                .bind(&receipt_claim_batch_indices)
                 .fetch_all(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
@@ -8721,6 +9407,7 @@ impl QueueStorage {
                 enqueue_shard: ready.enqueue_shard,
                 next_seq: ready.lane_seq + 1,
                 only_if_current: Some(ready.lane_seq),
+                evidence: None,
             };
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
@@ -10192,6 +10879,47 @@ impl QueueStorage {
         Ok(())
     }
 
+    /// Take the closers' attempt locks without waiting, returning the attempts
+    /// locked. A heartbeat must not queue behind a closer: an attempt whose lock
+    /// is held is being finalized or rescued right now, and rescue skips it for
+    /// as long as the lock is held. Taking the locks in a statement of their own
+    /// means the statement that then decides what is still open starts after
+    /// every closer that held a lock first has committed (#614), so a heartbeat
+    /// cannot recreate state for an attempt that has just been closed.
+    async fn try_lock_receipt_attempt_keys_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        jobs: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            WITH attempts AS MATERIALIZED (
+                SELECT DISTINCT
+                    input.job_id,
+                    input.run_lease,
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', input.job_id, input.run_lease),
+                        0
+                    ) AS lock_key
+                FROM unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
+            )
+            SELECT job_id, run_lease
+            FROM attempts
+            WHERE pg_catalog.pg_try_advisory_xact_lock(lock_key)
+            "#,
+        )
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     async fn ensure_running_leases_from_receipts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -10488,7 +11216,6 @@ impl QueueStorage {
                       WHERE dlq.job_id = items.job_id
                         AND dlq.run_lease = items.run_lease
                   )
-                FOR UPDATE OF claim_batches
             ),
             claim_refs AS (
                 SELECT * FROM row_claim_refs
@@ -10524,10 +11251,14 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
+    /// With `skip_locked`, attempts whose lock another transaction holds are
+    /// left out, as a heartbeat batch wants. Without it the call waits for
+    /// each attempt's lock, so an explicit flush is never dropped.
     async fn upsert_attempt_state_progress_from_receipts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         jobs: &[(i64, i64, serde_json::Value)],
+        skip_locked: bool,
     ) -> Result<usize, AwaError> {
         if jobs.is_empty() {
             return Ok(0);
@@ -10537,6 +11268,28 @@ impl QueueStorage {
             .iter()
             .map(|(job_id, run_lease, _)| (*job_id, *run_lease))
             .collect();
+        let locked: Option<HashSet<_>> = if skip_locked {
+            Some(
+                self.try_lock_receipt_attempt_keys_tx(tx, &receipt_jobs)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let jobs: Vec<_> = jobs
+            .iter()
+            .filter(|(job_id, run_lease, _)| {
+                locked
+                    .as_ref()
+                    .is_none_or(|locked| locked.contains(&(*job_id, *run_lease)))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+        let receipt_jobs: Vec<_> = jobs.iter().map(|(id, lease, _)| (*id, *lease)).collect();
         self.lock_receipt_attempts_tx(tx, &receipt_jobs).await?;
 
         let schema = self.schema();
@@ -10606,7 +11359,6 @@ impl QueueStorage {
                       WHERE dlq.job_id = items.job_id
                         AND dlq.run_lease = items.run_lease
                   )
-                FOR UPDATE OF claim_batches
             ),
             claim_refs AS (
                 SELECT * FROM row_claim_refs
@@ -10856,14 +11608,19 @@ impl QueueStorage {
         match hydrated {
             Ok(hydrated) => Ok(hydrated),
             // One unresolvable attempt must not stop the rescue of the others.
-            Err(HydrateError::Ambiguous { job_id, run_lease }) => {
-                tracing::error!(
-                    schema = self.schema(),
-                    job_id,
-                    run_lease,
-                    "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
-                );
-                Ok(Err(BusyRetained(vec![(job_id, run_lease)])))
+            Err(HydrateError::Ambiguous(attempts)) => {
+                for (job_id, run_lease) in &attempts {
+                    tracing::error!(
+                        schema = self.schema(),
+                        job_id,
+                        run_lease,
+                        "Rescue skipped an attempt: queue storage ready body ambiguous for deleted lease; it stays running until its retained bodies are repaired"
+                    );
+                }
+                Ok(Err(BusyRetained {
+                    attempts,
+                    unresolvable: true,
+                }))
             }
             Err(HydrateError::Awa(err)) => Err(err),
         }
@@ -10883,6 +11640,33 @@ impl QueueStorage {
         let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
         let (ready_map, claimed_lanes) =
             self.load_ready_snapshot_candidates_tx(tx, &deleted).await?;
+        // Report every ambiguous attempt at once, before any write, so a
+        // caller that sets them aside needs one retry for all of them.
+        let ambiguous: Vec<(i64, i64)> = deleted
+            .iter()
+            .filter(|row| {
+                ready_map
+                    .get(&(
+                        row.ready_slot,
+                        row.ready_generation,
+                        row.queue.clone(),
+                        row.enqueue_shard,
+                        row.lane_seq,
+                        row.job_id,
+                        row.run_lease,
+                    ))
+                    .is_some_and(|candidates| {
+                        matches!(
+                            select_claimed_ready_body(candidates, &claimed_lanes, row),
+                            Err(HydrateError::Ambiguous(_))
+                        )
+                    })
+            })
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        if !ambiguous.is_empty() {
+            return Err(HydrateError::Ambiguous(ambiguous));
+        }
 
         let attempt_rows: Vec<AttemptStateRow> = sqlx::query_as(&format!(
             r#"
@@ -11138,10 +11922,10 @@ impl QueueStorage {
                 .insert((source.job_id, source.run_lease), source)
                 .is_some()
             {
-                return Err(HydrateError::Ambiguous {
-                    job_id: source.job_id,
-                    run_lease: source.run_lease + 1,
-                });
+                return Err(HydrateError::Ambiguous(vec![(
+                    source.job_id,
+                    source.run_lease + 1,
+                )]));
             }
         }
         let job_ids: Vec<i64> = sources.iter().map(|row| row.job_id).collect();
@@ -11189,7 +11973,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
             if !busy.is_empty() {
-                return Ok(Some(BusyRetained(busy)));
+                return Ok(Some(BusyRetained::busy(busy)));
             }
         } else {
             self.lock_claim_heads_of_jobs_with_wait_tx(tx, &job_ids, true)
@@ -11274,10 +12058,10 @@ impl QueueStorage {
         for row in &emitted {
             let key = (row.job_id, row.run_lease);
             if !seen.insert(key) || expected.get(&key).copied() != Some(row) {
-                return Err(HydrateError::Ambiguous {
-                    job_id: row.job_id,
-                    run_lease: row.run_lease + 1,
-                });
+                return Err(HydrateError::Ambiguous(vec![(
+                    row.job_id,
+                    row.run_lease + 1,
+                )]));
             }
         }
         sqlx::query(&format!(
@@ -11600,57 +12384,90 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         cutoff: DateTime<Utc>,
+        options: &RescueBatchOptions,
         excluded: &BTreeSet<(i64, i64)>,
         selected: Option<&BTreeSet<(i64, i64)>>,
-    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
-        let mut rescued = Vec::new();
+        batch: &mut ReceiptRescueBatch,
+    ) -> Result<(), AwaError> {
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
-        let preferred_slot = self.oldest_initialized_claim_slot_tx(tx).await?;
-
-        if let Some(slot) = preferred_slot {
-            let mut slot_rescued = self
+        for slot in self.rescue_slot_order_tx(tx, options).await? {
+            let (slot_rescued, scan_full, cursor) = self
                 .rescue_stale_receipt_claims_for_slot_tx(
-                    tx, slot, cutoff, remaining, excluded, selected,
+                    tx,
+                    slot,
+                    cutoff,
+                    options
+                        .cursor_scan_limit
+                        .map_or(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT, |limit| {
+                            limit.max(1) as i64
+                        }),
+                    remaining,
+                    excluded,
+                    selected,
                 )
                 .await?;
-            remaining = remaining.saturating_sub(slot_rescued.len() as i64);
-            rescued.append(&mut slot_rescued);
-            if remaining == 0 {
-                return Ok(rescued);
+            batch.saturated |= scan_full;
+            if !scan_full && slot_rescued.is_empty() {
+                batch.idle_slots.push(slot);
             }
-        }
-
-        for slot in 0..self.claim_slot_count() {
-            let slot = slot as i32;
-            if Some(slot) == preferred_slot {
-                continue;
-            }
-
-            let mut slot_rescued = self
-                .rescue_stale_receipt_claims_for_slot_tx(
-                    tx, slot, cutoff, remaining, excluded, selected,
-                )
-                .await?;
+            batch.scan_progress.push(RescueScanProgress {
+                slot,
+                cursors: vec![RescueScanCursor {
+                    position: cursor,
+                    saturated: scan_full,
+                }],
+            });
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
-            rescued.append(&mut slot_rescued);
-
+            batch.rescued.extend(slot_rescued);
             if remaining == 0 {
+                batch.saturated = true;
                 break;
             }
         }
-
-        Ok(rescued)
+        Ok(())
     }
 
+    /// The claim slots one rescue batch visits, in order. Slots go from the
+    /// oldest initialized one to the current one, so older claims come first.
+    async fn rescue_slot_order_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        options: &RescueBatchOptions,
+    ) -> Result<Vec<i32>, AwaError> {
+        let (oldest, by_age) = self.claim_slots_by_age_tx(tx).await?;
+        let others: Vec<i32> = by_age
+            .into_iter()
+            .filter(|slot| Some(*slot) != oldest)
+            .collect();
+        let mut slots = Vec::with_capacity(self.claim_slot_count());
+        match options.slot_order {
+            RescueSlotOrder::OldestFirst => {
+                slots.extend(oldest);
+                slots.extend(others);
+            }
+            RescueSlotOrder::OthersFirst(offset) => {
+                if !others.is_empty() {
+                    let start = offset % others.len();
+                    slots.extend(others[start..].iter().chain(&others[..start]));
+                }
+                slots.extend(oldest);
+            }
+        }
+        slots.retain(|slot| !options.skip_slots.contains(slot));
+        Ok(slots)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn rescue_stale_receipt_claims_for_slot_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         slot: i32,
         cutoff: DateTime<Utc>,
+        scan_limit: i64,
         rescue_limit: i64,
         excluded: &BTreeSet<(i64, i64)>,
         selected: Option<&BTreeSet<(i64, i64)>>,
-    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+    ) -> Result<ReceiptRescueScan, AwaError> {
         let (excluded_job_ids, excluded_run_leases): (Vec<_>, Vec<_>) =
             excluded.iter().copied().unzip();
         let (selected_job_ids, selected_run_leases): (Vec<i64>, Vec<i64>) = selected
@@ -11672,8 +12489,32 @@ impl QueueStorage {
                 WHERE slot = $1
                 FOR UPDATE
             ),
-            claim_source AS MATERIALIZED (
-                SELECT
+            -- The walk takes the first $3 claims after the cursor in
+            -- (claimed_at, job_id, run_lease) order, then wraps to the
+            -- first claims at or before it. Each side reads only the claims
+            -- it can return: row-local claims through the cursor index, and
+            -- compact batches (whose members share claimed_at) only up to
+            -- the batch at which $3 members are certainly covered.
+            after_batch_bound AS (
+                SELECT min(running.claimed_at) AS claimed_at
+                FROM (
+                    SELECT
+                        claim_batches.claimed_at,
+                        sum(claim_batches.claimed_count) FILTER (
+                            WHERE claim_batches.claimed_at > (SELECT rescue_cursor_claimed_at FROM cursor_row)
+                        ) OVER (
+                            ORDER BY claim_batches.claimed_at, claim_batches.batch_id
+                        ) AS covered
+                    FROM {claim_batch_child} AS claim_batches
+                    WHERE claim_batches.claim_slot = $1
+                      AND claim_batches.claimed_at < $2
+                      AND claim_batches.claimed_at >= (SELECT rescue_cursor_claimed_at FROM cursor_row)
+                ) AS running
+                WHERE running.covered >= $3
+            ),
+            after_source AS (
+                (
+                    SELECT
                     claims.claim_slot,
                     NULL::bigint AS batch_id,
                     claims.ready_slot,
@@ -11690,8 +12531,18 @@ impl QueueStorage {
                     claims.claimed_at,
                     claims.closed_at,
                     false AS compact_batch
-                FROM {claim_child} AS claims
-                WHERE claims.claim_slot = $1
+                    FROM {claim_child} AS claims
+                    WHERE claims.claim_slot = $1
+                      AND claims.claimed_at < $2
+                      AND (claims.claimed_at, claims.job_id, claims.run_lease)
+                          > (
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
+                        )
+                    ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                    LIMIT $3
+                )
                 UNION ALL
                 SELECT
                     claim_batches.claim_slot,
@@ -11711,6 +12562,7 @@ impl QueueStorage {
                     NULL::timestamptz AS closed_at,
                     true AS compact_batch
                 FROM {claim_batch_child} AS claim_batches
+                CROSS JOIN after_batch_bound
                 CROSS JOIN LATERAL unnest(
                     claim_batches.job_ids,
                     claim_batches.run_leases,
@@ -11720,119 +12572,194 @@ impl QueueStorage {
                     claim_batches.max_attempts
                 ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
                 WHERE claim_batches.claim_slot = $1
+                  AND claim_batches.claimed_at < $2
+                  AND claim_batches.claimed_at >= (SELECT rescue_cursor_claimed_at FROM cursor_row)
+                  AND claim_batches.claimed_at
+                      <= COALESCE(after_batch_bound.claimed_at, 'infinity'::timestamptz)
+                  AND (claim_batches.claimed_at, items.job_id, items.run_lease)
+                      > (
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
+                        )
             ),
             after_cursor AS MATERIALIZED (
                 SELECT
-                    claim_source.claim_slot,
-                    claim_source.job_id,
-                    claim_source.run_lease,
+                    after_source.*,
                     row_number() OVER (
-                        ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                        ORDER BY after_source.claimed_at, after_source.job_id, after_source.run_lease
                     ) AS rn
-                FROM claim_source
-                CROSS JOIN cursor_row
-                WHERE claim_source.claimed_at < $2
-                  AND (claim_source.claimed_at, claim_source.job_id, claim_source.run_lease)
-                      > (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
-                        )
-                ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                FROM after_source
+                ORDER BY after_source.claimed_at, after_source.job_id, after_source.run_lease
                 LIMIT $3
             ),
-            after_count AS (
+            after_count AS MATERIALIZED (
                 SELECT count(*)::bigint AS count FROM after_cursor
+            ),
+            before_batch_bound AS (
+                SELECT min(running.claimed_at) AS claimed_at
+                FROM (
+                    SELECT
+                        claim_batches.claimed_at,
+                        sum(claim_batches.claimed_count) FILTER (
+                            WHERE claim_batches.claimed_at < (SELECT rescue_cursor_claimed_at FROM cursor_row)
+                        ) OVER (
+                            ORDER BY claim_batches.claimed_at, claim_batches.batch_id
+                        ) AS covered
+                    FROM {claim_batch_child} AS claim_batches
+                    WHERE claim_batches.claim_slot = $1
+                      AND claim_batches.claimed_at < $2
+                      AND claim_batches.claimed_at <= (SELECT rescue_cursor_claimed_at FROM cursor_row)
+                ) AS running
+                WHERE running.covered >= $3
+            ),
+            before_source AS (
+                (
+                    SELECT
+                    claims.claim_slot,
+                    NULL::bigint AS batch_id,
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.job_id,
+                    claims.queue,
+                    claims.priority,
+                    claims.attempt,
+                    claims.run_lease,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.enqueue_shard,
+                    claims.receipt_id,
+                    claims.claimed_at,
+                    claims.closed_at,
+                    false AS compact_batch
+                    FROM {claim_child} AS claims
+                    WHERE (SELECT count FROM after_count) < $3
+                      AND claims.claim_slot = $1
+                      AND claims.claimed_at < $2
+                      AND (claims.claimed_at, claims.job_id, claims.run_lease)
+                          <= (
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
+                        )
+                    ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                    LIMIT $3
+                )
+                UNION ALL
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.batch_id,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    items.job_id,
+                    claim_batches.queue,
+                    claim_batches.priority,
+                    items.attempt,
+                    items.run_lease,
+                    items.max_attempts,
+                    items.lane_seq,
+                    claim_batches.enqueue_shard,
+                    items.receipt_id,
+                    claim_batches.claimed_at,
+                    NULL::timestamptz AS closed_at,
+                    true AS compact_batch
+                FROM {claim_batch_child} AS claim_batches
+                CROSS JOIN before_batch_bound
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids,
+                    claim_batches.lane_seqs,
+                    claim_batches.attempts,
+                    claim_batches.max_attempts
+                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+                WHERE (SELECT count FROM after_count) < $3
+                  AND claim_batches.claim_slot = $1
+                  AND claim_batches.claimed_at < $2
+                  AND claim_batches.claimed_at <= (SELECT rescue_cursor_claimed_at FROM cursor_row)
+                  AND claim_batches.claimed_at
+                      <= COALESCE(before_batch_bound.claimed_at, 'infinity'::timestamptz)
+                  AND (claim_batches.claimed_at, items.job_id, items.run_lease)
+                      <= (
+                          (SELECT rescue_cursor_claimed_at FROM cursor_row),
+                          (SELECT rescue_cursor_job_id FROM cursor_row),
+                          (SELECT rescue_cursor_run_lease FROM cursor_row)
+                        )
             ),
             before_cursor AS MATERIALIZED (
                 SELECT
-                    claim_source.claim_slot,
-                    claim_source.job_id,
-                    claim_source.run_lease,
+                    before_source.*,
                     after_count.count + row_number() OVER (
-                        ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                        ORDER BY before_source.claimed_at, before_source.job_id, before_source.run_lease
                     ) AS rn
-                FROM claim_source
-                CROSS JOIN cursor_row
+                FROM before_source
                 CROSS JOIN after_count
-                WHERE after_count.count < $3
-                  AND claim_source.claimed_at < $2
-                  AND (claim_source.claimed_at, claim_source.job_id, claim_source.run_lease)
-                      <= (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
-                        )
-                ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                ORDER BY before_source.claimed_at, before_source.job_id, before_source.run_lease
                 LIMIT (SELECT GREATEST($3 - count, 0) FROM after_count)
             ),
-            candidate_keys AS MATERIALIZED (
-                SELECT claim_slot, job_id, run_lease, rn FROM after_cursor
+            candidate_rows AS MATERIALIZED (
+                SELECT * FROM after_cursor
                 UNION ALL
-                SELECT claim_slot, job_id, run_lease, rn FROM before_cursor
+                SELECT * FROM before_cursor
             ),
             candidates AS MATERIALIZED (
                 SELECT
-                    claim_source.claim_slot,
-                    claim_source.batch_id,
-                    claim_source.ready_slot,
-                    claim_source.ready_generation,
-                    claim_source.job_id,
-                    claim_source.queue,
-                    claim_source.priority,
-                    claim_source.attempt,
-                    claim_source.run_lease,
-                    claim_source.max_attempts,
-                    claim_source.lane_seq,
-                    claim_source.enqueue_shard,
-                    claim_source.receipt_id,
-                    claim_source.claimed_at,
-                    claim_source.closed_at,
-                    claim_source.compact_batch,
-                    COALESCE(attempt.heartbeat_at, claim_source.claimed_at) < $2 AS is_stale,
+                    candidate_rows.claim_slot,
+                    candidate_rows.batch_id,
+                    candidate_rows.ready_slot,
+                    candidate_rows.ready_generation,
+                    candidate_rows.job_id,
+                    candidate_rows.queue,
+                    candidate_rows.priority,
+                    candidate_rows.attempt,
+                    candidate_rows.run_lease,
+                    candidate_rows.max_attempts,
+                    candidate_rows.lane_seq,
+                    candidate_rows.enqueue_shard,
+                    candidate_rows.receipt_id,
+                    candidate_rows.claimed_at,
+                    candidate_rows.closed_at,
+                    candidate_rows.compact_batch,
+                    COALESCE(attempt.heartbeat_at, candidate_rows.claimed_at) < $2 AS is_stale,
                     (
-                        claim_source.closed_at IS NOT NULL
+                        candidate_rows.closed_at IS NOT NULL
                         OR EXISTS (
                             SELECT 1 FROM {closure_child} AS closures
-                            WHERE closures.claim_slot = claim_source.claim_slot
-                              AND closures.job_id = claim_source.job_id
-                              AND closures.run_lease = claim_source.run_lease
+                            WHERE closures.claim_slot = candidate_rows.claim_slot
+                              AND closures.job_id = candidate_rows.job_id
+                              AND closures.run_lease = candidate_rows.run_lease
                         )
                         OR EXISTS (
                             SELECT 1
                             FROM {closure_batch_child} AS closure_batches
-                            WHERE closure_batches.receipt_ranges @> claim_source.receipt_id
+                            WHERE closure_batches.receipt_ranges @> candidate_rows.receipt_id
                         )
                         OR EXISTS (
                             SELECT 1 FROM {schema}.done_entries AS done
-                            WHERE done.job_id = claim_source.job_id
-                              AND done.run_lease = claim_source.run_lease
+                            WHERE done.job_id = candidate_rows.job_id
+                              AND done.run_lease = candidate_rows.run_lease
                         )
                         OR EXISTS (
                             SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                            WHERE deferred.job_id = claim_source.job_id
-                              AND deferred.run_lease = claim_source.run_lease
+                            WHERE deferred.job_id = candidate_rows.job_id
+                              AND deferred.run_lease = candidate_rows.run_lease
                         )
                         OR EXISTS (
                             SELECT 1 FROM {schema}.dlq_entries AS dlq
-                            WHERE dlq.job_id = claim_source.job_id
-                              AND dlq.run_lease = claim_source.run_lease
+                            WHERE dlq.job_id = candidate_rows.job_id
+                              AND dlq.run_lease = candidate_rows.run_lease
                         )
                     ) AS is_closed,
                     EXISTS (
                         SELECT 1 FROM {schema}.leases AS lease
-                        WHERE lease.job_id = claim_source.job_id
-                          AND lease.run_lease = claim_source.run_lease
+                        WHERE lease.job_id = candidate_rows.job_id
+                          AND lease.run_lease = candidate_rows.run_lease
                     ) AS is_lease_managed,
-                    candidate_keys.rn
-                FROM candidate_keys
-                JOIN claim_source
-                  ON claim_source.claim_slot = candidate_keys.claim_slot
-                 AND claim_source.job_id = candidate_keys.job_id
-                 AND claim_source.run_lease = candidate_keys.run_lease
+                    candidate_rows.rn
+                FROM candidate_rows
                 LEFT JOIN {schema}.attempt_state AS attempt
-                  ON attempt.job_id = claim_source.job_id
-                 AND attempt.run_lease = claim_source.run_lease
+                  ON attempt.job_id = candidate_rows.job_id
+                 AND attempt.run_lease = candidate_rows.run_lease
             ),
             stale_candidates AS (
                 SELECT candidates.*
@@ -11873,7 +12800,7 @@ impl QueueStorage {
             ))
             .bind(slot)
             .bind(cutoff)
-            .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(scan_limit)
             .bind(rescue_limit)
             .bind(&excluded_job_ids)
             .bind(&excluded_run_leases)
@@ -11885,7 +12812,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?
             .into_iter()
             .unzip();
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+        let (rescued, scan_full, cursor_at, cursor_job_id, cursor_run_lease): ReceiptRescueScanRow = sqlx::query_as(&format!(
             r#"
             WITH {candidate_ctes},
             stale_row_locked AS (
@@ -12081,11 +13008,9 @@ impl QueueStorage {
                     rescue_cursor_run_lease = advance_target.run_lease
                 FROM advance_target
                 WHERE slots.slot = $1
-                RETURNING slots.slot
+                RETURNING slots.rescue_cursor_claimed_at, slots.rescue_cursor_job_id, slots.rescue_cursor_run_lease
             ),
-            cursor_advance AS (
-                SELECT count(*) FROM advance_cursor
-            )
+            rescued_rows AS (
             SELECT
                 stale_locked.ready_slot,
                 stale_locked.ready_generation,
@@ -12104,12 +13029,18 @@ impl QueueStorage {
               ON closed_locked.claim_slot = stale_locked.claim_slot
              AND closed_locked.job_id = stale_locked.job_id
              AND closed_locked.run_lease = stale_locked.run_lease
-            CROSS JOIN cursor_advance
+            )
+            SELECT
+                COALESCE((SELECT jsonb_agg(to_jsonb(rescued_rows)) FROM rescued_rows), '[]'::jsonb),
+                (SELECT count(*) >= $3 FROM candidates),
+                (SELECT rescue_cursor_claimed_at FROM advance_cursor),
+                (SELECT rescue_cursor_job_id FROM advance_cursor),
+                (SELECT rescue_cursor_run_lease FROM advance_cursor)
             "#
         ))
         .bind(slot)
         .bind(cutoff)
-        .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
+        .bind(scan_limit)
         .bind(rescue_limit)
         .bind(&excluded_job_ids)
         .bind(&excluded_run_leases)
@@ -12118,10 +13049,18 @@ impl QueueStorage {
         .bind(&selected_run_leases)
         .bind(&locked_job_ids)
         .bind(&locked_run_leases)
-        .fetch_all(tx.as_mut())
+        .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        Ok(rescued)
+        let scan_full = scan_full || rescued.0.len() as i64 >= rescue_limit;
+        Ok((
+            rescued.0,
+            scan_full,
+            cursor_at
+                .zip(cursor_job_id)
+                .zip(cursor_run_lease)
+                .map(|((at, id), lease)| (at, id, lease)),
+        ))
     }
 
     /// Receipt-side counterpart to `rescue_expired_deadlines`: scans
@@ -12144,54 +13083,56 @@ impl QueueStorage {
     async fn rescue_expired_receipt_deadlines_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        options: &RescueBatchOptions,
         excluded: &BTreeSet<(i64, i64)>,
         selected: Option<&BTreeSet<(i64, i64)>>,
-    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
-        let mut rescued = Vec::new();
+        batch: &mut ReceiptRescueBatch,
+    ) -> Result<(), AwaError> {
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
-        let preferred_slot = self.oldest_initialized_claim_slot_tx(tx).await?;
-
-        if let Some(slot) = preferred_slot {
-            let mut slot_rescued = self
+        for slot in self.rescue_slot_order_tx(tx, options).await? {
+            let (slot_rescued, scan_full, cursor) = self
                 .rescue_expired_receipt_deadlines_for_slot_tx(
-                    tx, slot, remaining, excluded, selected,
+                    tx,
+                    slot,
+                    options
+                        .cursor_scan_limit
+                        .map_or(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT, |limit| {
+                            limit.max(1) as i64
+                        }),
+                    remaining,
+                    excluded,
+                    selected,
                 )
                 .await?;
-            remaining = remaining.saturating_sub(slot_rescued.len() as i64);
-            rescued.append(&mut slot_rescued);
-            if remaining == 0 {
-                return Ok(rescued);
+            batch.saturated |= scan_full;
+            if !scan_full && slot_rescued.is_empty() {
+                batch.idle_slots.push(slot);
             }
-        }
-
-        for slot in 0..self.claim_slot_count() {
-            let slot = slot as i32;
-            if Some(slot) == preferred_slot {
-                continue;
-            }
-
-            let mut slot_rescued = self
-                .rescue_expired_receipt_deadlines_for_slot_tx(
-                    tx, slot, remaining, excluded, selected,
-                )
-                .await?;
+            batch.scan_progress.push(RescueScanProgress {
+                slot,
+                cursors: vec![RescueScanCursor {
+                    position: cursor,
+                    saturated: scan_full,
+                }],
+            });
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
-            rescued.append(&mut slot_rescued);
-
+            batch.rescued.extend(slot_rescued);
             if remaining == 0 {
+                batch.saturated = true;
                 break;
             }
         }
-
-        Ok(rescued)
+        Ok(())
     }
 
-    async fn oldest_initialized_claim_slot_tx<'a>(
+    /// The oldest initialized claim slot, and every slot ordered from it
+    /// around the ring to the current one, then any not yet initialized.
+    async fn claim_slots_by_age_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-    ) -> Result<Option<i32>, AwaError> {
+    ) -> Result<(Option<i32>, Vec<i32>), AwaError> {
         let schema = self.schema();
-        let preferred_slot = sqlx::query_as::<_, (i32, i64, i32)>(&format!(
+        let ring_cursor = sqlx::query_as::<_, (i32, i64, i32)>(&format!(
             r#"
             SELECT current_slot, generation, slot_count
             FROM {schema}.claim_ring_state
@@ -12200,26 +13141,42 @@ impl QueueStorage {
         ))
         .fetch_optional(tx.as_mut())
         .await
-        .map_err(map_sqlx_error)?
-        .and_then(|(current_slot, generation, slot_count)| {
-            oldest_initialized_ring_slot(current_slot, generation, slot_count)
-                .map(|(slot, _generation)| slot)
-                .filter(|slot| *slot >= 0 && (*slot as usize) < self.claim_slot_count())
-        });
-
-        Ok(preferred_slot)
+        .map_err(map_sqlx_error)?;
+        let slot_count = self.claim_slot_count() as i32;
+        let Some((current_slot, generation, ring_slot_count)) = ring_cursor else {
+            return Ok((None, (0..slot_count).collect()));
+        };
+        let oldest = oldest_initialized_ring_slot(current_slot, generation, ring_slot_count)
+            .map(|(slot, _generation)| slot)
+            .filter(|slot| (0..slot_count).contains(slot));
+        let start = oldest.unwrap_or(current_slot).rem_euclid(slot_count);
+        let mut by_age: Vec<i32> = Vec::with_capacity(slot_count as usize);
+        let mut slot = start;
+        loop {
+            by_age.push(slot);
+            if slot == current_slot.rem_euclid(slot_count) || by_age.len() == slot_count as usize {
+                break;
+            }
+            slot = (slot + 1).rem_euclid(slot_count);
+        }
+        let uninitialized: Vec<i32> = (0..slot_count)
+            .filter(|slot| !by_age.contains(slot))
+            .collect();
+        by_age.extend(uninitialized);
+        Ok((oldest, by_age))
     }
 
     async fn rescue_expired_receipt_deadlines_for_slot_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         slot: i32,
+        scan_limit: i64,
         rescue_limit: i64,
         excluded: &BTreeSet<(i64, i64)>,
         selected: Option<&BTreeSet<(i64, i64)>>,
-    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+    ) -> Result<ReceiptRescueScan, AwaError> {
         if rescue_limit <= 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false, None));
         }
 
         let (excluded_job_ids, excluded_run_leases): (Vec<_>, Vec<_>) =
@@ -12253,15 +13210,14 @@ impl QueueStorage {
                         ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                     ) AS rn
                 FROM {claim_child} AS claims
-                CROSS JOIN cursor_row
                 WHERE claims.claim_slot = $1
                   AND claims.deadline_at IS NOT NULL
                   AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       > (
-                          cursor_row.deadline_cursor_deadline_at,
-                          cursor_row.deadline_cursor_job_id,
-                          cursor_row.deadline_cursor_run_lease
+                          (SELECT deadline_cursor_deadline_at FROM cursor_row),
+                          (SELECT deadline_cursor_job_id FROM cursor_row),
+                          (SELECT deadline_cursor_run_lease FROM cursor_row)
                         )
                 ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                 LIMIT $2
@@ -12278,7 +13234,6 @@ impl QueueStorage {
                         ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                     ) AS rn
                 FROM {claim_child} AS claims
-                CROSS JOIN cursor_row
                 CROSS JOIN after_count
                 WHERE after_count.count < $2
                   AND claims.claim_slot = $1
@@ -12286,9 +13241,9 @@ impl QueueStorage {
                   AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       <= (
-                          cursor_row.deadline_cursor_deadline_at,
-                          cursor_row.deadline_cursor_job_id,
-                          cursor_row.deadline_cursor_run_lease
+                          (SELECT deadline_cursor_deadline_at FROM cursor_row),
+                          (SELECT deadline_cursor_job_id FROM cursor_row),
+                          (SELECT deadline_cursor_run_lease FROM cursor_row)
                         )
                 ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
                 LIMIT (SELECT GREATEST($2 - count, 0) FROM after_count)
@@ -12362,7 +13317,7 @@ impl QueueStorage {
                 "#
             ))
             .bind(slot)
-            .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(scan_limit)
             .bind(rescue_limit)
             .bind(&excluded_job_ids)
             .bind(&excluded_run_leases)
@@ -12374,7 +13329,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?
             .into_iter()
             .unzip();
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+        let (rescued, scan_full, cursor_at, cursor_job_id, cursor_run_lease): ReceiptRescueScanRow = sqlx::query_as(&format!(
             r#"
             WITH {candidate_ctes},
             expired_locked AS (
@@ -12452,11 +13407,9 @@ impl QueueStorage {
                     deadline_cursor_run_lease = advance_target.run_lease
                 FROM advance_target
                 WHERE slots.slot = $1
-                RETURNING slots.slot
+                RETURNING slots.deadline_cursor_deadline_at, slots.deadline_cursor_job_id, slots.deadline_cursor_run_lease
             ),
-            cursor_advance AS (
-                SELECT count(*) FROM advance_cursor
-            )
+            rescued_rows AS (
             SELECT
                 expired_locked.ready_slot,
                 expired_locked.ready_generation,
@@ -12475,11 +13428,17 @@ impl QueueStorage {
               ON inserted.claim_slot = expired_locked.claim_slot
              AND inserted.job_id = expired_locked.job_id
              AND inserted.run_lease = expired_locked.run_lease
-            CROSS JOIN cursor_advance
+            )
+            SELECT
+                COALESCE((SELECT jsonb_agg(to_jsonb(rescued_rows)) FROM rescued_rows), '[]'::jsonb),
+                (SELECT count(*) >= $2 FROM candidates),
+                (SELECT deadline_cursor_deadline_at FROM advance_cursor),
+                (SELECT deadline_cursor_job_id FROM advance_cursor),
+                (SELECT deadline_cursor_run_lease FROM advance_cursor)
             "#
         ))
         .bind(slot)
-        .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+        .bind(scan_limit)
         .bind(rescue_limit)
         .bind(&excluded_job_ids)
         .bind(&excluded_run_leases)
@@ -12488,10 +13447,18 @@ impl QueueStorage {
         .bind(&selected_run_leases)
         .bind(&locked_job_ids)
         .bind(&locked_run_leases)
-        .fetch_all(tx.as_mut())
+        .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        Ok(rescued)
+        let scan_full = scan_full || rescued.0.len() as i64 >= rescue_limit;
+        Ok((
+            rescued.0,
+            scan_full,
+            cursor_at
+                .zip(cursor_job_id)
+                .zip(cursor_run_lease)
+                .map(|((at, id), lease)| (at, id, lease)),
+        ))
     }
 
     async fn active_job_read_row_tx(
@@ -12576,6 +13543,20 @@ impl QueueStorage {
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+        crate::read_transaction::read_until_untruncated(|guard| {
+            self.load_job_in_snapshot(pool, job_id, guard)
+        })
+        .await
+    }
+
+    /// The job's newest row, and whether no ring partition was truncated
+    /// while the read's snapshot was in use.
+    async fn load_job_in_snapshot(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        guard: crate::read_transaction::TruncationGuard,
+    ) -> Result<(Option<JobRow>, bool), AwaError> {
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
@@ -12590,6 +13571,13 @@ impl QueueStorage {
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
             .await
             .map_err(map_sqlx_error)?;
+        let snapshot = crate::read_transaction::GuardedSnapshot::before_begin(
+            &mut begin_guard.connection,
+            schema,
+            guard,
+        )
+        .await
+        .map_err(map_sqlx_error)?;
         let mut tx = sqlx::Connection::begin_with(
             &mut *begin_guard.connection,
             "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
@@ -12597,6 +13585,10 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         begin_guard.begin_pending = false;
+        snapshot
+            .after_begin(tx.as_mut(), schema)
+            .await
+            .map_err(map_sqlx_error)?;
 
         sqlx::query("SAVEPOINT awa_read_leg")
             .execute(tx.as_mut())
@@ -13118,14 +14110,19 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
+        let untruncated = snapshot
+            .untruncated(&mut begin_guard.connection, schema)
+            .await
+            .map_err(map_sqlx_error)?;
         drop(begin_guard);
-        Ok(candidates.into_iter().max_by_key(|job| {
+        let job = candidates.into_iter().max_by_key(|job| {
             (
                 job.run_lease,
                 transition_timestamp(job),
                 state_rank(job.state),
             )
-        }))
+        });
+        Ok((job, untruncated))
     }
 
     pub async fn register_callback(
@@ -14122,6 +15119,7 @@ impl QueueStorage {
             self.upsert_attempt_state_progress_from_receipts_tx(
                 &mut tx,
                 &[(job_id, run_lease, progress.clone())],
+                false,
             )
             .await?;
         }
@@ -14151,6 +15149,141 @@ impl QueueStorage {
         Ok(())
     }
 
+    /// Heartbeat compact receipt claims by their batch identity. Each claim
+    /// batch is addressed by primary key and the attempt by item index, with
+    /// index-only closure probes and no batch row lock, so the cost is
+    /// O(in-flight attempts) rather than O(open claim batches). Attempts that
+    /// a closer holds right now are skipped rather than waited for.
+    pub async fn heartbeat_claims_batch(
+        &self,
+        pool: &PgPool,
+        claims: &[ClaimHeartbeatRef],
+    ) -> Result<usize, AwaError> {
+        if claims.is_empty() {
+            return Ok(0);
+        }
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let pairs: Vec<(i64, i64)> = claims
+            .iter()
+            .map(|claim| (claim.job_id, claim.run_lease))
+            .collect();
+        let locked: HashSet<(i64, i64)> = self
+            .try_lock_receipt_attempt_keys_tx(&mut tx, &pairs)
+            .await?
+            .into_iter()
+            .collect();
+        let claims: Vec<&ClaimHeartbeatRef> = claims
+            .iter()
+            .filter(|claim| locked.contains(&(claim.job_id, claim.run_lease)))
+            .collect();
+        if claims.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(0);
+        }
+        let job_ids: Vec<i64> = claims.iter().map(|claim| claim.job_id).collect();
+        let run_leases: Vec<i64> = claims.iter().map(|claim| claim.run_lease).collect();
+        let claim_slots: Vec<i32> = claims.iter().map(|claim| claim.claim_slot).collect();
+        let batch_ids: Vec<i64> = claims.iter().map(|claim| claim.claim_batch_id).collect();
+        let batch_indices: Vec<i32> = claims.iter().map(|claim| claim.claim_batch_index).collect();
+        let receipt_ids: Vec<i64> = claims.iter().map(|claim| claim.receipt_id).collect();
+        let updated: i64 = sqlx::query_scalar(&format!(
+            r#"
+            WITH inflight(job_id, run_lease, claim_slot, batch_id, batch_index, receipt_id) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::int[], $4::bigint[], $5::int[], $6::bigint[])
+            ),
+            open_claims AS (
+                SELECT inflight.job_id, inflight.run_lease
+                FROM inflight
+                JOIN {schema}.lease_claim_batches AS claim_batches
+                  ON claim_batches.claim_slot = inflight.claim_slot
+                 AND claim_batches.batch_id = inflight.batch_id
+                WHERE inflight.batch_index BETWEEN 1 AND claim_batches.claimed_count
+                  AND claim_batches.job_ids[inflight.batch_index] = inflight.job_id
+                  AND claim_batches.run_leases[inflight.batch_index] = inflight.run_lease
+                  AND claim_batches.receipt_ids[inflight.batch_index] = inflight.receipt_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = inflight.claim_slot
+                        AND closures.job_id = inflight.job_id
+                        AND closures.run_lease = inflight.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = inflight.claim_slot
+                        AND closure_batches.receipt_ranges @> inflight.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = inflight.job_id AND done.run_lease = inflight.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = inflight.job_id AND deferred.run_lease = inflight.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = inflight.job_id AND dlq.run_lease = inflight.run_lease
+                  )
+            ),
+            upserted AS (
+                INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+                SELECT open_claims.job_id, open_claims.run_lease, clock_timestamp(), clock_timestamp()
+                FROM open_claims
+                ON CONFLICT (job_id, run_lease)
+                DO UPDATE SET
+                    heartbeat_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                RETURNING job_id
+            )
+            SELECT count(*)::bigint FROM upserted
+            "#
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .bind(&claim_slots)
+        .bind(&batch_ids)
+        .bind(&batch_indices)
+        .bind(&receipt_ids)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(updated as usize)
+    }
+
+    /// Lock legacy lease rows without waiting behind a finalizer. Keep this
+    /// separate from the updating statement: the latter must use a fresh
+    /// snapshot and must not mix partition pruning with row locking (PG18).
+    async fn lock_live_leases_for_heartbeat_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        jobs: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        sqlx::query_as::<_, (i64, i64)>(&format!(
+            r#"
+            SELECT lease.job_id, lease.run_lease
+            FROM {table} AS lease
+            JOIN unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
+              ON lease.job_id = input.job_id AND lease.run_lease = input.run_lease
+            WHERE lease.state = 'running'
+            ORDER BY lease.job_id, lease.run_lease
+            FOR UPDATE OF lease SKIP LOCKED
+            "#,
+            table = self.leases_table(),
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     pub async fn heartbeat_batch(
         &self,
         pool: &PgPool,
@@ -14171,14 +15304,18 @@ impl QueueStorage {
             // dead entries per write under sustained churn). Compat
             // reads in `LeaseJobRow` SELECTs and the `awa.jobs` view
             // COALESCE attempt_state.heartbeat_at first.
+            let locked = self.try_lock_receipt_attempt_keys_tx(&mut tx, jobs).await?;
             updated += self
-                .upsert_attempt_state_from_receipts_tx(&mut tx, jobs)
+                .upsert_attempt_state_from_receipts_tx(&mut tx, &locked)
                 .await?;
         } else {
             // Legacy non-receipts mode (custom schemas with
             // `lease_claim_receipts=FALSE`): the `leases.heartbeat_at`
             // write is still the heartbeat home, since there is no
             // upsert_attempt_state path firing.
+            let jobs = self
+                .lock_live_leases_for_heartbeat_tx(&mut tx, jobs)
+                .await?;
             let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
             let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
             let result = sqlx::query(&format!(
@@ -14226,12 +15363,22 @@ impl QueueStorage {
             // anti-joined against durable closure evidence so it picks
             // up every open claim regardless of whether
             // `materialize_claims` has fanned it out to `leases` yet.
-            self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
+            self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs, true)
                 .await?
         } else {
-            // Legacy non-receipts mode keeps the old CTE shape that
-            // updates leases.heartbeat_at + leases.progress
-            // (via attempt_state upsert) in a single round-trip.
+            // Prelock independently so a finalizer cannot stall the entire
+            // heartbeat pass. Skipped progress snapshots remain unacknowledged
+            // in the worker and are retried on the next pass.
+            let keys: Vec<_> = jobs.iter().map(|(id, lease, _)| (*id, *lease)).collect();
+            let locked: HashSet<_> = self
+                .lock_live_leases_for_heartbeat_tx(&mut tx, &keys)
+                .await?
+                .into_iter()
+                .collect();
+            let jobs: Vec<_> = jobs
+                .iter()
+                .filter(|(id, lease, _)| locked.contains(&(*id, *lease)))
+                .collect();
             let schema = self.schema();
             let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _, _)| *job_id).collect();
             let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
@@ -14466,59 +15613,196 @@ impl QueueStorage {
         done.into_job_row()
     }
 
-    /// Settle one attempt that maintenance rescued (stale heartbeat, expired
+    /// Settle attempts that maintenance rescued (stale heartbeat, expired
     /// deadline or callback timeout): back to `retryable` with backoff while
     /// attempts remain, `failed` once the rescued attempt was the last. A job
     /// that kills or hangs its worker every time therefore stops after
     /// `max_attempts`, like one whose handler returns an error.
     ///
-    /// An exhausted attempt on a queue whose DLQ is enabled (`dlq_reason`
-    /// is `Some`) goes straight to `dlq_entries` in this transaction, as
-    /// `fail_to_dlq` does for a handler error, so there is no window in
-    /// which it sits `failed` outside the DLQ.
-    async fn settle_rescued_attempt_tx(
+    /// An exhausted attempt on a queue whose DLQ is enabled goes straight to
+    /// `dlq_entries` in this transaction, as `fail_to_dlq` does for a handler
+    /// error, so there is no window in which it sits `failed` outside the DLQ.
+    ///
+    /// Each outcome is written in one statement per previous state. If that
+    /// statement hits a unique-claim conflict, the group is retried row by
+    /// row so only the conflicting attempts become cancellations.
+    async fn settle_rescued_attempts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
+        rows: Vec<LeaseTransitionRow>,
         error: &str,
-        dlq_reason: Option<&str>,
-    ) -> Result<JobRow, AwaError> {
-        let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
-            row.payload.clone(),
-            row.progress.clone(),
-        )?)?;
-        let exhausted = row.attempt >= row.max_attempts;
-        payload.push_error(lifecycle_error(error, row.attempt, exhausted));
-        let duplicate_error = "rescued as duplicate: unique claim held by a newer job";
-        if exhausted {
-            let finalized_at = Utc::now();
-            if let Some(dlq_reason) = dlq_reason {
-                let dlq = row.clone().into_dlq_row(
+        dlq: RescueDlq<'_>,
+    ) -> Result<Vec<JobRow>, AwaError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (retry_attempts, retry_max_attempts): (Vec<i16>, Vec<i16>) = rows
+            .iter()
+            .filter(|row| row.attempt < row.max_attempts)
+            .map(|row| (row.attempt, row.max_attempts))
+            .unzip();
+        let mut retry_run_ats = self
+            .backoffs_at_tx(tx, &retry_attempts, &retry_max_attempts)
+            .await?
+            .into_iter();
+
+        let finalized_at = Utc::now();
+        let mut retries: Vec<(LeaseTransitionRow, DeferredJobRow)> = Vec::new();
+        let mut failures: Vec<(LeaseTransitionRow, DoneJobRow)> = Vec::new();
+        let mut dead_letters: Vec<(LeaseTransitionRow, DlqJobRow)> = Vec::new();
+        for row in rows {
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                row.payload.clone(),
+                row.progress.clone(),
+            )?)?;
+            let exhausted = row.attempt >= row.max_attempts;
+            payload.push_error(lifecycle_error(error, row.attempt, exhausted));
+            if !exhausted {
+                let run_at = retry_run_ats.next().ok_or_else(|| {
+                    AwaError::Validation("rescue backoff missing for a retryable attempt".into())
+                })?;
+                let deferred = row.clone().into_deferred_row(
+                    JobState::Retryable,
+                    run_at,
+                    Some(finalized_at),
+                    payload.into_json(),
+                );
+                retries.push((row, deferred));
+            } else if (dlq.enabled)(&row.queue) {
+                let dead_letter = row.clone().into_dlq_row(
                     finalized_at,
                     payload.into_json(),
-                    dlq_reason.to_string(),
+                    dlq.reason.to_string(),
                     finalized_at,
                 );
-                return self
-                    .insert_rescued_dlq_or_cancel_tx(tx, row, dlq, duplicate_error)
-                    .await;
+                dead_letters.push((row, dead_letter));
+            } else {
+                let done =
+                    row.clone()
+                        .into_done_row(JobState::Failed, finalized_at, payload.into_json());
+                failures.push((row, done));
             }
-            let done =
-                row.clone()
-                    .into_done_row(JobState::Failed, finalized_at, payload.into_json());
-            self.insert_rescued_done_or_cancel_tx(tx, row, done, duplicate_error)
-                .await
-        } else {
-            let deferred = row.clone().into_deferred_row(
-                JobState::Retryable,
-                self.backoff_at_tx(tx, row.attempt, row.max_attempts)
-                    .await?,
-                Some(Utc::now()),
-                payload.into_json(),
-            );
-            self.insert_rescued_deferred_or_cancel_tx(tx, row, deferred, duplicate_error)
-                .await
         }
+
+        let mut settled = Vec::with_capacity(retries.len() + failures.len() + dead_letters.len());
+        for (old_state, group) in group_by_previous_state(retries) {
+            let deferred: Vec<DeferredJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_deferred_rows_tx(&mut savepoint, deferred, Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    for (_, deferred) in group {
+                        settled.push(deferred.into_job_row()?);
+                    }
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                    for (row, deferred) in group {
+                        settled.push(
+                            self.insert_rescued_deferred_or_cancel_tx(
+                                tx,
+                                row,
+                                deferred,
+                                RESCUED_DUPLICATE_ERROR,
+                            )
+                            .await?,
+                        );
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        for (old_state, group) in group_by_previous_state(failures) {
+            let done: Vec<DoneJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_done_rows_tx(&mut savepoint, &done, Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    for done in done {
+                        settled.push(done.into_job_row()?);
+                    }
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                    for (row, done) in group {
+                        settled.push(
+                            self.insert_rescued_done_or_cancel_tx(
+                                tx,
+                                row,
+                                done,
+                                RESCUED_DUPLICATE_ERROR,
+                            )
+                            .await?,
+                        );
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        for (old_state, group) in group_by_previous_state(dead_letters) {
+            let dead_letters: Vec<DlqJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_dlq_rows_tx(&mut savepoint, &dead_letters, Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    for dead_letter in dead_letters {
+                        settled.push(dead_letter.into_job_row()?);
+                    }
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                    for (row, dead_letter) in group {
+                        settled.push(
+                            self.insert_rescued_dlq_or_cancel_tx(
+                                tx,
+                                row,
+                                dead_letter,
+                                RESCUED_DUPLICATE_ERROR,
+                            )
+                            .await?,
+                        );
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(settled)
+    }
+
+    /// `clock_timestamp() + awa.backoff_duration(..)` for each attempt, in
+    /// one round trip, in input order.
+    async fn backoffs_at_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        attempts: &[i16],
+        max_attempts: &[i16],
+    ) -> Result<Vec<DateTime<Utc>>, AwaError> {
+        if attempts.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar(
+            r#"
+            SELECT clock_timestamp() + awa.backoff_duration(attempts.attempt, attempts.max_attempts)
+            FROM unnest($1::smallint[], $2::smallint[])
+                WITH ORDINALITY AS attempts(attempt, max_attempts, ord)
+            ORDER BY attempts.ord
+            "#,
+        )
+        .bind(attempts)
+        .bind(max_attempts)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
     }
 
     /// Rescue-path fallback for unique-claim conflicts: insert the rescued
@@ -15278,18 +16562,41 @@ impl QueueStorage {
     /// [`Self::rescue_stale_heartbeats`], moving an exhausted attempt into
     /// `dlq_entries` (reason `heartbeat_stale`) in the rescue transaction
     /// when `dlq_enabled` returns true for its queue.
-    #[tracing::instrument(
-        skip(self, pool, dlq_enabled),
-        name = "queue_storage.rescue_stale_heartbeats"
-    )]
     pub async fn rescue_stale_heartbeats_with_dlq(
         &self,
         pool: &PgPool,
         staleness: Duration,
         dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<Vec<JobRow>, AwaError> {
+        Ok(self
+            .rescue_stale_heartbeats_batch(
+                pool,
+                staleness,
+                dlq_enabled,
+                &RescueBatchOptions::default(),
+            )
+            .await?
+            .rescued)
+    }
+
+    /// One stale-heartbeat rescue batch in its own transaction: up to
+    /// 500 lease rows and 500 receipt claims.
+    #[tracing::instrument(
+        skip(self, pool, dlq_enabled, options),
+        name = "queue_storage.rescue_stale_heartbeats"
+    )]
+    pub async fn rescue_stale_heartbeats_batch(
+        &self,
+        pool: &PgPool,
+        staleness: Duration,
+        dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
+        options: &RescueBatchOptions,
+    ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(RESCUE_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let cutoff = Utc::now()
             - TimeDelta::from_std(staleness)
                 .map_err(|err| AwaError::Validation(format!("invalid staleness: {err}")))?;
@@ -15329,73 +16636,83 @@ impl QueueStorage {
                 .unwrap_or_default();
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases AS target
-            WHERE (target.job_id, target.run_lease) IN (
-                SELECT lease.job_id, lease.run_lease
-                FROM {schema}.leases AS lease
-                LEFT JOIN {schema}.attempt_state AS attempt
-                  ON attempt.job_id = lease.job_id
-                 AND attempt.run_lease = lease.run_lease
-                WHERE lease.state = 'running'
-                  AND COALESCE(attempt.heartbeat_at, lease.heartbeat_at) < $1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM unnest($2::bigint[], $3::bigint[]) AS excluded(job_id, run_lease)
-                      WHERE excluded.job_id = lease.job_id AND excluded.run_lease = lease.run_lease
-                  )
-                  AND ($4::boolean OR EXISTS (
-                      SELECT 1 FROM unnest($5::bigint[], $6::bigint[]) AS selected(job_id, run_lease)
-                      WHERE selected.job_id = lease.job_id AND selected.run_lease = lease.run_lease
-                  ))
-                ORDER BY COALESCE(attempt.heartbeat_at, lease.heartbeat_at) ASC
-                LIMIT 500
-                FOR UPDATE OF lease SKIP LOCKED
-            )
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(cutoff)
-        .bind(&excluded_job_ids)
-        .bind(&excluded_run_leases)
-        .bind(selected.is_none())
-        .bind(&selected_job_ids)
-        .bind(&selected_run_leases)
-        .fetch_all(attempt.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                r#"
+                DELETE FROM {schema}.leases AS target
+                WHERE (target.job_id, target.run_lease) IN (
+                    SELECT lease.job_id, lease.run_lease
+                    FROM {schema}.leases AS lease
+                    LEFT JOIN {schema}.attempt_state AS attempt
+                      ON attempt.job_id = lease.job_id
+                     AND attempt.run_lease = lease.run_lease
+                    WHERE lease.state = 'running'
+                      AND COALESCE(attempt.heartbeat_at, lease.heartbeat_at) < $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest($2::bigint[], $3::bigint[]) AS excluded(job_id, run_lease)
+                          WHERE excluded.job_id = lease.job_id AND excluded.run_lease = lease.run_lease
+                      )
+                      AND ($4::boolean OR EXISTS (
+                          SELECT 1 FROM unnest($5::bigint[], $6::bigint[]) AS selected(job_id, run_lease)
+                          WHERE selected.job_id = lease.job_id AND selected.run_lease = lease.run_lease
+                      ))
+                    ORDER BY COALESCE(attempt.heartbeat_at, lease.heartbeat_at) ASC
+                    LIMIT $7
+                    FOR UPDATE OF lease SKIP LOCKED
+                )
+                RETURNING
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    enqueue_shard,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at,
+                    callback_id,
+                    callback_timeout_at
+                "#
+            ))
+            .bind(cutoff)
+            .bind(&excluded_job_ids)
+            .bind(&excluded_run_leases)
+            .bind(selected.is_none())
+            .bind(&selected_job_ids)
+            .bind(&selected_run_leases)
+            .bind(RECEIPT_RESCUE_BATCH_LIMIT)
+            .fetch_all(attempt.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            let mut saturated = deleted.len() as i64 >= RECEIPT_RESCUE_BATCH_LIMIT;
 
             let receipt_excluded: BTreeSet<_> = excluded
                 .iter()
                 .copied()
                 .chain(deleted.iter().map(|row| (row.job_id, row.run_lease)))
                 .collect();
-            let rescued_receipts = if self.lease_claim_receipts() {
+            let mut receipts = ReceiptRescueBatch::default();
+            if self.lease_claim_receipts() {
                 self.rescue_stale_receipt_claims_tx(
                     &mut attempt,
                     cutoff,
+                    options,
                     &receipt_excluded,
                     selected.as_ref(),
+                    &mut receipts,
                 )
-                .await?
-            } else {
-                Vec::new()
-            };
+                .await?;
+            }
+            saturated |= receipts.saturated;
+            let ReceiptRescueBatch {
+                rescued: rescued_receipts,
+                idle_slots,
+                scan_progress,
+                ..
+            } = receipts;
 
             selected.get_or_insert_with(|| {
                 deleted
@@ -15408,7 +16725,12 @@ impl QueueStorage {
             if deleted.is_empty() && rescued_receipts.is_empty() {
                 attempt.commit().await.map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
-                return Ok(Vec::new());
+                return Ok(RescueBatch {
+                    idle_slots,
+                    scan_progress,
+                    saturated,
+                    ..RescueBatch::default()
+                });
             }
 
             let moved_leases = match self
@@ -15418,7 +16740,7 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
@@ -15429,39 +16751,42 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
 
-            let mut rescued = Vec::with_capacity(moved_leases.len() + moved_receipts.len());
-            for row in moved_leases {
-                let dlq_reason = dlq_enabled(&row.queue).then_some("heartbeat_stale");
-                rescued.push(
-                    self.settle_rescued_attempt_tx(
-                        &mut attempt,
-                        row,
-                        "heartbeat stale: worker presumed dead",
-                        dlq_reason,
-                    )
-                    .await?,
-                );
-            }
-            for row in moved_receipts {
-                let dlq_reason = dlq_enabled(&row.queue).then_some("heartbeat_stale");
-                rescued.push(
-                    self.settle_rescued_attempt_tx(
-                        &mut attempt,
-                        row,
-                        "receipt claim stale: worker presumed dead",
-                        dlq_reason,
-                    )
-                    .await?,
-                );
-            }
+            let mut rescued = self
+                .settle_rescued_attempts_tx(
+                    &mut attempt,
+                    moved_leases,
+                    "heartbeat stale: worker presumed dead",
+                    RescueDlq {
+                        reason: "heartbeat_stale",
+                        enabled: dlq_enabled,
+                    },
+                )
+                .await?;
+            rescued.extend(
+                self.settle_rescued_attempts_tx(
+                    &mut attempt,
+                    moved_receipts,
+                    "receipt claim stale: worker presumed dead",
+                    RescueDlq {
+                        reason: "heartbeat_stale",
+                        enabled: dlq_enabled,
+                    },
+                )
+                .await?,
+            );
             attempt.commit().await.map_err(map_sqlx_error)?;
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(rescued);
+            return Ok(RescueBatch {
+                rescued,
+                saturated,
+                idle_slots,
+                scan_progress,
+            });
         }
     }
 
@@ -15476,17 +16801,34 @@ impl QueueStorage {
     /// [`Self::rescue_expired_deadlines`], moving an exhausted attempt into
     /// `dlq_entries` (reason `deadline_exceeded`) in the rescue transaction
     /// when `dlq_enabled` returns true for its queue.
-    #[tracing::instrument(
-        skip(self, pool, dlq_enabled),
-        name = "queue_storage.rescue_expired_deadlines"
-    )]
     pub async fn rescue_expired_deadlines_with_dlq(
         &self,
         pool: &PgPool,
         dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<Vec<JobRow>, AwaError> {
+        Ok(self
+            .rescue_expired_deadlines_batch(pool, dlq_enabled, &RescueBatchOptions::default())
+            .await?
+            .rescued)
+    }
+
+    /// One deadline rescue batch in its own transaction: up to
+    /// 500 lease rows and 500 receipt claims.
+    #[tracing::instrument(
+        skip(self, pool, dlq_enabled, options),
+        name = "queue_storage.rescue_expired_deadlines"
+    )]
+    pub async fn rescue_expired_deadlines_batch(
+        &self,
+        pool: &PgPool,
+        dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
+        options: &RescueBatchOptions,
+    ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(RESCUE_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut excluded = BTreeSet::new();
         let mut selected: Option<BTreeSet<(i64, i64)>> = None;
         loop {
@@ -15498,53 +16840,55 @@ impl QueueStorage {
                 .unwrap_or_default();
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE (job_id, run_lease) IN (
-                SELECT job_id, run_lease
-                FROM {schema}.leases
-                WHERE state = 'running'
-                  AND deadline_at IS NOT NULL
-                  AND deadline_at < clock_timestamp()
-                  AND NOT EXISTS (
-                      SELECT 1 FROM unnest($1::bigint[], $2::bigint[]) AS excluded(job_id, run_lease)
-                      WHERE excluded.job_id = leases.job_id AND excluded.run_lease = leases.run_lease
-                  )
-                  AND ($3::boolean OR EXISTS (
-                      SELECT 1 FROM unnest($4::bigint[], $5::bigint[]) AS selected(job_id, run_lease)
-                      WHERE selected.job_id = leases.job_id AND selected.run_lease = leases.run_lease
-                  ))
-                ORDER BY deadline_at ASC
-                LIMIT 500
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(&excluded_job_ids)
-        .bind(&excluded_run_leases)
-        .bind(selected.is_none())
-        .bind(&selected_job_ids)
-        .bind(&selected_run_leases)
-        .fetch_all(attempt.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                r#"
+                DELETE FROM {schema}.leases
+                WHERE (job_id, run_lease) IN (
+                    SELECT job_id, run_lease
+                    FROM {schema}.leases
+                    WHERE state = 'running'
+                      AND deadline_at IS NOT NULL
+                      AND deadline_at < clock_timestamp()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest($1::bigint[], $2::bigint[]) AS excluded(job_id, run_lease)
+                          WHERE excluded.job_id = leases.job_id AND excluded.run_lease = leases.run_lease
+                      )
+                      AND ($3::boolean OR EXISTS (
+                          SELECT 1 FROM unnest($4::bigint[], $5::bigint[]) AS selected(job_id, run_lease)
+                          WHERE selected.job_id = leases.job_id AND selected.run_lease = leases.run_lease
+                      ))
+                    ORDER BY deadline_at ASC
+                    LIMIT $6
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    enqueue_shard,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at,
+                    callback_id,
+                    callback_timeout_at
+                "#
+            ))
+            .bind(&excluded_job_ids)
+            .bind(&excluded_run_leases)
+            .bind(selected.is_none())
+            .bind(&selected_job_ids)
+            .bind(&selected_run_leases)
+            .bind(RECEIPT_RESCUE_BATCH_LIMIT)
+            .fetch_all(attempt.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            let mut saturated = deleted.len() as i64 >= RECEIPT_RESCUE_BATCH_LIMIT;
 
             // Receipts-mode short-path claims hold their deadline on
             // `lease_claims.deadline_at` rather than on a `leases` row, so
@@ -15556,16 +16900,24 @@ impl QueueStorage {
                 .copied()
                 .chain(deleted.iter().map(|row| (row.job_id, row.run_lease)))
                 .collect();
-            let receipt_deleted = if self.lease_claim_receipts() {
+            let mut receipts = ReceiptRescueBatch::default();
+            if self.lease_claim_receipts() {
                 self.rescue_expired_receipt_deadlines_tx(
                     &mut attempt,
+                    options,
                     &receipt_excluded,
                     selected.as_ref(),
+                    &mut receipts,
                 )
-                .await?
-            } else {
-                Vec::new()
-            };
+                .await?;
+            }
+            saturated |= receipts.saturated;
+            let ReceiptRescueBatch {
+                rescued: receipt_deleted,
+                idle_slots,
+                scan_progress,
+                ..
+            } = receipts;
 
             selected.get_or_insert_with(|| {
                 deleted
@@ -15578,7 +16930,12 @@ impl QueueStorage {
             if deleted.is_empty() && receipt_deleted.is_empty() {
                 attempt.commit().await.map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
-                return Ok(Vec::new());
+                return Ok(RescueBatch {
+                    idle_slots,
+                    scan_progress,
+                    saturated,
+                    ..RescueBatch::default()
+                });
             }
 
             let mut moved = match self
@@ -15588,40 +16945,41 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
-            moved.extend(
-                match self
-                    .try_hydrate_deleted_leases_tx(&mut attempt, receipt_deleted)
-                    .await?
-                {
-                    Ok(moved) => moved,
-                    Err(busy) => {
-                        attempt.rollback().await.map_err(map_sqlx_error)?;
-                        busy.exclude(&mut excluded)?;
-                        continue;
-                    }
-                },
-            );
-
-            let mut rescued = Vec::with_capacity(moved.len());
-            for row in moved {
-                let dlq_reason = dlq_enabled(&row.queue).then_some("deadline_exceeded");
-                rescued.push(
-                    self.settle_rescued_attempt_tx(
-                        &mut attempt,
-                        row,
-                        "hard deadline exceeded",
-                        dlq_reason,
-                    )
-                    .await?,
-                );
+            match self
+                .try_hydrate_deleted_leases_tx(&mut attempt, receipt_deleted)
+                .await?
+            {
+                Ok(receipts_moved) => moved.extend(receipts_moved),
+                Err(busy) => {
+                    attempt.rollback().await.map_err(map_sqlx_error)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
+                    continue;
+                }
             }
+
+            let rescued = self
+                .settle_rescued_attempts_tx(
+                    &mut attempt,
+                    moved,
+                    "hard deadline exceeded",
+                    RescueDlq {
+                        reason: "deadline_exceeded",
+                        enabled: dlq_enabled,
+                    },
+                )
+                .await?;
             attempt.commit().await.map_err(map_sqlx_error)?;
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(rescued);
+            return Ok(RescueBatch {
+                rescued,
+                saturated,
+                idle_slots,
+                scan_progress,
+            });
         }
     }
 
@@ -15636,17 +16994,35 @@ impl QueueStorage {
     /// [`Self::rescue_expired_callbacks`], moving an exhausted attempt into
     /// `dlq_entries` (reason `callback_timeout`) in the rescue transaction
     /// when `dlq_enabled` returns true for its queue.
-    #[tracing::instrument(
-        skip(self, pool, dlq_enabled),
-        name = "queue_storage.rescue_expired_callbacks"
-    )]
     pub async fn rescue_expired_callbacks_with_dlq(
         &self,
         pool: &PgPool,
         dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<Vec<JobRow>, AwaError> {
+        Ok(self
+            .rescue_expired_callbacks_batch(pool, dlq_enabled, &RescueBatchOptions::default())
+            .await?
+            .rescued)
+    }
+
+    /// One callback-timeout rescue batch in its own transaction: up to
+    /// 500 attempts. The options do not apply: callback waits live in
+    /// `leases`, not in the claim ring.
+    #[tracing::instrument(
+        skip(self, pool, dlq_enabled, _options),
+        name = "queue_storage.rescue_expired_callbacks"
+    )]
+    pub async fn rescue_expired_callbacks_batch(
+        &self,
+        pool: &PgPool,
+        dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
+        _options: &RescueBatchOptions,
+    ) -> Result<RescueBatch, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(RESCUE_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut excluded = BTreeSet::new();
         let mut selected: Option<BTreeSet<(i64, i64)>> = None;
         loop {
@@ -15658,53 +17034,55 @@ impl QueueStorage {
                 .unwrap_or_default();
             let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
             let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE (job_id, run_lease) IN (
-                SELECT job_id, run_lease
-                FROM {schema}.leases
-                WHERE state = 'waiting_external'
-                  AND callback_timeout_at IS NOT NULL
-                  AND callback_timeout_at < clock_timestamp()
-                  AND NOT EXISTS (
-                      SELECT 1 FROM unnest($1::bigint[], $2::bigint[]) AS excluded(job_id, run_lease)
-                      WHERE excluded.job_id = leases.job_id AND excluded.run_lease = leases.run_lease
-                  )
-                  AND ($3::boolean OR EXISTS (
-                      SELECT 1 FROM unnest($4::bigint[], $5::bigint[]) AS selected(job_id, run_lease)
-                      WHERE selected.job_id = leases.job_id AND selected.run_lease = leases.run_lease
-                  ))
-                ORDER BY callback_timeout_at ASC
-                LIMIT 500
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(&excluded_job_ids)
-        .bind(&excluded_run_leases)
-        .bind(selected.is_none())
-        .bind(&selected_job_ids)
-        .bind(&selected_run_leases)
-        .fetch_all(attempt.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                r#"
+                DELETE FROM {schema}.leases
+                WHERE (job_id, run_lease) IN (
+                    SELECT job_id, run_lease
+                    FROM {schema}.leases
+                    WHERE state = 'waiting_external'
+                      AND callback_timeout_at IS NOT NULL
+                      AND callback_timeout_at < clock_timestamp()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest($1::bigint[], $2::bigint[]) AS excluded(job_id, run_lease)
+                          WHERE excluded.job_id = leases.job_id AND excluded.run_lease = leases.run_lease
+                      )
+                      AND ($3::boolean OR EXISTS (
+                          SELECT 1 FROM unnest($4::bigint[], $5::bigint[]) AS selected(job_id, run_lease)
+                          WHERE selected.job_id = leases.job_id AND selected.run_lease = leases.run_lease
+                      ))
+                    ORDER BY callback_timeout_at ASC
+                    LIMIT $6
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    enqueue_shard,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at,
+                    callback_id,
+                    callback_timeout_at
+                "#
+            ))
+            .bind(&excluded_job_ids)
+            .bind(&excluded_run_leases)
+            .bind(selected.is_none())
+            .bind(&selected_job_ids)
+            .bind(&selected_run_leases)
+            .bind(RECEIPT_RESCUE_BATCH_LIMIT)
+            .fetch_all(attempt.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            let saturated = deleted.len() as i64 >= RECEIPT_RESCUE_BATCH_LIMIT;
 
             selected.get_or_insert_with(|| {
                 deleted
@@ -15716,7 +17094,7 @@ impl QueueStorage {
             if deleted.is_empty() {
                 attempt.commit().await.map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
-                return Ok(Vec::new());
+                return Ok(RescueBatch::default());
             }
 
             let moved = match self
@@ -15726,27 +17104,30 @@ impl QueueStorage {
                 Ok(moved) => moved,
                 Err(busy) => {
                     attempt.rollback().await.map_err(map_sqlx_error)?;
-                    busy.exclude(&mut excluded)?;
+                    busy.exclude(&mut excluded, &mut selected)?;
                     continue;
                 }
             };
 
-            let mut rescued = Vec::with_capacity(moved.len());
-            for row in moved {
-                let dlq_reason = dlq_enabled(&row.queue).then_some("callback_timeout");
-                rescued.push(
-                    self.settle_rescued_attempt_tx(
-                        &mut attempt,
-                        row,
-                        "callback timed out",
-                        dlq_reason,
-                    )
-                    .await?,
-                );
-            }
+            let rescued = self
+                .settle_rescued_attempts_tx(
+                    &mut attempt,
+                    moved,
+                    "callback timed out",
+                    RescueDlq {
+                        reason: "callback_timeout",
+                        enabled: dlq_enabled,
+                    },
+                )
+                .await?;
             attempt.commit().await.map_err(map_sqlx_error)?;
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(rescued);
+            return Ok(RescueBatch {
+                rescued,
+                saturated,
+                idle_slots: Vec::new(),
+                scan_progress: Vec::new(),
+            });
         }
     }
 
@@ -16090,6 +17471,33 @@ impl QueueStorage {
             }
         }
         Ok(false)
+    }
+
+    /// TRUNCATE those of `children` that hold reclaimable storage. The caller
+    /// must already hold ACCESS EXCLUSIVE on every child; a child it skips has
+    /// no heap page, so it holds no row.
+    async fn truncate_used_children_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        children: &[&str],
+    ) -> Result<(), AwaError> {
+        let mut targets: Vec<&str> = Vec::with_capacity(children.len());
+        for child in children {
+            let reclaimable: bool = sqlx::query_scalar(RECLAIMABLE_CHILD_STORAGE_SQL)
+                .bind(child)
+                .fetch_one(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            if reclaimable {
+                targets.push(child);
+            }
+        }
+        if !targets.is_empty() {
+            sqlx::query(&format!("TRUNCATE TABLE {}", targets.join(", ")))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
@@ -16939,16 +18347,34 @@ impl QueueStorage {
         let locked: Result<PruneOutcome, AwaError> = async {
             set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+            // Locks are requested in this order, and a statement that holds
+            // a later child while it waits behind the request for an earlier
+            // one deadlocks with prune until the lock timeout. Claims take
+            // the segment child first, and retry, fail and snooze take the
+            // done child before the ready child.
+            let slot_children = format!(
+                "{segment_child}, {done_child}, {ready_child}, {claim_attempt_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
+            );
+            // SHARE ROW EXCLUSIVE waits for every transaction that has
+            // written to this slot and blocks new writers, while claims,
+            // completions and admin reads keep reading the sealed children.
+            // The gates and the scans below can therefore take as long as
+            // the slot needs without stalling traffic; ACCESS EXCLUSIVE is
+            // only requested once the truncate is the next statement.
             sqlx::query(&format!(
-                "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
+                "LOCK TABLE {slot_children} IN SHARE ROW EXCLUSIVE MODE"
             ))
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+            sqlx::query("SAVEPOINT awa_prune_slot_frozen")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
 
-            // The pre-lock gates are only an MVCC snapshot. If an in-flight
-            // producer or claimer committed while the exclusive partition
-            // lock waited, these post-lock gates see it before TRUNCATE.
+            // The pre-lock gates are only an MVCC snapshot. Writers that
+            // touched the slot have committed by the time the lock is
+            // granted, so these gates see them.
             let active_leases =
                 queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
             if active_leases {
@@ -17174,12 +18600,50 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            sqlx::query(&format!(
-                "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
-            ))
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout).await?;
+
+            // A receipt claim inserts its attempt batch into this slot, so
+            // it cannot have started after the slot was frozen, and closures
+            // only accumulate: the claim-reference proof above still holds.
+            // A claim that writes a lease directly touches no child of the
+            // slot, and one that read its ready row before the freeze can
+            // commit until the upgrade is granted. These two gates see it.
+            let active_leases =
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+            let pending = !active_leases
+                && queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation)
+                    .await?;
+            if active_leases || pending {
+                // Drops the carried failed rows along with the slot locks.
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_slot_frozen")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return Ok(PruneOutcome::SkippedActive {
+                    slot,
+                    reason: if active_leases {
+                        SkipReason::QueueActiveLeases
+                    } else {
+                        SkipReason::QueuePendingReady
+                    },
+                    count: busy_indicator(true),
+                });
+            }
+
+            Self::truncate_used_children_tx(
+                &mut tx,
+                &[
+                    &segment_child,
+                    &done_child,
+                    &ready_child,
+                    &claim_attempt_child,
+                    &tomb_child,
+                    &receipt_batch_child,
+                    &receipt_tomb_child,
+                    &delta_child,
+                ],
+            )
+            .await?;
 
             if !pruned_terminal_counts.is_empty() {
                 self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
@@ -17329,10 +18793,7 @@ impl QueueStorage {
                 });
             }
 
-            sqlx::query(&format!("TRUNCATE TABLE {lease_child}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+            Self::truncate_used_children_tx(&mut tx, &[&lease_child]).await?;
             Ok(PruneOutcome::Pruned {
                 slot,
                 carried_failed_rows: 0,
@@ -17505,13 +18966,16 @@ impl QueueStorage {
             return Ok(PruneOutcome::Noop);
         };
 
-        // Lock the slot row so concurrent rotate/prune observe the same
-        // state machine transition.
+        // The ring state row locked above already serializes rotate and
+        // prune. The slot row is only read here: rescue takes its table
+        // locks on the slot's partitions and then locks this row for its
+        // cursor, so holding the row while waiting for ACCESS EXCLUSIVE on
+        // those partitions would deadlock with every rescue of the slot.
+        // Prune locks the row once it holds the partitions.
         let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
             r#"
             SELECT slot FROM {schema}.claim_ring_slots
             WHERE slot = $1
-            FOR UPDATE
             "#
         ))
         .bind(slot)
@@ -17581,17 +19045,26 @@ impl QueueStorage {
         let locked: Result<PruneOutcome, AwaError> = async {
             set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+            let slot_children = format!(
+                "{claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
+            );
+            // Heartbeat, retry, fail and snooze read `lease_claims` and then
+            // update it in the same transaction. A weaker lock held across
+            // the proof below would let them read and then block their
+            // update, and the request for ACCESS EXCLUSIVE would deadlock
+            // with every one of them. Claim prune therefore takes
+            // ACCESS EXCLUSIVE before the proof.
+            acquire_prune_exclusive_lock_tx(&mut tx, &slot_children, self.prune_lock_timeout)
+                .await?;
+
             sqlx::query(&format!(
-                "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
+                "SELECT slot FROM {schema}.claim_ring_slots WHERE slot = $1 FOR UPDATE"
             ))
+            .bind(slot)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
-            // After taking ACCESS EXCLUSIVE, recheck that the slot is still
-            // not the current one. The ring-state lock should already make
-            // this stable, but keeping the explicit gate documents the
-            // truncate precondition.
             let current_slot: i32 = sqlx::query_scalar(&format!(
                 r#"
                 SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
@@ -17626,12 +19099,16 @@ impl QueueStorage {
                 });
             }
 
-            sqlx::query(&format!(
-                "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
-            ))
-            .execute(tx.as_mut())
-            .await
-                .map_err(map_sqlx_error)?;
+            Self::truncate_used_children_tx(
+                &mut tx,
+                &[
+                    &claim_child,
+                    &claim_batch_child,
+                    &closure_child,
+                    &closure_batch_child,
+                ],
+            )
+            .await?;
             self.ensure_claim_batch_job_index_tx(&mut tx, slot).await?;
             sqlx::query(&format!(
                 r#"

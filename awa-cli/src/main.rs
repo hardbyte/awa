@@ -1,3 +1,5 @@
+mod control;
+use control::ControlCommands;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,6 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Control automatic maintenance pruning across this database.
+    Control {
+        #[command(subcommand)]
+        command: ControlCommands,
+    },
     /// Run database migrations
     Migrate {
         /// Extract migration SQL to a directory instead of applying
@@ -833,6 +840,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     unreachable!()
                 }
 
+                Commands::Control { command } => control::run(&pool, command).await?,
+
                 Commands::Job { command } => match command {
                     JobCommands::Dump { id } => {
                         let dump = awa_model::admin::dump_job(&pool, id).await?;
@@ -1430,7 +1439,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!(
                                     "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
                                     stat.queue,
-                                    stat.available,
+                                    if stat.available_is_estimate {
+                                        format!("~{}", stat.available)
+                                    } else {
+                                        stat.available.to_string()
+                                    },
                                     stat.running,
                                     stat.failed,
                                     stat.completed_last_hour,
