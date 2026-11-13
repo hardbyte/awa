@@ -379,7 +379,10 @@ impl JobExecutor {
                 }),
                 finalizing: false,
             };
-            in_flight.insert((job_id, job_run_lease), in_flight_state);
+            // An operator cancel can commit after the claim and before this
+            // registration; the registry kept it for us. The cancel already
+            // closed the attempt, so there is nothing to run or finalize.
+            let cancelled_before_start = in_flight.insert((job_id, job_run_lease), in_flight_state);
             let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
                 in_flight: in_flight.clone(),
                 key: (job_id, job_run_lease),
@@ -402,6 +405,15 @@ impl JobExecutor {
 
             let mut started_event = None;
             let result = match workers.get(&job.kind) {
+                Some(_) if cancelled_before_start => {
+                    info!(
+                        kind = %job.kind,
+                        job_id,
+                        run_lease = job_run_lease,
+                        "Skipping a handler whose attempt was cancelled before it started"
+                    );
+                    None
+                }
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();

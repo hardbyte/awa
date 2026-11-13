@@ -123,7 +123,7 @@ Terminal rows differ by storage backend:
 - DLQ-enabled terminal failures are routed or moved into `dlq_entries` instead of ordinary terminal history; that table has explicit retention cleanup plus operator retry/purge.
 - In the canonical compatibility path, terminal rows in `awa.jobs_hot` use row-by-row retention cleanup.
 
-Progress is cleared on successful completion and preserved across retry, snooze, cancel, fail, and rescue. On queue storage, mutable progress snapshots live in `attempt_state` once an attempt first needs that mutable state; they are not rewrites of the immutable ready row. Cancellation is cooperative for live handlers: Rust handlers can poll `ctx.is_cancelled()`, Python handlers can poll `job.is_cancelled()`, and stale storage writes are still rejected by the `run_lease` guard if a handler misses the signal.
+Progress is cleared on successful completion and preserved across retry, snooze, cancel, fail, and rescue. On queue storage, mutable progress snapshots live in `attempt_state` once an attempt first needs that mutable state; they are not rewrites of the immutable ready row. Cancellation is cooperative for live handlers: Rust handlers can poll `ctx.is_cancelled()`, Python handlers can poll `job.is_cancelled()`, and stale storage writes are still rejected by the `run_lease` guard if a handler misses the signal. An attempt cancelled after its claim committed but before its handler started does not run: the runtime keeps the cancel until the attempt registers.
 
 ## Enqueue And Claim
 
