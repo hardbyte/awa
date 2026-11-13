@@ -637,11 +637,11 @@ impl<'a> BranchTimer<'a> {
     }
 }
 
-/// Owns the per-branch overrun state for the maintenance leader loop.
-/// All access is logically single-threaded — the maintenance loop is the
-/// only caller — but the loop runs inside a `tokio::spawn`-ed task that
-/// requires `Send`, so we use `std::sync::Mutex` rather than `RefCell`.
-/// The mutex is uncontended in practice (one acquirer); cost is one
+/// Owns the per-branch overrun state for the maintenance leader's loops.
+/// The recovery and hygiene loops share it on one task, so access never
+/// overlaps, but the task is `tokio::spawn`-ed and must be `Send`, so this
+/// is a `std::sync::Mutex` rather than a `RefCell`. State is keyed by
+/// branch and the guard is never held across an `.await`; cost is one
 /// uncontended lock per branch tick.
 #[derive(Default)]
 struct MaintenanceBranchTracker {
@@ -1620,9 +1620,6 @@ impl MaintenanceService {
                 .storage
                 .queue_storage()
                 .map(|runtime| runtime.claim_rotate_interval);
-            // Per-branch overrun tracker. Issue #242 — observability only;
-            // the architectural split of this `tokio::select!` is deferred
-            // to v0.7 conditional on the overrun counter showing fleet hits.
             *self
                 .rescue_owner_evidence
                 .lock()
@@ -1637,6 +1634,8 @@ impl MaintenanceService {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
+            // Per-branch overrun tracker (#242), shared by the recovery and
+            // hygiene loops below (#303, ADR-051).
             let branch_tracker = MaintenanceBranchTracker::new();
             // Per-segment prune backoff (#169). Gates the prune step of
             // each rotate branch so a pinned MVCC snapshot doesn't make
@@ -1685,165 +1684,223 @@ impl MaintenanceService {
                 timer.tick().await;
             }
 
-            // Do an initial sync immediately on becoming leader
-            self.sync_periodic_jobs_to_db().await;
-            let cron_eval_cancel = self.cancel.child_token();
+            // #303 (ADR-051): promotion and rescue run in their own loop, so
+            // a hygiene branch waiting on a lock or scanning a large table
+            // cannot hold back the work users wait on. The leader check runs
+            // beside both loops, so a lost lock session is noticed while
+            // either is inside a branch. All three run on this task and end
+            // with the term: `term` is cancelled on shutdown or when the lock
+            // session is lost, and each loop returns at its next select. A
+            // branch already in flight runs to completion. Branches never
+            // relied on running one at a time: each is its own transaction,
+            // kept safe by SQL locks, as it must be when an old leader's
+            // branch outlives its lock and overlaps the new leader's.
+            let term = self.cancel.child_token();
+
+            // The evaluator starts before the initial sync, on its own task,
+            // so a sync waiting on a locked cron row does not stop schedules
+            // already in `awa.cron_jobs` from firing. Until the sync commits,
+            // a schedule whose declaration changed is evaluated as stored, as
+            // the previous leader left it; `last_enqueued_at` still guards
+            // against a double fire.
+            let cron_eval_cancel = term.child_token();
             let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
                 self.pool.clone(),
                 cron_eval_cancel.clone(),
                 self.cron_eval_interval,
             ));
 
-            loop {
-                tokio::select! {
-                    _ = self.cancel.cancelled() => {
-                        debug!("Maintenance service shutting down");
-                        self.leader.store(false, Ordering::SeqCst);
-                        Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
-                        // Release leader lock on the same connection that acquired it.
-                        // If this fails, dropping the connection will release the lock anyway.
-                        let _ = Self::release_leader(&mut leader_conn).await;
-                        return;
-                    }
-                    origin = heartbeat_rescue_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
-                            let backlog = self.rescue_stale_heartbeats(origin).await;
-                            timer.finish();
-                            if backlog {
-                                heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+            let leader_check = async {
+                loop {
+                    tokio::select! {
+                        _ = term.cancelled() => return,
+                        _ = leader_check_timer.tick() => {
+                            // The advisory lock is session-scoped: if the
+                            // connection is alive, the lock is held. If the
+                            // query fails, the connection (and lock) are gone.
+                            if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
+                                warn!("Leader connection lost, re-entering election loop");
+                                self.leader.store(false, Ordering::SeqCst);
+                                Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
+                                term.cancel();
+                                return;
                             }
-                        }
-                    }
-                    origin = deadline_rescue_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
-                            let backlog = self.rescue_expired_deadlines(origin).await;
-                            timer.finish();
-                            if backlog {
-                                deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
-                            }
-                        }
-                    }
-                    origin = callback_rescue_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
-                            let backlog = self.rescue_expired_callbacks(origin).await;
-                            timer.finish();
-                            if backlog {
-                                callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
-                            }
-                        }
-                    }
-                    _ = promote_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
-                            self.promote_scheduled(&promoters).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = cleanup_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("cleanup", self.cleanup_interval, &self.metrics) {
-                            self.cleanup_completed().await;
-                            self.cleanup_dlq_rows().await;
-                            self.cleanup_batch_operations().await;
-                            self.cleanup_stale_runtime_snapshots().await;
-                            self.cleanup_stale_descriptors().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = cron_sync_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("cron_sync", self.cron_sync_interval, &self.metrics) {
-                            self.sync_periodic_jobs_to_db().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = queue_stats_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("queue_stats", self.queue_stats_interval, &self.metrics) {
-                            self.publish_queue_health_metrics().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = dirty_key_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics) {
-                            self.recompute_dirty_admin_metadata().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = metadata_reconciliation_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics) {
-                            self.refresh_admin_metadata().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = priority_aging_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("priority_aging", self.priority_aging_interval, &self.metrics) {
-                            self.age_waiting_priorities().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = batch_operations_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("batch_operations", self.batch_operations_interval, &self.metrics) {
-                            self.process_batch_operation().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = terminal_count_rollup_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
-                            self.rollup_terminal_count_deltas().await;
-                            timer.finish();
-                        }
-                    }
-                    _ = async {
-                        if let Some(timer) = &mut vacuum_queue_timer {
-                            timer.tick().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    }, if vacuum_queue_timer.is_some() => {
-                        let interval = vacuum_queue_interval
-                            .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
-                        if let Some(timer) = branch_tracker.try_begin("rotate_queue", interval, &self.metrics) {
-                            self.rotate_queue_storage_queue(&prune_tracker).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = async {
-                        if let Some(timer) = &mut vacuum_lease_timer {
-                            timer.tick().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    }, if vacuum_lease_timer.is_some() => {
-                        let interval = vacuum_lease_interval
-                            .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
-                        if let Some(timer) = branch_tracker.try_begin("rotate_lease", interval, &self.metrics) {
-                            self.rotate_queue_storage_leases(&prune_tracker).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = async {
-                        if let Some(timer) = &mut vacuum_claim_timer {
-                            timer.tick().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    }, if vacuum_claim_timer.is_some() => {
-                        let interval = vacuum_claim_interval
-                            .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
-                        if let Some(timer) = branch_tracker.try_begin("rotate_claim", interval, &self.metrics) {
-                            self.rotate_queue_storage_claims(&prune_tracker).await;
-                            timer.finish();
-                        }
-                    }
-                    _ = leader_check_timer.tick() => {
-                        // Verify leader connection is still alive.
-                        // The advisory lock is session-scoped: if the connection is alive,
-                        // the lock is held. If the query fails, the connection (and lock) are gone.
-                        if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
-                            warn!("Leader connection lost, re-entering election loop");
-                            self.leader.store(false, Ordering::SeqCst);
-                            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
-                            break;
                         }
                     }
                 }
+            };
+
+            let recovery = async {
+                loop {
+                    tokio::select! {
+                        _ = term.cancelled() => return,
+                        origin = heartbeat_rescue_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
+                                let backlog = self.rescue_stale_heartbeats(origin).await;
+                                timer.finish();
+                                if backlog {
+                                    heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+                                }
+                            }
+                        }
+                        origin = deadline_rescue_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
+                                let backlog = self.rescue_expired_deadlines(origin).await;
+                                timer.finish();
+                                if backlog {
+                                    deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
+                                }
+                            }
+                        }
+                        origin = callback_rescue_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
+                                let backlog = self.rescue_expired_callbacks(origin).await;
+                                timer.finish();
+                                if backlog {
+                                    callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
+                                }
+                            }
+                        }
+                        _ = promote_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
+                                self.promote_scheduled(&promoters).await;
+                                timer.finish();
+                            }
+                        }
+                    }
+                }
+            };
+
+            let hygiene = async {
+                // Do an initial sync immediately on becoming leader
+                self.sync_periodic_jobs_to_db().await;
+                loop {
+                    tokio::select! {
+                        _ = term.cancelled() => return,
+                        _ = cleanup_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("cleanup", self.cleanup_interval, &self.metrics) {
+                                self.cleanup_completed().await;
+                                self.cleanup_dlq_rows().await;
+                                self.cleanup_batch_operations().await;
+                                self.cleanup_stale_runtime_snapshots().await;
+                                self.cleanup_stale_descriptors().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = cron_sync_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("cron_sync", self.cron_sync_interval, &self.metrics) {
+                                self.sync_periodic_jobs_to_db().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = queue_stats_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("queue_stats", self.queue_stats_interval, &self.metrics) {
+                                self.publish_queue_health_metrics().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = dirty_key_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics) {
+                                self.recompute_dirty_admin_metadata().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = metadata_reconciliation_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics) {
+                                self.refresh_admin_metadata().await;
+                                timer.finish();
+                            }
+                        }
+                        // Aging only rewrites waiting priorities, so it is
+                        // hygiene, not recovery.
+                        _ = priority_aging_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("priority_aging", self.priority_aging_interval, &self.metrics) {
+                                self.age_waiting_priorities().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = batch_operations_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("batch_operations", self.batch_operations_interval, &self.metrics) {
+                                self.process_batch_operation().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = terminal_count_rollup_timer.tick() => {
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin_without_cooldown("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
+                                self.rollup_terminal_count_deltas().await;
+                                timer.finish();
+                            }
+                        }
+                        _ = async {
+                            if let Some(timer) = &mut vacuum_queue_timer {
+                                timer.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if vacuum_queue_timer.is_some() => {
+                            let interval = vacuum_queue_interval
+                                .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("rotate_queue", interval, &self.metrics) {
+                                self.rotate_queue_storage_queue(&prune_tracker).await;
+                                timer.finish();
+                            }
+                        }
+                        _ = async {
+                            if let Some(timer) = &mut vacuum_lease_timer {
+                                timer.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if vacuum_lease_timer.is_some() => {
+                            let interval = vacuum_lease_interval
+                                .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("rotate_lease", interval, &self.metrics) {
+                                self.rotate_queue_storage_leases(&prune_tracker).await;
+                                timer.finish();
+                            }
+                        }
+                        _ = async {
+                            if let Some(timer) = &mut vacuum_claim_timer {
+                                timer.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if vacuum_claim_timer.is_some() => {
+                            let interval = vacuum_claim_interval
+                                .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
+                            if term.is_cancelled() { return; }
+                            if let Some(timer) = branch_tracker.try_begin("rotate_claim", interval, &self.metrics) {
+                                self.rotate_queue_storage_claims(&prune_tracker).await;
+                                timer.finish();
+                            }
+                        }
+                    }
+                }
+            };
+
+            tokio::join!(leader_check, recovery, hygiene);
+            self.leader.store(false, Ordering::SeqCst);
+            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
+            if self.cancel.is_cancelled() {
+                debug!("Maintenance service shutting down");
+                // Release leader lock on the same connection that acquired it.
+                // If this fails, dropping the connection will release the lock anyway.
+                let _ = Self::release_leader(&mut leader_conn).await;
+                return;
             }
         }
     }
@@ -4541,6 +4598,60 @@ mod tests {
         assert_eq!(lane_waiter_limit(16), 2);
         assert_eq!(lane_waiter_limit(32), 4);
         assert_eq!(lane_waiter_limit(200), 4);
+    }
+
+    /// #303 (ADR-051): promotion and rescue run in the recovery loop and
+    /// nothing else does, so no hygiene branch can delay them, and every
+    /// select arm in both loops except cancellation registers its branch.
+    #[test]
+    fn recovery_loop_runs_exactly_promotion_and_rescue() {
+        let source = include_str!("maintenance.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        let after_recovery = source.split("let recovery = async {").nth(1).unwrap();
+        let recovery = after_recovery
+            .split("let hygiene = async {")
+            .next()
+            .unwrap();
+        let hygiene = after_recovery
+            .split("let hygiene = async {")
+            .nth(1)
+            .unwrap()
+            .split("tokio::join!(leader_check, recovery, hygiene)")
+            .next()
+            .unwrap();
+        let branches = |section: &str| -> Vec<String> {
+            section
+                .split("branch_tracker.try_begin")
+                .skip(1)
+                .map(|rest| rest.split('"').nth(1).unwrap().to_string())
+                .collect()
+        };
+        let arms = |section: &str| {
+            section
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| line.starts_with("_ = ") || line.starts_with("origin = "))
+                .count()
+        };
+        let recovery_branches = [
+            "rescue_stale_heartbeats",
+            "rescue_expired_deadlines",
+            "rescue_expired_callbacks",
+            "promote_scheduled",
+        ];
+        assert_eq!(branches(recovery), recovery_branches);
+        let hygiene_branches = branches(hygiene);
+        assert!(hygiene_branches.len() >= 11, "{hygiene_branches:?}");
+        for branch in &hygiene_branches {
+            assert!(
+                !recovery_branches.contains(&branch.as_str()),
+                "{branch} belongs in the recovery loop"
+            );
+        }
+        assert_eq!(arms(recovery), branches(recovery).len() + 1);
+        assert_eq!(arms(hygiene), hygiene_branches.len() + 1);
     }
 
     #[test]
