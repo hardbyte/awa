@@ -1335,9 +1335,10 @@ impl LeaderPromoters {
     /// One read-only statement that is true when any plane a promotion tick
     /// covers holds a due scheduled or retryable row: canonical
     /// `scheduled_jobs` and the deferred table of each queue-storage store.
-    /// Each arm matches the index its promotion path scans (the partial
-    /// `run_at` indexes on `scheduled_jobs`, `(state, run_at, …)` on
-    /// `deferred_jobs`) and uses the same clock as that path.
+    /// Each arm is an index condition on the index its promotion path scans
+    /// (the partial `run_at` indexes on `scheduled_jobs`, `(state, run_at, …)`
+    /// on `deferred_jobs`). The canonical arms compare `run_at` with `now()`,
+    /// the deferred arms with `statement_timestamp()`.
     fn due_probe_sql(&self) -> String {
         let mut arms = Vec::with_capacity(6);
         for state in ["scheduled", "retryable"] {
@@ -1351,7 +1352,7 @@ impl LeaderPromoters {
             for state in ["scheduled", "retryable"] {
                 arms.push(format!(
                     "EXISTS (SELECT 1 FROM {schema}.deferred_jobs \
-                     WHERE state = '{state}'::awa.job_state AND run_at <= clock_timestamp())"
+                     WHERE state = '{state}'::awa.job_state AND run_at <= statement_timestamp())"
                 ));
             }
         }

@@ -553,6 +553,18 @@ impl Dispatcher {
         permits
     }
 
+    /// In weighted mode, clear this queue's overflow demand.
+    fn clear_overflow_demand(&self) {
+        if let ConcurrencyMode::Weighted {
+            overflow_pool,
+            queue_name,
+            ..
+        } = &self.concurrency
+        {
+            overflow_pool.try_acquire(queue_name, 0);
+        }
+    }
+
     fn refund_rate_limit(&self, n: usize) {
         if n == 0 {
             return;
@@ -817,6 +829,7 @@ impl Dispatcher {
                     {
                         Ok(false) => {
                             self.refund_rate_limit(batch_size);
+                            self.clear_overflow_demand();
                             return false;
                         }
                         Ok(true) => {}
@@ -949,14 +962,7 @@ impl Dispatcher {
                 self.metrics
                     .record_dispatch_empty_claim(&self.queue, reason.as_str());
             }
-            if let ConcurrencyMode::Weighted {
-                overflow_pool,
-                queue_name,
-                ..
-            } = &self.concurrency
-            {
-                overflow_pool.try_acquire(queue_name, 0);
-            }
+            self.clear_overflow_demand();
             return false;
         }
 
