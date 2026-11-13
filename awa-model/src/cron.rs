@@ -291,14 +291,25 @@ impl CronJobRow {
 
 /// Upsert a periodic job schedule into `awa.cron_jobs`.
 ///
-/// Additive only — never deletes rows not in the input set.
+/// Additive only — never deletes rows not in the input set. A declaration
+/// identical to the stored row writes nothing, so runtimes that sync the same
+/// schedules on a timer do not rewrite the row or move `updated_at`.
 pub async fn upsert_cron_job<'e, E>(executor: E, job: &PeriodicJob) -> Result<(), AwaError>
 where
     E: PgExecutor<'e>,
 {
+    // `live` is read from the statement's snapshot. An unchanged declaration
+    // is accepted through it without a write. A conflicting row this snapshot
+    // cannot see (a concurrent first insert of the same name) is rewritten as
+    // before, so the statement still reports it accepted.
     let accepted: bool = sqlx::query_scalar(
         r#"
-        WITH upsert AS (
+        WITH live AS (
+            SELECT EXISTS(
+                SELECT 1 FROM awa.cron_jobs WHERE name=$1 AND owner_id IS NULL AND retired_at IS NULL
+            ) AS seen
+        ),
+        upsert AS (
         INSERT INTO awa.cron_jobs (name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata, missed_fire_policy)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (name) DO UPDATE SET
@@ -314,9 +325,20 @@ where
             missed_fire_policy = EXCLUDED.missed_fire_policy,
             updated_at = now()
         WHERE awa.cron_jobs.owner_id IS NULL AND awa.cron_jobs.retired_at IS NULL
+          AND (
+            NOT (SELECT seen FROM live)
+            OR (awa.cron_jobs.cron_expr, awa.cron_jobs.timezone, awa.cron_jobs.kind,
+                awa.cron_jobs.queue, awa.cron_jobs.args, awa.cron_jobs.priority,
+                awa.cron_jobs.max_attempts, awa.cron_jobs.tags, awa.cron_jobs.metadata,
+                awa.cron_jobs.missed_fire_policy)
+               IS DISTINCT FROM
+               (EXCLUDED.cron_expr, EXCLUDED.timezone, EXCLUDED.kind, EXCLUDED.queue,
+                EXCLUDED.args, EXCLUDED.priority, EXCLUDED.max_attempts, EXCLUDED.tags,
+                EXCLUDED.metadata, EXCLUDED.missed_fire_policy)
+          )
         RETURNING 1
         )
-        SELECT EXISTS(SELECT 1 FROM upsert) OR EXISTS(
+        SELECT EXISTS(SELECT 1 FROM upsert) OR (SELECT seen FROM live) OR EXISTS(
             SELECT 1 FROM awa.cron_jobs WHERE name=$1 AND owner_id IS NULL AND retired_at IS NOT NULL
         )
         "#,

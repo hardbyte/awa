@@ -195,6 +195,53 @@ async fn test_upsert_updates_existing_schedule() {
 }
 
 #[tokio::test]
+async fn test_upsert_of_an_unchanged_schedule_writes_nothing() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["test_upsert_unchanged"]).await;
+
+    let job = PeriodicJob::builder("test_upsert_unchanged", "0 9 * * *")
+        .queue("reports")
+        .build_raw(
+            "daily_report".to_string(),
+            serde_json::json!({"format": "pdf"}),
+        )
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+    let version = |pool: sqlx::PgPool| async move {
+        sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
+            "SELECT xmin::text, updated_at FROM awa.cron_jobs WHERE name = 'test_upsert_unchanged'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let first = version(pool.clone()).await;
+
+    upsert_cron_job(&pool, &job)
+        .await
+        .expect("an unchanged declaration is still accepted");
+    assert_eq!(
+        version(pool.clone()).await,
+        first,
+        "an identical declaration must not rewrite the row"
+    );
+
+    let changed = PeriodicJob::builder("test_upsert_unchanged", "0 9 * * *")
+        .queue("reports")
+        .build_raw(
+            "daily_report".to_string(),
+            serde_json::json!({"format": "csv"}),
+        )
+        .unwrap();
+    upsert_cron_job(&pool, &changed).await.unwrap();
+    assert_ne!(
+        version(pool.clone()).await.0,
+        first.0,
+        "a changed declaration must still update the row"
+    );
+}
+
+#[tokio::test]
 async fn test_multi_deployment_no_orphan_deletion() {
     let pool = setup().await;
     clean_cron_names(&pool, &["deploy_a_job", "deploy_b_job"]).await;
