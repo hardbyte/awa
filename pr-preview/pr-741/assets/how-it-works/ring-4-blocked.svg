@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" role="img" aria-labelledby="title desc">
+  <title id="title">4 · blocked: an unfinished job holds the oldest slot</title>
+  <desc id="desc">The ring has wrapped and slot 1 is current. The oldest sealed slot, slot 2, holds an unfinished job, so prune waits and the finished slots behind it wait too. The next rotation would reuse slot 2, so rotation stops and slot 1 keeps growing until the job finishes or is rescued.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="context-stroke"/></marker>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line class="hatch-l" x1="0" y1="0" x2="0" y2="8"/></pattern>
+    <style>
+.canvas{fill:#eef8f1}.card{fill:#fff;stroke:#b9d6c4;stroke-width:2}
+.h{fill:#173324}.c{fill:#52675a}.lbl{fill:#376248}
+.line{fill:none;stroke:#47725a;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.thin{fill:none;stroke:#47725a;stroke-width:2;stroke-linecap:round}
+.dash{stroke-dasharray:7 6}
+.ready{fill:#dff3e6;stroke:#4f9a6c;stroke-width:2}.ready-t{fill:#1d4d31}
+.claim{fill:#e7f0fb;stroke:#77a2cf;stroke-width:2}.claim-t{fill:#244f76}
+.lease{fill:#fff5d9;stroke:#d7ad4f;stroke-width:2}.lease-t{fill:#644b16}
+.term{fill:#f8e6e3;stroke:#bd746a;stroke-width:2}.term-t{fill:#71342d}
+.muted{fill:#f1f4f2;stroke:#c6d3cb;stroke-width:2}.muted-t{fill:#6b7d72}
+.bad{fill:none;stroke:#b5483b;stroke-width:3;stroke-linecap:round}.bad-t{fill:#9a3a2f}
+.good-t{fill:#2f7a4b}
+.hatch-l{stroke:#8fbf9f;stroke-width:2}
+@media (prefers-color-scheme:dark){
+.canvas{fill:#101713}.card{fill:#17221b;stroke:#3f6b50}
+.h{fill:#eff8f2}.c{fill:#b9c9bf}.lbl{fill:#a9dfbd}
+.line,.thin{stroke:#72c997}
+.ready{fill:#173826;stroke:#4fae76}.ready-t{fill:#c8f0d6}
+.claim{fill:#16283b;stroke:#5d8fc4}.claim-t{fill:#cfe3f7}
+.lease{fill:#33290f;stroke:#c49a3f}.lease-t{fill:#f3e2b6}
+.term{fill:#3a1d1a;stroke:#b8665d}.term-t{fill:#f4d2cd}
+.muted{fill:#1c2620;stroke:#3b4a41}.muted-t{fill:#93a69a}
+.bad{stroke:#e0786a}.bad-t{fill:#f0a196}.good-t{fill:#8ee0ad}
+.hatch-l{stroke:#3f7a55}
+}
+</style>
+  </defs>
+  <rect class="canvas" width="1000" height="600" rx="24"/>
+  <g font-family="Inter,system-ui,sans-serif">
+<text class="lbl" x="500" y="46" font-size="22.5" font-weight="760" text-anchor="middle">4 · BLOCKED: AN UNFINISHED JOB HOLDS THE OLDEST SLOT</text>
+<path class="card" d="M305.7 100.1A230 230 0 0 1 458.5 163.4L375.8 250.3A110 110 0 0 0 302.7 220.0Z"/>
+<path d="M305.7 100.1A230 230 0 0 1 458.5 163.4L375.8 250.3A110 110 0 0 0 302.7 220.0Z" fill="url(#hatch)" stroke="none"/>
+<rect class="canvas" x="331.1" y="159.9" width="68" height="26" rx="13" fill-opacity=".85"/>
+<text class="h" x="365.1" y="179.9" font-size="21.25" font-weight="700" text-anchor="middle">slot 0</text>
+<path class="ready" d="M466.6 171.5A230 230 0 0 1 529.9 324.3L410.0 327.3A110 110 0 0 0 379.7 254.2Z"/>
+
+<text class="ready-t" x="457.1" y="271.9" font-size="21.25" font-weight="700" text-anchor="middle">slot 1</text>
+<path class="term" d="M529.9 335.7A230 230 0 0 1 466.6 488.5L379.7 405.8A110 110 0 0 0 410.0 332.7Z"/>
+
+<text class="term-t" x="457.1" y="402.1" font-size="21.25" font-weight="700" text-anchor="middle">slot 2</text>
+<path class="card" d="M458.5 496.6A230 230 0 0 1 305.7 559.9L302.7 440.0A110 110 0 0 0 375.8 409.7Z"/>
+<path d="M458.5 496.6A230 230 0 0 1 305.7 559.9L302.7 440.0A110 110 0 0 0 375.8 409.7Z" fill="url(#hatch)" stroke="none"/>
+<rect class="canvas" x="331.1" y="474.1" width="68" height="26" rx="13" fill-opacity=".85"/>
+<text class="h" x="365.1" y="494.1" font-size="21.25" font-weight="700" text-anchor="middle">slot 3</text>
+<path class="card" d="M294.3 559.9A230 230 0 0 1 141.5 496.6L224.2 409.7A110 110 0 0 0 297.3 440.0Z"/>
+<path d="M294.3 559.9A230 230 0 0 1 141.5 496.6L224.2 409.7A110 110 0 0 0 297.3 440.0Z" fill="url(#hatch)" stroke="none"/>
+<rect class="canvas" x="200.9" y="474.1" width="68" height="26" rx="13" fill-opacity=".85"/>
+<text class="h" x="234.9" y="494.1" font-size="21.25" font-weight="700" text-anchor="middle">slot 4</text>
+<path class="card" d="M133.4 488.5A230 230 0 0 1 70.1 335.7L190.0 332.7A110 110 0 0 0 220.3 405.8Z"/>
+<path d="M133.4 488.5A230 230 0 0 1 70.1 335.7L190.0 332.7A110 110 0 0 0 220.3 405.8Z" fill="url(#hatch)" stroke="none"/>
+<rect class="canvas" x="108.9" y="382.1" width="68" height="26" rx="13" fill-opacity=".85"/>
+<text class="h" x="142.9" y="402.1" font-size="21.25" font-weight="700" text-anchor="middle">slot 5</text>
+<path class="card" d="M70.1 324.3A230 230 0 0 1 133.4 171.5L220.3 254.2A110 110 0 0 0 190.0 327.3Z"/>
+<path d="M70.1 324.3A230 230 0 0 1 133.4 171.5L220.3 254.2A110 110 0 0 0 190.0 327.3Z" fill="url(#hatch)" stroke="none"/>
+<rect class="canvas" x="108.9" y="251.9" width="68" height="26" rx="13" fill-opacity=".85"/>
+<text class="h" x="142.9" y="271.9" font-size="21.25" font-weight="700" text-anchor="middle">slot 6</text>
+<path class="card" d="M141.5 163.4A230 230 0 0 1 294.3 100.1L297.3 220.0A110 110 0 0 0 224.2 250.3Z"/>
+<path d="M141.5 163.4A230 230 0 0 1 294.3 100.1L297.3 220.0A110 110 0 0 0 224.2 250.3Z" fill="url(#hatch)" stroke="none"/>
+<rect class="canvas" x="200.9" y="159.9" width="68" height="26" rx="13" fill-opacity=".85"/>
+<text class="h" x="234.9" y="179.9" font-size="21.25" font-weight="700" text-anchor="middle">slot 7</text>
+<circle class="card" cx="300" cy="330" r="44"/>
+<path class="line" d="M337.0 314.7L396.1 290.2" marker-end="url(#arrow)"/>
+<text class="lbl" x="300" y="328" font-size="16.25" font-weight="700" text-anchor="middle">write</text>
+<text class="lbl" x="300" y="345" font-size="16.25" font-weight="700" text-anchor="middle">cursor</text>
+<text class="lbl" x="540.2" y="434.5" font-size="16.25" font-weight="700" text-anchor="middle">oldest</text>
+<rect class="ready" x="580" y="110" width="28" height="24" rx="6"/>
+<text class="c" x="620" y="128" font-size="18.75" font-weight="400" text-anchor="start">current: new rows land here</text>
+<rect class="card" x="580" y="146" width="28" height="24" rx="6"/>
+<rect x="580" y="146" width="28" height="24" rx="6" fill="url(#hatch)"/>
+<text class="c" x="620" y="164" font-size="18.75" font-weight="400" text-anchor="start">sealed, all finished</text>
+<rect class="term" x="580" y="182" width="28" height="24" rx="6"/>
+<text class="c" x="620" y="200" font-size="18.75" font-weight="400" text-anchor="start">oldest, holds an unfinished job</text>
+  </g>
+</svg>
