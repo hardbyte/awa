@@ -366,6 +366,14 @@ v059 replaces the body of `awa.backoff_duration(attempt, max_attempts)`, which s
 
 It is one `CREATE OR REPLACE FUNCTION` that keeps the function's signature, volatility, owner and privileges, and takes no lock on any `awa` or queue-storage table. Binaries before v059 call the same function from the same statements, so they get the new delays as soon as the migration commits and can run before or after it. Jobs already waiting to retry keep their scheduled time. External migration runners apply `awa migrate --sql --from 58 --to 59`.
 
+## v060: correlated claim tombstone checks
+
+A claim checks each candidate row against `ready_tombstones`, which records rows that were cancelled, retried or moved before they were claimed. For a small batch PostgreSQL could plan that `EXISTS` check as a hashed subplan that reads the slot's whole tombstone partition on every claim, although the lookup index exists, so the cost of each claim grew with churn in the slot. The check now carries `OFFSET 0`, which keeps it correlated: one index probe per candidate row.
+
+v060 rewrites `<schema>.claim_ready_runtime` and each `<schema>.claim_ready_slot_<n>` in the default and every discovered custom queue-storage schema from their own definitions, so signatures, owners, privileges and settings are unchanged. A function that already carries the check is left alone, so a replay, a fresh install and a database coming from 0.6.17 (whose `correlated_claim_tombstones` schema patch made the same change) are no-ops. It reinstalls no table or trigger and takes no lock on any `awa` or queue-storage table; a claim in flight finishes on the old body.
+
+Binaries before v060 call the same functions with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete `awa migrate --sql --from 59 --to 60` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
