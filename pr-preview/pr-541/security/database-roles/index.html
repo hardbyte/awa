@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -687,6 +686,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -739,6 +748,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -1704,10 +1853,38 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#provision-queues-before-starting-restricted-runtimes" class="md-nav__link">
+  <a href="#lane-sequences" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Provision queues before starting restricted runtimes
+        Lane sequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Lane sequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#check-and-repair-lane-ownership" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Check and repair lane ownership
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#claim-batch-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Claim batch index
       
     </span>
   </a>
@@ -2256,10 +2433,38 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#provision-queues-before-starting-restricted-runtimes" class="md-nav__link">
+  <a href="#lane-sequences" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Provision queues before starting restricted runtimes
+        Lane sequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Lane sequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#check-and-repair-lane-ownership" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Check and repair lane ownership
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#claim-batch-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Claim batch index
       
     </span>
   </a>
@@ -2371,31 +2576,48 @@
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">FUNCTIONS</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span></code></pre></div>
 <p>If an existing installation created objects as <code>awa_migrator</code> without first setting the owner role, transfer every existing schema object to <code>awa_owner</code> before relying on owner-scoped defaults. New migrations should use the effective-role command above.</p>
-<h2 id="provision-queues-before-starting-restricted-runtimes">Provision queues before starting restricted runtimes<a class="headerlink" href="#provision-queues-before-starting-restricted-runtimes" title="Permanent link">&para;</a></h2>
-<p>From schema v049, runtime calls use existing lane sequences without issuing
-<code>CREATE SEQUENCE</code>. Run provisioning as the migrator for every queue before
-starting its producers or workers:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>prepare-queue<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>--queue<span class="w"> </span>email<span class="w"> </span>--enqueue-shards<span class="w"> </span><span class="m">1</span>
+<h2 id="lane-sequences">Lane sequences<a class="headerlink" href="#lane-sequences" title="Permanent link">&para;</a></h2>
+<p>Each queue lane, <code>(queue, priority, enqueue_shard)</code>, has an enqueue and a claim sequence. From schema v053 they are created by the schema owner, whichever role first enqueues into, claims from or promotes into the lane: the lane helpers call <code>provision_lane</code> and <code>provision_lane_sequences</code> in the queue-storage schema. These are <code>SECURITY DEFINER</code> functions owned by the schema owner with a pinned <code>search_path</code>. Like the other runtime-callable functions they are executable by <code>PUBLIC</code>, so schema <code>USAGE</code> is what gates them, and they only create lanes, after checking that the queue, priority and shard are set and the shard is 0–63. A runtime therefore needs neither schema <code>CREATE</code> nor default privileges to start using a new queue, priority or shard. Their inserts into <code>queue_lanes</code>, <code>queue_enqueue_heads</code> and <code>queue_claim_heads</code> fire those tables' triggers as the schema owner, so don't grant <code>TRIGGER</code> on them to any other role.</p>
+<p>A new lane sequence gets the privileges of the head table it backs. A role that may <code>INSERT</code> or <code>UPDATE</code> <code>queue_enqueue_heads</code> gets <code>USAGE, SELECT, UPDATE</code> on the enqueue sequences, and one that may only <code>SELECT</code> it gets <code>SELECT</code>; <code>queue_claim_heads</code> does the same for the claim sequences. Granting the runtime the table privileges above is enough, and no sequence default privileges are needed for lanes.</p>
+<p>Run migrations with the schema owner as the effective role, as above, so the provisioning functions belong to it. A migrator that cannot <code>SET ROLE</code> to the owner leaves them owned by itself and the migration warns.</p>
+<p><code>awa storage prepare-queue</code> still creates every priority and shard of a queue in one transaction, and any runtime role may run it. Use it to create lanes before a deploy rather than on first use.</p>
+<h3 id="check-and-repair-lane-ownership">Check and repair lane ownership<a class="headerlink" href="#check-and-repair-lane-ownership" title="Permanent link">&para;</a></h3>
+<p>Lanes created before v053 belong to whichever role touched them first, and only that role, or the roles its default privileges named, can use them. A different runtime role then fails with <code>permission denied for sequence</code> on that lane. List lane sequences that are not owned by the schema owner or lack a runtime grant (read-only, any role):</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>lane-sequences<span class="w"> </span>--schema<span class="w"> </span>awa
 </span></code></pre></div>
-<p>The command provisions all four priorities in one transaction and is safe to
-repeat on a live queue: existing sequence cursors keep their positions. It does
-not change routing or the queue's configured shard count. Prepare additional
-shards before increasing <code>enqueue_shards</code>; match <code>--queue-stripe-count</code> to the
-runtime's queue-storage configuration. With <code>PartitionedQueue</code>, provision each
-physical queue. Use <code>--schema</code> for a custom storage schema.</p>
-<p>Apply the sequence grants above after provisioning, or set the owner's default
-privileges first. Lane cursors need <code>UPDATE</code> for <code>setval</code>, in addition to <code>USAGE</code>
-and <code>SELECT</code>. <code>CREATE SEQUENCE IF NOT EXISTS</code> requires schema CREATE even when
-the sequence already exists, so provisioning alone does not repair pre-v049
-helpers: apply the migration first, or, under a running 0.6 fleet, run
-<code>awa storage prepare-create-revoke</code> as described in the
-<a href="../../upgrade-0.6-to-0.7/#custom-schema-discovery-during-migration">0.6→0.7 upgrade guide</a>. Schema owners retain lazy creation for
-single-role installations; a restricted runtime encountering an unprepared
-lane fails with a provisioning hint.</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>The command exits 2 while any remain.</p>
+<p><code>awa migrate</code> repairs them once the migration commits, one sequence per short transaction: it gives each sequence to the schema owner and adds its missing grants, wherever it is allowed to. Reassigning takes the sequence's <code>ACCESS EXCLUSIVE</code> lock, so the repair waits at most 300 ms for it. A sequence that an open enqueue or claim holds for longer is skipped, left unchanged and reported as busy. A sequence the repair is not allowed to change is reported with the roles that can finish it. Neither fails the migration. Run the repair again at any time; it is idempotent:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>lane-sequences<span class="w"> </span>--repair
+</span></code></pre></div>
+<p>Which role can repair a sequence:</p>
+<ul>
+<li>Reassigning it needs a role that holds the current owner's privileges (a member of the owner, with inheritance) and can <code>SET ROLE</code> to the schema owner.</li>
+<li>Adding its grants needs the current owner's privileges.</li>
+</ul>
+<p>The schema owner holds neither the migration role's nor an application role's privileges, so a repair running as <code>awa_owner</code> cannot reassign sequences those roles created. That includes the migration role connected with <code>PGOPTIONS='-c role=awa_owner'</code>. Run the repair as the migration role itself, without <code>PGOPTIONS</code>, as above. <code>awa migrate</code> and <code>--repair</code> retry each sequence the effective role could not repair as the login role, so <code>awa migrate</code> run with <code>PGOPTIONS='-c role=awa_owner'</code>, as documented, still repairs the migration role's sequences.</p>
+<p>For a migrator with SET-only membership in <code>awa_owner</code>, grant schema access and helper execution explicitly before running the repair. Run as the schema owner:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_migrator</span><span class="p">;</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">FUNCTION</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="nb">TEXT</span><span class="p">,</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">),</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span><span class="n">awa</span><span class="p">.</span><span class="n">repair_lane_sequence</span><span class="p">(</span><span class="nb">TEXT</span><span class="p">,</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">)</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">  </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_migrator</span><span class="p">;</span>
+</span></code></pre></div>
+<p>For a custom queue-storage schema, also grant <code>USAGE</code> on that schema. The migrator must still hold the old sequence owner's privileges and be allowed to <code>SET ROLE</code> to the schema owner; inherited privileges from the schema owner are not required.</p>
+<p>For each sequence that remains, the output lists <code>repair_roles</code>, the login roles other than superusers that can repair it, and the statements to run. A busy sequence only needs another <code>--repair</code>. When <code>repair_roles</code> is empty, which is usual for a sequence an application role created on managed PostgreSQL, either:</p>
+<ul>
+<li>run <code>missing_grants</code> as the current owner. Every runtime role can then use the lane, although the owner stays unchanged; or</li>
+<li>give the migration role the owner's privileges, for example <code>GRANT app_role TO awa_migrator</code> from a role with <code>ADMIN</code> on <code>app_role</code>, rerun <code>--repair</code> as the migration role, then revoke the membership.</li>
+</ul>
+<p>Without the CLI, repair one sequence per transaction from <code>psql</code> in autocommit mode, connected as the migration role:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">format</span><span class="p">(</span><span class="s1">'SELECT * FROM awa.repair_lane_sequence(%L, %L)'</span><span class="p">,</span><span class="w"> </span><span class="s1">'awa'</span><span class="p">,</span><span class="w"> </span><span class="n">sequence_name</span><span class="p">)</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">)</span><span class="w"> </span><span class="err">\</span><span class="n">gexec</span>
+</span></code></pre></div>
+<h2 id="claim-batch-index">Claim batch index<a class="headerlink" href="#claim-batch-index" title="Permanent link">&para;</a></h2>
+<p>From schema v054 each queue-storage schema has <code>ensure_claim_batch_job_index(slot)</code>. Claim prune calls it right after truncating a claim slot to give that <code>lease_claim_batches</code> partition its GIN index on <code>job_ids</code>. It is <code>SECURITY DEFINER</code>, owned by the owner of <code>lease_claim_batches</code> (creating an index needs table ownership), with a pinned <code>search_path</code>. It only creates that one index, and only on a partition that is empty and unlocked. From v056 only a valid, non-partial GIN index on <code>job_ids</code> counts; a different index or relation already named <code>lease_claim_batches_&lt;slot&gt;_job_ids_idx</code> is left in place with a warning naming it, and that slot keeps scanning until it is dropped or renamed. <code>PUBLIC</code> cannot execute it. Each time the migration or installer runs, <code>EXECUTE</code> is reset to exactly the roles that then hold <code>TRUNCATE</code> on <code>lease_claim_batches</code>: a runtime role given <code>TRUNCATE</code> later gets it on the next run (or from <code>GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA</code> above until then), and a role that has lost <code>TRUNCATE</code> loses it. A runtime that cannot execute it skips the step and claims keep working.</p>
 <h2 id="custom-queue-storage-schemas">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas" title="Permanent link">&para;</a></h2>
-<p>Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and <code>TRUNCATE</code>, but never DDL. See <a href="../../queue-storage-substrate/">Queue storage</a>.</p>
+<p>Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and <code>TRUNCATE</code>, but never DDL. Check lanes in a custom schema with <code>awa storage lane-sequences --schema &lt;name&gt;</code>. See <a href="../../queue-storage-substrate/">Queue storage</a>.</p>
 <h2 id="why-the-grants-are-broad">Why the grants are broad<a class="headerlink" href="#why-the-grants-are-broad" title="Permanent link">&para;</a></h2>
 <p>Runtime triggers maintain queue counts, descriptors, uniqueness claims, and other metadata as the invoking role. The elected maintenance task promotes and rescues jobs, refreshes metadata, and reclaims eligible ring slots. Consequently a login holding <code>awa_runtime</code> is trusted Awa infrastructure: do not grant it to a producer-only application or a public callback service.</p>
 <p><a href="../../adr/042-caller-owned-finalization-transactions/">ADR-042</a> and <a href="../../adr/043-postgresql-capability-functions/">ADR-043</a> describe accepted/proposed boundaries for a narrower application finalizer and capability-specific runtime roles. They are not implemented by the current 0.6 or 0.7 development runtime.</p>

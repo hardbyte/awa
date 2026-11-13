@@ -109,8 +109,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -681,6 +680,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -733,6 +742,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2474,6 +2623,7 @@
 <li>ADR-021 relies on expired callback rescue. This ADR gives deployments a way to run that rescue without also executing handlers in the same process.</li>
 <li>ADR-019 owns queue-storage maintenance concerns such as rotation and pruning. Maintenance-only runs those existing storage tasks; it does not redefine the storage engine.</li>
 <li>ADR-029 defines transactional follow-up jobs. Maintenance-only uses that mechanism to dispatch durable lifecycle effects for rescues (expired callback, stale heartbeat, exceeded deadline). The dispatch is best-effort (in a separate transaction after the rescue UPDATE commits — see ADR-029's atomicity matrix); once the follow-up <code>INSERT</code> lands, the row is a regular Awa job. This closes the rescue/timeout event gap without requiring a handler registry in the maintenance process.</li>
+<li><a href="../052-runtime-halt/">ADR-052</a> proposes a shared exhaustive branch map, per-scope failure policies and a permanent reclamation cap for job-executing and maintenance-only runtimes. Its prune-only Phase 1 can be reviewed independently; observation and reporting continue while work is halted.</li>
 </ul>
 
 

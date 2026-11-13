@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -687,6 +686,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -739,6 +748,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2552,6 +2701,12 @@
 <td><span class="awa-status awa-status--accepted">Accepted</span></td>
 </tr>
 <tr>
+<td style="text-align: right;">047</td>
+<td><a href="047-operator-skip-rules/">Operator skip rules</a></td>
+<td>Operator rules hold, dead-letter or cancel claimed jobs of a kind, optionally matching a CEL predicate, before the handler runs; enforced after claim so the claim path and its proofs are untouched (#546 follow-up).</td>
+<td><span class="awa-status awa-status--proposed">Proposed</span></td>
+</tr>
+<tr>
 <td style="text-align: right;">048</td>
 <td><a href="048-retained-job-output/">Retained job output</a></td>
 <td>A handler may record a size-bounded JSON output for its attempt, sealed with the staging buffer and published only by the attempt's own lease-guarded transition: as the job's output on completion, or in the error entry of a failure, where only the latest entry to record one keeps it. It rides the compact completion batch, and neither the engine nor another job reads it. A kind may declare its output type, which types the API and is published in its descriptor.</td>
@@ -2568,6 +2723,12 @@
 <td><a href="050-admin-view-observation/">Admin views use invalidation and authoritative refetch</a></td>
 <td>Polling-first owning API reads, disposable invalidation and independent bounded reconciliation; push transport is deferred.</td>
 <td><span class="awa-status awa-status--accepted">Accepted</span></td>
+</tr>
+<tr>
+<td style="text-align: right;">052</td>
+<td><a href="052-runtime-halt/">Scoped runtime controls</a></td>
+<td>Permanent reclamation cap and an independently reviewable prune gate; full scoped controls remain proposed.</td>
+<td><span class="awa-status awa-status--proposed">Proposed</span></td>
 </tr>
 </tbody>
 </table>
