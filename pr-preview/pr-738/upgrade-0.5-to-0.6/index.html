@@ -2762,6 +2762,7 @@ before flipping a cluster with outstanding callbacks; a fix installed only in
 <li><code>awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}</code> rate should be near zero — non-zero <code>blocked</code> means a held-tx is preventing partition reclaim</li>
 <li><code>awa_storage_canonical_live_backlog</code> should trend monotonically to 0 once routing has flipped — a backlog that plateaus while jobs are visibly executing means canonical work is being re-created rather than drained, which is the shape <a href="https://github.com/hardbyte/awa/issues/456">#456</a> fixed (see Known issues)</li>
 </ul>
+<p>The <a href="../grafana/alerts/">shipped alert rules</a> cover the rotation, prune and queue-lag signals (<code>awa_ring_rotation_stalled</code>, <code>awa_ring_prune_blocked</code>, <code>awa_queue_lag_high</code>) and, in the Postgres rule set, transaction age (<code>awa_pg_long_transaction</code>).</p>
 <p>If any of these go wrong <strong>before</strong> any queue-storage work is accepted, <code>awa storage abort</code> is still available. After, you commit to forward-only.</p>
 <h2 id="known-issues">Known issues<a class="headerlink" href="#known-issues" title="Permanent link">&para;</a></h2>
 <ul>

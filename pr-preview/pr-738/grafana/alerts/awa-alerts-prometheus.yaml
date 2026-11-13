@@ -487,6 +487,39 @@ groups:
         data:
           - refId: A
             relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: sum by (awa_job_queue) (increase(awa_job_output_dropped_total{awa_output_reason="schema_missing"}[10m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }
+
       - uid: awa_staged_follow_ups_discarded
         title: "awa handler discards staged follow-ups"
         condition: "C"
@@ -513,6 +546,218 @@ groups:
               datasource: { type: prometheus, uid: DS_PROMETHEUS }
               expr: sum by (awa_job_queue) (rate(awa_job_output_dropped_total{awa_output_reason="schema_missing"}[5m]))
               expr: sum by (awa_job_kind) (increase(awa_job_staged_follow_ups_discarded_total[15m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }
+
+      - uid: awa_ring_rotation_stalled
+        title: "awa ring has not rotated for 15 minutes"
+        condition: "C"
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "The {{ $labels.awa_ring }} ring skips every rotation as busy"
+          description: |
+            Maintenance has tried to rotate the {{ $labels.awa_ring }} ring for 15
+            minutes and found the next slot still in use every time. Storage keeps
+            growing until it rotates. On the queue ring the usual cause is a backlog
+            older than one full turn of the ring; on the lease and claim rings it is a
+            long-running or stuck attempt still holding the oldest slot. See "Rotation
+            skip blockers" on the Awa dashboard, and /runtime in awa-ui.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: "(sum by (awa_ring) (increase(awa_maintenance_rotate_attempts_total{awa_ring_outcome=\"skipped_busy\"}[15m])) > 0) unless on (awa_ring) (sum by (awa_ring) (increase(awa_maintenance_rotate_attempts_total{awa_ring_outcome=\"rotated\"}[15m])) > 0)"
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }
+
+      - uid: awa_ring_prune_blocked
+        title: "awa ring prune blocked for 30 minutes"
+        condition: "C"
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Pruning the {{ $labels.awa_ring }} ring has been blocked for 30 minutes"
+          description: |
+            Every prune of the {{ $labels.awa_ring }} ring in the last 30 minutes
+            timed out waiting for a lock, and none succeeded. A session holding a lock
+            or a long transaction on the oldest partition is the usual cause; completed
+            rows are not reclaimed until it ends. Find it with the "Inspect long
+            transactions" query in the troubleshooting guide. See "Prune rate by ring +
+            outcome" on the Awa dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1800, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: "(sum by (awa_ring) (increase(awa_maintenance_prune_attempts_total{awa_ring_outcome=\"blocked\"}[30m])) > 0) unless on (awa_ring) (sum by (awa_ring) (increase(awa_maintenance_prune_attempts_total{awa_ring_outcome=\"pruned\"}[30m])) > 0)"
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }
+
+      - uid: awa_maintenance_branch_overrunning
+        title: "awa maintenance branch overrunning its interval"
+        condition: "C"
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: info
+          owner: awa
+        annotations:
+          summary: "Maintenance branch {{ $labels.awa_maintenance_branch }} keeps overrunning its interval"
+          description: |
+            The {{ $labels.awa_maintenance_branch }} maintenance branch has taken
+            longer than its interval in every 10-minute window for 15 minutes, so its
+            work (rescue, promotion, rotation or pruning) runs late. Check database
+            load and the branch's duration histogram on the Awa dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: "sum by (awa_maintenance_branch) (increase(awa_maintenance_branch_overrun_total[10m]))"
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }
+
+      - uid: awa_dlq_growing
+        title: "awa DLQ growing for an hour"
+        condition: "C"
+        for: 30m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: info
+          owner: awa
+        annotations:
+          summary: "The dead-letter queue for {{ $labels.awa_job_queue }} keeps growing"
+          description: |
+            {{ $labels.awa_job_queue }} has added dead-lettered jobs in every
+            1-hour window for 30 minutes. Each one is a job that exhausted its
+            attempts or failed permanently. Look at /dlq in awa-ui for the failing
+            kinds and errors, then retry or purge.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: "max by (awa_job_queue) (delta(awa_job_dlq_depth[1h]))"
               instant: true
               intervalMs: 1000
               maxDataPoints: 43200
