@@ -21,6 +21,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
+- **Alert rules for ring maintenance, the DLQ and long transactions** ([#376](https://github.com/hardbyte/awa/issues/376)). The Prometheus rule set adds `awa_ring_rotation_stalled` (a ring has skipped every rotation as busy for 15 minutes), `awa_ring_prune_blocked` (every prune of a ring for 30 minutes was blocked by a lock), `awa_maintenance_branch_overrunning` and `awa_dlq_growing`. The Postgres rule set adds `awa_pg_long_transaction`, which fires on a transaction older than 5 minutes. `validate-grafana.sh` now evaluates every rule's query against the live Prometheus and Postgres, and fails on a rule with an incomplete query.
 - **Per-queue worker utilization metrics (#733).** Every runtime samples `awa.queue.worker.in_use` (worker slots held by a running handler or one waiting for finalizer capacity) and `awa.queue.worker.capacity` (`max_workers`, or in weighted mode `min_workers` plus the overflow pool) for each queue on each runtime snapshot, so a dashboard can plot utilization as in-use ÷ capacity. Waits grow steeply once utilization stays above about 0.8; see [sizing workers from utilization](docs/configuration.md#sizing-workers-from-utilization). The overview Grafana dashboard has a **Worker utilization by queue** panel.
 - **The queue-storage prune `lock_timeout` is configurable, and prune
   attempts are counted by outcome for every ring.** Prune (queue, lease and
@@ -51,6 +52,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **The `awa_job_output_schema_missing` alert rule imports.** Its query had no expression or datasource and the rule had no threshold, so Grafana refused to provision it. It now fires when a queue drops outputs with reason `schema_missing` for 10 minutes.
 - **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.
 - **A queue lane is usable by every runtime role, whichever role creates it
   first (migration v053).** A lane's enqueue and claim sequences belonged to
