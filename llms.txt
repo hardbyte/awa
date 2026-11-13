@@ -50,6 +50,7 @@ These links are curated for agents. Each target is the Markdown representation o
 - [Upgrade 0.5 to 0.6](upgrade-0.5-to-0.6/index.md): This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; Migrations covers the general migration.
 - [Upgrade 0.6 to 0.7](upgrade-0.6-to-0.7/index.md): The 0.6 → 0.7 upgrade is short: the storage step is "be finalized." Everything else in 0.7 is additive.
 - [Observability](grafana/index.md): Three dashboards are provided.
+- [Admin dashboard observation](admin-observation/index.md): The dashboard observes ordinary owning APIs through polling. One scheduler per visible tab combines initial reads, periodic polling, independent reconciliation, mutation invalidations, focus/resume and explicit refresh. There is no.
 - [Troubleshooting](troubleshooting/index.md): This guide covers the operational issues that come up most often in practice: stuck running jobs, leader-election delays, and heartbeat timeouts.
 
 ## Security
