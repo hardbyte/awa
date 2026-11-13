@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -687,6 +686,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -739,6 +748,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -1618,6 +1767,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#queue-utilization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue utilization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#what-the-dashboards-cannot-show" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2484,6 +2644,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#queue-utilization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue utilization
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#what-the-dashboards-cannot-show" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2838,6 +3009,11 @@
 <td>Currently executing jobs by queue (stacked)</td>
 </tr>
 <tr>
+<td><strong>Worker utilization by queue</strong></td>
+<td>Time series</td>
+<td>Worker slots in use ÷ worker capacity per queue, summed over runtimes; see <a href="#queue-utilization">queue utilization</a></td>
+</tr>
+<tr>
 <td><strong>Job Duration (p50/p95/p99)</strong></td>
 <td>Time series</td>
 <td>Execution time percentiles by queue</td>
@@ -2920,6 +3096,34 @@
 </tbody>
 </table>
 <p>Color semantics are consistent across panels: green for healthy/fast paths, orange for warning/tail latency or retries, red for failures/high tail latency, blue for queue intake/backlog, and yellow for callback/external wait states.</p>
+<h3 id="queue-utilization">Queue utilization<a class="headerlink" href="#queue-utilization" title="Permanent link">&para;</a></h3>
+<p>Every runtime samples two gauges per queue on each runtime snapshot (every 10 s by default; <code>ClientBuilder::runtime_snapshot_interval</code> in Rust):</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Prometheus name</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>awa.queue.worker.in_use</code></td>
+<td><code>awa_queue_worker_in_use</code></td>
+<td>Worker slots of the queue held in this runtime: a handler running, or a finished handler waiting for finalizer capacity. It is the same count as <code>awa_job_in_flight</code>, sampled at the same moment as the capacity.</td>
+</tr>
+<tr>
+<td><code>awa.queue.worker.capacity</code></td>
+<td><code>awa_queue_worker_capacity</code></td>
+<td>Worker slots this runtime can give the queue: <code>max_workers</code> in hard-reserved mode, <code>min_workers</code> plus the whole overflow pool (<code>global_max_workers</code> minus the sum of every queue's <code>min_workers</code>) in weighted mode.</td>
+</tr>
+</tbody>
+</table>
+<p>Both carry <code>awa_job_queue</code>. Their ratio is the queue's utilization, the fraction of its workers that are busy:</p>
+<div class="language-promql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">awa_job_queue</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">awa_queue_worker_in_use</span><span class="o">)</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="o">/</span><span class="w"> </span><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">awa_job_queue</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">awa_queue_worker_capacity</span><span class="o">)</span>
+</span></code></pre></div>
+<p>A weighted queue reaches its ceiling only while no other queue wants overflow, so it can be saturated below 1 when other queues hold part of the pool; for weighted runtimes also watch <code>sum(awa_queue_worker_in_use)</code> against <code>global_max_workers</code>. See <a href="../configuration/#sizing-workers-from-utilization">sizing workers from utilization</a> for how to read the number.</p>
 <h3 id="what-the-dashboards-cannot-show">What the dashboards cannot show<a class="headerlink" href="#what-the-dashboards-cannot-show" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>Due-but-unpromoted work.</strong> <code>awa_queue_depth{awa_job_state="scheduled"}</code> counts every deferred job, due or not, and queue lag only sees jobs already in the ready lanes. A stall in promotion shows up as the deferred backlog growing while the promotion rate is flat, not as a direct number.</li>
@@ -2929,20 +3133,20 @@
 </ul>
 <h2 id="setup">Setup<a class="headerlink" href="#setup" title="Permanent link">&para;</a></h2>
 <h3 id="1-configure-otlp-export-in-your-worker">1. Configure OTLP export in your worker<a class="headerlink" href="#1-configure-otlp-export-in-your-worker" title="Permanent link">&para;</a></h3>
-<div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">// In your worker binary, before starting the client:</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">use</span><span class="w"> </span><span class="n">opentelemetry_otlp</span><span class="p">::</span><span class="n">WithExportConfig</span><span class="p">;</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">use</span><span class="w"> </span><span class="n">opentelemetry_sdk</span><span class="p">::</span><span class="n">metrics</span><span class="p">::</span><span class="n">SdkMeterProvider</span><span class="p">;</span>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">exporter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">opentelemetry_otlp</span><span class="p">::</span><span class="n">MetricExporter</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="p">.</span><span class="n">with_tonic</span><span class="p">()</span>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span><span class="p">.</span><span class="n">with_endpoint</span><span class="p">(</span><span class="s">"http://localhost:4317"</span><span class="p">)</span>
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
-</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>
-</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="kd">let</span><span class="w"> </span><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SdkMeterProvider</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
-</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">    </span><span class="p">.</span><span class="n">with_periodic_exporter</span><span class="p">(</span><span class="n">exporter</span><span class="p">)</span>
-</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">();</span>
-</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>
-</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="n">opentelemetry</span><span class="p">::</span><span class="n">global</span><span class="p">::</span><span class="n">set_meter_provider</span><span class="p">(</span><span class="n">provider</span><span class="p">);</span>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1">// In your worker binary, before starting the client:</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">use</span><span class="w"> </span><span class="n">opentelemetry_otlp</span><span class="p">::</span><span class="n">WithExportConfig</span><span class="p">;</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">use</span><span class="w"> </span><span class="n">opentelemetry_sdk</span><span class="p">::</span><span class="n">metrics</span><span class="p">::</span><span class="n">SdkMeterProvider</span><span class="p">;</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">exporter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">opentelemetry_otlp</span><span class="p">::</span><span class="n">MetricExporter</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">    </span><span class="p">.</span><span class="n">with_tonic</span><span class="p">()</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">    </span><span class="p">.</span><span class="n">with_endpoint</span><span class="p">(</span><span class="s">"http://localhost:4317"</span><span class="p">)</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="kd">let</span><span class="w"> </span><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SdkMeterProvider</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">    </span><span class="p">.</span><span class="n">with_periodic_exporter</span><span class="p">(</span><span class="n">exporter</span><span class="p">)</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">();</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="n">opentelemetry</span><span class="p">::</span><span class="n">global</span><span class="p">::</span><span class="n">set_meter_provider</span><span class="p">(</span><span class="n">provider</span><span class="p">);</span>
 </span></code></pre></div>
 <h3 id="2-import-the-dashboard">2. Import the dashboard<a class="headerlink" href="#2-import-the-dashboard" title="Permanent link">&para;</a></h3>
 <p><strong>Option A: Grafana UI</strong></p>
@@ -2953,20 +3157,20 @@
 <li>Choose the Prometheus datasource with the <strong>Datasource</strong> variable at the top of the dashboard</li>
 </ol>
 <p><strong>Option B: Provisioning</strong> Copy <code>awa-dashboard.json</code> and <code>awa-queue-detail.json</code> to the directory a Grafana dashboard provider reads. The dashboards need no datasource substitution: the <code>datasource</code> variable defaults to your default Prometheus datasource.</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>/var/lib/grafana/dashboards/awa-dashboard.json
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>/var/lib/grafana/dashboards/awa-queue-detail.json
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>/var/lib/grafana/dashboards/awa-dashboard.json
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>/var/lib/grafana/dashboards/awa-queue-detail.json
 </span></code></pre></div>
 <p><strong>Option C: API</strong></p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># The Grafana API requires a wrapper object around the dashboard JSON</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">for</span><span class="w"> </span>dashboard<span class="w"> </span><span class="k">in</span><span class="w"> </span>awa-dashboard.json<span class="w"> </span>awa-queue-detail.json<span class="p">;</span><span class="w"> </span><span class="k">do</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="s2">"http://admin:admin@localhost:3000/api/dashboards/db"</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">    </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span>-d<span class="w"> </span><span class="s2">"{\"dashboard\": </span><span class="k">$(</span>cat<span class="w"> </span><span class="nv">$dashboard</span><span class="k">)</span><span class="s2">, \"overwrite\": true}"</span>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="k">done</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># The Grafana API requires a wrapper object around the dashboard JSON</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">for</span><span class="w"> </span>dashboard<span class="w"> </span><span class="k">in</span><span class="w"> </span>awa-dashboard.json<span class="w"> </span>awa-queue-detail.json<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="s2">"http://admin:admin@localhost:3000/api/dashboards/db"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span>-d<span class="w"> </span><span class="s2">"{\"dashboard\": </span><span class="k">$(</span>cat<span class="w"> </span><span class="nv">$dashboard</span><span class="k">)</span><span class="s2">, \"overwrite\": true}"</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="k">done</span>
 </span></code></pre></div>
 <h3 id="3-verify-metrics-are-flowing">3. Verify metrics are flowing<a class="headerlink" href="#3-verify-metrics-are-flowing" title="Permanent link">&para;</a></h3>
 <p>Check Prometheus has awa metrics:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>curl -s "http://localhost:9090/api/v1/label/__name__/values" | grep awa
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>curl -s "http://localhost:9090/api/v1/label/__name__/values" | grep awa
 </span></code></pre></div>
 <p>Expected metrics: <code>awa_job_completed_total</code>, <code>awa_job_in_flight</code>, <code>awa_job_duration_seconds_*</code>, etc.</p>
 <h3 id="4-traces">4. Traces<a class="headerlink" href="#4-traces" title="Permanent link">&para;</a></h3>
@@ -3203,6 +3407,12 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Promotion time</td>
 </tr>
 <tr>
+<td><code>awa.maintenance.promote.lane_contention</code></td>
+<td>Counter</td>
+<td>state, queue, outcome</td>
+<td>Promotion lanes whose lock was busy: <code>handed_off</code> to a dedicated waiter, <code>waiter_limit</code> when every waiter was busy, <code>waiter_timed_out</code> when a waiter's 30 s wait ran out</td>
+</tr>
+<tr>
 <td><code>awa.maintenance.rescues</code></td>
 <td>Counter</td>
 <td>rescue_kind</td>
@@ -3219,6 +3429,18 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Histogram (s)</td>
 <td>ring, phase</td>
 <td>Successful destructive prune time split into <code>lock</code>, <code>truncate</code>, and <code>commit</code></td>
+</tr>
+<tr>
+<td><code>awa.maintenance.rescue.pass_size</code></td>
+<td>Histogram</td>
+<td>rescue_kind, rescue_pass_end</td>
+<td>Attempts rescued per queue-storage rescue pass, and why the pass stopped (<code>drained</code>, <code>time_budget</code>, <code>row_limit</code>, <code>owners_unconfirmed</code>, <code>error</code>)</td>
+</tr>
+<tr>
+<td><code>awa.maintenance.rescue.oldest_attempt_age</code></td>
+<td>Gauge (s)</td>
+<td>rescue_kind</td>
+<td>Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; <code>0</code> when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader</td>
 </tr>
 </tbody>
 </table>

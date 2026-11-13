@@ -109,8 +109,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -681,6 +680,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -733,6 +742,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2304,8 +2453,40 @@
 <td>a kind discarded staged follow-ups (returned <code>WaitForCallback</code> after staging) in each of the last 15m</td>
 <td>no discards for 15m</td>
 </tr>
+<tr>
+<td><code>awa_ring_rotation_stalled</code> <em>(Prom only)</em></td>
+<td>warning</td>
+<td>a ring skipped every rotation as busy for 15m, for 5m</td>
+<td>the ring rotates</td>
+</tr>
+<tr>
+<td><code>awa_ring_prune_blocked</code> <em>(Prom only)</em></td>
+<td>warning</td>
+<td>every prune of a ring in 30m was blocked by a lock and none succeeded, for 5m</td>
+<td>a prune succeeds</td>
+</tr>
+<tr>
+<td><code>awa_maintenance_branch_overrunning</code> <em>(Prom only)</em></td>
+<td>info</td>
+<td>a maintenance branch overran its interval in every 10m window, for 15m</td>
+<td>no overruns for 10m</td>
+</tr>
+<tr>
+<td><code>awa_dlq_growing</code> <em>(Prom only)</em></td>
+<td>info</td>
+<td>a queue's DLQ depth rose over the last hour, for 30m</td>
+<td>depth stops rising</td>
+</tr>
+<tr>
+<td><code>awa_pg_long_transaction</code> <em>(Postgres only)</em></td>
+<td>warning</td>
+<td>the oldest open transaction on the database is older than 5m, for 2m</td>
+<td>it commits or aborts</td>
+</tr>
 </tbody>
 </table>
+<p>The ring rules read awa's maintenance counters. A lease or claim ring cannot rotate past an attempt that is still running, so workloads whose jobs routinely run longer than 15 minutes should lengthen <code>awa_ring_rotation_stalled</code>'s window or its <code>for</code>.</p>
+<p>Transaction age comes from <code>pg_stat_activity</code>, which awa doesn't export, so only the Postgres rule set has it. With postgres_exporter, <code>pg_stat_activity_max_tx_duration</code> gives the same signal in Prometheus.</p>
 <p>Every rule's <code>description</code> annotation names the dashboard panel an operator should look at and links to the relevant awa-ui page. The 2–15 minute <code>for</code> windows deliberately skip transient spikes (rolling deploys, CI runs).</p>
 <h2 id="importing">Importing<a class="headerlink" href="#importing" title="Permanent link">&para;</a></h2>
 <h3 id="option-a-grafana-provisioning-recommended">Option A — Grafana provisioning (recommended)<a class="headerlink" href="#option-a-grafana-provisioning-recommended" title="Permanent link">&para;</a></h3>

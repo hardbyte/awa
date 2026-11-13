@@ -7,14 +7,14 @@ The `awa` command runs migrations, inspects and administers queues, and can host
 === "uv tool (recommended)"
 
     ```bash
-    uv tool install awa-cli==0.6.6
+    uv tool install awa-cli
     awa --help
     ```
 
 === "Project dependency"
 
     ```bash
-    uv add 'awa-pg[ui]==0.6.6'
+    uv add 'awa-pg[ui]'
     uv run python -m awa --help
     ```
 

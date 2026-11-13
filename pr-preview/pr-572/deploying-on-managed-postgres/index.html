@@ -113,8 +113,7 @@
             
   <span class="awa-version-note">
     These docs track <strong>main / 0.7 development</strong>.
-    Latest stable:
-    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+    See <a href="https://github.com/hardbyte/awa/releases">releases</a> for stable versions.
   </span>
 
           </div>
@@ -687,6 +686,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -739,6 +748,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2740,7 +2889,7 @@
 </span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span>
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">backend_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'client backend'</span><span class="p">;</span>
 </span></code></pre></div>
-<p>Alert when <code>max_xact_age_seconds</code> exceeds a few multiples of your normal longest job; <code>300</code> is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in <a href="../troubleshooting/#inspect-long-transactions">Inspect long transactions</a>.</p>
+<p>Alert when <code>max_xact_age_seconds</code> exceeds a few multiples of your normal longest job; <code>300</code> is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in <a href="../troubleshooting/#inspect-long-transactions">Inspect long transactions</a>. The Postgres alert rule set ships this check as <a href="../grafana/alerts/"><code>awa_pg_long_transaction</code></a>.</p>
 <h3 id="4-give-autovacuum-enough-capacity">4. Give autovacuum enough capacity<a class="headerlink" href="#4-give-autovacuum-enough-capacity" title="Permanent link">&para;</a></h3>
 <p>The queue-storage substrate ships aggressive per-table autovacuum storage parameters on its hot mutable tables (ring state, heads, leases, claims), so per-table thresholds are normally not yours to tune. What managed-Postgres defaults often starve is instance-wide vacuum capacity. If the <a href="../troubleshooting/#inspect-table-churn">table churn query</a> shows <code>autovacuum_count</code> flat while dead tuples climb on <code>leases%</code> or <code>attempt_state</code>, raise these flags:</p>
 <ul>
