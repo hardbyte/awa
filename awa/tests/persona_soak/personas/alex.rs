@@ -335,7 +335,7 @@ impl Context {
                 .get(first)
                 .is_some_and(|record| record.completed_events > 0);
             if let Some(Some(job)) = self.timed("cancel", admin::cancel(&pool, first)).await {
-                self.after_cancel(job.id, completed_before, started_ms);
+                self.after_cancel(job.id, job.run_lease, completed_before, started_ms);
             }
         } else if let Some(cancelled) = self
             .timed("bulk_cancel", admin::bulk_cancel(&pool, &ids))
@@ -343,15 +343,22 @@ impl Context {
         {
             let now = self.shared.now_ms() as u32;
             for job in &cancelled {
-                self.after_cancel(job.id, false, now);
+                self.after_cancel(job.id, job.run_lease, false, now);
             }
         }
     }
 
-    fn after_cancel(&self, job_id: i64, completed_before: bool, call_started_ms: u32) {
+    fn after_cancel(
+        &self,
+        job_id: i64,
+        run_lease: i64,
+        completed_before: bool,
+        call_started_ms: u32,
+    ) {
         self.shared.record_operator_cancel(
             Persona::Alex,
             job_id,
+            run_lease,
             completed_before,
             call_started_ms,
         );

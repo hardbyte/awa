@@ -1089,6 +1089,70 @@ mod tests {
         }
     }
 
+    fn cancel_fixture() -> Arc<Shared> {
+        let config = SoakConfig::for_test(
+            "postgres://postgres:test@localhost/awa_soak_cancel_lease".to_string(),
+        );
+        let info = db::ServerInfo::default();
+        let budget = Budget::new(&info, 0);
+        Shared::new(config, info, budget)
+    }
+
+    fn attempt(job_id: i64, run_lease: i64) -> awa::JobRow {
+        let now = chrono::Utc::now();
+        serde_json::from_value(serde_json::json!({
+            "id": job_id, "kind": "cancel_lease", "queue": "cancel_lease", "args": {},
+            "state": "running", "priority": 2, "attempt": run_lease, "run_lease": run_lease,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "metadata": {}, "tags": [],
+        }))
+        .expect("job row")
+    }
+
+    fn violations_of(shared: &Shared, kind: &str) -> usize {
+        shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .filter(|violation| violation.kind == kind)
+            .count()
+    }
+
+    /// Cancellation of a running handler is cooperative, so the attempt the
+    /// operator cancelled may still start after the cancel committed: its
+    /// claim committed first and it was on its way to the handler. Only a
+    /// newer attempt, which a claim after the cancel would produce, shows
+    /// the cancel did not stop the job.
+    #[test]
+    fn handler_start_after_cancel_is_judged_by_run_lease() {
+        let shared = cancel_fixture();
+        // The ledger reads a cancel at 0 ms as none.
+        std::thread::sleep(Duration::from_millis(5));
+        shared.record_operator_cancel(Persona::Alex, 42, 3, false, 0);
+        std::thread::sleep(Duration::from_millis(5));
+
+        drop(shared.begin_execution(Persona::Tom, &attempt(42, 3), false));
+        assert_eq!(violations_of(&shared, "ran_after_cancel"), 0);
+
+        drop(shared.begin_execution(Persona::Tom, &attempt(42, 4), false));
+        assert_eq!(violations_of(&shared, "ran_after_cancel"), 1);
+    }
+
+    /// The cancelled attempt may start, but it must never be reported
+    /// completed: the cancel already ended it.
+    #[test]
+    fn completion_of_the_cancelled_attempt_is_a_violation() {
+        let shared = cancel_fixture();
+        shared.record_operator_cancel(Persona::Alex, 42, 3, false, 0);
+        drop(shared.begin_execution(Persona::Tom, &attempt(42, 3), false));
+        shared.on_event(&awa::UntypedJobEvent::Completed {
+            job: attempt(42, 3),
+            duration: Duration::ZERO,
+        });
+        assert_eq!(violations_of(&shared, "cancelled_attempt_completed"), 1);
+    }
+
     struct TestRun {
         shared: Arc<Shared>,
         pool: PgPool,

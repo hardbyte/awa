@@ -99,7 +99,7 @@ impl CancelListener {
         }
     }
 
-    fn handle_notification(&self, payload: &str) {
+    pub(crate) fn handle_notification(&self, payload: &str) {
         let parsed: CancelPayload = match serde_json::from_str(payload) {
             Ok(parsed) => parsed,
             Err(err) => {

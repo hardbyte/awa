@@ -262,6 +262,7 @@ impl Shared {
         &self,
         persona: Persona,
         job_id: i64,
+        run_lease: i64,
         completed_before: bool,
         call_started_ms: u32,
     ) {
@@ -273,6 +274,7 @@ impl Shared {
             |record| {
                 record.flags |= flag::OPERATOR_REMOVED | flag::OPERATOR_CANCEL_OK;
                 record.operator_cancel_ms = now;
+                record.operator_cancel_run_lease = Some(run_lease);
             },
         );
         if completed_before {
