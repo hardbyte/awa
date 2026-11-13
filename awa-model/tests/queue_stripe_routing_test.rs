@@ -16,9 +16,10 @@ use awa_model::{
     QueueStorage, QueueStorageConfig,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 use std::time::Duration;
 
 fn database_url() -> String {
@@ -34,6 +35,45 @@ async fn connect() -> PgPool {
         .expect("connect");
     migrations::run(&pool).await.expect("run migrations");
     pool
+}
+
+/// A freshly created database on the `DATABASE_URL` server, for a test that
+/// changes the database-wide active storage engine. Returns the test pool and
+/// a pool on the original database, which drops the test database with
+/// [`drop_dedicated_database`].
+async fn dedicated_database(name: &str) -> (PgPool, PgPool) {
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .expect("connect");
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .expect("drop dedicated database");
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .expect("create dedicated database");
+    let options = PgConnectOptions::from_str(&database_url())
+        .expect("parse DATABASE_URL")
+        .database(name);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect to dedicated database");
+    migrations::run(&pool).await.expect("run migrations");
+    (pool, admin)
+}
+
+async fn drop_dedicated_database(pool: PgPool, admin: PgPool, name: &str) {
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .expect("drop dedicated database");
+    admin.close().await;
 }
 
 fn config(schema: &str, stripes: usize) -> QueueStorageConfig {
@@ -61,11 +101,6 @@ async fn fresh_store(pool: &PgPool, schema: &str, stripes: usize) -> QueueStorag
 /// Make `schema` the active queue-storage engine, so the SQL compat insert
 /// path (`awa.insert_job_compat`) writes into it.
 async fn activate_queue_storage(pool: &PgPool, schema: &str) {
-    let _ = storage::abort(pool).await;
-    sqlx::query("DELETE FROM awa.runtime_instances")
-        .execute(pool)
-        .await
-        .expect("clear runtime instances");
     storage::prepare(
         pool,
         "queue_storage",
@@ -156,7 +191,8 @@ async fn drain(
 
 #[tokio::test]
 async fn sql_path_jobs_are_claimed_by_a_striped_worker() {
-    let pool = connect().await;
+    let database = "awa_stripe_routing_sql";
+    let (pool, admin) = dedicated_database(database).await;
     let schema = "stripe_routing_sql";
     let store = fresh_store(&pool, schema, 2).await;
     activate_queue_storage(&pool, schema).await;
@@ -233,10 +269,7 @@ async fn sql_path_jobs_are_claimed_by_a_striped_worker() {
         "a striped worker claims every SQL-path job: {claimed:?}"
     );
 
-    cron::delete_cron_job(&pool, "stripe_routing_cron")
-        .await
-        .expect("delete cron job");
-    let _ = storage::abort(&pool).await;
+    drop_dedicated_database(pool, admin, database).await;
 }
 
 #[tokio::test]
