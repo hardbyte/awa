@@ -195,6 +195,136 @@ async fn test_upsert_updates_existing_schedule() {
 }
 
 #[tokio::test]
+async fn test_upsert_of_an_unchanged_schedule_writes_nothing() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["test_upsert_unchanged"]).await;
+
+    let job = PeriodicJob::builder("test_upsert_unchanged", "0 9 * * *")
+        .queue("reports")
+        .build_raw(
+            "daily_report".to_string(),
+            serde_json::json!({"format": "pdf"}),
+        )
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+    let version = |pool: sqlx::PgPool| async move {
+        sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
+            "SELECT xmin::text, updated_at FROM awa.cron_jobs WHERE name = 'test_upsert_unchanged'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let first = version(pool.clone()).await;
+
+    upsert_cron_job(&pool, &job)
+        .await
+        .expect("an unchanged declaration is still accepted");
+    assert_eq!(
+        version(pool.clone()).await,
+        first,
+        "an identical declaration must not rewrite the row"
+    );
+
+    let changed = PeriodicJob::builder("test_upsert_unchanged", "0 9 * * *")
+        .queue("reports")
+        .build_raw(
+            "daily_report".to_string(),
+            serde_json::json!({"format": "csv"}),
+        )
+        .unwrap();
+    upsert_cron_job(&pool, &changed).await.unwrap();
+    assert_ne!(
+        version(pool.clone()).await.0,
+        first.0,
+        "a changed declaration must still update the row"
+    );
+}
+
+/// An adoption that commits while an unchanged declaration waits on the row
+/// lock must win: the declaration was taken against an unowned row in the
+/// statement's snapshot, but the row it locks is owned, so it is rejected.
+#[tokio::test]
+async fn test_upsert_waiting_on_an_adoption_is_rejected() {
+    let pool = setup().await;
+    let clean = |pool: PgPool| async move {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('awa.cron_admin', 'on', true)")
+            .execute(tx.as_mut())
+            .await
+            .unwrap();
+        // An owned schedule cannot be deleted; release it first.
+        sqlx::query(
+            "UPDATE awa.cron_jobs SET owner_id = NULL WHERE name = 'test_upsert_adopted_midway'",
+        )
+        .execute(tx.as_mut())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM awa.cron_jobs WHERE name = 'test_upsert_adopted_midway'")
+            .execute(tx.as_mut())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    };
+    clean(pool.clone()).await;
+    let job = PeriodicJob::builder("test_upsert_adopted_midway", "0 9 * * *")
+        .build_raw("daily_report".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+    sqlx::query("INSERT INTO awa.cron_owners(owner_id) VALUES ('adopter') ON CONFLICT DO NOTHING")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // What an operator adoption writes (`cron_reconciliation::operate`).
+    let mut adoption = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('awa.cron_admin', 'on', true)")
+        .execute(adoption.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE awa.cron_jobs SET owner_id = 'adopter' WHERE name = 'test_upsert_adopted_midway'",
+    )
+    .execute(adoption.as_mut())
+    .await
+    .unwrap();
+
+    let declaring = {
+        let pool = pool.clone();
+        let job = job.clone();
+        tokio::spawn(async move { upsert_cron_job(&pool, &job).await })
+    };
+    // The declaration has taken its snapshot and is waiting on the row lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND query LIKE '%INSERT INTO awa.cron_jobs%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "declaration never waited on the adoption's row lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    adoption.commit().await.unwrap();
+
+    let result = declaring.await.unwrap();
+    assert!(
+        result.is_err(),
+        "a declaration must not be accepted for a schedule adopted before it locked the row: {result:?}"
+    );
+    clean(pool).await;
+}
+
+#[tokio::test]
 async fn test_multi_deployment_no_orphan_deletion() {
     let pool = setup().await;
     clean_cron_names(&pool, &["deploy_a_job", "deploy_b_job"]).await;
