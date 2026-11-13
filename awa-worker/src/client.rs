@@ -150,6 +150,7 @@ pub struct ClientBuilder {
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
+    maintenance_leader: bool,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
     completed_retention: Option<Duration>,
@@ -211,6 +212,7 @@ impl ClientBuilder {
             global_max_workers: None,
             leader_election_interval: None,
             leader_check_interval: None,
+            maintenance_leader: true,
             priority_aging_interval: None,
             terminal_count_rollup_interval: None,
             completed_retention: None,
@@ -802,6 +804,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Set whether this runtime contends for maintenance leadership
+    /// (default: true).
+    ///
+    /// With `false` the runtime never takes the maintenance advisory lock, so
+    /// it never promotes, rescues, rotates or cleans up for the fleet. It
+    /// still claims and executes jobs, heartbeats them, publishes runtime
+    /// snapshots and reports runtime-control observations, and it keeps its
+    /// own periodic job declarations synced so whichever runtime leads
+    /// evaluates them. Maintenance settings on this builder, such as
+    /// retention and rescue intervals, only take effect on a runtime that
+    /// leads, so configure them on the runtimes that may lead.
+    ///
+    /// At least one live runtime must keep the default, or no maintenance
+    /// runs. An opted-out runtime logs a warning and records
+    /// `awa.maintenance.leader_eligible_runtimes = 0` while it sees none.
+    pub fn maintenance_leader(mut self, eligible: bool) -> Self {
+        self.maintenance_leader = eligible;
+        self
+    }
+
     /// Set a global maximum worker count across all queues (enables weighted mode).
     ///
     /// When set, each queue gets `min_workers` guaranteed permits plus a share
@@ -1162,6 +1184,8 @@ impl ClientBuilder {
             metrics,
             leader_election_interval: self.leader_election_interval,
             leader_check_interval: self.leader_check_interval,
+            maintenance_leader: self.maintenance_leader,
+            leader_visibility: Arc::new(LeaderVisibility::default()),
             priority_aging_interval: self.priority_aging_interval,
             terminal_count_rollup_interval: self.terminal_count_rollup_interval,
             completed_retention: self.completed_retention,
@@ -1268,6 +1292,8 @@ pub struct Client {
     metrics: crate::metrics::AwaMetrics,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
+    maintenance_leader: bool,
+    leader_visibility: Arc<LeaderVisibility>,
     priority_aging_interval: Option<Duration>,
     terminal_count_rollup_interval: Option<Duration>,
     completed_retention: Option<Duration>,
@@ -1321,6 +1347,23 @@ struct RuntimeReporterState {
     transition_role: TransitionWorkerRole,
     metrics: crate::metrics::AwaMetrics,
     runtime_control: Arc<PruneControl>,
+    maintenance_leader: bool,
+    leader_visibility: Arc<LeaderVisibility>,
+}
+
+/// What an opted-out runtime last saw of the runtimes that may lead, so it
+/// warns when that count reaches zero rather than on every snapshot.
+struct LeaderVisibility {
+    /// Eligible runtimes seen by the previous check; -1 before the first.
+    last_eligible: std::sync::atomic::AtomicI64,
+}
+
+impl Default for LeaderVisibility {
+    fn default() -> Self {
+        Self {
+            last_eligible: std::sync::atomic::AtomicI64::new(-1),
+        }
+    }
 }
 
 /// Best-effort extraction of the most recent error message from a job's
@@ -1513,6 +1556,8 @@ impl Client {
             queue_storage_capable: self.storage.queue_storage().is_some(),
             transition_role: self.transition_role,
             metrics: self.metrics.clone(),
+            maintenance_leader: self.maintenance_leader,
+            leader_visibility: self.leader_visibility.clone(),
         }
     }
 
@@ -1521,12 +1566,37 @@ impl Client {
         reporter.publish_snapshot().await;
     }
 
+    async fn warn_on_unreported_leader_opt_out(&self) {
+        if self.maintenance_leader {
+            return;
+        }
+        match admin::maintenance_eligibility_reportable(&self.pool).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "This runtime does not contend for maintenance leadership, but status reports it as \
+                 eligible: apply the runtime_maintenance_eligibility schema patch (awa migrate) and \
+                 grant this role SELECT, INSERT and DELETE on awa.runtime_maintenance_eligibility"
+            ),
+            Err(err) => warn!(
+                error = %err,
+                "Could not check whether this runtime's maintenance leadership opt-out is reported"
+            ),
+        }
+    }
+
     async fn warn_on_unsafe_prune_lock_timeout(&self) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
-        let timeout = runtime.store.prune_lock_timeout();
-        let risks = match crate::storage::check_prune_lock_timeout(&self.pool, timeout).await {
+        let timeout = runtime.store.prune_lock_wait_ceiling();
+        let statement_wait = runtime.store.prune_lock_statement_wait_ceiling();
+        let risks = match crate::storage::check_prune_lock_timeout(
+            &self.pool,
+            timeout,
+            statement_wait,
+        )
+        .await
+        {
             Ok(risks) => risks,
             Err(err) => {
                 debug!(error = %err, "Could not read lock settings to check the prune lock timeout");
@@ -1536,17 +1606,20 @@ impl Client {
         for risk in risks {
             match risk {
                 crate::storage::PruneLockTimeoutRisk::DeadlockTimeout { limit_ms } => warn!(
-                    prune_lock_timeout_ms = timeout.as_millis() as u64,
+                    prune_lock_wait_ceiling_ms = timeout.as_millis() as u64,
                     deadlock_timeout_ms = limit_ms,
-                    "Prune lock timeout is at or above deadlock_timeout; a waiting prune can \
+                    "Prune's longest lock wait is at or above deadlock_timeout; a waiting prune can \
                      make PostgreSQL run deadlock detection and cancel a concurrent claim. \
-                     Keep the timeout well below deadlock_timeout"
+                     Keep the prune lock timeout and its 320 ms retry ceiling well below \
+                     deadlock_timeout"
                 ),
                 crate::storage::PruneLockTimeoutRisk::StatementTimeout { limit_ms } => warn!(
-                    prune_lock_timeout_ms = timeout.as_millis() as u64,
+                    prune_lock_statement_wait_ms = statement_wait.as_millis() as u64,
                     statement_timeout_ms = limit_ms,
-                    "Prune lock timeout is at or above statement_timeout; prune is cancelled \
-                     by the statement timeout and fails instead of reporting blocked"
+                    "A prune lock statement can wait as long as statement_timeout, because the \
+                     lock timeout applies to each of the eight partitions it locks; prune is \
+                     then cancelled by the statement timeout and fails instead of reporting \
+                     blocked"
                 ),
             }
         }
@@ -1614,6 +1687,7 @@ impl Client {
         self.log_transition_startup_status(&effective_storage)
             .await?;
         self.warn_on_unsafe_prune_lock_timeout().await;
+        self.warn_on_unreported_leader_opt_out().await;
 
         if let Some(admission) = self.runtime_control.admit(MaintenanceBranch::Descriptors) {
             admission
@@ -1752,6 +1826,7 @@ impl Client {
         if let Some(interval) = self.leader_check_interval {
             maintenance = maintenance.leader_check_interval(interval);
         }
+        maintenance = maintenance.leader_eligible(self.maintenance_leader);
         if let Some(interval) = self.priority_aging_interval {
             maintenance = maintenance.priority_aging_interval(interval);
         }
@@ -2326,6 +2401,42 @@ impl Client {
 }
 
 impl RuntimeReporterState {
+    /// Count the other live runtimes that may take maintenance leadership,
+    /// and warn when there are none: with this runtime opted out, nothing
+    /// visible would promote, rescue or clean up.
+    async fn check_eligible_leaders(&self) {
+        let instances = match admin::list_runtime_instances(&self.pool).await {
+            Ok(instances) => instances,
+            Err(err) => {
+                warn!(error = %err, "Could not read runtime snapshots to find eligible maintenance leaders");
+                return;
+            }
+        };
+        let eligible = instances
+            .iter()
+            .filter(|instance| {
+                instance.instance_id != self.instance_id && instance.can_take_leadership()
+            })
+            .count() as i64;
+        self.metrics
+            .record_maintenance_leader_eligible_runtimes(eligible);
+        let previous = self
+            .leader_visibility
+            .last_eligible
+            .swap(eligible, Ordering::SeqCst);
+        if eligible == 0 && previous != 0 {
+            warn!(
+                "This runtime does not contend for maintenance leadership and no live runtime that \
+                 may lead is visible; promotion, rescue and cleanup stop until one starts"
+            );
+        } else if eligible > 0 && previous == 0 {
+            info!(
+                eligible_runtimes = eligible,
+                "A runtime that may take maintenance leadership is visible again"
+            );
+        }
+    }
+
     async fn storage_capability(&self) -> StorageCapability {
         if !self.queue_storage_capable {
             return StorageCapability::Canonical;
@@ -2493,6 +2604,7 @@ impl RuntimeReporterState {
             maintenance_alive,
             shutting_down,
             leader,
+            maintenance_leader: self.maintenance_leader,
             global_max_workers: self.global_max_workers,
             queues,
             queue_descriptor_hashes: self.queue_descriptor_hashes(),
@@ -2562,6 +2674,11 @@ impl RuntimeReporterState {
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
+        }
+        self.metrics
+            .record_maintenance_leader_eligible(self.maintenance_leader);
+        if !self.maintenance_leader {
+            self.check_eligible_leaders().await;
         }
 
         if !self.leader.load(Ordering::SeqCst) {
@@ -3046,18 +3163,26 @@ mod tests {
             .await
             .expect("connect with session limits");
 
-        assert!(check_prune_lock_timeout(&pool, Duration::from_millis(100))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(check_prune_lock_timeout(
+            &pool,
+            Duration::from_millis(100),
+            Duration::from_millis(100)
+        )
+        .await
+        .unwrap()
+        .is_empty());
         assert_eq!(
-            check_prune_lock_timeout(&pool, Duration::from_millis(300))
-                .await
-                .unwrap(),
+            check_prune_lock_timeout(
+                &pool,
+                Duration::from_millis(300),
+                Duration::from_millis(300)
+            )
+            .await
+            .unwrap(),
             vec![PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 200 }]
         );
         assert_eq!(
-            check_prune_lock_timeout(&pool, Duration::from_secs(5))
+            check_prune_lock_timeout(&pool, Duration::from_secs(5), Duration::from_secs(5))
                 .await
                 .unwrap(),
             vec![

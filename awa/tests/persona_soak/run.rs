@@ -19,6 +19,10 @@ const HEADROOM: u32 = 14;
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
     super::gate_metrics::install("parent")?;
+    // OTLP capture, when on, owns the global meter provider, and its collector also
+    // receives the maintenance metrics, so the in-memory capture is only for runs without it.
+    let maintenance_metrics =
+        (!super::gate_metrics::active()).then(super::maintenance_metrics::install);
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -260,6 +264,12 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     };
     if let Err(error) = report::write(&shared, &outcome) {
         eprintln!("could not write the report: {error}");
+    }
+    if let Some(Err(error)) = maintenance_metrics
+        .as_ref()
+        .map(|capture| capture.write(&shared.config.report_dir))
+    {
+        eprintln!("could not write the maintenance metrics: {error}");
     }
     oracle_pool.close().await;
     Ok(shared)

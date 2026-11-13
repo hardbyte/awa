@@ -9,6 +9,7 @@ pub mod fleet;
 pub mod gate_metrics;
 pub mod gate_proof;
 pub mod ledger;
+pub mod maintenance_metrics;
 pub mod oracle;
 pub mod personas;
 pub mod pgserver;

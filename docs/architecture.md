@@ -70,7 +70,7 @@ Most applications should use the Rust, Python, CLI, or UI APIs rather than query
 | `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. When queue storage is active, the runtime does not claim or complete from `awa.jobs`; compatibility inserts route into the active backend, and SQL deletes of ready rows append ready tombstones. | Public compatibility surface. Prefer Rust/Python/adapter APIs for ordinary writes. For high-volume queue-storage producers, prefer configured direct COPY through `QueueStorage::enqueue_params_copy()` or Python `enqueue_many_copy()` rather than the compat COPY path. |
 | `{schema}.terminal_jobs` | Read-only hydrated view over queue-storage terminal history. It joins narrow `done_entries_*` rows and compact `receipt_completion_batches_*` rows back to retained `ready_entries_*` bodies. | Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface. |
 | `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
-| `ready_claim_attempt_batches_*` | Physical attempt-emission ledger keyed by ready slot/generation and lane ranges. | Internal storage. Claim writes one compact batch row in the same transaction as the receipt/lease claims; stale claim-cursor recovery treats covered lanes as durable evidence that those lanes already emitted `run_lease + 1`. Queue prune truncates it with the matching ready segment. |
+| `ready_claim_attempt_batches_*` | Physical attempt-emission ledger keyed by ready slot/generation and lane ranges. | Internal storage. Receipt-mode claim writes one compact batch row in the same transaction as its receipt claims; stale claim-cursor recovery treats committed covered lanes as evidence that those lanes already emitted `run_lease + 1`. Legacy materialized claims use their exact lease attempt as evidence. Queue prune truncates it with the matching ready segment. |
 | `ready_tombstones_*` | Physical ledger for ready lanes made unavailable by cancellation, priority aging, or similar out-of-band ready mutations. | Internal storage. Claim treats matching rows as spent lane evidence and exact-count paths skip them; maintenance truncates it with the matching ready segment. |
 | `ready_segments_*` | Compact control-plane map from committed ready lane ranges to their ready slot/generation. | Internal storage. Claim uses it to choose the target ready segment before validating `ready_entries_*`; ranges are split when the lane-head `run_at` timestamp changes so claim-time priority aging stays exact as the cursor advances; queue prune truncates the matching ready-slot child. |
 | `queue_claim_heads` ready-segment columns | Legacy nullable ready-slot/generation cache beside the per-lane claim cursor. | **Unused.** `claim_ready_runtime` resolves the target ready slot from `ready_segments_*` on every claim instead of caching it here — the per-claim `UPDATE` of this singleton row was the dominant dead-tuple source under a pinned MVCC horizon. The columns are retained for rolling-upgrade compatibility; dropping them is deferred to a major version. |
@@ -169,6 +169,8 @@ Claim is cursor-based rather than heap-scan based:
 - `PartitionedQueue` is a Rust and Python helper for mapping one hot logical queue to several ordinary physical queue names. The storage engine does not add a separate group table for this; each physical queue keeps the normal lane, lease, DLQ, descriptor, and terminal-history contract.
 - Queue striping and bounded claimers reduce contention on very hot logical queues. Per-queue `claimers` can add dispatcher/claimer loops inside one runtime, but those loops share the queue's worker permits and rate limiter; they do not own jobs. Recovery still follows the receipt/lease state in Postgres.
 
+Claim transactions and their post-commit cursor advances use `synchronous_commit = off`. An acknowledged claim can be lost before WAL durability or standby replication, leaving its job claimable again under the at-least-once contract. Enqueues and completions stay synchronous. Cursor replays require claim evidence visible on the current server: a covering ready-attempt range for receipt claims or the exact materialized lease attempt for legacy claims. Missing evidence leaves the cursor behind; the spent-prefix recovery path repairs it from committed dispositions. A later local synchronous commit flushes preceding claim WAL, while failover survival still depends on replication configuration. See the [async-claim refinement mapping](https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md#asynchronous-claim-commits-507). A worker still running a claim that was lost this way is not fenced: the job's next claim reuses the lost claim's run lease, so that worker's heartbeat or completion can be accepted against the new attempt. Delivery stays at-least-once; before asynchronous claim commits this needed a failover with asynchronous replication, and a primary crash can now cause it until the next synchronous commit or WAL writer flush.
+
 Priority ordering is by effective priority first. Within one enqueue shard the lane sequence is FIFO; across enqueue shards, strict global lane order is not promised. With queue storage, priority aging is applied at claim time rather than by physically rewriting ready rows. The ready/done/lease partitions carry shard-aware lane indexes on `(queue, priority, enqueue_shard, lane_seq)` so deep backlog claim probes do not scan a non-shard-selective lane index and post-filter most rows.
 
 ## Completion And Callbacks
@@ -200,6 +202,8 @@ Awa has three rescue paths:
 - **Hard deadline rescue.** Per-queue deadlines write `deadline_at` onto row-local receipt claims or lease rows. The maintenance leader closes expired attempts and routes them through the normal retry/fail/DLQ path.
 - **Callback-timeout rescue.** Waiting attempts with expired callback timeouts are moved back through the same guarded finalization machinery.
 
+On queue storage each rescue runs as a pass of 500-attempt batches, each in its own short transaction, oldest claim slot first. A pass stops when a batch comes back short, after `rescue_pass_budget` or once it has rescued `rescue_pass_max_rows`, and while a backlog remains the next pass runs a second later, so the open claims a killed runtime leaves behind stop pinning the queue and claim rings within minutes. Stale-heartbeat passes take more than one batch only once runtime snapshots show the claims' owners gone; deadline and callback passes need no such evidence. See [draining a backlog of abandoned claims](configuration.md#rescue-backlog).
+
 Rescue closes the old attempt before making work available again. If the old handler later writes a completion, the `run_lease` guard rejects it as stale. When rescue happens in a process that still has the handler registered, the runtime also flips the in-memory cancellation flag.
 
 ## Partition Rotation And Reclamation
@@ -214,6 +218,8 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
 
+Operators can durably halt this reclamation with the `maintenance.prune` control (`awa control halt`). A leader that observes the halt stops admitting rotation, prune, terminal count rollup, cleanup, admin metadata refresh and descriptor publication, while enqueue, dispatch, promotion and rescue continue; the rings stay where they are until `awa control resume`. See [runtime controls](runtime-controls.md).
+
 The common safety pattern is:
 
 1. Lock the ring-state row with `FOR UPDATE`.
@@ -221,7 +227,7 @@ The common safety pattern is:
 3. Prove cheap skip gates before the exclusive-lock path. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.
 4. Take child-table `ACCESS EXCLUSIVE` locks with a short transaction-local `lock_timeout` so maintenance gives up promptly under contention.
 5. Recheck the skip gates after acquiring the partition locks so rows that committed while the lock waited are visible before truncate.
-6. `TRUNCATE` only partitions that are proven inactive.
+6. `TRUNCATE` only partitions that are proven inactive, and of those only the ones that hold storage beyond an empty table's metadata (any heap, TOAST, free-space-map or visibility-map page, or index pages beyond an empty btree, GiST or BRIN index). Every child of the slot is still locked; a child with no heap page holds no row, so leaving it keeps its relfilenode without changing what the slot holds when it is reused.
 
 This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.
 
@@ -292,7 +298,7 @@ Core safety invariants are modeled in TLA+:
 | [`AwaSegmentedStorageRaces`](../correctness/storage/AwaSegmentedStorageRaces.tla) | claim-vs-rotate/prune interleavings |
 | [`AwaSegmentedStorageTrace`](../correctness/storage/AwaSegmentedStorageTrace.tla) | concrete runtime trace acceptance for representative queue-storage flows |
 | [`AwaShardedPrune`](../correctness/storage/AwaShardedPrune.tla) | cross-shard ready/terminal prune matching by `enqueue_shard` |
-| [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across claim, rotate, and prune |
+| [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across enqueue, new-lane provisioning, claim, rescue, rotate, and prune |
 | [`AwaStorageTransition`](../correctness/storage/AwaStorageTransition.tla) | queue-storage transition prepare, mixed-entry, finalize, and abort gates |
 | [`AwaDeadTupleContract`](../correctness/storage/AwaDeadTupleContract.tla) | hot-table reclaim-kind contract for partition truncate and bounded warm tables |
 | [`AwaCbk`](../correctness/races/AwaCbk.tla) | callback registration/resume/finalization races |

@@ -869,6 +869,7 @@ DECLARE
     v_initial_gen    BIGINT;
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
+    v_identity_rel   REGCLASS;
 BEGIN
     IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
         RAISE EXCEPTION 'install_queue_storage_substrate: schema name must match ^[a-z_][a-z0-9_]*$; got %',
@@ -4084,6 +4085,8 @@ BEGIN
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
                           AND tomb.lane_seq = ready.lane_seq
+                        -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                        OFFSET 0
                     ) AS is_tombstone
                 FROM %1$I.ready_entries AS ready
                 WHERE ready.queue = p_queue
@@ -4253,6 +4256,8 @@ BEGIN
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
                           AND tomb.lane_seq = ready.lane_seq
+                        -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                        OFFSET 0
                     ) AS is_tombstone
                 FROM %1$I.ready_entries AS ready
                 WHERE ready.queue = p_queue
@@ -4338,6 +4343,25 @@ BEGIN
         p_schema,
         'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
     );
+
+    --------------------------------------------------------------------
+    -- REPLICA IDENTITY FULL on the terminal-count delta parent and each
+    -- of its partitions, which have no primary key and do not inherit
+    -- the parent's setting. Guarded: a re-run takes no lock.
+    --------------------------------------------------------------------
+
+    FOR v_identity_rel IN
+        SELECT c.oid::regclass
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = p_schema
+          AND c.relkind IN ('r', 'p')
+          AND c.relreplident <> 'f'
+          AND c.relname ~ '^queue_terminal_count_deltas(_[0-9]+)?$'
+        ORDER BY c.relkind, c.relname
+    LOOP
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+    END LOOP;
 
     --------------------------------------------------------------------
     -- Seed ring-slot generation rows. Slot 0 starts at generation 0;

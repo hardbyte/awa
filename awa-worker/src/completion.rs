@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -84,12 +85,30 @@ const COMPLETE_BATCH_SQL: &str = r#"
     RETURNING locked.id, locked.run_lease
 "#;
 
+/// Why the batcher did not complete an attempt.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompletionError {
+    /// Another transaction holds the attempt's completion lock, so the batch
+    /// left it out. The attempt is neither completed nor stale; complete it
+    /// again once that transaction ends.
+    #[error(
+        "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
+    )]
+    LockHeld { job_id: i64, run_lease: RunLease },
+    #[error(transparent)]
+    Storage(#[from] AwaError),
+}
+
+fn lock_held((job_id, run_lease): (i64, RunLease)) -> CompletionError {
+    CompletionError::LockHeld { job_id, run_lease }
+}
+
 struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
     claim: Option<ClaimedEntry>,
     runtime_job: Option<ClaimedRuntimeJob>,
-    response: oneshot::Sender<Result<bool, AwaError>>,
+    response: oneshot::Sender<Result<bool, CompletionError>>,
 }
 
 fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
@@ -118,14 +137,18 @@ impl CompletionBatcherHandle {
             .min(tokio::sync::Semaphore::MAX_PERMITS)
     }
 
-    pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
+    pub async fn complete(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(job_id, run_lease, None, None).await
     }
 
     pub async fn complete_runtime_job(
         &self,
         runtime_job: ClaimedRuntimeJob,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(
             runtime_job.job.id,
             runtime_job.job.run_lease,
@@ -141,7 +164,7 @@ impl CompletionBatcherHandle {
         run_lease: RunLease,
         claim: Option<ClaimedEntry>,
         runtime_job: Option<ClaimedRuntimeJob>,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
         self.shards[shard]
@@ -183,15 +206,17 @@ impl CompletionBatcher {
             let (tx, rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
             shards.push(tx);
             workers.push(CompletionWorker {
-                shard_id,
-                shard_count,
-                pool: pool.clone(),
                 rx,
                 cancel: cancel.clone(),
-                metrics: metrics.clone(),
-                storage: storage.clone(),
                 batch_size,
                 flush_interval,
+                flusher: CompletionFlusher {
+                    shard_id,
+                    shard_count,
+                    pool: pool.clone(),
+                    metrics: metrics.clone(),
+                    storage: storage.clone(),
+                },
             });
         }
 
@@ -214,68 +239,119 @@ impl CompletionBatcher {
 }
 
 struct CompletionWorker {
-    shard_id: usize,
-    shard_count: usize,
-    pool: PgPool,
     rx: mpsc::Receiver<CompletionRequest>,
     cancel: CancellationToken,
-    metrics: crate::metrics::AwaMetrics,
-    storage: RuntimeStorage,
     batch_size: usize,
     flush_interval: Duration,
+    flusher: CompletionFlusher,
 }
 
 impl CompletionWorker {
     async fn run(mut self) {
-        let mut pending = Vec::with_capacity(self.batch_size);
+        collect_batches(
+            &mut self.rx,
+            &self.cancel,
+            self.batch_size,
+            self.flush_interval,
+            &self.flusher,
+        )
+        .await;
+        debug!(
+            shard = self.flusher.shard_id,
+            "Completion batcher shard stopped"
+        );
+    }
+}
 
-        loop {
-            if pending.is_empty() {
-                tokio::select! {
-                    _ = self.cancel.cancelled() => break,
-                    request = self.rx.recv() => {
-                        match request {
-                            Some(request) => pending.push(request),
-                            None => break,
-                        }
-                    }
-                }
-            } else {
-                let timer = tokio::time::sleep(self.flush_interval);
-                tokio::pin!(timer);
+/// Writes one batch of pending requests and leaves `pending` empty.
+trait FlushBatch<T> {
+    fn flush(&self, pending: &mut Vec<T>) -> impl std::future::Future<Output = ()> + Send;
+}
 
-                tokio::select! {
-                    _ = self.cancel.cancelled() => break,
-                    _ = &mut timer => {
-                        self.flush(&mut pending).await;
-                    }
-                    request = self.rx.recv() => {
-                        match request {
-                            Some(request) => {
-                                pending.push(request);
-                                if pending.len() >= self.batch_size {
-                                    self.flush(&mut pending).await;
-                                }
+/// Groups requests from `rx` into batches and hands each to `flusher`.
+///
+/// A batch is flushed when it reaches `batch_size`, or `flush_interval` after
+/// its first request arrived, whichever comes first. The deadline is fixed by
+/// that first arrival, so a steady stream of requests cannot postpone it. On
+/// cancellation or channel close, requests already in the channel are drained
+/// and flushed before returning.
+async fn collect_batches<T, F: FlushBatch<T>>(
+    rx: &mut mpsc::Receiver<T>,
+    cancel: &CancellationToken,
+    batch_size: usize,
+    flush_interval: Duration,
+    flusher: &F,
+) {
+    let mut pending = Vec::with_capacity(batch_size);
+    let mut deadline = Instant::now();
+
+    loop {
+        if pending.is_empty() {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                request = rx.recv() => {
+                    match request {
+                        Some(request) => {
+                            deadline = Instant::now() + flush_interval;
+                            pending.push(request);
+                            if pending.len() >= batch_size {
+                                flusher.flush(&mut pending).await;
                             }
-                            None => break,
                         }
+                        None => break,
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep_until(deadline) => {
+                    flusher.flush(&mut pending).await;
+                }
+                request = rx.recv() => {
+                    match request {
+                        Some(request) => {
+                            pending.push(request);
+                            if pending.len() >= batch_size {
+                                flusher.flush(&mut pending).await;
+                            }
+                        }
+                        None => break,
                     }
                 }
             }
         }
-
-        while let Ok(request) = self.rx.try_recv() {
-            pending.push(request);
-            if pending.len() >= self.batch_size {
-                self.flush(&mut pending).await;
-            }
-        }
-        if !pending.is_empty() {
-            self.flush(&mut pending).await;
-        }
-        debug!(shard = self.shard_id, "Completion batcher shard stopped");
     }
 
+    while let Ok(request) = rx.try_recv() {
+        pending.push(request);
+        if pending.len() >= batch_size {
+            flusher.flush(&mut pending).await;
+        }
+    }
+    if !pending.is_empty() {
+        flusher.flush(&mut pending).await;
+    }
+}
+
+struct CompletionFlusher {
+    shard_id: usize,
+    shard_count: usize,
+    pool: PgPool,
+    metrics: crate::metrics::AwaMetrics,
+    storage: RuntimeStorage,
+}
+
+impl FlushBatch<CompletionRequest> for CompletionFlusher {
+    fn flush(
+        &self,
+        pending: &mut Vec<CompletionRequest>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        CompletionFlusher::flush(self, pending)
+    }
+}
+
+impl CompletionFlusher {
     #[tracing::instrument(
         skip(self, pending),
         fields(shard = self.shard_id, batch_size = pending.len())
@@ -303,6 +379,9 @@ impl CompletionWorker {
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
 
+        // Attempts whose completion lock another transaction holds are left
+        // out of the batch, so one held attempt cannot hold up the shard.
+        let mut contended: HashSet<(i64, i64)> = HashSet::new();
         let updated = match &self.storage {
             RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
                 .bind(&job_ids)
@@ -318,8 +397,12 @@ impl CompletionWorker {
                 {
                     runtime
                         .store
-                        .complete_runtime_batch(&self.pool, &runtime_jobs)
+                        .complete_runtime_batch_isolating(&self.pool, &runtime_jobs)
                         .await
+                        .map(|outcome| {
+                            contended.extend(outcome.contended);
+                            outcome.updated
+                        })
                 } else if let Some(claimed) = batch
                     .iter()
                     .map(|request| request.claim.clone())
@@ -355,14 +438,19 @@ impl CompletionWorker {
                     flush_start.elapsed(),
                 );
                 for request in batch {
-                    let _ = request
-                        .response
-                        .send(Ok(updated.contains(&(request.job_id, request.run_lease))));
+                    let pair = (request.job_id, request.run_lease);
+                    let response = if contended.contains(&pair) {
+                        Err(lock_held(pair))
+                    } else {
+                        Ok(updated.contains(&pair))
+                    };
+                    let _ = request.response.send(response);
                 }
                 debug!(
                     shard = self.shard_id,
                     batch_size = job_ids.len(),
                     updated = updated_count,
+                    contended = contended.len(),
                     "Flushed completed job batch"
                 );
             }
@@ -386,13 +474,21 @@ impl CompletionWorker {
                                 Ok(true)
                             } else {
                                 let updated = if let Some(runtime_job) = &request.runtime_job {
-                                    runtime
+                                    match runtime
                                         .store
-                                        .complete_runtime_batch(
+                                        .complete_runtime_batch_isolating(
                                             &self.pool,
                                             std::slice::from_ref(runtime_job),
                                         )
                                         .await
+                                    {
+                                        Ok(outcome) if outcome.contended.contains(&pair) => {
+                                            let _ = request.response.send(Err(lock_held(pair)));
+                                            continue;
+                                        }
+                                        Ok(outcome) => Ok(outcome.updated),
+                                        Err(err) => Err(err),
+                                    }
                                 } else if let Some(claim) = &request.claim {
                                     runtime
                                         .store
@@ -412,7 +508,9 @@ impl CompletionWorker {
                             if matches!(&response, Ok(true)) {
                                 committed_pairs.insert(pair);
                             }
-                            let _ = request.response.send(response);
+                            let _ = request
+                                .response
+                                .send(response.map_err(CompletionError::from));
                         }
                         self.metrics.record_completion_flush(
                             self.shard_id,
@@ -431,7 +529,7 @@ impl CompletionWorker {
                 for request in batch {
                     let _ = request
                         .response
-                        .send(Err(AwaError::Validation(message.clone())));
+                        .send(Err(AwaError::Validation(message.clone()).into()));
                 }
             }
         }
@@ -443,8 +541,108 @@ mod tests {
     use super::*;
     use awa_model::migrations;
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    /// Records, for each flush, the time it ran and the arrival time of every
+    /// request in the batch.
+    #[derive(Default)]
+    struct RecordingFlusher {
+        flushes: Mutex<Vec<(tokio::time::Instant, Vec<tokio::time::Instant>)>>,
+    }
+
+    impl FlushBatch<tokio::time::Instant> for RecordingFlusher {
+        async fn flush(&self, pending: &mut Vec<tokio::time::Instant>) {
+            let batch = std::mem::take(pending);
+            self.flushes
+                .lock()
+                .unwrap()
+                .push((tokio::time::Instant::now(), batch));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_of_one_flushes_each_request_as_it_arrives() {
+        let (tx, mut rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let flusher = Arc::new(RecordingFlusher::default());
+        let batcher = tokio::spawn({
+            let cancel = cancel.clone();
+            let flusher = flusher.clone();
+            async move {
+                collect_batches(
+                    &mut rx,
+                    &cancel,
+                    1,
+                    Duration::from_secs(60),
+                    flusher.as_ref(),
+                )
+                .await;
+            }
+        });
+
+        for _ in 0..3 {
+            let sent_at = tokio::time::Instant::now();
+            tx.send(sent_at).await.unwrap();
+            tokio::task::yield_now().await;
+            let flushes = flusher.flushes.lock().unwrap();
+            let (flushed_at, batch) = flushes.last().expect("request was not flushed");
+            assert_eq!(batch.as_slice(), &[sent_at]);
+            assert_eq!(*flushed_at, sent_at);
+        }
+        cancel.cancel();
+        batcher.await.unwrap();
+        assert_eq!(flusher.flushes.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_arrivals_cannot_postpone_a_batch_past_its_flush_interval() {
+        let flush_interval = Duration::from_millis(10);
+        let arrival_gap = Duration::from_micros(500);
+        let arrivals = 200;
+        let (tx, mut rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let flusher = Arc::new(RecordingFlusher::default());
+        let batcher = tokio::spawn({
+            let cancel = cancel.clone();
+            let flusher = flusher.clone();
+            async move {
+                collect_batches(&mut rx, &cancel, 512, flush_interval, flusher.as_ref()).await;
+            }
+        });
+
+        for _ in 0..arrivals {
+            tx.send(tokio::time::Instant::now()).await.unwrap();
+            tokio::time::advance(arrival_gap).await;
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        batcher.await.unwrap();
+
+        let flushes = flusher.flushes.lock().unwrap();
+        let flushed: usize = flushes.iter().map(|(_, batch)| batch.len()).sum();
+        assert_eq!(flushed, arrivals);
+        // Every batch but the shutdown drain is flushed by its deadline.
+        let (_, timed) = flushes.split_last().unwrap();
+        assert!(
+            timed.len() >= 5,
+            "expected several deadline flushes in {:?} of arrivals, got {}",
+            arrival_gap * arrivals as u32,
+            timed.len()
+        );
+        // Tokio timers fire on whole-millisecond ticks, and a deadline that
+        // falls on a half-millisecond arrival rounds up to the next tick.
+        let timer_resolution = Duration::from_millis(1);
+        for (flushed_at, batch) in timed {
+            let first_arrival = batch[0];
+            assert!(
+                *flushed_at - first_arrival <= flush_interval + timer_resolution,
+                "batch of {} flushed {:?} after its first arrival",
+                batch.len(),
+                *flushed_at - first_arrival
+            );
+        }
+    }
 
     fn base_database_url() -> String {
         std::env::var("DATABASE_URL")
@@ -1193,12 +1391,12 @@ mod tests {
             });
             responses.push(rx);
         }
-        tokio::time::timeout(Duration::from_secs(5), worker.flush(&mut batch))
+        tokio::time::timeout(Duration::from_secs(5), worker.flusher.flush(&mut batch))
             .await
             .expect("contended batch isolates singleton errors without waiting");
         let busy = responses.remove(0).await.unwrap();
         assert!(
-            matches!(busy, Err(AwaError::Database(ref error))
+            matches!(busy, Err(CompletionError::Storage(AwaError::Database(ref error)))
             if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))),
             "busy attempt must report its real error, never stale: {busy:?}"
         );
@@ -1226,6 +1424,7 @@ mod tests {
         blocker.rollback().await.unwrap();
         let (response, rx) = oneshot::channel();
         worker
+            .flusher
             .flush(&mut vec![CompletionRequest {
                 job_id: historical.job.id,
                 run_lease: historical.job.run_lease,

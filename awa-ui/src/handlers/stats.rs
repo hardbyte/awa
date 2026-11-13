@@ -1,10 +1,8 @@
 use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
-use std::collections::HashMap;
 
 use awa_model::admin;
-use awa_model::job::JobState;
 
 use crate::cache::CacheError;
 use crate::error::ApiError;
@@ -12,7 +10,7 @@ use crate::state::{AppState, Capabilities};
 
 pub async fn get_stats(
     State(state): State<AppState>,
-) -> Result<Json<HashMap<JobState, i64>>, ApiError> {
+) -> Result<Json<admin::StateCounts>, ApiError> {
     let pool = state.pool.clone();
     let counts = state
         .cache

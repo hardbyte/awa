@@ -16,6 +16,7 @@ mod read_transaction;
 pub mod reschedule;
 pub mod runtime_control;
 pub mod storage;
+mod storage_footprint_sql;
 pub mod unique;
 
 // Re-exports for ergonomics
@@ -52,7 +53,8 @@ pub use partitioned_queue::{
 pub use queue_storage::{
     ClaimedEntry, ClaimedRuntimeJob, PromoteOutcome, PromotionLane, PruneOutcome, QueueCounts,
     QueueStorage, QueueStorageConfig, RescueBatch, RescueBatchOptions, RescueScanCursor,
-    RescueScanProgress, RescueSlotOrder, RotateOutcome, SkipReason, TerminalDeltaRollupOutcome,
+    RescueScanProgress, RescueSlotOrder, RotateOutcome, RuntimeBatchCompletion, SkipReason,
+    TerminalDeltaRollupOutcome,
 };
 pub use storage::StorageStatus;
 

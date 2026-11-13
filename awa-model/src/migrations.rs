@@ -397,6 +397,73 @@ macro_rules! claim_batch_job_index_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `correlated_claim_tombstones` patch: the
+/// installer, and each claim function of an installed queue-storage substrate
+/// whose tombstone check closes straight after the `lane_seq` comparison, with
+/// no `OFFSET 0` to keep it correlated.
+macro_rules! correlated_claim_tombstones_pending_sql {
+    () => {
+        "SELECT 'awa.install_queue_storage_substrate'::text AS target \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc ~ 'AND tomb[.]lane_seq = ready[.]lane_seq[[:space:]]*[)]') \
+         UNION ALL \
+         SELECT format('claim function %s.%s', n.nspname, p.proname) \
+         FROM pg_proc AS p \
+         JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+         WHERE p.prokind = 'f' \
+           AND (p.proname = 'claim_ready_runtime' OR p.proname ~ '^claim_ready_slot_[0-9]+$') \
+           AND p.prosrc ~ 'AND tomb[.]lane_seq = ready[.]lane_seq[[:space:]]*[)]' \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'ready_tombstones' \
+                         AND c.relkind = 'p')"
+    };
+}
+
+/// Rows naming what still lacks the `replica_identity` patch: the installer,
+/// the awa tables without a primary key, and each `queue_terminal_count_deltas`
+/// table or partition of an installed queue-storage substrate (found as for
+/// `correlated_claim_tombstones`) whose replica identity is not FULL. A missing
+/// mark table counts, so the patch runs after `wait_free_dirty_marks` creates
+/// it.
+macro_rules! replica_identity_pending_sql {
+    () => {
+        "SELECT 'awa.install_queue_storage_substrate'::text AS target \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc NOT LIKE '%REPLICA IDENTITY FULL%') \
+         UNION ALL \
+         SELECT 'replica identity of awa.' || marks.relname \
+         FROM (VALUES ('admin_dirty_kind_marks'), ('admin_dirty_queue_marks')) AS marks(relname) \
+         WHERE NOT EXISTS (SELECT 1 FROM pg_class AS c \
+                           WHERE c.oid = to_regclass('awa.' || marks.relname) \
+                             AND c.relreplident = 'f') \
+         UNION ALL \
+         SELECT 'replica identity of awa.job_unique_claims' \
+         WHERE to_regclass('awa.job_unique_claims') IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM pg_index AS i \
+                           WHERE i.indrelid = to_regclass('awa.job_unique_claims') \
+                             AND i.indisreplident) \
+         UNION ALL \
+         SELECT format('replica identity of %I.%I', n.nspname, c.relname) \
+         FROM pg_class AS c \
+         JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p') \
+           AND c.relreplident <> 'f' \
+           AND c.relname ~ '^queue_terminal_count_deltas(_[0-9]+)?$' \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname = 'claim_ready_runtime' \
+                         AND oidvectortypes(p.proargtypes) \
+                             = 'text, bigint, double precision, double precision')"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
@@ -412,6 +479,11 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
         "claim_batch_job_index" => {
             Some(concat!(claim_batch_job_index_pending_sql!(), " ORDER BY 1"))
         }
+        "correlated_claim_tombstones" => Some(concat!(
+            correlated_claim_tombstones_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        "replica_identity" => Some(concat!(replica_identity_pending_sql!(), " ORDER BY 1")),
         _ => None,
     }
 }
@@ -508,6 +580,45 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
             AND to_regprocedure('awa.resume_runtime_scope(text,uuid)') IS NOT NULL \
             AND to_regprocedure('awa.prune_controls_protocol_version()') IS NOT NULL \
             AND to_regclass('awa.runtime_control_observations') IS NOT NULL",
+    },
+    SchemaPatch {
+        name: "runtime_maintenance_eligibility",
+        description: "Report runtimes that never contend for maintenance leadership",
+        // A new table only: it locks no existing relation, so it never queues
+        // behind runtime snapshot writes.
+        sql: include_str!("../migrations/patches/runtime_maintenance_eligibility.sql"),
+        applied_probe:
+            "SELECT to_regclass('awa.runtime_maintenance_eligibility') IS NOT NULL",
+    },
+    SchemaPatch {
+        name: "correlated_claim_tombstones",
+        description: "Keep claim tombstone checks on indexed probes (awa 0.7 migration v056)",
+        // The v023 definitions first, so the installer writes the fenced
+        // check into new substrates; the patch then rewrites the claim
+        // functions of every installed queue-storage schema.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/correlated_claim_tombstones.sql"),
+        ),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            correlated_claim_tombstones_pending_sql!(),
+            ")"
+        ),
+    },
+    SchemaPatch {
+        name: "replica_identity",
+        description: "Replica identity for every awa table (awa 0.7 migration v047)",
+        // The v023 definitions first, so the installer sets the identity in
+        // schemas prepared later; the patch then sets it on existing tables.
+        // Keep last: it holds table locks until its transaction commits.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/replica_identity.sql"),
+        ),
+        applied_probe: concat!("SELECT NOT EXISTS (", replica_identity_pending_sql!(), ")"),
     },
 ];
 
@@ -1119,6 +1230,18 @@ mod tests {
                 _ => patch.sql.to_string(),
             };
             let upper = top_level.to_uppercase();
+            // The only ALTER TABLE a patch may run is the guarded replica
+            // identity change.
+            let guarded_identity = "ALTER TABLE %S REPLICA IDENTITY %S";
+            if upper.contains(guarded_identity) {
+                assert!(
+                    upper.contains("RELREPLIDENT <> 'F'")
+                        && (!upper.contains("USING INDEX") || upper.contains("INDISREPLIDENT")),
+                    "patch {} must skip tables that already have their identity",
+                    patch.name
+                );
+            }
+            let upper = upper.replace(guarded_identity, "");
             assert!(
                 !upper.contains("INSERT INTO AWA.SCHEMA_VERSION"),
                 "patch {} must not record a schema version",

@@ -81,14 +81,14 @@ ORDER BY heartbeat_at ASC;
 
 Interpretation:
 
-- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying`
+- low `heartbeat_age_s`: the worker is still alive. If its handler has already returned, the worker is retrying finalization after lock contention, for up to 120 s, and its log shows `Durable finalization failed; retrying` or `Another transaction holds this attempt's completion lock; still retrying`
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 - stale, but every rescue pass logs `Rescue skipped an attempt: queue storage ready body ambiguous`: an aging race in an older release left two equally plausible bodies for this attempt. Rescue leaves it running and moves on to other attempts. Reads and cancellation of the job fail with the same ambiguity error, so it needs manual repair; open an issue with the job id and run lease from the log
 
 ### Transient Admin Reads During Partition Pruning
 
-In 0.6, a job-detail read, including list-item hydration, uses several queries within one snapshot. It retains read locks on the located ready body, but does not lock all ring partitions before establishing that snapshot. Prune can truncate a ready partition before its body is located, or a lease or claim partition before that read phase reaches it. A completed job can then briefly appear available or missing. Retry with a fresh read before treating that result as missing durable work. Filtering tombstoned source rows after a queue or priority move does not close these separate windows.
+In 0.6, job detail, list-item hydration, the `list_jobs` candidate scan and kind overviews each run several queries within one snapshot. They release partition locks between queries so prune does not wait for the whole read. `TRUNCATE` is not MVCC-safe: once a prune commits, the later queries of a read whose snapshot predates it see the truncated partition empty and cannot see the failed rows it moved. Since 0.6.17 these reads compare the relfilenode of every ring partition before their snapshot and after it ends, and read again in a new snapshot if prune or the terminal-count rollup truncated one in between. If three reads in a row each overlap a truncation, a fourth locks the ring partitions before taking its snapshot and holds them until it commits; a prune that cannot get its locks within `prune_lock_timeout` reports `Blocked` and runs on a later pass. Single-statement reads, such as state counts and queue overviews, lock their partitions before taking their snapshot under `READ COMMITTED` and are not affected.
 
 ### Failed Jobs Rescued After Priority Aging
 
@@ -161,6 +161,21 @@ Durable completion, or lifecycle hooks, are behind the handlers. A runtime lets 
 ### Fixes
 
 Clear the lock contention or long transaction; claiming recovers as soon as completions commit again. Raising `max_workers` does not help while completion is the bottleneck. For jobs with large payloads, lowering `AWA_COMPLETION_BATCH_SIZE` reduces how much memory waiting attempts can hold.
+
+### A Completion Waits On An Application's Transaction
+
+A transaction that changes a running attempt, such as `admin::cancel_tx` run inside an application's own transaction, holds that attempt's completion lock until it commits or rolls back. If the attempt's handler returns meanwhile, its completion cannot proceed until then. Once the attempt has waited a second, the worker logs `Another transaction holds this attempt's completion lock; still retrying` with the attempt's `job_id` and `waited_ms`.
+
+In queue storage with receipts on (the default), a successful attempt in that state is left out of its completion batch and retried with backoff, without holding a pool connection, so completions of other jobs carry on. Its worker slot stays held while it retries. When the transaction commits, the retry sees the committed change: a cancelled attempt's completion is ignored as stale. If the lock is still held after two minutes, the worker gives up, logs `Failed to complete job`, stops heartbeating the attempt, and leaves it to stale-heartbeat rescue.
+
+Earlier releases waited on the lock inside the batch instead. Every completion the runtime sent through its completion batcher then waited behind that one transaction, and once the in-flight completion allowance filled, the runtime stopped claiming in every queue.
+
+Not every completion is covered:
+
+- Attempts that end in a retry, snooze, cancel, failure or callback wait, and successful attempts of a kind with follow-up enqueues, finalize one job at a time. They still wait on the lock while holding a pool connection and their worker slot, but no other attempt waits with them.
+- With receipts off (`lease_claim_receipts = false`, only possible on a non-default queue-storage schema), a successful attempt's batch still waits on the lock, and the rest of the batch waits with it.
+
+Keep transactions that touch running jobs short, and commit or roll back before doing slow work in them.
 
 ## Rescue Fails With `idx_awa_jobs_unique`
 
@@ -277,6 +292,21 @@ If no leader appears:
 - confirm the worker process actually called `start()`
 - make sure the pool is not exhausted
 
+### No Runtime May Lead
+
+A runtime started with `maintenance_leader(false)` (Python `maintenance_leader=False`) never takes leadership. If every live runtime is started that way, leadership stays vacant: jobs that are already available still run, but scheduled and retryable jobs stop being promoted, abandoned attempts are not rescued, and queue storage stops rotating. An alert on a missing maintenance leader fires and does not clear on its own.
+
+Signs:
+
+- an opted-out runtime logs `no live runtime that may lead is visible`
+- `awa.maintenance.leader_eligible_runtimes` is `0` on an opted-out runtime
+- `awa control status` shows `"leader_eligible_runtimes": 0`, and each runtime shows `"maintenance_leader": false`
+- the admin UI marks every runtime "Never leads"
+
+Start or scale up a deployment that may lead (the default), and leadership is taken within one `leader_election_interval`. If leadership instead keeps moving between deployments, or lands on one you would rather keep it off, opt those deployments out and keep at least two runtimes that may lead, so a restart of one does not leave leadership vacant.
+
+`awa control status` and the admin UI show opted-out runtimes only once `awa migrate` has applied the `runtime_maintenance_eligibility` schema patch. Before that, every runtime reads as eligible. See [maintenance leader election](configuration.md#leader-election).
+
 ### Tuning
 
 If you want faster leader failover:
@@ -285,6 +315,24 @@ If you want faster leader failover:
 - Python: lower `leader_election_interval_ms=...` in `client.start(...)`
 
 Use lower values carefully. Faster checks mean more advisory-lock traffic.
+
+### A Maintenance Statement Waits On A Lock
+
+The leader runs promotion and the three rescues (stale heartbeat, deadline, callback timeout) in one loop, and its other maintenance in another: cleanup, cron sync, metadata, batch operations, terminal-count rollup and ring rotation and prune. A statement in the second loop that waits on a lock, such as the cron sync upserting a schedule row another session holds, delays only that loop. Promotion and rescue keep running, and schedules already stored keep firing, because the cron evaluator runs on its own task.
+
+Everything else in the second loop does wait. While that statement waits, cleanup does not run and the queue, lease and claim rings do not rotate or prune, so queue-storage partitions are not reclaimed.
+
+In releases after 0.6.16, a leader whose scheduled jobs are not promoted is therefore not blocked by its own cleanup or cron sync. Look instead at promotion's own lane locks (`awa.maintenance.promote.lane_contention`), at pool exhaustion, and at a long rescue pass. To find a stuck maintenance statement, list the sessions waiting on locks, and pick out the leader's by `application_name` or by its pid in `pg_locks`:
+
+```sql
+SELECT pid, application_name, wait_event_type, wait_event,
+       now() - query_start AS waiting, left(query, 120)
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock' AND datname = current_database()
+ORDER BY query_start;
+```
+
+0.6.16 and earlier ran every branch in one loop, so there a single waiting statement stopped promotion, rescue and cron until its lock was released. See [ADR-051](adr/051-maintenance-recovery-loop.md).
 
 ## Heartbeat Timeouts
 
@@ -537,6 +585,17 @@ Fix:
   ```sql
   SELECT awa.active_queue_storage_schema();
   ```
+
+### `cannot delete from table ... because it does not have a replica identity`
+
+```text
+cannot delete from table "admin_dirty_queue_marks" because it does not
+have a replica identity and publishes deletes
+```
+
+The awa schema is in a logical-replication publication (`CREATE PUBLICATION ... FOR ALL TABLES`, which Debezium creates by default, or `FOR TABLES IN SCHEMA awa`) and the database lacks the `replica_identity` schema patch, so some awa tables have no primary key or replica identity. PostgreSQL then rejects every `UPDATE` and `DELETE` on those tables: the admin dirty-mark drain fails on each maintenance tick, so queue and kind counts go stale, and unique-claim release fails.
+
+Fix: run `awa migrate` with 0.6.18 or later, which applies the patch; it takes a brief `ACCESS EXCLUSIVE` lock on each table it changes (see the [upgrade guide](upgrade-0.6.17-to-0.6.18.md#replica-identity-locks)). Independently, prefer keeping the awa schema out of the publication; see [logical replication and CDC](deploying-on-managed-postgres.md#logical-replication-and-cdc).
 
 ### `register at least one worker before starting the runtime`
 

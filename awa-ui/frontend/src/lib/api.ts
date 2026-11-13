@@ -1,4 +1,5 @@
 /** Typed fetch wrapper for the AWA API. */
+import { apiPath } from "./base-path";
 
 export interface JobRow {
   id: number;
@@ -65,6 +66,8 @@ export interface QueueOverview extends DescriptorFields {
   total_queued: number;
   scheduled: number;
   available: number;
+  /** Absent on servers that predate the exact-count limit. */
+  available_is_estimate?: boolean;
   retryable: number;
   running: number;
   failed: number;
@@ -137,6 +140,11 @@ export interface RuntimeInstance {
   maintenance_alive: boolean;
   shutting_down: boolean;
   leader: boolean;
+  /**
+   * False for a runtime started with `maintenance_leader(false)`, which never
+   * contends for maintenance leadership. Absent from servers that predate it.
+   */
+  maintenance_leader?: boolean;
   global_max_workers: number | null;
   queues: QueueRuntimeSnapshot[];
 }
@@ -147,6 +155,8 @@ export interface RuntimeOverview {
   stale_instances: number;
   healthy_instances: number;
   leader_instances: number;
+  /** Live runtimes that may take maintenance leadership. */
+  leader_eligible_instances?: number;
   instances: RuntimeInstance[];
 }
 
@@ -181,7 +191,11 @@ export interface CronJobRow {
   paused_by: string | null;
 }
 
-export type StateCounts = Record<string, number>;
+export interface StateCounts {
+  counts: Record<string, number>;
+  /** `counts.available` is a head-sequence estimate for an over-deep lane. */
+  available_is_estimate: boolean;
+}
 
 export interface TimeseriesBucket {
   bucket: string;
@@ -318,7 +332,7 @@ export interface ListJobsParams {
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(apiPath(path), {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
@@ -568,7 +582,7 @@ export async function fetchStorage(
   options: { history?: boolean } = {}
 ): Promise<StorageStatusReport | null> {
   const qs = options.history ? "?history=true" : "";
-  const res = await fetch(`/api/storage${qs}`, {
+  const res = await fetch(apiPath(`/storage${qs}`), {
     headers: { "Content-Type": "application/json" },
   });
   if (res.status === 404) return null;

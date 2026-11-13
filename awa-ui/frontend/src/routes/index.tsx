@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
+import { AvailableCount } from "@/components/AvailableCount";
 import { timeAgo } from "@/lib/time";
 import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
 import { usePollInterval } from "@/hooks/use-poll-interval";
@@ -120,7 +121,7 @@ export function DashboardPage() {
     : null;
 
   const totalJobs = statsQuery.data
-    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
+    ? Object.values(statsQuery.data.counts).reduce((a, b) => a + b, 0)
     : null;
 
   // Sort queues by visible workload so deferred-heavy queues stay prominent.
@@ -142,7 +143,7 @@ export function DashboardPage() {
       {/* Headline counter cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {COUNTER_KEYS.map((key) => {
-          const count = statsQuery.data?.[key];
+          const count = statsQuery.data?.counts[key];
           const bg = STATE_CARD_BG[key] ?? "";
           const series = seriesByState[key] ?? [];
           return (
@@ -160,7 +161,12 @@ export function DashboardPage() {
                     {statsQuery.isLoading ? (
                       <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
                     ) : (
-                      (count ?? 0).toLocaleString()
+                      <AvailableCount
+                        count={count ?? 0}
+                        isEstimate={
+                          key === "available" && statsQuery.data?.available_is_estimate
+                        }
+                      />
                     )}
                   </div>
                   <div className="mt-1.5 flex items-center justify-center gap-2">
@@ -459,7 +465,7 @@ export function DashboardPage() {
                         {q.scheduled.toLocaleString()}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
-                        {q.available.toLocaleString()}
+                        <AvailableCount count={q.available} isEstimate={q.available_is_estimate} />
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {q.retryable.toLocaleString()}

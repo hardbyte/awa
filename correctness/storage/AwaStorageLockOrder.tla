@@ -111,6 +111,15 @@ Compatible(held, wanted) == held = ModeShared /\ wanted = ModeShared
 \* deadlock; two transactions on the same lane and shard reduce to
 \* the existing `LaneResource(q, p)` model.
 LaneResource(q, p) == [k |-> "queue_lane", q |-> q, p |-> p]
+\* Creating a new lane takes two more locks before the enqueue lock. The
+\* `queue_lanes` row: an uncommitted insert of a `(queue, priority)` key
+\* makes a second inserter of that key wait for its transaction. The
+\* provisioning advisory lock `{schema}:{queue}:{priority}:{shard}`, under
+\* which the lane's sequences and head rows are created. Once a lane
+\* exists neither blocks, so modelling both as held to commit
+\* over-approximates every enqueue after the first.
+LaneRowResource(q, p) == [k |-> "queue_lane_row", q |-> q, p |-> p]
+LaneProvisionResource(q, p) == [k |-> "queue_lane_provision", q |-> q, p |-> p]
 LeaseRingStateResource == [k |-> "lease_ring_state"]
 LeaseRingSlotResource(s) == [k |-> "lease_ring_slot", s |-> s]
 LeaseChildResource(s) == [k |-> "lease_child", s |-> s]
@@ -136,6 +145,8 @@ ClosureChildResource(s) == [k |-> "closure_child", s |-> s]
 ClosureBatchChildResource(s) == [k |-> "closure_batch_child", s |-> s]
 
 LaneResources == { LaneResource(q, p) : q \in Queues, p \in Priorities }
+LaneRowResources == { LaneRowResource(q, p) : q \in Queues, p \in Priorities }
+LaneProvisionResources == { LaneProvisionResource(q, p) : q \in Queues, p \in Priorities }
 LeaseRingSlotResources == { LeaseRingSlotResource(s) : s \in LeaseSlots }
 LeaseChildResources == { LeaseChildResource(s) : s \in LeaseSlots }
 QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
@@ -155,6 +166,8 @@ ClosureBatchChildResources == { ClosureBatchChildResource(s) : s \in ClaimSlots 
 
 Resources ==
     LaneResources \cup
+    LaneRowResources \cup
+    LaneProvisionResources \cup
     {LeaseRingStateResource} \cup
     LeaseRingSlotResources \cup
     LeaseChildResources \cup
@@ -210,6 +223,31 @@ TwoStripeQueuesOK ==
 EnqueueTwoStripePlan(p) ==
     << Step(LaneResource(StripeA, p), ModeExclusive),
        Step(LaneResource(StripeB, p), ModeExclusive) >>
+
+\* First enqueue to a `(queue, priority)` lane, by any producer:
+\*   SQL inserts (`awa.insert_job`, `insert_jobs_compat_batch`):
+\*     INSERT INTO queue_lanes ... ON CONFLICT DO NOTHING
+\*     INSERT INTO queue_enqueue_heads, whose BEFORE INSERT trigger takes
+\*       the provisioning lock to create the lane's sequences
+\*     reserve_enqueue_seq takes the lane's enqueue lock
+\*   QueueStorage::ensure_lane_inserts (batch enqueue, promotion of
+\*   scheduled or retried jobs, prepare_queue):
+\*     INSERT INTO queue_lanes ... ON CONFLICT DO NOTHING
+\*     pg_advisory_xact_lock on the provisioning key, then provision_lane
+\*       or the head-row inserts
+\*     reserve_enqueue_seq takes the lane's enqueue lock
+ProvisionLanePlan(q, p) ==
+    << Step(LaneRowResource(q, p), ModeExclusive),
+       Step(LaneProvisionResource(q, p), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
+\* QueueStorage::ensure_lane_inserts through 0.6.15 took the provisioning
+\* lock before writing the `queue_lanes` row, the reverse of the SQL
+\* inserts. Kept only as a negative regression harness.
+OldQueueStorageProvisionLanePlan(q, p) ==
+    << Step(LaneProvisionResource(q, p), ModeExclusive),
+       Step(LaneRowResource(q, p), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
 
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
@@ -313,13 +351,16 @@ CloseReceiptPlan(claimSlot) ==
 \*   UPDATE claim_ring_slots[slot] rescue cursor
 \* The leases anti-join takes AccessShare on the leases
 \* parent so rescue can race against prune_oldest_leases.
+\* PostgreSQL takes every relation lock of a statement when it plans it,
+\* before the executor takes any row lock. The cursor row's FOR UPDATE is
+\* written first in the statement but is therefore acquired last.
 RescueReceiptsPlan(claimSlot) ==
-    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
-       Step(ClaimChildResource(claimSlot), ModeShared),
+    << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClaimBatchChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared),
-       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
+       Step(ClaimRingSlotResource(claimSlot), ModeExclusive) >>
 
 \* rescue_expired_receipt_deadlines_tx
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
@@ -332,11 +373,11 @@ RescueReceiptsPlan(claimSlot) ==
 \* Same resource order as stale receipt rescue; only the index order and
 \* advancement predicate differ.
 RescueReceiptDeadlinesPlan(claimSlot) ==
-    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
-       Step(ClaimChildResource(claimSlot), ModeShared),
+    << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared),
-       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
+       Step(ClaimRingSlotResource(claimSlot), ModeExclusive) >>
 
 \* ensure_running_leases_from_receipts_tx
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
@@ -454,11 +495,11 @@ PruneReadyPlan(slot) ==
        Step(ClosureProofResource, ModeShared),
        Step(ClosureBatchProofResource, ModeShared),
        Step(ReadyChildResource(slot), ModeShared),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
+       Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyChildResource(slot), ModeExclusive),
        Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
-       Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyTombstoneChildResource(slot), ModeExclusive),
-       Step(ReadySegmentChildResource(slot), ModeExclusive),
        Step(ReceiptBatchChildResource(slot), ModeExclusive),
        Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
        Step(TerminalDeltaChildResource(slot), ModeExclusive),
@@ -498,7 +539,11 @@ RotateClaimsPlan(nextSlot) ==
 \*     models the successful truncate path after the proof has passed
 \*   TRUNCATE claim_child[slot] + claim_batch_child[slot] +
 \*     closure_child[slot] + closure_batch_child[slot]
-PruneClaimsPlan(slot) ==
+\* The slot row is locked only once the partitions are held. Rescue takes
+\* the partitions and then the slot row, so the 0.6.16 order below, slot row
+\* first, deadlocked with every rescue of the slot for as long as prune
+\* waited for the partitions.
+OldPruneClaimsPlan(slot) ==
     << Step(ClaimRingStateResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
        Step(ClaimChildResource(slot), ModeShared),
@@ -509,6 +554,18 @@ PruneClaimsPlan(slot) ==
        Step(ClaimBatchChildResource(slot), ModeExclusive),
        Step(ClosureChildResource(slot), ModeExclusive),
        Step(ClosureBatchChildResource(slot), ModeExclusive) >>
+
+PruneClaimsPlan(slot) ==
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimChildResource(slot), ModeShared),
+       Step(ClaimBatchChildResource(slot), ModeShared),
+       Step(ClosureChildResource(slot), ModeShared),
+       Step(ClosureBatchChildResource(slot), ModeShared),
+       Step(ClaimChildResource(slot), ModeExclusive),
+       Step(ClaimBatchChildResource(slot), ModeExclusive),
+       Step(ClosureChildResource(slot), ModeExclusive),
+       Step(ClosureBatchChildResource(slot), ModeExclusive),
+       Step(ClaimRingSlotResource(slot), ModeExclusive) >>
 
 VARIABLES
     heldLocks,     \* [resource -> set of <<tx, mode>>]
@@ -578,6 +635,16 @@ StartEnqueueTwoStripe(t, p) ==
     /\ p \in Priorities
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = EnqueueTwoStripePlan(p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartProvisionLane(t, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = ProvisionLanePlan(q, p)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -767,6 +834,7 @@ Stutter == /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities : StartProvisionLane(t, q, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -876,6 +944,63 @@ NextOldStripedClaimDeadlockDemo ==
 
 SpecOldStripedClaimDeadlockDemo ==
     ConfigOK /\ Init /\ [][NextOldStripedClaimDeadlockDemo]_vars
+
+\* ---- Historical lane-provisioning deadlock harness ----
+\*
+\* A 0.6.15 QueueStorage process and a SQL producer that are both first to
+\* use a lane: QueueStorage holds the provisioning lock and waits for the
+\* SQL producer's uncommitted `queue_lanes` row, while the SQL producer
+\* holds that row and waits for the provisioning lock. TLC is expected to
+\* flag NoDeadlock on this spec.
+
+StartOldQueueStorageProvisionLane(t, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldQueueStorageProvisionLanePlan(q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+NextOldLaneProvisioningDeadlockDemo ==
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities : StartProvisionLane(t, q, p)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities :
+          StartOldQueueStorageProvisionLane(t, q, p)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldLaneProvisioningDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldLaneProvisioningDeadlockDemo]_vars
+
+\* ---- Historical claim-prune slot-row deadlock harness ----
+\*
+\* 0.6.16 claim prune locked the slot's `claim_ring_slots` row before the
+\* slot's partitions. Rescue holds the partitions and waits for that row
+\* while prune holds the row and waits for the partitions. TLC is expected
+\* to flag NoDeadlock on this spec.
+
+StartOldPruneClaims(t, slot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ slot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldPruneClaimsPlan(slot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+NextOldClaimPruneSlotRowDeadlockDemo ==
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartOldPruneClaims(t, cs)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldClaimPruneSlotRowDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldClaimPruneSlotRowDeadlockDemo]_vars
 
 \* ---- Invariants ----
 

@@ -277,8 +277,8 @@ async fn public_read(which: Read, store: &QueueStorage, pool: &PgPool, job_id: i
             assert_eq!((job.id, job.state), (job_id, JobState::Available));
         }
         Read::Counts => assert_eq!(
-            admin::state_counts(pool).await?.get(&JobState::Available),
-            Some(&1)
+            admin::state_counts(pool).await?.count(JobState::Available),
+            1
         ),
         Read::Queue => assert_eq!(
             admin::queue_overview(pool, "admin_read_cancel")

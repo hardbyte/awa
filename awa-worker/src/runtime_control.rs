@@ -780,14 +780,14 @@ mod tests {
         assert!(!control.allowed());
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let value: Option<serde_json::Value> = sqlx::query_scalar(
+                let value: Option<Option<serde_json::Value>> = sqlx::query_scalar(
                     "SELECT observation FROM awa.runtime_control_observations WHERE instance_id=$1",
                 )
                 .bind(id)
-                .fetch_one(&admin)
+                .fetch_optional(&admin)
                 .await
                 .unwrap();
-                if value.is_some_and(|v| {
+                if value.flatten().is_some_and(|v| {
                     v["observed_revision"] == halt.revision && v["state"] == "halted"
                 }) {
                     break;
@@ -969,15 +969,57 @@ mod tests {
             .split("            run_leader_term(")
             .next()
             .unwrap();
-        // Every select arm except cancellation must register and gate its work.
-        let selected = leader.matches("\n                        _ = ").count()
-            + leader
-                .matches("\n                        origin = ")
-                .count();
+        // Every select arm except the two cancellation arms in each of the
+        // recovery and hygiene loops must register and gate its work.
+        // Matched by shape, not indentation, so the count survives a
+        // change in nesting.
+        let selected = leader
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("_ = ") || line.starts_with("origin = "))
+            .count();
         assert_eq!(
             selected,
-            leader.matches("branch_tracker.try_begin").count() + 2
+            leader.matches("branch_tracker.try_begin").count() + 4
         );
+        // #303: promotion and rescue run in the recovery loop, and nothing
+        // else does, so no hygiene branch can delay them.
+        let recovery = leader
+            .split("let recovery = async {")
+            .nth(1)
+            .unwrap()
+            .split("let hygiene = async {")
+            .next()
+            .unwrap();
+        let hygiene = leader.split("let hygiene = async {").nth(1).unwrap();
+        let admitted = |section: &str| -> Vec<String> {
+            section
+                .split("self.control.admit(MaintenanceBranch::")
+                .skip(1)
+                .map(|rest| rest.split(')').next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            admitted(recovery),
+            [
+                "RescueHeartbeat",
+                "RescueDeadline",
+                "RescueCallback",
+                "Promote"
+            ]
+        );
+        for branch in admitted(hygiene) {
+            assert!(
+                ![
+                    "RescueHeartbeat",
+                    "RescueDeadline",
+                    "RescueCallback",
+                    "Promote"
+                ]
+                .contains(&branch.as_str()),
+                "{branch} belongs in the recovery loop"
+            );
+        }
         assert!(!leader.contains("try_begin(\""));
         assert!(!leader.contains("try_begin_without_cooldown(\""));
         assert_eq!(

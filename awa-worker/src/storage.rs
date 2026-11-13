@@ -79,10 +79,13 @@ pub(crate) enum PruneLockTimeoutRisk {
     StatementTimeout { limit_ms: u64 },
 }
 
-/// Compare a prune lock timeout with the session's `deadlock_timeout` and
-/// `statement_timeout` (milliseconds; a zero `statement_timeout` is disabled).
+/// Compare the longest single prune lock wait with the session's
+/// `deadlock_timeout`, and the longest wait of one prune lock statement with
+/// its `statement_timeout` (milliseconds; a zero `statement_timeout` is
+/// disabled).
 pub(crate) fn prune_lock_timeout_risks(
     timeout: Duration,
+    statement_wait: Duration,
     deadlock_timeout_ms: Option<u64>,
     statement_timeout_ms: Option<u64>,
 ) -> Vec<PruneLockTimeoutRisk> {
@@ -94,7 +97,7 @@ pub(crate) fn prune_lock_timeout_risks(
         }
     }
     if let Some(limit_ms) = statement_timeout_ms.filter(|limit| *limit > 0) {
-        if timeout_ms >= u128::from(limit_ms) {
+        if statement_wait.as_millis() >= u128::from(limit_ms) {
             risks.push(PruneLockTimeoutRisk::StatementTimeout { limit_ms });
         }
     }
@@ -106,6 +109,7 @@ pub(crate) fn prune_lock_timeout_risks(
 pub(crate) async fn check_prune_lock_timeout(
     pool: &sqlx::PgPool,
     timeout: Duration,
+    statement_wait: Duration,
 ) -> Result<Vec<PruneLockTimeoutRisk>, sqlx::Error> {
     let settings: Vec<(String, i64)> = sqlx::query_as(
         "SELECT name, setting::bigint FROM pg_settings \
@@ -121,6 +125,7 @@ pub(crate) async fn check_prune_lock_timeout(
     };
     Ok(prune_lock_timeout_risks(
         timeout,
+        statement_wait,
         setting("deadlock_timeout"),
         setting("statement_timeout"),
     ))
@@ -134,18 +139,38 @@ mod tests {
     fn prune_lock_timeout_risks_flag_timeouts_at_or_above_server_limits() {
         let below = Duration::from_millis(999);
         let at = Duration::from_millis(1000);
-        assert!(prune_lock_timeout_risks(below, Some(1000), Some(0)).is_empty());
+        assert!(prune_lock_timeout_risks(below, below, Some(1000), Some(0)).is_empty());
         assert_eq!(
-            prune_lock_timeout_risks(at, Some(1000), Some(0)),
+            prune_lock_timeout_risks(at, at, Some(1000), Some(0)),
             vec![PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 1000 }]
         );
         assert_eq!(
-            prune_lock_timeout_risks(Duration::from_secs(30), Some(1000), Some(5000)),
+            prune_lock_timeout_risks(
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Some(1000),
+                Some(5000)
+            ),
             vec![
                 PruneLockTimeoutRisk::DeadlockTimeout { limit_ms: 1000 },
                 PruneLockTimeoutRisk::StatementTimeout { limit_ms: 5000 },
             ]
         );
-        assert!(prune_lock_timeout_risks(Duration::from_secs(30), None, None).is_empty());
+        assert!(prune_lock_timeout_risks(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            None,
+            None
+        )
+        .is_empty());
+        assert_eq!(
+            prune_lock_timeout_risks(
+                Duration::from_millis(320),
+                Duration::from_millis(2560),
+                Some(1000),
+                Some(2000)
+            ),
+            vec![PruneLockTimeoutRisk::StatementTimeout { limit_ms: 2000 }]
+        );
     }
 }

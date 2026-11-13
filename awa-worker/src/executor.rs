@@ -1,4 +1,4 @@
-use crate::completion::CompletionBatcherHandle;
+use crate::completion::{CompletionBatcherHandle, CompletionError};
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{lock_progress, InFlightMap, InFlightState, ProgressState};
@@ -624,6 +624,22 @@ fn completion_contention_backoff(retry: u32) -> Duration {
     Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
 }
 
+/// Why one finalization attempt did not finish.
+#[derive(Debug, thiserror::Error)]
+enum FinalizeAttemptError {
+    #[error(transparent)]
+    Operation(#[from] AwaError),
+    /// Another transaction holds the attempt's completion lock. Nothing was
+    /// written; the attempt is finalized again after a backoff.
+    #[error("another transaction holds the attempt's completion lock")]
+    LockHeld,
+}
+
+/// How long an attempt may wait on a held completion lock before the wait is
+/// logged as a warning. The runtime's own heartbeat and progress flush hold
+/// the lock for the length of one short transaction, which is not worth one.
+const COMPLETION_LOCK_HELD_WARN_AFTER: Duration = Duration::from_secs(1);
+
 #[derive(Debug, thiserror::Error)]
 enum FinalizeError {
     #[error(transparent)]
@@ -633,7 +649,7 @@ enum FinalizeError {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finalize_with_retry<T, F, Fut>(
+async fn finalize_with_retry<T, E, F, Fut>(
     mut finalize: F,
     metrics: &crate::metrics::AwaMetrics,
     job_id: i64,
@@ -644,11 +660,15 @@ async fn finalize_with_retry<T, F, Fut>(
 ) -> Result<T, FinalizeError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, AwaError>>,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: Into<FinalizeAttemptError>,
 {
-    let deadline = retry_lock_contention.then(|| tokio::time::Instant::now() + window);
+    let started = tokio::time::Instant::now();
+    let deadline = retry_lock_contention.then(|| started + window);
     let mut deadlock_retries = 0;
     let mut lock_retries = 0;
+    let mut lock_held_retries = 0;
+    let mut lock_held_warned = false;
     loop {
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(FinalizeError::Deadline);
@@ -656,7 +676,35 @@ where
         let outcome = finalize().await;
         let error = match outcome {
             Ok(outcome) => return Ok(outcome),
-            Err(error) => error,
+            Err(error) => match error.into() {
+                FinalizeAttemptError::Operation(error) => error,
+                FinalizeAttemptError::LockHeld => {
+                    lock_held_retries += 1;
+                    let delay = completion_contention_backoff(lock_held_retries);
+                    let waited = started.elapsed();
+                    if waited >= COMPLETION_LOCK_HELD_WARN_AFTER && !lock_held_warned {
+                        lock_held_warned = true;
+                        warn!(
+                            job_id,
+                            waited_ms = waited.as_millis() as u64,
+                            "Another transaction holds this attempt's completion lock; still retrying"
+                        );
+                    } else {
+                        debug!(
+                            job_id,
+                            delay_ms = delay.as_millis() as u64,
+                            "Another transaction holds this attempt's completion lock; retrying"
+                        );
+                    }
+                    tokio::time::timeout_at(started + window, tokio::time::sleep(delay))
+                        .await
+                        .map_err(|_| FinalizeError::Deadline)?;
+                    if tokio::time::Instant::now() >= started + window {
+                        return Err(FinalizeError::Deadline);
+                    }
+                    continue;
+                }
+            },
         };
         let delay = if error.is_deadlock() && deadlock_retries < COMPLETION_DEADLOCK_RETRIES {
             deadlock_retries += 1;
@@ -743,23 +791,22 @@ async fn complete_job(
     storage: &RuntimeStorage,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
-) -> Result<CompletionOutcome, AwaError> {
+) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match storage {
-        RuntimeStorage::Canonical => {
-            complete_job_canonical(
-                pool,
-                job,
-                result,
-                completion_batcher,
-                progress_snapshot,
-                duration,
-                needs_event,
-                enqueue_specs,
-                dlq_enabled,
-                metrics,
-            )
-            .await
-        }
+        RuntimeStorage::Canonical => complete_job_canonical(
+            pool,
+            job,
+            result,
+            completion_batcher,
+            progress_snapshot,
+            duration,
+            needs_event,
+            enqueue_specs,
+            dlq_enabled,
+            metrics,
+        )
+        .await
+        .map_err(Into::into),
         RuntimeStorage::QueueStorage(runtime) => {
             complete_job_queue_storage(
                 runtime,
@@ -1800,7 +1847,7 @@ async fn complete_job_queue_storage(
     >,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
-) -> Result<CompletionOutcome, AwaError> {
+) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match result {
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");
@@ -1866,6 +1913,16 @@ async fn complete_job_queue_storage(
                 None => completion_batcher.complete(job.id, job.run_lease).await,
             } {
                 Ok(updated) => updated,
+                // Another transaction holds this attempt's completion lock.
+                // Finalizing it directly would wait on that lock while
+                // holding a pool connection; `finalize_with_retry` retries it
+                // with backoff instead.
+                Err(CompletionError::LockHeld { .. }) => {
+                    return Err(FinalizeAttemptError::LockHeld)
+                }
+                Err(CompletionError::Storage(err)) if is_completion_lock_contention(&err) => {
+                    return Err(err.into())
+                }
                 Err(err) => {
                     warn!(
                         job_id = job.id,
@@ -1926,7 +1983,8 @@ async fn complete_job_queue_storage(
                     metrics,
                     needs_event,
                 )
-                .await;
+                .await
+                .map_err(Into::into);
             }
 
             info!(
@@ -2362,6 +2420,7 @@ async fn complete_job_queue_storage(
                     needs_event,
                 )
                 .await
+                .map_err(Into::into)
             } else {
                 warn!(
                     job_id = job.id,
@@ -3313,7 +3372,7 @@ mod tests {
                         let event = response.await.map_err(|_| {
                             AwaError::Validation("completion acknowledgement dropped".into())
                         })?;
-                        Ok(CompletionOutcome::Applied {
+                        Ok::<_, AwaError>(CompletionOutcome::Applied {
                             event: Some(event),
                             terminal: false,
                         })
@@ -3385,6 +3444,52 @@ mod tests {
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1, "{code}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_completion_lock_is_retried_until_the_attempt_finalizes() {
+        let calls = AtomicU32::new(0);
+        let result = finalize_with_retry(
+            || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if call < 3 {
+                    Err(FinalizeAttemptError::LockHeld)
+                } else {
+                    Ok(call)
+                })
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert!(matches!(result, Ok(3)));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_lock_held_past_the_window_ends_finalization() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(FinalizeAttemptError::LockHeld))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(calls.load(Ordering::SeqCst) > 5);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3837,7 +3942,8 @@ mod tests {
                     .await;
                     if let Err(error) = &result {
                         assert!(
-                            is_completion_lock_contention(error),
+                            matches!(error, FinalizeAttemptError::Operation(error)
+                                if is_completion_lock_contention(error)),
                             "expected actual held-head55P03: {error}"
                         );
                         busy.notify_one();

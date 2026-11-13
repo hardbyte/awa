@@ -175,6 +175,7 @@ async def test_queue_stats_returns_typed_objects(async_client):
     assert hasattr(stat, "total_queued")
     assert hasattr(stat, "scheduled")
     assert hasattr(stat, "available")
+    assert hasattr(stat, "available_is_estimate")
     assert hasattr(stat, "retryable")
     assert hasattr(stat, "running")
     assert hasattr(stat, "failed")
