@@ -1,4 +1,4 @@
-use crate::completion::{CompletionBatcherHandle, FinalizationBudget};
+use crate::completion::{CompletionBatcherHandle, CompletionError, FinalizationBudget};
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
@@ -637,10 +637,14 @@ impl JobExecutor {
                                         .inspect_err(|err| {
                                             // The schema lost the output columns
                                             // under this process; re-probe on retry.
-                                            if let (true, RuntimeStorage::QueueStorage(runtime)) =
-                                                (err.is_undefined_column(), storage)
+                                            if let (
+                                                FinalizeAttemptError::Operation(err),
+                                                RuntimeStorage::QueueStorage(runtime),
+                                            ) = (err, storage)
                                             {
-                                                runtime.store.forget_job_output_columns();
+                                                if err.is_undefined_column() {
+                                                    runtime.store.forget_job_output_columns();
+                                                }
                                             }
                                         })
                                     }
@@ -822,6 +826,22 @@ fn completion_contention_backoff(retry: u32) -> Duration {
     Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
 }
 
+/// Why one finalization attempt did not finish.
+#[derive(Debug, thiserror::Error)]
+enum FinalizeAttemptError {
+    #[error(transparent)]
+    Operation(#[from] AwaError),
+    /// Another transaction holds the attempt's completion lock. Nothing was
+    /// written; the attempt is finalized again after a backoff.
+    #[error("another transaction holds the attempt's completion lock")]
+    LockHeld,
+}
+
+/// How long an attempt may wait on a held completion lock before the wait is
+/// logged as a warning. The runtime's own heartbeat and progress flush hold
+/// the lock for the length of one short transaction, which is not worth one.
+const COMPLETION_LOCK_HELD_WARN_AFTER: Duration = Duration::from_secs(1);
+
 #[derive(Debug, thiserror::Error)]
 enum FinalizeError {
     #[error(transparent)]
@@ -844,7 +864,7 @@ struct FinalizeAck<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finalize_with_retry<T, F, Fut>(
+async fn finalize_with_retry<T, E, F, Fut>(
     mut finalize: F,
     metrics: &crate::metrics::AwaMetrics,
     job_id: i64,
@@ -855,13 +875,16 @@ async fn finalize_with_retry<T, F, Fut>(
 ) -> Result<FinalizeAck<T>, FinalizeError>
 where
     F: FnMut(CompletionPath) -> Fut,
-    Fut: std::future::Future<Output = Result<T, AwaError>>,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: Into<FinalizeAttemptError>,
 {
     let started = tokio::time::Instant::now();
     let budget = window.into();
     let mut deadlock_retries = 0;
     let mut reconnect_retries = 0;
     let mut lock_retries = 0;
+    let mut lock_held_retries = 0;
+    let mut lock_held_warned = false;
     let mut warned = false;
     let mut schema_retried = false;
     let mut completion_path = CompletionPath::Batched;
@@ -884,7 +907,39 @@ where
                     elapsed: started.elapsed(),
                 });
             }
-            Err(error) => error,
+            Err(error) => match error.into() {
+                FinalizeAttemptError::Operation(error) => error,
+                // Retried on the same completion path: a held lock is not a
+                // failure of that path, and both paths leave the attempt out
+                // rather than wait on the lock while holding a connection.
+                FinalizeAttemptError::LockHeld => {
+                    lock_held_retries += 1;
+                    let delay = completion_contention_backoff(lock_held_retries);
+                    let waited = started.elapsed();
+                    if waited >= COMPLETION_LOCK_HELD_WARN_AFTER && !lock_held_warned {
+                        lock_held_warned = true;
+                        warn!(
+                            job_id,
+                            waited_ms = waited.as_millis() as u64,
+                            "Another transaction holds this attempt's completion lock; still retrying"
+                        );
+                    } else {
+                        debug!(
+                            job_id,
+                            delay_ms = delay.as_millis() as u64,
+                            "Another transaction holds this attempt's completion lock; retrying"
+                        );
+                    }
+                    let backoff = tokio::time::sleep(delay);
+                    if retry_lock_contention {
+                        budget.timeout(backoff).await
+                    } else {
+                        budget.timeout_unpaused(backoff).await
+                    }
+                    .map_err(|_| FinalizeError::Deadline)?;
+                    continue;
+                }
+            },
         };
         let delay = if error.is_deadlock() && deadlock_retries < COMPLETION_DEADLOCK_RETRIES {
             deadlock_retries += 1;
@@ -1032,25 +1087,24 @@ async fn complete_job(
     storage: &RuntimeStorage,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
-) -> Result<CompletionOutcome, AwaError> {
+) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match storage {
-        RuntimeStorage::Canonical => {
-            complete_job_canonical(
-                pool,
-                job,
-                result,
-                staged_follow_ups,
-                completion_batcher,
-                completion_path,
-                progress_snapshot,
-                duration,
-                needs_event,
-                enqueue_specs,
-                dlq_enabled,
-                metrics,
-            )
-            .await
-        }
+        RuntimeStorage::Canonical => complete_job_canonical(
+            pool,
+            job,
+            result,
+            staged_follow_ups,
+            completion_batcher,
+            completion_path,
+            progress_snapshot,
+            duration,
+            needs_event,
+            enqueue_specs,
+            dlq_enabled,
+            metrics,
+        )
+        .await
+        .map_err(Into::into),
         RuntimeStorage::QueueStorage(runtime) => {
             complete_job_queue_storage(
                 runtime,
@@ -2101,7 +2155,7 @@ async fn complete_job_queue_storage(
     >,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
-) -> Result<CompletionOutcome, AwaError> {
+) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match result {
         Ok(JobResult::Completed) => {
             // ADR-029: when this kind has follow-up specs registered, drive
@@ -2154,6 +2208,10 @@ async fn complete_job_queue_storage(
                     )
                     .await?
                 }
+                // A held completion lock comes back as `LockHeld` on either
+                // path, for `finalize_with_retry` to retry with backoff, rather
+                // than finalizing directly and waiting on the lock while
+                // holding a pool connection.
                 CompletionPath::Batched => match match queue_storage_claim {
                     Some(claim) => {
                         completion_batcher
@@ -2168,7 +2226,10 @@ async fn complete_job_queue_storage(
                     None => completion_batcher.complete(job.id, job.run_lease).await,
                 } {
                     Ok(updated) => updated,
-                    Err(_) => {
+                    Err(CompletionError::LockHeld { .. }) => {
+                        return Err(FinalizeAttemptError::LockHeld)
+                    }
+                    Err(CompletionError::Storage(_)) => {
                         direct_complete_job_queue_storage(
                             runtime,
                             pool,
@@ -2221,7 +2282,8 @@ async fn complete_job_queue_storage(
                     metrics,
                     needs_event,
                 )
-                .await;
+                .await
+                .map_err(Into::into);
             }
 
             // ADR-029: caller-requested retry on queue storage.
@@ -2600,6 +2662,7 @@ async fn complete_job_queue_storage(
                     needs_event,
                 )
                 .await
+                .map_err(Into::into)
             } else {
                 // ADR-029: retryable error with backoff -> Retried outcome.
                 let kind_specs = enqueue_specs
@@ -2999,17 +3062,21 @@ async fn direct_complete_job_queue_storage(
     job: &JobRow,
     queue_storage_claim: Option<&ClaimedEntry>,
     queue_storage_unique_states: Option<&str>,
-) -> Result<bool, AwaError> {
+) -> Result<bool, FinalizeAttemptError> {
     let updated = if let Some(claim) = queue_storage_claim {
         let runtime_job = ClaimedRuntimeJob {
             claim: claim.clone(),
             job: job.clone(),
             unique_states: queue_storage_unique_states.map(std::string::ToString::to_string),
         };
-        runtime
+        let outcome = runtime
             .store
-            .complete_runtime_batch(pool, std::slice::from_ref(&runtime_job))
-            .await?
+            .complete_runtime_batch_isolating(pool, std::slice::from_ref(&runtime_job))
+            .await?;
+        if !outcome.contended.is_empty() {
+            return Err(FinalizeAttemptError::LockHeld);
+        }
+        outcome.updated
     } else {
         runtime
             .store
@@ -4005,7 +4072,8 @@ mod tests {
                     .await;
                     if let Err(error) = &result {
                         assert!(
-                            is_completion_lock_contention(error),
+                            matches!(error, FinalizeAttemptError::Operation(error)
+                                if is_completion_lock_contention(error)),
                             "expected actual held-head55P03: {error}"
                         );
                         busy.notify_one();
@@ -4112,6 +4180,53 @@ mod tests {
         .await;
         assert!(matches!(result, Err(FinalizeError::Operation(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_completion_lock_is_retried_on_the_same_path_until_it_finalizes() {
+        let calls = AtomicU32::new(0);
+        let result = finalize_with_retry(
+            |path| {
+                assert_eq!(path, CompletionPath::Batched, "a held lock keeps batching");
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if call < 3 {
+                    Err(FinalizeAttemptError::LockHeld)
+                } else {
+                    Ok(call)
+                })
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert!(matches!(result, Ok(FinalizeAck { outcome: 3, .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_lock_held_past_the_window_ends_finalization() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(FinalizeAttemptError::LockHeld))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(calls.load(Ordering::SeqCst) > 5);
     }
 
     // Fresh partitioned-schema fixtures share PostgreSQL's cluster-wide lock table.
