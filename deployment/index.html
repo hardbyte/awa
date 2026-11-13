@@ -2708,7 +2708,7 @@
 <ul>
 <li>one dispatcher per configured queue</li>
 <li>one heartbeat loop</li>
-<li>one maintenance loop</li>
+<li>the maintenance service: on the leader, a recovery loop (promotion and rescue) and a hygiene loop (cleanup, cron sync, rotation and the rest)</li>
 <li>one elected leader per database for rescue, promotion, cleanup, and cron evaluation</li>
 </ul>
 <p>That means you scale by running more worker processes, not by adding local state.</p>
