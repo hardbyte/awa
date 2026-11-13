@@ -23,6 +23,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - Syncing a periodic job declaration that matches the stored schedule no longer rewrites its `awa.cron_jobs` row or moves `updated_at`, so a leader that syncs on a timer stops generating a row version per schedule per interval. A changed declaration, or an owned or retired schedule, is handled as before.
 - The architecture overview says that a worker still running a claim lost before its WAL flush is not fenced by its run lease, because the job's next claim reuses it, and describes queue-storage rescue passes and their bounds. The lifecycle hooks guide says a rescue pass can exceed `rescue_pass_max_rows` by nearly one batch.
+- Cleanup, cron sync, batch operations, metadata refresh, rollup and ring rotation no longer hold back promotion and rescue (#303). The maintenance leader ran every branch from one loop, so while one branch's statement waited on a lock or ran a long scan, scheduled and retryable jobs were not promoted and stale, overdue and timed-out attempts were not rescued. With one `awa.cron_jobs` row locked by another session, the leader's startup cron sync stalled both for as long as the lock was held, and stopped cron from firing. Promotion and the three rescues now run in their own loop within the leader term, the leader check runs beside both loops so a lost lock session is noticed while a branch is in flight, and the cron evaluator starts before the startup cron sync. A rescue pass still delays promotion, and the other branches still delay one another: a stuck cleanup or cron sync still holds back ring rotation and prune, and shutdown still waits for it. No configuration or schema change is needed. A leader holds one more pool connection at a time. While a rescue pass runs, lease prune may report more `blocked` outcomes and claim prune may wait out a rescue batch. See [ADR-051](docs/adr/051-maintenance-recovery-loop.md).
 
 ### Added
 
@@ -57,6 +58,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Claiming from a ready slot that holds tombstones no longer scans the slot's whole tombstone partition on every claim (#713, reported and fixed by @Wallace99, migration v060). Each claim checks its candidate rows against `ready_tombstones`, and for a small batch PostgreSQL could plan that check as a hashed subplan over the partition instead of one index probe per row: a 32-row claim read 10,000 tombstone rows in the regression test. The check now carries `OFFSET 0`, which keeps it correlated. v060 rewrites `claim_ready_runtime` and every `claim_ready_slot_<n>` in the default and every trusted custom queue-storage schema in place, without reinstalling tables or triggers; it takes no table locks, and binaries before it claim unchanged. 0.6.17 made the same change through its `correlated_claim_tombstones` schema patch. See [v060](docs/upgrade-0.6-to-0.7.md#v060-correlated-claim-tombstone-checks).
 - **The `awa_job_output_schema_missing` alert rule imports.** Its query had no expression or datasource and the rule had no threshold, so Grafana refused to provision it. It now fires when a queue drops outputs with reason `schema_missing` for 10 minutes.
 - **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.
 - **A queue lane is usable by every runtime role, whichever role creates it
@@ -437,8 +439,9 @@ for each step.
   runtime role keeps working; only the migration is refused. Before upgrading,
   remove `TRIGGER` from runtime-role grants, which `GRANT ALL ON ALL TABLES`
   includes, remove runtime roles' `CREATE` on the schema, and remove triggers
-  of your own from awa tables. Revoking a running 0.6 fleet's `CREATE` needs
-  the order in the upgrade guide.
+  of your own from awa tables. A running 0.6 fleet keeps running if
+  `awa migrate` from a 0.6.x CLI, 0.6.14 or later, has applied its lane schema patches
+  before the `CREATE` revoke; see the upgrade guide.
 - **External migration runners.** Generate the pending SQL with an upgraded
   binary, for example `awa migrate --pending --extract-to ./pending`, apply
   complete bundles, and keep the files already applied unchanged. Apply
