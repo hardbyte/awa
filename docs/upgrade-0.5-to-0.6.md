@@ -199,6 +199,8 @@ These are the metrics that distinguish "transition healthy" from "transition stu
 - `awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}` rate should be near zero — non-zero `blocked` means a held-tx is preventing partition reclaim
 - `awa_storage_canonical_live_backlog` should trend monotonically to 0 once routing has flipped — a backlog that plateaus while jobs are visibly executing means canonical work is being re-created rather than drained, which is the shape [#456](https://github.com/hardbyte/awa/issues/456) fixed (see Known issues)
 
+The [shipped alert rules](grafana/alerts/README.md) cover the rotation, prune and queue-lag signals (`awa_ring_rotation_stalled`, `awa_ring_prune_blocked`, `awa_queue_lag_high`) and, in the Postgres rule set, transaction age (`awa_pg_long_transaction`).
+
 If any of these go wrong **before** any queue-storage work is accepted, `awa storage abort` is still available. After, you commit to forward-only.
 
 ## Known issues

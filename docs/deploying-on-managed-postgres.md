@@ -142,7 +142,7 @@ WHERE datname = current_database()
   AND backend_type = 'client backend';
 ```
 
-Alert when `max_xact_age_seconds` exceeds a few multiples of your normal longest job; `300` is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in [Inspect long transactions](troubleshooting.md#inspect-long-transactions).
+Alert when `max_xact_age_seconds` exceeds a few multiples of your normal longest job; `300` is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in [Inspect long transactions](troubleshooting.md#inspect-long-transactions). The Postgres alert rule set ships this check as [`awa_pg_long_transaction`](grafana/alerts/README.md).
 
 ### 4. Give autovacuum enough capacity
 
