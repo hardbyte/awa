@@ -36,6 +36,7 @@ Every worker process dispatches and heartbeats its own attempts. One of them als
 
 | Page | What it explains |
 | --- | --- |
+| [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md) | What a queue is, and when to use separate queues, priority, shards, partitions or claimers, and which combine |
 | [Lanes and claiming](lanes-and-claiming.md) | How jobs are ordered, how a producer's commit makes them visible, and how workers pick the next one |
 | [Claims, receipts and leases](claims-receipts-and-leases.md) | What a claim writes, how heartbeats and rescue work, and how `run_lease` fences out stale workers |
 | [Rings: rotation and prune](rings.md) | How storage is reclaimed without vacuuming hot tables, and what stops a ring from moving |

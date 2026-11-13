@@ -39,6 +39,7 @@ Judge a change by durable completions per second, end-to-end p99 latency, queue 
 
 ## Related
 
+- [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md): what each tool changes about a queue, and which combine.
 - [Lanes and claiming](lanes-and-claiming.md): what a lane is and how a claim takes from it.
 - [Batching](batching.md): moving more jobs through each statement.
 - [Choosing a throughput lever](../configuration.md#choosing-a-throughput-lever) and [ADR-025](../adr/025-sharded-enqueue-heads.md): settings and design records.

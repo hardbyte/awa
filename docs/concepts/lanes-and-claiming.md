@@ -41,6 +41,7 @@ One lane admits one claimer and one producer at a time. When a single `(queue, p
 
 ## Related
 
+- [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md): how lanes relate to queue policy, and the tools that add lanes or queues.
 - [Claims, receipts and leases](claims-receipts-and-leases.md): what a claim writes and how an attempt ends.
 - [Transactional enqueue](transactional-enqueue.md): enqueueing with the business write.
 - [Architecture: enqueue and claim](../architecture.md#enqueue-and-claim): the tables and functions behind each step.
