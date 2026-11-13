@@ -171,13 +171,13 @@ async fn dashboards(options: &PgConnectOptions) -> Result<(), Error> {
         &pool,
         app,
         admin::state_counts(&pool),
-        |r| serde_json::json!({"returned_rows":r.as_ref().ok().map(|v|v.len())}),
+        |r| serde_json::json!({"returned_rows":r.as_ref().ok().map(|v|v.counts.len())}),
     )
     .await?;
     pool.close().await;
     let rows = result?;
     check(
-        rows.values().sum::<i64>() == 40,
+        rows.counts.values().sum::<i64>() == 40,
         "state counts lost seeded work",
     )?;
     eprintln!(
