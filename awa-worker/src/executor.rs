@@ -371,11 +371,7 @@ impl JobExecutor {
                 cancel: cancel.clone(),
                 progress: progress_state.clone(),
                 claim: queue_storage_claim.as_ref().and_then(|claim| {
-                    awa_model::queue_storage::ClaimHeartbeatRef::from_claim(
-                        job_id,
-                        job_run_lease,
-                        claim,
-                    )
+                    crate::runtime::ClaimRef::from_claim(job_id, job_run_lease, claim)
                 }),
                 finalizing: false,
             };
