@@ -261,6 +261,20 @@ async fn sql_path_jobs_are_claimed_by_a_striped_worker() {
         "a striped store counts jobs in the unstriped queue"
     );
 
+    // The query the CHANGELOG gives operators for finding these jobs.
+    let unstriped: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT queue, state::text, count(*) FROM awa.jobs \
+         WHERE state IN ('available', 'scheduled', 'retryable') AND strpos(queue, '#') = 0 \
+         GROUP BY queue, state",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("list jobs in unstriped queues");
+    assert_eq!(
+        unstriped,
+        vec![(queue.to_string(), "available".to_string(), 10)]
+    );
+
     let claimed = drain(&pool, &store, queue, 4).await;
     let seqs: BTreeSet<i64> = claimed.iter().map(|(seq, _)| *seq).collect();
     assert_eq!(
