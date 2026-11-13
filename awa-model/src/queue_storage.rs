@@ -301,6 +301,30 @@ pub struct QueueClaimerLease {
     pub lease_epoch: i64,
 }
 
+/// Sum of `enqueue cursor - claim cursor` over the lanes of the physical
+/// queues bound as `$1`: the claimer signal (see
+/// `QueueStorage::queue_claimer_signal`).
+fn claimer_signal_sql(schema: &str) -> String {
+    format!(
+        r#"
+            SELECT COALESCE(
+                sum(GREATEST(
+                    {schema}.sequence_next_value(qe.seq_name)
+                        - {schema}.sequence_next_value(qc.seq_name),
+                    0
+                )),
+                0
+            )::bigint
+            FROM {schema}.queue_enqueue_heads AS qe
+            JOIN {schema}.queue_claim_heads AS qc
+              ON qc.queue = qe.queue
+             AND qc.priority = qe.priority
+             AND qc.enqueue_shard = qe.enqueue_shard
+            WHERE qe.queue = ANY($1)
+            "#
+    )
+}
+
 /// How long a claim may reuse this instance's cached claimer lease before
 /// re-reading the lease row and the queue's claimer target.
 const CLAIMER_GATE_CACHE_TTL: Duration = Duration::from_millis(250);
@@ -8288,28 +8312,11 @@ impl QueueStorage {
     ) -> Result<AvailableSignal, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
-        let available: i64 = sqlx::query_scalar(audited_sql(format!(
-            r#"
-            SELECT COALESCE(
-                sum(GREATEST(
-                    {schema}.sequence_next_value(qe.seq_name)
-                        - {schema}.sequence_next_value(qc.seq_name),
-                    0
-                )),
-                0
-            )::bigint
-            FROM {schema}.queue_enqueue_heads AS qe
-            JOIN {schema}.queue_claim_heads AS qc
-              ON qc.queue = qe.queue
-             AND qc.priority = qe.priority
-             AND qc.enqueue_shard = qe.enqueue_shard
-            WHERE qe.queue = ANY($1)
-            "#
-        )))
-        .bind(&queues)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        let available: i64 = sqlx::query_scalar(audited_sql(claimer_signal_sql(schema)))
+            .bind(&queues)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
 
         Ok(AvailableSignal { available })
     }
@@ -9949,72 +9956,76 @@ impl QueueStorage {
     ) -> Result<QueueCounts, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
-        // available: dispatcher signal — already an index-only sum over
-        // the (queue, priority, enqueue_shard) head tables.
-        let available = self.queue_claimer_signal(pool, queue).await?.available;
+        let signal_sql = claimer_signal_sql(schema);
+        // One statement, so a high-cadence poller costs one round trip and
+        // one transaction, and the three counts come from one snapshot.
+        //
+        // available: dispatcher signal — an index-only sum over the
+        // (queue, priority, enqueue_shard) head tables.
         // running: leases.state = 'running' only, matching
         // queue_counts_exact's strict definition. Receipt-plane claims
         // that haven't materialised a lease row yet are documented as
         // omitted in the method-level doc.
-        let running: i64 = sqlx::query_scalar(audited_sql(format!(
-            r#"
-            SELECT COALESCE(count(*)::bigint, 0)
-            FROM {schema}.leases
-            WHERE queue = ANY($1)
-              AND state = 'running'
-            "#
-        )))
-        .bind(&queues)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)?;
         // terminal: denormalised rollup plus unfolded prune deltas
         // (#371). Live (un-rolled-up) done_entries rows are excluded —
         // see method-level docs. The GREATEST legacy dedupe applies to
         // the completed column only: queue_lanes never carried a failed
         // column.
-        let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(audited_sql(format!(
-            r#"
+        let (available, running, pruned_completed, pruned_failed): (i64, i64, i64, i64) =
+            sqlx::query_as(audited_sql(format!(
+                r#"
             SELECT
-                COALESCE(sum(
-                    GREATEST(
-                        COALESCE(lanes.pruned_completed_count, 0),
-                        COALESCE(rollups.pruned_completed_count, 0)
-                    )
-                    + COALESCE(pending.pruned_completed_delta, 0)
-                ), 0)::bigint,
-                COALESCE(sum(
-                    COALESCE(rollups.pruned_failed_count, 0)
-                    + COALESCE(pending.pruned_failed_delta, 0)
-                ), 0)::bigint
+                ({signal_sql}) AS available,
+                (
+                    SELECT COALESCE(count(*)::bigint, 0)
+                    FROM {schema}.leases
+                    WHERE queue = ANY($1)
+                      AND state = 'running'
+                ) AS running,
+                terminal.pruned_completed,
+                terminal.pruned_failed
             FROM (
-                SELECT queue, priority, pruned_completed_count
-                FROM {schema}.queue_lanes
-                WHERE queue = ANY($1)
-            ) AS lanes
-            FULL OUTER JOIN (
-                SELECT queue, priority, pruned_completed_count, pruned_failed_count
-                FROM {schema}.queue_terminal_rollups
-                WHERE queue = ANY($1)
-            ) AS rollups
-            USING (queue, priority)
-            FULL OUTER JOIN (
                 SELECT
-                    queue,
-                    priority,
-                    sum(pruned_completed_delta)::bigint AS pruned_completed_delta,
-                    sum(pruned_failed_delta)::bigint AS pruned_failed_delta
-                FROM {schema}.queue_terminal_rollup_deltas
-                WHERE queue = ANY($1)
-                GROUP BY queue, priority
-            ) AS pending
-            USING (queue, priority)
+                    COALESCE(sum(
+                        GREATEST(
+                            COALESCE(lanes.pruned_completed_count, 0),
+                            COALESCE(rollups.pruned_completed_count, 0)
+                        )
+                        + COALESCE(pending.pruned_completed_delta, 0)
+                    ), 0)::bigint AS pruned_completed,
+                    COALESCE(sum(
+                        COALESCE(rollups.pruned_failed_count, 0)
+                        + COALESCE(pending.pruned_failed_delta, 0)
+                    ), 0)::bigint AS pruned_failed
+                FROM (
+                    SELECT queue, priority, pruned_completed_count
+                    FROM {schema}.queue_lanes
+                    WHERE queue = ANY($1)
+                ) AS lanes
+                FULL OUTER JOIN (
+                    SELECT queue, priority, pruned_completed_count, pruned_failed_count
+                    FROM {schema}.queue_terminal_rollups
+                    WHERE queue = ANY($1)
+                ) AS rollups
+                USING (queue, priority)
+                FULL OUTER JOIN (
+                    SELECT
+                        queue,
+                        priority,
+                        sum(pruned_completed_delta)::bigint AS pruned_completed_delta,
+                        sum(pruned_failed_delta)::bigint AS pruned_failed_delta
+                    FROM {schema}.queue_terminal_rollup_deltas
+                    WHERE queue = ANY($1)
+                    GROUP BY queue, priority
+                ) AS pending
+                USING (queue, priority)
+            ) AS terminal
             "#
-        )))
-        .bind(&queues)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)?;
+            )))
+            .bind(&queues)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
         Ok(QueueCounts {
             available,
             running,
