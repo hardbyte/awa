@@ -9,6 +9,10 @@
 //! An optional completion stall holds completions back while handlers keep running. The
 //! window from the stall to as long again after it is left out of the slope and checked on
 //! its own: resident memory may rise by at most a fixed amount, however long the stall.
+//!
+//! The harness's own ledger also lives here and grows with every job enqueued. When the
+//! runtimes fall behind the producers, as on a host short of CPU, that growth lands on few
+//! executions and would read as a leak, so the slope is then reported as not evaluated.
 
 use super::config::Persona;
 use super::shared::Shared;
@@ -22,6 +26,7 @@ pub struct MemorySample {
     pub at_ms: i64,
     pub load: bool,
     pub executions: i64,
+    pub ledger_jobs: i64,
     pub rss_kib: i64,
     pub hwm_kib: i64,
     pub rss_anon_kib: i64,
@@ -39,6 +44,9 @@ pub struct MemoryLog {
 pub struct MemoryVerdict {
     pub samples: usize,
     pub executions_evaluated: i64,
+    pub enqueued_evaluated: i64,
+    /// Why the slope was not evaluated, when it was not.
+    pub not_evaluated: Option<String>,
     pub slope_mib_per_100k: Option<f64>,
     pub limit_mib_per_100k: f64,
     pub start_rss_mib: f64,
@@ -96,6 +104,7 @@ pub async fn sample(shared: Arc<Shared>, stop: Stop) {
                 at_ms: shared.now_ms(),
                 load: !shared.load_stop.is_stopped(),
                 executions: executions(&shared),
+                ledger_jobs: shared.ledger.len() as i64,
                 rss_kib: status_kib(&status, "VmRSS:"),
                 hwm_kib: status_kib(&status, "VmHWM:"),
                 rss_anon_kib: status_kib(&status, "RssAnon:"),
@@ -221,7 +230,25 @@ pub fn evaluate(shared: &Shared, load_started_ms: i64) {
         .iter()
         .filter_map(|segment| Some(segment.last()?.executions - segment.first()?.executions))
         .sum();
-    let slope_mib_per_100k = if executions_evaluated >= shared.config.memory_min_executions {
+    let enqueued_evaluated: i64 = [&before_stall, &after_stall]
+        .iter()
+        .filter_map(|segment| Some(segment.last()?.ledger_jobs - segment.first()?.ledger_jobs))
+        .sum();
+    let not_evaluated = if executions_evaluated < shared.config.memory_min_executions {
+        Some(format!(
+            "{executions_evaluated} executions after the warm-up, {} needed",
+            shared.config.memory_min_executions
+        ))
+    } else if enqueued_evaluated * 4 > executions_evaluated * 5 {
+        Some(format!(
+            "the runtimes fell behind the producers ({enqueued_evaluated} jobs enqueued, \
+             {executions_evaluated} executions after the warm-up), so the harness ledger's \
+             growth would dominate the slope"
+        ))
+    } else {
+        None
+    };
+    let slope_mib_per_100k = if not_evaluated.is_none() {
         slope(&segments).map(|kib_per_execution| kib_per_execution * 100_000.0 / 1024.0)
     } else {
         None
@@ -229,6 +256,8 @@ pub fn evaluate(shared: &Shared, load_started_ms: i64) {
     let verdict = MemoryVerdict {
         samples: samples.len(),
         executions_evaluated,
+        enqueued_evaluated,
+        not_evaluated,
         slope_mib_per_100k,
         limit_mib_per_100k: shared.config.memory_slope_limit_mib_per_100k,
         start_rss_mib: first.rss_kib as f64 / 1024.0,
@@ -292,8 +321,8 @@ pub fn evaluate(shared: &Shared, load_started_ms: i64) {
         None => shared.note(
             "memory",
             format!(
-                "memory growth not evaluated: {} executions after the warm-up, {} needed",
-                verdict.executions_evaluated, shared.config.memory_min_executions
+                "memory growth not evaluated: {}",
+                verdict.not_evaluated.as_deref().unwrap_or("no slope")
             ),
         ),
     }
@@ -301,14 +330,15 @@ pub fn evaluate(shared: &Shared, load_started_ms: i64) {
 }
 
 pub fn csv(samples: &[MemorySample]) -> String {
-    let mut out = String::from("at_s,phase,executions,rss_kib,hwm_kib,rss_anon_kib\n");
+    let mut out = String::from("at_s,phase,executions,ledger_jobs,rss_kib,hwm_kib,rss_anon_kib\n");
     for sample in samples {
         let _ = writeln!(
             out,
-            "{:.1},{},{},{},{},{}",
+            "{:.1},{},{},{},{},{},{}",
             sample.at_ms as f64 / 1000.0,
             if sample.load { "load" } else { "drain" },
             sample.executions,
+            sample.ledger_jobs,
             sample.rss_kib,
             sample.hwm_kib,
             sample.rss_anon_kib

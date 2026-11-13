@@ -150,8 +150,8 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
                 ),
                 None => writeln!(
                     out,
-                    "- growth after warm-up: not evaluated ({} executions, {} needed)",
-                    verdict.executions_evaluated, config.memory_min_executions
+                    "- growth after warm-up: not evaluated: {}",
+                    verdict.not_evaluated.as_deref().unwrap_or("no slope")
                 ),
             };
             if let Some(rise) = verdict.stall_rise_mib {
