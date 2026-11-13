@@ -1093,7 +1093,6 @@ fn receipt_closed_evidence_sql(
 /// carrying failed rows out of a slot it retires. Prune retires a slot only
 /// once every claim referencing it has a closure, and closures are checked
 /// before the terminal row, so the other children never decide the outcome.
-/// See ADR-023, "Slot-local terminal evidence".
 fn receipt_closed_evidence_in_slot_sql(
     schema: &str,
     closure_rel: &str,
