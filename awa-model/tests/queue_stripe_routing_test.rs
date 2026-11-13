@@ -462,6 +462,78 @@ async fn single_job_inserts_spread_across_stripes() {
 }
 
 #[tokio::test]
+async fn short_ordering_keys_spread_across_stripes() {
+    let pool = connect().await;
+    let schema = "stripe_routing_short_keys";
+    let store = fresh_store(&pool, schema, 4).await;
+    let queue = "stripe_short_keys";
+    let jobs: Vec<_> = (0..200)
+        .map(|seq| job(queue, seq, Some(&seq.to_string())))
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &jobs)
+        .await
+        .expect("keyed enqueue");
+
+    let mut per_stripe: BTreeMap<String, usize> = BTreeMap::new();
+    let mut single_byte_stripes = BTreeSet::new();
+    for (seq, physical, _) in placement(&pool, schema).await {
+        if seq < 10 {
+            single_byte_stripes.insert(physical.clone());
+        }
+        *per_stripe.entry(physical).or_default() += 1;
+    }
+    assert_eq!(
+        per_stripe.keys().cloned().collect::<Vec<_>>(),
+        (0..4)
+            .map(|stripe| format!("{queue}#{stripe}"))
+            .collect::<Vec<_>>(),
+        "decimal keys use every stripe"
+    );
+    for (stripe, count) in &per_stripe {
+        assert!(
+            (35..=65).contains(count),
+            "{stripe} holds {count} of 200 decimal keys"
+        );
+    }
+    assert!(
+        single_byte_stripes.len() > 1,
+        "single-byte keys use more than one stripe: {single_byte_stripes:?}"
+    );
+}
+
+#[tokio::test]
+async fn equal_length_prefixed_keys_spread_across_stripes() {
+    let pool = connect().await;
+    let schema = "stripe_routing_prefixed_keys";
+    let store = fresh_store(&pool, schema, 4).await;
+    let queue = "stripe_prefixed_keys";
+    let jobs: Vec<_> = (1..=100)
+        .map(|seq| job(queue, seq, Some(&format!("tenant-{seq}"))))
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &jobs)
+        .await
+        .expect("keyed enqueue");
+
+    let mut per_stripe: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, physical, _) in placement(&pool, schema).await {
+        *per_stripe.entry(physical).or_default() += 1;
+    }
+    assert_eq!(
+        per_stripe.len(),
+        4,
+        "prefixed keys use every stripe: {per_stripe:?}"
+    );
+    for (stripe, count) in &per_stripe {
+        assert!(
+            (15..=35).contains(count),
+            "{stripe} holds {count} of 100 prefixed keys"
+        );
+    }
+}
+
+#[tokio::test]
 async fn keys_on_one_stripe_still_use_every_enqueue_shard() {
     let pool = connect().await;
     let schema = "stripe_routing_shards";
