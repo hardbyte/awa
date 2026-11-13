@@ -699,7 +699,20 @@ impl Oracle {
         let mut sampled = 0i64;
         let mut confirmed = 0i64;
         let mut excluded = 0i64;
+        let mut cancelled_completed: Vec<String> = Vec::new();
         self.shared.ledger.for_each(|id, record| {
+            // The lifecycle check in `on_event` misses jobs without events;
+            // their terminal rows read from the store cover the same rule.
+            if record.operator_cancel_run_lease.is_some()
+                && record.operator_cancel_run_lease == record.terminal_run_lease
+                && record.has(flag::DB_SEEN_COMPLETED)
+                && cancelled_completed.len() < MAX_ROWS
+            {
+                cancelled_completed.push(format!(
+                    "{{\"job_id\":{id},\"run_lease\":{}}}",
+                    record.terminal_run_lease.unwrap_or_default()
+                ));
+            }
             if record.has(flag::OPERATOR_REMOVED) || record.has(flag::DLQ_PURGED) {
                 return;
             }
@@ -746,6 +759,16 @@ impl Oracle {
                 unresolved.push(id);
             }
         });
+        if !cancelled_completed.is_empty() {
+            self.shared.violation(
+                "cancelled_attempt_completed",
+                format!(
+                    "{} job(s) stored a completion for the attempt an operator cancel had closed",
+                    cancelled_completed.len()
+                ),
+                cancelled_completed,
+            );
+        }
         if !unexpected.is_empty() {
             self.shared.violation(
                 "unexpected_outcome",
