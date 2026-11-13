@@ -4,6 +4,8 @@ use sqlx::PgPool;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const PATCH: &str = "correlated_claim_tombstones";
+/// `claim_ready_runtime` as 0.6.17 installs it with receipts.
+const RELEASED_BODY: &str = include_str!("fixtures/claim_ready_runtime_0_6_17.sql");
 const FENCE: &str =
     "                        -- Keep this bounded claim on indexed probes, not a full-partition hash.\n                        OFFSET 0\n";
 
@@ -53,7 +55,14 @@ async fn claim_tombstone_patch_keeps_bounded_claims_on_index_probes(pool: PgPool
         .await?;
 
         // Put the released function bodies back, so the patch is exercised on
-        // installed functions and not only through the new installer.
+        // installed functions and not only through the new installer. With
+        // receipts the installer now writes per-slot claim functions, so the
+        // 0.6.17 dispatcher is restored first.
+        if receipts {
+            sqlx::raw_sql(&RELEASED_BODY.replace("__SCHEMA__", schema))
+                .execute(&pool)
+                .await?;
+        }
         let functions: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT p.oid::bigint, p.proname::text, pg_get_functiondef(p.oid)
              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace

@@ -423,6 +423,65 @@ macro_rules! correlated_claim_tombstones_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `live_slot_claims` patch: the claim
+/// function generator, the installer, each `claim_ready_runtime` of an
+/// installed queue-storage substrate with receipts that still has the
+/// released body, and each queue slot of a refreshed substrate without its
+/// `claim_slot_<n>`. Substrates with `lease_claim_receipts = FALSE` keep
+/// their claim function and are not reported.
+macro_rules! live_slot_claims_pending_sql {
+    () => {
+        "SELECT 'awa.refresh_claim_functions'::text AS target \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.oid = to_regprocedure('awa.refresh_claim_functions(text,boolean)') \
+               AND p.prosrc LIKE '%awa:claim-routing:v2%' \
+               AND p.prosrc LIKE '%awa.queue_storage.retire:%') \
+         UNION ALL \
+         SELECT 'awa.install_queue_storage_substrate' \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc NOT LIKE '%refresh_claim_functions%') \
+         UNION ALL \
+         SELECT format('claim function %s.claim_ready_runtime', n.nspname) \
+         FROM pg_proc AS p \
+         JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+         WHERE p.proname = 'claim_ready_runtime' \
+           AND oidvectortypes(p.proargtypes) \
+               = 'text, bigint, double precision, double precision' \
+           AND p.prosrc LIKE '%claim_attempt_batches AS (%' \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'ready_segments' \
+                         AND c.relkind = 'p') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'queue_ring_slots') \
+         UNION ALL \
+         SELECT format('claim function %s.claim_slot_%s', n.nspname, \
+                       substring(child.relname FROM '^ready_entries_([0-9]+)$')) \
+         FROM pg_proc AS p \
+         JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+         JOIN pg_inherits AS inh \
+           ON inh.inhparent = to_regclass(format('%I.ready_entries', n.nspname)) \
+         JOIN pg_class AS child ON child.oid = inh.inhrelid \
+         WHERE p.proname = 'claim_ready_runtime' \
+           AND oidvectortypes(p.proargtypes) \
+               = 'text, bigint, double precision, double precision' \
+           AND p.prosrc LIKE '%awa:claim-routing:v2%' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM pg_proc AS slot_fn \
+               WHERE slot_fn.pronamespace = n.oid \
+                 AND slot_fn.proname = 'claim_slot_' \
+                     || substring(child.relname FROM '^ready_entries_([0-9]+)$') \
+                 AND oidvectortypes(slot_fn.proargtypes) \
+                     = 'text, bigint, smallint, smallint, text, bigint, bigint, boolean, double precision, double precision' \
+                 AND slot_fn.prosrc LIKE '%awa:claim-routing:v2%')"
+    };
+}
+
 /// Rows naming what still lacks the `replica_identity` patch: the installer,
 /// the awa tables without a primary key, and each `queue_terminal_count_deltas`
 /// table or partition of an installed queue-storage substrate (found as for
@@ -483,6 +542,7 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
             correlated_claim_tombstones_pending_sql!(),
             " ORDER BY 1"
         )),
+        "live_slot_claims" => Some(concat!(live_slot_claims_pending_sql!(), " ORDER BY 1")),
         "replica_identity" => Some(concat!(replica_identity_pending_sql!(), " ORDER BY 1")),
         _ => None,
     }
@@ -606,6 +666,20 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
             correlated_claim_tombstones_pending_sql!(),
             ")"
         ),
+    },
+    SchemaPatch {
+        name: "live_slot_claims",
+        description: "Claim through per-slot functions that skip the slot prune retires (#721)",
+        // The v023 definitions first, so the installer and the claim
+        // function generator carry the per-slot functions; the patch then
+        // refreshes the claim functions of every installed schema with
+        // receipts.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/live_slot_claims.sql"),
+        ),
+        applied_probe: concat!("SELECT NOT EXISTS (", live_slot_claims_pending_sql!(), ")"),
     },
     SchemaPatch {
         name: "replica_identity",
