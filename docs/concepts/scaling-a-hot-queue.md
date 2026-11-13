@@ -2,7 +2,7 @@
 
 One busy queue can outgrow the coordination around a single [lane](lanes-and-claiming.md). A lane admits one producer at a time, because a producer holds it until it commits, and one claimer at a time, because a claim locks the lane's cursor. When many producers and workers share one `(queue, priority)`, they queue behind those two locks while the database still has room.
 
-[Batching](batching.md) is the first answer: a larger claim or insert batch moves more jobs through each lock. When that is not enough, AWA can spread the queue so the work no longer funnels through one lane. Each way of spreading it gives up some ordering.
+[Batching](batching.md) is the first answer: a larger claim or insert batch moves more jobs through each lock. When that is not enough, AWA can spread the queue so the work no longer funnels through one lane. Each way of spreading it gives up some ordering. [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md) explains what each tool changes about a queue; this page covers which to try first and how to measure the result.
 
 <div class="awa-diagram" markdown>
 ![Enqueue shards add lanes inside one queue, PartitionedQueue spreads a workload over several queues, queue stripes split every queue in the engine, and claimers add claim loops over the same lanes](../assets/how-it-works/scaling.svg)
@@ -17,7 +17,7 @@ One busy queue can outgrow the coordination around a single [lane](lanes-and-cla
 | `queue_stripe_count` | every logical queue into physical stripes `queue#0`, `queue#1`, … | order only within a stripe; jobs sharing an `ordering_key` share a stripe | storage configuration, for the whole fleet |
 | `claimers` | nothing: adds claim loops over the same lanes in one runtime | unchanged | per queue, in `QueueConfig` |
 
-**Enqueue shards** keep one queue name for operators and spread it over up to 64 lanes per priority. A producer picks a shard by hashing the job's ordering key, so jobs with the same key stay in order; without a key, each producer moves to the next shard for each batch. Lowering the shard count is safe at any time. See [Sharding the enqueue head](../configuration.md#sharding-the-enqueue-head-per-queue).
+**Enqueue shards** keep one queue name for operators and spread it over up to 64 lanes per priority. A producer picks a shard by hashing the job's ordering key, so jobs with the same key stay in order; jobs without a key are spread across the shards. Lowering the shard count never strands jobs, but changing it in either direction moves keys to different shards, so a key's older and newer jobs can run out of order until the backlog drains. See [Sharding the enqueue head](../configuration.md#sharding-the-enqueue-head-per-queue).
 
 **`PartitionedQueue`** spreads one logical workload over physical queues named `email`, `email__p1`, `email__p2` and so on. Each partition is a complete queue, so worker capacity and rate limits apply per partition: four partitions of 32 workers allow 128. It also routes by key, keeping jobs with the same key in one partition and in order. See [Partitioned queues](../configuration.md#partitioned-queues).
 
@@ -39,7 +39,7 @@ Judge a change by durable completions per second, end-to-end p99 latency, queue 
 
 ## Related
 
-- [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md): what each tool changes about a queue, and which combine.
+- [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md): the problem each tool solves, what it gives up, and which combine.
 - [Lanes and claiming](lanes-and-claiming.md): what a lane is and how a claim takes from it.
 - [Batching](batching.md): moving more jobs through each statement.
 - [Choosing a throughput lever](../configuration.md#choosing-a-throughput-lever) and [ADR-025](../adr/025-sharded-enqueue-heads.md): settings and design records.

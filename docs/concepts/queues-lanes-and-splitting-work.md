@@ -1,52 +1,47 @@
 # Queues, lanes and splitting work
 
-AWA gives you several ways to divide work: separate queues, priorities, enqueue shards, partitioned queues, claimers and queue stripes. They are not interchangeable. Each one changes a different part of what a queue is, so each solves a different problem and gives up something different. This page builds up what a queue is from first principles, then says what each tool changes, which to reach for, and which combine.
+AWA gives you several ways to divide work: separate queues, priorities, claimers, enqueue shards and partitioned queues. They are not interchangeable: each one solves a different problem and gives up something different. This page starts from the simplest queue and adds one tool at a time, each when a specific problem calls for it. It ends with a decision guide and a table of which tools combine.
 
-## Why a Postgres queue has contention points
+## One queue, one lane
 
-A job queue in PostgreSQL is a table that many producers write to and many workers read from. Two promises make it useful, and both need coordination:
-
-- **Order.** If producer A commits job 1 before producer B commits job 2, a worker should not run job 2 first. Rows become visible in commit order, not in the order their sequence numbers were handed out, so something has to stop a later number from becoming visible while an earlier one might still commit.
-- **Exactly one claimer per attempt.** Two workers must not both take the same job. Something has to record "taken up to here" so the next worker starts after it.
-
-AWA does both with one small piece of state per ordered sequence of jobs, called a **lane**. A producer holds the lane's enqueue lock from the moment it reserves positions until it commits, so positions become visible in order. A worker locks the lane's claim cursor while it reads the next jobs and moves the cursor past them. Those two locks are where producers and workers meet, and therefore where they wait for each other under load. The database can have plenty of CPU and I/O left while every producer for one lane is queued behind that lane's lock.
-
-[Lanes and claiming](lanes-and-claiming.md) describes the mechanism in detail. For this page, the point is: **one lane admits one producer and one claimer at a time.** Every scaling tool below either adds lanes, adds whole queues, or adds claim loops over lanes that already exist.
-
-## What a queue is
-
-A queue in AWA plays three roles at once.
-
-| Role | What it covers | Set by |
-| --- | --- | --- |
-| **Policy domain** | Worker capacity (`max_workers`, or `min_workers` and `weight` in weighted mode), `rate_limit`, `deadline_duration`, priority aging, retention, dead-letter queue enablement, and the metrics and admin views labelled with the queue name | `QueueConfig` and builder settings in each worker process |
-| **Ordering domain** | A set of lanes, one per `(queue, priority, enqueue_shard)`. Jobs come out in order within a lane; across lanes, a claim prefers the lane whose head has the best effective priority | The job's `queue` and `priority`, and the queue's `enqueue_shards` |
-| **Coordination points** | Each lane's enqueue lock and claim cursor lock | Follows from the lanes |
+A producer appends jobs to a **lane**, an ordered sequence of jobs, and workers claim jobs from the lane's head. A lane belongs to one `(queue, priority, enqueue_shard)`, so a queue whose jobs all use the default priority and the default single shard has exactly one lane.
 
 ```mermaid
 flowchart LR
-    subgraph Q["queue: email (one policy domain)"]
-        direction TB
-        subgraph P1["priority 1"]
-            L10["lane (email, 1, shard 0)"]
-            L11["lane (email, 1, shard 1)"]
-        end
-        subgraph P2["priority 2"]
-            L20["lane (email, 2, shard 0)"]
-            L21["lane (email, 2, shard 1)"]
-        end
+    P1[producer] --> EL
+    P2[producer] --> EL
+    subgraph Q["queue: email"]
+        direction LR
+        EL(["enqueue lock"]) --> L["lane<br/>priority 2 · shard 0"] --> CC(["claim cursor"])
     end
+    CC --> W[worker process]
 ```
 
-Policy is applied by each worker process to the queues it serves. `max_workers` is a semaphore and `rate_limit` is a token bucket inside one runtime, shared by that runtime's claim loops for the queue. Three worker processes each configured with `max_workers: 20` and a rate of 50 per second for `email` allow up to 60 concurrent jobs and 150 jobs per second across the fleet. Divide the per-process values by the replica count when you need a fleet-wide cap.
+A lane has two coordination points. A producer holds the lane's **enqueue lock** from the moment it reserves positions until it commits, so a later position can never become visible while an earlier one might still commit. A worker locks the lane's **claim cursor** while it reads the next jobs and moves the cursor past them, so no two workers take the same job. One lane therefore admits one producer and one claimer at a time, and that is what makes its jobs come out in commit order. [Lanes and claiming](lanes-and-claiming.md) describes both steps in detail.
 
-## The tools
+The queue name also carries policy: worker capacity (`max_workers`, or `min_workers` and `weight` in weighted mode), `rate_limit`, `deadline_duration`, priority aging, retention, dead-letter queue enablement, and the metrics and admin views labelled with the queue name. Each worker process applies the policy itself. `max_workers` is a semaphore and `rate_limit` is a token bucket inside one runtime, so three worker processes each configured with `max_workers: 20` and a rate of 50 per second allow up to 60 concurrent jobs and 150 jobs per second across the fleet. Divide the per-process values by the replica count when you need a fleet-wide cap.
 
-Each tool below is described by which of the three roles it changes.
+Most queues never need more than this. Each section below starts from a problem this queue runs into and adds one tool to solve it.
 
-### Separate queues
+## Unrelated work: a separate queue
 
-A new queue is a new policy domain with its own lanes. The producer chooses the queue when it enqueues.
+**Problem:** webhook deliveries call a slow third party that allows 10 requests per second, and they share the `email` queue. A backlog of webhooks takes worker slots that email needs, and email's rate limit and deadline are wrong for webhooks.
+
+A separate queue has its own policy and its own lanes. The producer chooses the queue when it enqueues.
+
+```mermaid
+flowchart LR
+    PE[email producers] --> LE
+    PW[webhook producers] --> LW
+    subgraph QE["queue: email · 20 workers"]
+        LE["lane"]
+    end
+    subgraph QW["queue: webhooks · 10/s"]
+        LW["lane"]
+    end
+    LE --> WE[email workers]
+    LW --> WW[webhook workers]
+```
 
 ```rust
 awa::insert_with(&pool, &SendWebhook { url, body },
@@ -57,15 +52,29 @@ awa::insert_with(&pool, &SendWebhook { url, body },
 await client.insert(SendWebhook(url=url, body=body), queue="webhooks")
 ```
 
-- **You get:** isolation. A slow or failing `webhooks` handler cannot use `email`'s worker slots, rate limit or deadline. Each queue can run on its own worker processes, scale separately and be paused or drained on its own. Job kinds with very different run times belong on different queues so short jobs do not wait behind long ones; see [Sizing workers from utilization](../configuration.md#sizing-workers-from-utilization).
-- **You give up:** nothing is ordered across queues, and the caller has to know which queue a job belongs on.
-- **Contention:** each queue has its own lanes, so two queues never share an enqueue or claim lock.
+- **You get:** isolation. A slow or failing `webhooks` handler cannot use `email`'s worker slots, rate limit or deadline. Each queue can run on its own worker processes, scale separately and be paused or drained on its own. The two queues never share an enqueue lock or claim cursor.
+- **You give up:** nothing is ordered across queues, and the producer has to know which queue a job belongs on.
 
-Use separate queues when work needs different policy. Do not use them only to spread load for one kind of work; that is what shards and partitions are for.
+Put job kinds with very different run times on separate queues too, so short jobs do not wait behind long ones; see [Sizing workers from utilization](../configuration.md#sizing-workers-from-utilization). Do not add queues only to spread the load of one kind of work: claimers, shards and partitions below do that without splitting its policy by accident.
 
-### Priority
+## Urgent work: priority
 
-Priority (1 to 4, default 2) adds lanes inside the same queue. All priorities share the queue's policy.
+**Problem:** a password-reset email waits behind 50,000 newsletter emails on the same queue and the same workers.
+
+Priority (1 to 4, default 2) adds a lane per priority inside the same queue. All priorities share the queue's policy. A claim takes from the lane whose head has the best effective priority.
+
+```mermaid
+flowchart LR
+    PU[urgent producers] --> L1
+    PB[bulk producers] --> L2
+    subgraph Q["queue: email"]
+        L1["lane · priority 1"]
+        L2["lane · priority 2"]
+    end
+    L1 --> C{{"claim: best effective priority"}}
+    L2 --> C
+    C --> W[worker process]
+```
 
 ```rust
 InsertOpts { queue: "email".into(), priority: 1, ..Default::default() }
@@ -75,18 +84,79 @@ InsertOpts { queue: "email".into(), priority: 1, ..Default::default() }
 await client.insert(SendEmail(to=to, subject=subject), queue="email", priority=1)
 ```
 
-- **You get:** urgent work runs ahead of bulk work on the same workers. Priority aging improves a waiting job's effective priority over time so low-priority work is not starved; see [Job priority and aging](../configuration.md#job-priority-and-aging).
-- **You give up:** jobs at different priorities are ordered by effective priority, not by enqueue time, and priority 1 work shares capacity and rate limit with everything else on the queue.
-- **Contention:** each priority is its own lane, so producers at different priorities do not wait on each other. This is a side effect; priority is not a scaling tool.
+- **You get:** urgent work runs ahead of bulk work on the same workers. Priority aging improves a waiting job's effective priority over time, so low-priority work is not starved; see [Job priority and aging](../configuration.md#job-priority-and-aging).
+- **You give up:** jobs at different priorities are ordered by effective priority, not by enqueue time. Priority 1 work still shares capacity and rate limit with everything else on the queue.
 
-### Enqueue shards
+Producers at different priorities use different lanes, so they do not wait on each other's enqueue lock. That is a side effect: priority is not a scaling tool.
 
-`enqueue_shards` (1 to 64, default 1) splits each priority of one queue into several lanes. It is a per-queue setting stored in `awa.queue_meta`:
+## Idle workers with a backlog: claimers
+
+**Problem:** the queue has a backlog, but the worker process has free worker slots. One claim loop, waiting on a database round trip per claim, cannot hand out jobs as fast as the workers finish them.
+
+Try a larger `claim_batch_size` first, so each claim takes more jobs. If one loop still leaves workers idle, `claimers` (default 1) runs more claim loops for the queue in each worker process. Claimers add no lanes and no policy: the loops share the queue's worker slots and rate limiter and take turns on the same lanes.
+
+```mermaid
+flowchart LR
+    P[producers] --> L1
+    P --> L2
+    subgraph Q["queue: email"]
+        L1["lane · priority 1"]
+        L2["lane · priority 2"]
+    end
+    subgraph W["worker process"]
+        C1["claim loop 1"]
+        C2["claim loop 2"]
+        S[("shared worker slots<br/>and rate limit")]
+    end
+    L1 --> C1
+    L1 --> C2
+    L2 --> C1
+    L2 --> C2
+    C1 --> S
+    C2 --> S
+```
+
+```rust
+.queue("email", QueueConfig { max_workers: 64, claimers: 2, ..Default::default() })
+```
+
+```python
+await client.start([{"name": "email", "max_workers": 64, "claimers": 2}])
+```
+
+- **You get:** more claims in flight when one loop cannot keep the process's workers busy.
+- **You give up:** more database transactions per claimed job. A claim loop that finds a lane's cursor locked by another loop skips that lane, so with few lanes the extra loops mostly skip each other. In measured hot-queue shapes, more claimers made tail latency worse.
+
+## Producers waiting on one lane: enqueue shards
+
+**Problem:** many producers write to one queue at one priority. Each waits for the producer ahead of it to commit and release the lane's enqueue lock, and claims queue behind one claim cursor, while the database still has CPU and I/O to spare.
+
+`enqueue_shards` (1 to 64, default 1) splits each priority of one queue into several lanes. Each shard has its own enqueue lock and claim cursor, and one claim still compares the effective priority of every lane in the queue. The count is a per-queue setting in `awa.queue_meta`:
 
 ```sql
 INSERT INTO awa.queue_meta (queue, enqueue_shards)
-VALUES ('email', 4)
+VALUES ('billing', 2)
 ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
+```
+
+```mermaid
+flowchart LR
+    P[producers] --> H{{"hash key"}}
+    subgraph Q["queue: billing"]
+        L10["p1 · shard 0"]
+        L11["p1 · shard 1"]
+        L20["p2 · shard 0"]
+        L21["p2 · shard 1"]
+    end
+    H --> L10
+    H --> L11
+    H --> L20
+    H --> L21
+    L10 --> C{{"claim: best effective priority"}}
+    L11 --> C
+    L20 --> C
+    L21 --> C
+    C --> W[worker process]
 ```
 
 A job with an `ordering_key` goes to the shard its key hashes to, so jobs with the same key stay in order. Jobs without a key are spread across the shards.
@@ -104,16 +174,42 @@ await client.insert(ChargeAccount(account_id=account_id), queue="billing",
                     ordering_key=f"account-{account_id}")
 ```
 
-- **You get:** more producers and claimers can work on one queue at the same time, because there are more enqueue locks and claim cursors. One claim still compares all of the queue's lanes, so priority works across shards. The queue stays one name with one policy.
+- **You get:** more producers and claimers working on one queue at the same time. The queue keeps one name, one policy and one set of metrics.
 - **You give up:** FIFO across the whole queue. Order holds within a shard, and per key when you pass `ordering_key`. Jobs without a key have no order relative to jobs on other shards.
-- **Policy:** unchanged. Capacity and rate limit still apply to the queue as a whole.
-- **Changing it:** lowering the count is safe at any time; existing jobs on higher shards are still claimed. Raising or lowering it moves keys to different shards, so a key's jobs enqueued before and after the change can run out of order until the older ones drain. A producer process that enqueues directly into queue storage keeps the shard count it first read until it restarts; the SQL insert path reads it on every insert.
+- **Changing it:** lowering the count never strands jobs; workers still claim the ones on higher shards. Changing the count in either direction moves keys to different shards, so a key's jobs enqueued before and after the change can run out of order until the older ones drain. A producer that enqueues directly into queue storage keeps the count it first read until it restarts; the SQL insert path reads it on every insert.
 
-See [Sharding the enqueue head](../configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](../adr/025-sharded-enqueue-heads.md).
+[Scaling a hot queue](scaling-a-hot-queue.md) has measured throughput for each shard count and how to confirm the change helped. See also [Sharding the enqueue head](../configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](../adr/025-sharded-enqueue-heads.md).
 
-### Partitioned queues
+## One slice needs its own limits: partitioned queues
 
-`PartitionedQueue` turns one logical workload into N ordinary queues, named `email`, `email__p1`, `email__p2` and so on, and routes each job to one of them. Routing by key keeps a key's jobs in one partition and sets the job's `ordering_key` too.
+**Problem:** one workload, such as charging customer accounts, needs to be split so each part has its own worker capacity and rate limit. Or one busy account enqueues so much that its jobs take every worker on the queue, and other accounts wait behind it.
+
+`PartitionedQueue` turns one logical workload into N ordinary queues, named `billing`, `billing__p1`, `billing__p2` and so on, and routes each job to one of them. Each partition is a complete queue with its own policy and lanes. Routing by key keeps a key's jobs in one partition and also sets the job's `ordering_key`.
+
+```mermaid
+flowchart LR
+    P[producers] --> R{{"route_by_key"}}
+    subgraph Q0["billing · 16 workers"]
+        L0["lane"]
+    end
+    subgraph Q1["billing__p1 · 16 workers"]
+        L1["lane"]
+    end
+    subgraph Q2["billing__p2 · 16 workers"]
+        L2["lane"]
+    end
+    subgraph Q3["billing__p3 · 16 workers"]
+        L3["lane"]
+    end
+    R --> L0
+    R --> L1
+    R --> L2
+    R --> L3
+    L0 --> W[worker processes]
+    L1 --> W
+    L2 --> W
+    L3 --> W
+```
 
 ```rust
 let billing = PartitionedQueue::new("billing", 4)?;
@@ -136,36 +232,11 @@ await client.insert(ChargeAccount(account_id=account_id),
                     **billing.route_by_key(f"account-{account_id}"))
 ```
 
-- **You get:** N policy domains and N sets of lanes. Each partition has its own capacity, rate limit, claim path, completion stream and metrics, so a burst of one key's work fills one partition rather than the whole workload. `route_by_index` / `route_opts_by_index` spread work round-robin when you do not need per-key order.
-- **You give up:** one queue in the admin views and metrics; operators see N queues. Capacity and rate limit multiply: four partitions with `max_workers: 16` and a rate of 50 per second allow 64 workers and 200 jobs per second per process. Divide the values, or use weighted mode with `global_max_workers`, for a total cap. Retention and dead-letter overrides are keyed by queue name, so set them for each partition. Priority is compared only within a partition.
-- **Changing it:** changing N moves keys to different partitions. Grow workers before producers; shrink producers first and drain the removed partitions before stopping their workers. See [ADR-031](../adr/031-partitioned-queues.md).
+- **You get:** N sets of policy and lanes. Each partition has its own capacity, rate limit, claim path, completion stream and metrics, so a burst of one key's work fills one partition rather than the whole workload. `route_by_index` and `route_opts_by_index` spread work round-robin when you do not need per-key order.
+- **You give up:** one queue in the admin views and metrics; operators see N queues. Keys that share a partition with a busy key still wait behind it. Capacity and rate limit multiply: four partitions with `max_workers: 16` and a rate of 50 per second allow 64 workers and 200 jobs per second in each worker process. Divide the values, or use weighted mode with `global_max_workers`, for a total cap. Retention and dead-letter overrides are keyed by queue name, so set them for each partition. Priority is compared only within a partition.
+- **Changing it:** changing N moves keys to different partitions. Start workers for new partitions before producers route to them; when shrinking, move producers first and drain the removed partitions before stopping their workers. See [ADR-031](../adr/031-partitioned-queues.md).
 
-See [Partitioned queues](../configuration.md#partitioned-queues).
-
-### Claimers
-
-`claimers` (default 1) runs more claim loops for one queue inside one worker process. It adds no lanes and no policy domains: the loops share the queue's worker slots and rate limiter, and take turns on the same lanes.
-
-```rust
-.queue("email", QueueConfig { max_workers: 64, claimers: 2, ..Default::default() })
-```
-
-```python
-await client.start([{"name": "email", "max_workers": 64, "claimers": 2}])
-```
-
-- **You get:** more claim round trips in flight when one loop cannot keep the process's workers busy.
-- **You give up:** more database transactions per claimed job. In measured hot-queue shapes, more claimers made tail latency worse. A larger `claim_batch_size` is usually the better first step.
-
-### Queue stripes
-
-`queue_stripe_count` (Rust `QueueStorageConfig::queue_stripe_count`, Python `queue_storage_queue_stripe_count`, default 1) is a storage setting for the whole fleet. It splits every logical queue `q` into physical queues `q#0` to `q#N-1`, each with its own lanes. Producers and workers must use the same count.
-
-- **You get:** more lanes for every queue, without changing the queue's policy. Capacity and rate limit are configured on the logical queue and shared across its stripes.
-- **You give up:** order across stripes, and priority across stripes: a claim visits the stripes in turn, so a priority 1 job on one stripe can wait while lower-priority jobs on another stripe are claimed. The setting applies to every queue, not just the hot one. Shard counts in `awa.queue_meta` are read per stripe, so a striped queue's shard count is set on each `q#N`.
-- **Routing:** from 0.6.18, a direct queue-storage enqueue puts a job on the stripe its `ordering_key` hashes to, else its unique key's stripe, and rotates other jobs across stripes. Jobs inserted through the SQL insert path, cron and handler follow-ups go to the unstriped `q`, and striped workers claim from `q` as well as its stripes ([#749](https://github.com/hardbyte/awa/issues/749)).
-
-Enqueue shards cover the same need per queue, with per-key order and without fleet-wide agreement on a setting. Stripes are planned for deprecation in 0.7 in favour of shards and partitioned queues ([#752](https://github.com/hardbyte/awa/issues/752)). Do not adopt them for new deployments.
+See [Partitioned queues](../configuration.md#partitioned-queues) for the full API.
 
 ## Decision guide
 
@@ -173,35 +244,33 @@ Enqueue shards cover the same need per queue, with per-key order and without fle
 | --- | --- | --- |
 | Different capacity, rate limit, deadline, retention or DLQ policy for some work | Separate queues | Policy is per queue |
 | A slow or failing kind of work not to hold up another | Separate queues, served by separate worker processes if needed | Separate worker slots and lanes |
-| Urgent work to run ahead of bulk work on the same workers | Priority | More lanes, same policy, ordered by effective priority |
-| More enqueue or claim throughput on one queue, keeping one queue name | `enqueue_shards` | More lanes in the same policy domain |
-| Order per customer, account or order, with more throughput | `enqueue_shards` or `PartitionedQueue`, with an `ordering_key` | Same key, same lane |
-| Capacity or rate limit per slice of one workload, or a busy key not to fill the whole workload | `PartitionedQueue` | Each partition is a full queue |
+| Urgent work to run ahead of bulk work on the same workers | Priority | A lane per priority, same policy, ordered by effective priority |
 | Workers sitting idle while the queue has a backlog | A larger `claim_batch_size`, then `claimers` | More jobs per claim, then more claim loops |
+| More enqueue or claim throughput on one queue, keeping one queue name | `enqueue_shards` | More lanes under the same policy |
+| Order per customer, account or order, with more throughput | `enqueue_shards` or `PartitionedQueue`, with an `ordering_key` | Same key, same lane |
+| Capacity or rate limit per slice of one workload, or a busy key not to fill the whole workload | `PartitionedQueue` | Each partition is a complete queue |
 | Strict FIFO across the whole queue | One queue, one priority, `enqueue_shards = 1` | One lane is the only total order |
 
-Before splitting a queue, check that it is short of lane throughput rather than of workers. A queue whose utilization stays above about 0.8 needs more workers; shards, stripes and claimers add none. See [Scaling a hot queue](scaling-a-hot-queue.md#which-to-try-first) for the order to try them in and how to measure the result.
+Before splitting a queue, check that it is short of lane throughput rather than of workers. A queue whose utilization stays above about 0.8 needs more workers, and shards and claimers add none. [Scaling a hot queue](scaling-a-hot-queue.md#which-to-try-first) gives the order to try the throughput tools in and how to measure the result.
 
 ## What combines
 
 | Combination | Result | Notes |
 | --- | --- | --- |
-| Separate queues + anything | Composes | Each queue is configured independently; shards, partitions and claimers apply per queue |
+| Separate queues + anything | Composes | Each queue is configured independently; priority, claimers, shards and partitions apply per queue |
 | Priority + `enqueue_shards` | Composes | Lanes are `priorities × shards`; a claim compares effective priority across all of them |
 | Priority + `PartitionedQueue` | Composes, priority per partition | A priority 1 job in one partition does not run ahead of a priority 2 job in another |
-| `PartitionedQueue` + `enqueue_shards` | Composes | Each partition can raise its own shard count. Key routing sets `ordering_key`, and the partition and shard hashes are independent, so a key keeps one partition and one shard while a partition's keys still use all its shards |
-| `enqueue_shards` + `ordering_key` | Composes | Per-key FIFO within the queue; `ordering_key` is ignored at one shard |
-| `claimers` + `enqueue_shards` | Composes | More lanes reduce the chance that claim loops skip each other's locked lanes; measure before raising claimers |
+| `claimers` + `enqueue_shards` | Composes | More lanes mean claim loops skip each other's locked lanes less often; measure before raising claimers |
 | `claimers` + `PartitionedQueue` | Composes, multiplies | Claimers apply to each partition, multiplying claim loops and transactions |
-| `queue_stripe_count` + `enqueue_shards` | Overlap | Both add lanes to spread the same locks; lanes become `stripes × priorities × shards`. Prefer shards alone |
-| `queue_stripe_count` + `PartitionedQueue` | Overlap | Every partition is striped too, since stripes apply to every queue |
-| Strict global FIFO + shards, stripes or partitions | Conflict | Each of these gives up order across lanes; only per-key order survives, and only with an `ordering_key` |
+| `enqueue_shards` + `ordering_key` | Composes | Per-key FIFO within the queue; `ordering_key` has no effect at one shard |
+| `PartitionedQueue` + `enqueue_shards` | Composes | Each partition can raise its own shard count. Key routing sets `ordering_key`, and the partition and shard hashes are independent, so a key keeps one partition and one shard while a partition's keys still use all its shards |
+| Strict global FIFO + shards or partitions | Conflict | Both give up order across lanes; only per-key order survives, and only with an `ordering_key` |
 
-Rate limit and capacity differ by tool. With separate queues and `PartitionedQueue`, each queue or partition has its own `max_workers` and `rate_limit`. With priority, `enqueue_shards`, claimers and stripes, the queue keeps one `max_workers` and one `rate_limit` across all its lanes. In every case the values apply per worker process.
+Rate limit and capacity differ by tool. With separate queues and `PartitionedQueue`, each queue or partition has its own `max_workers` and `rate_limit`. With priority, claimers and `enqueue_shards`, the queue keeps one `max_workers` and one `rate_limit` across all its lanes. In every case the values apply per worker process.
 
 ## Read next
 
 - [Lanes and claiming](lanes-and-claiming.md): how a lane orders jobs, and what enqueue and claim lock.
-- [Scaling a hot queue](scaling-a-hot-queue.md): which lever to try first, and how to measure it.
+- [Scaling a hot queue](scaling-a-hot-queue.md): which throughput tool to try first for one busy queue, and how to measure it.
 - [Queue configuration](../configuration.md#queue-configuration): every `QueueConfig` field, in Rust and Python.
 - [ADR-025: sharded enqueue heads](../adr/025-sharded-enqueue-heads.md) and [ADR-031: partitioned queues](../adr/031-partitioned-queues.md): design records.
