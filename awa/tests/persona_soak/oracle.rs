@@ -358,7 +358,7 @@ impl Oracle {
         let schema = schema(&self.shared);
         let mut threshold = self.shared.config.promotion_overdue;
         if self.shared.chaos_active() {
-            threshold += self.shared.config.chaos_slack;
+            threshold += self.shared.chaos_slack();
         }
         let rows: Result<Vec<(i64, String, f64)>, _> = sqlx::query_as(&format!(
             "SELECT job_id, queue, extract(epoch FROM now() - run_at)::float8
@@ -447,7 +447,7 @@ impl Oracle {
         let now = self.shared.now_ms();
         let mut window = self.shared.config.stall_window;
         if self.shared.chaos_active() {
-            window += self.shared.config.chaos_slack;
+            window += self.shared.chaos_slack();
         }
         let mut candidates = Vec::new();
         for (queue_name, backlog, cursor) in rows {

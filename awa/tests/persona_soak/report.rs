@@ -134,6 +134,40 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     }
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "## Memory");
+    match shared.memory.verdict() {
+        Some(verdict) => {
+            let _ = writeln!(
+                out,
+                "- resident: start {:.0} MiB, end {:.0} MiB, peak {:.0} MiB ([memory.csv](memory.csv))",
+                verdict.start_rss_mib, verdict.end_rss_mib, verdict.peak_hwm_mib
+            );
+            let _ = match verdict.slope_mib_per_100k {
+                Some(slope) => writeln!(
+                    out,
+                    "- growth after warm-up: {slope:.1} MiB per 100k executions over {} executions (limit {:.1})",
+                    verdict.executions_evaluated, verdict.limit_mib_per_100k
+                ),
+                None => writeln!(
+                    out,
+                    "- growth after warm-up: not evaluated: {}",
+                    verdict.not_evaluated.as_deref().unwrap_or("no slope")
+                ),
+            };
+            if let Some(rise) = verdict.stall_rise_mib {
+                let _ = writeln!(
+                    out,
+                    "- rise while completions were stalled: {rise:.0} MiB (limit {:.0})",
+                    verdict.stall_limit_mib
+                );
+            }
+        }
+        None => {
+            let _ = writeln!(out, "- not sampled");
+        }
+    }
+    let _ = writeln!(out);
+
     let findings = shared.findings.lock().expect("findings");
     let _ = writeln!(out, "## Findings, not fatal ({})", findings.len());
     for finding in findings.iter() {
@@ -214,10 +248,15 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "personas_stats": per_persona,
         "abandon": shared.abandon.to_json(),
         "run": { "counters": shared.run.counters(), "samples": shared.run.summaries() },
+        "memory": shared.memory.verdict(),
         "violations": violations,
         "findings": shared.findings.lock().expect("findings").clone(),
         "timeline": timeline,
     });
+    std::fs::write(
+        dir.join("memory.csv"),
+        super::memory::csv(&shared.memory.samples()),
+    )?;
     std::fs::write(
         dir.join("report.json"),
         serde_json::to_string_pretty(&summary).unwrap_or_default(),

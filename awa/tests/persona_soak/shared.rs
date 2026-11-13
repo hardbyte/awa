@@ -135,6 +135,8 @@ pub struct Shared {
     pub shardops: super::shard_oracle::ShardOpsState,
     /// State of the claim-and-abandon persona and the checks that go with it.
     pub abandon: super::abandon_oracle::AbandonState,
+    /// Resident memory of this process over the run, and the growth gate's verdict.
+    pub memory: super::memory::MemoryLog,
     chaos_until_ms: AtomicI64,
 }
 
@@ -166,6 +168,7 @@ impl Shared {
             fleets: Mutex::new(HashMap::new()),
             shardops: Default::default(),
             abandon: Default::default(),
+            memory: Default::default(),
             chaos_until_ms: AtomicI64::new(0),
         })
     }
@@ -196,6 +199,14 @@ impl Shared {
     pub fn chaos_window(&self, duration: std::time::Duration) {
         let until = self.now_ms() + duration.as_millis() as i64;
         self.chaos_until_ms.fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// Recovery time the time-based checks allow during a disruptive window: the configured
+    /// slack, plus the completion stall while one has been run, since claiming and promotion
+    /// wait on the stalled tables for its whole length.
+    pub fn chaos_slack(&self) -> std::time::Duration {
+        let stalled = self.memory.stalled_for();
+        self.config.chaos_slack + stalled
     }
 
     pub fn chaos_active(&self) -> bool {
