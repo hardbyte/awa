@@ -4584,7 +4584,15 @@ impl QueueStorage {
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        let mut install_tx = pool.begin().await.map_err(map_sqlx_error)?;
+        // The install touches every substrate relation and compiles the claim
+        // functions, and the backend that runs it keeps those relation, plan and
+        // function caches for as long as it lives. Run it on a connection taken
+        // out of the pool and close it afterwards, so a pooled backend does not
+        // carry install-sized caches for the rest of the process. Detach rather
+        // than mark the connection to close on drop: the close then completes
+        // inline even if the caller drops its runtime right after (see #408).
+        let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?.detach();
+        let mut install_tx = install_conn.begin().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
@@ -4878,24 +4886,29 @@ impl QueueStorage {
         }
         .await;
 
-        match install_result {
-            Ok(()) => {
-                install_tx.commit().await.map_err(map_sqlx_error)?;
-                // Best-effort (ADR-049): empty partitions get their tag
-                // index on the spot; populated ones wait for the migrator's
-                // `awa storage build-tag-index`.
-                if let Ok(mut conn) = pool.acquire().await {
-                    if let Err(error) = crate::tag_index::index_empty_partitions(&mut conn).await {
+        let outcome = match install_result {
+            Ok(()) => match install_tx.commit().await {
+                Ok(()) => {
+                    // Best-effort (ADR-049): empty partitions get their tag
+                    // index on the spot; populated ones wait for the migrator's
+                    // `awa storage build-tag-index`. Same connection: it walks
+                    // every partition too.
+                    if let Err(error) =
+                        crate::tag_index::index_empty_partitions(&mut install_conn).await
+                    {
                         tracing::warn!(%error, "Skipped creating tag indexes");
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
+                Err(err) => Err(map_sqlx_error(err)),
+            },
             Err(err) => {
                 let _ = install_tx.rollback().await;
                 Err(err)
             }
-        }
+        };
+        let _ = sqlx::Connection::close(install_conn).await;
+        outcome
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.activate_backend")]

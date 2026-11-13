@@ -522,14 +522,26 @@ async fn run_migration_transaction(
     options: &MigrateOptions,
     lock_key: i64,
 ) -> Result<i32, AwaError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(lock_key)
-        .execute(&mut *tx)
-        .await?;
-    let version_before = apply_migrations(&mut tx, options).await?;
-    tx.commit().await?;
-    Ok(version_before)
+    // The backend that applies the migrations keeps relation, plan and
+    // function caches for every object they touched for as long as it lives
+    // (tens of MB once the queue-storage substrate is installed). Take the
+    // connection out of the pool and close it afterwards so no pooled backend
+    // carries them; detached for the same reason as
+    // [`warm_admin_metadata_cache`].
+    let mut conn = pool.acquire().await?.detach();
+    let result: Result<i32, AwaError> = async {
+        let mut tx = conn.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+        let version_before = apply_migrations(&mut tx, options).await?;
+        tx.commit().await?;
+        Ok(version_before)
+    }
+    .await;
+    let _ = conn.close().await;
+    result
 }
 
 /// The migration that makes lane sequences belong to the schema owner.
