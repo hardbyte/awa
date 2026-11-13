@@ -293,6 +293,10 @@
          <lastmod>2026-11-13</lastmod>
     </url>
     <url>
+         <loc>https://hardbyte.github.io/awa/adr/052-runtime-halt/</loc>
+         <lastmod>2026-11-13</lastmod>
+    </url>
+    <url>
          <loc>https://hardbyte.github.io/awa/adr/bench/019-queue-storage-validation-2026-04-19/</loc>
          <lastmod>2026-11-13</lastmod>
     </url>
@@ -350,6 +354,10 @@
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/design/queue-storage-efficiency/</loc>
+         <lastmod>2026-11-13</lastmod>
+    </url>
+    <url>
+         <loc>https://hardbyte.github.io/awa/design/runtime-control-source-audit/</loc>
          <lastmod>2026-11-13</lastmod>
     </url>
     <url>
