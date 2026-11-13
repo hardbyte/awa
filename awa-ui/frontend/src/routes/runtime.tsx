@@ -225,19 +225,24 @@ export function RuntimePage() {
       {/* fetchStorage returns null on a 404 (backend predates /api/storage),
           so those deployments stay quiet. Any other failure surfaces as a
           small error card so operators don't lose rollout-readiness
-          visibility when the endpoint is broken rather than absent. */}
-      {storageQuery.isError ? (
+          visibility when the endpoint is broken rather than absent. A failed
+          refresh keeps the last report, shown inside the error card so it
+          isn't read as current. */}
+      {storageQuery.error ? (
         <Card>
           <CardHeader
             title="Storage transition"
             description="Readiness gates for rolling forward a prepared storage engine"
           />
-          <CardContent>
-            <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm text-danger-subtle-fg">
-              Couldn't load storage transition state from /api/storage.
-              Rollout-readiness gates can't be evaluated until the endpoint
-              responds successfully.
+          <CardContent className="space-y-3">
+            <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm text-danger-subtle-fg" role="alert">
+              {storageQuery.data
+                ? "Couldn't refresh storage transition state from /api/storage. The last report below is out of date; rollout-readiness gates can't be evaluated until the endpoint responds successfully."
+                : "Couldn't load storage transition state from /api/storage. Rollout-readiness gates can't be evaluated until the endpoint responds successfully."}
             </div>
+            {shouldShowStorageTransitionCard(storageQuery.data) && storageQuery.data && (
+              <StorageTransitionCard report={storageQuery.data} />
+            )}
           </CardContent>
         </Card>
       ) : (
