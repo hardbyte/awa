@@ -293,6 +293,10 @@
          <lastmod>2026-11-13</lastmod>
     </url>
     <url>
+         <loc>https://hardbyte.github.io/awa/adr/051-maintenance-recovery-loop/</loc>
+         <lastmod>2026-11-13</lastmod>
+    </url>
+    <url>
          <loc>https://hardbyte.github.io/awa/adr/052-runtime-halt/</loc>
          <lastmod>2026-11-13</lastmod>
     </url>
