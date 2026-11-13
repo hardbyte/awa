@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { refreshAll, getReadStatus, subscribeReadStatus, observationPolicy } from "@/lib/observation/coordinator";
+import { useManagedQuery } from "@/hooks/use-managed-query";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { Outlet, useRouterState, useNavigate } from "@tanstack/react-router";
 import {
   Link as AriaLink,
   RouterProvider as AriaRouterProvider,
 } from "react-aria-components";
-import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsFetching, useQuery } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import {
   fetchCapabilities,
@@ -31,7 +33,6 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 
 /**
  * Koru-river logo — a Maori koru (unfurling fern spiral) with
@@ -148,7 +149,6 @@ function ThemeToggle() {
 /** Refresh button with live indicator — click to force refresh all queries */
 function RefreshControl() {
   const isFetching = useIsFetching();
-  const queryClient = useQueryClient();
   const fetching = isFetching > 0;
 
   return (
@@ -156,7 +156,7 @@ function RefreshControl() {
       intent="plain"
       size="sq-sm"
       aria-label="Refresh data"
-      onPress={() => void queryClient.invalidateQueries()}
+      onPress={refreshAll}
       className="relative"
     >
       <svg
@@ -354,7 +354,6 @@ export function Shell() {
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;
   const navigate = useNavigate();
-  const poll = usePollInterval();
 
   // Routes react-aria-components Link clicks through TanStack Router so sidebar
   // nav is client-side. Modifier-key handling (cmd/ctrl/shift-click → new tab)
@@ -367,8 +366,10 @@ export function Shell() {
   const capabilitiesQuery = useQuery({
     queryKey: ["capabilities"],
     queryFn: fetchCapabilities,
+    enabled: false, refetchOnWindowFocus: false, refetchOnReconnect: false, retry: false,
     staleTime: 60_000,
   });
+  const readStatus = useSyncExternalStore(subscribeReadStatus, getReadStatus, getReadStatus);
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
   // Instance identity (#437): the UI is single-backend by design; when the
@@ -385,23 +386,19 @@ export function Shell() {
   }, [capabilitiesQuery.isSuccess, instanceName, instanceColor]);
 
   // Cluster status for the sidebar footer; poll-aligned with other pages.
-  const runtimeQuery = useQuery({
+  const runtimeQuery = useManagedQuery({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
   // Authoritative engine/transition state for the chip label. Shares the
   // runtime page's query key and fetch shape so visiting /runtime dedupes
   // into one /api/storage poll instead of two (the history param costs
   // nothing server-side). Backends predating /api/storage resolve to null;
   // stop polling once known-absent.
-  const storageQuery = useQuery({
+  const storageQuery = useManagedQuery({
     queryKey: ["storage", "with-history"],
     queryFn: () => fetchStorage({ history: true }),
-    refetchInterval: (query) =>
-      query.state.data === null ? false : poll.interval,
-    staleTime: poll.staleTime,
+
     retry: false,
   });
 
@@ -505,6 +502,8 @@ export function Shell() {
         </header>
 
         <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+          <div className="text-xs text-muted-fg">Polling; scheduled reconciliation maximum: {observationPolicy.reconcileMaxMs / 1000}s.</div>
+          {readStatus && <div role="status" className="text-sm text-muted-fg">{readStatus}</div>}
           {showReadOnlyBanner && (
             <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-fg">
               Connected to a read-only database. Dashboard queries work, but admin actions are disabled.

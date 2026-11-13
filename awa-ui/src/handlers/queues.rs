@@ -1,27 +1,21 @@
 use axum::extract::{Path, State};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
 use awa_model::admin;
 
-use crate::cache::CacheError;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-pub async fn list_queues(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<admin::QueueOverview>>, ApiError> {
+pub async fn list_queues(State(state): State<AppState>) -> Result<Response, ApiError> {
     let pool = state.pool.clone();
     let stats = state
         .cache
         .queues
-        .try_get_with((), async {
-            admin::queue_overviews(&pool)
-                .await
-                .map_err(CacheError::from)
-        })
+        .get(|| admin::queue_overviews(&pool))
         .await?;
-    Ok(Json(stats))
+    Ok(stats.into_response())
 }
 
 pub async fn get_queue(

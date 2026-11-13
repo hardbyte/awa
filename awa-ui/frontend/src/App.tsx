@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+import { startObservation } from "./lib/observation/coordinator";
 import {
   createRouter,
   createRootRoute,
@@ -119,6 +121,7 @@ import { Toaster } from "@/components/ui/toast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 export function App() {
+  useEffect(startObservation, []);
   return (
     <ErrorBoundary>
     <QueryClientProvider client={queryClient}>

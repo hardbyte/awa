@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
   effectiveEngine,
@@ -28,7 +28,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 import {
   formatDateTime,
   formatSnapshotInterval,
@@ -77,7 +76,6 @@ function EngineCaption({
 }
 
 export function RuntimePage() {
-  const poll = usePollInterval();
   const navigate = useNavigate();
   const search = useSearch({ strict: false }) as { lifecycle?: string };
   const lifecycle: LifecycleFilter =
@@ -92,32 +90,28 @@ export function RuntimePage() {
       replace: true,
     });
   };
-  const runtimeQuery = useQuery<RuntimeOverview>({
+  const runtimeQuery = useManagedQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
-  const queueRuntimeQuery = useQuery<QueueRuntimeSummary[]>({
+  const queueRuntimeQuery = useManagedQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   // Optional: backends before 0.5.5-alpha return 404 for /storage, in which
   // case fetchStorage resolves to null and the card simply doesn't render.
   // Once we've seen a null response the endpoint is known-absent for this
   // session — stop polling so we don't hammer it with 404s every interval.
-  const storageQuery = useQuery<StorageStatusReport | null>({
+  const storageQuery = useManagedQuery<StorageStatusReport | null>({
     queryKey: ["storage", "with-history"],
     // The card accumulates per-epoch backlog history client-side (Option
     // A from issue #297). The `?history=true` query param is still set
     // so the server-side contract is engaged — it makes future server
     // ring-buffer rollouts a no-op for clients that already opted in.
     queryFn: () => fetchStorage({ history: true }),
-    refetchInterval: (query) =>
-      query.state.data === null ? false : poll.interval,
-    staleTime: poll.staleTime,
+
     retry: false,
   });
 
@@ -231,25 +225,27 @@ export function RuntimePage() {
       {/* fetchStorage returns null on a 404 (backend predates /api/storage),
           so those deployments stay quiet. Any other failure surfaces as a
           small error card so operators don't lose rollout-readiness
-          visibility when the endpoint is broken rather than absent. */}
-      {storageQuery.isError ? (
+          visibility when the endpoint is broken rather than absent. A failed
+          refresh keeps the last report below the error card, marked out of
+          date; the report card keeps its position so its backlog samples
+          survive the failure. */}
+      {storageQuery.error && (
         <Card>
           <CardHeader
             title="Storage transition"
             description="Readiness gates for rolling forward a prepared storage engine"
           />
           <CardContent>
-            <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm text-danger-subtle-fg">
-              Couldn't load storage transition state from /api/storage.
-              Rollout-readiness gates can't be evaluated until the endpoint
-              responds successfully.
+            <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm text-danger-subtle-fg" role="alert">
+              {storageQuery.data
+                ? "Couldn't refresh storage transition state from /api/storage. The last report below is out of date; rollout-readiness gates can't be evaluated until the endpoint responds successfully."
+                : "Couldn't load storage transition state from /api/storage. Rollout-readiness gates can't be evaluated until the endpoint responds successfully."}
             </div>
           </CardContent>
         </Card>
-      ) : (
-        shouldShowStorageTransitionCard(storageQuery.data) && storageQuery.data && (
-          <StorageTransitionCard report={storageQuery.data} />
-        )
+      )}
+      {shouldShowStorageTransitionCard(storageQuery.data) && storageQuery.data && (
+        <StorageTransitionCard report={storageQuery.data} />
       )}
 
       <Card>

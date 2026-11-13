@@ -1,6 +1,6 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useState } from "react";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -42,13 +42,13 @@ export function QueueDetailPage() {
   const readOnly = useReadOnly();
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
-  const queueQuery = useQuery({
+  const queueQuery = useManagedQuery({
     queryKey: ["queue", queueName],
     queryFn: () => fetchQueue(queueName),
     enabled: !!queueName,
   });
 
-  const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
+  const runtimeQuery = useManagedQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
     enabled: !!queueName,
@@ -92,7 +92,7 @@ export function QueueDetailPage() {
   if (queueQuery.isLoading) {
     return <p className="text-sm text-muted-fg">Loading...</p>;
   }
-  if (queueQuery.error) {
+  if (queueQuery.error && queueQuery.data === undefined) {
     return (
       <p className="text-sm text-danger">Error: {String(queueQuery.error)}</p>
     );

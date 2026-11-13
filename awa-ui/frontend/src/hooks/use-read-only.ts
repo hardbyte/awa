@@ -12,6 +12,7 @@ export function useReadOnly(): boolean {
   const capabilitiesQuery = useQuery({
     queryKey: ["capabilities"],
     queryFn: fetchCapabilities,
+    enabled: false, refetchOnWindowFocus: false, refetchOnReconnect: false, retry: false,
     staleTime: 60_000,
   });
 

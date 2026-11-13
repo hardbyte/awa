@@ -1,5 +1,5 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import {
   fetchStats,
@@ -31,7 +31,6 @@ import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
 import { timeAgo } from "@/lib/time";
 import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 
 /** Background tint per state for counter cards */
 const STATE_CARD_BG: Record<string, string> = {
@@ -47,23 +46,19 @@ const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_ex
 
 export function DashboardPage() {
   const navigate = useNavigate();
-  const poll = usePollInterval();
 
-  const statsQuery = useQuery<StateCounts>({
+  const statsQuery = useManagedQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   // Timeseries powers the inline sparklines on the state counter cards.
   // Returns an empty array on pre-v10 deployments / seed-free databases, in
   // which case Sparkline renders an empty slot of its reserved size so the
   // card layout doesn't jump.
-  const timeseriesQuery = useQuery<TimeseriesBucket[]>({
+  const timeseriesQuery = useManagedQuery<TimeseriesBucket[]>({
     queryKey: ["stats", "timeseries", 60],
     queryFn: () => fetchTimeseries(60),
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
   /** Pivot the flat timeseries response into a per-state numeric series
@@ -97,22 +92,19 @@ export function DashboardPage() {
     return result;
   }, [timeseriesQuery.data]);
 
-  const queuesQuery = useQuery<QueueStats[]>({
+  const queuesQuery = useManagedQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
-  const failedQuery = useQuery<JobRow[]>({
+  const failedQuery = useManagedQuery<JobRow[]>({
     queryKey: ["jobs", { state: "failed", limit: 10 }],
     queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
-  const runtimeQuery = useQuery<RuntimeOverview>({
+  const runtimeQuery = useManagedQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const completedPerHour = queuesQuery.data
