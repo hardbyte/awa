@@ -125,10 +125,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
-- **Listing is faster on queue storage.** One query narrows candidates with
-  only the predicates a filter sets and reads only the storage its states can
-  reach, and a page of jobs loads in one batched read instead of one round
-  trip per job. Previously a listing query bound every field as
+- **Listing is faster on queue storage.** Candidate queries write only the
+  predicates a filter sets and read only the storage its states can reach,
+  one branch per read phase so each phase releases its partition locks, and a
+  page of jobs loads in one batched read instead of one round trip per job. Previously a listing query bound every field as
   `($n IS NULL OR …)` and degraded to minutes once Postgres switched it to a
   generic plan; at 50,000 retained jobs a rare-tag lookup now takes tens of
   milliseconds instead of more than two minutes.

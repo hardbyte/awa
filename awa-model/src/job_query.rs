@@ -649,14 +649,13 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
     branches
 }
 
-/// The candidate statement for queue storage, or `None` when no branch can
-/// hold a match.
-fn queue_storage_statement(
+/// The branches that can hold a match, with the states `filter` selects
+/// among `eligible`, or `None` when no branch can.
+fn reachable_branches(
     schema: &str,
     filter: &JobFilter,
     eligible: &[JobState],
-    window: Window,
-) -> Option<Statement> {
+) -> Option<(Vec<JobState>, Vec<Branch>)> {
     let states = filter.effective_states(eligible);
     let branches: Vec<Branch> = queue_storage_branches(schema, filter)
         .into_iter()
@@ -668,21 +667,13 @@ fn queue_storage_statement(
         })
         .filter(|branch| filter.tags.is_empty() || branch.payload.is_some())
         .collect();
-    if branches.is_empty() {
-        return None;
-    }
-    let mut statement = Statement {
-        sql: String::new(),
-        binds: Vec::new(),
-    };
-    let needs_cursors = branches
-        .iter()
-        .any(|branch| branch.from.contains("claim_cursors"));
-    let parts: Vec<String> = branches
-        .iter()
-        .map(|branch| branch.compile(&mut statement, filter, &states, window))
-        .collect();
-    let cursors = if needs_cursors {
+    (!branches.is_empty()).then_some((states, branches))
+}
+
+/// The `WITH` prefix a statement needs when any of `branches` reads lane
+/// cursors, or nothing.
+fn cursor_prefix<'a>(schema: &str, mut branches: impl Iterator<Item = &'a Branch>) -> String {
+    if branches.any(|branch| branch.from.contains("claim_cursors")) {
         // One cursor read per lane: the function is VOLATILE and would
         // otherwise run once per ready row (#422).
         format!(
@@ -693,9 +684,73 @@ fn queue_storage_statement(
         )
     } else {
         String::new()
+    }
+}
+
+/// The count statement for queue storage, or `None` when no branch can hold
+/// a match.
+fn queue_storage_statement(
+    schema: &str,
+    filter: &JobFilter,
+    eligible: &[JobState],
+    window: Window,
+) -> Option<Statement> {
+    let (states, branches) = reachable_branches(schema, filter, eligible)?;
+    let mut statement = Statement {
+        sql: String::new(),
+        binds: Vec::new(),
     };
+    let parts: Vec<String> = branches
+        .iter()
+        .map(|branch| branch.compile(&mut statement, filter, &states, window))
+        .collect();
+    let cursors = cursor_prefix(schema, branches.iter());
     statement.sql = finish(cursors, parts.join(" UNION ALL "), window, &mut statement);
     Some(statement)
+}
+
+/// One candidate statement per branch for a windowed read, or `None` when no
+/// branch can hold a match. Each returns that branch's first `limit` ids in
+/// window order; [`merge_window`] combines them.
+///
+/// Run as separate phases, each branch's partitions are locked only while it
+/// reads them (see [`fetch_phases`]), rather than every retained partition of
+/// every branch for the whole read, which prune's exclusive locks would wait
+/// behind.
+fn queue_storage_phases(
+    schema: &str,
+    filter: &JobFilter,
+    eligible: &[JobState],
+    window: Window,
+) -> Option<Vec<Statement>> {
+    let (states, branches) = reachable_branches(schema, filter, eligible)?;
+    Some(
+        branches
+            .iter()
+            .map(|branch| {
+                let mut statement = Statement {
+                    sql: String::new(),
+                    binds: Vec::new(),
+                };
+                let part = branch.compile(&mut statement, filter, &states, window);
+                let cursors = cursor_prefix(schema, std::iter::once(branch));
+                statement.sql = format!("{cursors}SELECT job_id FROM {part} AS phase");
+                statement
+            })
+            .collect(),
+    )
+}
+
+/// The distinct ids across `phases`, in `window` order, up to its limit:
+/// what one `UNION ALL` of the branches grouped, ordered and limited would
+/// return, since each phase already holds its branch's first `limit` ids.
+fn merge_window(phases: Vec<Vec<i64>>, window: Window) -> Vec<i64> {
+    let ids: std::collections::BTreeSet<i64> = phases.into_iter().flatten().collect();
+    match window {
+        Window::NewestFirst { limit, .. } => ids.into_iter().rev().take(limit as usize).collect(),
+        Window::OldestFirst { limit, .. } => ids.into_iter().take(limit as usize).collect(),
+        Window::Unbounded { .. } => ids.into_iter().collect(),
+    }
 }
 
 /// Wraps the branches: candidate ids de-duplicated in window order, or the
@@ -758,7 +813,7 @@ pub(crate) const CANONICAL_REFUSAL: &str =
     "finding jobs by filter requires an active queue_storage backend; \
      the canonical engine is deprecated (ADR-037)";
 
-/// The candidate statement, or `None` when no job can match.
+/// The count statement, or `None` when no job can match.
 async fn statement(
     pool: &PgPool,
     filter: &JobFilter,
@@ -774,16 +829,89 @@ async fn statement(
     )
 }
 
-/// Run a candidate or count statement. Interactive reads pass the time left
-/// in their [`ReadBudget`]; a batch operation's scan passes `None` and runs
-/// without one, as it did before ADR-049, because failing it fails the
-/// operation.
+/// Candidate ids for a windowed read, in window order, with the store to
+/// load them from; `None` when no job can match.
+async fn candidates(
+    pool: &PgPool,
+    filter: &JobFilter,
+    eligible: &[JobState],
+    window: Window,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<(QueueStorage, Vec<i64>)>, AwaError> {
+    let Some(store) = active_store(pool).await? else {
+        return Ok(None);
+    };
+    let Some(phases) = queue_storage_phases(store.schema(), filter, eligible, window) else {
+        return Ok(None);
+    };
+    let ids = merge_window(fetch_phases(pool, phases, timeout).await?, window);
+    Ok(Some((store, ids)))
+}
+
+/// Run each candidate phase in one `REPEATABLE READ` snapshot, so a job that
+/// moves between branches mid-read is still seen in one of them. Rolling
+/// back to a savepoint after each phase releases the locks that phase took
+/// on its partitions while keeping the snapshot.
+async fn fetch_phases(
+    pool: &PgPool,
+    phases: Vec<Statement>,
+    timeout: Option<std::time::Duration>,
+) -> Result<Vec<Vec<i64>>, AwaError> {
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+    let mut tx = sqlx::Connection::begin_with(
+        &mut *begin_guard.connection,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .await
+    .map_err(map_sqlx_error)?;
+    begin_guard.begin_pending = false;
+    plan_reads(&mut tx, false).await?;
+    if let Some(timeout) = timeout {
+        set_statement_timeout(&mut tx, timeout).await?;
+    }
+    let mut results = Vec::with_capacity(phases.len());
+    for phase in phases {
+        sqlx::query("SAVEPOINT awa_job_query_phase")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        results.push(
+            phase
+                .query_scalar()
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?,
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT awa_job_query_phase")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        sqlx::query("RELEASE SAVEPOINT awa_job_query_phase")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+    }
+    tx.commit().await.map_err(map_sqlx_error)?;
+    drop(begin_guard);
+    Ok(results)
+}
+
+/// Run a count statement. Interactive reads pass the time left in their
+/// [`ReadBudget`]; a batch operation's preview count passes `None`.
 async fn fetch_scalars(
     pool: &PgPool,
     statement: Statement,
     timeout: Option<std::time::Duration>,
 ) -> Result<Vec<i64>, AwaError> {
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+    let mut tx = sqlx::Connection::begin(&mut *begin_guard.connection)
+        .await
+        .map_err(map_sqlx_error)?;
+    begin_guard.begin_pending = false;
     plan_reads(&mut tx, false).await?;
     if let Some(timeout) = timeout {
         set_statement_timeout(&mut tx, timeout).await?;
@@ -794,6 +922,7 @@ async fn fetch_scalars(
         .await
         .map_err(map_sqlx_error)?;
     tx.commit().await.map_err(map_sqlx_error)?;
+    drop(begin_guard);
     Ok(rows)
 }
 
@@ -961,11 +1090,17 @@ async fn find_within(
             },
             Window::Unbounded { .. } => unreachable!("rejected above"),
         };
-        let Some((store, statement)) = statement(pool, filter, eligible, cursor_window).await?
+        let Some((store, ids)) = candidates(
+            pool,
+            filter,
+            eligible,
+            cursor_window,
+            Some(budget.remaining()?),
+        )
+        .await?
         else {
             return Ok(Vec::new());
         };
-        let ids = fetch_scalars(pool, statement, Some(budget.remaining()?)).await?;
         let exhausted = (ids.len() as i64) < fetch;
         for (job, dead_lettered) in load(pool, &store, &ids, budget.remaining()?).await? {
             if effective.contains(&job.state) && filter.matches(&job, dead_lettered) {
@@ -1044,10 +1179,9 @@ pub(crate) async fn max_id(
         before_id: None,
         limit: 1,
     };
-    let Some((_, statement)) = statement(pool, filter, eligible, window).await? else {
-        return Ok(None);
-    };
-    Ok(fetch_scalars(pool, statement, None).await?.first().copied())
+    Ok(candidates(pool, filter, eligible, window, None)
+        .await?
+        .and_then(|(_, ids)| ids.first().copied()))
 }
 
 /// Candidate ids for a batch scan's next chunk, oldest first. The runner
@@ -1066,10 +1200,10 @@ pub(crate) async fn scan_ids(
         max_id,
         limit,
     };
-    let Some((_, statement)) = statement(pool, filter, eligible, window).await? else {
-        return Ok(Vec::new());
-    };
-    fetch_scalars(pool, statement, None).await
+    Ok(candidates(pool, filter, eligible, window, None)
+        .await?
+        .map(|(_, ids)| ids)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -1092,8 +1226,9 @@ mod tests {
         assert!(err.to_string().contains("narrow the filter"), "{err}");
     }
 
+    /// Every phase of a listing read, joined for inspection.
     fn sql(filter: &JobFilter, eligible: &[JobState]) -> Option<String> {
-        queue_storage_statement(
+        queue_storage_phases(
             "awa",
             filter,
             eligible,
@@ -1102,7 +1237,49 @@ mod tests {
                 limit: 10,
             },
         )
-        .map(|statement| statement.sql)
+        .map(|phases| {
+            phases
+                .into_iter()
+                .map(|phase| phase.sql)
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ")
+        })
+    }
+
+    #[test]
+    fn phases_merge_into_one_window() {
+        let phases = vec![vec![9, 7, 3], vec![8, 7], vec![], vec![10, 2]];
+        let newest = Window::NewestFirst {
+            before_id: None,
+            limit: 4,
+        };
+        assert_eq!(merge_window(phases.clone(), newest), vec![10, 9, 8, 7]);
+        let oldest = Window::OldestFirst {
+            after_id: 0,
+            max_id: 10,
+            limit: 3,
+        };
+        assert_eq!(merge_window(phases, oldest), vec![2, 3, 7]);
+    }
+
+    #[test]
+    fn only_the_available_phase_reads_lane_cursors() {
+        let phases = queue_storage_phases(
+            "awa",
+            &JobFilter::new(),
+            &ALL_STATES,
+            Window::NewestFirst {
+                before_id: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        let with_cursors: Vec<_> = phases
+            .iter()
+            .filter(|phase| phase.sql.starts_with("WITH claim_cursors"))
+            .collect();
+        assert_eq!(with_cursors.len(), 1);
+        assert!(with_cursors[0].sql.contains("queue_ring_slots"));
     }
 
     #[test]
