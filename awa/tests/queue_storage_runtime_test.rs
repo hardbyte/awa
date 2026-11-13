@@ -24034,3 +24034,115 @@ async fn test_prune_brin_fsm_baseline_follows_block_size() {
         );
     }
 }
+
+/// Claim latency and throughput with `AWA_BENCH_CLAIM_WORKERS` workers that
+/// each claim one deadline-backed job and complete it, for
+/// `AWA_BENCH_CLAIM_SECS` seconds. `AWA_BENCH_CLAIM_BODY=released` swaps in
+/// the claim function body 0.6.17 installs (a cached plan, no retire barrier,
+/// no live-slot filter) to compare against the current one (#721).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark"]
+async fn bench_claim_latency_by_claim_body() {
+    let workers: usize = std::env::var("AWA_BENCH_CLAIM_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    let secs: u64 = std::env::var("AWA_BENCH_CLAIM_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(15);
+    let body = std::env::var("AWA_BENCH_CLAIM_BODY").unwrap_or_else(|_| "current".into());
+    let released = body == "released";
+    let (_db_guard, pool) = setup_pool(workers as u32 + 4).await;
+    let schema = "awa_qs_bench_claim_body";
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    let queue = "qs_bench_claim_body";
+    for _ in 0..40 {
+        store.enqueue_batch(&pool, queue, 2, 5_000).await.unwrap();
+    }
+    if released {
+        let current: String = sqlx::query_scalar(&format!(
+            "SELECT pg_get_functiondef('{schema}.claim_ready_runtime(text,bigint,float8,float8)'::regprocedure)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let start = current
+            .find("            -- The slot queue prune retires next.")
+            .unwrap();
+        let end_marker = "                ORDER BY slots.slot\n            );\n\n";
+        let end = start + current[start..].find(end_marker).unwrap() + end_marker.len();
+        let old = format!("{}{}", &current[..start], &current[end..])
+            .replace(
+                "later_segment.ready_slot = ANY(v_live_slots)\n                      AND ",
+                "",
+            )
+            .replace(
+                "segment.ready_slot = ANY(v_live_slots)\n                      AND ",
+                "",
+            )
+            .replace(" SET plan_cache_mode TO 'force_custom_plan'\n", "");
+        assert!(!old.contains("ANY(v_live_slots)") && !old.contains("plan_cache_mode"));
+        assert!(old.contains("WHERE later_segment.ready_slot = segment.ready_slot"));
+        sqlx::raw_sql(&old).execute(&pool).await.unwrap();
+    }
+    if body == "cached" {
+        sqlx::raw_sql(&format!(
+            "ALTER FUNCTION {schema}.claim_ready_runtime(text,bigint,float8,float8) RESET plan_cache_mode"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(&format!(
+        "ANALYZE {schema}.ready_entries; ANALYZE {schema}.ready_segments;"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for _ in 0..workers {
+        let (pool, store, stop) = (pool.clone(), store.clone(), stop.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut latencies = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let claimed = store
+                    .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+                    .await
+                    .unwrap();
+                latencies.push(started.elapsed());
+                if !claimed.is_empty() {
+                    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+                }
+            }
+            latencies
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+    stop.store(true, Ordering::Relaxed);
+    let mut latencies = Vec::new();
+    for task in tasks {
+        latencies.extend(task.await.unwrap());
+    }
+    latencies.sort_unstable();
+    let pick = |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
+    println!(
+        "BENCH body={} workers={workers} claims_per_s={:.0} p50_ms={:.2} p99_ms={:.2}",
+        body,
+        latencies.len() as f64 / secs as f64,
+        pick(0.50).as_secs_f64() * 1000.0,
+        pick(0.99).as_secs_f64() * 1000.0,
+    );
+}
