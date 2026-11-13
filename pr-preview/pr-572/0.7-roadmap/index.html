@@ -2856,7 +2856,7 @@ this roadmap and not yet filed.</p>
 <tr>
 <td><strong>#303</strong> Maintenance-task split</td>
 <td>P2</td>
-<td>Unchanged: telemetry-gated. Check <code>awa_maintenance_branch_overrun_total</code> across beta fleets; implement the rescue+promote split only if non-trivial overruns appear; else close wontfix as the issue itself proposes.</td>
+<td>Implemented (<a href="../adr/051-maintenance-recovery-loop/">ADR-051</a>): shipped in 0.6.17 and forward-ported, after a reproduction showed one locked cron row stalls promotion and rescue for as long as the lock is held; the overrun counter does not see that stall.</td>
 </tr>
 </tbody>
 </table>
@@ -3313,7 +3313,7 @@ is the original baseline; #383 holds the current checklist.</p>
 </tr>
 <tr>
 <td>#303 maintenance split</td>
-<td>Telemetry-gated during beta; implement or close-wontfix per its own rule.</td>
+<td>Implemented (<a href="../adr/051-maintenance-recovery-loop/">ADR-051</a>); shipped in 0.6.17 and forward-ported.</td>
 </tr>
 <tr>
 <td>#295-adjacent #246 regression</td>
