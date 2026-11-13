@@ -774,9 +774,9 @@ const RETIRE_BARRIER_CEILING: Duration = Duration::from_secs(2);
 
 /// The advisory key of the barrier that retires queue ring slot `slot`.
 ///
-/// `claim_ready_runtime` computes the same key for the slot prune would
-/// retire next and tries it in shared mode; the format string must match the
-/// one in `awa.refresh_claim_runtime`.
+/// A claim function that consults the barrier computes the same key for the
+/// slot prune would retire next and tries it in shared mode, so the format
+/// string is part of the claim protocol.
 const QUEUE_RETIRE_BARRIER_KEY_SQL: &str =
     "hashtextextended(format('awa.queue_storage.retire:%s:queue:%s', $1::text, $2::int), 0)";
 
