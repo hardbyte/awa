@@ -159,13 +159,13 @@ Clear the lock contention or long transaction; claiming recovers as soon as comp
 
 A transaction that changes a running attempt, such as `admin::cancel_tx` run inside an application's own transaction, holds that attempt's completion lock until it commits or rolls back. If the attempt's handler returns meanwhile, its completion cannot proceed until then. Once the attempt has waited a second, the worker logs `Another transaction holds this attempt's completion lock; still retrying` with the attempt's `job_id` and `waited_ms`.
 
-In queue storage with receipts on (the default), a successful attempt in that state is left out of its completion batch and retried with backoff, without holding a pool connection, so completions of other jobs carry on. Its worker slot stays held while it retries. When the transaction commits, the retry sees the committed change: a cancelled attempt's completion is ignored as stale. If the lock is still held after two minutes, the worker gives up, logs `Failed to complete job`, stops heartbeating the attempt, and leaves it to stale-heartbeat rescue.
+In queue storage with receipts on (the default), a successful attempt in that state is left out of its completion batch and retried with backoff, without holding a pool connection, so completions of other jobs carry on. It keeps its finalizer slot and its heartbeat while it retries; its worker slot was released when the attempt was handed to the finalizer. When the transaction commits, the retry sees the committed change: a cancelled attempt's completion is ignored as stale. If the lock is still held after two minutes of finalization budget (time spent waiting for an accepted completion to be acknowledged does not count), the worker gives up, logs `Failed to complete job`, stops heartbeating the attempt, and leaves it to stale-heartbeat rescue.
 
 Releases before 0.6.17, and 0.7.0-alpha.1, waited on the lock inside the batch instead. Every completion the runtime sent through its completion batcher then waited behind that one transaction, and once the in-flight completion allowance filled, the runtime stopped claiming in every queue.
 
 Not every completion is covered:
 
-- Attempts that end in a retry, snooze, cancel, failure or callback wait, and successful attempts of a kind with follow-up enqueues or whose handler staged follow-ups, finalize one job at a time. They still wait on the lock while holding a pool connection and their worker slot, but no other attempt waits with them.
+- Attempts that end in a retry, snooze, cancel, failure or callback wait, and successful attempts of a kind with follow-up enqueues or whose handler staged follow-ups, finalize one job at a time. They still wait on the lock while holding a pool connection, a finalizer slot and their heartbeat, but no other attempt waits with them.
 - With receipts off (`lease_claim_receipts = false`, only possible on a non-default queue-storage schema), a successful attempt's batch still waits on the lock, and the rest of the batch waits with it.
 
 Keep transactions that touch running jobs short, and commit or roll back before doing slow work in them.
