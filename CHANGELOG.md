@@ -4,6 +4,68 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- **Build the tag indexes after upgrading** (ADR-049). As the migrator, run
+  `awa storage build-tag-index --wait`. There is no migration: empty
+  partitions and new schemas are indexed during `awa migrate` and schema
+  preparation, and the command covers populated partitions, each once pruning
+  empties it. `--now` builds them immediately with `CREATE INDEX
+  CONCURRENTLY`, at the cost of holding back vacuum and blocking pruning of
+  each partition while it builds. See the
+  [upgrade guide](docs/upgrade-0.6-to-0.7.md#tag-indexes-adr-049).
+- **Rust library users: `BatchOperationFilter` is now `JobFilter`.** Its
+  `state` and `tag` fields become `states` and `tags` lists. Build a filter
+  with `JobFilter::new().state(..).tag(..)` or `JobFilter { kind: ..,
+  ..Default::default() }`. Its JSON keeps ADR-030's keys, so stored batch
+  operations still load. Several tags or states go under `tag` or `state` as
+  a list, which 0.6's filter type rejects rather than ignoring (a unit test
+  reads the new shape with a copy of that type). Unknown JSON fields are now
+  an error rather than ignored. See
+  [stability](docs/stability.md#job-filters-adr-049) for what is and isn't
+  rehearsed across versions.
+- **HTTP: `GET /api/jobs`, `/api/jobs/count` and `/api/dlq` refuse unknown
+  or empty query parameters** with a 400. A 0.6 server ignored unknown
+  parameters, returning a wider list. Listing and counting jobs by filter now share one
+  30-second budget per request, across every candidate pass and row load;
+  past it the request fails asking for a narrower filter.
+- **HTTP: DLQ retry and purge by the full filter use new endpoints,
+  `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching`, with body
+  `{"filter": {...}}`.** `all: true` is accepted only with an empty filter.
+  `/api/dlq/bulk-retry` and `/bulk-purge` keep their 0.6 body (`kind`,
+  `queue`, one `tag`, `all`) and now refuse fields beyond it. A 0.6 server
+  ignores body fields it doesn't know, so a richer body on the old paths
+  could act on more rows there (a filter beside `all: true` would act on the
+  whole DLQ); it answers the new paths with 405, and a v0.6.9 server was
+  checked to.
+- **Finding, counting and batch-operating on jobs by filter require queue
+  storage.** On the deprecated canonical engine (ADR-037), `find_jobs`,
+  `count_jobs`, the deprecated `list_jobs`, `GET /api/jobs`, `awa job list`
+  and batch-operation preview and submit return an error naming the
+  missing queue_storage backend, as the DLQ APIs already did. In 0.7 a
+  migrated cluster is finalized onto queue storage; only a fresh install that
+  hasn't started a worker is still canonical. While it holds no jobs, listing
+  and counting there return nothing rather than an error.
+- **A DLQ purge or bulk retry needs a filter that narrows the DLQ** (kind,
+  queue, tag, ids or a created bound) unless `allow_all` is set; `state:
+  failed` and `dead_lettered: true` alone are refused, since every DLQ row
+  matches them.
+- **A batch operation needs the same:** a kind, queue, tag, ids or created
+  bound, unless `allow_all` is set. In 0.6 a state alone was enough, so
+  `{"state": "available"}` changed every available job; it is now refused.
+  Stored operations are unaffected. An empty `ids` list is refused in any
+  filter, since it would match nothing; omit `ids` to match any id.
+- **`awa storage status` prints one JSON document,** now with a
+  `tag_indexes: {valid, total}` field; the build hint goes to stderr.
+- **Deprecated:** `admin::list_jobs` and `ListJobsFilter` (use `find_jobs`
+  with `JobFilter` and `JobPage`), and `dlq::list_dlq`, `purge_dlq`,
+  `bulk_retry_from_dlq` and `ListDlqFilter` (use `find_dlq`,
+  `purge_dlq_matching` and `bulk_retry_from_dlq_matching`). They keep working
+  through 0.8.
+- **A batch operation whose filter uses several tags, several states or
+  `dead_lettered` is refused** while a runtime older than 0.7.0-alpha.2 is
+  live, because an older runner can't read them.
+
 ### Forward-ported from 0.6.14
 
 - Everything [0.6.14](https://github.com/hardbyte/awa/releases/tag/v0.6.14) shipped that this branch did not already have; see its release notes for the details. Promotion runs each enqueue lane in its own transaction, hands a busy lane to a dedicated waiter, and wakes claimers after the lanes commit; `awa.maintenance.promote.lane_contention` counts the hand-offs. Rescue skips an attempt whose retained ready bodies are ambiguous instead of stopping rescue of every other attempt. Lifecycle events no longer re-read a completed job, and a failed re-read no longer fails a committed callback wait. Admin job lists and kind counts find their candidates in read phases that release partition locks between them, and probe receipt closures more cheaply; a job list still loads each candidate with a point read, which holds `ACCESS SHARE` on every ready, lease and claim partition for the length of that read. `awa migrate` rejects `--sql` combined with `--extract-to`. The persona soak suite (`awa/tests/persona_soak_test.rs`, `scripts/persona-soak.sh`) is added.
@@ -27,6 +89,22 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
+- **One job filter ([ADR-049](docs/adr/049-job-filter-and-indexed-tags.md),
+  [guide](docs/finding-jobs.md)).** `JobFilter` (kind, queue, any-of states,
+  all-of tags, dead-lettered, ids, created-at bounds) drives job listing,
+  counting, batch preview and execution, and the DLQ, so each selects the same
+  jobs. `admin::find_jobs` and `admin::count_jobs` (exact up to 10,000);
+  Python `find_jobs` and `count_jobs`, with a `filter=` dict on the DLQ
+  helpers; `GET /api/jobs` with repeatable `tag` and `state` and
+  `GET /api/jobs/count`; `awa job list` and the DLQ commands gain `--tag`,
+  `--state`, `--id` and created-at bounds. The admin UI's search accepts
+  several `tag:` terms, `id:` and `created>=`/`created<`, shows the match
+  count, and carries a search into the batch-operations form.
+- **Tags are indexed on queue storage.** A partial GIN index over non-empty
+  payload tags on each partition where a job's row outlives its claim makes
+  finding jobs by tag an indexed lookup in every state, including
+  dead-lettered. Postgres maintains it for every binary; untagged jobs add
+  nothing to it.
 - **Alert rules for ring maintenance, the DLQ and long transactions** ([#376](https://github.com/hardbyte/awa/issues/376)). The Prometheus rule set adds `awa_ring_rotation_stalled` (a ring has skipped every rotation as busy for 15 minutes), `awa_ring_prune_blocked` (every prune of a ring for 30 minutes was blocked by a lock), `awa_maintenance_branch_overrunning` and `awa_dlq_growing`. The Postgres rule set adds `awa_pg_long_transaction`, which fires on a transaction older than 5 minutes. `validate-grafana.sh` now evaluates every rule's query against the live Prometheus and Postgres, and fails on a rule with an incomplete query.
 - **Per-queue worker utilization metrics (#733).** Every runtime samples `awa.queue.worker.in_use` (worker slots held by a running handler or one waiting for finalizer capacity) and `awa.queue.worker.capacity` (`max_workers`, or in weighted mode `min_workers` plus the overflow pool) for each queue on each runtime snapshot, so a dashboard can plot utilization as in-use ÷ capacity. Waits grow steeply once utilization stays above about 0.8; see [sizing workers from utilization](docs/configuration.md#sizing-workers-from-utilization). The overview Grafana dashboard has a **Worker utilization by queue** panel.
 - **The queue-storage prune `lock_timeout` is configurable, and prune
@@ -54,10 +132,38 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- **Listing is faster on queue storage.** Candidate queries write only the
+  predicates a filter sets and read only the storage its states can reach,
+  one branch per read phase so each phase releases its partition locks, and a
+  page of jobs loads in one batched read instead of one round trip per job. Previously a listing query bound every field as
+  `($n IS NULL OR …)` and degraded to minutes once Postgres switched it to a
+  generic plan; at 50,000 retained jobs a rare-tag lookup now takes tens of
+  milliseconds instead of more than two minutes.
 - **Automatic retries spread wider (#733, migration v059).** `awa.backoff_duration` drew the delay before a retry from `2^attempt` seconds plus 0 to 25%, so jobs that failed together retried close together and hit a recovering dependency at once. The delay is now `2^attempt` seconds times a random factor in [0.5, 1.5), capped at 24 hours as before: the mean is the base delay (previously 12.5% above it), the shortest possible delay halves, and in a simulation of 10,000 jobs failing together the peak retry rate for each attempt falls by about 3.5×. v059 is one function replacement with no table locks, and binaries before it use the new delays as soon as it commits. See [v059](docs/upgrade-0.6-to-0.7.md#v059-wider-retry-jitter).
 
 ### Fixed
 
+- **Reading one job by id no longer misses a job that moved mid-read.** The
+  loader behind `get_job` and filtered listings reads every table from one
+  snapshot (`REPEATABLE READ READ ONLY`); a promotion or retry committing
+  between two of its statements could hide the job.
+- **A batch operation the runner can't read is marked failed** instead of
+  being claimed on every tick, which blocked every later operation. The same
+  goes for one whose stored filter no longer suits its operation.
+- **`awa storage build-tag-index --now` waits out long transactions** rather
+  than aborting after 5 s and leaving an invalid index that every write still
+  maintained. It runs on its own connection with no lock or statement
+  timeout, and also drops the `_ccold` copies a failed rebuild leaves.
+- **Job filters are bounded while they're parsed.** Tag de-duplication is
+  linear, and the query-string parser stops at 20 tags or 1,000 ids, so an
+  oversized request costs no more than the limit.
+- **The DLQ listing has the same 30-second read budget** as job listing.
+- **Admin UI:** the DLQ page shows the server's error instead of "DLQ is
+  empty" and disables bulk actions while its list is failing or loading; a
+  4xx response is not retried; the jobs page shows the server's message. A
+  batch operation needs a preview of the form's current filter and a
+  confirmation stating its scope and count, and the jobs page offers the
+  batch link only for a search that narrows the population.
 - Claiming from a ready slot that holds tombstones no longer scans the slot's whole tombstone partition on every claim (#713, reported and fixed by @Wallace99, migration v060). Each claim checks its candidate rows against `ready_tombstones`, and for a small batch PostgreSQL could plan that check as a hashed subplan over the partition instead of one index probe per row: a 32-row claim read 10,000 tombstone rows in the regression test. The check now carries `OFFSET 0`, which keeps it correlated. v060 rewrites `claim_ready_runtime` and every `claim_ready_slot_<n>` in the default and every trusted custom queue-storage schema in place, without reinstalling tables or triggers; it takes no table locks, and binaries before it claim unchanged. 0.6.17 made the same change through its `correlated_claim_tombstones` schema patch. See [v060](docs/upgrade-0.6-to-0.7.md#v060-correlated-claim-tombstone-checks).
 - **The `awa_job_output_schema_missing` alert rule imports.** Its query had no expression or datasource and the rule had no threshold, so Grafana refused to provision it. It now fires when a queue drops outputs with reason `schema_missing` for 10 minutes.
 - **A completion batch no longer waits to fill while attempts keep arriving (#732).** A completion shard restarted its flush timer on every arrival, so while attempts arrived faster than one per flush interval a batch was written only once it reached `AWA_COMPLETION_BATCH_SIZE`. With the defaults, a completion could wait up to about 511 ÷ the shard's completion rate before being written: about 250 ms at 2,000 completions per second per shard. The flush deadline now starts when the first attempt of a batch arrives, so a batch is written when it is full or `AWA_COMPLETION_FLUSH_MS` (default 1 ms) after its first attempt, whichever comes first.

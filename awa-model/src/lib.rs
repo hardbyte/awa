@@ -8,8 +8,10 @@ pub mod cron_reconciliation;
 pub use cron_reconciliation::PeriodicReconciliation;
 pub mod dlq;
 pub mod error;
+pub mod filter;
 pub mod insert;
 pub mod job;
+mod job_query;
 pub mod kind;
 pub mod migrations;
 pub mod output;
@@ -19,6 +21,7 @@ mod read_transaction;
 pub mod reschedule;
 pub mod storage;
 mod storage_footprint_sql;
+pub mod tag_index;
 pub mod trace;
 pub mod unique;
 
@@ -45,6 +48,7 @@ pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
 pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::{map_sqlx_error, AwaError};
+pub use filter::{DlqPage, JobCount, JobFilter, JobPage};
 pub use insert::{
     insert, insert_many, insert_many_copy, insert_many_copy_from_pool,
     insert_many_skip_unique_conflicts, insert_prepared, insert_with,

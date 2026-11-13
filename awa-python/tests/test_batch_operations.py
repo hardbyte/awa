@@ -13,6 +13,7 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+SCHEMA = "awa_py_batch"
 
 
 @dataclass
@@ -38,15 +39,21 @@ def _reset_control_plane(client: awa.Client) -> None:
     tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
     tx.execute("DELETE FROM awa.batch_operation_items")
     tx.execute("DELETE FROM awa.batch_operations")
-    tx.execute("DELETE FROM awa.jobs_hot WHERE queue LIKE 'pybatch_%'")
+    tx.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
     tx.commit()
+
+
+def _use_queue_storage(client: awa.Client) -> None:
+    # Batch operations select jobs by filter, which needs queue storage (ADR-049).
+    _reset_control_plane(client)
+    client.install_queue_storage(schema=SCHEMA, reset=True)
 
 
 @pytest.fixture
 def sync_client():
     client = awa.Client(DATABASE_URL)
     client.migrate()
-    _reset_control_plane(client)
+    _use_queue_storage(client)
     try:
         yield client
     finally:
@@ -60,7 +67,7 @@ async def async_client():
     await client.migrate()
     reset = awa.Client(DATABASE_URL)
     try:
-        _reset_control_plane(reset)
+        _use_queue_storage(reset)
     finally:
         reset.close()
     try:
@@ -126,8 +133,13 @@ def test_sync_batch_operation_move_queue_and_validation(sync_client):
     assert operation["spec"]["queue"] == "pybatch_dest"
     assert operation["spec"]["priority"] == 2
 
-    with pytest.raises(awa.ValidationError, match="requires a filter"):
+    with pytest.raises(awa.ValidationError, match="needs a kind, queue"):
         sync_client.set_priority(1)
+    # A state alone still names every job in it.
+    with pytest.raises(awa.ValidationError, match="needs a kind, queue"):
+        sync_client.submit_batch_operation(
+            "set_priority", spec={"priority": 1}, filter={"state": "available"}
+        )
 
 
 @pytest.mark.asyncio

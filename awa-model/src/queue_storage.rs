@@ -53,7 +53,8 @@ const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
 // Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
-// btree/GiST main forks retain one page; BRIN retains three main
+// btree/GiST main forks retain one page; GIN (tag and claim-batch job indexes) retains its
+// metapage and root; BRIN retains three main
 // and three FSM pages (four below 4 KiB block size) when empty. Unknown
 // access methods conservatively count any allocation as reclaimable. Include
 // heap/TOAST/index forks: VACUUM can leave an empty heap with expanded indexes.
@@ -89,7 +90,7 @@ SELECT EXISTS (
        OR pg_relation_size(oid, 'vm') > 0
        OR pg_relation_size(oid) > current_setting('block_size')::bigint *
           CASE amname WHEN 'btree' THEN 1 WHEN 'gist' THEN 1
-                      WHEN 'brin' THEN 3 ELSE 0 END
+                      WHEN 'gin' THEN 2 WHEN 'brin' THEN 3 ELSE 0 END
 )
 "#
 );
@@ -4859,7 +4860,18 @@ impl QueueStorage {
         .await;
 
         match install_result {
-            Ok(()) => install_tx.commit().await.map_err(map_sqlx_error),
+            Ok(()) => {
+                install_tx.commit().await.map_err(map_sqlx_error)?;
+                // Best-effort (ADR-049): empty partitions get their tag
+                // index on the spot; populated ones wait for the migrator's
+                // `awa storage build-tag-index`.
+                if let Ok(mut conn) = pool.acquire().await {
+                    if let Err(error) = crate::tag_index::index_empty_partitions(&mut conn).await {
+                        tracing::warn!(%error, "Skipped creating tag indexes");
+                    }
+                }
+                Ok(())
+            }
             Err(err) => {
                 let _ = install_tx.rollback().await;
                 Err(err)
@@ -15731,12 +15743,48 @@ impl QueueStorage {
         self.load_job_inner(pool, job_id, false).await
     }
 
+    /// The current row of each job in `job_ids`, in that order, without
+    /// outputs (ADR-048), with whether that row is dead-lettered. Ids with no
+    /// retained row are skipped.
+    /// With a `timeout`, each statement is cancelled once it runs past it.
+    #[doc(hidden)]
+    pub async fn load_jobs_without_output(
+        &self,
+        pool: &PgPool,
+        job_ids: &[i64],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<(JobRow, bool)>, AwaError> {
+        self.load_jobs_inner(pool, job_ids, false, timeout).await
+    }
+
     async fn load_job_inner(
         &self,
         pool: &PgPool,
         job_id: i64,
         include_output: bool,
     ) -> Result<Option<JobRow>, AwaError> {
+        Ok(self
+            .load_jobs_inner(pool, &[job_id], include_output, None)
+            .await?
+            .into_iter()
+            .next()
+            .map(|(job, _)| job))
+    }
+
+    /// Load the current row of each job in `job_ids`, in that order,
+    /// skipping ids with no retained row. Each query reads every place a
+    /// job's row can live once for the whole list, so a page of jobs costs
+    /// the same seven round trips as one job.
+    async fn load_jobs_inner(
+        &self,
+        pool: &PgPool,
+        job_ids: &[i64],
+        include_output: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<(JobRow, bool)>, AwaError> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let schema = self.schema();
         let output_column = if include_output && self.supports_job_output(pool).await? {
             ",\n                output"
@@ -15748,9 +15796,16 @@ impl QueueStorage {
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let mut candidates = Vec::new();
-        // A job moves between these relations as it is promoted, claimed,
-        // completed or dead-lettered. Read them all from one snapshot so a
-        // move between two reads cannot hide the job or surface a stale row.
+        // One read-only transaction, so these statements get the settings
+        // the filter reads use. They are fixed-shape probes by `job_id`, so a
+        // connection plans each once rather than once per call; a custom plan
+        // costs more than running it, because each probe expands to every
+        // partition.
+        //
+        // REPEATABLE READ gives every probe one snapshot. Under READ
+        // COMMITTED a job that moves to a table already read (a promotion,
+        // retry or DLQ retry committing between two probes) is in none of
+        // them, and reads as missing.
         let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool)
             .await
             .map_err(map_sqlx_error)?;
@@ -15761,6 +15816,12 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         begin_guard.begin_pending = false;
+        // Neither SET nor LOCK TABLE takes the snapshot, so the timeout also
+        // bounds the lock wait below.
+        crate::job_query::plan_reads(&mut tx, true).await?;
+        if let Some(timeout) = timeout {
+            crate::job_query::set_statement_timeout(&mut tx, timeout).await?;
+        }
         // TRUNCATE is not MVCC-safe: a partition that prune empties after the
         // snapshot reads as empty, while the completion that let prune run is
         // newer than the snapshot, so the job could read as available or
@@ -15797,26 +15858,28 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
-            WHERE ready.job_id = $1
+            FROM {schema}.ready_entries AS r
+            WHERE job_id = ANY($1)
+              -- A priority or queue move tombstones the old row and copies
+              -- its lease and times to the new one, so the two would tie.
               AND NOT EXISTS (
                   SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-                    AND tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
+                  WHERE tomb.ready_slot = r.ready_slot
+                    AND tomb.ready_generation = r.ready_generation
+                    AND tomb.queue = r.queue
+                    AND tomb.priority = r.priority
+                    AND tomb.enqueue_shard = r.enqueue_shard
+                    AND tomb.lane_seq = r.lane_seq
               )
             ORDER BY run_lease DESC, attempted_at DESC NULLS LAST, run_at DESC
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in ready_rows {
-            candidates.push(row.into_job_row()?);
+            candidates.push((row.into_job_row()?, false));
         }
 
         let deferred_rows: Vec<DeferredJobRow> = sqlx::query_as(audited_sql(format!(
@@ -15839,15 +15902,15 @@ impl QueueStorage {
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
             FROM {schema}.deferred_jobs
-            WHERE job_id = $1
+            WHERE job_id = ANY($1)
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in deferred_rows {
-            candidates.push(row.into_job_row()?);
+            candidates.push((row.into_job_row()?, false));
         }
 
         let lease_rows = sqlx::query(audited_sql(format!(
@@ -15909,17 +15972,17 @@ impl QueueStorage {
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id
              AND attempt.run_lease = lease.run_lease
-            WHERE lease.job_id = $1
+            WHERE lease.job_id = ANY($1)
             ORDER BY lease.run_lease DESC
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_rows {
             if let Some(job) = self.active_job_read_row_tx(&mut tx, row).await? {
-                candidates.push(job);
+                candidates.push((job, false));
             }
         }
 
@@ -15984,7 +16047,7 @@ impl QueueStorage {
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
-            WHERE claims.job_id = $1
+            WHERE claims.job_id = ANY($1)
               AND NOT {closed_evidence}
               -- Exclude claims that have already been materialized into
               -- leases — the lease-backed branch above already reports
@@ -15997,13 +16060,13 @@ impl QueueStorage {
             ORDER BY claims.run_lease DESC
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_rows {
             if let Some(job) = self.active_job_read_row_tx(&mut tx, row).await? {
-                candidates.push(job);
+                candidates.push((job, false));
             }
         }
 
@@ -16054,28 +16117,37 @@ impl QueueStorage {
                 claim_batches.attempts,
                 claim_batches.max_attempts
             ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-            LEFT JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = claim_batches.ready_slot
-             AND ready.ready_generation = claim_batches.ready_generation
-             AND ready.queue = claim_batches.queue
-             AND ready.enqueue_shard = claim_batches.enqueue_shard
-             AND ready.lane_seq = items.lane_seq
-             AND ready.job_id = items.job_id
-             AND ready.run_lease + 1 = items.run_lease
-             AND NOT EXISTS (
-                 SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                 WHERE tomb.ready_slot = ready.ready_slot
-                   AND tomb.ready_generation = ready.ready_generation
-                   AND tomb.queue = ready.queue
-                   AND tomb.priority = ready.priority
-                   AND tomb.enqueue_shard = ready.enqueue_shard
-                   AND tomb.lane_seq = ready.lane_seq
-             )
+            -- A `job_id` probe in the batch's ring slot. Joined plainly, the
+            -- planner can match every batch against every ready row in its
+            -- lane before unnesting.
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM {schema}.ready_entries AS ready_probe
+                WHERE ready_probe.job_id = items.job_id
+                  AND ready_probe.ready_slot = claim_batches.ready_slot
+                  AND ready_probe.ready_generation = claim_batches.ready_generation
+                  AND ready_probe.queue = claim_batches.queue
+                  AND ready_probe.enqueue_shard = claim_batches.enqueue_shard
+                  AND ready_probe.lane_seq = items.lane_seq
+                  AND ready_probe.run_lease + 1 = items.run_lease
+                  -- Moving a ready row tombstones the old one and re-inserts
+                  -- the same attempt, which can reuse the old lane_seq.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready_probe.ready_slot
+                        AND tomb.ready_generation = ready_probe.ready_generation
+                        AND tomb.queue = ready_probe.queue
+                        AND tomb.priority = ready_probe.priority
+                        AND tomb.enqueue_shard = ready_probe.enqueue_shard
+                        AND tomb.lane_seq = ready_probe.lane_seq
+                  )
+                OFFSET 0
+            ) AS ready ON true
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
-            WHERE claim_batches.job_ids @> ARRAY[$1::bigint]
-              AND items.job_id = $1
+            WHERE claim_batches.job_ids && $1
+              AND items.job_id = ANY($1)
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -16113,13 +16185,13 @@ impl QueueStorage {
             ORDER BY items.run_lease DESC
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_batch_rows {
             if let Some(job) = self.active_job_read_row_tx(&mut tx, row).await? {
-                candidates.push(job);
+                candidates.push((job, false));
             }
         }
 
@@ -16147,16 +16219,16 @@ impl QueueStorage {
                 unique_states,
                 payload{output_column}
             FROM {schema}.terminal_jobs AS done
-            WHERE done.job_id = $1
+            WHERE done.job_id = ANY($1)
             ORDER BY done.run_lease DESC, done.finalized_at DESC
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in done_rows {
-            candidates.push(row.into_job_row()?);
+            candidates.push((row.into_job_row()?, false));
         }
 
         let dlq_rows: Vec<DlqJobRow> = sqlx::query_as(audited_sql(format!(
@@ -16182,27 +16254,43 @@ impl QueueStorage {
                 dlq_at,
                 original_run_lease
             FROM {schema}.dlq_entries
-            WHERE job_id = $1
+            WHERE job_id = ANY($1)
             ORDER BY dlq_at DESC
             "#,
         )))
-        .bind(job_id)
+        .bind(job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in dlq_rows {
-            candidates.push(row.into_job_row()?);
+            candidates.push((row.into_job_row()?, true));
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         drop(begin_guard);
-        Ok(candidates.into_iter().max_by_key(|job| {
-            (
-                job.run_lease,
-                transition_timestamp(job),
-                state_rank(job.state),
-            )
-        }))
+
+        let mut current: HashMap<i64, (JobRow, bool)> = HashMap::with_capacity(job_ids.len());
+        for (job, dead_lettered) in candidates {
+            let key = |job: &JobRow| {
+                (
+                    job.run_lease,
+                    transition_timestamp(job),
+                    state_rank(job.state),
+                )
+            };
+            match current.get(&job.id) {
+                // Ties go to the later candidate, as `max_by_key` did when
+                // this loaded one job.
+                Some((existing, _)) if key(existing) > key(&job) => {}
+                _ => {
+                    current.insert(job.id, (job, dead_lettered));
+                }
+            }
+        }
+        Ok(job_ids
+            .iter()
+            .filter_map(|job_id| current.remove(job_id))
+            .collect())
     }
 
     pub async fn register_callback(
@@ -18689,29 +18777,37 @@ impl QueueStorage {
         fields(kind = ?filter.kind, queue = ?filter.queue, tag = ?filter.tag),
         name = "queue_storage.bulk_retry_from_dlq"
     )]
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `dlq::bulk_retry_from_dlq_matching` with a `JobFilter`"
+    )]
     pub async fn bulk_retry_from_dlq(
         &self,
         pool: &PgPool,
         filter: &ListDlqFilter,
     ) -> Result<u64, AwaError> {
+        let (job_filter, page) = filter.split();
+        let Some(mut predicate) = crate::job_query::dlq_predicate(&job_filter) else {
+            return Ok(0);
+        };
+        crate::dlq::before_position(&mut predicate, page.before_dlq_at, page.before_id);
+        self.bulk_retry_from_dlq_where(pool, &predicate).await
+    }
+
+    /// Move the DLQ rows `predicate` selects back to ready, in one
+    /// transaction. A unique-claim conflict aborts it and leaves every row
+    /// in the DLQ.
+    pub(crate) async fn bulk_retry_from_dlq_where(
+        &self,
+        pool: &PgPool,
+        predicate: &crate::job_query::Predicate,
+    ) -> Result<u64, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Vec<DlqJobRow> = sqlx::query_as(audited_sql(format!(
+        let sql = format!(
             r#"
             DELETE FROM {schema}.dlq_entries
-            WHERE ($1::text IS NULL OR kind = $1)
-              AND ($2::text IS NULL OR queue = $2)
-              AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-              AND (
-                  ($4::bigint IS NULL AND $5::timestamptz IS NULL)
-                  OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
-                  OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
-                  OR (
-                      $4::bigint IS NOT NULL
-                      AND $5::timestamptz IS NOT NULL
-                      AND (dlq_at, job_id) < ($5, $4)
-                  )
-              )
+            {where_clause}
             RETURNING
                 job_id,
                 kind,
@@ -18732,16 +18828,14 @@ impl QueueStorage {
                 dlq_reason,
                 dlq_at,
                 original_run_lease
-            "#
-        )))
-        .bind(&filter.kind)
-        .bind(&filter.queue)
-        .bind(&filter.tag)
-        .bind(filter.before_id)
-        .bind(filter.before_dlq_at)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+            "#,
+            where_clause = predicate.where_clause(),
+        );
+        let moved: Vec<DlqJobRow> = predicate
+            .bind_query_as(sqlx::query_as(audited_sql(sql)))
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
         if moved.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;

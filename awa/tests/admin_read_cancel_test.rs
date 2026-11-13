@@ -287,6 +287,7 @@ enum Read {
     Jobs,
 }
 
+#[allow(deprecated)]
 async fn public_read(which: Read, store: &QueueStorage, pool: &PgPool, job_id: i64) -> TestResult {
     match which {
         Read::Job => {

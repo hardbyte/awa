@@ -7,6 +7,7 @@ import { useState, useCallback, useMemo } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchJobs,
+  fetchJobCount,
   fetchStats,
   fetchQueues,
   bulkRetry,
@@ -14,12 +15,14 @@ import {
   pauseQueue,
   resumeQueue,
   drainQueue,
+  toWireFilter,
 } from "@/lib/api";
+import { isNarrowing } from "@/lib/batch";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
+import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { SearchBar, parseSearch } from "@/components/SearchBar";
+import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -108,22 +111,61 @@ export function JobsPage() {
 
   const searchFilters = parseSearch(filters.search);
 
-  const params: ListJobsParams = {
-    state: filters.state === "all" ? undefined : filters.state,
+  const filterParams: ListJobsParams = {
+    states: filters.state === "all" ? undefined : [filters.state],
     kind: searchFilters.kind,
     queue: searchFilters.queue,
-    tag: searchFilters.tag,
+    tags: searchFilters.tags,
+    ids: searchFilters.ids,
+    created_at_gte: toRfc3339(searchFilters.createdGte),
+    created_at_lt: toRfc3339(searchFilters.createdLt),
+  };
+  const params: ListJobsParams = {
+    ...filterParams,
     before_id: filters.beforeId,
     limit: filters.limit,
   };
+  const hasFilter =
+    filters.state !== "all" || Object.keys(parseSearch(filters.search)).length > 0;
 
   const hasSel = selected.size > 0;
   const poll = usePollInterval();
+  const searchError = termError(filters.search);
 
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
+    enabled: !searchError,
     refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
+  });
+
+  // A batch operation acts on available and scheduled jobs, so the jobs
+  // page offers one only when its filter can reach them and names which of
+  // them (a state alone doesn't). The batch form reads tags as a comma list,
+  // so a tag with a comma can't be carried over.
+  const batchEligible =
+    ["all", "available", "scheduled"].includes(filters.state) &&
+    isNarrowing(toWireFilter(filterParams));
+  const tagWithComma = (searchFilters.tags ?? []).some((tag) => tag.includes(","));
+  const batchSearch: Record<string, string> = Object.fromEntries(
+    Object.entries({
+      kind: searchFilters.kind,
+      queue: searchFilters.queue,
+      tags: searchFilters.tags?.join(", "),
+      ids: searchFilters.ids?.join(", "),
+      state: filters.state === "all" ? undefined : filters.state,
+      created_at_gte: searchFilters.createdGte,
+      created_at_lt: searchFilters.createdLt,
+    }).filter((entry): entry is [string, string] => Boolean(entry[1]))
+  );
+
+  // Counted when the filter changes, not on every poll: a count reads the
+  // whole matching population.
+  const countQuery = useQuery<JobCount>({
+    queryKey: ["jobs-count", filterParams],
+    queryFn: () => fetchJobCount(filterParams),
+    enabled: hasFilter && !searchError,
+    staleTime: 30_000,
   });
 
   const statsQuery = useQuery<StateCounts>({
@@ -159,7 +201,9 @@ export function JobsPage() {
     },
   });
 
-  const jobs = jobsQuery.data ?? [];
+  // A malformed term is left out of the query key, so the cache can hold the
+  // wider search's rows; show none of them beside the error.
+  const jobs = searchError ? [] : jobsQuery.data ?? [];
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
@@ -203,9 +247,10 @@ export function JobsPage() {
     onError: () => toast.error("Failed to drain queue"),
   });
 
-  // Compute which selected jobs are retryable vs cancellable
+  // Compute which selected jobs are retryable vs cancellable. Dead-lettered
+  // jobs are retried through the DLQ page; the job endpoints skip them.
   const { retryableIds, cancellableIds } = useMemo(() => {
-    const selectedJobs = jobs.filter((j) => selected.has(j.id));
+    const selectedJobs = jobs.filter((j) => selected.has(j.id) && !j.dlq);
     return {
       retryableIds: selectedJobs
         .filter((j) => RETRYABLE_STATES.has(j.state))
@@ -367,6 +412,45 @@ export function JobsPage() {
       {/* Search bar with integrated filter chips */}
       <SearchBar value={filters.search} onChange={setSearch} />
 
+      {searchError && (
+        <p className="text-sm text-danger" role="alert">
+          {searchError}. No jobs are listed until the search is fixed.
+        </p>
+      )}
+
+      {hasFilter && !searchError && (
+        <div className="flex flex-wrap items-center gap-3 text-sm text-muted-fg">
+          {countQuery.data && (
+            <span data-testid="match-count">
+              {countQuery.data.kind === "at_least"
+                ? `${countQuery.data.value.toLocaleString()}+`
+                : countQuery.data.value.toLocaleString()}{" "}
+              matching
+            </span>
+          )}
+          {countQuery.isError && (
+            <span className="text-danger" data-testid="match-count-error">
+              Count failed: {countQuery.error.message}
+            </span>
+          )}
+          {batchEligible && tagWithComma && (
+            <span>A tag containing a comma can't be carried into a batch operation.</span>
+          )}
+          {batchEligible && !tagWithComma && (
+            <Button
+              size="sm"
+              intent="outline"
+              isDisabled={readOnly}
+              onPress={() =>
+                void navigate({ to: "/batch-ops", search: batchSearch })
+              }
+            >
+              Change priority or queue of matching jobs
+            </Button>
+          )}
+        </div>
+      )}
+
       {/* Bulk action toolbar */}
       {selected.size > 0 && (
         <div className="flex items-center gap-3 rounded-lg bg-muted p-3">
@@ -398,9 +482,11 @@ export function JobsPage() {
           <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
         )}
         {!jobsQuery.isLoading && jobsQuery.isError && (
-          <p className="py-8 text-center text-sm text-danger-fg">Failed to load jobs.</p>
+          <p className="py-8 text-center text-sm text-danger-fg">
+            Failed to load jobs: {jobsQuery.error.message}
+          </p>
         )}
-        {!jobsQuery.isLoading && !jobsQuery.isError && jobs.length === 0 && (
+        {!jobsQuery.isLoading && !jobsQuery.isError && !searchError && jobs.length === 0 && (
           <p className="py-8 text-center text-sm text-muted-fg">No jobs found.</p>
         )}
         {jobs.map((job) => (
@@ -515,10 +601,12 @@ export function JobsPage() {
             if (jobsQuery.isError) {
               return (
                 <div className="flex h-32 items-center justify-center text-sm text-danger-fg">
-                  Failed to load jobs.
+                  Failed to load jobs: {jobsQuery.error.message}
                 </div>
               );
             }
+            // The search error above says why nothing is listed.
+            if (searchError) return null;
             return (
               <div className="flex h-32 items-center justify-center text-sm text-muted-fg">
                 No jobs found.

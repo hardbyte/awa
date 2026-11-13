@@ -10,13 +10,13 @@ use super::super::registry::QueueInfo;
 use super::super::rng::Rng;
 use super::super::shared::Shared;
 use super::{attach_events, backoff, queue, register_rows, tune};
-use awa::model::admin::{self, ListJobsFilter};
+use awa::model::admin;
 use awa::model::batch_operations::{
-    get_batch_operation, submit_batch_operation, BatchOperationFilter, BatchOperationSpec,
-    BatchOperationState, SubmitBatchOperation,
+    get_batch_operation, submit_batch_operation, BatchOperationSpec, BatchOperationState,
+    SubmitBatchOperation,
 };
-use awa::model::dlq::{self, ListDlqFilter};
-use awa::model::{insert_many, JobState, RetryFromDlqOpts};
+use awa::model::dlq;
+use awa::model::{insert_many, DlqPage, JobFilter, JobPage, JobState, RetryFromDlqOpts};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -203,12 +203,12 @@ impl Context {
         self.timed("admin_dlq_depth_by_queue", dlq::dlq_depth_by_queue(&pool))
             .await;
         if let Some(queue) = self.queue_of(Persona::Tom) {
-            let filter = ListJobsFilter {
-                queue: Some(queue.name.clone()),
-                limit: Some(50),
+            let filter = JobFilter::new().queue(queue.name.clone());
+            let page = JobPage {
+                limit: 50,
                 ..Default::default()
             };
-            self.timed("admin_list_jobs", admin::list_jobs(&pool, &filter))
+            self.timed("admin_list_jobs", admin::find_jobs(&pool, &filter, page))
                 .await;
         }
     }
@@ -306,14 +306,13 @@ impl Context {
         ];
         let state = *self.rng.pick(&states).expect("states");
         let pool = self.pool.clone();
-        let filter = ListJobsFilter {
-            queue: Some(queue.name.clone()),
-            state: Some(state),
-            limit: Some(30),
+        let filter = JobFilter::new().queue(queue.name.clone()).state(state);
+        let page = JobPage {
+            limit: 30,
             ..Default::default()
         };
         let Some(rows) = self
-            .timed("admin_list_jobs", admin::list_jobs(&pool, &filter))
+            .timed("admin_list_jobs", admin::find_jobs(&pool, &filter, page))
             .await
         else {
             return;
@@ -359,12 +358,15 @@ impl Context {
 
     async fn dlq_operations(&mut self) {
         let pool = self.pool.clone();
-        let filter = ListDlqFilter {
-            queue: Some(super::mia::INFER_QUEUE.to_string()),
-            limit: Some(20),
+        let filter = JobFilter::new().queue(super::mia::INFER_QUEUE);
+        let page = DlqPage {
+            limit: 20,
             ..Default::default()
         };
-        let Some(rows) = self.timed("dlq_list", dlq::list_dlq(&pool, &filter)).await else {
+        let Some(rows) = self
+            .timed("dlq_list", dlq::find_dlq(&pool, &filter, page))
+            .await
+        else {
             return;
         };
         let ids: Vec<i64> = rows.iter().map(|row| row.job.id).collect();
@@ -402,14 +404,11 @@ impl Context {
                     super::mia::INFER_QUEUE,
                     flag::DLQ_RETRIED,
                 );
-                let bulk = ListDlqFilter {
-                    queue: Some(super::mia::INFER_QUEUE.to_string()),
-                    ..Default::default()
-                };
+                let bulk = JobFilter::new().queue(super::mia::INFER_QUEUE);
                 if let Some(count) = self
                     .timed(
                         "dlq_bulk_retry",
-                        dlq::bulk_retry_from_dlq(&pool, &bulk, false),
+                        dlq::bulk_retry_from_dlq_matching(&pool, &bulk, false),
                     )
                     .await
                 {
@@ -422,12 +421,12 @@ impl Context {
                     super::mia::TRAIN_QUEUE,
                     flag::DLQ_PURGED,
                 );
-                let bulk = ListDlqFilter {
-                    queue: Some(super::mia::TRAIN_QUEUE.to_string()),
-                    ..Default::default()
-                };
+                let bulk = JobFilter::new().queue(super::mia::TRAIN_QUEUE);
                 if let Some(count) = self
-                    .timed("dlq_bulk_purge", dlq::purge_dlq(&pool, &bulk, false))
+                    .timed(
+                        "dlq_bulk_purge",
+                        dlq::purge_dlq_matching(&pool, &bulk, false),
+                    )
                     .await
                 {
                     self.stats().add("dlq_bulk_purged", count as i64);
@@ -443,22 +442,14 @@ impl Context {
                     queue: QUEUE_B.to_string(),
                     priority: None,
                 },
-                BatchOperationFilter {
-                    queue: Some(QUEUE_A.to_string()),
-                    state: Some(JobState::Available),
-                    ..Default::default()
-                },
+                JobFilter::new().queue(QUEUE_A).state(JobState::Available),
                 "move_queue",
                 QUEUE_A,
             )
         } else {
             (
                 BatchOperationSpec::SetPriority { priority: 1 },
-                BatchOperationFilter {
-                    queue: Some(QUEUE_B.to_string()),
-                    state: Some(JobState::Available),
-                    ..Default::default()
-                },
+                JobFilter::new().queue(QUEUE_B).state(JobState::Available),
                 "set_priority",
                 QUEUE_B,
             )

@@ -512,6 +512,8 @@ const ALL_STATES: [JobState; 8] = [
     JobState::Cancelled,
 ];
 
+// Keep exercising the deprecated compatibility wrapper against its reference.
+#[allow(deprecated)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_jobs_matches_the_current_jobs_definition() -> TestResult {
     let mut fixture = Fixture::new().await?;

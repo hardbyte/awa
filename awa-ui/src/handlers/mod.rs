@@ -2,6 +2,7 @@ pub mod batch_ops;
 pub mod callbacks;
 pub mod cron;
 pub mod dlq;
+pub mod filter_params;
 pub mod jobs;
 pub mod kinds;
 pub mod queues;

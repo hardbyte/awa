@@ -10,7 +10,7 @@ use sqlx::Acquire;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
 use std::cmp::max;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -848,458 +848,6 @@ async fn notify_cancellation_tx<'a>(
         .execute(tx.as_mut())
         .await?;
     Ok(())
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum JobCandidateSource {
-    States,
-    Receipts(usize),
-}
-
-/// Candidate job ids for [`list_jobs`] from one source: the newest `limit`
-/// distinct ids below `cursor`, with the statement's binds in order. State
-/// sources apply kind/state/queue filters. Receipt sources enumerate open
-/// claims in one physical slot and apply kind/queue before their limit.
-///
-/// Each place a job can live is read and limited on its own, with only the
-/// state legs that can hold the requested state. Known filters are written
-/// into the statement rather than as `$n IS NULL OR` terms that a generic plan
-/// can't drop. Read through
-/// `current_jobs`, Postgres joins every retained completion to a scan of the
-/// ready rows, because that join and the `UNION ALL` are each estimated at one
-/// row. Available rows are found per lane as a claim finds them, and a
-/// completion batch's members are ordered by id before the ready primary key
-/// is probed for each, so a page of newest ids probes only as many as it
-/// returns.
-fn queue_storage_job_id_candidates_sql(
-    schema: &str,
-    filter: &ListJobsFilter,
-    cursor: Option<i64>,
-    limit: i64,
-    source: JobCandidateSource,
-) -> (String, Vec<CandidateBind>) {
-    let mut binds = Vec::new();
-    let mut bind = |value: CandidateBind| {
-        binds.push(value);
-        format!("${}", binds.len())
-    };
-    let state = filter
-        .state
-        .filter(|_| source == JobCandidateSource::States)
-        .map(|state| bind(CandidateBind::State(state)));
-    let kind = filter
-        .kind
-        .as_ref()
-        .map(|kind| bind(CandidateBind::Text(kind.clone())));
-    let queue = filter
-        .queue
-        .as_ref()
-        .map(|queue| bind(CandidateBind::Text(queue.clone())));
-    let before = cursor.map(|cursor| bind(CandidateBind::Int(cursor)));
-    let limit = bind(CandidateBind::Int(limit));
-
-    // `AND column = $n` for each filter that is set; `kind` and `queue` name
-    // the columns, which differ by leg.
-    let predicates = |state_column: Option<&str>,
-                      kind_column: Option<&str>,
-                      queue_column: &str,
-                      id_column: &str| {
-        let mut sql = String::new();
-        if let (Some(param), Some(column)) = (&state, state_column) {
-            sql.push_str(&format!(" AND {column} = {param}::awa.job_state"));
-        }
-        if let (Some(param), Some(column)) = (&kind, kind_column) {
-            sql.push_str(&format!(" AND {column} = {param}"));
-        }
-        if let Some(param) = &queue {
-            sql.push_str(&format!(" AND {queue_column} = {param}"));
-        }
-        if let Some(param) = &before {
-            sql.push_str(&format!(" AND {id_column} < {param}::bigint"));
-        }
-        sql
-    };
-    let holds = |states: &[JobState]| {
-        source == JobCandidateSource::States
-            && filter
-                .state
-                .is_none_or(|requested| states.contains(&requested))
-    };
-
-    let mut legs: Vec<String> = Vec::new();
-    let mut with = String::new();
-    if holds(&[JobState::Available]) {
-        let lane_rows = crate::queue_storage::available_lane_rows_sql(
-            schema,
-            "heads",
-            "ready.job_id",
-            &format!(
-                "TRUE{}",
-                predicates(None, Some("ready.kind"), "ready.queue", "ready.job_id")
-            ),
-        );
-        let head_queue = queue
-            .as_ref()
-            .map(|param| format!("WHERE claims.queue = {param}"))
-            .unwrap_or_default();
-        with = format!(
-            r#"
-            WITH heads AS MATERIALIZED (
-                SELECT
-                    claims.queue,
-                    claims.priority,
-                    claims.enqueue_shard,
-                    {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                    {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
-                FROM {schema}.queue_claim_heads AS claims
-                JOIN {schema}.queue_enqueue_heads AS enqueues
-                  ON enqueues.queue = claims.queue
-                 AND enqueues.priority = claims.priority
-                 AND enqueues.enqueue_shard = claims.enqueue_shard
-                {head_queue}
-            )
-            "#
-        );
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT lane.job_id
-                FROM heads
-                CROSS JOIN LATERAL ({lane_rows}) AS lane
-                ORDER BY lane.job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-    if holds(&[JobState::Scheduled, JobState::Retryable]) {
-        let predicates = predicates(Some("state"), Some("kind"), "queue", "job_id");
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT job_id
-                FROM {schema}.deferred_jobs
-                WHERE TRUE{predicates}
-                ORDER BY job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-    if holds(&[JobState::Running, JobState::WaitingExternal]) {
-        let predicates = predicates(
-            Some("leases.state"),
-            Some("ready.kind"),
-            "leases.queue",
-            "leases.job_id",
-        );
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT leases.job_id
-                FROM {schema}.leases AS leases
-                JOIN {schema}.ready_entries AS ready
-                  ON ready.ready_slot = leases.ready_slot
-                 AND ready.ready_generation = leases.ready_generation
-                 AND ready.queue = leases.queue
-                 -- Leases keep the aged effective priority; match the ready attempt.
-                 AND ready.job_id = leases.job_id
-                 AND ready.run_lease + 1 = leases.run_lease
-                 AND ready.enqueue_shard = leases.enqueue_shard
-                 AND ready.lane_seq = leases.lane_seq
-                 -- Moving a ready row tombstones the old one and re-inserts the same
-                 -- attempt, which can reuse the old lane_seq on the new lane.
-                 AND NOT EXISTS (
-                     SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                     WHERE tomb.ready_slot = ready.ready_slot
-                       AND tomb.ready_generation = ready.ready_generation
-                       AND tomb.queue = ready.queue
-                       AND tomb.priority = ready.priority
-                       AND tomb.enqueue_shard = ready.enqueue_shard
-                       AND tomb.lane_seq = ready.lane_seq
-                 )
-                WHERE TRUE{predicates}
-                ORDER BY leases.job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-    if let JobCandidateSource::Receipts(slot) = source {
-        let open_running =
-            crate::queue_storage::open_receipt_running_claims_sql_in_slot(schema, slot);
-        let kind_join = if kind.is_some() {
-            format!(
-                r#"
-                CROSS JOIN LATERAL (
-                    SELECT ready.kind
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.job_id = open_claims.job_id
-                    LIMIT 1
-                ) AS created
-                "#
-            )
-        } else {
-            String::new()
-        };
-        let predicates = predicates(
-            None,
-            Some("created.kind"),
-            "open_claims.queue",
-            "open_claims.job_id",
-        );
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT open_claims.job_id
-                FROM ({open_running}) AS open_claims
-                {kind_join}
-                WHERE TRUE{predicates}
-                ORDER BY open_claims.job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-    if holds(&[JobState::Completed, JobState::Failed, JobState::Cancelled]) {
-        let predicates = predicates(Some("state"), Some("kind"), "queue", "job_id");
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT job_id
-                FROM {schema}.done_entries
-                WHERE TRUE{predicates}
-                ORDER BY job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-    if holds(&[JobState::Completed]) {
-        let members = predicates(None, None, "batch.queue", "item.job_id");
-        let kind = kind
-            .as_ref()
-            .map(|param| format!(" AND ready.kind = {param}"))
-            .unwrap_or_default();
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT member.job_id
-                FROM (
-                    SELECT
-                        batch.ready_slot,
-                        batch.ready_generation,
-                        batch.queue,
-                        batch.priority,
-                        batch.enqueue_shard,
-                        item.job_id,
-                        item.run_lease,
-                        item.lane_seq
-                    FROM {schema}.receipt_completion_batches AS batch
-                    CROSS JOIN LATERAL unnest(
-                        batch.job_ids,
-                        batch.run_leases,
-                        batch.lane_seqs
-                    ) AS item(job_id, run_lease, lane_seq)
-                    WHERE TRUE{members}
-                    ORDER BY item.job_id DESC
-                    OFFSET 0
-                ) AS member
-                CROSS JOIN LATERAL (
-                    SELECT 1
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.ready_slot = member.ready_slot
-                      AND ready.ready_generation = member.ready_generation
-                      AND ready.queue = member.queue
-                      AND ready.priority = member.priority
-                      AND ready.enqueue_shard = member.enqueue_shard
-                      AND ready.lane_seq = member.lane_seq
-                      AND ready.job_id = member.job_id{kind}
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.receipt_completion_tombstones AS tomb
-                          WHERE tomb.ready_slot = member.ready_slot
-                            AND tomb.ready_generation = member.ready_generation
-                            AND tomb.job_id = member.job_id
-                            AND tomb.run_lease = member.run_lease
-                      )
-                    LIMIT 1
-                ) AS live
-                ORDER BY member.job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-    if holds(&[JobState::Failed]) {
-        let predicates = predicates(None, Some("kind"), "queue", "job_id");
-        legs.push(format!(
-            r#"(
-                SELECT DISTINCT job_id
-                FROM {schema}.dlq_entries
-                WHERE TRUE{predicates}
-                ORDER BY job_id DESC
-                LIMIT {limit}
-            )"#
-        ));
-    }
-
-    let sql = format!(
-        r#"
-        {with}
-        SELECT DISTINCT job_id
-        FROM ({legs}) AS candidates
-        ORDER BY job_id DESC
-        LIMIT {limit}
-        "#,
-        legs = legs.join(" UNION ALL "),
-    );
-    (sql, binds)
-}
-
-/// A value bound to the statement [`queue_storage_job_id_candidates_sql`]
-/// returns.
-#[derive(Debug)]
-enum CandidateBind {
-    State(JobState),
-    Text(String),
-    Int(i64),
-}
-
-async fn fetch_queue_storage_job_candidates(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    sql: &str,
-    binds: Vec<CandidateBind>,
-) -> Result<Vec<i64>, sqlx::Error> {
-    sqlx::query("SAVEPOINT awa_list_candidates")
-        .execute(tx.as_mut())
-        .await?;
-    let mut query = sqlx::query_scalar::<_, i64>(audited_sql(sql));
-    for value in binds {
-        query = match value {
-            CandidateBind::State(state) => query.bind(state),
-            CandidateBind::Text(text) => query.bind(text),
-            CandidateBind::Int(int) => query.bind(int),
-        };
-    }
-    let ids = query.fetch_all(tx.as_mut()).await?;
-    // Keep the outer repeatable-read snapshot, but release this read phase's
-    // relation locks. Destroy the savepoint too rather than stacking names.
-    sqlx::query("ROLLBACK TO SAVEPOINT awa_list_candidates")
-        .execute(tx.as_mut())
-        .await?;
-    sqlx::query("RELEASE SAVEPOINT awa_list_candidates")
-        .execute(tx.as_mut())
-        .await?;
-    Ok(ids)
-}
-
-async fn list_queue_storage_jobs(
-    store: &QueueStorage,
-    pool: &PgPool,
-    filter: &ListJobsFilter,
-) -> Result<Vec<JobRow>, AwaError> {
-    let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
-    let candidate_limit = if filter.tag.is_some() {
-        limit.saturating_mul(10).min(5000)
-    } else {
-        limit.saturating_mul(3).min(2000)
-    };
-
-    let mut jobs = Vec::new();
-    let mut cursor = filter.before_id;
-
-    loop {
-        // Every candidate phase sees the same MVCC snapshot. Each phase
-        // releases its own read locks before the next one opens more tables.
-        let mut begin_guard = crate::read_transaction::BeginGuard::acquire(pool).await?;
-        let mut tx = sqlx::Connection::begin_with(
-            &mut *begin_guard.connection,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        )
-        .await?;
-        begin_guard.begin_pending = false;
-        sqlx::query("SET LOCAL jit = off")
-            .execute(tx.as_mut())
-            .await?;
-        let states = filter.state.map_or_else(
-            || {
-                vec![
-                    JobState::Available,
-                    JobState::Scheduled,
-                    JobState::Retryable,
-                    JobState::Running,
-                    JobState::WaitingExternal,
-                    JobState::Completed,
-                    JobState::Failed,
-                    JobState::Cancelled,
-                ]
-            },
-            |state| vec![state],
-        );
-        let mut ids = BTreeSet::new();
-        for state in states {
-            let mut phase_filter = filter.clone();
-            phase_filter.state = Some(state);
-            let (sql, binds) = queue_storage_job_id_candidates_sql(
-                store.schema(),
-                &phase_filter,
-                cursor,
-                candidate_limit,
-                JobCandidateSource::States,
-            );
-            ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
-        }
-        if filter.state.is_none_or(|state| state == JobState::Running) {
-            for slot in queue_storage_populated_claim_slots(&mut tx, store).await? {
-                let (sql, binds) = queue_storage_job_id_candidates_sql(
-                    store.schema(),
-                    filter,
-                    cursor,
-                    candidate_limit,
-                    JobCandidateSource::Receipts(slot),
-                );
-                ids.extend(fetch_queue_storage_job_candidates(&mut tx, &sql, binds).await?);
-            }
-        }
-        tx.commit().await?;
-        drop(begin_guard);
-        let ids: Vec<i64> = ids
-            .into_iter()
-            .rev()
-            .take(candidate_limit as usize)
-            .collect();
-        if ids.is_empty() {
-            break;
-        }
-
-        for job_id in &ids {
-            let Some(job) = store.load_job_without_output(pool, *job_id).await? else {
-                continue;
-            };
-
-            if let Some(state) = filter.state {
-                if job.state != state {
-                    continue;
-                }
-            }
-            if let Some(kind) = &filter.kind {
-                if &job.kind != kind {
-                    continue;
-                }
-            }
-            if let Some(queue) = &filter.queue {
-                if &job.queue != queue {
-                    continue;
-                }
-            }
-            if let Some(tag) = &filter.tag {
-                if !job.tags.iter().any(|job_tag| job_tag == tag) {
-                    continue;
-                }
-            }
-
-            jobs.push(job);
-            if jobs.len() as i64 >= limit {
-                break;
-            }
-        }
-
-        if jobs.len() as i64 >= limit || ids.len() < candidate_limit as usize {
-            break;
-        }
-        cursor = ids.last().copied();
-    }
-
-    jobs.sort_by_key(|job| std::cmp::Reverse(job.id));
-    Ok(jobs)
 }
 
 /// Retry a single failed, cancelled, or waiting_external job.
@@ -3548,6 +3096,10 @@ where
 }
 
 /// List jobs with optional filters.
+///
+/// Superseded by [`JobFilter`](crate::filter::JobFilter) and [`find_jobs`]
+/// (ADR-049), which add multiple tags and states, ids, created-at bounds and
+/// dead-lettered jobs, and keep paging out of the filter.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ListJobsFilter {
     pub state: Option<JobState>,
@@ -3558,36 +3110,92 @@ pub struct ListJobsFilter {
     pub limit: Option<i64>,
 }
 
-/// List jobs matching the given filter.
-pub async fn list_jobs(pool: &PgPool, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
-        return list_queue_storage_jobs(&store, pool, filter).await;
+impl ListJobsFilter {
+    /// The equivalent filter and page.
+    pub fn split(&self) -> (crate::filter::JobFilter, crate::filter::JobPage) {
+        let filter = crate::filter::JobFilter {
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            states: self.state.into_iter().collect(),
+            tags: self.tag.clone().into_iter().collect(),
+            ..Default::default()
+        };
+        let page = crate::filter::JobPage {
+            before_id: self.before_id,
+            limit: self.limit.unwrap_or(crate::filter::DEFAULT_PAGE_LIMIT),
+        };
+        (filter, page)
     }
+}
 
-    let limit = filter.limit.unwrap_or(100);
+/// List jobs matching the given filter.
+#[deprecated(
+    since = "0.7.0",
+    note = "use `find_jobs` with a `JobFilter` and `JobPage`"
+)]
+pub async fn list_jobs(pool: &PgPool, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError> {
+    let (filter, page) = filter.split();
+    find_jobs(pool, &filter, page).await
+}
 
-    let rows = sqlx::query_as::<_, JobRow>(
-        r#"
-        SELECT * FROM awa.jobs
-        WHERE ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
-          AND ($5::bigint IS NULL OR id < $5)
-        ORDER BY id DESC
-        LIMIT $6
-        "#,
+/// Jobs matching `filter`, newest first, one page at a time (ADR-049).
+///
+/// Each job appears once, in its current state. A job whose claim is in
+/// flight may be missed or shown in its previous state; keyset paging on ids
+/// never repeats a job across pages, though a job can change state between
+/// them.
+pub async fn find_jobs(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+    page: crate::filter::JobPage,
+) -> Result<Vec<JobRow>, AwaError> {
+    filter.validate()?;
+    crate::job_query::find(
+        pool,
+        filter,
+        &crate::job_query::ALL_STATES,
+        crate::job_query::Window::NewestFirst {
+            before_id: page.before_id,
+            limit: page.clamped_limit(),
+        },
     )
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.before_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    .await
+}
 
-    Ok(rows)
+/// [`find_jobs`], with DLQ metadata for each job that is dead-lettered, so
+/// a caller can send actions on it through the DLQ rather than the job
+/// endpoints.
+pub async fn find_jobs_with_source(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+    page: crate::filter::JobPage,
+) -> Result<Vec<(JobRow, Option<DlqMetadata>)>, AwaError> {
+    let jobs = find_jobs(pool, filter, page).await?;
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    let mut dlq = crate::dlq::dlq_metadata_for(pool, &ids).await?;
+    Ok(jobs
+        .into_iter()
+        .map(|job| {
+            let metadata = dlq.remove(&job.id);
+            (job, metadata)
+        })
+        .collect())
+}
+
+/// How many jobs `filter` selects: exact up to
+/// [`COUNT_CAP`](crate::filter::COUNT_CAP), otherwise at least that many.
+pub async fn count_jobs(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+) -> Result<crate::filter::JobCount, AwaError> {
+    filter.validate()?;
+    crate::job_query::count(
+        pool,
+        filter,
+        &crate::job_query::ALL_STATES,
+        Some(crate::filter::COUNT_CAP),
+    )
+    .await
 }
 
 /// Get a single job by ID.
