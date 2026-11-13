@@ -112,10 +112,17 @@ pub async fn sample(shared: Arc<Shared>, stop: Stop) {
 /// shape in which a runtime that buffers finished attempts grows without bound.
 pub async fn stall_completions(shared: Arc<Shared>) {
     let hold = shared.config.completion_stall;
+    if hold.is_zero() {
+        return;
+    }
     let Some(schema) = shared.info.queue_storage_schema.clone() else {
+        shared.note(
+            "memory",
+            "could not stall completions: no queue-storage schema",
+        );
         return;
     };
-    if hold.is_zero() || shared.load_stop.sleep(shared.config.load / 2).await {
+    if shared.load_stop.sleep(shared.config.load / 2).await {
         return;
     }
     let stalled = async {
@@ -236,6 +243,16 @@ pub fn evaluate(shared: &Shared, load_started_ms: i64) {
         stall_limit_mib: shared.config.completion_stall_memory_limit_mib,
     };
     match verdict.stall_rise_mib {
+        // A stall that was asked for but never held would otherwise pass unseen.
+        None if !shared.config.completion_stall.is_zero() => shared.violation(
+            "memory_growth_under_stall",
+            format!(
+                "AWA_SOAK_COMPLETION_STALL_SECONDS={} was set but no stall was measured; \
+                 see the memory notes in the timeline",
+                shared.config.completion_stall.as_secs()
+            ),
+            vec![],
+        ),
         Some(rise) if rise > verdict.stall_limit_mib => shared.violation(
             "memory_growth_under_stall",
             format!(
