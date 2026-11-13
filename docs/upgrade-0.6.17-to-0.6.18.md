@@ -1,6 +1,6 @@
 # Upgrading from 0.6.17 to 0.6.18
 
-0.6.18 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Every awa table gets a replica identity, so awa keeps working when its schema is in a logical-replication publication, and ring prune truncates only the partitions that hold rows.
+0.6.18 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Claims no longer lock the queue slot prune is retiring, so overlapping claims cannot stop the queue ring from rotating. Every awa table gets a replica identity, so awa keeps working when its schema is in a logical-replication publication, and ring prune truncates only the partitions that hold rows.
 
 Binaries and the migration can roll in either order.
 
@@ -14,7 +14,7 @@ Binaries and the migration can roll in either order.
      awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
    ```
 
-   On a 0.6.17 database the output reports `Schema patch replica_identity: applied`. Unlike the earlier 0.6 patches, it takes table locks; see [replica identity locks](#replica-identity-locks).
+   On a 0.6.17 database the output reports `Schema patch live_slot_claims: applied` and `Schema patch replica_identity: applied`. `live_slot_claims` replaces and creates functions only; see [per-slot claim functions](#per-slot-claim-functions). Unlike the earlier 0.6 patches, `replica_identity` takes table locks; see [replica identity locks](#replica-identity-locks).
 
 3. Roll workers, producers and admin processes to 0.6.18, in any order.
 
@@ -22,13 +22,39 @@ Binaries and the migration can roll in either order.
 
 ### External migration runners
 
-`awa migrate --sql --pending` prints `R__replica_identity` on a 0.6.17 database. Apply it as a repeatable script after `V40` and after the other `R__` scripts, as the owner of the awa and queue-storage tables. Extract the full set with:
+`awa migrate --sql --pending` prints `R__live_slot_claims` and `R__replica_identity` on a 0.6.17 database. Apply them as repeatable scripts after `V40`, `R__replica_identity` after the other `R__` scripts. Run `R__live_slot_claims` as the owner of the claim functions, or a role that can `SET ROLE` to it, and `R__replica_identity` as the owner of the awa and queue-storage tables. Extract the full set with:
 
 ```bash
 awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate --extract-to ./sql/awa --from 40
 ```
 
 Replace all `R__` files together with that set and keep previously applied `V` files unchanged.
+
+## Per-slot claim functions
+
+Before 0.6.18 every claim locked every partition of the queue ring, so while claims overlapped, queue prune never got its `ACCESS EXCLUSIVE` lock on the sealed slot it truncates: every attempt ended `skipped_busy`, the ring stopped rotating and the current slot kept growing (#721).
+
+The `live_slot_claims` patch, in every queue-storage schema with lease claim receipts:
+
+- replaces `<schema>.claim_ready_runtime` in place, with the same arguments, result, owner and privileges;
+- creates `<schema>.claim_slot_<n>(...)` for each queue slot, owned by the owner of `claim_ready_runtime` and with its `EXECUTE` grants. A runtime role that may call `claim_ready_runtime` may call these too.
+
+Each statement in the new functions names the partitions it reads, so a claim locks the slots it claims from and the segment partitions it routes through, not the whole ring. The patch takes no table lock. A claim in flight finishes on the old function. Schemas with `lease_claim_receipts = FALSE` keep their claim function and are not reported by `awa migrate`.
+
+A migrator that is not the function owner but can `SET ROLE` to it creates the functions as the owner and gets its own role back. One that cannot fails with `cannot act as that role`, and nothing changes.
+
+Once a 0.6.18 maintenance leader runs prune, it takes the retiring slot's barrier, an advisory lock, after checking that no lane has a ready row left in that slot, and holds it until the prune attempt ends. Patched claims leave that slot out meanwhile and never wait on the barrier. A lane whose claim cursor has not reached a segment outside the slot, or sits on a sequence gap, gets nothing until the attempt ends; expect such pauses of up to a few seconds per lane once per prune of a busy slot.
+
+Mixed fleets need no ordering:
+
+| Maintenance leader | Claim functions | Prune under overlapping claims |
+|---|---|---|
+| 0.6.17 | unpatched | starved, as on 0.6.17 |
+| 0.6.17 | patched | claims still lock the retiring slot's segment partition, so still starved |
+| 0.6.18 | unpatched | the barrier is taken but no claim reads it; as on 0.6.17 |
+| 0.6.18 | patched | prune wins |
+
+Heartbeats and completions from 0.6.17 runtimes still lock sealed slots until those runtimes are replaced.
 
 ## Replica identity locks
 
@@ -57,4 +83,4 @@ This part needs no migration and applies once the maintenance leader runs 0.6.18
 
 ## Rollback
 
-Roll binaries back to 0.6.17 in any order. Leave the patch in place: 0.6.17 runs unchanged against tables with a replica identity.
+Roll binaries back to 0.6.17 in any order. Leave the patches in place: 0.6.17 runs unchanged against the per-slot claim functions and against tables with a replica identity.
