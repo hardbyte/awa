@@ -455,6 +455,34 @@ async fn create_store_with_config(pool: &sqlx::PgPool, config: QueueStorageConfi
     store
 }
 
+/// Prune `slot`, retrying while it reports `Blocked` for that slot. Prune takes
+/// its locks NOWAIT, so a background session on the slot (autovacuum, or a
+/// hosted Postgres's own workers) blocks it; the maintenance loop retries the
+/// same way. Any other outcome, or `Blocked` past the deadline, is returned for
+/// the caller to assert on.
+async fn prune_retrying_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+    slot: i32,
+) -> PruneOutcome {
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(5));
+    loop {
+        let outcome = store
+            .prune_oldest(pool, retention)
+            .await
+            .expect("prune_oldest");
+        match outcome {
+            PruneOutcome::Blocked { slot: blocked }
+                if blocked == slot && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     // Tests that go through this helper exercise the legacy
     // (non-receipts) lease-materialization path. The receipts mode
@@ -15699,11 +15727,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_retrying_blocked(&store, &pool, Duration::from_secs(3600), 0).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
@@ -15747,11 +15771,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
 
     // Second prune: current slot is 0, so the oldest sealed non-current
     // slot is slot 1 (the carried row). It is carried again into slot 0.
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest re-carry")
-    {
+    match prune_retrying_blocked(&store, &pool, Duration::from_secs(3600), 1).await {
         PruneOutcome::Pruned {
             slot: 1,
             carried_failed_rows: 1,
@@ -18036,10 +18056,7 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         .await
         .expect("Failed to release reader lock");
 
-    let pruned = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune after reader lock release");
+    let pruned = prune_retrying_blocked(&store, &pool, Duration::ZERO, 0).await;
     assert!(
         matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
