@@ -133,6 +133,15 @@ pub fn ordering_key_hash64(ordering_key: &[u8]) -> u64 {
     hash as u64
 }
 
+/// SplitMix64 finalizer over an [`ordering_key_hash64`] value, used to pick
+/// a queue stripe.
+fn stripe_hash(hash: u64) -> u64 {
+    let mut z = hash;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// Deterministically map an ordering key to a shard in `[0, shards)`.
 ///
 /// Inputs sharing a key always produce the same shard, which is what
@@ -4290,8 +4299,8 @@ impl QueueStorage {
     /// A job with an `ordering_key` goes to the stripe its key hashes to,
     /// so jobs sharing a key share a stripe and keep their claim order;
     /// otherwise a `unique_key` picks the stripe the same way. The stripe
-    /// uses the high 32 bits of [`ordering_key_hash64`] and the enqueue
-    /// shard ([`shard_for_ordering_key`]) uses the hash modulo the shard
+    /// uses [`stripe_hash`] of [`ordering_key_hash64`] and the enqueue
+    /// shard ([`shard_for_ordering_key`]) uses the raw hash modulo the shard
     /// count, so the keys on one stripe still spread across every shard.
     /// A job with neither key takes `spread` when given (a job id),
     /// else the next value of the store's enqueue-stripe counter.
@@ -4308,7 +4317,7 @@ impl QueueStorage {
 
         let stripes = self.queue_stripe_count();
         let stripe = match ordering_key.or(unique_key) {
-            Some(key) => ((ordering_key_hash64(key) >> 32) % stripes as u64) as usize,
+            Some(key) => (stripe_hash(ordering_key_hash64(key)) % stripes as u64) as usize,
             None => match spread {
                 Some(value) => value.rem_euclid(stripes as i64) as usize,
                 None => self.next_enqueue_stripe.fetch_add(1, Ordering::Relaxed) % stripes,
