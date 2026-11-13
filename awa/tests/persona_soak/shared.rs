@@ -11,7 +11,7 @@ use awa::{JobRow, UntypedJobEvent};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +110,7 @@ pub struct Shared {
     pub info: ServerInfo,
     pub started: Instant,
     pub ledger: Ledger,
+    pub gate_proof: OnceLock<super::gate_proof::GateProof>,
     pub queues: QueueRegistry,
     pub budget: Budget,
     pub load_stop: Stop,
@@ -151,6 +152,7 @@ impl Shared {
             info,
             started: Instant::now(),
             ledger: Ledger::new(),
+            gate_proof: OnceLock::new(),
             queues: QueueRegistry::default(),
             budget,
             load_stop: Stop::new(),
@@ -300,6 +302,21 @@ impl Shared {
 
     /// Records the start of a handler. Hold the returned guard for the duration of
     /// `perform`; dropping it, including when the runtime is killed, ends the execution.
+    pub async fn record_completed_return(&self, persona: Persona, job: &JobRow) {
+        if let Some(proof) = self.gate_proof.get() {
+            let started = Instant::now();
+            if let Err(error) = proof.returned_completed(job, persona.name()).await {
+                self.incomplete(error, vec![]);
+                self.run.add("gate_handler_return_write_failures", 1);
+            }
+            self.run.add(
+                "gate_handler_return_write_us",
+                started.elapsed().as_micros().min(i64::MAX as u128) as i64,
+            );
+        }
+        self.ledger.mark(job.id, flag::RETURNED_COMPLETED);
+    }
+
     pub fn begin_execution(
         self: &Arc<Self>,
         persona: Persona,

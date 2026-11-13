@@ -18,7 +18,11 @@ const HEADROOM: u32 = 14;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
-    let maintenance_metrics = super::maintenance_metrics::install();
+    super::gate_metrics::install("parent")?;
+    // OTLP capture, when on, owns the global meter provider, and its collector also
+    // receives the maintenance metrics, so the in-memory capture is only for runs without it.
+    let maintenance_metrics =
+        (!super::gate_metrics::active()).then(super::maintenance_metrics::install);
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -57,6 +61,9 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         ));
     }
     let shared = Shared::new(config, info, budget);
+    if super::gate_proof::enabled_from_env()? {
+        super::gate_proof::GateProof::install(&shared).await?;
+    }
 
     // The UI personas talk to the real admin server, run as a child process.
     let ui_personas = [
@@ -255,6 +262,13 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         server.stop();
     }
     super::worker_errors::reconcile(&shared, &worker_errors).await;
+    super::gate_proof::reconcile(&shared).await;
+    if let Some(proof) = shared.gate_proof.get() {
+        if let Err(error) = proof.close().await {
+            shared.incomplete(error, vec![]);
+        }
+    }
+    super::gate_metrics::reconcile(&shared);
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
@@ -264,7 +278,10 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     if let Err(error) = report::write(&shared, &outcome) {
         eprintln!("could not write the report: {error}");
     }
-    if let Err(error) = maintenance_metrics.write(&shared.config.report_dir) {
+    if let Some(Err(error)) = maintenance_metrics
+        .as_ref()
+        .map(|capture| capture.write(&shared.config.report_dir))
+    {
         eprintln!("could not write the maintenance metrics: {error}");
     }
     oracle_pool.close().await;

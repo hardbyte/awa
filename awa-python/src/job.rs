@@ -86,6 +86,7 @@ pub struct PyJob {
     pub priority: i16,
     #[pyo3(get)]
     pub attempt: i16,
+    #[pyo3(get)]
     pub run_lease: i64,
     #[pyo3(get)]
     pub max_attempts: i16,

@@ -79,6 +79,7 @@ pub struct AbandonCanaryJob {
 /// The worker in the child process: records every start in the child ledger and then
 /// holds the job until the process is killed.
 struct ChildWorker {
+    gate_proof: Option<super::super::gate_proof::GateProof>,
     generation: u32,
     ledger: Mutex<std::fs::File>,
     active: Arc<AtomicI64>,
@@ -108,6 +109,15 @@ impl Worker for ChildWorker {
         let now = self.active.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak.fetch_max(now, Ordering::Relaxed);
         tokio::time::sleep(HOLD).await;
+        if let Some(proof) = &self.gate_proof {
+            if proof
+                .returned_completed(&ctx.job, "abandon_child")
+                .await
+                .is_err()
+            {
+                eprintln!("{}", super::super::gate_proof::ERROR_MARKER);
+            }
+        }
         self.active.fetch_sub(1, Ordering::Relaxed);
         Ok(JobResult::Completed)
     }
@@ -125,6 +135,10 @@ pub async fn run_child() {
         return;
     };
     super::super::worker_errors::install(true).expect("child worker error tracing");
+    if let Err(error) = super::super::gate_metrics::install("claim_child") {
+        eprintln!("{}", super::super::gate_metrics::ERROR_MARKER);
+        panic!("child telemetry setup: {error}");
+    }
     let generation: u32 = generation.parse().expect("generation");
     let workers: u32 = workers.parse().expect("workers");
     let pool_size: u32 = std::env::var(ENV_POOL)
@@ -151,6 +165,13 @@ pub async fn run_child() {
         .expect("child ledger");
     let active = Arc::new(AtomicI64::new(0));
     let peak = Arc::new(AtomicI64::new(0));
+    let gate_proof = match super::super::gate_proof::GateProof::child().await {
+        Ok(proof) => proof,
+        Err(error) => {
+            eprintln!("{}", super::super::gate_proof::ERROR_MARKER);
+            panic!("claim child proof setup failed: {error}");
+        }
+    };
     let claiming = |deadline_duration: Duration| QueueConfig {
         max_workers: workers,
         poll_interval: Duration::from_millis(50),
@@ -169,23 +190,36 @@ pub async fn run_child() {
                 .unwrap_or(default),
         )
     };
-    let client = timings(
-        Client::builder(pool)
-            .queue(QUEUE_PLAIN, claiming(Duration::ZERO))
-            .queue(QUEUE_DEADLINE, claiming(DEADLINE))
-            .register_worker(ChildWorker {
-                generation,
-                ledger: Mutex::new(file),
-                active: active.clone(),
-                peak: peak.clone(),
-            }),
-        seconds(ENV_HEARTBEAT, DEFAULT_HEARTBEAT_SECONDS),
-        seconds(ENV_STALENESS, DEFAULT_STALENESS_SECONDS),
+    let metrics_identity = super::super::gate_metrics::begin_host(
+        Persona::ClaimAbandon,
+        &format!("abandon_child_{generation}"),
+        &format!("soak_abandon_{generation}"),
     )
-    .leader_election_interval(Duration::from_secs(3600))
-    .build()
-    .expect("build child client");
+    .unwrap_or_else(|error| {
+        eprintln!("{}", super::super::gate_metrics::ERROR_MARKER);
+        panic!("child telemetry identity: {error}")
+    });
+    let client = super::super::gate_metrics::build_client(metrics_identity.as_ref(), || {
+        timings(
+            Client::builder(pool)
+                .queue(QUEUE_PLAIN, claiming(Duration::ZERO))
+                .queue(QUEUE_DEADLINE, claiming(DEADLINE))
+                .register_worker(ChildWorker {
+                    gate_proof,
+                    generation,
+                    ledger: Mutex::new(file),
+                    active: active.clone(),
+                    peak: peak.clone(),
+                }),
+            seconds(ENV_HEARTBEAT, DEFAULT_HEARTBEAT_SECONDS),
+            seconds(ENV_STALENESS, DEFAULT_STALENESS_SECONDS),
+        )
+        .leader_election_interval(Duration::from_secs(3600))
+        .build()
+        .expect("build child client")
+    });
     client.start().await.expect("start child client");
+    super::super::gate_metrics::lifecycle(metrics_identity.as_ref(), "host_started");
     println!("READY gen={generation}");
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -221,8 +255,8 @@ impl Worker for FinisherWorker {
             },
         );
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::ClaimAbandon, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }
@@ -246,8 +280,8 @@ impl Worker for CanaryWorker {
             .stats(Persona::ClaimAbandon)
             .observe("canary_wait_ms", waited);
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::ClaimAbandon, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }
@@ -287,6 +321,18 @@ fn spawn_child(
             "--test-threads=1",
         ])
         .env(ENV_URL, url)
+        .env(
+            super::super::gate_proof::ENV_ENABLED,
+            if shared.gate_proof.get().is_some() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            super::super::gate_proof::ENV_URL,
+            super::super::gate_proof::GateProof::owned_url(shared),
+        )
         .env(ENV_GENERATION, generation.to_string())
         .env(ENV_LEDGER, ledger)
         .env(ENV_WORKERS, workers_per_queue.to_string())
@@ -341,6 +387,12 @@ fn spawn_child(
 }
 
 fn absorb_output(shared: &Shared, line: &str) {
+    if super::super::gate_proof::absorb_error(shared, line) {
+        return;
+    }
+    if super::super::gate_metrics::absorb_output(shared, line) {
+        return;
+    }
     if super::super::worker_errors::absorb_child_marker(line) {
         return;
     }

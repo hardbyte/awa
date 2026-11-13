@@ -171,6 +171,7 @@ impl Oracle {
     }
 
     async fn check_terminal_uniqueness(&mut self) {
+        super::gate_proof::check_lease_duplicates(&self.shared).await;
         let schema = schema(&self.shared);
         let terminal = terminal_cte(&schema);
         let started = std::time::Instant::now();
@@ -762,14 +763,25 @@ impl Oracle {
         let mut lost = Vec::new();
         let mut lost_after_run = Vec::new();
         let mut terminal_in_db = 0usize;
+        let gate_proof = self.shared.gate_proof.get().is_some();
+        let completed = if gate_proof {
+            "SELECT job_id, 'audit_completed', run_lease FROM public.awa_soak_completed_inserts WHERE job_id = ANY($1)".to_string()
+        } else {
+            format!("SELECT b.job_id, 'receipt_completed', b.run_lease
+                      FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids, c.run_leases) AS b(job_id, run_lease)
+                      WHERE c.job_ids && $1 AND b.job_id = ANY($1)")
+        };
+        let done_filter = if gate_proof {
+            "AND state <> 'completed'"
+        } else {
+            ""
+        };
         for chunk in unresolved.chunks(5000) {
             let found: Result<Vec<(i64, String, Option<i64>)>, _> = sqlx::query_as(&format!(
                 "SELECT job_id, string_agg(place, ','), max(terminal_run_lease) FROM (
-                    SELECT job_id, 'done:' || state::text AS place, run_lease AS terminal_run_lease FROM {schema}.done_entries WHERE job_id = ANY($1)
+                    SELECT job_id, 'done:' || state::text AS place, run_lease AS terminal_run_lease FROM {schema}.done_entries WHERE job_id = ANY($1) {done_filter}
                     UNION ALL SELECT job_id, 'dlq', run_lease FROM {schema}.dlq_entries WHERE job_id = ANY($1)
-                    UNION ALL SELECT b.job_id, 'receipt_completed', b.run_lease
-                      FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids, c.run_leases) AS b(job_id, run_lease)
-                      WHERE c.job_ids && $1 AND b.job_id = ANY($1)
+                    UNION ALL {completed}
                     UNION ALL SELECT job_id, 'deferred:' || state::text, NULL::bigint FROM {schema}.deferred_jobs WHERE job_id = ANY($1)
                     UNION ALL SELECT job_id, 'ready', NULL::bigint FROM {schema}.ready_entries WHERE job_id = ANY($1)
                     UNION ALL SELECT job_id, 'leased:' || state::text, NULL::bigint FROM {schema}.leases WHERE job_id = ANY($1)
@@ -1159,6 +1171,9 @@ mod tests {
         }
 
         async fn drop(self) {
+            if let Some(proof) = self.shared.gate_proof.get() {
+                proof.close().await.expect("close proof pool");
+            }
             self.pool.close().await;
             let admin = db::connect_pool(&self.shared.config.admin_url(), "oracle_cleanup", 1)
                 .await
@@ -1426,6 +1441,220 @@ mod tests {
             1,
             "the failed lookup chunk must be accounted for"
         );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_handler_return_without_finalization_cannot_gain_terminal_proof() {
+        let mut run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.shared
+            .record_completed_return(Persona::Priya, &run.claim.job)
+            .await;
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM public.awa_soak_handler_returns),
+                    (SELECT count(*) FROM public.awa_soak_completed_inserts)",
+        )
+        .fetch_one(&run.pool)
+        .await
+        .expect("read independent witnesses");
+        assert_eq!(counts, (1, 0));
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        assert!(!run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("record")
+            .has_durable_terminal());
+        run.oracle.final_check(true).await;
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|row| row.kind == "stuck_job"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_completed_audit_survives_compact_and_materialized_terminal_pruning() {
+        for materialized in [false, true] {
+            let mut run = TestRun::create().await;
+            super::super::gate_proof::GateProof::install(&run.shared)
+                .await
+                .expect("install gate proof");
+            run.shared
+                .record_completed_return(Persona::Priya, &run.claim.job)
+                .await;
+            if materialized {
+                run.store
+                    .register_callback(
+                        &run.pool,
+                        run.claim.job.id,
+                        run.claim.job.run_lease,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("materialize receipt claim");
+            }
+            run.store
+                .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+                .await
+                .expect("complete");
+            let shape: String = sqlx::query_scalar("SELECT writer_shape FROM public.awa_soak_completed_inserts WHERE job_id=$1 AND run_lease=$2")
+                .bind(run.claim.job.id).bind(run.claim.job.run_lease).fetch_one(&run.pool).await.expect("audit insert");
+            assert_eq!(
+                shape,
+                if materialized {
+                    "done"
+                } else {
+                    "receipt_batch"
+                }
+            );
+            run.store
+                .reset(&run.pool)
+                .await
+                .expect("remove retained product evidence");
+            super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+            assert!(run
+                .shared
+                .ledger
+                .get(run.claim.job.id)
+                .expect("record")
+                .has_durable_terminal());
+            run.oracle.final_check(true).await;
+            super::super::gate_proof::reconcile(&run.shared).await;
+            assert_eq!(run.shared.run.get("gate_completed_unique_pairs"), 1);
+            assert!(run.shared.violations.lock().expect("violations").is_empty());
+            run.drop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_duplicate_completed_insert_evidence_is_visible_and_fatal() {
+        let run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete");
+        sqlx::query("INSERT INTO public.awa_soak_completed_inserts(job_id,run_lease,attempt,queue,writer_shape)
+                     SELECT job_id,run_lease,attempt,queue,writer_shape FROM public.awa_soak_completed_inserts")
+            .execute(&run.pool).await.expect("inject duplicate without pair uniqueness");
+        super::super::gate_proof::reconcile(&run.shared).await;
+        assert_eq!(run.shared.run.get("gate_completed_insert_rows"), 2);
+        assert_eq!(run.shared.run.get("gate_completed_unique_pairs"), 1);
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|row| row.kind == "duplicate_completed_inserts"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_materialized_lease_duplicate_is_visible_without_counting_receipts() {
+        let run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .register_callback(
+                &run.pool,
+                run.claim.job.id,
+                run.claim.job.run_lease,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("materialize receipt claim");
+        super::super::gate_proof::check_lease_duplicates(&run.shared).await;
+        assert!(run.shared.violations.lock().expect("violations").is_empty());
+        sqlx::query(
+            "INSERT INTO awa.leases SELECT (jsonb_populate_record(NULL::awa.leases,
+                     to_jsonb(lease)||jsonb_build_object('lane_seq',lease.lane_seq+1000000))).*
+                     FROM awa.leases AS lease WHERE job_id=$1 AND run_lease=$2",
+        )
+        .bind(run.claim.job.id)
+        .bind(run.claim.job.run_lease)
+        .execute(&run.pool)
+        .await
+        .expect("inject second materialized lease");
+        super::super::gate_proof::check_lease_duplicates(&run.shared).await;
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|row| row.kind == "duplicate_materialized_leases"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_imported_no_events_sample_with_unknown_lease_recovers_pruned_audit() {
+        let mut run = TestRun::create().await;
+        assert_eq!(
+            run.claim
+                .job
+                .id
+                .rem_euclid(super::super::ledger::TERMINAL_PROOF_STRIDE),
+            0
+        );
+        assert!(samples_terminal_proof(run.claim.job.id));
+        run.shared.ledger.with(
+            run.claim.job.id,
+            || unreachable!("registered"),
+            |record| {
+                let mut imported = JobRecord::new(
+                    Persona::ClaimAbandon,
+                    record.queue,
+                    0,
+                    expect::COMPLETED,
+                    flag::NO_EVENTS,
+                );
+                imported.executions = 1;
+                imported.max_attempt = run.claim.job.attempt;
+                *record = imported;
+            },
+        );
+        let imported = run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("imported start");
+        assert_eq!(imported.latest_run_lease, 0);
+        assert!(!imported.has(flag::RETURNED_COMPLETED));
+        assert!(!imported.has_durable_terminal());
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete actual attempt");
+        run.store
+            .reset(&run.pool)
+            .await
+            .expect("remove retained product evidence");
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        let observed = run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("observed sample");
+        assert_eq!(observed.latest_run_lease, 0);
+        assert_eq!(observed.terminal_run_lease, Some(run.claim.job.run_lease));
+        assert!(observed.has_durable_terminal());
+        run.oracle.final_check(true).await;
+        assert!(!run.shared.oracle_incomplete.load(Ordering::Relaxed));
+        assert!(run.shared.violations.lock().expect("violations").is_empty());
         run.drop().await;
     }
 }

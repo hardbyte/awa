@@ -221,6 +221,7 @@ pub type ClientFactory = Arc<dyn Fn(PgPool) -> Client + Send + Sync>;
 /// shutdown handshake and the connections drop.
 pub struct ClientHost {
     pub label: String,
+    metrics_identity: Option<super::gate_metrics::HostIdentity>,
     /// Always `Some` until the host is stopped or dropped.
     runtime: Option<tokio::runtime::Runtime>,
     client: Arc<Client>,
@@ -231,15 +232,24 @@ impl ClientHost {
     pub async fn spawn(
         url: String,
         label: String,
+        persona: Persona,
         pool_size: u32,
         worker_threads: usize,
         factory: ClientFactory,
     ) -> Result<Self, String> {
         let thread_label = label.clone();
         tokio::task::spawn_blocking(move || {
+            let metrics_identity = super::gate_metrics::begin_host(
+                persona,
+                &thread_label,
+                &format!("soak_{thread_label}"),
+            )?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(worker_threads)
-                .thread_name(format!("soak-{thread_label}"))
+                .thread_name(super::gate_metrics::thread_name(
+                    metrics_identity.as_ref(),
+                    &format!("soak-{thread_label}"),
+                ))
                 .enable_all()
                 .build()
                 .map_err(|error| format!("build runtime: {error}"))?;
@@ -247,15 +257,19 @@ impl ClientHost {
                 let pool = connect_pool(&url, &format!("soak_{thread_label}"), pool_size)
                     .await
                     .map_err(|error| format!("connect pool: {error}"))?;
-                let client = factory(pool.clone());
+                let client = super::gate_metrics::build_client(metrics_identity.as_ref(), || {
+                    factory(pool.clone())
+                });
                 client
                     .start()
                     .await
                     .map_err(|error| format!("start client: {error}"))?;
                 Ok::<_, String>((pool, client))
             })?;
+            super::gate_metrics::lifecycle(metrics_identity.as_ref(), "host_started");
             Ok(Self {
                 label: thread_label,
+                metrics_identity,
                 runtime: Some(runtime),
                 client: Arc::new(client),
                 pool,
@@ -275,6 +289,7 @@ impl ClientHost {
 
     /// Graceful stop: stop claiming, drain in-flight jobs, then close the pool.
     pub async fn shutdown(mut self, timeout: Duration) {
+        super::gate_metrics::lifecycle(self.metrics_identity.as_ref(), "shutdown_requested");
         let Some(runtime) = self.runtime.take() else {
             return;
         };
@@ -288,10 +303,15 @@ impl ClientHost {
             })
             .await;
         runtime.shutdown_background();
+        super::gate_metrics::lifecycle(
+            self.metrics_identity.as_ref(),
+            "shutdown_returned_background_requested",
+        );
     }
 
     /// Abrupt stop: no shutdown handshake, as when a process is killed.
     pub fn kill(self) {
+        super::gate_metrics::lifecycle(self.metrics_identity.as_ref(), "kill_requested");
         drop(self);
     }
 }
@@ -359,6 +379,7 @@ mod tests {
             .expect("host runtime");
         let host = ClientHost {
             label: "host_drop".to_string(),
+            metrics_identity: None,
             runtime: Some(runtime),
             client: Arc::new(client),
             pool,

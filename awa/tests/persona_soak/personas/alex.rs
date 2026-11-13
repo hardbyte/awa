@@ -52,8 +52,8 @@ impl Worker for AlexWorker {
             return Err(JobError::retryable_msg("interrupted"));
         }
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Alex, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }
@@ -675,7 +675,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
 
     let diagnostics = connect_pool(
         &shared.config.database_url,
-        "soak_alex_diagnostics",
+        "awa_alex_diagnostics",
         shared.budget.reserve("alex-diagnostics", 1, 1),
     )
     .await

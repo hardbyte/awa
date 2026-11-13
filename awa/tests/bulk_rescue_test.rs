@@ -15,7 +15,7 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +35,8 @@ static BACKLOG_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What each run of a job saw, by job id.
 type RunsByJob<T> = HashMap<i64, Vec<T>>;
+/// The `(job_id, run_lease)` of every attempt a handler ran.
+type HandledAttempts = Arc<Mutex<HashSet<(i64, i64)>>>;
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct AbandonedJob {
@@ -412,6 +414,59 @@ impl Drop for BulkRescueDatabase {
     }
 }
 
+/// Installs the persona soak's completion witness: triggers that copy every
+/// committed completion, receipt or materialized, into a plain table that
+/// prune never touches.
+async fn install_completion_witness(pool: &PgPool) {
+    sqlx::raw_sql(&include_str!("persona_soak/gate_proof.sql").replace("__SCHEMA__", "awa"))
+        .execute(pool)
+        .await
+        .expect("install completion witness");
+}
+
+/// Committed completions of `queue` as `(job_id, run_lease, attempt)`, one row
+/// per completion written, so a repeated completion shows up twice.
+async fn witnessed_completions(pool: &PgPool, queue: &str) -> Vec<(i64, i64, i16)> {
+    sqlx::query_as(
+        "SELECT job_id, run_lease, attempt FROM public.awa_soak_completed_inserts
+         WHERE queue = $1 ORDER BY job_id, run_lease",
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("witnessed completions")
+}
+
+/// Asserts the witnessed completions are exactly the attempts the handlers
+/// returned from, once each and all on `attempt`, and returns their job ids.
+fn assert_completed_exactly(
+    witnessed: &[(i64, i64, i16)],
+    returned: &HashSet<(i64, i64)>,
+    attempt: i16,
+) -> HashSet<i64> {
+    let pairs: HashSet<(i64, i64)> = witnessed
+        .iter()
+        .map(|(id, lease, _)| (*id, *lease))
+        .collect();
+    let ids: HashSet<i64> = witnessed.iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(witnessed.len(), pairs.len(), "an attempt completed twice");
+    assert_eq!(witnessed.len(), ids.len(), "a job completed more than once");
+    assert_eq!(
+        &pairs, returned,
+        "committed completions differ from handler returns"
+    );
+    let other_attempts: Vec<_> = witnessed
+        .iter()
+        .filter(|(_, _, observed)| *observed != attempt)
+        .take(5)
+        .collect();
+    assert!(
+        other_attempts.is_empty(),
+        "completed on an attempt other than {attempt}: {other_attempts:?}"
+    );
+    ids
+}
+
 /// A client on its own Tokio runtime, so it can be killed the way SIGKILL
 /// would: every task is dropped mid-flight, no shutdown runs, and its
 /// connections close with their transactions rolled back.
@@ -495,6 +550,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
 
     let db = BulkRescueDatabase::create().await;
     let pool = db.pool().clone();
+    install_completion_witness(&pool).await;
     let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
     let claim_slots = store.claim_slot_count() as i64;
 
@@ -512,10 +568,12 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         .await
         .expect("live pool");
     let live_runs: Arc<Mutex<RunsByJob<i16>>> = Arc::default();
+    let live_attempts: HandledAttempts = Arc::default();
     // The live runtime leads maintenance, so it sees every rescue.
     let rescues: Arc<Mutex<RunsByJob<(&'static str, i16)>>> = Arc::default();
     let live = {
         let live_runs = live_runs.clone();
+        let live_attempts = live_attempts.clone();
         let live_rescues = rescues.clone();
         let abandoned_rescues = rescues.clone();
         queue_storage_builder(&live_pool, staleness, heartbeat_interval)
@@ -562,6 +620,10 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
                     .entry(ctx.job.id)
                     .or_default()
                     .push(ctx.job.attempt);
+                live_attempts
+                    .lock()
+                    .expect("live attempts")
+                    .insert((ctx.job.id, ctx.job.run_lease));
                 async move {
                     tokio::time::sleep(Duration::from_millis(job.hold_ms)).await;
                     Ok(JobResult::Completed)
@@ -760,6 +822,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
 
     // A fresh runtime runs every retried job exactly once, on its second attempt.
     let recovered: Arc<Mutex<RunsByJob<(i16, bool)>>> = Arc::default();
+    let recovered_attempts: HandledAttempts = Arc::default();
     let recovery_pool = PgPoolOptions::new()
         .max_connections(20)
         .connect(&db.url())
@@ -767,6 +830,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         .expect("recovery pool");
     let recovery = {
         let recovered = recovered.clone();
+        let recovered_attempts = recovered_attempts.clone();
         queue_storage_builder(&recovery_pool, staleness, heartbeat_interval)
             .queue(
                 ABANDONED_QUEUE,
@@ -795,6 +859,10 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
                     .entry(ctx.job.id)
                     .or_default()
                     .push((ctx.job.attempt, rescue_recorded));
+                recovered_attempts
+                    .lock()
+                    .expect("recovered attempts")
+                    .insert((ctx.job.id, ctx.job.run_lease));
                 async { Ok(JobResult::Completed) }
             })
             .build()
@@ -815,6 +883,15 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
         || async {
             running(&pool, &store, ABANDONED_QUEUE).await == 0
                 && waiting_retry_counts(&pool, ABANDONED_QUEUE).await == (0, 0)
+                && count(
+                    &pool,
+                    format!(
+                        "SELECT count(*) FROM public.awa_soak_completed_inserts
+                         WHERE queue = '{ABANDONED_QUEUE}'"
+                    ),
+                )
+                .await
+                    >= ABANDONED - exhausted
         },
     )
     .await;
@@ -865,6 +942,48 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
             "neither live nor recovered attempts may be rescued: {unexpected:?}"
         );
     }
+
+    // Prune has had time to drop many of these completions, so the witness,
+    // not the queue tables, shows which attempts committed.
+    let recovered_ids = assert_completed_exactly(
+        &witnessed_completions(&pool, ABANDONED_QUEUE).await,
+        &recovered_attempts.lock().expect("recovered attempts"),
+        2,
+    );
+    let live_ids = assert_completed_exactly(
+        &witnessed_completions(&pool, LIVE_QUEUE).await,
+        &live_attempts.lock().expect("live attempts"),
+        1,
+    );
+    assert_eq!(
+        live_ids.len(),
+        produced,
+        "every live job committed its completion"
+    );
+    let dead_lettered: HashSet<i64> = sqlx::query_scalar(
+        "SELECT job_id FROM awa.dlq_entries WHERE queue = $1 AND dlq_reason = 'heartbeat_stale'",
+    )
+    .bind(ABANDONED_QUEUE)
+    .fetch_all(&pool)
+    .await
+    .expect("dead-lettered abandoned jobs")
+    .into_iter()
+    .collect();
+    assert!(
+        dead_lettered.is_disjoint(&recovered_ids),
+        "a job was both dead-lettered and completed"
+    );
+    let abandoned_outcomes: HashSet<i64> = dead_lettered.union(&recovered_ids).copied().collect();
+    assert_eq!(
+        abandoned_outcomes,
+        rescues
+            .lock()
+            .expect("rescues")
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>(),
+        "every rescued job ends exactly once, dead-lettered or completed"
+    );
     let live_runs = live_runs.lock().expect("live runs");
     assert_eq!(live_runs.len(), produced, "every live job ran");
     let rerun: Vec<_> = live_runs
