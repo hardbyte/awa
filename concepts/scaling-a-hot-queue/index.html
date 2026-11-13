@@ -2524,7 +2524,7 @@
 <tr>
 <td><code>queue_stripe_count</code></td>
 <td>every logical queue into physical stripes <code>queue#0</code>, <code>queue#1</code>, …</td>
-<td>order only within a stripe</td>
+<td>order only within a stripe; jobs sharing an <code>ordering_key</code> share a stripe</td>
 <td>storage configuration, for the whole fleet</td>
 </tr>
 <tr>
@@ -2537,7 +2537,7 @@
 </table>
 <p><strong>Enqueue shards</strong> keep one queue name for operators and spread it over up to 64 lanes per priority. A producer picks a shard by hashing the job's ordering key, so jobs with the same key stay in order; without a key, each producer moves to the next shard for each batch. Lowering the shard count is safe at any time. See <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head</a>.</p>
 <p><strong><code>PartitionedQueue</code></strong> spreads one logical workload over physical queues named <code>email</code>, <code>email__p1</code>, <code>email__p2</code> and so on. Each partition is a complete queue, so worker capacity and rate limits apply per partition: four partitions of 32 workers allow 128. It also routes by key, keeping jobs with the same key in one partition and in order. See <a href="../../configuration/#partitioned-queues">Partitioned queues</a>.</p>
-<p><strong>Queue stripes</strong> are a storage-engine setting that splits every queue the same way, for fleets of many small replicas contending on one queue. Producers that write to queue storage directly must use the same stripe count as the workers, or their jobs land in a queue the workers never claim from.</p>
+<p><strong>Queue stripes</strong> are a storage-engine setting that splits every queue the same way, for fleets of many small replicas contending on one queue. Producers that write to queue storage directly should use the same stripe count as the workers. Workers also claim from the unstriped <code>queue</code>, which SQL compatibility inserts and unstriped producers write, but jobs there do not share the stripes' load spreading, and an <code>ordering_key</code> keeps its order only across producers with the same stripe count.</p>
 <p><strong>Claimers</strong> add claim loops inside one runtime. They share the queue's worker permits and rate limit, so they help only when a single loop cannot keep the workers busy. They add transactions without adding lanes, and in measured hot-queue shapes more claimers made tail latency worse.</p>
 <h2 id="which-to-try-first">Which to try first<a class="headerlink" href="#which-to-try-first" title="Permanent link">&para;</a></h2>
 <ol>
