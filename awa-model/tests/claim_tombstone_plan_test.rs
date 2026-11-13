@@ -52,9 +52,59 @@ async fn claim_tombstone_upgrade_keeps_bounded_claims_on_index_probes(pool: PgPo
             assert_ne!(&old, definition, "fixture must restore the old lookup");
             sqlx::raw_sql(audited_sql(old)).execute(&pool).await?;
         }
+
+        // Functions that share a claim function's name but are not one the
+        // installer made, each with an unfenced check: an overload of the
+        // runtime and of slot 0, and a slot beyond the installed slot count.
+        // The migration must leave all three alone.
+        let decoy_body = format!(
+            "RETURNS boolean LANGUAGE sql AS $decoy$
+             SELECT EXISTS (
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb, {schema}.ready_entries AS ready
+                 WHERE tomb.queue = ready.queue
+                   AND tomb.lane_seq = ready.lane_seq
+             ) $decoy$;"
+        );
+        sqlx::raw_sql(audited_sql(format!(
+            "CREATE FUNCTION {schema}.claim_ready_runtime(p_queue text) {decoy_body}
+             CREATE FUNCTION {schema}.claim_ready_slot_0(p_queue text) {decoy_body}
+             CREATE FUNCTION {schema}.claim_ready_slot_7(
+                 text, int, bigint, smallint, smallint, bigint, bigint,
+                 double precision, timestamptz, timestamptz, double precision, bigint
+             ) {decoy_body}"
+        )))
+        .execute(&pool)
+        .await?;
+        let decoys = "SELECT p.oid::bigint, pg_get_functiondef(p.oid)
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = $1 AND p.prorettype = 'boolean'::regtype
+               AND (p.proname = 'claim_ready_runtime'
+                    OR p.proname ~ '^claim_ready_slot_[0-9]+$')
+             ORDER BY p.oid";
+        let decoys_before: Vec<(i64, String)> =
+            sqlx::query_as(decoys).bind(schema).fetch_all(&pool).await?;
+        assert_eq!(decoys_before.len(), 3);
+
         for (_, _, sql) in migrations::migration_sql_range(59, 60) {
             sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
         }
+
+        let decoys_after: Vec<(i64, String)> =
+            sqlx::query_as(decoys).bind(schema).fetch_all(&pool).await?;
+        assert_eq!(
+            decoys_before, decoys_after,
+            "{schema}: only the installed claim functions are rewritten"
+        );
+        sqlx::raw_sql(audited_sql(format!(
+            "DROP FUNCTION {schema}.claim_ready_runtime(text);
+             DROP FUNCTION {schema}.claim_ready_slot_0(text);
+             DROP FUNCTION {schema}.claim_ready_slot_7(
+                 text, int, bigint, smallint, smallint, bigint, bigint,
+                 double precision, timestamptz, timestamptz, double precision, bigint
+             );"
+        )))
+        .execute(&pool)
+        .await?;
         for (oid, _) in &functions {
             let upgraded: String = sqlx::query_scalar("SELECT pg_get_functiondef($1::oid)")
                 .bind(*oid)

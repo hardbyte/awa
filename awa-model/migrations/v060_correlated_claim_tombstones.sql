@@ -9,8 +9,9 @@
 --
 -- V23_UP writes the fenced check into new substrates. This file rewrites the
 -- claim functions already installed in the default and every discovered custom
--- queue-storage schema: <schema>.claim_ready_runtime and each
--- <schema>.claim_ready_slot_<n> from v051. It replaces each function from its
+-- queue-storage schema: <schema>.claim_ready_runtime and the
+-- <schema>.claim_ready_slot_<n> from v051 for each installed queue slot, each
+-- found by its exact signature. It replaces each function from its
 -- own definition, so signature, owner, privileges and settings are unchanged,
 -- and a function that already carries the fence (a fresh install, a replay, or
 -- a database coming from 0.6.17, whose correlated_claim_tombstones schema
@@ -34,6 +35,7 @@
 DO $$
 DECLARE
     v_schema TEXT;
+    v_queue_slots INT;
     v_function RECORD;
     v_definition TEXT;
     v_updated TEXT;
@@ -47,17 +49,37 @@ BEGIN
         PERFORM pg_advisory_xact_lock(
             hashtextextended(format('awa.queue_storage.install:%I', v_schema), 0)
         );
+        IF to_regclass(format('%I.queue_ring_state', v_schema)) IS NULL THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format(
+            'SELECT slot_count FROM %I.queue_ring_state WHERE singleton = TRUE',
+            v_schema
+        )
+        INTO v_queue_slots;
+
+        -- Only the installer's functions: claim_ready_runtime and the
+        -- claim_ready_slot_<n> for each installed queue slot, each by its
+        -- exact signature. Another function that shares one of these names
+        -- is not touched.
         FOR v_function IN
-            SELECT p.oid
-            FROM pg_proc AS p
-            JOIN pg_namespace AS n ON n.oid = p.pronamespace
-            WHERE n.nspname = v_schema
-              AND p.prokind = 'f'
-              AND (p.proname = 'claim_ready_runtime'
-                   OR p.proname ~ '^claim_ready_slot_[0-9]+$')
-            ORDER BY p.oid
+            SELECT candidate.proc
+            FROM (
+                SELECT to_regprocedure(format(
+                    '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+                    v_schema
+                )) AS proc
+                UNION ALL
+                SELECT to_regprocedure(format(
+                    '%I.claim_ready_slot_%s(text,int,bigint,smallint,smallint,bigint,bigint,double precision,timestamptz,timestamptz,double precision,bigint)',
+                    v_schema,
+                    slot
+                ))
+                FROM generate_series(0, COALESCE(v_queue_slots, 0) - 1) AS slot
+            ) AS candidate
+            WHERE candidate.proc IS NOT NULL
         LOOP
-            v_definition := pg_get_functiondef(v_function.oid);
+            v_definition := pg_get_functiondef(v_function.proc::oid);
             -- Only a check that closes straight after the lane_seq comparison
             -- is unfenced; one already followed by OFFSET does not match.
             v_updated := regexp_replace(
