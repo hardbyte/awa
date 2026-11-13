@@ -2571,10 +2571,10 @@
 <li>Jobs at different priorities are ordered by effective priority, not by when they were enqueued.</li>
 </ul>
 <h2 id="shards-more-lanes-for-one-hot-queue">Shards: more lanes for one hot queue<a class="headerlink" href="#shards-more-lanes-for-one-hot-queue" title="Permanent link">&para;</a></h2>
-<p>One lane admits one claimer and one producer at a time. When a single <code>(queue, priority)</code> carries more traffic than that, raise the queue's <code>enqueue_shards</code>. Producers spread jobs across the shards and workers claim from all of them, at the cost of strict FIFO across the whole queue. See <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head per queue</a> and <a href="../../configuration/#choosing-a-throughput-lever">Choosing a throughput lever</a>.</p>
+<p>One lane admits one claimer and one producer at a time. When a single <code>(queue, priority)</code> carries more traffic than that, raise the queue's <code>enqueue_shards</code>. Producers spread jobs across the shards and workers claim from all of them, at the cost of strict FIFO across the whole queue. <a href="../queues-lanes-and-splitting-work/#producers-waiting-on-one-lane-enqueue-shards">Queues, lanes and splitting work</a> compares shards with the other ways to divide work. See <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head per queue</a> and <a href="../../configuration/#choosing-a-throughput-lever">Choosing a throughput lever</a>.</p>
 <h2 id="related">Related<a class="headerlink" href="#related" title="Permanent link">&para;</a></h2>
 <ul>
-<li><a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a>: how lanes relate to queue policy, and the tools that add lanes or queues.</li>
+<li><a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a>: when to use separate queues, priority, claimers, shards or partitions, and which combine.</li>
 <li><a href="../claims-receipts-and-leases/">Claims, receipts and leases</a>: what a claim writes and how an attempt ends.</li>
 <li><a href="../transactional-enqueue/">Transactional enqueue</a>: enqueueing with the business write.</li>
 <li><a href="../../architecture/#enqueue-and-claim">Architecture: enqueue and claim</a>: the tables and functions behind each step.</li>
