@@ -29,3 +29,31 @@ export const queryClient = new QueryClient({
     },
   },
 });
+
+/** The parts of a list query's state that say whose rows it holds. */
+export interface ListReadState {
+  isPending: boolean;
+  isError: boolean;
+  isPlaceholderData: boolean;
+}
+
+/**
+ * Whether a list's rows belong to the filter and page now in the URL.
+ * Actions that act on the whole filter, or a cursor taken from the last row,
+ * are judged against those rows. A pending or failed read has none of its
+ * own. Placeholder rows are the previous filter's, kept on screen while the
+ * new read runs, and TanStack Query reports them with success status.
+ */
+export function listMatchesFilter(query: ListReadState): boolean {
+  return !query.isPending && !query.isError && !query.isPlaceholderData;
+}
+
+/**
+ * The row a "Next page" cursor is taken from: the last row of a full page
+ * that belongs to the current filter. Undefined while the list shows a short
+ * page, or the previous filter's placeholder rows, whose cursor would skip
+ * or repeat rows of the new filter.
+ */
+export function nextPageAnchor<T>(rows: readonly T[], limit: number, query: ListReadState): T | undefined {
+  return rows.length >= limit && listMatchesFilter(query) ? rows[rows.length - 1] : undefined;
+}

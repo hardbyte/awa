@@ -18,6 +18,7 @@ import {
   toWireFilter,
 } from "@/lib/api";
 import { isNarrowing } from "@/lib/batch";
+import { nextPageAnchor } from "@/lib/query";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
@@ -304,6 +305,7 @@ export function JobsPage() {
     : undefined;
 
   const lastJob = jobs[jobs.length - 1];
+  const nextAnchor = nextPageAnchor(jobs, filters.limit, jobsQuery);
 
   return (
     <div className="space-y-4">
@@ -696,7 +698,10 @@ export function JobsPage() {
             <Button
               intent="outline"
               size="sm"
-              onPress={() => setBeforeId(lastJob.id)}
+              isDisabled={!nextAnchor}
+              onPress={() => {
+                if (nextAnchor) setBeforeId(nextAnchor.id);
+              }}
             >
               Next page
             </Button>
