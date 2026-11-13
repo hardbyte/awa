@@ -12393,6 +12393,29 @@ async fn test_queue_storage_prune_past_floor_folds_failed_into_rollup() {
 /// pruning with the floor again, re-homes the same row into the new live
 /// slot without duplicating it in `done_entries` and without drifting the
 /// exact counters.
+/// `prune_oldest`, retried while it reports `Blocked`: a lock timeout rolls the
+/// prune back, and on some servers background readers briefly hold the ring
+/// partitions.
+async fn prune_oldest_past_lock_timeouts(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+) -> PruneOutcome {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        match store
+            .prune_oldest(pool, retention)
+            .await
+            .expect("prune_oldest")
+        {
+            PruneOutcome::Blocked { .. } if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
     let (_db_guard, pool) = setup_pool(10).await;
@@ -12431,11 +12454,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         RotateOutcome::Rotated { slot: 1, .. } => {}
         other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
+    match prune_oldest_past_lock_timeouts(&store, &pool, Duration::from_secs(3600)).await {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
@@ -12469,11 +12488,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
 
     // Second prune: current slot is 0, so the oldest sealed non-current
     // slot is slot 1 (the carried row). It is carried again into slot 0.
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest re-carry")
-    {
+    match prune_oldest_past_lock_timeouts(&store, &pool, Duration::from_secs(3600)).await {
         PruneOutcome::Pruned {
             slot: 1,
             carried_failed_rows: 1,
