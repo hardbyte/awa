@@ -13106,6 +13106,7 @@ impl QueueStorage {
             "TRUNCATE TABLE {}",
             targets.join(", ")
         )))
+        .persistent(false)
         .execute(tx.as_mut())
         .await?;
         Ok(targets.len())
@@ -20200,6 +20201,11 @@ impl QueueStorage {
         }
     }
 
+    // Statements whose text names one ring child (probes, prune locks and
+    // truncates) run on whichever pooled connection is free, and there is one
+    // text per child. Prepared, each would sit in the per-connection statement
+    // cache of every connection that ever ran it, holding a server-side plan
+    // in that backend. They are cheap to plan, so send them unprepared.
     async fn relation_has_rows_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         relation: &str,
@@ -20207,6 +20213,7 @@ impl QueueStorage {
         sqlx::query_scalar(audited_sql(format!(
             "SELECT EXISTS (SELECT 1 FROM {relation} LIMIT 1)"
         )))
+        .persistent(false)
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
@@ -20268,6 +20275,7 @@ impl QueueStorage {
             )))
             .bind(children)
             .bind(cursor.1)
+            .persistent(false)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -21064,6 +21072,7 @@ impl QueueStorage {
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
             )))
+            .persistent(false)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -21256,6 +21265,7 @@ impl QueueStorage {
             };
 
             sqlx::query(audited_sql(format!("TRUNCATE TABLE {delta_child}")))
+                .persistent(false)
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
@@ -21527,11 +21537,13 @@ impl QueueStorage {
                 sqlx::query(audited_sql(format!(
                     "LOCK TABLE {segment_child} IN ACCESS EXCLUSIVE MODE"
                 )))
+                .persistent(false)
                 .execute(tx.as_mut())
                 .await?;
                 sqlx::query(audited_sql(format!(
                     "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
                 )))
+                .persistent(false)
                 .execute(tx.as_mut())
                 .await
             }
@@ -21923,6 +21935,7 @@ impl QueueStorage {
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
             )))
+            .persistent(false)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -22288,6 +22301,7 @@ impl QueueStorage {
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
             )))
+            .persistent(false)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
