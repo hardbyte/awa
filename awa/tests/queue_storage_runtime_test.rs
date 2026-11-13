@@ -23237,14 +23237,20 @@ async fn test_prune_wins_against_overlapping_claim_transactions() {
                     .heartbeat_claims_batch(&pool, &compact)
                     .await
                     .expect("heartbeat claims");
-                let pairs: Vec<(i64, i64)> = claimed
+                let rows: Vec<_> = claimed
                     .iter()
-                    .map(|job| (job.job.id, job.job.run_lease))
+                    .filter_map(|job| {
+                        awa::model::queue_storage::RowClaimHeartbeatRef::from_claim(
+                            job.job.id,
+                            job.job.run_lease,
+                            &job.claim,
+                        )
+                    })
                     .collect();
                 store
-                    .heartbeat_batch(&pool, &pairs)
+                    .heartbeat_row_claims_batch(&pool, &rows)
                     .await
-                    .expect("heartbeat");
+                    .expect("heartbeat row claims");
                 store
                     .complete_runtime_batch(&pool, &claimed)
                     .await
@@ -23616,12 +23622,25 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         )
         .await;
         assert_eq!(deadline_claims.len(), 4);
-        let pairs: Vec<(i64, i64)> = deadline_claims
+        let row_refs: Vec<_> = deadline_claims
             .iter()
-            .map(|job| (job.job.id, job.job.run_lease))
+            .map(|job| {
+                awa::model::queue_storage::RowClaimHeartbeatRef::from_claim(
+                    job.job.id,
+                    job.job.run_lease,
+                    &job.claim,
+                )
+                .expect("row claim identity")
+            })
             .collect();
         run_against_locked_children(&holder_pool, &locked, &mut blocked, "heartbeat", || async {
-            store.heartbeat_batch(&pool, &pairs).await.unwrap()
+            assert_eq!(
+                store
+                    .heartbeat_row_claims_batch(&pool, &row_refs)
+                    .await
+                    .unwrap(),
+                4
+            )
         })
         .await;
         run_against_locked_children(
@@ -23707,7 +23726,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
             &locked,
             &mut blocked,
             "heartbeat (compact)",
-            || async { store.heartbeat_claims_batch(&pool, &refs).await.unwrap() },
+            || async { assert_eq!(store.heartbeat_claims_batch(&pool, &refs).await.unwrap(), 4) },
         )
         .await;
         run_against_locked_children(
@@ -23730,9 +23749,17 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         all_blocked.extend(blocked);
     }
 
+    // Retry, fail and snooze still find the attempt by job id alone, which
+    // reads every claim and done child; they run once per failed attempt
+    // rather than on every claim and heartbeat.
+    let not_yet_slot_addressed = ["retry", "fail", "snooze"];
+    let hot_blocked: Vec<_> = all_blocked
+        .iter()
+        .filter(|name| !not_yet_slot_addressed.contains(name))
+        .collect();
     assert!(
-        all_blocked.is_empty(),
-        "hot paths waited on a sealed slot's children: {all_blocked:?}"
+        hot_blocked.is_empty(),
+        "hot paths waited on a sealed slot's children: {hot_blocked:?}"
     );
 }
 

@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use awa_model::queue_storage::ClaimHeartbeatRef;
+use awa_model::queue_storage::{ClaimHeartbeatRef, ClaimedEntry, RowClaimHeartbeatRef};
 
 const IN_FLIGHT_SHARDS: usize = 64;
 
@@ -19,13 +19,30 @@ type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
 pub(crate) struct InFlightState {
     pub cancel: CancelFlag,
     pub progress: Arc<std::sync::Mutex<ProgressState>>,
-    /// Compact receipt claim identity, when the attempt was dispatched from
-    /// queue storage with one; lets the heartbeat address the claim batch
+    /// Receipt claim identity, when the attempt was dispatched from queue
+    /// storage with one; lets the heartbeat address the claim's slots
     /// directly.
-    pub claim: Option<ClaimHeartbeatRef>,
+    pub claim: Option<ClaimRef>,
     /// The handler has returned and the attempt waits for its finalize. It is
     /// still heartbeated, but its progress is settled by the finalize.
     pub finalizing: bool,
+}
+
+/// How the heartbeat addresses a receipt claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimRef {
+    /// A zero-deadline claim, by its claim batch.
+    Compact(ClaimHeartbeatRef),
+    /// A deadline-backed claim, by its claim and ready slots.
+    Row(RowClaimHeartbeatRef),
+}
+
+impl ClaimRef {
+    pub(crate) fn from_claim(job_id: i64, run_lease: i64, claim: &ClaimedEntry) -> Option<Self> {
+        ClaimHeartbeatRef::from_claim(job_id, run_lease, claim)
+            .map(Self::Compact)
+            .or_else(|| RowClaimHeartbeatRef::from_claim(job_id, run_lease, claim).map(Self::Row))
+    }
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -179,8 +196,8 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    /// Every attempt to heartbeat, with its compact claim identity, if any.
-    pub fn claim_refs(&self) -> Vec<(InFlightKey, Option<ClaimHeartbeatRef>)> {
+    /// Every attempt to heartbeat, with its receipt claim identity, if any.
+    pub fn claim_refs(&self) -> Vec<(InFlightKey, Option<ClaimRef>)> {
         let mut refs = Vec::new();
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
