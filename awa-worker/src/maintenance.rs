@@ -951,6 +951,14 @@ impl PruneBackoffTracker {
     }
 }
 
+/// An idle ring still at generation 0 has never sealed a slot, so a prune
+/// would select nothing and return `Noop`. Rings that never fill, such as
+/// the lease ring when every claim takes the receipt path, stay there, and
+/// without this check pay a prune transaction on every rotate tick.
+fn idle_ring_at_genesis(idle_cursor: Option<(i32, i64)>) -> bool {
+    matches!(idle_cursor, Some((_, 0)))
+}
+
 /// Branch keys used by the prune backoff tracker. Kept as `&'static
 /// str` so the tracker's HashMap doesn't have to allocate per call.
 const PRUNE_BRANCH_LEASE: &str = "lease";
@@ -3772,6 +3780,9 @@ impl MaintenanceService {
             }
         };
 
+        if idle_ring_at_genesis(idle_cursor) {
+            return;
+        }
         if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_QUEUE,
@@ -3889,6 +3900,9 @@ impl MaintenanceService {
             }
         };
 
+        if idle_ring_at_genesis(idle_cursor) {
+            return;
+        }
         if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_LEASE,
@@ -3994,6 +4008,9 @@ impl MaintenanceService {
             }
         };
 
+        if idle_ring_at_genesis(idle_cursor) {
+            return;
+        }
         if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_CLAIM,
@@ -6412,6 +6429,19 @@ mod tests {
             tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 1, 1, 4),
             Some((0, 0)),
             "partial-ring startup derives the same generation as storage prune"
+        );
+    }
+
+    #[test]
+    fn idle_ring_at_genesis_skips_only_a_ring_that_never_sealed() {
+        assert!(idle_ring_at_genesis(Some((0, 0))));
+        assert!(
+            !idle_ring_at_genesis(Some((1, 1))),
+            "one rotation seals slot 0, which prune may still need to reclaim"
+        );
+        assert!(
+            !idle_ring_at_genesis(None),
+            "a non-idle outcome keeps the prune path"
         );
     }
 
