@@ -951,6 +951,59 @@ impl PruneBackoffTracker {
     }
 }
 
+/// Longest a ring that keeps reporting idle goes between rotate checks.
+const IDLE_ROTATE_MAX_GAP: Duration = Duration::from_secs(4);
+
+/// Thins rotate checks on a ring that keeps reporting idle.
+///
+/// An idle outcome means every partition of the ring is empty, so the
+/// check can only find work once new rows arrive. Each consecutive idle
+/// outcome doubles the ticks skipped before the next check, up to
+/// [`IDLE_ROTATE_MAX_GAP`]; any other outcome restores every-tick checks.
+/// New rows in an idle ring can be observed up to the gap later.
+struct IdleRotateBackoff {
+    idle_streak: u32,
+    skip_remaining: u32,
+    max_skip: u32,
+}
+
+impl IdleRotateBackoff {
+    fn new(interval: Duration) -> Self {
+        let ticks = IDLE_ROTATE_MAX_GAP.as_millis() / interval.as_millis().max(1);
+        Self {
+            idle_streak: 0,
+            skip_remaining: 0,
+            max_skip: u32::try_from(ticks.saturating_sub(1)).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// True when this tick's rotate check should be skipped.
+    fn should_skip(&mut self) -> bool {
+        if self.skip_remaining > 0 {
+            self.skip_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record(&mut self, idle: bool) {
+        if idle {
+            self.idle_streak = self.idle_streak.saturating_add(1);
+            self.skip_remaining = ((1u32 << self.idle_streak.min(16)) - 1).min(self.max_skip);
+        } else {
+            self.idle_streak = 0;
+            self.skip_remaining = 0;
+        }
+    }
+}
+
+/// True for an idle ring still at generation 0, which has never sealed a
+/// slot and so has nothing to prune.
+fn idle_ring_at_genesis(idle_cursor: Option<(i32, i64)>) -> bool {
+    matches!(idle_cursor, Some((_, 0)))
+}
+
 /// Branch keys used by the prune backoff tracker. Kept as `&'static
 /// str` so the tracker's HashMap doesn't have to allocate per call.
 const PRUNE_BRANCH_LEASE: &str = "lease";
@@ -1276,6 +1329,35 @@ async fn promote_waiting_lane(
 struct LeaderPromoters {
     primary: Option<QueueStoragePromoter>,
     standby: Option<QueueStoragePromoter>,
+}
+
+impl LeaderPromoters {
+    /// One read-only statement that is true when any plane a promotion tick
+    /// covers holds a due scheduled or retryable row: canonical
+    /// `scheduled_jobs` and the deferred table of each queue-storage store.
+    /// Each arm is an index condition on the index its promotion path scans
+    /// (the partial `run_at` indexes on `scheduled_jobs`, `(state, run_at, …)`
+    /// on `deferred_jobs`). The canonical arms compare `run_at` with `now()`,
+    /// the deferred arms with `statement_timestamp()`.
+    fn due_probe_sql(&self) -> String {
+        let mut arms = Vec::with_capacity(6);
+        for state in ["scheduled", "retryable"] {
+            arms.push(format!(
+                "EXISTS (SELECT 1 FROM awa.scheduled_jobs \
+                 WHERE state = '{state}'::awa.job_state AND run_at <= now())"
+            ));
+        }
+        for promoter in [&self.primary, &self.standby].into_iter().flatten() {
+            let schema = promoter.store.schema();
+            for state in ["scheduled", "retryable"] {
+                arms.push(format!(
+                    "EXISTS (SELECT 1 FROM {schema}.deferred_jobs \
+                     WHERE state = '{state}'::awa.job_state AND run_at <= statement_timestamp())"
+                ));
+            }
+        }
+        format!("SELECT {}", arms.join(" OR "))
+    }
 }
 
 impl MaintenanceService {
@@ -1776,6 +1858,12 @@ impl MaintenanceService {
             };
 
             let hygiene = async {
+                let mut queue_idle_backoff =
+                    IdleRotateBackoff::new(vacuum_queue_interval.unwrap_or(Duration::from_secs(1)));
+                let mut lease_idle_backoff =
+                    IdleRotateBackoff::new(vacuum_lease_interval.unwrap_or(Duration::from_secs(1)));
+                let mut claim_idle_backoff =
+                    IdleRotateBackoff::new(vacuum_claim_interval.unwrap_or(Duration::from_secs(1)));
                 // Do an initial sync immediately on becoming leader
                 self.sync_periodic_jobs_to_db().await;
                 loop {
@@ -1853,9 +1941,13 @@ impl MaintenanceService {
                             let interval = vacuum_queue_interval
                                 .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
                             if term.is_cancelled() { return; }
+                            if queue_idle_backoff.should_skip() {
+                                continue;
+                            }
                             if let Some(timer) = branch_tracker.try_begin("rotate_queue", interval, &self.metrics) {
-                                self.rotate_queue_storage_queue(&prune_tracker).await;
+                                let idle = self.rotate_queue_storage_queue(&prune_tracker).await;
                                 timer.finish();
+                                queue_idle_backoff.record(idle);
                             }
                         }
                         _ = async {
@@ -1868,9 +1960,13 @@ impl MaintenanceService {
                             let interval = vacuum_lease_interval
                                 .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
                             if term.is_cancelled() { return; }
+                            if lease_idle_backoff.should_skip() {
+                                continue;
+                            }
                             if let Some(timer) = branch_tracker.try_begin("rotate_lease", interval, &self.metrics) {
-                                self.rotate_queue_storage_leases(&prune_tracker).await;
+                                let idle = self.rotate_queue_storage_leases(&prune_tracker).await;
                                 timer.finish();
+                                lease_idle_backoff.record(idle);
                             }
                         }
                         _ = async {
@@ -1883,9 +1979,13 @@ impl MaintenanceService {
                             let interval = vacuum_claim_interval
                                 .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
                             if term.is_cancelled() { return; }
+                            if claim_idle_backoff.should_skip() {
+                                continue;
+                            }
                             if let Some(timer) = branch_tracker.try_begin("rotate_claim", interval, &self.metrics) {
-                                self.rotate_queue_storage_claims(&prune_tracker).await;
+                                let idle = self.rotate_queue_storage_claims(&prune_tracker).await;
                                 timer.finish();
+                                claim_idle_backoff.record(idle);
                             }
                         }
                     }
@@ -3460,6 +3560,27 @@ impl MaintenanceService {
     /// Promote scheduled jobs that are now due.
     #[tracing::instrument(skip(self, promoters), name = "maintenance.promote")]
     async fn promote_scheduled(&self, promoters: &LeaderPromoters) {
+        // Skip the full pass when nothing is due. A row that becomes due or
+        // visible after the probe is promoted on the next tick. A failed
+        // probe runs the full pass.
+        let probe_started = Instant::now();
+        match sqlx::query_scalar::<_, bool>(audited_sql(promoters.due_probe_sql()))
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(false) => {
+                let elapsed = probe_started.elapsed();
+                for state in [JobState::Scheduled, JobState::Retryable] {
+                    self.metrics
+                        .record_promotion_batch(state.as_str(), 0, elapsed);
+                }
+                return;
+            }
+            Ok(true) => {}
+            Err(err) => {
+                debug!(error = %err, "Promotion due probe failed; running the full pass");
+            }
+        }
         if let Err(err) = self
             .promote_due_state(JobState::Scheduled, "scheduled jobs", promoters)
             .await
@@ -3670,9 +3791,9 @@ impl MaintenanceService {
         Ok((promoted, queues))
     }
 
-    async fn rotate_queue_storage_queue(&self, prune_tracker: &PruneBackoffTracker) {
+    async fn rotate_queue_storage_queue(&self, prune_tracker: &PruneBackoffTracker) -> bool {
         let Some(runtime) = self.storage.queue_storage() else {
-            return;
+            return false;
         };
 
         let idle_cursor = match runtime
@@ -3717,10 +3838,14 @@ impl MaintenanceService {
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage queue segments");
-                return;
+                return false;
             }
         };
+        let idle = idle_cursor.is_some();
 
+        if idle_ring_at_genesis(idle_cursor) {
+            return idle;
+        }
         if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_QUEUE,
@@ -3734,13 +3859,13 @@ impl MaintenanceService {
                 slot,
                 generation, "Queue storage queue segment already pruned"
             );
-            return;
+            return idle;
         }
 
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
             debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
             self.metrics.record_prune_backed_off("queue");
-            return;
+            return idle;
         }
 
         match runtime
@@ -3791,11 +3916,12 @@ impl MaintenanceService {
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
         }
+        idle
     }
 
-    async fn rotate_queue_storage_leases(&self, prune_tracker: &PruneBackoffTracker) {
+    async fn rotate_queue_storage_leases(&self, prune_tracker: &PruneBackoffTracker) -> bool {
         let Some(runtime) = self.storage.queue_storage() else {
-            return;
+            return false;
         };
 
         let idle_cursor = match runtime
@@ -3834,10 +3960,14 @@ impl MaintenanceService {
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage lease segments");
-                return;
+                return false;
             }
         };
+        let idle = idle_cursor.is_some();
 
+        if idle_ring_at_genesis(idle_cursor) {
+            return idle;
+        }
         if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_LEASE,
@@ -3851,13 +3981,13 @@ impl MaintenanceService {
                 slot,
                 generation, "Queue storage lease segment already pruned"
             );
-            return;
+            return idle;
         }
 
         if prune_tracker.should_skip(PRUNE_BRANCH_LEASE) {
             debug!(branch = PRUNE_BRANCH_LEASE, "Prune backed off this tick");
             self.metrics.record_prune_backed_off("lease");
-            return;
+            return idle;
         }
 
         match runtime.store.prune_oldest_leases(&self.pool).await {
@@ -3891,14 +4021,15 @@ impl MaintenanceService {
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
         }
+        idle
     }
 
     /// Claim-ring maintenance tick (see ADR-023). Rotates the claim-ring
     /// cursor and prunes the oldest fully-closed partition, mirroring the
     /// lease-ring rotate/prune pair above.
-    async fn rotate_queue_storage_claims(&self, prune_tracker: &PruneBackoffTracker) {
+    async fn rotate_queue_storage_claims(&self, prune_tracker: &PruneBackoffTracker) -> bool {
         let Some(runtime) = self.storage.queue_storage() else {
-            return;
+            return false;
         };
 
         let idle_cursor = match runtime
@@ -3939,10 +4070,14 @@ impl MaintenanceService {
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage claim segments");
-                return;
+                return false;
             }
         };
+        let idle = idle_cursor.is_some();
 
+        if idle_ring_at_genesis(idle_cursor) {
+            return idle;
+        }
         if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_CLAIM,
@@ -3956,13 +4091,13 @@ impl MaintenanceService {
                 slot,
                 generation, "Queue storage claim segment already pruned"
             );
-            return;
+            return idle;
         }
 
         if prune_tracker.should_skip(PRUNE_BRANCH_CLAIM) {
             debug!(branch = PRUNE_BRANCH_CLAIM, "Prune backed off this tick");
             self.metrics.record_prune_backed_off("claim");
-            return;
+            return idle;
         }
 
         match runtime.store.prune_oldest_claims(&self.pool).await {
@@ -3996,6 +4131,7 @@ impl MaintenanceService {
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }
+        idle
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.
@@ -6361,6 +6497,49 @@ mod tests {
             tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 1, 1, 4),
             Some((0, 0)),
             "partial-ring startup derives the same generation as storage prune"
+        );
+    }
+
+    #[test]
+    fn idle_rotate_backoff_doubles_to_the_gap_and_resets_on_work() {
+        // 250 ms ticks: a 4 s gap allows at most 15 skipped ticks.
+        let mut backoff = IdleRotateBackoff::new(Duration::from_millis(250));
+        let mut skipped_runs = Vec::new();
+        for _ in 0..6 {
+            backoff.record(true);
+            let mut skipped = 0;
+            while backoff.should_skip() {
+                skipped += 1;
+            }
+            skipped_runs.push(skipped);
+        }
+        assert_eq!(skipped_runs, vec![1, 3, 7, 15, 15, 15]);
+
+        backoff.record(false);
+        assert!(
+            !backoff.should_skip(),
+            "any non-idle outcome checks every tick"
+        );
+        backoff.record(true);
+        assert!(backoff.should_skip());
+        assert!(!backoff.should_skip(), "the streak restarts from one skip");
+
+        // An interval at or above the gap never skips.
+        let mut slow = IdleRotateBackoff::new(Duration::from_secs(5));
+        slow.record(true);
+        assert!(!slow.should_skip());
+    }
+
+    #[test]
+    fn idle_ring_at_genesis_skips_only_a_ring_that_never_sealed() {
+        assert!(idle_ring_at_genesis(Some((0, 0))));
+        assert!(
+            !idle_ring_at_genesis(Some((1, 1))),
+            "one rotation seals slot 0, which prune may still need to reclaim"
+        );
+        assert!(
+            !idle_ring_at_genesis(None),
+            "a non-idle outcome keeps the prune path"
         );
     }
 
