@@ -86,12 +86,30 @@ const COMPLETE_BATCH_SQL: &str = r#"
     RETURNING locked.id, locked.run_lease
 "#;
 
+/// Why the batcher did not complete an attempt.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompletionError {
+    /// Another transaction holds the attempt's completion lock, so the batch
+    /// left it out. The attempt is neither completed nor stale; complete it
+    /// again once that transaction ends.
+    #[error(
+        "completion lock for job {job_id} run lease {run_lease} is held by another transaction"
+    )]
+    LockHeld { job_id: i64, run_lease: RunLease },
+    #[error(transparent)]
+    Storage(#[from] AwaError),
+}
+
+fn lock_held((job_id, run_lease): (i64, RunLease)) -> CompletionError {
+    CompletionError::LockHeld { job_id, run_lease }
+}
+
 struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
     claim: Option<ClaimedEntry>,
     runtime_job: Option<ClaimedRuntimeJob>,
-    response: oneshot::Sender<Result<bool, AwaError>>,
+    response: oneshot::Sender<Result<bool, CompletionError>>,
 }
 
 #[derive(Clone)]
@@ -217,12 +235,12 @@ impl Drop for AcknowledgementWait {
 }
 
 struct CompletionReceipt {
-    response: oneshot::Receiver<Result<bool, AwaError>>,
+    response: oneshot::Receiver<Result<bool, CompletionError>>,
     acknowledgement_wait: Option<AcknowledgementWait>,
 }
 
 impl CompletionReceipt {
-    async fn acknowledge(self) -> Result<bool, AwaError> {
+    async fn acknowledge(self) -> Result<bool, CompletionError> {
         let result = self
             .response
             .await
@@ -271,14 +289,18 @@ impl CompletionBatcherHandle {
             .min(tokio::sync::Semaphore::MAX_PERMITS)
     }
 
-    pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
+    pub async fn complete(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(job_id, run_lease, None, None).await
     }
 
     pub async fn complete_runtime_job(
         &self,
         runtime_job: ClaimedRuntimeJob,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         self.complete_inner(
             runtime_job.job.id,
             runtime_job.job.run_lease,
@@ -294,7 +316,7 @@ impl CompletionBatcherHandle {
         run_lease: RunLease,
         claim: Option<ClaimedEntry>,
         runtime_job: Option<ClaimedRuntimeJob>,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<bool, CompletionError> {
         self.submit(job_id, run_lease, claim, runtime_job)
             .await?
             .acknowledge()
@@ -552,6 +574,9 @@ impl CompletionFlusher {
         // same flush failed; they still learn their outcome.
         let mut committed_job_ids: HashSet<i64> = HashSet::new();
         let mut committed_pairs: HashSet<(i64, i64)> = HashSet::new();
+        // Attempts whose completion lock another transaction holds are left
+        // out of the batch, so one held attempt cannot hold up the shard.
+        let mut contended: HashSet<(i64, i64)> = HashSet::new();
 
         let updated = match &self.storage {
             RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
@@ -576,10 +601,13 @@ impl CompletionFlusher {
                 if !runtime_jobs.is_empty() {
                     match runtime
                         .store
-                        .complete_runtime_batch(&self.pool, &runtime_jobs)
+                        .complete_runtime_batch_isolating(&self.pool, &runtime_jobs)
                         .await
                     {
-                        Ok(rows) => updated.extend(rows),
+                        Ok(outcome) => {
+                            updated.extend(outcome.updated);
+                            contended.extend(outcome.contended);
+                        }
                         Err(err) => result = Err(err),
                     }
                 }
@@ -629,14 +657,19 @@ impl CompletionFlusher {
                     flush_start.elapsed(),
                 );
                 for request in batch {
-                    let _ = request
-                        .response
-                        .send(Ok(updated.contains(&(request.job_id, request.run_lease))));
+                    let pair = (request.job_id, request.run_lease);
+                    let response = if contended.contains(&pair) {
+                        Err(lock_held(pair))
+                    } else {
+                        Ok(updated.contains(&pair))
+                    };
+                    let _ = request.response.send(response);
                 }
                 debug!(
                     shard = self.shard_id,
                     batch_size = job_ids.len(),
                     updated = updated_count,
+                    contended = contended.len(),
                     "Flushed completed job batch"
                 );
             }
@@ -655,17 +688,29 @@ impl CompletionFlusher {
                     if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
                         for request in batch {
                             let pair = (request.job_id, request.run_lease);
+                            if contended.contains(&pair) {
+                                let _ = request.response.send(Err(lock_held(pair)));
+                                continue;
+                            }
                             let response = if committed_pairs.contains(&pair) {
                                 Ok(true)
                             } else {
                                 let updated = if let Some(runtime_job) = &request.runtime_job {
-                                    runtime
+                                    match runtime
                                         .store
-                                        .complete_runtime_batch(
+                                        .complete_runtime_batch_isolating(
                                             &self.pool,
                                             std::slice::from_ref(runtime_job),
                                         )
                                         .await
+                                    {
+                                        Ok(outcome) if outcome.contended.contains(&pair) => {
+                                            let _ = request.response.send(Err(lock_held(pair)));
+                                            continue;
+                                        }
+                                        Ok(outcome) => Ok(outcome.updated),
+                                        Err(err) => Err(err),
+                                    }
                                 } else if let Some(claim) = &request.claim {
                                     runtime
                                         .store
@@ -685,7 +730,7 @@ impl CompletionFlusher {
                             if matches!(&response, Ok(true)) {
                                 committed_pairs.insert(pair);
                             }
-                            let _ = request.response.send(response);
+                            let _ = request.response.send(response.map_err(Into::into));
                         }
                         self.metrics.record_completion_flush(
                             self.shard_id,
@@ -702,10 +747,13 @@ impl CompletionFlusher {
                 );
                 let message = format!("completion batch flush failed: {err}");
                 for request in batch {
-                    let response = if committed_job_ids.contains(&request.job_id) {
-                        Ok(committed_pairs.contains(&(request.job_id, request.run_lease)))
+                    let pair = (request.job_id, request.run_lease);
+                    let response = if contended.contains(&pair) {
+                        Err(lock_held(pair))
+                    } else if committed_job_ids.contains(&request.job_id) {
+                        Ok(committed_pairs.contains(&pair))
                     } else {
-                        Err(AwaError::Validation(message.clone()))
+                        Err(AwaError::Validation(message.clone()).into())
                     };
                     let _ = request.response.send(response);
                 }
@@ -920,7 +968,9 @@ mod tests {
         assert_eq!(flusher.flushes.lock().unwrap().len(), 3);
     }
 
-    async fn assert_remaining_budget_after_acknowledgement(response: Result<bool, AwaError>) {
+    async fn assert_remaining_budget_after_acknowledgement(
+        response: Result<bool, CompletionError>,
+    ) {
         let (handle, mut requests) = controlled_completions(1);
         let budget = FinalizationBudget::from(Duration::from_millis(100));
         let handle = handle.with_acknowledgement_budget(budget.clone());
@@ -958,7 +1008,8 @@ mod tests {
     async fn failed_acknowledgement_does_not_exempt_direct_fallback() {
         assert_remaining_budget_after_acknowledgement(Err(AwaError::Validation(
             "completion flush failed".into(),
-        )))
+        )
+        .into()))
         .await;
     }
 
@@ -1752,7 +1803,7 @@ mod tests {
             .expect("contended batch isolates singleton errors without waiting");
         let busy = responses.remove(0).await.unwrap();
         assert!(
-            matches!(busy, Err(AwaError::Database(ref error))
+            matches!(busy, Err(CompletionError::Storage(AwaError::Database(ref error)))
             if error.as_database_error().is_some_and(|error| error.code().as_deref()==Some("55P03"))),
             "busy attempt must report its real error, never stale: {busy:?}"
         );

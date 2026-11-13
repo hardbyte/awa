@@ -2477,12 +2477,15 @@ async fn assert_claiming_stops_while_finalization_is_stalled(
 
     let mut stall = pool.begin().await.expect("begin stall transaction");
     if lease_claim_receipts {
+        // Every job's completion lock: a batch leaves out an attempt whose
+        // lock another transaction holds, so holding only some of them would
+        // stall only those attempts.
         let first_jobs: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
             "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT $2",
             store.schema()
         )))
         .bind(queue)
-        .bind(i64::from(WORKERS) * 2)
+        .bind(JOBS)
         .fetch_all(&pool)
         .await
         .expect("first jobs");

@@ -2622,16 +2622,37 @@ async fn test_finalize_retries_after_terminated_finalization_backends() {
     .await
     .expect("handler must start")
     .unwrap();
+    // Finalization never waits on the attempt's completion lock: it leaves a
+    // held attempt out and retries it. Every completion path deletes the
+    // attempt's `attempt_state` row, so a row lock on it parks the
+    // finalization statement itself, after it has taken the completion lock.
+    let schema = active_queue_storage_schema(&observer_pool)
+        .await
+        .expect("finalization transport test requires queue storage");
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at) \
+         VALUES ($1, $2, clock_timestamp(), clock_timestamp()) \
+         ON CONFLICT (job_id, run_lease) DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at"
+    )))
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(&observer_pool)
+    .await
+    .unwrap();
     let mut blocker = observer_pool.begin().await.unwrap();
     let blocking_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(blocker.as_mut())
         .await
         .unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("awa.receipt.complete:{job_id}:{run_lease}"))
-        .execute(blocker.as_mut())
-        .await
-        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.attempt_state \
+         WHERE job_id = $1 AND run_lease = $2 FOR UPDATE"
+    )))
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(blocker.as_mut())
+    .await
+    .unwrap();
     finish.notify_one();
     let mut terminated = Vec::<i32>::new();
     // Fail the active batch flush and its direct fallback, rather than idle sockets
@@ -2657,7 +2678,7 @@ async fn test_finalize_retries_after_terminated_finalization_backends() {
             }
         })
         .await
-        .expect("finalization must be blocked on the receipt attempt lock");
+        .expect("finalization must be blocked on the attempt's state row");
         let killed: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
             .bind(pid)
             .fetch_one(&observer_pool)
