@@ -222,7 +222,7 @@ this roadmap and not yet filed.
 | **#371** Ring-state metadata striping | P1 | The residual pinned-horizon accumulators after #355 are `lease_ring_state` (~14k dead tuples/hr) and `claim_ring_state` (~3.5k). Apply the ADR-026 discipline (striping or delta-append) to ring bookkeeping. Small, measurable, keeps the "no dominant hot row" invariant tight. **Accept:** long-horizon idle-phase dead tuples for ring-state ≤ noise. |
 | **#341** Backpressure | P1 | Per the issue's own design lean: **soft-signal default, opt-in hard rejection.** Concretely: (a) enqueue paths can return a depth signal (`EnqueueOutcome::pressure`) sourced from lane-head cursors (index-only, no scans); (b) `InsertOpts::backpressure: Off \| Signal \| Reject{limit}` — `Reject` returns a typed error and is documented as *changing transactional-enqueue semantics* (ADR-006 tension made explicit); (c) `PacedProducer` helpers in Rust + Python (the pattern the bench harness already proved externally); (d) metrics `awa.enqueue.backpressure.{signaled,rejected}`. E6 validates defaults. **Accept:** 2×-capacity offered load with paced producer holds bounded depth; hard-reject never enabled implicitly. |
 | **#380** Adaptive claimers (experiment-gated) | P2 | E4: bounded controller adjusting per-queue claimers within `[1, max]` on lane-lag signal, opt-in. Addresses the single-shard default-shape ceiling (10k offered / 4k completed) without making users hand-tune `claimers`. Ships only if E4 shows stability under bursty load; otherwise document tuning presets instead. |
-| **#303** Maintenance-task split | P2 | Unchanged: telemetry-gated. Check `awa_maintenance_branch_overrun_total` across beta fleets; implement the rescue+promote split only if non-trivial overruns appear; else close wontfix as the issue itself proposes. |
+| **#303** Maintenance-task split | P2 | Implemented ([ADR-051](../adr/051-maintenance-recovery-loop/index.md)): shipped in 0.6.17 and forward-ported, after a reproduction showed one locked cron row stalls promotion and rescue for as long as the lock is held; the overrun counter does not see that stall. |
 
 ### WS-3 · Deployment & operations (D3, D5)
 
@@ -472,7 +472,7 @@ The #383 tracker opens with these as live checklists (the #197 template, six gat
 | #401 caller-owned finalization | **In**, P1, M4 (ADR-042; composes with #342 and #340). |
 | #452 PostgreSQL capability boundary | ADR-043 design only beyond #401's narrow 0.7 bounded-owner/finalizer-manifest slice; ordinary-runtime implementation deferred beyond 0.7. |
 | #335 CI sharding | **In**, P0, M0, first. |
-| #303 maintenance split | Telemetry-gated during beta; implement or close-wontfix per its own rule. |
+| #303 maintenance split | Implemented ([ADR-051](../adr/051-maintenance-recovery-loop/index.md)); shipped in 0.6.17 and forward-ported. |
 | #295-adjacent #246 regression | **In**, P0 (E2 first; fix or fold into Gate A). |
 | #282 maintenance-only role | **In**, P0, M2 (ADR-028 → Accepted). |
 | #256 SeaORM | Verify shipped (crate exists, publish chain updated); close. |

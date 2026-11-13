@@ -106,39 +106,18 @@ schema owner:
     REVOKE TRIGGER, REFERENCES ON TABLES FROM awa_runtime;
   ```
 
-- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
-  runtimes created lane sequences themselves, so they needed `CREATE`.
-  Sequences they own are accepted; the `CREATE` grant is not, because it lets
-  the runtime add objects while a migration runs. Until the migration refreshes
-  them, the 0.6 lane helpers and enqueue-head triggers run
-  `CREATE SEQUENCE IF NOT EXISTS` on every reservation, and that checks
-  `CREATE` even for a sequence that exists, so revoking the grant makes running
-  0.6 producers and workers fail with `42501` until the migration commits.
-  Provisioning lanes in advance does not avoid this. Take a short pause:
+- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** Before the 0.6.14 schema patch, 0.6 runtimes created lane sequences themselves, so they needed `CREATE`. Sequences they own are accepted; the `CREATE` grant is not, because it lets the runtime add objects while a migration runs. Remove it while 0.6 producers and workers keep running:
 
-  1. Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
-     enqueue or claim runs.
-  2. Revoke the grant and commit:
+  1. Run `awa migrate` with a 0.6.x CLI, 0.6.14 or later, with the schema owner as the effective role. The schema stays at v40. A 0.7 CLI cannot do this step: it applies the versioned 0.7 migrations, whose schema check refuses the runtime role's `CREATE` grant. Its `prepared_lane_sequences` patch makes the lane helpers and head-table triggers skip `CREATE SEQUENCE` when the lane's sequence exists, and its `definer_lane_provisioning` patch creates a missing lane's sequences through the schema owner's `SECURITY DEFINER` functions, so no runtime role needs `CREATE`. The patches only replace functions, in `awa` and every other queue-storage schema, and earlier 0.6 binaries call the patched helpers with the same arguments. External migration runners apply the `R__` patches as the [0.6.13 to 0.6.14 upgrade guide](https://github.com/hardbyte/awa/blob/v0.6.14/docs/upgrade-0.6.13-to-0.6.14.md#external-migration-runners) describes.
+  2. Revoke the grant in each queue-storage schema:
 
      ```sql
      REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
      ```
 
-  3. Run `awa migrate` as the migrator. The bundle refreshes the lane helpers
-     to use provisioned sequences without `CREATE` (v049).
-  4. Provision any lanes the 0.7 runtimes will need, as the migrator:
+  3. Continue with the 0.7 migration.
 
-     ```bash
-     PGOPTIONS='-c role=awa_owner' \
-       awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
-       --queue <queue> --enqueue-shards <n>
-     ```
-
-  5. Start the 0.7 runtimes.
-
-  An uninterrupted path would need the revoke and the helper refresh to become
-  visible to every session at once; that has not been verified, so do not
-  combine them into one transaction as a substitute for the pause.
+  Revoking before the patches makes running 0.6 producers and workers fail with `42501`: the unpatched helpers run `CREATE SEQUENCE IF NOT EXISTS` on every reservation, which checks `CREATE` even for a sequence that exists. The 0.6 release branch's `awa/tests/patch_upgrade_rehearsal_test.rs` applies the patches under a released 0.6.9 or 0.6.15 fleet, provisions its queues, grants sequence privileges and revokes `CREATE` from its runtime role, then checks that restarted released workers complete every job and a released producer creates a new queue's lanes through the schema owner's functions.
 
 - **A custom schema prepared by a runtime or another role.** A worker that
   auto-prepares a schema, or a DBA who ran the preparation as another user,
@@ -367,6 +346,14 @@ It replaces functions only and takes no lock on any `awa` or queue-storage table
 v059 replaces the body of `awa.backoff_duration(attempt, max_attempts)`, which sets the delay before an automatic retry. The delay was `2^attempt` seconds plus up to 25% of that, so jobs that failed together, for example while a dependency was down, retried within a quarter of their base delay of each other and reached the recovering dependency together. It is now `2^attempt` seconds multiplied by a random factor in [0.5, 1.5), still capped at 24 hours. The mean delay is the base delay (the old mean was 12.5% above it), the shortest delay for an attempt halves, and the retries from one failure spread over a window four times as wide, which cuts their peak arrival rate by about 3.5×. These figures hold while the whole range is below the cap, which is through attempt 15. From attempt 16 the top of the range is cut to 24 hours, and from attempt 18 every retry waits exactly 24 hours, with no jitter. The function sets every retry delay awa chooses itself: after a retryable handler error and after rescue of a stale heartbeat, an expired deadline or a callback timeout. `RetryAfter` and `Snooze` keep the delay the handler gives.
 
 It is one `CREATE OR REPLACE FUNCTION` that keeps the function's signature, volatility, owner and privileges, and takes no lock on any `awa` or queue-storage table. Binaries before v059 call the same function from the same statements, so they get the new delays as soon as the migration commits and can run before or after it. Jobs already waiting to retry keep their scheduled time. External migration runners apply `awa migrate --sql --from 58 --to 59`.
+
+## v060: correlated claim tombstone checks
+
+A claim checks each candidate row against `ready_tombstones`, which records rows that were cancelled, retried or moved before they were claimed. For a small batch PostgreSQL could plan that `EXISTS` check as a hashed subplan that reads the slot's whole tombstone partition on every claim, although the lookup index exists, so the cost of each claim grew with churn in the slot. The check now carries `OFFSET 0`, which keeps it correlated: one index probe per candidate row.
+
+v060 rewrites `<schema>.claim_ready_runtime` and each `<schema>.claim_ready_slot_<n>` in the default and every discovered custom queue-storage schema from their own definitions, so signatures, owners, privileges and settings are unchanged. A function that already carries the check is left alone, so a replay, a fresh install and a database coming from 0.6.17 (whose `correlated_claim_tombstones` schema patch made the same change) are no-ops. It reinstalls no table or trigger and takes no lock on any `awa` or queue-storage table; a claim in flight finishes on the old body.
+
+Binaries before v060 call the same functions with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete `awa migrate --sql --from 59 --to 60` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
 
 ## The one gate
 
