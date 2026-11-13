@@ -51,6 +51,8 @@ pub mod names {
     pub const JOB_DLQ_DEPTH: &str = "awa.job.dlq_depth";
     pub const QUEUE_DEPTH: &str = "awa.queue.depth";
     pub const QUEUE_LAG: &str = "awa.queue.lag";
+    pub const QUEUE_WORKER_IN_USE: &str = "awa.queue.worker.in_use";
+    pub const QUEUE_WORKER_CAPACITY: &str = "awa.queue.worker.capacity";
     pub const QUEUE_INFO: &str = "awa.queue.info";
     pub const JOB_KIND_INFO: &str = "awa.job_kind.info";
     pub const DISPATCH_CLAIM_BATCHES: &str = "awa.dispatch.claim_batches";
@@ -67,9 +69,12 @@ pub mod names {
     pub const COMPLETION_FLUSH_DURATION: &str = "awa.completion.flush_duration";
     pub const HEARTBEAT_BATCHES: &str = "awa.heartbeat.batches";
     pub const MAINTENANCE_RESCUES: &str = "awa.maintenance.rescues";
+    pub const MAINTENANCE_RESCUE_PASS_SIZE: &str = "awa.maintenance.rescue.pass_size";
+    pub const MAINTENANCE_RESCUE_OLDEST_AGE: &str = "awa.maintenance.rescue.oldest_attempt_age";
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
+    pub const MAINTENANCE_PROMOTE_LANE_CONTENTION: &str = "awa.maintenance.promote.lane_contention";
     pub const MAINTENANCE_BRANCH_DURATION: &str = "awa.maintenance.branch.duration";
     pub const MAINTENANCE_BRANCH_OVERRUN: &str = "awa.maintenance.branch.overrun";
     pub const MAINTENANCE_ROTATE_ATTEMPTS: &str = "awa.maintenance.rotate.attempts";
@@ -192,18 +197,38 @@ pub struct AwaMetrics {
     pub promotion_batch_size: Histogram<u64>,
     /// Promotion query duration.
     pub promotion_duration_seconds: Histogram<f64>,
+    /// Promotion lanes whose locks were busy past the leader's wait budget,
+    /// attributed to (state, queue, outcome): `handed_off` to a dedicated
+    /// waiter, `waiter_limit` when every waiter was busy, `waiter_timed_out`
+    /// when a waiter's own budget ran out.
+    pub promotion_lane_contention: Counter<u64>,
     /// Current in-flight jobs (can go up and down).
     pub jobs_in_flight: UpDownCounter<i64>,
     /// Total heartbeat batches sent.
     pub heartbeat_batches: Counter<u64>,
     /// Total maintenance rescue operations.
     pub maintenance_rescues: Counter<u64>,
+    /// Attempts rescued per queue-storage rescue pass, attributed by
+    /// `awa.rescue.kind` and why the pass stopped (`awa.rescue.pass_end`).
+    pub maintenance_rescue_pass_size: Histogram<u64>,
+    /// Age of the oldest attempt the latest queue-storage rescue pass
+    /// rescued, per `awa.rescue.kind`; 0 when it rescued nothing. Rescue
+    /// works oldest claim first, so a value well above the heartbeat
+    /// staleness or deadline means a backlog of abandoned claims.
+    pub maintenance_rescue_oldest_attempt_age_seconds: Gauge<f64>,
     /// Total jobs parked for external callback.
     pub jobs_waiting_external: Counter<u64>,
     /// Current queue depth per state — how many jobs are in each state per queue.
     pub queue_depth: Gauge<i64>,
     /// Queue lag — age of the oldest available job per queue.
     pub queue_lag_seconds: Gauge<f64>,
+    /// Worker slots of a queue held by attempts in this runtime: a handler
+    /// running, or a finished handler waiting for finalizer capacity.
+    pub queue_worker_in_use: Gauge<i64>,
+    /// Worker slots this runtime can give a queue: `max_workers` in
+    /// hard-reserved mode, `min_workers` plus the whole overflow pool in
+    /// weighted mode.
+    pub queue_worker_capacity: Gauge<i64>,
     /// Time from job creation to claim — the user-visible queuing latency.
     pub wait_duration_seconds: Histogram<f64>,
     /// Total jobs moved into the Dead Letter Queue.
@@ -251,9 +276,12 @@ pub struct AwaMetrics {
     /// pinned by handfuls of stragglers or by mountains of unfinished work.
     pub maintenance_rotate_skipped_rows: Histogram<u64>,
     /// Maintenance ring prune attempts, attributed to (ring, outcome, reason).
-    /// reason="none" for Pruned/Noop/Blocked; otherwise carries the
-    /// SkipReason discriminator (e.g. "queue.active_leases",
-    /// "queue.pending_ready", "claim.open").
+    /// Outcomes: `pruned`, `noop`, `blocked` (the exclusive locks were not
+    /// available within the prune lock timeout), `skipped_active`,
+    /// `already_pruned`, `backed_off` (the tick skipped prune after repeated
+    /// `skipped_active` results) and `error`. reason="none" except for
+    /// `skipped_active`, which carries the SkipReason discriminator (e.g.
+    /// "queue.active_leases", "queue.pending_ready", "claim.open").
     pub maintenance_prune_attempts: Counter<u64>,
     /// Magnitude of the reason count when prune returns SkippedActive.
     pub maintenance_prune_skipped_rows: Histogram<u64>,
@@ -479,6 +507,11 @@ impl AwaMetrics {
                 .with_unit("s")
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .build(),
+            promotion_lane_contention: meter
+                .u64_counter(names::MAINTENANCE_PROMOTE_LANE_CONTENTION)
+                .with_description("Promotion lanes whose locks were busy, by state/queue/outcome")
+                .with_unit("{lane}")
+                .build(),
             jobs_in_flight: meter
                 .i64_up_down_counter(names::JOB_IN_FLIGHT)
                 .with_description("Current number of in-flight jobs")
@@ -494,6 +527,19 @@ impl AwaMetrics {
                 .with_description("Number of jobs rescued by maintenance")
                 .with_unit("{job}")
                 .build(),
+            maintenance_rescue_pass_size: meter
+                .u64_histogram(names::MAINTENANCE_RESCUE_PASS_SIZE)
+                .with_description("Attempts rescued per queue-storage rescue pass")
+                .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
+                .build(),
+            maintenance_rescue_oldest_attempt_age_seconds: meter
+                .f64_gauge(names::MAINTENANCE_RESCUE_OLDEST_AGE)
+                .with_description(
+                    "Age of the oldest attempt rescued by the latest queue-storage rescue pass",
+                )
+                .with_unit("s")
+                .build(),
             jobs_waiting_external: meter
                 .u64_counter(names::JOB_WAITING_EXTERNAL)
                 .with_description("Number of jobs parked for external callback")
@@ -508,6 +554,16 @@ impl AwaMetrics {
                 .f64_gauge(names::QUEUE_LAG)
                 .with_description("Age of the oldest available job per queue")
                 .with_unit("s")
+                .build(),
+            queue_worker_in_use: meter
+                .i64_gauge(names::QUEUE_WORKER_IN_USE)
+                .with_description("Worker slots per queue held by attempts in this runtime")
+                .with_unit("{worker}")
+                .build(),
+            queue_worker_capacity: meter
+                .i64_gauge(names::QUEUE_WORKER_CAPACITY)
+                .with_description("Worker slots per queue this runtime can run at once")
+                .with_unit("{worker}")
                 .build(),
             wait_duration_seconds: meter
                 .f64_histogram(names::JOB_WAIT_DURATION)
@@ -894,6 +950,28 @@ impl AwaMetrics {
             .record(duration.as_secs_f64(), &attrs);
     }
 
+    /// Record one queue-storage rescue pass: how many attempts it rescued,
+    /// why it stopped, and the age of the oldest attempt it rescued.
+    pub fn record_rescue_pass(
+        &self,
+        kind: &'static str,
+        pass_end: &'static str,
+        rescued: u64,
+        oldest_attempt_age: Duration,
+    ) {
+        self.maintenance_rescue_pass_size.record(
+            rescued,
+            &[
+                opentelemetry::KeyValue::new("awa.rescue.kind", kind),
+                opentelemetry::KeyValue::new("awa.rescue.pass_end", pass_end),
+            ],
+        );
+        self.maintenance_rescue_oldest_attempt_age_seconds.record(
+            oldest_attempt_age.as_secs_f64(),
+            &[opentelemetry::KeyValue::new("awa.rescue.kind", kind)],
+        );
+    }
+
     /// Record a scheduled/retryable promotion batch.
     pub fn record_promotion_batch(&self, state: &str, batch_size: u64, duration: Duration) {
         let attrs = [opentelemetry::KeyValue::new(
@@ -904,6 +982,23 @@ impl AwaMetrics {
         self.promotion_batch_size.record(batch_size, &attrs);
         self.promotion_duration_seconds
             .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record a promotion lane whose locks were busy past the leader's wait
+    /// budget, with what became of it (`handed_off`, `waiter_limit`,
+    /// `waiter_timed_out`).
+    pub fn record_promotion_lane_contention(
+        &self,
+        state: &str,
+        queue: &str,
+        outcome: &'static str,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.state", state.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.promote.outcome", outcome),
+        ];
+        self.promotion_lane_contention.add(1, &attrs);
     }
 
     /// Record in-flight change.
@@ -931,6 +1026,18 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.queue_lag_seconds.record(lag_seconds, &attrs);
+    }
+
+    /// Record a queue's worker slots in use and its capacity in this runtime,
+    /// sampled together so their ratio is the queue's utilization.
+    pub fn record_queue_workers(&self, queue: &str, in_use: u32, capacity: u32) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.queue_worker_in_use.record(i64::from(in_use), &attrs);
+        self.queue_worker_capacity
+            .record(i64::from(capacity), &attrs);
     }
 
     /// Record job wait duration (time from creation to claim).
@@ -1315,15 +1422,31 @@ impl AwaMetrics {
         }
     }
 
-    /// Record an idle maintenance tick that skipped destructive prune because
-    /// the exact sealed generation was already reclaimed by this leader.
-    pub fn record_prune_already_pruned(&self, ring: &'static str) {
+    /// Record a maintenance tick that skipped prune because the ring's
+    /// backoff after repeated `skipped_active` results had not yet elapsed.
+    pub fn record_prune_backed_off(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "backed_off");
+    }
+
+    /// Record a prune attempt that failed with a database error rather than
+    /// returning an outcome.
+    pub fn record_prune_error(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "error");
+    }
+
+    fn record_prune_attempt_without_reason(&self, ring: &'static str, outcome: &'static str) {
         let attrs = [
             opentelemetry::KeyValue::new("awa.ring", ring),
-            opentelemetry::KeyValue::new("awa.ring.outcome", "already_pruned"),
+            opentelemetry::KeyValue::new("awa.ring.outcome", outcome),
             opentelemetry::KeyValue::new("awa.ring.reason", "none"),
         ];
         self.maintenance_prune_attempts.add(1, &attrs);
+    }
+
+    /// Record an idle maintenance tick that skipped destructive prune because
+    /// the exact sealed generation was already reclaimed by this leader.
+    pub fn record_prune_already_pruned(&self, ring: &'static str) {
+        self.record_prune_attempt_without_reason(ring, "already_pruned");
     }
 }
 
@@ -1443,6 +1566,156 @@ mod tests {
         assert!(saw_already_pruned);
     }
 
+    #[test]
+    fn promotion_lane_contention_counts_each_outcome_per_state_and_queue() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_promotion_lane_contention("scheduled", "emails", "handed_off");
+        metrics.record_promotion_lane_contention("scheduled", "emails", "handed_off");
+        metrics.record_promotion_lane_contention("retryable", "emails", "waiter_limit");
+        metrics.record_promotion_lane_contention("scheduled", "billing", "waiter_timed_out");
+        provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+
+        let mut counts = BTreeMap::new();
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if let (
+                        names::MAINTENANCE_PROMOTE_LANE_CONTENTION,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    {
+                        for point in sum.data_points() {
+                            let label = |key: &str| {
+                                point
+                                    .attributes()
+                                    .find(|kv| kv.key.as_str() == key)
+                                    .map(|kv| kv.value.as_str().into_owned())
+                                    .unwrap_or_default()
+                            };
+                            counts.insert(
+                                (
+                                    label("awa.job.state"),
+                                    label("awa.job.queue"),
+                                    label("awa.promote.outcome"),
+                                ),
+                                point.value(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let key = |state: &str, queue: &str, outcome: &str| {
+            (state.to_string(), queue.to_string(), outcome.to_string())
+        };
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                (key("retryable", "emails", "waiter_limit"), 1),
+                (key("scheduled", "billing", "waiter_timed_out"), 1),
+                (key("scheduled", "emails", "handed_off"), 2),
+            ])
+        );
+    }
+
+    #[test]
+    fn prune_attempts_count_every_outcome_per_ring() {
+        use awa_model::{PruneDurations, PruneOutcome, SkipReason};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        for ring in ["queue", "lease", "claim"] {
+            metrics.record_prune_outcome(
+                ring,
+                &PruneOutcome::Pruned {
+                    slot: 0,
+                    generation: 1,
+                    carried_failed_rows: 0,
+                    durations: PruneDurations::default(),
+                },
+            );
+            metrics.record_prune_outcome(ring, &PruneOutcome::Blocked { slot: 0 });
+            metrics.record_prune_outcome(ring, &PruneOutcome::Noop);
+            metrics.record_prune_already_pruned(ring);
+            metrics.record_prune_backed_off(ring);
+            metrics.record_prune_error(ring);
+        }
+        metrics.record_prune_outcome("claim", &PruneOutcome::Blocked { slot: 1 });
+        metrics.record_prune_outcome(
+            "claim",
+            &PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::ClaimOpen,
+                count: 3,
+            },
+        );
+        provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+
+        let mut counts: std::collections::BTreeMap<(String, String, String), u64> =
+            std::collections::BTreeMap::new();
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let (
+                        names::MAINTENANCE_PRUNE_ATTEMPTS,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    else {
+                        continue;
+                    };
+                    for point in sum.data_points() {
+                        let label = |key: &str| {
+                            point
+                                .attributes()
+                                .find(|attribute| attribute.key.as_str() == key)
+                                .map(|attribute| attribute.value.as_str().into_owned())
+                                .unwrap_or_default()
+                        };
+                        counts.insert(
+                            (
+                                label("awa.ring"),
+                                label("awa.ring.outcome"),
+                                label("awa.ring.reason"),
+                            ),
+                            point.value(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let count = |ring: &str, outcome: &str, reason: &str| {
+            counts
+                .get(&(ring.to_string(), outcome.to_string(), reason.to_string()))
+                .copied()
+        };
+        for ring in ["queue", "lease", "claim"] {
+            for outcome in ["pruned", "noop", "already_pruned", "backed_off", "error"] {
+                assert_eq!(count(ring, outcome, "none"), Some(1), "{ring} {outcome}");
+            }
+            let expected_blocked = if ring == "claim" { 2 } else { 1 };
+            assert_eq!(
+                count(ring, "blocked", "none"),
+                Some(expected_blocked),
+                "{ring} blocked"
+            );
+        }
+        assert_eq!(count("claim", "skipped_active", "claim.open"), Some(1));
+        assert_eq!(count("queue", "skipped_active", "claim.open"), None);
+    }
+
     /// A second-scale observation must not fall in the SDK's default
     /// millisecond-scale buckets (upper bounds 5, 10, 25, ...), and every
     /// histogram must export the intended explicit boundaries.
@@ -1504,7 +1777,7 @@ mod tests {
                 &JOB_DURATION_BUCKETS_SECONDS,
             ),
         ];
-        let counts: [(&str, &Histogram<u64>); 7] = [
+        let counts: [(&str, &Histogram<u64>); 8] = [
             (names::ENQUEUE_BATCH_SIZE, &metrics.enqueue_batch_size),
             (
                 names::DISPATCH_CAPACITY_AVAILABLE,
@@ -1518,6 +1791,10 @@ mod tests {
             (
                 names::MAINTENANCE_PROMOTE_BATCH_SIZE,
                 &metrics.promotion_batch_size,
+            ),
+            (
+                names::MAINTENANCE_RESCUE_PASS_SIZE,
+                &metrics.maintenance_rescue_pass_size,
             ),
             (
                 names::MAINTENANCE_ROTATE_SKIPPED_ROWS,

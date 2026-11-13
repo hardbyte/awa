@@ -1,4 +1,5 @@
 use crate::executor::DlqPolicy;
+use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::audited_sql;
@@ -8,20 +9,25 @@ use awa_model::cron::{
 #[cfg(test)]
 use awa_model::SkipReason;
 use awa_model::{
-    JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome, TerminalDeltaRollupOutcome,
+    AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
+    RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
+    TerminalDeltaRollupOutcome,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Detached lifecycle hook tasks maintenance may have outstanding at once.
+const MAINTENANCE_LIFECYCLE_EVENT_CAPACITY: usize = 1024;
 
 /// The canonical unique-claim conflict raised by `awa.sync_job_unique_claims`
 /// (SQLSTATE 23505, constraint reported as `idx_awa_jobs_unique`). See #388.
@@ -224,6 +230,276 @@ const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
 
 /// How often the leader scans for attempts past their deadline by default.
 pub(crate) const DEFAULT_DEADLINE_RESCUE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default wall-clock budget for one queue-storage rescue pass.
+pub(crate) const DEFAULT_RESCUE_PASS_BUDGET: Duration = Duration::from_secs(1);
+
+/// Default cap on attempts one queue-storage rescue pass rescues.
+pub(crate) const DEFAULT_RESCUE_PASS_MAX_ROWS: usize = 5_000;
+
+/// While a rescue kind still has a backlog, its next pass runs after this
+/// rather than after its full interval. With the per-pass row cap this bounds
+/// a drain to about `rescue_pass_max_rows` attempts per second per kind.
+const RESCUE_BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Claims each slot's cursor walk examines in every batch of a pass that may
+/// take more than one: deadline rescue, and stale-heartbeat rescue once its
+/// owners are confirmed gone. Every claim examined costs its closure checks,
+/// so a narrow window keeps each batch's transaction short; the pass continues
+/// while windows come back full. A pass limited to one batch keeps the store's
+/// wider default so it can walk past a long closed prefix.
+const RESCUE_FOLLOW_UP_SCAN_LIMIT: usize = 2_000;
+
+/// One batch in this many visits the other claim slots before the oldest, so
+/// a long drain of the oldest slot leaves the rest at least that share.
+const RESCUE_OTHERS_FIRST_EVERY: usize = 4;
+
+/// Runtime snapshots the leader reads before accelerating stale-heartbeat rescue. A runtime is `fresh` while its snapshot is
+/// within three effective snapshot intervals. An unconfirmed phase exists only
+/// when 3 * max(snapshot_interval, 1s) < heartbeat staleness ($1, milliseconds).
+/// With a larger interval a stalled live runtime can pass directly from fresh
+/// to gone; this evidence is a bounded heuristic, not proof of process death.
+/// `last_gone_heartbeat` estimates the last heartbeat of a gone runtime from
+/// its final snapshot and configured interval.
+const RESCUE_RUNTIME_EVIDENCE_SQL: &str = r#"
+    SELECT
+        count(*) FILTER (WHERE fresh AND NOT heartbeat_alive)::bigint AS fresh_without_heartbeat,
+        count(*) FILTER (WHERE NOT fresh AND NOT gone)::bigint AS unconfirmed,
+        max(last_seen_at + snapshot_interval_ms * 2 * interval '1 millisecond')
+            FILTER (WHERE gone) AS last_gone_heartbeat
+    FROM (
+        SELECT
+            heartbeat_alive,
+            last_seen_at,
+            snapshot_interval_ms,
+            last_seen_at >= now() - GREATEST(snapshot_interval_ms, 1000) * 3 * interval '1 millisecond'
+                AS fresh,
+            last_seen_at < now() - GREATEST(snapshot_interval_ms, 1000) * 3 * interval '1 millisecond'
+                AND last_seen_at < now() - $1 * interval '1 millisecond'
+                AS gone
+        FROM awa.runtime_instances
+    ) AS runtimes
+"#;
+
+/// The queue-storage rescue kinds a leader drains in passes of batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RescueKind {
+    Heartbeat,
+    Deadline,
+    Callback,
+}
+
+impl RescueKind {
+    /// The `awa.rescue.kind` attribute value, as on `awa.maintenance.rescues`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Heartbeat => "heartbeat",
+            Self::Deadline => "deadline",
+            Self::Callback => "callback_timeout",
+        }
+    }
+}
+
+/// Why a queue-storage rescue pass stopped taking batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescuePassEnd {
+    /// The last batch found fewer eligible attempts than its limit.
+    Drained,
+    /// The pass budget is spent.
+    TimeBudget,
+    /// The pass reached `rescue_pass_max_rows`.
+    RowLimit,
+    /// Stale-heartbeat only: the runtime snapshots do not yet show that the
+    /// owners of stale claims are gone, so the pass keeps to one batch.
+    OwnersUnconfirmed,
+    Error,
+}
+
+impl RescuePassEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::TimeBudget => "time_budget",
+            Self::RowLimit => "row_limit",
+            Self::OwnersUnconfirmed => "owners_unconfirmed",
+            Self::Error => "error",
+        }
+    }
+
+    /// The pass stopped with eligible attempts left that it was allowed to
+    /// take, so the next pass should come sooner than the interval.
+    fn backlog_remains(self) -> bool {
+        matches!(self, Self::TimeBudget | Self::RowLimit)
+    }
+}
+
+/// The leader's record of whether every runtime that could own a stale
+/// claim is gone. A claim does not record its runtime, so the evidence is
+/// fleet-wide: every runtime snapshot is either fresh with its heartbeat
+/// loop alive, or silent for at least the heartbeat staleness. That must
+/// hold at every sample for a full staleness window before a stale-heartbeat
+/// rescue may run extra batches or early passes. This settled window may have
+/// started before a runtime stalled. If freshness lasts at least the staleness,
+/// that runtime can pass directly from fresh to gone without resetting it.
+/// A gap between samples longer than half the staleness restarts the window,
+/// because a stall the leader did not sample could have hidden behind it.
+#[derive(Debug, Default)]
+struct RescueOwnerEvidence {
+    steady_since: Option<Instant>,
+    last_sample: Option<Instant>,
+}
+
+impl RescueOwnerEvidence {
+    /// Record one sample and return whether the evidence now allows a
+    /// stale-heartbeat pass to take more than one batch.
+    fn observe(&mut self, now: Instant, settled: bool, staleness: Duration) -> bool {
+        let sampled_recently = self
+            .last_sample
+            .is_some_and(|last| now.saturating_duration_since(last) <= staleness / 2);
+        self.last_sample = Some(now);
+        if !settled {
+            self.steady_since = None;
+            return false;
+        }
+        if !sampled_recently {
+            self.steady_since = Some(now);
+        }
+        let steady_since = *self.steady_since.get_or_insert(now);
+        now.saturating_duration_since(steady_since) >= staleness
+    }
+}
+
+/// A normal interval tick is a baseline visit even if scheduler jitter makes
+/// its actual start slightly earlier than one interval after the last start.
+/// A reset tick is accelerated work and must retain the owner/cadence gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescueTickOrigin {
+    Ordinary,
+    Backlog,
+}
+
+struct RescueTimer {
+    interval: tokio::time::Interval,
+    next_origin: RescueTickOrigin,
+}
+
+impl RescueTimer {
+    fn new(period: Duration) -> Self {
+        Self {
+            interval: leader_loop_interval(period),
+            next_origin: RescueTickOrigin::Ordinary,
+        }
+    }
+
+    async fn tick(&mut self) -> RescueTickOrigin {
+        self.interval.tick().await;
+        // Consume even when the caller's branch cooldown skips this tick.
+        std::mem::replace(&mut self.next_origin, RescueTickOrigin::Ordinary)
+    }
+
+    fn reset_after(&mut self, duration: Duration) {
+        self.interval.reset_after(duration);
+        self.next_origin = RescueTickOrigin::Backlog;
+    }
+}
+
+/// A sweep survives early re-arms: closed history must not keep the leader
+/// scanning once a cursor has made a full revolution. The first window is
+/// already visited, so crossing its end after wrapping completes the sweep.
+#[derive(Debug, Default)]
+struct RescueSweep {
+    cursors: HashMap<i32, Vec<RescueSweepCursor>>,
+    idle_slots: Vec<i32>,
+    last_revisit: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct RescueSweepCursor {
+    first: Option<(DateTime<Utc>, i64, i64)>,
+    previous: Option<(DateTime<Utc>, i64, i64)>,
+    wrapped: bool,
+    /// The latest scan left its window unfilled.
+    drained: bool,
+    done: bool,
+}
+
+impl RescueSweep {
+    /// A long drain must revisit slots whose claims have become eligible
+    /// since their last scan. Keep unfinished cursors so a large history
+    /// sweep still converges across these ordinary-cadence revisits.
+    fn revisit(&mut self, now: Instant, interval: Duration, origin: RescueTickOrigin) {
+        if origin == RescueTickOrigin::Ordinary
+            || self
+                .last_revisit
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            self.idle_slots.clear();
+            for cursor in self.cursors.values_mut().flatten() {
+                if cursor.done {
+                    *cursor = RescueSweepCursor::default();
+                }
+            }
+            self.last_revisit = Some(now);
+        }
+    }
+
+    fn observe(&mut self, progress: RescueScanProgress) {
+        let cursors = self.cursors.entry(progress.slot).or_default();
+        cursors.resize_with(progress.cursors.len(), RescueSweepCursor::default);
+        for (cursor, progress) in cursors.iter_mut().zip(progress.cursors) {
+            if !progress.saturated {
+                cursor.drained = true;
+                cursor.done = true;
+            } else if cursor.drained {
+                // A drained cursor whose window fills again starts a new sweep.
+                *cursor = RescueSweepCursor::default();
+            }
+            if let Some(position) = progress.position {
+                if let Some(first) = cursor.first {
+                    let crossed = cursor.previous.is_some_and(|previous| position <= previous);
+                    cursor.done |= (cursor.wrapped && crossed)
+                        || ((cursor.wrapped || crossed) && position >= first);
+                    cursor.wrapped |= crossed;
+                } else {
+                    cursor.first = Some(position);
+                }
+                cursor.previous = Some(position);
+            }
+        }
+        if !cursors.is_empty() && cursors.iter().all(|cursor| cursor.done) {
+            self.idle_slots.push(progress.slot);
+        }
+    }
+}
+
+/// An early re-arm may run after owner evidence disappears. Keep ordinary
+/// first batches on their original cadence; every accelerated batch needs
+/// the same owner cutoff as follow-up batches.
+#[derive(Debug, Default)]
+struct RescueHeartbeatCadence {
+    last_baseline: Option<Instant>,
+}
+
+impl RescueHeartbeatCadence {
+    fn select(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+        cutoff: Option<DateTime<Utc>>,
+        origin: RescueTickOrigin,
+    ) -> Option<Option<DateTime<Utc>>> {
+        if origin == RescueTickOrigin::Ordinary
+            || self
+                .last_baseline
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            self.last_baseline = Some(now);
+            Some(None)
+        } else {
+            cutoff.map(Some)
+        }
+    }
+}
 
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
@@ -704,6 +980,10 @@ pub struct MaintenanceService {
     /// In-process `Rescued` lifecycle hooks (ADR-015), shared with the
     /// executor. Best-effort fire-and-forget per rescued job.
     lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
+    /// Bounds the detached lifecycle hook tasks maintenance has outstanding;
+    /// events beyond it are dropped and counted.
+    lifecycle_event_capacity: Arc<tokio::sync::Semaphore>,
+    dropped_lifecycle_events: Arc<AtomicU64>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
@@ -716,6 +996,15 @@ pub struct MaintenanceService {
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
+    rescue_pass_budget: Duration,
+    rescue_pass_max_rows: usize,
+    rescue_owner_evidence: std::sync::Mutex<RescueOwnerEvidence>,
+    rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
+    rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
+    /// Batches each rescue kind has started under this service, across
+    /// passes, for the slot-order rotation.
+    rescue_batches_started: std::sync::Mutex<HashMap<RescueKind, usize>>,
+    rescue_others_first_offset: AtomicUsize,
     promote_interval: Duration,
     cleanup_interval: Duration,
     cron_sync_interval: Duration,
@@ -763,6 +1052,232 @@ const CRON_CATCH_UP_LIMIT: usize = 1_000;
 const TERMINAL_COUNT_ROLLUP_MAX_SLOTS_PER_TICK: usize = 4;
 type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
 
+/// How long a promotion transaction waits on one lane's locks before the
+/// leader hands the lane to a dedicated waiter and goes on without it.
+const PROMOTE_LANE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
+/// Lock wait of a dedicated lane waiter. PostgreSQL grants a lock to its
+/// waiters in arrival order, so a waiter is served after the producers queued
+/// ahead of it, however busy the lane stays.
+const PROMOTE_LANE_WAITER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most lanes with a dedicated waiter at once. A waiter holds a pool
+/// connection while it waits, so smaller pools get fewer: one per eight
+/// connections, and always one so a busy lane is still promoted.
+const PROMOTE_MAX_LANE_WAITERS: usize = 4;
+
+fn lane_waiter_limit(pool_max_connections: u32) -> usize {
+    (pool_max_connections as usize / 8).clamp(1, PROMOTE_MAX_LANE_WAITERS)
+}
+
+/// Queue-storage promotion of due scheduled and retryable rows, as the
+/// maintenance leader runs it for one store.
+///
+/// Each lane's share of a batch is promoted in its own transaction under a
+/// short `lock_timeout`, so a lane whose enqueue lock is busy delays only its
+/// own rows. A lane that times out keeps its rows deferred and is handed to a
+/// dedicated waiter task, which promotes it under a long lock timeout while
+/// the leader carries on with other lanes and other maintenance branches.
+/// Dropping the promoter aborts its waiters.
+#[doc(hidden)]
+pub struct QueueStoragePromoter {
+    pool: PgPool,
+    store: Arc<QueueStorage>,
+    metrics: AwaMetrics,
+    waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
+    waiters: std::sync::Mutex<JoinSet<()>>,
+    max_waiters: usize,
+}
+
+impl QueueStoragePromoter {
+    pub fn new(pool: PgPool, store: Arc<QueueStorage>, metrics: AwaMetrics) -> Self {
+        let max_waiters = lane_waiter_limit(pool.options().get_max_connections());
+        Self {
+            max_waiters,
+            pool,
+            store,
+            metrics,
+            waiting: Arc::default(),
+            waiters: std::sync::Mutex::new(JoinSet::new()),
+        }
+    }
+
+    /// One promotion tick for `state`: batches until one selects fewer rows
+    /// than the batch size, each skipping lanes that have a waiter or were
+    /// contended earlier in the tick. Returns the rows promoted by the tick
+    /// itself, not by waiters.
+    pub async fn promote_due(
+        &self,
+        state: JobState,
+        cancel: &CancellationToken,
+    ) -> Result<usize, AwaError> {
+        {
+            let mut waiters = self.waiters.lock().expect("lane waiters poisoned");
+            while waiters.try_join_next().is_some() {}
+        }
+
+        let mut contended: Vec<PromotionLane> = Vec::new();
+        let mut promoted = 0usize;
+        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let mut skip = self.waiting_lanes(state);
+            skip.extend(contended.iter().cloned());
+            let batch_started = Instant::now();
+            let outcome = self
+                .store
+                .promote_due_lanes(
+                    &self.pool,
+                    state,
+                    PROMOTE_BATCH_SIZE,
+                    Some(PROMOTE_LANE_LOCK_TIMEOUT),
+                    &skip,
+                )
+                .await?;
+            self.metrics.record_promotion_batch(
+                state.as_str(),
+                outcome.promoted as u64,
+                batch_started.elapsed(),
+            );
+            promoted += outcome.promoted;
+            for lane in outcome.contended {
+                self.hand_off(state, lane.clone());
+                contended.push(lane);
+            }
+            if (outcome.selected as i64) < PROMOTE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(promoted)
+    }
+
+    fn waiting_lanes(&self, state: JobState) -> Vec<PromotionLane> {
+        self.waiting
+            .lock()
+            .expect("waiting lanes poisoned")
+            .iter()
+            .filter(|(waiting_state, _)| *waiting_state == state)
+            .map(|(_, lane)| lane.clone())
+            .collect()
+    }
+
+    fn hand_off(&self, state: JobState, lane: PromotionLane) {
+        let key = (state, lane);
+        {
+            let mut waiting = self.waiting.lock().expect("waiting lanes poisoned");
+            if waiting.len() >= self.max_waiters {
+                self.metrics.record_promotion_lane_contention(
+                    state.as_str(),
+                    &key.1.queue,
+                    "waiter_limit",
+                );
+                debug!(
+                    queue = %key.1.queue,
+                    priority = key.1.priority,
+                    "Promotion lane contended with every lane waiter busy; retrying next tick"
+                );
+                return;
+            }
+            if !waiting.insert(key.clone()) {
+                return;
+            }
+        }
+        self.metrics
+            .record_promotion_lane_contention(state.as_str(), &key.1.queue, "handed_off");
+        let guard = WaitingLane {
+            waiting: Arc::clone(&self.waiting),
+            key,
+        };
+        let pool = self.pool.clone();
+        let store = Arc::clone(&self.store);
+        let metrics = self.metrics.clone();
+        self.waiters
+            .lock()
+            .expect("lane waiters poisoned")
+            .spawn(async move {
+                promote_waiting_lane(&pool, &store, &metrics, &guard.key).await;
+                drop(guard);
+            });
+    }
+}
+
+/// Holds a lane in [`QueueStoragePromoter`]'s waiting set until its waiter
+/// finishes, panics or is aborted.
+struct WaitingLane {
+    waiting: Arc<std::sync::Mutex<HashSet<(JobState, PromotionLane)>>>,
+    key: (JobState, PromotionLane),
+}
+
+impl Drop for WaitingLane {
+    fn drop(&mut self) {
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.remove(&self.key);
+        }
+    }
+}
+
+async fn promote_waiting_lane(
+    pool: &PgPool,
+    store: &QueueStorage,
+    metrics: &AwaMetrics,
+    (state, lane): &(JobState, PromotionLane),
+) {
+    for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+        let batch_started = Instant::now();
+        match store
+            .promote_due_lane(
+                pool,
+                *state,
+                lane,
+                PROMOTE_BATCH_SIZE,
+                Some(PROMOTE_LANE_WAITER_LOCK_TIMEOUT),
+            )
+            .await
+        {
+            Ok(outcome) if !outcome.contended.is_empty() => {
+                metrics.record_promotion_lane_contention(
+                    state.as_str(),
+                    &lane.queue,
+                    "waiter_timed_out",
+                );
+                warn!(
+                    queue = %lane.queue,
+                    priority = lane.priority,
+                    lock_timeout_ms = PROMOTE_LANE_WAITER_LOCK_TIMEOUT.as_millis() as u64,
+                    "Promotion of a contended lane timed out waiting for its locks; retrying next tick"
+                );
+                return;
+            }
+            Ok(outcome) => {
+                metrics.record_promotion_batch(
+                    state.as_str(),
+                    outcome.promoted as u64,
+                    batch_started.elapsed(),
+                );
+                if (outcome.selected as i64) < PROMOTE_BATCH_SIZE {
+                    return;
+                }
+            }
+            Err(err) => {
+                error!(
+                    queue = %lane.queue,
+                    priority = lane.priority,
+                    error = %err,
+                    "Failed to promote a contended lane"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The leader's queue-storage promoters: its own store's, and the configured
+/// store a canonical-resolved leader promotes once routing has flipped
+/// (#456). Scoped to one leadership term.
+struct LeaderPromoters {
+    primary: Option<QueueStoragePromoter>,
+    standby: Option<QueueStoragePromoter>,
+}
+
 impl MaintenanceService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -794,9 +1309,20 @@ impl MaintenanceService {
             standby_queue_storage: None,
             enqueue_specs,
             lifecycle_handlers,
+            lifecycle_event_capacity: Arc::new(tokio::sync::Semaphore::new(
+                MAINTENANCE_LIFECYCLE_EVENT_CAPACITY,
+            )),
+            dropped_lifecycle_events: Arc::new(AtomicU64::new(0)),
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: DEFAULT_DEADLINE_RESCUE_INTERVAL,
             callback_rescue_interval: Duration::from_secs(30),
+            rescue_pass_budget: DEFAULT_RESCUE_PASS_BUDGET,
+            rescue_pass_max_rows: DEFAULT_RESCUE_PASS_MAX_ROWS,
+            rescue_owner_evidence: std::sync::Mutex::new(RescueOwnerEvidence::default()),
+            rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
+            rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
+            rescue_batches_started: std::sync::Mutex::new(HashMap::new()),
+            rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
             cron_sync_interval: Duration::from_secs(60),
@@ -925,6 +1451,22 @@ impl MaintenanceService {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches
+    /// (default: 1s, and never more than half the rescue interval). Zero
+    /// keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = budget;
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). A pass always finishes the batch it started;
+    /// zero keeps one batch per ordinary interval, as a zero pass budget does.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = max_rows;
+        self
+    }
+
     /// Set how long a heartbeat must be stale before the job is rescued (default: 90s).
     ///
     /// Should be at least 3× the heartbeat interval to avoid false rescues
@@ -1035,9 +1577,9 @@ impl MaintenanceService {
             }
 
             // Run maintenance tasks as leader
-            let mut heartbeat_rescue_timer = leader_loop_interval(self.heartbeat_rescue_interval);
-            let mut deadline_rescue_timer = leader_loop_interval(self.deadline_rescue_interval);
-            let mut callback_rescue_timer = leader_loop_interval(self.callback_rescue_interval);
+            let mut heartbeat_rescue_timer = RescueTimer::new(self.heartbeat_rescue_interval);
+            let mut deadline_rescue_timer = RescueTimer::new(self.deadline_rescue_interval);
+            let mut callback_rescue_timer = RescueTimer::new(self.callback_rescue_interval);
             let mut promote_timer = leader_loop_interval(self.promote_interval);
             let mut cleanup_timer = leader_loop_interval(self.cleanup_interval);
             let mut cron_sync_timer = leader_loop_interval(self.cron_sync_interval);
@@ -1081,6 +1623,20 @@ impl MaintenanceService {
             // Per-branch overrun tracker. Issue #242 — observability only;
             // the architectural split of this `tokio::select!` is deferred
             // to v0.7 conditional on the overrun counter showing fleet hits.
+            *self
+                .rescue_owner_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                RescueOwnerEvidence::default();
+            *self
+                .rescue_heartbeat_cadence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                RescueHeartbeatCadence::default();
+            self.rescue_sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             let branch_tracker = MaintenanceBranchTracker::new();
             // Per-segment prune backoff (#169). Gates the prune step of
             // each rotate branch so a pinned MVCC snapshot doesn't make
@@ -1088,6 +1644,22 @@ impl MaintenanceService {
             // tick. Local to the leader loop so a re-election resets
             // backoff to zero.
             let prune_tracker = PruneBackoffTracker::new();
+            let promoters = LeaderPromoters {
+                primary: self.storage.queue_storage().map(|runtime| {
+                    QueueStoragePromoter::new(
+                        self.pool.clone(),
+                        Arc::clone(&runtime.store),
+                        self.metrics.clone(),
+                    )
+                }),
+                standby: self.standby_queue_storage.as_ref().map(|runtime| {
+                    QueueStoragePromoter::new(
+                        self.pool.clone(),
+                        Arc::clone(&runtime.store),
+                        self.metrics.clone(),
+                    )
+                }),
+            };
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -1133,27 +1705,36 @@ impl MaintenanceService {
                         let _ = Self::release_leader(&mut leader_conn).await;
                         return;
                     }
-                    _ = heartbeat_rescue_timer.tick() => {
+                    origin = heartbeat_rescue_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
-                            self.rescue_stale_heartbeats().await;
+                            let backlog = self.rescue_stale_heartbeats(origin).await;
                             timer.finish();
+                            if backlog {
+                                heartbeat_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.heartbeat_rescue_interval));
+                            }
                         }
                     }
-                    _ = deadline_rescue_timer.tick() => {
+                    origin = deadline_rescue_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
-                            self.rescue_expired_deadlines().await;
+                            let backlog = self.rescue_expired_deadlines(origin).await;
                             timer.finish();
+                            if backlog {
+                                deadline_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.deadline_rescue_interval));
+                            }
                         }
                     }
-                    _ = callback_rescue_timer.tick() => {
+                    origin = callback_rescue_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
-                            self.rescue_expired_callbacks().await;
+                            let backlog = self.rescue_expired_callbacks(origin).await;
                             timer.finish();
+                            if backlog {
+                                callback_rescue_timer.reset_after(RESCUE_BACKLOG_INTERVAL.min(self.callback_rescue_interval));
+                            }
                         }
                     }
                     _ = promote_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin_without_cooldown("promote_scheduled", self.promote_interval, &self.metrics) {
-                            self.promote_scheduled().await;
+                            self.promote_scheduled(&promoters).await;
                             timer.finish();
                         }
                     }
@@ -1626,39 +2207,303 @@ impl MaintenanceService {
     /// `canonical_live_backlog` above zero and wedge `finalize --wait`,
     /// and stuck queue-storage rows would wait out a drain-only leader.
     /// Both cross-plane sweeps are cheap no-ops once their tables are empty.
+    ///
+    /// Returns whether the queue-storage pass left a backlog it may keep
+    /// draining, so the next pass should run before the full interval.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
-    async fn rescue_stale_heartbeats(&self) {
+    async fn rescue_stale_heartbeats(&self, origin: RescueTickOrigin) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
                 self.process_heartbeat_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_stale_heartbeats_with_dlq(
-                            &self.pool,
-                            self.heartbeat_staleness,
-                            &|queue| self.dlq_policy.enabled_for(queue),
-                        )
-                        .await;
-                    self.process_heartbeat_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Heartbeat, runtime, false, origin)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_stale_heartbeats_with_dlq(
-                        &self.pool,
-                        self.heartbeat_staleness,
-                        &|queue| self.dlq_policy.enabled_for(queue),
-                    )
-                    .await;
-                self.process_heartbeat_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Heartbeat, runtime, true, origin)
                     .await;
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
                 self.process_heartbeat_rescues(outcome, false, None).await;
+                backlog
             }
+        }
+    }
+
+    /// One queue-storage rescue pass: batches of up to 500 attempts per
+    /// source, each in its own transaction, until a batch comes back short,
+    /// the pass budget is spent, or the pass reaches `rescue_pass_max_rows`. Most batches visit the oldest claim slot
+    /// first, since the ring cannot rotate back into it while it holds open
+    /// claims; every [`RESCUE_OTHERS_FIRST_EVERY`]th visits the others first.
+    /// A slot a batch found nothing in is left out for the rest of the pass.
+    ///
+    /// A stale heartbeat cannot tell a dead runtime from a stalled one, so a
+    /// stale-heartbeat pass takes more than one batch only when
+    /// [`RescueOwnerEvidence`] holds, and its later batches take only claims
+    /// last heartbeated before the most recently gone runtime stopped
+    /// reporting. This reduces the chance of draining a lagging live runtime,
+    /// but snapshot freshness and sampling cannot prove an owner is dead.
+    /// Deadline and callback rescues act on a deadline that has passed whoever
+    /// owns the attempt.
+    ///
+    /// Returns whether the pass stopped with a backlog it may keep draining,
+    /// so the next pass should run before the full interval.
+    async fn rescue_queue_storage_pass(
+        &self,
+        kind: RescueKind,
+        runtime: &QueueStorageRuntime,
+        signal_local: bool,
+        origin: RescueTickOrigin,
+    ) -> bool {
+        let started = Instant::now();
+        let interval = match kind {
+            RescueKind::Heartbeat => self.heartbeat_rescue_interval,
+            RescueKind::Deadline => self.deadline_rescue_interval,
+            RescueKind::Callback => self.callback_rescue_interval,
+        };
+        let budget = self.rescue_pass_budget.min(interval / 2);
+        let dlq_enabled = |queue: &str| self.dlq_policy.enabled_for(queue);
+        let bulk_heartbeat_cutoff = if kind == RescueKind::Heartbeat {
+            self.stale_claim_owners_gone().await
+        } else {
+            None
+        };
+        let first_heartbeat_cutoff = if kind == RescueKind::Heartbeat {
+            let selected = self
+                .rescue_heartbeat_cadence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .select(started, interval, bulk_heartbeat_cutoff, origin);
+            let Some(cutoff) = selected else {
+                self.rescue_sweeps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&kind);
+                return false;
+            };
+            cutoff
+        } else {
+            None
+        };
+        let mut rescued_total = 0usize;
+        let mut oldest_attempt: Option<DateTime<Utc>> = None;
+        let mut batches = 0usize;
+        let mut sweep = self
+            .rescue_sweeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&kind)
+            .unwrap_or_default();
+        sweep.revisit(started, interval, origin);
+        let pass_end = loop {
+            let batch_number = {
+                let mut started = self
+                    .rescue_batches_started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let started = started.entry(kind).or_default();
+                let batch_number = *started;
+                *started = started.wrapping_add(1);
+                batch_number
+            };
+            let slot_order =
+                if batch_number % RESCUE_OTHERS_FIRST_EVERY == RESCUE_OTHERS_FIRST_EVERY - 1 {
+                    RescueSlotOrder::OthersFirst(
+                        self.rescue_others_first_offset
+                            .fetch_add(1, Ordering::Relaxed),
+                    )
+                } else {
+                    RescueSlotOrder::OldestFirst
+                };
+            let options = RescueBatchOptions {
+                slot_order,
+                skip_slots: sweep.idle_slots.clone(),
+                cursor_scan_limit: (batches > 0
+                    || (!budget.is_zero()
+                        && self.rescue_pass_max_rows > 0
+                        && match kind {
+                            RescueKind::Heartbeat => bulk_heartbeat_cutoff.is_some(),
+                            RescueKind::Deadline => true,
+                            RescueKind::Callback => false,
+                        }))
+                .then_some(RESCUE_FOLLOW_UP_SCAN_LIMIT),
+                // Follow-up batches take only claims last heartbeated
+                // before a runtime known to be gone stopped reporting.
+                heartbeated_before: if batches == 0 {
+                    first_heartbeat_cutoff
+                } else {
+                    bulk_heartbeat_cutoff
+                },
+            };
+            let outcome = match kind {
+                RescueKind::Heartbeat => {
+                    runtime
+                        .store
+                        .rescue_stale_heartbeats_batch(
+                            &self.pool,
+                            self.heartbeat_staleness,
+                            &dlq_enabled,
+                            &options,
+                        )
+                        .await
+                }
+                RescueKind::Deadline => {
+                    runtime
+                        .store
+                        .rescue_expired_deadlines_batch(&self.pool, &dlq_enabled, &options)
+                        .await
+                }
+                RescueKind::Callback => {
+                    runtime
+                        .store
+                        .rescue_expired_callbacks_batch(&self.pool, &dlq_enabled, &options)
+                        .await
+                }
+            };
+            batches += 1;
+            let RescueBatch {
+                rescued,
+                saturated,
+                idle_slots: batch_idle_slots,
+                scan_progress,
+            } = match outcome {
+                Ok(batch) => batch,
+                Err(err) => {
+                    self.process_queue_storage_rescues(kind, Err(err), signal_local, runtime)
+                        .await;
+                    break RescuePassEnd::Error;
+                }
+            };
+            sweep.idle_slots.extend(batch_idle_slots);
+            for progress in scan_progress {
+                sweep.observe(progress);
+            }
+            rescued_total += rescued.len();
+            if let Some(attempted_at) = rescued.iter().filter_map(|job| job.attempted_at).min() {
+                oldest_attempt =
+                    Some(oldest_attempt.map_or(attempted_at, |oldest| oldest.min(attempted_at)));
+            }
+            self.process_queue_storage_rescues(kind, Ok(rescued), signal_local, runtime)
+                .await;
+
+            if !saturated {
+                break RescuePassEnd::Drained;
+            }
+            if budget.is_zero() || self.rescue_pass_max_rows == 0 {
+                break RescuePassEnd::TimeBudget;
+            }
+            if kind == RescueKind::Heartbeat && bulk_heartbeat_cutoff.is_none() {
+                break RescuePassEnd::OwnersUnconfirmed;
+            }
+            if rescued_total >= self.rescue_pass_max_rows {
+                break RescuePassEnd::RowLimit;
+            }
+            if started.elapsed() >= budget {
+                break RescuePassEnd::TimeBudget;
+            }
+        };
+
+        let oldest_attempt_age = oldest_attempt
+            .and_then(|attempted_at| (Utc::now() - attempted_at).to_std().ok())
+            .unwrap_or_default();
+        self.metrics.record_rescue_pass(
+            kind.as_str(),
+            pass_end.as_str(),
+            rescued_total as u64,
+            oldest_attempt_age,
+        );
+        if batches > 1 {
+            info!(
+                rescue_kind = kind.as_str(),
+                rescued = rescued_total,
+                batches,
+                pass_end = pass_end.as_str(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                oldest_attempt_age_s = oldest_attempt_age.as_secs(),
+                "Queue-storage rescue pass drained a backlog"
+            );
+        }
+        let rearm = pass_end.backlog_remains()
+            && !budget.is_zero()
+            && self.rescue_pass_max_rows > 0
+            && (kind != RescueKind::Heartbeat || bulk_heartbeat_cutoff.is_some());
+        if rearm {
+            self.rescue_sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(kind, sweep);
+        }
+        rearm
+    }
+
+    async fn process_queue_storage_rescues(
+        &self,
+        kind: RescueKind,
+        outcome: Result<Vec<JobRow>, awa_model::AwaError>,
+        signal_local: bool,
+        runtime: &QueueStorageRuntime,
+    ) {
+        match kind {
+            RescueKind::Heartbeat => {
+                self.process_heartbeat_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+            RescueKind::Deadline => {
+                self.process_deadline_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+            RescueKind::Callback => {
+                self.process_callback_rescues(outcome, signal_local, Some(runtime))
+                    .await
+            }
+        }
+    }
+
+    /// Sample the runtime snapshots and update [`RescueOwnerEvidence`].
+    /// Returns the heartbeat cutoff for accelerated stale-heartbeat batches
+    /// when the evidence holds and some runtime is known to be gone; `None`
+    /// keeps the pass to one batch. A failed read counts as no evidence.
+    async fn stale_claim_owners_gone(&self) -> Option<DateTime<Utc>> {
+        let staleness_ms = i64::try_from(self.heartbeat_staleness.as_millis()).unwrap_or(i64::MAX);
+        let (settled, last_gone_heartbeat) = match sqlx::query_as::<
+            _,
+            (i64, i64, Option<DateTime<Utc>>),
+        >(RESCUE_RUNTIME_EVIDENCE_SQL)
+        .bind(staleness_ms)
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok((fresh_without_heartbeat, unconfirmed, last_gone_heartbeat)) => {
+                if fresh_without_heartbeat > 0 || unconfirmed > 0 {
+                    debug!(
+                        fresh_without_heartbeat,
+                        unconfirmed,
+                        "Stale-heartbeat rescue kept to one batch: runtime snapshots do not show the claim owners gone"
+                    );
+                }
+                (
+                    fresh_without_heartbeat == 0 && unconfirmed == 0,
+                    last_gone_heartbeat,
+                )
+            }
+            Err(err) => {
+                warn!(error = %err, "Failed to read runtime snapshots for stale-heartbeat rescue");
+                (false, None)
+            }
+        };
+        let steady = self
+            .rescue_owner_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(Instant::now(), settled, self.heartbeat_staleness);
+        if steady {
+            last_gone_heartbeat
+        } else {
+            None
         }
     }
 
@@ -1825,33 +2670,25 @@ impl MaintenanceService {
     /// #456 mirror: sweeps both storage planes; see
     /// [`Self::rescue_stale_heartbeats`].
     #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
-    async fn rescue_expired_deadlines(&self) {
+    async fn rescue_expired_deadlines(&self, origin: RescueTickOrigin) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
-                            self.dlq_policy.enabled_for(queue)
-                        })
-                        .await;
-                    self.process_deadline_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Deadline, runtime, false, origin)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
-                        self.dlq_policy.enabled_for(queue)
-                    })
-                    .await;
-                self.process_deadline_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Deadline, runtime, true, origin)
                     .await;
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, false, None).await;
+                backlog
             }
         }
     }
@@ -1998,33 +2835,25 @@ impl MaintenanceService {
     /// doubly here because callback-carrying jobs never migrate off the
     /// canonical plane during a transition.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
-    async fn rescue_expired_callbacks(&self) {
+    async fn rescue_expired_callbacks(&self, origin: RescueTickOrigin) -> bool {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime
-                        .store
-                        .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
-                            self.dlq_policy.enabled_for(queue)
-                        })
-                        .await;
-                    self.process_callback_rescues(outcome, false, Some(runtime))
+                    return self
+                        .rescue_queue_storage_pass(RescueKind::Callback, runtime, false, origin)
                         .await;
                 }
+                false
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime
-                    .store
-                    .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
-                        self.dlq_policy.enabled_for(queue)
-                    })
-                    .await;
-                self.process_callback_rescues(outcome, true, Some(runtime))
+                let backlog = self
+                    .rescue_queue_storage_pass(RescueKind::Callback, runtime, true, origin)
                     .await;
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, false, None).await;
+                backlog
             }
         }
     }
@@ -2385,9 +3214,7 @@ impl MaintenanceService {
                 job: job.clone(),
                 reason,
             };
-            tokio::spawn(async move {
-                crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
-            });
+            self.spawn_lifecycle_event(handlers, kind, event);
         }
     }
 
@@ -2474,8 +3301,41 @@ impl MaintenanceService {
             job: job.clone(),
             reason,
         };
+        self.spawn_lifecycle_event(handlers, kind, event);
+    }
+
+    /// Runs `kind`'s lifecycle hooks for `event` on a detached task, so a slow
+    /// hook does not hold up maintenance. At most
+    /// [`MAINTENANCE_LIFECYCLE_EVENT_CAPACITY`] such tasks are outstanding; an
+    /// event beyond that is dropped rather than retaining its job until the
+    /// hooks catch up.
+    fn spawn_lifecycle_event(
+        &self,
+        handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
+        kind: String,
+        event: crate::events::UntypedJobEvent,
+    ) {
+        if !handlers.contains_key(&kind) {
+            return;
+        }
+        let Ok(permit) = self.lifecycle_event_capacity.clone().try_acquire_owned() else {
+            let dropped = self
+                .dropped_lifecycle_events
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if dropped % 1000 == 1 {
+                warn!(
+                    kind,
+                    dropped,
+                    capacity = MAINTENANCE_LIFECYCLE_EVENT_CAPACITY,
+                    "Dropped a maintenance lifecycle event: earlier hooks have not returned"
+                );
+            }
+            return;
+        };
         tokio::spawn(async move {
             crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
+            drop(permit);
         });
     }
 
@@ -2541,13 +3401,20 @@ impl MaintenanceService {
     }
 
     /// Promote scheduled jobs that are now due.
-    #[tracing::instrument(skip(self), name = "maintenance.promote")]
-    async fn promote_scheduled(&self) {
-        if let Err(err) = self.promote_due_state("scheduled", "scheduled jobs").await {
+    #[tracing::instrument(skip(self, promoters), name = "maintenance.promote")]
+    async fn promote_scheduled(&self, promoters: &LeaderPromoters) {
+        if let Err(err) = self
+            .promote_due_state(JobState::Scheduled, "scheduled jobs", promoters)
+            .await
+        {
             error!(error = %err, "Failed to promote scheduled jobs");
         }
         if let Err(err) = self
-            .promote_due_state("retryable", "retryable jobs (backoff elapsed)")
+            .promote_due_state(
+                JobState::Retryable,
+                "retryable jobs (backoff elapsed)",
+                promoters,
+            )
             .await
         {
             error!(error = %err, "Failed to promote retryable jobs");
@@ -2556,138 +3423,62 @@ impl MaintenanceService {
 
     async fn promote_due_state(
         &self,
-        state: &'static str,
+        state: JobState,
         label: &'static str,
-    ) -> Result<(), awa_model::AwaError> {
+        promoters: &LeaderPromoters,
+    ) -> Result<(), AwaError> {
+        let canonical_state = match state {
+            JobState::Scheduled => "scheduled",
+            JobState::Retryable => "retryable",
+            other => {
+                return Err(AwaError::Validation(format!(
+                    "unsupported promote state: {other:?}"
+                )));
+            }
+        };
         let mut promoted_total = 0usize;
         let mut notified_queues = HashSet::new();
 
-        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
-            if self.cancel.is_cancelled() {
-                break;
-            }
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                promoted_total += self
+                    .promote_canonical_due(canonical_state, &mut notified_queues)
+                    .await?;
 
-            match &self.storage {
-                RuntimeStorage::Canonical => {
-                    let (promoted, queues) = self
-                        .promote_due_batch(state)
-                        .await
-                        .map_err(awa_model::AwaError::Database)?;
-                    if promoted == 0 {
-                        break;
-                    }
-
-                    promoted_total += promoted;
-                    notified_queues.extend(queues);
-
-                    if promoted < PROMOTE_BATCH_SIZE as usize {
-                        break;
-                    }
-                }
-                RuntimeStorage::QueueStorage(runtime) => {
-                    let job_state = match state {
-                        "scheduled" => awa_model::JobState::Scheduled,
-                        "retryable" => awa_model::JobState::Retryable,
-                        other => {
-                            return Err(awa_model::AwaError::Validation(format!(
-                                "unsupported queue storage promote state: {other}"
-                            )));
-                        }
-                    };
-                    let promote_start = std::time::Instant::now();
-                    let promoted = runtime
-                        .store
-                        .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
-                        .await?;
-                    self.metrics.record_promotion_batch(
-                        state,
-                        promoted as u64,
-                        promote_start.elapsed(),
-                    );
-                    if promoted == 0 {
-                        break;
-                    }
-
-                    promoted_total += promoted;
-
-                    if promoted < PROMOTE_BATCH_SIZE as usize {
-                        break;
+                // #456 mirror: a canonical-resolved (pre-flip) leader must
+                // promote the queue-storage deferred backlog once routing has
+                // flipped — re-scheduled canonical jobs migrate there, and
+                // post-flip runtimes that would promote them may not hold
+                // leadership. The active-schema guard keeps this a no-op until
+                // the flip.
+                if let (Some(runtime), Some(promoter)) =
+                    (&self.standby_queue_storage, &promoters.standby)
+                {
+                    let active_schema: Option<String> =
+                        sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(AwaError::Database)?;
+                    if active_schema.as_deref() == Some(runtime.store.schema()) {
+                        promoted_total += promoter.promote_due(state, &self.cancel).await?;
                     }
                 }
             }
-        }
+            RuntimeStorage::QueueStorage(_) => {
+                if let Some(promoter) = &promoters.primary {
+                    promoted_total += promoter.promote_due(state, &self.cancel).await?;
+                }
 
-        // #456: while a storage transition drains, due jobs can still sit in
-        // the canonical deferred backlog. Drain-only runtimes execute
-        // canonical work but stop leading maintenance once a post-flip
-        // runtime wins the election, so a queue-storage leader must promote
-        // the canonical plane too. Both queries are cheap no-ops once the
-        // canonical tables are empty (every finalized or fresh install).
-        if matches!(&self.storage, RuntimeStorage::QueueStorage(_)) {
-            for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
-                if self.cancel.is_cancelled() {
-                    break;
-                }
-                let (promoted, queues) = self
-                    .promote_due_batch(state)
-                    .await
-                    .map_err(awa_model::AwaError::Database)?;
-                if promoted == 0 {
-                    break;
-                }
-                promoted_total += promoted;
-                notified_queues.extend(queues);
-                if promoted < PROMOTE_BATCH_SIZE as usize {
-                    break;
-                }
-            }
-        }
-
-        // #456 mirror: a canonical-resolved (pre-flip) leader must promote
-        // the queue-storage deferred backlog once routing has flipped —
-        // re-scheduled canonical jobs migrate there, and post-flip runtimes
-        // that would promote them may not hold leadership. The active-schema
-        // guard keeps this a no-op until the flip.
-        if matches!(&self.storage, RuntimeStorage::Canonical) {
-            if let Some(runtime) = &self.standby_queue_storage {
-                let active_schema: Option<String> =
-                    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(awa_model::AwaError::Database)?;
-                if active_schema.as_deref() == Some(runtime.store.schema()) {
-                    let job_state = match state {
-                        "scheduled" => awa_model::JobState::Scheduled,
-                        "retryable" => awa_model::JobState::Retryable,
-                        other => {
-                            return Err(awa_model::AwaError::Validation(format!(
-                                "unsupported queue storage promote state: {other}"
-                            )));
-                        }
-                    };
-                    for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
-                        if self.cancel.is_cancelled() {
-                            break;
-                        }
-                        let promote_start = std::time::Instant::now();
-                        let promoted = runtime
-                            .store
-                            .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
-                            .await?;
-                        self.metrics.record_promotion_batch(
-                            state,
-                            promoted as u64,
-                            promote_start.elapsed(),
-                        );
-                        if promoted == 0 {
-                            break;
-                        }
-                        promoted_total += promoted;
-                        if promoted < PROMOTE_BATCH_SIZE as usize {
-                            break;
-                        }
-                    }
-                }
+                // #456: while a storage transition drains, due jobs can still
+                // sit in the canonical deferred backlog. Drain-only runtimes
+                // execute canonical work but stop leading maintenance once a
+                // post-flip runtime wins the election, so a queue-storage
+                // leader must promote the canonical plane too. This is a
+                // cheap no-op once the canonical tables are empty (every
+                // finalized or fresh install).
+                promoted_total += self
+                    .promote_canonical_due(canonical_state, &mut notified_queues)
+                    .await?;
             }
         }
 
@@ -2695,12 +3486,40 @@ impl MaintenanceService {
             debug!(
                 count = promoted_total,
                 queues = notified_queues.len(),
-                state,
+                state = canonical_state,
                 "Promoted {label}"
             );
         }
 
         Ok(())
+    }
+
+    /// Promote due canonical `scheduled_jobs` rows in batches until one comes
+    /// back short.
+    async fn promote_canonical_due(
+        &self,
+        state: &'static str,
+        notified_queues: &mut HashSet<String>,
+    ) -> Result<usize, AwaError> {
+        let mut promoted_total = 0usize;
+        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            let (promoted, queues) = self
+                .promote_due_batch(state)
+                .await
+                .map_err(AwaError::Database)?;
+            if promoted == 0 {
+                break;
+            }
+            promoted_total += promoted;
+            notified_queues.extend(queues);
+            if promoted < PROMOTE_BATCH_SIZE as usize {
+                break;
+            }
+        }
+        Ok(promoted_total)
     }
 
     /// SQL template for promotion. The state literal is injected directly
@@ -2863,6 +3682,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
             debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("queue");
             return;
         }
 
@@ -2910,6 +3730,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("queue");
                 error!(error = %err, "Failed to prune queue storage queue segments");
             }
         }
@@ -2978,6 +3799,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_LEASE) {
             debug!(branch = PRUNE_BRANCH_LEASE, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("lease");
             return;
         }
 
@@ -3008,6 +3830,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("lease");
                 error!(error = %err, "Failed to prune queue storage lease segments");
             }
         }
@@ -3081,6 +3904,7 @@ impl MaintenanceService {
 
         if prune_tracker.should_skip(PRUNE_BRANCH_CLAIM) {
             debug!(branch = PRUNE_BRANCH_CLAIM, "Prune backed off this tick");
+            self.metrics.record_prune_backed_off("claim");
             return;
         }
 
@@ -3111,6 +3935,7 @@ impl MaintenanceService {
                 }
             }
             Err(err) => {
+                self.metrics.record_prune_error("claim");
                 error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }
@@ -3710,6 +4535,15 @@ mod tests {
     }
 
     #[test]
+    fn lane_waiters_scale_with_the_pool_and_never_drop_to_zero() {
+        assert_eq!(lane_waiter_limit(1), 1);
+        assert_eq!(lane_waiter_limit(10), 1);
+        assert_eq!(lane_waiter_limit(16), 2);
+        assert_eq!(lane_waiter_limit(32), 4);
+        assert_eq!(lane_waiter_limit(200), 4);
+    }
+
+    #[test]
     fn compute_fire_times_coalesces_missed_existing_fires_by_default() {
         let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
@@ -4036,8 +4870,12 @@ mod tests {
             Arc::new(HashMap::new()),
         );
 
-        service.rescue_stale_heartbeats().await;
-        service.rescue_expired_callbacks().await;
+        service
+            .rescue_stale_heartbeats(RescueTickOrigin::Backlog)
+            .await;
+        service
+            .rescue_expired_callbacks(RescueTickOrigin::Backlog)
+            .await;
 
         // Post-flip the `awa.jobs` view exposes only the queue-storage
         // plane, so assert against the physical canonical tables: both
@@ -4288,6 +5126,729 @@ mod tests {
             Some(clock + BRANCH_COOLDOWN_MAX),
             "cap bounds the cooldown"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_rescue_ticks_survive_jitter_and_revisit_finished_slots() {
+        let interval = Duration::from_secs(30);
+        let mut timer = RescueTimer::new(interval);
+        timer.tick().await;
+        let mut cadence = RescueHeartbeatCadence::default();
+        let mut sweep = RescueSweep::default();
+        tokio::time::advance(interval + Duration::from_millis(2)).await;
+        let first_origin = timer.tick().await;
+        assert_eq!(first_origin, RescueTickOrigin::Ordinary);
+        let first_start = tokio::time::Instant::now().into_std();
+        assert_eq!(
+            cadence.select(first_start, interval, None, first_origin),
+            Some(None)
+        );
+        sweep.revisit(first_start, interval, first_origin);
+        let stamp = Utc::now();
+        for (slot, saturated) in [(0, false), (1, true)] {
+            sweep.observe(RescueScanProgress {
+                slot,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 100, 1)),
+                    saturated,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+        tokio::time::advance(interval - Duration::from_millis(2)).await;
+        let next_origin = timer.tick().await;
+        let next_start = tokio::time::Instant::now().into_std();
+        assert_eq!(
+            next_start.duration_since(first_start),
+            interval - Duration::from_millis(2)
+        );
+        assert_eq!(next_origin, RescueTickOrigin::Ordinary);
+        assert_eq!(
+            cadence.select(next_start, interval, None, next_origin),
+            Some(None),
+            "an ordinary tick must not disappear because the prior tick started 2ms late"
+        );
+        sweep.revisit(next_start, interval, next_origin);
+        assert!(
+            sweep.idle_slots.is_empty(),
+            "newly eligible finished slots must be revisited"
+        );
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "ordinary revisits must retain unfinished sweep progress"
+        );
+    }
+
+    #[test]
+    fn ordinary_rescue_revisit_preserves_unfinished_cursor_under_jitter() {
+        let interval = Duration::from_secs(30);
+        let now = Instant::now();
+        let first_start = now + interval + Duration::from_millis(2);
+        let second_start = now + interval * 2;
+        let stamp = Utc::now();
+        let mut sweep = RescueSweep::default();
+        sweep.revisit(first_start, interval, RescueTickOrigin::Ordinary);
+        for (slot, saturated) in [(0, false), (1, true)] {
+            sweep.observe(RescueScanProgress {
+                slot,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 100, 1)),
+                    saturated,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+        sweep.revisit(second_start, interval, RescueTickOrigin::Ordinary);
+        assert!(
+            sweep.idle_slots.is_empty(),
+            "finished slot must be revisited on the ordinary tick"
+        );
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "unfinished sweep progress must survive the same ordinary revisit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_rescue_baseline_does_not_turn_early_rearm_into_baseline() {
+        let interval = Duration::from_secs(30);
+        let mut timer = RescueTimer::new(interval);
+        timer.tick().await;
+        tokio::time::advance(Duration::from_secs(52)).await;
+        let first_origin = timer.tick().await;
+        let first_start = tokio::time::Instant::now().into_std();
+        let mut cadence = RescueHeartbeatCadence::default();
+        assert_eq!(
+            cadence.select(first_start, interval, None, first_origin),
+            Some(None)
+        );
+        timer.reset_after(Duration::from_secs(8));
+        let origin = timer.tick().await;
+        let now = tokio::time::Instant::now().into_std();
+        assert_eq!(now.duration_since(first_start), Duration::from_secs(8));
+        assert_eq!(origin, RescueTickOrigin::Backlog);
+        assert_eq!(cadence.select(now, interval, None, origin), None,
+            "a tick scheduled 30s but serviced at52s must not make backlog60s an unguarded baseline");
+        let cutoff = Utc::now();
+        assert_eq!(
+            cadence.select(now, interval, Some(cutoff), origin),
+            Some(Some(cutoff)),
+            "an early re-arm must retain the owner cutoff"
+        );
+        let origin = timer.tick().await;
+        let now = tokio::time::Instant::now().into_std();
+        assert_eq!(origin, RescueTickOrigin::Ordinary);
+        assert_eq!(now.duration_since(first_start), Duration::from_secs(38));
+        assert_eq!(cadence.select(now, interval, None, origin), Some(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rescue_backlog_tick_is_consumed_even_when_branch_cooldown_skips_it() {
+        let (tracker, clock, cooldown_until) = tracker_flipped_by_250ms_bodies();
+        let metrics = metrics_for_test();
+        let mut timer = RescueTimer::new(Duration::from_secs(30));
+        timer.tick().await;
+        timer.reset_after(TICK_100MS);
+        let origin = timer.tick().await;
+        assert_eq!(origin, RescueTickOrigin::Backlog);
+        let skipped_at = clock + Duration::from_nanos(1);
+        assert!(skipped_at < cooldown_until);
+        assert!(tracker
+            .try_begin_at("cleanup", TICK_100MS, &metrics, true, skipped_at)
+            .is_none());
+        // tick() consumed the marker before try_begin could skip the work.
+        assert_eq!(timer.tick().await, RescueTickOrigin::Ordinary);
+    }
+
+    #[test]
+    fn rescue_accelerated_first_batch_requires_owner_evidence() {
+        let mut cadence = RescueHeartbeatCadence::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let cutoff = Utc::now();
+        assert_eq!(
+            cadence.select(now, interval, None, RescueTickOrigin::Backlog),
+            Some(None)
+        );
+        assert_eq!(
+            cadence.select(
+                now + Duration::from_secs(1),
+                interval,
+                Some(cutoff),
+                RescueTickOrigin::Backlog
+            ),
+            Some(Some(cutoff))
+        );
+        // The preceding accelerated pass re-armed the timer, but owners
+        // became unconfirmed before it fired: no ordinary batch may slip in.
+        assert_eq!(
+            cadence.select(
+                now + Duration::from_secs(2),
+                interval,
+                None,
+                RescueTickOrigin::Backlog
+            ),
+            None
+        );
+        assert_eq!(
+            cadence.select(now + interval, interval, None, RescueTickOrigin::Backlog),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn rescue_closed_history_sweep_stops_after_wrap() {
+        let mut sweep = RescueSweep::default();
+        let stamp = Utc::now();
+        // First window ends midway around a slot. Sweep state survives
+        // the pass's time budget and the next early timer fire.
+        for id in [20, 40, 60, 10] {
+            sweep.observe(RescueScanProgress {
+                slot: 1,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, id, 1)),
+                    saturated: true,
+                }],
+            });
+            assert!(sweep.idle_slots.is_empty());
+        }
+        sweep.observe(RescueScanProgress {
+            slot: 1,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: Some((stamp, 20, 1)),
+                saturated: true,
+            }],
+        });
+        assert_eq!(sweep.idle_slots, vec![1]);
+
+        let mut one = RescueSweep::default();
+        for _ in 0..2 {
+            one.observe(RescueScanProgress {
+                slot: 0,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, 1, 1)),
+                    saturated: true,
+                }],
+            });
+        }
+        assert_eq!(one.idle_slots, vec![0]);
+    }
+
+    #[test]
+    fn rescue_sweep_revisits_newly_eligible_slots_at_the_ordinary_interval() {
+        let mut sweep = RescueSweep::default();
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let stamp = Utc::now();
+        sweep.revisit(now, interval, RescueTickOrigin::Backlog);
+        // Slot A's deadlines are in the future; B keeps a large pass open.
+        sweep.observe(RescueScanProgress {
+            slot: 0,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: None,
+                saturated: false,
+            }],
+        });
+        sweep.observe(RescueScanProgress {
+            slot: 1,
+            cursors: vec![awa_model::RescueScanCursor {
+                position: Some((stamp, 100, 1)),
+                saturated: true,
+            }],
+        });
+        sweep.revisit(now + interval / 2, interval, RescueTickOrigin::Backlog);
+        assert_eq!(sweep.idle_slots, vec![0]);
+        // A can now be expired (or contain claims from a reused generation).
+        sweep.revisit(now + interval, interval, RescueTickOrigin::Backlog);
+        assert!(sweep.idle_slots.is_empty());
+        assert!(!sweep.cursors[&0][0].done);
+        assert_eq!(
+            sweep.cursors[&1][0].first,
+            Some((stamp, 100, 1)),
+            "revisiting an idle slot must not restart an unfinished sweep"
+        );
+    }
+
+    #[test]
+    fn rescue_sweep_detects_a_window_crossing_its_origin() {
+        let mut sweep = RescueSweep::default();
+        let stamp = Utc::now();
+        // A window can cross the origin and wrap again before its last key.
+        // Its end alone need never equal or exceed the original last key.
+        for id in [10_000, 1_999, 3_999, 5_999, 7_999, 9_999, 1_998] {
+            sweep.observe(RescueScanProgress {
+                slot: 0,
+                cursors: vec![awa_model::RescueScanCursor {
+                    position: Some((stamp, id, 1)),
+                    saturated: true,
+                }],
+            });
+        }
+        assert_eq!(sweep.idle_slots, vec![0]);
+    }
+
+    /// A slot with two cursors is idle only while both are finished. One
+    /// that drained and then filled its window again is not finished when
+    /// the other drains.
+    #[test]
+    fn rescue_sweep_keeps_a_slot_whose_drained_cursor_fills_again() {
+        let stamp = Utc::now();
+        let observe = |sweep: &mut RescueSweep, first: (i64, bool), second: (i64, bool)| {
+            sweep.observe(RescueScanProgress {
+                slot: 0,
+                cursors: [first, second]
+                    .into_iter()
+                    .map(|(id, saturated)| awa_model::RescueScanCursor {
+                        position: Some((stamp, id, 0)),
+                        saturated,
+                    })
+                    .collect(),
+            });
+        };
+        let mut sweep = RescueSweep::default();
+        observe(&mut sweep, (10, false), (100, true));
+        assert!(sweep.cursors[&0][0].done);
+        assert!(sweep.idle_slots.is_empty());
+        observe(&mut sweep, (20, true), (200, true));
+        assert!(
+            !sweep.cursors[&0][0].done,
+            "a cursor whose window fills again has work left"
+        );
+        observe(&mut sweep, (30, true), (300, false));
+        assert!(
+            sweep.idle_slots.is_empty(),
+            "the slot stays active while its first cursor is saturated"
+        );
+        observe(&mut sweep, (40, false), (300, false));
+        assert_eq!(sweep.idle_slots, vec![0]);
+    }
+
+    struct SparseHeartbeatFixture {
+        pool: PgPool,
+        runtime: QueueStorageRuntime,
+        service: MaintenanceService,
+        stale_job: i64,
+        fresh_job: i64,
+        fresh_runtime: Uuid,
+    }
+
+    impl SparseHeartbeatFixture {
+        async fn new(budget: Duration, max_rows: usize, confirmed: bool) -> Self {
+            let pool = setup_pool(4).await;
+            reset_schema(&pool).await;
+            migrations::run(&pool).await.expect("migrations");
+            let config = QueueStorageConfig::default();
+            let store = QueueStorage::new(config.clone()).expect("queue storage");
+            store.install(&pool).await.expect("install");
+            let jobs: Vec<_> = (0..2)
+                .map(|id| awa_model::InsertParams {
+                    kind: "sparse_heartbeat".into(),
+                    args: serde_json::json!({ "id": id }),
+                    opts: awa_model::InsertOpts {
+                        queue: "sparse_heartbeat".into(),
+                        max_attempts: 3,
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            store
+                .enqueue_params_batch(&pool, &jobs)
+                .await
+                .expect("enqueue");
+            let claims = store
+                .claim_runtime_batch(&pool, "sparse_heartbeat", 2, Duration::from_secs(3600))
+                .await
+                .expect("claim real jobs");
+            assert_eq!(claims.len(), 2);
+            let slot = claims[0].claim.claim_slot;
+            assert_eq!(claims[1].claim.claim_slot, slot);
+            let stamp = Utc::now() - chrono::Duration::hours(2);
+
+            // Keep the old row-local representation valid on both versions.
+            // Closed history needs no payload; the two open claims retain their
+            // real ready rows so rescue exercises the actual disposition path.
+            sqlx::query("DELETE FROM awa.lease_claim_batches WHERE queue = 'sparse_heartbeat'")
+                .execute(&pool)
+                .await
+                .expect("replace compact claims with legacy rows");
+            for (index, claim) in claims.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO awa.lease_claims
+                     (claim_slot, receipt_id, job_id, run_lease, ready_slot, ready_generation,
+                      queue, priority, attempt, max_attempts, lane_seq, enqueue_shard, claimed_at, deadline_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+interval '1 hour')
+                     ON CONFLICT (claim_slot,job_id,run_lease) DO UPDATE
+                     SET claimed_at=EXCLUDED.claimed_at, deadline_at=EXCLUDED.deadline_at",
+                )
+                .bind(slot).bind(claim.claim.receipt_id).bind(claim.job.id).bind(claim.job.run_lease)
+                .bind(claim.claim.ready_slot).bind(claim.claim.ready_generation).bind(&claim.claim.queue)
+                .bind(claim.claim.priority).bind(claim.job.attempt).bind(claim.job.max_attempts)
+                .bind(claim.claim.lane_seq).bind(claim.claim.enqueue_shard)
+                .bind(stamp + chrono::Duration::microseconds(if index == 0 { 3500 } else { 4500 }))
+                .execute(&pool).await.expect("legacy open receipt");
+            }
+            sqlx::query(
+                "INSERT INTO awa.lease_claims
+                 (claim_slot,job_id,run_lease,ready_slot,ready_generation,queue,priority,
+                  attempt,max_attempts,lane_seq,claimed_at,closed_at)
+                 SELECT $1,1000000+id,1,0,0,'sparse_history',0,1,3,id,
+                        $2::timestamptz+id*interval '1 microsecond',clock_timestamp()
+                 FROM generate_series(1,6000) AS id",
+            )
+            .bind(slot)
+            .bind(stamp)
+            .execute(&pool)
+            .await
+            .expect("sparse closed prefix");
+            let stale_job = claims[0].job.id;
+            let fresh_job = claims[1].job.id;
+            sqlx::query(
+                "INSERT INTO awa.attempt_state(job_id,run_lease,heartbeat_at,updated_at)
+                 VALUES($1,$2,clock_timestamp(),clock_timestamp())",
+            )
+            .bind(fresh_job)
+            .bind(claims[1].job.run_lease)
+            .execute(&pool)
+            .await
+            .expect("protect fresh claim");
+            let fresh_runtime = Uuid::new_v4();
+            for (id, seen, heartbeat_alive) in [
+                (Uuid::new_v4(), stamp + chrono::Duration::hours(1), false),
+                (fresh_runtime, Utc::now(), true),
+            ] {
+                sqlx::query(
+                    "INSERT INTO awa.runtime_instances
+                     (instance_id,hostname,pid,version,started_at,last_seen_at,snapshot_interval_ms,
+                      healthy,postgres_connected,poll_loop_alive,heartbeat_alive,shutting_down,leader)
+                     VALUES($1,'sparse_test',1,'0.6.13',$2,$2,1000,true,true,true,$3,false,false)",
+                )
+                .bind(id).bind(seen).bind(heartbeat_alive)
+                .execute(&pool).await.expect("runtime evidence");
+            }
+            let runtime =
+                QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                    .expect("runtime");
+            let service = MaintenanceService::new(
+                pool.clone(),
+                metrics_for_test(),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                CancellationToken::new(),
+                Arc::new(Vec::new()),
+                InFlightMap::default(),
+                RuntimeStorage::QueueStorage(runtime.clone()),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+            )
+            .rescue_pass_budget(budget)
+            .rescue_pass_max_rows(max_rows);
+            if confirmed {
+                let now = Instant::now();
+                *service
+                    .rescue_owner_evidence
+                    .lock()
+                    .expect("owner evidence") = RescueOwnerEvidence {
+                    steady_since: Some(now - service.heartbeat_staleness * 2),
+                    last_sample: Some(now),
+                };
+            }
+            Self {
+                pool,
+                runtime,
+                service,
+                stale_job,
+                fresh_job,
+                fresh_runtime,
+            }
+        }
+
+        async fn pass(&self) -> bool {
+            sqlx::query("UPDATE awa.runtime_instances SET last_seen_at=clock_timestamp() WHERE instance_id=$1")
+                .bind(self.fresh_runtime).execute(&self.pool).await.expect("fresh owner snapshot");
+            self.service
+                .rescue_queue_storage_pass(
+                    RescueKind::Heartbeat,
+                    &self.runtime,
+                    false,
+                    RescueTickOrigin::Backlog,
+                )
+                .await
+        }
+
+        async fn assert_dispositions(&self) {
+            let stale = self
+                .runtime
+                .store
+                .load_job(&self.pool, self.stale_job)
+                .await
+                .expect("stale job lookup")
+                .expect("stale job");
+            assert_eq!(stale.state, JobState::Retryable);
+            let fresh = self
+                .runtime
+                .store
+                .load_job(&self.pool, self.fresh_job)
+                .await
+                .expect("fresh job lookup")
+                .expect("fresh job");
+            assert_eq!(
+                fresh.state,
+                JobState::Running,
+                "fresh heartbeat stays protected"
+            );
+            let closures: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM awa.lease_claim_closures WHERE job_id=$1")
+                    .bind(self.stale_job)
+                    .fetch_one(&self.pool)
+                    .await
+                    .expect("closure count");
+            assert_eq!(closures, 1, "sparse stale attempt is rescued exactly once");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_confirmed_heartbeat_sparse_sweep_progresses_and_stops() {
+        let _guard = db_test_mutex().lock().await;
+        // A positive budget below any database round trip makes each pass
+        // finish its first batch and rearm; no elapsed-time assertion is used.
+        let run = SparseHeartbeatFixture::new(Duration::from_nanos(1), 5000, true).await;
+        assert!(run.pass().await, "closed prefix leaves a resumable sweep");
+        let cursor: i64 = sqlx::query_scalar(
+            "SELECT rescue_cursor_job_id FROM awa.claim_ring_slots WHERE slot=0",
+        )
+        .fetch_one(&run.pool)
+        .await
+        .expect("first persisted cursor");
+        assert_eq!(
+            cursor, 1002000,
+            "confirmed bulk starts with one small window"
+        );
+        let stale = run
+            .runtime
+            .store
+            .load_job(&run.pool, run.stale_job)
+            .await
+            .expect("unvisited job lookup")
+            .expect("unvisited job");
+        assert_eq!(
+            stale.state,
+            JobState::Running,
+            "sparse job lies beyond the first window"
+        );
+        let mut drained = false;
+        for _ in 0..12 {
+            if !run.pass().await {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "persisted sparse sweep converges instead of rearming forever"
+        );
+        assert!(run.service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        run.assert_dispositions().await;
+        run.pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_disabled_acceleration_keeps_wide_first_heartbeat_window() {
+        let _guard = db_test_mutex().lock().await;
+        for (budget, max_rows) in [(Duration::ZERO, 5000), (Duration::from_secs(1), 0)] {
+            let run = SparseHeartbeatFixture::new(budget, max_rows, true).await;
+            assert!(!run.pass().await, "disabled acceleration never rearms");
+            run.assert_dispositions().await;
+            run.pool.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_unconfirmed_heartbeat_keeps_wide_first_window() {
+        let _guard = db_test_mutex().lock().await;
+        let run = SparseHeartbeatFixture::new(Duration::from_nanos(1), 5000, false).await;
+        assert!(
+            !run.pass().await,
+            "unconfirmed owners keep the ordinary one-batch cadence"
+        );
+        run.assert_dispositions().await;
+        run.pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_closed_history_stops_rearming() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.expect("migrations");
+        let config = QueueStorageConfig::default();
+        let store = QueueStorage::new(config.clone()).expect("queue storage");
+        store.install(&pool).await.expect("install");
+        sqlx::query(
+            "INSERT INTO awa.lease_claims
+             (claim_slot, job_id, run_lease, ready_slot, ready_generation,
+              queue, priority, attempt, max_attempts, lane_seq, claimed_at, closed_at, deadline_at)
+             SELECT 0, id, 1, 0, 0, 'closed_history', 0, 1, 3, id,
+                    now() - interval '1 hour', now(), now() - interval '1 minute'
+             FROM generate_series(1, 10001) AS id",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed more closed history than a scan window");
+        let runtime =
+            QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("runtime");
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime.clone()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .rescue_pass_budget(Duration::from_millis(200));
+        let mut drained = false;
+        for _ in 0..20 {
+            if !service
+                .rescue_queue_storage_pass(
+                    RescueKind::Deadline,
+                    &runtime,
+                    false,
+                    RescueTickOrigin::Backlog,
+                )
+                .await
+            {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "closed history must finish a bounded sweep instead of rearming forever"
+        );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        // Zero is a documented way to retain the ordinary one-batch cadence.
+        let service = service.rescue_pass_max_rows(0);
+        assert!(
+            !service
+                .rescue_queue_storage_pass(
+                    RescueKind::Deadline,
+                    &runtime,
+                    false,
+                    RescueTickOrigin::Backlog
+                )
+                .await
+        );
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        pool.close().await;
+    }
+
+    /// Passes that do not re-arm still share the slot-order rotation: every
+    /// fourth batch of a kind visits the other claim slots first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rescue_slot_order_rotates_across_passes_that_do_not_rearm() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.expect("migrations");
+        let config = QueueStorageConfig::default();
+        let store = QueueStorage::new(config.clone()).expect("queue storage");
+        store.install(&pool).await.expect("install");
+        let runtime =
+            QueueStorageRuntime::new(config, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("runtime");
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime.clone()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .rescue_pass_max_rows(0);
+        for pass in 1..=2 * RESCUE_OTHERS_FIRST_EVERY {
+            assert!(
+                !service
+                    .rescue_queue_storage_pass(
+                        RescueKind::Deadline,
+                        &runtime,
+                        false,
+                        RescueTickOrigin::Ordinary,
+                    )
+                    .await
+            );
+            assert_eq!(
+                service.rescue_others_first_offset.load(Ordering::Relaxed),
+                pass / RESCUE_OTHERS_FIRST_EVERY,
+                "others-first batches after {pass} one-batch passes"
+            );
+        }
+        assert!(service.rescue_sweeps.lock().expect("sweeps").is_empty());
+        pool.close().await;
+    }
+
+    #[test]
+    fn rescue_owner_evidence_needs_a_full_settled_staleness_window() {
+        let staleness = Duration::from_secs(90);
+        let sample_every = Duration::from_secs(30);
+        let mut evidence = RescueOwnerEvidence::default();
+        let mut clock = Instant::now();
+
+        for _ in 0..3 {
+            assert!(!evidence.observe(clock, true, staleness));
+            clock += sample_every;
+        }
+        assert!(
+            evidence.observe(clock, true, staleness),
+            "settled at every sample across the staleness window"
+        );
+
+        clock += sample_every;
+        assert!(
+            !evidence.observe(clock, false, staleness),
+            "an unsettled sample closes the gate at once"
+        );
+        for _ in 0..3 {
+            clock += sample_every;
+            assert!(
+                !evidence.observe(clock, true, staleness),
+                "the window restarts after an unsettled sample"
+            );
+        }
+        clock += sample_every;
+        assert!(evidence.observe(clock, true, staleness));
+    }
+
+    #[test]
+    fn rescue_owner_evidence_restarts_after_an_unsampled_gap() {
+        let staleness = Duration::from_secs(90);
+        let mut evidence = RescueOwnerEvidence::default();
+        let mut clock = Instant::now();
+        for _ in 0..4 {
+            evidence.observe(clock, true, staleness);
+            clock += Duration::from_secs(30);
+        }
+        assert!(evidence.observe(clock, true, staleness));
+
+        // The leader did not sample for longer than half the staleness: a
+        // stall in that gap would have been invisible, so start over.
+        clock += Duration::from_secs(46);
+        assert!(!evidence.observe(clock, true, staleness));
+        clock += Duration::from_secs(45);
+        assert!(!evidence.observe(clock, true, staleness));
+        clock += Duration::from_secs(45);
+        assert!(evidence.observe(clock, true, staleness));
     }
 
     #[test]

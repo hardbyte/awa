@@ -15,7 +15,15 @@ slow-timeout = { period = "60s" }
 
 [test-groups]
 migrations = { max-threads = 1 }
+bulk-rescue-backlog = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'binary(migration_test)'
 test-group = 'migrations'
+
+# The two bulk rescue backlog tests each load the same database heavily; run
+# concurrently, the live runtime in one cannot heartbeat its claims inside the
+# staleness window.
+[[profile.default.overrides]]
+filter = 'binary(bulk_rescue_test) and test(/^rescue_drains_/)'
+test-group = 'bulk-rescue-backlog'

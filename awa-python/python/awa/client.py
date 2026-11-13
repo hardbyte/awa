@@ -921,6 +921,8 @@ class AsyncClient:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        rescue_pass_budget_ms: int | None = None,
+        rescue_pass_max_rows: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
@@ -930,6 +932,7 @@ class AsyncClient:
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 250,
         queue_storage_claim_rotate_interval_ms: int | None = None,
+        queue_storage_prune_lock_timeout_ms: int | None = None,
         queue_storage_rotate_min_slot_age_ms: int | None = None,
         queue_storage_rotate_target_slot_bytes: int | None = None,
         queue_storage_rotate_min_slot_rows: int | None = None,
@@ -967,6 +970,23 @@ class AsyncClient:
         counters. Exact reads include pending deltas, so the default favors
         fewer hot counter updates over immediate folding.
 
+        ``rescue_pass_budget_ms`` (default 1000) and ``rescue_pass_max_rows``
+        (default 5000) bound how long one queue-storage rescue pass keeps
+        taking 500-attempt batches and how many attempts it rescues; see the
+        configuration guide's "Draining a backlog of abandoned claims".
+
+        ``queue_storage_prune_lock_timeout_ms`` sets the PostgreSQL
+        ``lock_timeout`` the maintenance leader uses when pruning the queue,
+        lease and claim rings (default 10 ms). Each lock acquisition gets its
+        own timeout; this does not bound the whole prune. Among queue prune's
+        initial partition locks, only ``ready_segments`` waits; the others use
+        ``NOWAIT``. Later reads and writes also run under the timeout. A lock
+        timeout rolls back the prune and counts it as ``blocked``; the
+        maintenance loop retries on a later tick. Raise it when ``blocked``
+        outcomes persist, keeping it well below the server's
+        ``deadlock_timeout`` and ``statement_timeout`` (a warning is logged at
+        start otherwise). Must be > 0.
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -987,6 +1007,8 @@ class AsyncClient:
             heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
+            rescue_pass_budget_ms=rescue_pass_budget_ms,
+            rescue_pass_max_rows=rescue_pass_max_rows,
             terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
@@ -996,6 +1018,7 @@ class AsyncClient:
             queue_storage_queue_rotate_interval_ms=queue_storage_queue_rotate_interval_ms,
             queue_storage_lease_rotate_interval_ms=queue_storage_lease_rotate_interval_ms,
             queue_storage_claim_rotate_interval_ms=queue_storage_claim_rotate_interval_ms,
+            queue_storage_prune_lock_timeout_ms=queue_storage_prune_lock_timeout_ms,
             queue_storage_rotate_min_slot_age_ms=queue_storage_rotate_min_slot_age_ms,
             queue_storage_rotate_target_slot_bytes=queue_storage_rotate_target_slot_bytes,
             queue_storage_rotate_min_slot_rows=queue_storage_rotate_min_slot_rows,
