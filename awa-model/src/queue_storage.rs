@@ -6956,24 +6956,41 @@ impl QueueStorage {
 
         let now = Utc::now();
         if !claimed.is_empty() && lease.needs_refresh(now, lease_ttl, idle_threshold) {
-            let still_owned = self
+            // The claim has committed: these jobs are this runtime's whatever
+            // happens to the lease refresh, so its failure must not fail the
+            // call and strand them until rescue. Forget the cached lease
+            // instead, so the next claim re-reads it.
+            let refreshed = match self
                 .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
-                .await?;
-            if still_owned {
-                let refreshed = QueueClaimerLeaseRow {
-                    last_claimed_at: now,
-                    expires_at: now
-                        + TimeDelta::from_std(lease_ttl).map_err(|err| {
-                            AwaError::Validation(format!("invalid claimer lease ttl: {err}"))
-                        })?,
-                    ..lease
-                };
-                self.cache_claimer_gate(gate_key, refreshed);
-            } else {
-                self.claimer_gates
-                    .lock()
-                    .expect("claimer gate cache poisoned")
-                    .remove(&gate_key);
+                .await
+            {
+                Ok(true) => TimeDelta::from_std(lease_ttl)
+                    .ok()
+                    .map(|ttl| QueueClaimerLeaseRow {
+                        last_claimed_at: now,
+                        expires_at: now + ttl,
+                        ..lease
+                    }),
+                Ok(false) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        queue,
+                        claimed = claimed.len(),
+                        "failed to refresh the queue claimer lease after a committed claim; \
+                         dispatching the claimed jobs"
+                    );
+                    None
+                }
+            };
+            match refreshed {
+                Some(refreshed) => self.cache_claimer_gate(gate_key, refreshed),
+                None => {
+                    self.claimer_gates
+                        .lock()
+                        .expect("claimer gate cache poisoned")
+                        .remove(&gate_key);
+                }
             }
         }
 
