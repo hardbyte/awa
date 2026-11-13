@@ -1,4 +1,4 @@
-use crate::completion::CompletionBatcherHandle;
+use crate::completion::{CompletionBatcherHandle, FinalizationBudget};
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
@@ -409,8 +409,13 @@ impl JobExecutor {
                         claim,
                     )
                 }),
+                finalizing: false,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
+            let heartbeat_guard = storage.queue_storage().map(|_| FinalizationHeartbeatGuard {
+                in_flight: in_flight.clone(),
+                key: (job_id, job_run_lease),
+            });
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
@@ -429,20 +434,21 @@ impl JobExecutor {
                 progress_state.clone(),
             );
 
+            let mut started_event = None;
             let result = match workers.get(&job.kind) {
                 Some(worker) => {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
                         let started_job = crate::output::without_outputs(&job).into_owned();
-                        tokio::spawn(async move {
+                        started_event = Some(tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
                                 &started_kind,
                                 UntypedJobEvent::Started { job: started_job },
                             )
                             .await;
-                        });
+                        }));
                     }
                     let perform = CatchUnwind(worker.perform(&ctx));
                     let outcome = match abandon_after {
@@ -514,16 +520,22 @@ impl JobExecutor {
                 }
             }
 
+            // The handler's progress snapshot is final: the finalize settles it,
+            // so heartbeats stop flushing progress for this attempt.
+            in_flight.mark_finalizing((job_id, job_run_lease));
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
-                    permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
+                    biased;
                     _ = finalize_cancel.cancelled() => None,
+                    permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
                 },
                 None => None,
             };
 
-            in_flight.remove((job_id, job_run_lease));
+            if heartbeat_guard.is_none() {
+                in_flight.remove((job_id, job_run_lease));
+            }
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
@@ -575,6 +587,12 @@ impl JobExecutor {
                         });
                         let output_kept = AtomicBool::new(true);
                         let outcome = {
+                            let budget = FinalizationBudget::from(COMPLETION_RECONNECT_WINDOW);
+                            let completion_batcher = if storage.queue_storage().is_some() {
+                                completion_batcher.with_acknowledgement_budget(budget.clone())
+                            } else {
+                                completion_batcher.clone()
+                            };
                             let (job, stripped_job, output_kept) = (&job, &stripped_job, &output_kept);
                             let (pool, result, storage) = (&pool, &result, &storage);
                             let (staged_follow_ups, completion_batcher) =
@@ -631,8 +649,10 @@ impl JobExecutor {
                                 job_id,
                                 &job_kind,
                                 &job_queue,
-                                COMPLETION_RECONNECT_WINDOW,
-                            )
+                                budget,
+
+storage.queue_storage().is_some(),
+)
                             .await
                         };
                         if !output_kept.into_inner() {
@@ -758,13 +778,23 @@ impl JobExecutor {
                             None
                         },
                     };
-                    drop(finalize_permit);
-                    if let Some(event) = event {
-                        tokio::select! {
-                            _ = dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event) => {},
-                            _ = finalize_cancel.cancelled() => {},
+                    drop(heartbeat_guard);
+                    // Lifecycle hooks run under the finalizer permit, so a hook
+                    // slower than job throughput holds back claiming instead of
+                    // accumulating tasks that each retain a copy of the job.
+                    let hooks = async {
+                        if let Some(started_event) = started_event {
+                            let _ = started_event.await;
                         }
+                        if let Some(event) = event {
+                            dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = hooks => {},
+                        _ = finalize_cancel.cancelled() => {},
                     }
+                    drop(finalize_permit);
                 }
                 .in_current_span(),
             );
@@ -773,14 +803,22 @@ impl JobExecutor {
     }
 }
 
+struct FinalizationHeartbeatGuard {
+    in_flight: InFlightMap,
+    key: (i64, i64),
+}
+
+impl Drop for FinalizationHeartbeatGuard {
+    fn drop(&mut self) {
+        self.in_flight.remove(self.key);
+    }
+}
+
 /// How many times a finalize transaction is re-run after Postgres aborts it
 /// to break a lock cycle before the failure is surfaced.
 const COMPLETION_DEADLOCK_RETRIES: u32 = 3;
 
-/// Short exponential backoff between deadlock retries (10ms, 20ms, 40ms, ...).
-/// Postgres aborts only one party of a cycle, so the survivor has usually
-/// committed by the time the retry runs.
-fn completion_deadlock_backoff(retry: u32) -> Duration {
+fn completion_contention_backoff(retry: u32) -> Duration {
     Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
 }
 
@@ -805,28 +843,39 @@ struct FinalizeAck<T> {
     elapsed: Duration,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_with_retry<T, F, Fut>(
     mut finalize: F,
     metrics: &crate::metrics::AwaMetrics,
     job_id: i64,
     kind: &str,
     queue: &str,
-    window: Duration,
+    window: impl Into<FinalizationBudget>,
+    retry_lock_contention: bool,
 ) -> Result<FinalizeAck<T>, FinalizeError>
 where
     F: FnMut(CompletionPath) -> Fut,
     Fut: std::future::Future<Output = Result<T, AwaError>>,
 {
     let started = tokio::time::Instant::now();
-    let deadline = started + window;
+    let budget = window.into();
     let mut deadlock_retries = 0;
     let mut reconnect_retries = 0;
+    let mut lock_retries = 0;
+    let mut warned = false;
     let mut schema_retried = false;
     let mut completion_path = CompletionPath::Batched;
     loop {
-        let outcome = tokio::time::timeout_at(deadline, finalize(completion_path))
-            .await
-            .map_err(|_| FinalizeError::Deadline)?;
+        if retry_lock_contention && budget.is_elapsed() {
+            return Err(FinalizeError::Deadline);
+        }
+        let attempt = finalize(completion_path);
+        let outcome = if retry_lock_contention {
+            budget.timeout(attempt).await
+        } else {
+            budget.timeout_unpaused(attempt).await
+        }
+        .map_err(|_| FinalizeError::Deadline)?;
         let error = match outcome {
             Ok(outcome) => {
                 return Ok(FinalizeAck {
@@ -839,7 +888,10 @@ where
         };
         let delay = if error.is_deadlock() && deadlock_retries < COMPLETION_DEADLOCK_RETRIES {
             deadlock_retries += 1;
-            completion_deadlock_backoff(deadlock_retries)
+            completion_contention_backoff(deadlock_retries)
+        } else if retry_lock_contention && is_completion_lock_contention(&error) {
+            lock_retries += 1;
+            completion_contention_backoff(lock_retries)
         } else if error.is_connection_lost() {
             reconnect_retries += 1;
             completion_reconnect_backoff(reconnect_retries)
@@ -851,24 +903,55 @@ where
         } else {
             return Err(error.into());
         };
-        if deadlock_retries + reconnect_retries == 1 {
+        if !warned {
+            warned = true;
             warn!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
         } else {
             debug!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
         }
-        tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
-            .await
-            .map_err(|_| FinalizeError::Deadline)?;
+        let backoff = tokio::time::sleep(delay);
+        if retry_lock_contention {
+            budget.timeout(backoff).await
+        } else {
+            budget.timeout_unpaused(backoff).await
+        }
+        .map_err(|_| FinalizeError::Deadline)?;
         if error.is_connection_lost() {
             metrics.record_completion_reconnect_retry(kind, queue);
-        } else {
+        } else if error.is_deadlock() {
             metrics.record_completion_deadlock_retry(kind, queue);
         }
         completion_path = CompletionPath::Direct;
     }
 }
 
-/// Reconnect retry budget measured from the first finalize attempt. Rescue
+/// Re-read a job whose transition has committed, for its lifecycle event.
+/// The transition stands whatever the read returns, so a failed read is logged
+/// and the caller builds the event from the worker's copy instead.
+async fn reload_committed_job(
+    runtime: &QueueStorageRuntime,
+    pool: &PgPool,
+    job_id: i64,
+) -> Option<JobRow> {
+    match runtime.store.load_job(pool, job_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            warn!(
+                job_id,
+                error = %err,
+                "Could not re-read a committed job for its lifecycle event; using the worker's copy"
+            );
+            None
+        }
+    }
+}
+
+fn is_completion_lock_contention(error: &AwaError) -> bool {
+    matches!(error, AwaError::Database(sqlx::Error::Database(database))
+        if database.code().as_deref() == Some("55P03"))
+}
+
+/// Finalization retry budget measured from the first finalize attempt. Rescue
 /// can win before this expires; the lease guard then rejects the old result.
 const COMPLETION_RECONNECT_WINDOW: Duration = Duration::from_secs(120);
 
@@ -1985,6 +2068,17 @@ fn rescheduled_event_row(
     row
 }
 
+/// The job as a read returns it after this attempt completes.
+fn completed_event_row(job: &JobRow) -> JobRow {
+    let mut row = job.clone();
+    row.state = JobState::Completed;
+    row.finalized_at = Some(chrono::Utc::now());
+    row.progress = None;
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_job_queue_storage(
     runtime: &QueueStorageRuntime,
@@ -2090,23 +2184,11 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                // The output is set from the sealed value rather than re-read,
-                // which would detoast its compact batch's whole output array.
-                let mut updated_job = runtime
-                    .store
-                    .load_job_without_output(pool, job.id)
-                    .await?
-                    .unwrap_or_else(|| {
-                        let mut completed_job = job.clone();
-                        completed_job.state = JobState::Completed;
-                        completed_job.finalized_at = Some(chrono::Utc::now());
-                        completed_job.progress = None;
-                        completed_job
-                    });
-                updated_job.output = job.output.clone();
+                // The event is built from the worker's copy, which carries the
+                // sealed output, rather than re-reading the job.
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
-                        job: updated_job,
+                        job: completed_event_row(job),
                         duration,
                     }),
                     terminal: false,
@@ -2306,9 +2388,15 @@ async fn complete_job_queue_storage(
                 .and_then(|by_kind| by_kind.get(&job.kind))
                 .cloned();
             if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
-                let parked =
-                    park_queue_storage_with_followups(runtime, pool, job, guard.id(), &specs)
-                        .await?;
+                let parked = park_queue_storage_with_followups(
+                    runtime,
+                    pool,
+                    job,
+                    guard.id(),
+                    progress_snapshot.as_ref(),
+                    &specs,
+                )
+                .await?;
                 if let Some(parked_job) = parked {
                     let event = if needs_event {
                         Some(UntypedJobEvent::WaitingForCallback { job: parked_job })
@@ -2325,7 +2413,13 @@ async fn complete_job_queue_storage(
 
             let entered = runtime
                 .store
-                .enter_callback_wait(pool, job.id, job.run_lease, guard.id())
+                .enter_callback_wait_with_progress(
+                    pool,
+                    job.id,
+                    job.run_lease,
+                    guard.id(),
+                    progress_snapshot.as_ref(),
+                )
                 .await?;
             if !entered {
                 let current = runtime.store.load_job(pool, job.id).await?;
@@ -2383,10 +2477,8 @@ async fn complete_job_queue_storage(
                 }
             }
             let event = if needs_event {
-                let parked_job = runtime
-                    .store
-                    .load_job(pool, job.id)
-                    .await?
+                let parked_job = reload_committed_job(runtime, pool, job.id)
+                    .await
                     .unwrap_or_else(|| {
                         let mut parked = job.clone();
                         parked.state = JobState::WaitingExternal;
@@ -2645,12 +2737,7 @@ async fn complete_queue_storage_with_followups(
 
     // Synthesise the post-completion snapshot — the store has just moved the
     // lease into `done_entries` so a live SELECT would race with rotation.
-    // The happy-path fields are exactly those `complete_job_queue_storage`
-    // reconstructs when `load_job` returns None.
-    let mut updated_job = job.clone();
-    updated_job.state = JobState::Completed;
-    updated_job.finalized_at = Some(chrono::Utc::now());
-    updated_job.progress = None;
+    let updated_job = completed_event_row(job);
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
     let staged =
@@ -2854,12 +2941,19 @@ async fn park_queue_storage_with_followups(
     pool: &PgPool,
     job: &JobRow,
     callback_id: uuid::Uuid,
+    progress_snapshot: Option<&serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
     let entered = runtime
         .store
-        .enter_callback_wait_in_tx(&mut tx, job.id, job.run_lease, callback_id)
+        .enter_callback_wait_with_progress_in_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            callback_id,
+            progress_snapshot,
+        )
         .await?;
     if !entered {
         tx.rollback().await?;
@@ -3451,6 +3545,7 @@ mod tests {
             "test",
             "test",
             Duration::from_secs(2),
+            false,
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Deadline)));
@@ -3471,6 +3566,7 @@ mod tests {
             "test",
             "test",
             Duration::from_secs(2),
+            false,
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Deadline)));
@@ -3491,6 +3587,527 @@ mod tests {
             "test",
             "test",
             Duration::from_secs(120),
+            false,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Operation(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug)]
+    struct FinalizeDatabaseError(&'static str);
+
+    impl std::fmt::Display for FinalizeDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "sqlstate {}", self.0)
+        }
+    }
+
+    impl std::error::Error for FinalizeDatabaseError {}
+
+    impl sqlx::error::DatabaseError for FinalizeDatabaseError {
+        fn message(&self) -> &str {
+            "finalize transaction rejected"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn finalize_sqlstate(code: &'static str) -> AwaError {
+        AwaError::Database(sqlx::Error::Database(Box::new(FinalizeDatabaseError(code))))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_lock_contention_preserves_the_sealed_outcome() {
+        let calls = AtomicU32::new(0);
+        let applied = AtomicU32::new(0);
+        let paths = std::sync::Mutex::new(Vec::new());
+        let sealed = serde_json::json!({
+            "outcome":"retry_after", "delay_secs":60,
+            "progress":{"checkpoint":7}, "followups":[{"id":42}], "output":{"value":9}
+        });
+        let acknowledgement = finalize_with_retry(
+            |path| {
+                paths.lock().unwrap().push(path);
+                std::future::ready(if calls.fetch_add(1, Ordering::SeqCst) < 4 {
+                    Err(finalize_sqlstate("55P03"))
+                } else {
+                    applied.fetch_add(1, Ordering::SeqCst);
+                    Ok(sealed.clone())
+                })
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            true,
+        )
+        .await
+        .expect("contention must retry the saved outcome");
+        assert_eq!(acknowledgement.outcome, sealed);
+        assert_eq!(acknowledgement.reconnect_retries, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(applied.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *paths.lock().unwrap(),
+            [
+                CompletionPath::Batched,
+                CompletionPath::Direct,
+                CompletionPath::Direct,
+                CompletionPath::Direct,
+                CompletionPath::Direct,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_lock_contention_keeps_the_existing_deadline() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(finalize_sqlstate("55P03")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_millis(100),
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert!((3..=5).contains(&calls.load(Ordering::SeqCst)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_lock_contention_does_not_retry_unrelated_statement_errors() {
+        for code in ["57014", "23505", "55P04"] {
+            let calls = AtomicU32::new(0);
+            let result = finalize_with_retry(
+                |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<(), _>(finalize_sqlstate(code)))
+                },
+                &test_metrics(),
+                1,
+                "test",
+                "test",
+                Duration::from_secs(2),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(FinalizeError::Operation(_))),
+                "{code}: {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{code}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_finalization_retains_heartbeat_without_holding_worker_capacity() {
+        let metrics = test_metrics();
+        let now = chrono::Utc::now();
+        let job: JobRow = serde_json::from_value(serde_json::json!({
+            "id":1,"kind":"reconnect_parent","queue":"test","args":{},
+            "state":"running","priority":2,"attempt":1,"run_lease":1,"max_attempts":5,
+            "run_at":now,"attempted_at":now,"created_at":now,"metadata":{},"tags":[],
+        }))
+        .unwrap();
+        let key = (job.id, job.run_lease);
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig::default(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        for storage in [
+            RuntimeStorage::Canonical,
+            RuntimeStorage::QueueStorage(runtime),
+        ] {
+            let queue_storage = matches!(storage, RuntimeStorage::QueueStorage(_));
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:test@localhost/awa_test")
+                .unwrap();
+            let finalizers = TaskTracker::new();
+            let cancel = CancellationToken::new();
+            let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+            let count = Arc::new(AtomicU32::new(0));
+            let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+                pool.clone(),
+                cancel.clone(),
+                metrics.clone(),
+                storage.clone(),
+                1,
+            );
+            let pending_completions = handle.clone();
+            let executor = JobExecutor::new(
+                pool,
+                Arc::new(HashMap::from([(
+                    "reconnect_parent".into(),
+                    Box::new(ReconnectWorker(Arc::new(AtomicU32::new(0)))) as BoxedWorker,
+                )])),
+                Arc::new(HashMap::new()),
+                Arc::new(HashMap::new()),
+                in_flight.clone(),
+                Arc::new(HashMap::from([("test".into(), count.clone())])),
+                Arc::new(HashMap::new()),
+                metrics.clone(),
+                handle,
+                storage,
+                DlqPolicy::default(),
+                finalizers.clone(),
+                cancel.clone(),
+                1,
+            );
+            executor
+                .execute_task(
+                    DispatchedJob {
+                        job: job.clone(),
+                        queue_storage_claim: queue_storage.then(|| ClaimedEntry {
+                            queue: "test".into(),
+                            priority: 2,
+                            lane_seq: 1,
+                            ready_slot: 0,
+                            ready_generation: 0,
+                            lease_slot: 0,
+                            lease_generation: 0,
+                            claim_slot: 0,
+                            receipt_id: Some(1),
+                            claim_batch_id: Some(1),
+                            claim_batch_index: Some(1),
+                            lease_claim_receipt: true,
+                            enqueue_shard: 0,
+                        }),
+                        queue_storage_unique_states: None,
+                        abandon_after: None,
+                    },
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await;
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                0,
+                "handler capacity must be released"
+            );
+            assert_eq!(finalizers.len(), 1);
+            assert_eq!(
+                in_flight.get_cancel(key).is_some(),
+                queue_storage,
+                "queue-store heartbeats remain registered until finalization settles"
+            );
+            if queue_storage {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while pending_completions.pending_request_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the completion must be accepted before advancing the clock");
+                tokio::time::advance(COMPLETION_RECONNECT_WINDOW + Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert_eq!(count.load(Ordering::SeqCst), 0);
+                assert_eq!(finalizers.len(), 1);
+                assert!(
+                    in_flight.get_cancel(key).is_some(),
+                    "an accepted completion must retain its lease past the running-work budget"
+                );
+            }
+            cancel.cancel();
+            finalizers.close();
+            tokio::time::timeout(Duration::from_secs(2), finalizers.wait())
+                .await
+                .unwrap();
+            assert!(
+                in_flight.get_cancel(key).is_none(),
+                "cancellation must unregister the exact lease"
+            );
+        }
+    }
+
+    struct RetainedFinalizeFollowup;
+
+    impl crate::enqueue_specs::EnqueueFollowUp for RetainedFinalizeFollowup {
+        fn run<'a>(
+            &'a self,
+            connection: &'a mut sqlx::PgConnection,
+            job: &'a JobRow,
+            _context: Option<&'a crate::enqueue_specs::OutcomeContext>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AwaError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO public.finalize_followups(parent) VALUES ($1)")
+                    .bind(job.id)
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn retained_head_contention_replays_the_worker_outcome_once(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE public.finalize_followups(parent bigint PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig {
+                queue_stripe_count: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let queue = "retained_finalize";
+        runtime.store.prepare_queue(&pool, queue, 1).await.unwrap();
+        runtime
+            .store
+            .enqueue_params_batch(
+                &pool,
+                &[awa_model::job::InsertParams {
+                    kind: "retained_finalize_parent".into(),
+                    args: serde_json::json!({"body":"retained"}),
+                    opts: awa_model::InsertOpts {
+                        queue: queue.into(),
+                        priority: 4,
+                        max_attempts: 3,
+                        metadata: serde_json::json!({"preserved":true}),
+                        ..Default::default()
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let claimed = runtime
+            .store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let pair = (claimed.job.id, claimed.job.run_lease);
+        let schema = runtime.store.schema();
+        let mut historical = pool.begin().await.unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "INSERT INTO {schema}.ready_tombstones
+             (ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id)
+             SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,job_id
+             FROM {schema}.ready_entries WHERE job_id=$1"
+        )))
+        .bind(pair.0)
+        .execute(historical.as_mut())
+        .await
+        .unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "INSERT INTO {schema}.ready_entries
+             (ready_slot,ready_generation,job_id,kind,queue,args,priority,attempt,run_lease,max_attempts,
+              lane_seq,enqueue_shard,run_at,attempted_at,created_at,unique_key,unique_states,payload)
+             SELECT ready_slot,ready_generation,job_id,kind,queue,args,3,attempt,run_lease,max_attempts,
+              {schema}.reserve_enqueue_seq(queue,3::smallint,enqueue_shard,1::bigint),enqueue_shard,
+              run_at,attempted_at,created_at,unique_key,unique_states,payload
+             FROM {schema}.ready_entries WHERE job_id=$1"
+        ))).bind(pair.0).execute(historical.as_mut()).await.unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "INSERT INTO {schema}.ready_segments
+             (ready_slot,ready_generation,queue,priority,enqueue_shard,first_lane_seq,next_lane_seq,first_run_at,created_at)
+             SELECT ready_slot,ready_generation,queue,priority,enqueue_shard,lane_seq,lane_seq+1,run_at,created_at
+             FROM {schema}.ready_entries WHERE job_id=$1 AND priority=3 ON CONFLICT DO NOTHING"
+        ))).bind(pair.0).execute(historical.as_mut()).await.unwrap();
+        historical.commit().await.unwrap();
+        let progress = serde_json::json!({"checkpoint":7});
+        runtime
+            .store
+            .flush_progress(&pool, pair.0, pair.1, progress.clone())
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(awa_model::audited_sql(format!(
+            "SELECT 1 FROM {schema}.queue_claim_heads
+             WHERE queue=$1 AND priority=3 AND enqueue_shard=0 FOR UPDATE"
+        )))
+        .bind(queue)
+        .fetch_one(blocker.as_mut())
+        .await
+        .unwrap();
+        let metrics = test_metrics();
+        let storage = RuntimeStorage::QueueStorage(runtime.clone());
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::from([(
+            crate::enqueue_specs::Outcome::Retried,
+            HashMap::from([(
+                "retained_finalize_parent".into(),
+                vec![Arc::new(RetainedFinalizeFollowup) as crate::enqueue_specs::BoxedEnqueueSpec],
+            )]),
+        )]));
+        let intended = Ok(JobResult::RetryAfter(Duration::from_secs(60)));
+        let calls = AtomicU32::new(0);
+        let busy = tokio::sync::Notify::new();
+        let finalize = finalize_with_retry(
+            |path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let (pool, job, claim, intended, progress, handle, specs, storage, metrics, busy) = (
+                    &pool,
+                    &claimed.job,
+                    &claimed.claim,
+                    &intended,
+                    &progress,
+                    &handle,
+                    &specs,
+                    &storage,
+                    &metrics,
+                    &busy,
+                );
+                async move {
+                    let result = complete_job(
+                        pool,
+                        job,
+                        Some(claim),
+                        None,
+                        intended,
+                        &[],
+                        handle,
+                        path,
+                        Some(progress.clone()),
+                        Duration::ZERO,
+                        true,
+                        specs,
+                        storage,
+                        false,
+                        metrics,
+                    )
+                    .await;
+                    if let Err(error) = &result {
+                        assert!(
+                            is_completion_lock_contention(error),
+                            "expected actual held-head55P03: {error}"
+                        );
+                        busy.notify_one();
+                    }
+                    result
+                }
+            },
+            &metrics,
+            pair.0,
+            &claimed.job.kind,
+            queue,
+            Duration::from_secs(5),
+            true,
+        );
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(3), busy.notified())
+                .await
+                .expect("worker transition must encounter the held historical head");
+            let active = runtime
+                .store
+                .load_job(&pool, pair.0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.state, JobState::Running);
+            assert_eq!(active.run_lease, pair.1);
+            assert_eq!(active.progress, Some(progress.clone()));
+            let effects: i64 = sqlx::query_scalar("SELECT count(*) FROM public.finalize_followups")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(effects, 0, "failed transaction cannot publish its followup");
+            blocker.rollback().await.unwrap();
+        };
+        let (ack, ()) = tokio::join!(finalize, release);
+        let ack = ack.expect("saved worker outcome must survive transient head contention");
+        assert_eq!(ack.reconnect_retries, 0);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        let CompletionOutcome::Applied {
+            event: Some(UntypedJobEvent::Retried { job, .. }),
+            terminal: false,
+        } = ack.outcome
+        else {
+            panic!("worker must acknowledge its intended retry outcome")
+        };
+        assert_eq!(job.id, pair.0);
+        assert_eq!(job.run_lease, pair.1);
+        assert_eq!(job.state, JobState::Retryable);
+        assert_eq!(job.args, claimed.job.args);
+        assert_eq!(job.max_attempts, claimed.job.max_attempts);
+        assert_eq!(job.progress, Some(progress.clone()));
+        assert_eq!(job.metadata["preserved"], true);
+        let replay = complete_job(
+            &pool,
+            &claimed.job,
+            Some(&claimed.claim),
+            None,
+            &intended,
+            &[],
+            &handle,
+            CompletionPath::Direct,
+            Some(progress),
+            Duration::ZERO,
+            true,
+            &specs,
+            &storage,
+            false,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(replay, CompletionOutcome::IgnoredStale));
+        let effects: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM public.finalize_followups WHERE parent=$1")
+                .bind(pair.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            effects, 1,
+            "the acknowledged outcome publishes exactly one followup"
+        );
+        let deferred:i64 = sqlx::query_scalar(awa_model::audited_sql(format!(
+            "SELECT count(*) FROM {schema}.deferred_jobs WHERE job_id=$1 AND run_lease=$2 AND state='retryable'"
+        ))).bind(pair.0).bind(pair.1).fetch_one(&pool).await.unwrap();
+        assert_eq!(deferred, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canonical_finalization_does_not_retry_lock_contention() {
+        let calls = AtomicU32::new(0);
+        let result = finalize_with_retry(
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(finalize_sqlstate("55P03")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+            false,
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Operation(_))));
@@ -3542,6 +4159,7 @@ mod tests {
             "test",
             "test",
             Duration::from_secs(120),
+            false,
         )
         .with_subscriber(subscriber)
         .await
@@ -3768,6 +4386,7 @@ mod tests {
                 &job.kind,
                 &job.queue,
                 Duration::from_secs(5),
+                false,
             )
             .await
             .unwrap();
@@ -3822,7 +4441,9 @@ mod tests {
                 }
             },
             &metrics, job.id, &job.kind, &job.queue, Duration::from_secs(5),
-        ).await.unwrap();
+
+false,
+).await.unwrap();
         assert!(matches!(outcome.outcome, CompletionOutcome::IgnoredStale));
         let current: JobRow = sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
             .bind(job.id)
@@ -3902,6 +4523,7 @@ mod tests {
             &job.kind,
             &job.queue,
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap();
@@ -3984,7 +4606,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn pending_outcome_hook_does_not_hold_durable_finalizer_capacity(pool: PgPool) {
+    async fn pending_outcome_hook_holds_finalizer_capacity(pool: PgPool) {
         let _database_guard = RECONNECT_DB_LOCK.lock().await;
         awa_model::migrations::run(&pool).await.unwrap();
         let first = running_reconnect_job(&pool).await;
@@ -4022,9 +4644,10 @@ mod tests {
             RuntimeStorage::Canonical,
             1,
         );
+        let runs = Arc::new(AtomicU32::new(0));
         let workers: HashMap<String, BoxedWorker> = HashMap::from([(
             "reconnect_parent".into(),
-            Box::new(ReconnectWorker(Arc::new(AtomicU32::new(0)))) as BoxedWorker,
+            Box::new(ReconnectWorker(runs.clone())) as BoxedWorker,
         )]);
         let mut executor = JobExecutor::new(
             pool.clone(),
@@ -4055,15 +4678,29 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), hook_started.notified())
             .await
             .expect("first durable finalize must reach its outcome hook");
-        tokio::time::timeout(
-            Duration::from_secs(2),
+        let second_task = tokio::spawn(
             executor.execute_task(dispatched(second), Arc::new(AtomicBool::new(false))),
-        )
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runs.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("pending outcome hook must not consume the only finalize permit");
+        .expect("the second handler runs while the first hook is pending");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_task.is_finished(),
+            "a pending outcome hook must keep the only finalize permit"
+        );
+        release_hook.cancel();
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("the second attempt takes the permit once the hook returns")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), second_completed.notified())
             .await
-            .expect("second durable finalize must finish while the first hook is pending");
+            .expect("second durable finalize must finish after the first hook returns");
         let states: Vec<String> =
             sqlx::query_scalar("SELECT state::text FROM awa.jobs_hot WHERE id = ANY($1)")
                 .bind([first_id, second_id].as_slice())
@@ -4072,7 +4709,6 @@ mod tests {
                 .unwrap();
         assert_eq!(states.len(), 2);
         assert!(states.iter().all(|state| state == "completed"));
-        release_hook.cancel();
         finalizers.close();
         tokio::time::timeout(Duration::from_secs(2), finalizers.wait())
             .await

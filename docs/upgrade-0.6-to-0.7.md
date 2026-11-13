@@ -14,14 +14,48 @@ A [migrate-first rehearsal with released `awa-pg==0.6.7`](https://github.com/har
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.
 
-For a runtime without DDL privileges, apply v049 as the migrator, run
-`awa storage prepare-queue --queue <name>` for every physical queue, and grant
-sequence `USAGE, SELECT, UPDATE` before starting producers or workers. Match
-shard and stripe counts and provision extra lanes before increasing them.
 External migration runners must apply the complete generated
 `awa migrate --sql --from 48 --to 49` bundle: it refreshes the installer
-definition before replacing lane helpers in the installed schemas.
-See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+definition before replacing lane helpers in the installed schemas. From v053,
+runtimes without DDL privileges create lanes themselves through the schema
+owner's provisioning functions, so `awa storage prepare-queue` is optional.
+
+## Lane ownership and v053
+
+Before v053 a lane's sequences belonged to the role that first enqueued into,
+claimed from or promoted into it. With several runtime roles, only roles whose
+default privileges covered that role could use the lane; any other role failed
+with `permission denied for sequence`. v053 installs `SECURITY DEFINER`
+`provision_lane` and `provision_lane_sequences` functions, owned by the schema
+owner, in each queue-storage schema. The lane helpers create sequences through
+them, with grants that mirror the lane's head table. Once v053 commits,
+`awa migrate` gives every existing lane sequence to the schema owner and adds
+its missing grants, as far as it is allowed to, one sequence per short
+transaction with a bounded lock wait.
+
+0.6 and earlier 0.7 binaries call the same helpers, so lanes they create after
+v053 are owned by the schema owner too. A 0.7 binary running ahead of v053
+detects that `provision_lane` is missing and creates lanes as before.
+
+To adopt it:
+
+1. Run `awa migrate` with the schema owner as the effective role, as described
+   in [Database roles](security/database-roles.md).
+2. Check the remaining state: `awa storage lane-sequences` (read-only, exits 2
+   while lanes need repair). This command requires v053 to be installed.
+3. Read the migrate output. Any lane sequence it could not repair is listed in
+   a warning. A busy one needs another run of
+   `awa storage lane-sequences --repair` as the migration role (without
+   `PGOPTIONS`); the others name the roles that can repair them. See
+   [Check and repair lane ownership](security/database-roles.md#check-and-repair-lane-ownership).
+
+External migration runners apply the generated `awa migrate --sql --from 52
+--to 53` bundle, which does not repair existing lane sequences, then run
+`awa storage lane-sequences --repair` as the migration role itself.
+
+### New queue lanes during the roll
+
+When `QueueStorage` is the first to use a `(queue, priority)` lane, through a batch enqueue or a worker promoting scheduled or retried jobs, it writes the lane's `queue_lanes` row before taking its provisioning lock, the order SQL inserts already use. 0.6.15 and earlier, and 0.7 builds before this fix, take them the other way round. Until every `QueueStorage` process is upgraded, an older one and any other producer that are both first to use the same lane can still deadlock, and one transaction fails with `40P01`. Lanes that already exist are unaffected. To avoid it during the roll, create the lanes of a queue or priority before traffic first reaches it with `awa storage prepare-queue`, or retry the failed transaction. No schema change is involved.
 
 ## Custom-schema discovery during migration
 
@@ -70,39 +104,18 @@ schema owner:
     REVOKE TRIGGER, REFERENCES ON TABLES FROM awa_runtime;
   ```
 
-- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
-  runtimes created lane sequences themselves, so they needed `CREATE`.
-  Sequences they own are accepted; the `CREATE` grant is not, because it lets
-  the runtime add objects while a migration runs. Until the migration refreshes
-  them, the 0.6 lane helpers and enqueue-head triggers run
-  `CREATE SEQUENCE IF NOT EXISTS` on every reservation, and that checks
-  `CREATE` even for a sequence that exists, so revoking the grant makes running
-  0.6 producers and workers fail with `42501` until the migration commits.
-  Provisioning lanes in advance does not avoid this. Take a short pause:
+- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** Before the 0.6.14 schema patch, 0.6 runtimes created lane sequences themselves, so they needed `CREATE`. Sequences they own are accepted; the `CREATE` grant is not, because it lets the runtime add objects while a migration runs. Remove it while 0.6 producers and workers keep running:
 
-  1. Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
-     enqueue or claim runs.
-  2. Revoke the grant and commit:
+  1. Run `awa migrate` with a 0.6.x CLI, 0.6.14 or later, with the schema owner as the effective role. The schema stays at v40. A 0.7 CLI cannot do this step: it applies the versioned 0.7 migrations, whose schema check refuses the runtime role's `CREATE` grant. Its `prepared_lane_sequences` patch makes the lane helpers and head-table triggers skip `CREATE SEQUENCE` when the lane's sequence exists, and its `definer_lane_provisioning` patch creates a missing lane's sequences through the schema owner's `SECURITY DEFINER` functions, so no runtime role needs `CREATE`. The patches only replace functions, in `awa` and every other queue-storage schema, and earlier 0.6 binaries call the patched helpers with the same arguments. External migration runners apply the `R__` patches as the [0.6.13 to 0.6.14 upgrade guide](https://github.com/hardbyte/awa/blob/v0.6.14/docs/upgrade-0.6.13-to-0.6.14.md#external-migration-runners) describes.
+  2. Revoke the grant in each queue-storage schema:
 
      ```sql
      REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
      ```
 
-  3. Run `awa migrate` as the migrator. The bundle refreshes the lane helpers
-     to use provisioned sequences without `CREATE` (v049).
-  4. Provision any lanes the 0.7 runtimes will need, as the migrator:
+  3. Continue with the 0.7 migration.
 
-     ```bash
-     PGOPTIONS='-c role=awa_owner' \
-       awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
-       --queue <queue> --enqueue-shards <n>
-     ```
-
-  5. Start the 0.7 runtimes.
-
-  An uninterrupted path would need the revoke and the helper refresh to become
-  visible to every session at once; that has not been verified, so do not
-  combine them into one transaction as a substitute for the pause.
+  Revoking before the patches makes running 0.6 producers and workers fail with `42501`: the unpatched helpers run `CREATE SEQUENCE IF NOT EXISTS` on every reservation, which checks `CREATE` even for a sequence that exists. The 0.6 release branch's `awa/tests/patch_upgrade_rehearsal_test.rs` applies the patches under a released 0.6.9 or 0.6.15 fleet, provisions its queues, grants sequence privileges and revokes `CREATE` from its runtime role, then checks that restarted released workers complete every job and a released producer creates a new queue's lanes through the schema owner's functions.
 
 - **A custom schema prepared by a runtime or another role.** A worker that
   auto-prepares a schema, or a DBA who ran the preparation as another user,
@@ -252,6 +265,93 @@ workers report not ready until the migration runs, as for any version bump.
 
 External migration runners apply the complete `awa migrate --sql --from 51
 --to 52` bundle, which defines the helper before the tail calls it.
+
+## v054: claim batch job index
+
+Point lookups of compact receipt claims by job id (heartbeat and progress flush, completion fallbacks, receipt close, cancellation, rescue and `load_job`) use a GIN index on `lease_claim_batches.job_ids` instead of reading every retained claim batch. v054 installs `<schema>.ensure_claim_batch_job_index(slot)` in the default and every discovered custom queue-storage schema and builds no index itself, so it takes no lock on any awa or queue-storage table. Claim prune calls that function right after truncating a claim partition, which builds the index while the partition is empty, so every partition gains it within one claim-ring cycle. A new schema's installer indexes its claim partitions as it creates them.
+
+Do not build the index yourself on a populated partition: the build holds a `SHARE` lock, which blocks claim inserts into that partition, for about half a minute per 100k batches. Run the migration as the owner of the queue-storage tables, or as a migrator that can `SET ROLE` to it, so the function can create the index; see [Claim batch index](security/database-roles.md#claim-batch-index).
+
+Binaries before v054 neither use nor build the index, and binaries that use it read the same rows, by scan, from a partition without it. A database coming from 0.6.15 already has the function from the 0.6 `claim_batch_job_index` schema patch, and v054 replaces it in place. External migration runners apply the complete `awa migrate --sql --from 53 --to 54` bundle, which defines the helper before the tail installs the function.
+
+## v055: batch compatibility insert
+
+v055 adds one function, `awa.insert_jobs_compat_batch`, and changes nothing else: no table DDL, no table or sequence locks, no change to `awa.insert_job_compat` or to storage routing. It inserts a whole batch the way `awa.insert_job_compat` inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, scheduled rows, the result rows). Then, in `(queue, priority, shard)` order, it registers each lane it is the first to use, reserves each lane's range of positions once and writes the ready rows. Each lane's enqueue lock is therefore taken when the batch reaches that lane instead of at the batch's first ready row. The lock is transaction-scoped: it is held until the calling transaction commits or rolls back, including any work the caller does after the batch. Concurrent producers and promotion on the same lane no longer wait for the batch's lane-independent work or its earlier lanes.
+
+What callers see:
+
+- `insert_many_copy` (Rust) and `Client.insert_many_copy` (Python) use the function when it is installed and the connected role may execute it, otherwise the per-row path. They check on every call, so a running producer switches on its next call after the migration commits. Their results are unchanged: rows in input order, jobs whose unique key is already claimed skipped.
+- `insert_many_skip_unique_conflicts` (Rust) inserts a batch through the function and skips jobs whose unique key is already claimed, returning the inserted rows in input order. Use it instead of retrying a failed `insert_many` one job at a time. It returns a validation error on a schema before v055.
+- Generic `insert_many` is unchanged: one statement calling `awa.insert_job_compat` per row, on every schema, and a unique conflict still fails the whole batch.
+- A batch's rows in one lane occupy consecutive lane positions in input order, as before, and are described by one ready segment per run instead of one per row. A key repeated inside one batch keeps its first job in input order.
+
+Binaries before v055 never call the function. They keep calling `awa.insert_job_compat`, which takes the same lane lock, so old and new producers share a lane without reordering it. A database coming from 0.6.15 already has the function from the 0.6 `insert_jobs_compat_batch` schema patch, and v055 replaces it in place.
+
+The batch function takes all of a batch's unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, and binaries before v055) take each job's claim and its lane together, lane by lane. When a per-row transaction already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not yet committed, PostgreSQL aborts one of them with `deadlock detected` (SQLSTATE `40P01`), where before the per-row insert would have waited and then skipped the job or failed with a unique violation (`23505`). [v057](#v057-batch-inserts-give-way-to-per-row-producers) replaces the function's body so the batch gives way instead. Two batches through the function take claims in key order and lanes in lane order, so they do not deadlock with each other this way.
+
+New functions are executable by `PUBLIC` unless your deployment revokes that through default privileges. If it does and the runtime role's default privileges do not cover functions created by the migration role, grant it explicitly:
+
+```sql
+GRANT EXECUTE ON FUNCTION awa.insert_jobs_compat_batch(
+    text[], text[], jsonb[], text[], smallint[], smallint[], timestamptz[],
+    jsonb[], jsonb[], bytea[], text[], text[], boolean
+) TO awa_runtime;
+```
+
+Without `EXECUTE`, `insert_many_copy` keeps the per-row path and `insert_many_skip_unique_conflicts` fails with `permission denied`.
+
+External migration runners apply the complete `awa migrate --sql --from 54 --to 55` bundle, which refreshes trusted queue-storage discovery before it replaces the function.
+
+## v056: claim batch index recognition
+
+v056 replaces `<schema>.ensure_claim_batch_job_index(slot)` in the default and every discovered custom queue-storage schema. The v054 function counted any valid GIN index whose definition named `job_ids` as the claim batch index, a partial one included, and treated another index or relation that already had the index's name as the index, so claim prune could skip building the real one. The function now accepts only a valid, non-partial GIN index on `job_ids` alone. When something else already has the name `lease_claim_batches_<slot>_job_ids_idx`, it raises a warning naming it, returns false and leaves it in place; drop or rename it and claim prune builds the index the next time it empties that slot.
+
+The migration also fixes who may execute the function after a refresh by a migration role that owns it but may only `SET ROLE` to the table owner (PostgreSQL 16+ membership `WITH INHERIT FALSE`). The refresh handed the function to the table owner first, after which the migration role could no longer revoke or grant on it, PostgreSQL only warned, and `EXECUTE` stayed with `PUBLIC`. It now resets `EXECUTE` after the transfer, acting as the new owner when it cannot as itself, so exactly the roles holding `TRUNCATE` on `lease_claim_batches` can execute it. Migrations run with the owner as the effective role, as [database roles](security/database-roles.md) describes, were not affected.
+
+Like v054 it replaces functions only: it builds and drops no index and takes no lock on any `awa` or queue-storage table. Binaries before v056 call the new function unchanged, and an index the v054 function built is still recognised. A database coming from 0.6.16 already has this function from its `claim_batch_job_index` schema patch. External migration runners apply the complete `awa migrate --sql --from 55 --to 56` bundle, which defines the helper before the tail installs the function.
+
+## v057: batch inserts give way to per-row producers
+
+v057 replaces the body of `awa.insert_jobs_compat_batch`, which `insert_many_copy` and `insert_many_skip_unique_conflicts` call. It is one `CREATE OR REPLACE FUNCTION` with no table DDL and no table locks, and the function's signature, privileges and results are unchanged. The fix is in the function, so producers that already call it get it as soon as the migration commits, before or after their binaries roll.
+
+The function takes a batch's unique claims before its lane locks, while per-row inserts (generic `insert_many`, single-job inserts, and binaries before v055) take each job's claim and its lane together. With the v055 body, a per-row transaction that held a lane the batch needed and then inserted a key the batch had claimed but not committed waited on the batch while the batch waited on it, and PostgreSQL aborted one of them with `deadlock detected` (SQLSTATE `40P01`).
+
+From v057 the function takes its claims and lanes in a subtransaction and, while it holds any of them, waits at most 500 ms per lock, or half of its own session's `deadlock_timeout` if that is lower. When a wait would run longer, the batch rolls back what it took and tries again after a short randomised pause. The per-row transaction gets the key or the lane, proceeds and commits, and on its next attempt the batch skips the keys it committed, or fails with a unique violation when it does not skip conflicts, as it would for any key committed before it. The same applies to a transaction that enqueues lanes in separate statements in the opposite order to a batch. Two batches through the function still take claims in key order and lanes in lane order, so they cannot deadlock with each other.
+
+After 2 s of retries, the batch makes one last attempt that waits as the v055 function did. Contention that outlasts the retries is then served in lock order, and a cycle that rolling back cannot break ends in `deadlock detected` rather than endless retries. The protection therefore lasts only for the bounded phase: a per-row transaction that holds a lane for longer than about 2.5 s and only then inserts one of the batch's keys meets the ordinary attempt, and one of the two is aborted with `40P01` as before.
+
+What callers see:
+
+- A batch insert and a per-row producer that share keys or lanes no longer abort each other with `40P01` when the batch call is the first thing its transaction locks and the per-row producer's `deadlock_timeout` is above 500 ms (PostgreSQL's default is 1 s). The batch cannot see another session's setting, so the cap is fixed; a per-row session configured at or below 500 ms can still be aborted by its own, earlier deadlock check.
+- A per-row transaction that holds a lane longer than the bounded phase (about 2.5 s) before it inserts one of the batch's keys can still deadlock with the batch.
+- A batch whose transaction already holds locks from earlier statements can still be part of a deadlock: rolling back the batch cannot release them. That cycle now ends later, after about 3 to 4 s instead of 1 to 2 s, and the transaction usually aborted is the batch's caller rather than the per-row producer.
+- A batch can only give way while inserting its unique claims takes less than the 500 ms budget. Each claim costs roughly 20 µs on a fast database server and more on a slow or busy one, so the limit is in the range of 10,000 to 20,000 unique keys. A larger batch, or one whose claims are slowed by load, uses up each bounded attempt before it reaches its lanes and ends in the ordinary attempt, so it behaves as with the v055 body. Split such batches if they share keys or lanes with per-row producers.
+- Under contention that outlasts the retries, a batch waits for its lanes in lock order, as before.
+- A caller's `lock_timeout` applies to each of the batch's lock waits, as it does to any statement's, and a wait it ends fails the call with `lock_not_available` (SQLSTATE `55P03`). Time the batch spends on its own work or on retries does not count against it.
+- The 500 ms budget applies to each wait, not to a statement: a claim statement that meets several keys still in flight, or a lane reservation that waits for the lane's provisioning lock and then its lock, can wait up to the remaining budget each time.
+- The lane lock is still taken when the batch reaches the lane and held until the transaction ends.
+
+Binaries before v057 that call the function pass the same arguments, so they can run before or after the migration, and rolling binaries back needs no schema change. A database coming from 0.6.16 already has this body from its `insert_jobs_compat_batch` schema patch, and v057 replaces it in place. External migration runners apply the complete `awa migrate --sql --from 56 --to 57` bundle, which refreshes trusted queue-storage discovery before it replaces the function.
+
+## v058: lane row before lane lock
+
+v058 replaces `<schema>.provision_lane` in the default and every discovered custom queue-storage schema. The v053 function took the lane's advisory lock and then inserted its `queue_lanes` row, while producers and `QueueStorage` insert the row first and take the lock after it. A `provision_lane` call and a producer that were both first to use the same new `(queue, priority)` could each wait for the other until PostgreSQL aborted one with `deadlock detected` (`40P01`). The function now inserts the row first.
+
+It replaces functions only and takes no lock on any `awa` or queue-storage table. Binaries before v058 call the function with the same arguments, so they can run before or after the migration.
+
+## v059: wider retry jitter
+
+v059 replaces the body of `awa.backoff_duration(attempt, max_attempts)`, which sets the delay before an automatic retry. The delay was `2^attempt` seconds plus up to 25% of that, so jobs that failed together, for example while a dependency was down, retried within a quarter of their base delay of each other and reached the recovering dependency together. It is now `2^attempt` seconds multiplied by a random factor in [0.5, 1.5), still capped at 24 hours. The mean delay is the base delay (the old mean was 12.5% above it), the shortest delay for an attempt halves, and the retries from one failure spread over a window four times as wide, which cuts their peak arrival rate by about 3.5×. These figures hold while the whole range is below the cap, which is through attempt 15. From attempt 16 the top of the range is cut to 24 hours, and from attempt 18 every retry waits exactly 24 hours, with no jitter. The function sets every retry delay awa chooses itself: after a retryable handler error and after rescue of a stale heartbeat, an expired deadline or a callback timeout. `RetryAfter` and `Snooze` keep the delay the handler gives.
+
+It is one `CREATE OR REPLACE FUNCTION` that keeps the function's signature, volatility, owner and privileges, and takes no lock on any `awa` or queue-storage table. Binaries before v059 call the same function from the same statements, so they get the new delays as soon as the migration commits and can run before or after it. Jobs already waiting to retry keep their scheduled time. External migration runners apply `awa migrate --sql --from 58 --to 59`.
+
+## v060: correlated claim tombstone checks
+
+A claim checks each candidate row against `ready_tombstones`, which records rows that were cancelled, retried or moved before they were claimed. For a small batch PostgreSQL could plan that `EXISTS` check as a hashed subplan that reads the slot's whole tombstone partition on every claim, although the lookup index exists, so the cost of each claim grew with churn in the slot. The check now carries `OFFSET 0`, which keeps it correlated: one index probe per candidate row.
+
+v060 rewrites `<schema>.claim_ready_runtime` and each `<schema>.claim_ready_slot_<n>` in the default and every discovered custom queue-storage schema from their own definitions, so signatures, owners, privileges and settings are unchanged. A function that already carries the check is left alone, so a replay, a fresh install and a database coming from 0.6.17 (whose `correlated_claim_tombstones` schema patch made the same change) are no-ops. It reinstalls no table or trigger and takes no lock on any `awa` or queue-storage table; a claim in flight finishes on the old body.
+
+Binaries before v060 call the same functions with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete `awa migrate --sql --from 59 --to 60` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
 
 ## Tag indexes (ADR-049)
 

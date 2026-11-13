@@ -91,11 +91,14 @@ Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
 ## Restricted Database Roles
 
-When deploying a runtime without schema CREATE, apply v049 and provision every
-queue with `awa storage prepare-queue` as the migrator before starting producers
-or workers. Match shard/stripe counts; provision additional lanes before changing
-routing. Use the sequence grants and owner defaults in
-[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+From v053 any runtime role creates lanes through the schema owner's
+`SECURITY DEFINER` provisioning functions, so runtimes need neither schema
+CREATE nor sequence default privileges, and `awa storage prepare-queue` is
+optional. Run migrations with the schema owner as the effective role. Check
+lane ownership with `awa storage lane-sequences` (exits 2 while lanes need
+repair) and fix it with `--repair`, connected as the migration role itself
+rather than as the schema owner, or with the statements it prints; see
+[Database roles](../../docs/security/database-roles.md#check-and-repair-lane-ownership).
 
 ## Rolling Upgrades
 
@@ -137,7 +140,11 @@ tick). The leader alone runs cluster-wide scans: deferred→ready promotion, the
 three rescue paths (stale-heartbeat, hard-deadline, callback-timeout), ring
 rotation and prune, DLQ and descriptor cleanup, and cron evaluation. During an
 unfinalized transition it promotes both planes' deferred backlogs, so drain and
-post-flip execution do not depend on which runtime holds leadership. Every
+post-flip execution do not depend on which runtime holds leadership.
+Promotion gives each queue lane its own short transaction and hands a lane
+whose enqueue lock stays busy to a dedicated waiter, so a hot queue delays
+neither other queues' promotion nor rescue
+(`awa_maintenance_promote_lane_contention_total` counts the hand-offs). Every
 worker dispatches and heartbeats its own attempts. There is no `pg_cron` or
 external scheduler.
 
@@ -145,6 +152,28 @@ Late completions from a rescued attempt lose against the newer attempt via the
 `run_lease` guard, so rescue never double-commits. Set `heartbeat_staleness`
 (default 90s) to at least 3× the heartbeat interval; detection latency is
 roughly `heartbeat_staleness + heartbeat_rescue_interval`.
+
+On queue storage a killed runtime's open claims stop the claim ring rotating
+until rescue closes them. Rescue drains such a backlog in passes of 500-attempt
+batches, bounded by `rescue_pass_budget` (1s) and `rescue_pass_max_rows`
+(5000), with the next pass a second later while a backlog remains.
+Stale-heartbeat rescue runs extra batches and early passes only after runtime
+snapshots support a full settled staleness window. Steady evidence may predate a
+stall; it is a sampled heuristic, not proof that an owner has exited. An
+unconfirmed phase requires
+`3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness`; 5-second
+snapshots with 12-second staleness skip that phase and can accelerate rescue of
+stale live claims. See
+[rescue backlog](../../docs/configuration.md#rescue-backlog) for cutoff and
+sampling limits. The ordinary first batch keeps its configured interval. This
+evidence needs `heartbeat_rescue_interval` below half of `heartbeat_staleness`;
+at the defaults acceleration usually starts 3–3.5 minutes after a runtime's
+last snapshot. Leadership changes reset the evidence window. Zero for either
+rescue pass control keeps one batch per ordinary interval. Retried jobs retain
+their backoff, and due times can cluster; the pass row cap does not cap
+promotion throughput. Watch `awa.maintenance.rescue.pass_size` (by
+`awa.rescue.pass_end`) and `awa.maintenance.rescue.oldest_attempt_age`,
+filtering to the current leader.
 
 Finished handlers retry durable finalization for up to 120s from the first
 finalize attempt when database writes are unavailable, including connection,
@@ -171,6 +200,13 @@ Health signals:
 - `awa health [--json]`: database-only readiness (reachable, schema migrated for
   this binary, fleet heartbeat counts). Exit 0 ready, 1 unreachable or
   unmigrated.
+- Worker utilization (0.7+): `sum by (awa_job_queue) (awa_queue_worker_in_use)
+  / sum by (awa_job_queue) (awa_queue_worker_capacity)`. Waits climb steeply
+  once a queue stays above about 0.8; add `max_workers`, and put job kinds with
+  very different service times on separate queues. Weighted-mode capacity counts
+  the whole overflow pool, so a queue can be saturated at a low ratio while
+  other queues hold overflow permits; check its backlog too. See
+  [sizing workers from utilization](../../docs/configuration.md#sizing-workers-from-utilization).
 
 On Kubernetes, set `terminationGracePeriodSeconds` above the shutdown drain
 timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.
@@ -289,6 +325,25 @@ While the transition is unfinalized, a canonical attempt that re-schedules itsel
 Rings rotate only when active — a frozen generation on an idle queue is healthy.
 The condition to alert on is a frozen generation *with* accumulating rows
 (`skipped_busy`): a pinned ring, almost always caused by a long-held snapshot.
+
+## Prune Lock Timeout
+
+Ring prune installs its `lock_timeout` after the initial slot-row locks and
+pre-lock checks. From then on, each lock acquisition has its own timeout of
+10 ms by default; this does not bound the whole prune. A lock timeout rolls it
+back and counts `blocked` in
+`awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome}`. Sustained
+`increase()` of `blocked` (or `error`) warrants checking `pruned` outcomes,
+ring generations and accumulating rows; successful prunes can occur between
+blocked attempts. Raise
+`ClientBuilder::prune_lock_timeout` (Python
+`queue_storage_prune_lock_timeout_ms`) in small steps (`50ms`, `100ms`, `250ms`) when short readers of the ring
+partitions are the cause, and keep it well below `deadlock_timeout` (default 1 s)
+and any enabled `statement_timeout`. Startup warns when it is at or above either
+enabled limit. Of its initial partition locks, queue-ring prune waits under the
+timeout only on `ready_segments` and takes its other partitions with `NOWAIT`.
+`backed_off` means prune was skipped for a few ticks
+after repeated `skipped_active`.
 
 ## Ring Rotation Cadence
 

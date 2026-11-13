@@ -157,7 +157,7 @@ Three negative configurations reproduce using allocated bytes as row presence, u
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, the whole stale-heartbeat and deadline rescue transactions (lease delete, receipt sweep, closing the rescued attempt's own receipt, and the `done_entries` insert when the attempt was the last), ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. It checks the represented lock plans; implicit resources absent from a plan are outside the proof.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models enqueue, the first enqueue to a new lane (`queue_lanes` row, provisioning lock, enqueue lock), claim (receipts and legacy modes), complete, close-receipt, the whole stale-heartbeat and deadline rescue transactions (lease delete, receipt sweep, closing the rescued attempt's own receipt, and the `done_entries` insert when the attempt was the last), ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. It checks the represented lock plans; implicit resources absent from a plan are outside the proof.
 - [`AwaQueuePruneLockOrder.cfg`](./AwaQueuePruneLockOrder.cfg): segment-first claim readers and entry-first producers versus queue pruning. Prune waits on routing first and aborts the entire transaction if any later `NOWAIT` lock conflicts. Both authority modes use that tail. This proves cycle avoidance at the represented lock level, not successful pruning under perpetual contention.
 - [`AwaQueuePruneLockOrderBlocking.cfg`](./AwaQueuePruneLockOrderBlocking.cfg): old body-first blocking prune versus the segment-first reader; TLC must find the cycle captured during the saturation benchmark. The main claim plans now include the previously omitted routing-child read.
 - [`AwaWholeSchemaLockOrder.cfg`](./AwaWholeSchemaLockOrder.cfg): counter rebuild and reset versus every ring's rotate, prune and rollup, across the authority flip. Both whole-schema operations wait for the per-ring rotation locks before the ring-state singletons and their table locks. A ledger tick holds only the rotation lock before its child locks, and a tick promoted to ledger while queued on the singleton try-locks it.
@@ -165,6 +165,8 @@ Configs:
 - [`AwaStorageLockOrderPrepareQueue.cfg`](./AwaStorageLockOrderPrepareQueue.cfg): producer and preparer both lock `q#10` before `q#2`, matching the string order of the batched Rust producer path.
 - [`AwaStorageLockOrderPrepareQueueNumeric.cfg`](./AwaStorageLockOrderPrepareQueueNumeric.cfg): numeric preparation order locks `q#2` before `q#10`; TLC finds a waits-for cycle against a producer.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
+- [`AwaStorageLockOrderOldStripedClaimDeadlock.cfg`](./AwaStorageLockOrderOldStripedClaimDeadlock.cfg): the historical claim shape that walked several physical stripes against the enqueue order — **NoDeadlock tripped**.
+- [`AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg`](./AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg): the historical `QueueStorage` order for a new lane, provisioning lock before the `queue_lanes` row, against a SQL producer of the same lane — **NoDeadlock tripped in 5 steps** (#692).
 
 Run:
 
@@ -173,6 +175,8 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderPrepareQueue.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderPrepareQueueNumeric.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg
 ```
 
 Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.

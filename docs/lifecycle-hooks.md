@@ -74,9 +74,11 @@ A callback that _resumes_ the job to `running` emits no event itself; the job re
 Hooks are **best-effort, in-process notifications** — not a durable workflow mechanism:
 
 - They observe **committed** state. An outcome hook carries the post-transition `JobRow`; a stale/rejected finalization emits no outcome event (though a `Started` may already have fired for that attempt).
-- They do not block executor progress or queue capacity, and `shutdown()` does not wait for them. They can be lost on process crash or shutdown.
+- They do not delay a job's state transition, and `shutdown()` does not wait for them. They can be lost on process crash or shutdown.
+- Each attempt's hooks hold one of the worker's finalizer slots until they return, the same bounded slots that wait for completions to commit. Hooks slower than job throughput therefore slow claiming instead of piling up in memory. Keep hooks fast, and hand slow work to a job or follow-up instead.
+- Maintenance dispatches `Rescued` events, and `Cancelled` for duplicates it supersedes, on detached tasks with at most 1,024 outstanding per worker. Events beyond that are dropped with a warning rather than holding up rescue. While it [drains a backlog](configuration.md#rescue-backlog), a queue-storage rescue pass keeps rescuing until it reaches `rescue_pass_max_rows` (5,000 by default) and then finishes its current batch, so a pass can exceed that by nearly one batch, and `Rescued` hooks slower than the drain lose events.
 - **Dispatch is not atomic with the state transition.** The hook runs _after_ the job's transition commits, as a separate in-process step — it is not a transactional outbox. If the process dies between the commit and the dispatch, the job state is durable but the event is lost. The same applies to callback resolution: `complete_external` / `resolve_callback` commit the outcome first, then dispatch.
-- `Started` is dispatched detached, so a very fast job may finish before its `Started` hook completes — do not rely on strict started-before-outcome ordering for short jobs.
+- `Started` runs alongside the handler, so a very fast job's state transition may commit before its `Started` hook completes. For outcomes the worker finalizes itself, the outcome hook runs only after the `Started` hook has returned.
 - A panicking hook is logged; later hooks for the same kind still run.
 
 If a side effect must fire exactly once or survive a crash, do not drive it from a hook at all — the dispatch may never run, and enqueueing the follow-up work _from_ the hook just inherits that same unreliability. See the next section for the durable mechanism.

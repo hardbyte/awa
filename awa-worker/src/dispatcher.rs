@@ -312,6 +312,11 @@ impl OverflowPool {
         }
     }
 
+    /// Total overflow permits shared by the weighted queues.
+    pub fn total(&self) -> u32 {
+        self.total
+    }
+
     /// Get the number of overflow permits currently held by a queue.
     pub fn held(&self, queue: &str) -> u32 {
         let state = self.state.lock().unwrap();

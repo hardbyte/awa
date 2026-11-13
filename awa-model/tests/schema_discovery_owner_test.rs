@@ -556,8 +556,13 @@ async fn assert_configured_substrates_fail_closed(
     )
     .fetch_one(migrator_pool)
     .await?;
-    sqlx::query("DELETE FROM awa.schema_version WHERE version = $1")
-        .bind(migrations::CURRENT_VERSION)
+    let (discovery_version, _, pending_sql) = migrations::migration_sql()
+        .into_iter()
+        .rev()
+        .find(|(_, _, sql)| sql.contains("FROM awa.queue_storage_schemas() AS discovered"))
+        .expect("some migration discovers queue-storage schemas");
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= $1")
+        .bind(discovery_version)
         .execute(migrator_pool)
         .await?;
     let previous_version: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
@@ -602,7 +607,6 @@ async fn assert_configured_substrates_fail_closed(
             "CREATE SCHEMA awa_exp AUTHORIZATION {outsider}"
         ))))
         .await?;
-    let (_, _, pending_sql) = migrations::migration_sql().pop().unwrap();
     for (details, expected_schema) in [
         (
             serde_json::json!({"schema": "injected_custom"}),
