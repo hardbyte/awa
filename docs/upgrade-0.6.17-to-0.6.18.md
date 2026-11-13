@@ -39,7 +39,7 @@ The `live_slot_claims` patch, in every queue-storage schema with lease claim rec
 - replaces `<schema>.claim_ready_runtime` in place, with the same arguments, result, owner and privileges;
 - creates `<schema>.claim_slot_<n>(...)` for each queue slot, owned by the owner of `claim_ready_runtime` and with its `EXECUTE` grants. A runtime role that may call `claim_ready_runtime` may call these too.
 
-Each statement in the new functions names the partitions it reads, so a claim locks the slots it claims from and the segment partitions it routes through, not the whole ring. The patch takes no table lock. A claim in flight finishes on the old function. Schemas with `lease_claim_receipts = FALSE` keep their claim function and are not reported by `awa migrate`.
+Each statement in the new functions names the partitions it reads, so a claim locks the slots it claims from and the segment partitions it routes through, not the whole ring. The patch takes no table lock. Each database connection plans the new functions on its first claims, so claim p99 latency is higher for the first few seconds after the patch and on each new connection; after that, claims are as fast as or faster than on 0.6.17. A claim in flight finishes on the old function. Schemas with `lease_claim_receipts = FALSE` keep their claim function and are not reported by `awa migrate`.
 
 A migrator that is not the function owner but can `SET ROLE` to it creates the functions as the owner and gets its own role back. One that cannot fails with `cannot act as that role`, and nothing changes.
 

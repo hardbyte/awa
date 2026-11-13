@@ -2004,14 +2004,23 @@ BEGIN
         END IF;
     END IF;
 
-    EXECUTE format('SELECT slot_count FROM %I.queue_ring_state WHERE singleton = TRUE', p_schema)
-    INTO v_slot_count;
-    SELECT count(*) INTO v_partitions
-    FROM pg_inherits
-    WHERE inhparent = format('%I.ready_entries', p_schema)::regclass;
-    IF v_slot_count IS NULL OR v_partitions <> v_slot_count THEN
-        RAISE EXCEPTION 'refresh_claim_functions: %.ready_entries has % partitions but the queue ring has % slots',
-            p_schema, v_partitions, v_slot_count
+    -- The queue ring's slots are ready_entries' partitions, ready_entries_0
+    -- to ready_entries_<n-1>. Read from the catalog so the refresh locks no
+    -- table, not even queue_ring_state.
+    SELECT count(*)::int,
+           count(DISTINCT substring(child.relname FROM '^ready_entries_([0-9]+)$')::int)::int,
+           max(substring(child.relname FROM '^ready_entries_([0-9]+)$')::int)
+    INTO v_partitions, v_slot_count, v_slot
+    FROM pg_class AS parent
+    JOIN pg_namespace AS ns ON ns.oid = parent.relnamespace
+    JOIN pg_inherits AS inh ON inh.inhparent = parent.oid
+    JOIN pg_class AS child ON child.oid = inh.inhrelid
+    WHERE ns.nspname = p_schema
+      AND parent.relname = 'ready_entries'
+      AND parent.relkind = 'p';
+    IF v_partitions = 0 OR v_slot_count <> v_partitions OR v_slot <> v_partitions - 1 THEN
+        RAISE EXCEPTION 'refresh_claim_functions: %.ready_entries has % partitions, not ready_entries_0 to ready_entries_%',
+            p_schema, v_partitions, GREATEST(v_partitions - 1, 0)
             USING ERRCODE = '55000';
     END IF;
     FOR v_slot IN 0..(v_slot_count - 1) LOOP

@@ -69,9 +69,12 @@ BEGIN
               p.prosrc NOT LIKE '%awa:claim-routing:v2%'
               OR EXISTS (
                   SELECT 1
-                  FROM pg_inherits AS inh
+                  FROM pg_class AS parent
+                  JOIN pg_inherits AS inh ON inh.inhparent = parent.oid
                   JOIN pg_class AS child ON child.oid = inh.inhrelid
-                  WHERE inh.inhparent = to_regclass(format('%I.ready_entries', n.nspname))
+                  WHERE parent.relnamespace = n.oid
+                    AND parent.relname = 'ready_entries'
+                    AND parent.relkind = 'p'
                     AND NOT EXISTS (
                         SELECT 1 FROM pg_proc AS slot_fn
                         WHERE slot_fn.pronamespace = n.oid

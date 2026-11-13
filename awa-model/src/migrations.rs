@@ -434,7 +434,9 @@ macro_rules! live_slot_claims_pending_sql {
         "SELECT 'awa.refresh_claim_functions'::text AS target \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM pg_proc AS p \
-             WHERE p.oid = to_regprocedure('awa.refresh_claim_functions(text,boolean)') \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'refresh_claim_functions' \
+               AND oidvectortypes(p.proargtypes) = 'text, boolean' \
                AND p.prosrc LIKE '%awa:claim-routing:v2%' \
                AND p.prosrc LIKE '%awa.queue_storage.retire:%') \
          UNION ALL \
@@ -464,8 +466,11 @@ macro_rules! live_slot_claims_pending_sql {
                        substring(child.relname FROM '^ready_entries_([0-9]+)$')) \
          FROM pg_proc AS p \
          JOIN pg_namespace AS n ON n.oid = p.pronamespace \
-         JOIN pg_inherits AS inh \
-           ON inh.inhparent = to_regclass(format('%I.ready_entries', n.nspname)) \
+         JOIN pg_class AS parent \
+           ON parent.relnamespace = n.oid \
+          AND parent.relname = 'ready_entries' \
+          AND parent.relkind = 'p' \
+         JOIN pg_inherits AS inh ON inh.inhparent = parent.oid \
          JOIN pg_class AS child ON child.oid = inh.inhrelid \
          WHERE p.proname = 'claim_ready_runtime' \
            AND oidvectortypes(p.proargtypes) \
