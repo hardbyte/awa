@@ -9,7 +9,7 @@ use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::Acquire;
-use sqlx::{PgConnection, PgPool, Postgres};
+use sqlx::{PgPool, Postgres};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -713,7 +713,7 @@ async fn set_prune_lock_timeout_tx(
     Ok(())
 }
 
-pub(crate) fn validate_ident(ident: &str) -> Result<(), AwaError> {
+fn validate_ident(ident: &str) -> Result<(), AwaError> {
     let mut chars = ident.chars();
     match chars.next() {
         Some(first) if first.is_ascii_lowercase() || first == '_' => {}
@@ -4635,7 +4635,79 @@ impl QueueStorage {
         priority: i16,
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
-        insert_lane_rows(tx.as_mut(), self.schema(), queue, priority, enqueue_shard).await?;
+        let schema = self.schema();
+        let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lane_lock_key)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.queue_lanes (queue, priority)
+            VALUES ($1, $2)
+            ON CONFLICT (queue, priority) DO NOTHING
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // The head tables' BEFORE INSERT triggers run even for a row that
+        // ON CONFLICT then skips, and they read and set the lane's sequence.
+        // Skipping rows that exist keeps provisioning a live lane off a
+        // sequence another role owns, such as one a 0.6 runtime created.
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.queue_enqueue_heads (queue, priority, enqueue_shard)
+            SELECT $1, $2, $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.queue_enqueue_heads
+                WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            )
+            ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.queue_claim_heads (queue, priority, enqueue_shard)
+            SELECT $1, $2, $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.queue_claim_heads
+                WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            )
+            ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(audited_sql(format!(
+            r#"
+            SELECT {schema}.ensure_lane_sequences($1, $2, $3)
+            "#
+        )))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         self.mark_lane_ensured(queue, priority, enqueue_shard);
         Ok(())
     }
@@ -14197,17 +14269,8 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
-            WHERE ready.job_id = $1
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-                    AND tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-              )
+            FROM {schema}.ready_entries
+            WHERE job_id = $1
             ORDER BY run_lease DESC, attempted_at DESC NULLS LAST, run_at DESC
             "#,
         )))
@@ -19698,87 +19761,6 @@ impl QueueStorage {
     fn attempt_state_table(&self) -> String {
         format!("{}.{}", self.schema(), self.attempt_state_relname())
     }
-}
-
-/// Insert a lane's rows and create its sequences, under the lane lock that
-/// runtimes take for the same inserts. Head rows are inserted only when
-/// missing, so their sequence triggers never fire for an existing lane, whose
-/// sequences may belong to the runtime role that created them.
-pub(crate) async fn insert_lane_rows(
-    conn: &mut PgConnection,
-    schema: &str,
-    queue: &str,
-    priority: i16,
-    enqueue_shard: i16,
-) -> Result<(), AwaError> {
-    let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(lane_lock_key)
-        .execute(&mut *conn)
-        .await
-        .map_err(map_sqlx_error)?;
-
-    sqlx::query(audited_sql(format!(
-        r#"
-        INSERT INTO {schema}.queue_lanes (queue, priority)
-        VALUES ($1, $2)
-        ON CONFLICT (queue, priority) DO NOTHING
-        "#
-    )))
-    .bind(queue)
-    .bind(priority)
-    .execute(&mut *conn)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    sqlx::query(audited_sql(format!(
-        r#"
-        INSERT INTO {schema}.queue_enqueue_heads (queue, priority, enqueue_shard)
-        SELECT $1, $2, $3
-        WHERE NOT EXISTS (
-            SELECT 1 FROM {schema}.queue_enqueue_heads
-            WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
-        )
-        ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
-        "#
-    )))
-    .bind(queue)
-    .bind(priority)
-    .bind(enqueue_shard)
-    .execute(&mut *conn)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    sqlx::query(audited_sql(format!(
-        r#"
-        INSERT INTO {schema}.queue_claim_heads (queue, priority, enqueue_shard)
-        SELECT $1, $2, $3
-        WHERE NOT EXISTS (
-            SELECT 1 FROM {schema}.queue_claim_heads
-            WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
-        )
-        ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
-        "#
-    )))
-    .bind(queue)
-    .bind(priority)
-    .bind(enqueue_shard)
-    .execute(&mut *conn)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    sqlx::query(audited_sql(format!(
-        r#"
-        SELECT {schema}.ensure_lane_sequences($1, $2, $3)
-        "#
-    )))
-    .bind(queue)
-    .bind(priority)
-    .bind(enqueue_shard)
-    .execute(&mut *conn)
-    .await
-    .map_err(map_sqlx_error)?;
-    Ok(())
 }
 
 #[cfg(test)]
