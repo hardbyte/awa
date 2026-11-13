@@ -24287,7 +24287,9 @@ async fn bench_claim_locks(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i6
 ///
 /// `AWA_BENCH_FIXTURE=steady` keeps rows in two slots; `full` fills every
 /// queue slot with `AWA_BENCH_FULL_ROWS` claimed rows first. Other knobs:
-/// `AWA_BENCH_ROUNDS`, `AWA_BENCH_SECS`, `AWA_BENCH_WORKERS` (comma list),
+/// `AWA_BENCH_ROUNDS`, `AWA_BENCH_SECS`, `AWA_BENCH_WARMUP_SECS` (claims
+/// after each body switch that are not measured, so every connection has
+/// planned the new functions), `AWA_BENCH_WORKERS` (comma list),
 /// `AWA_BENCH_BODIES`, `AWA_BENCH_LANES`. One line per measurement:
 /// `BENCH fixture=.. round=.. body=.. workers=.. calls_per_s=.. jobs_per_s=..
 /// p50_ms=.. p99_ms=.. locks_per_claim=.. lockmgr_wait_share=..`.
@@ -24296,6 +24298,7 @@ async fn bench_claim_locks(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i6
 async fn bench_claim_latency_by_claim_body() {
     let rounds: usize = bench_env("AWA_BENCH_ROUNDS", 5);
     let secs: u64 = bench_env("AWA_BENCH_SECS", 8);
+    let warmup = Duration::from_secs(bench_env("AWA_BENCH_WARMUP_SECS", 0));
     let fixture = std::env::var("AWA_BENCH_FIXTURE").unwrap_or_else(|_| "steady".into());
     let full_rows: i64 = bench_env("AWA_BENCH_FULL_ROWS", 100_000);
     let lanes: i16 = bench_env("AWA_BENCH_LANES", 4);
@@ -24432,6 +24435,7 @@ async fn bench_claim_latency_by_claim_body() {
                         }
                     })
                 };
+                let measure_from = Instant::now() + warmup;
                 let mut tasks = Vec::new();
                 for _ in 0..workers {
                     let (pool, store, stop) = (pool.clone(), store.clone(), stop.clone());
@@ -24444,16 +24448,21 @@ async fn bench_claim_latency_by_claim_body() {
                                 .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
                                 .await
                                 .unwrap();
-                            latencies.push(started.elapsed());
+                            let measured = started >= measure_from;
+                            if measured {
+                                latencies.push(started.elapsed());
+                            }
                             if !claimed.is_empty() {
-                                jobs += claimed.len();
+                                if measured {
+                                    jobs += claimed.len();
+                                }
                                 store.complete_runtime_batch(&pool, &claimed).await.unwrap();
                             }
                         }
                         (latencies, jobs)
                     }));
                 }
-                tokio::time::sleep(Duration::from_secs(secs)).await;
+                tokio::time::sleep(warmup + Duration::from_secs(secs)).await;
                 stop.store(true, Ordering::Relaxed);
                 let mut latencies = Vec::new();
                 let mut jobs = 0;
