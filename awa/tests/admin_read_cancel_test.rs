@@ -24,6 +24,14 @@ fn bound() -> Duration {
     ci_timing::scaled_timeout(Duration::from_secs(5))
 }
 
+fn cleanup_ddl_bound() -> Duration {
+    ci_timing::scaled_timeout(Duration::from_secs(30))
+}
+
+fn phase_error(phase: &str, error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{phase}: {error}"))
+}
+
 #[derive(Default)]
 struct BeginGate {
     armed: AtomicBool,
@@ -243,21 +251,27 @@ impl Fixture {
     async fn close(self) -> TestResult {
         self.proxy.gate.release.notify_one();
         // Stop relays even if a broken connection cannot be returned normally.
-        let closed = tokio::time::timeout(bound(), self.reader.close()).await;
+        let closed = tokio::time::timeout(bound(), self.reader.close())
+            .await
+            .map_err(|error| phase_error("cleanup.reader_close", error));
         self.proxy.stop().await;
         if closed.is_err() {
-            tokio::time::timeout(bound(), self.reader.close()).await?;
+            tokio::time::timeout(bound(), self.reader.close())
+                .await
+                .map_err(|error| phase_error("cleanup.reader_close_after_proxy_stop", error))?;
         }
         self.observer.close().await;
         tokio::time::timeout(
-            bound(),
+            cleanup_ddl_bound(),
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE {} WITH (FORCE)",
                 self.database
             )))
             .execute(&self.admin),
         )
-        .await??;
+        .await
+        .map_err(|error| phase_error("cleanup.drop_database.timeout", error))?
+        .map_err(|error| phase_error("cleanup.drop_database.query", error))?;
         self.admin.close().await;
         Ok(())
     }
@@ -341,14 +355,17 @@ async fn backend_is_clean(observer: &PgPool, pid: i32) -> TestResult {
     .await
     .map_err(|_| {
         io::Error::other(format!(
-            "backend {pid} retained a transaction after read cancellation"
+            "body.backend_is_clean.timeout: backend {pid} retained a transaction after read cancellation"
         ))
-    })??;
+    })?
+    .map_err(|error| phase_error("body.backend_is_clean.query", error))?;
     Ok(())
 }
 
 async fn cancelled_begin(which: Read) -> TestResult {
-    let fixture = Fixture::new().await?;
+    let fixture = Fixture::new()
+        .await
+        .map_err(|error| phase_error("setup.fixture", error))?;
     let reader = fixture.reader.clone();
     let observer = fixture.observer.clone();
     let store = fixture.store.clone();
@@ -358,7 +375,9 @@ async fn cancelled_begin(which: Read) -> TestResult {
         gate.armed.store(true, Ordering::SeqCst);
         let mut read = Box::pin(public_read(which, &store, &reader, job_id));
         let pid = tokio::select! {
-            held = tokio::time::timeout(bound(), gate.held_pid()) => held??,
+            held = tokio::time::timeout(bound(), gate.held_pid()) => held
+                .map_err(|error| phase_error("body.real_begin_gate.timeout", error))?
+                .map_err(|error| phase_error("body.real_begin_gate.proxy", error))?,
             result = &mut read => return Err(io::Error::other(format!("{which:?} completed before real BEGIN gate: {result:?}")).into()),
         };
         let state: (String, bool) = sqlx::query_as(
@@ -368,11 +387,14 @@ async fn cancelled_begin(which: Read) -> TestResult {
         drop(read);
         gate.release.notify_one();
         backend_is_clean(&observer, pid).await?;
-        tokio::time::timeout(bound(), public_read(which, &store, &reader, job_id)).await??;
+        tokio::time::timeout(bound(), public_read(which, &store, &reader, job_id))
+            .await
+            .map_err(|error| phase_error("body.subsequent_public_read.timeout", error))?
+            .map_err(|error| phase_error("body.subsequent_public_read.query", error))?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     }).await;
     let cleanup = fixture.close().await;
-    tested??;
+    tested.map_err(|error| phase_error("body.task_join", error))??;
     cleanup
 }
 
@@ -408,7 +430,9 @@ async fn cancelled_job_list_begin_does_not_return_open_transaction() -> TestResu
 
 #[tokio::test]
 async fn completed_begin_and_query_error_preserve_healthy_connection() -> TestResult {
-    let fixture = Fixture::new().await?;
+    let fixture = Fixture::new()
+        .await
+        .map_err(|error| phase_error("setup.fixture", error))?;
     let reader = fixture.reader.clone();
     let observer = fixture.observer.clone();
     let store = fixture.store.clone();
@@ -447,6 +471,6 @@ async fn completed_begin_and_query_error_preserve_healthy_connection() -> TestRe
     })
     .await;
     let cleanup = fixture.close().await;
-    tested??;
+    tested.map_err(|error| phase_error("body.task_join", error))??;
     cleanup
 }
