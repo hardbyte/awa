@@ -680,6 +680,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -732,6 +742,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2215,6 +2365,7 @@
 
 <h1 id="scoped-runtime-controls-source-audit">Scoped runtime controls: source audit<a class="headerlink" href="#scoped-runtime-controls-source-audit" title="Permanent link">&para;</a></h1>
 <p>Evidence supporting proposed <a href="../../adr/052-runtime-halt/">ADR-052</a>. No controls or parameter choices described by the ADR have been implemented or tested by this audit.</p>
+<p>The audit is pinned to the commits below. Since then, 0.6.16 added a schema patch registry to the 0.6 migration runner and shipped the <code>maintenance.prune</code> control as its <code>prune_controls</code> patch; 0.6.17 moved promotion and rescue into their own maintenance loop (ADR-051); and <code>main</code> gained migrations v053 to v059. Line references describe the pinned commits.</p>
 <p>A check of a plain control table inside <code>claim_ready_runtime</code> is a plausible enforcement point for queue-storage runtime claims, but is not a complete dispatch halt. Canonical dispatch bypasses that function on both audited branches; main also has callable per-slot claim functions. A database read can avoid a client polling interval, but does not establish a barrier against claims already in progress or handler launches after the halt commits.</p>
 <p>This source audit pins main to <a href="https://github.com/hardbyte/awa/commit/d16ef5c4572cb96b25a8f26ad85bd5915ab76f64"><code>d16ef5c4572cb96b25a8f26ad85bd5915ab76f64</code></a> and <code>release/0.6.x</code> to <a href="https://github.com/hardbyte/awa/commit/8cec9e45a45735c300a89c98dc96573589100386"><code>8cec9e45a45735c300a89c98dc96573589100386</code></a>. It inspects source, not a running halt implementation or a mixed-version rehearsal. The prospective patch examples below are separate commits, not evidence that the pinned release contains their behavior.</p>
 <h2 id="claim-routes">Claim routes<a class="headerlink" href="#claim-routes" title="Permanent link">&para;</a></h2>

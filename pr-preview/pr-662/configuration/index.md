@@ -223,6 +223,14 @@ await client.start(
 
 Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Each queue's `min_workers` is guaranteed; remaining capacity is distributed by `weight`. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.
 
+### Sizing workers from utilization
+
+A queue's utilization is the fraction of its worker slots that are busy: `awa.queue.worker.in_use` divided by `awa.queue.worker.capacity`, summed over runtimes (see [queue utilization](../grafana/index.md#queue-utilization)). Watch it per queue rather than for the whole fleet. In weighted mode the capacity counts the whole overflow pool, so while other queues hold overflow permits a queue can be saturated at a low ratio; read its backlog alongside utilization.
+
+Waiting time does not grow in proportion to utilization. Kingman's approximation for a queue served by one worker puts the mean wait at roughly `ρ / (1 − ρ) × (Ca² + Cs²) / 2 × mean service time`, where `ρ` is utilization and `Ca` and `Cs` are the coefficients of variation of the arrival gaps and the service times. At 0.5 utilization the `ρ / (1 − ρ)` factor is 1, at 0.8 it is 4 and at 0.9 it is 9. A queue with many workers keeps waits short up to a higher utilization, but its wait still grows as `1 / (1 − ρ)` near 1, so a queue that runs above about 0.8 for long periods has waits that climb steeply with each further increase in load. Give it more workers or move part of its load elsewhere before it reaches that point. In hard-reserved mode that means a larger `max_workers`. In weighted mode, raise `global_max_workers` when the overflow pool is exhausted, or raise the queue's `min_workers` or `weight` when queues compete for the pool. A short burst to 1 is normal; sustained utilization near 1 means the backlog and `awa.job.wait_duration` keep growing.
+
+The `(Ca² + Cs²) / 2` term means variable service times inflate waits at any utilization. A queue that mixes a job kind taking 10 ms with one taking 30 s has a large `Cs`, and the short jobs wait behind the long ones. Put job kinds with very different service times on separate queues, each with its own `max_workers`.
+
 ### What can be tuned per queue vs per job
 
 Queue configuration is the normal way to express operational policy. Job kinds are primarily handler registrations and descriptor/catalog entries; if two kinds need different runtime policy, put them on different queues.
@@ -487,6 +495,29 @@ If you suspend a handler with `wait_for_callback()` and the external system neve
 | --- | --- | --- |
 | `ClientBuilder::callback_rescue_interval` | `30s` | How often the maintenance leader scans for `callback_timeout_at < now()`. The per-callback timeout itself is set when registering the callback in the handler. |
 
+### Draining a backlog of abandoned claims { #rescue-backlog }
+
+A runtime that is killed (OOM, `SIGKILL`, a lost node) leaves every attempt it had claimed open. On queue storage those open claims also stop the claim ring from rotating back into their slot, so a large backlog has to be rescued quickly, not 500 attempts per rescue interval.
+
+Each stale-heartbeat, deadline or callback-timeout rescue therefore runs as a pass of batches. A batch scans a bounded claim window and rescues up to 500 attempts per source (lease rows and receipt claims) in its own short transaction. The pass keeps starting batches while a scan window or rescue batch came back full, until its time budget is spent or it has rescued `rescue_pass_max_rows`. While a backlog remains, the next pass of that kind runs one second later instead of after its interval, so a drain proceeds at up to about `rescue_pass_max_rows` attempts per second per rescue kind.
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `ClientBuilder::rescue_pass_budget` (Rust) / `rescue_pass_budget_ms` (Python kwarg) | `1s` | How long one pass keeps starting batches. Capped at half the rescue interval. `Duration::ZERO` / `0` keeps every pass to one batch. |
+| `ClientBuilder::rescue_pass_max_rows` (Rust) / `rescue_pass_max_rows` (Python kwarg) | `5000` | How many attempts one pass rescues before it stops. Bounds the write burst (closures, retry rows, WAL, replica and CDC traffic), with up to one final batch beyond the cap. `0` keeps one batch per ordinary interval without early re-arms. |
+
+In practice the database sets the rate, not the cap. The figures in this paragraph were measured on 0.6.16 with PostgreSQL 17, where each claim with a deadline has its own claim row; 0.7 writes those claims as compact batches, and the same drain has not been measured on it. A batch of 500 such claims spent about 0.1–0.2 s in its rescue statements and wrote about 0.3 MB of WAL for its closures, so a default pass took several batches before its second of rest. With default intervals, 1.6 million abandoned claims past their deadlines drained in about 17 minutes (1,600 a second), against about 33 a second (500 per kind per interval) without passes. Rescue kinds run one after another on the leader, not in parallel. Raising `rescue_pass_budget` towards its cap and `rescue_pass_max_rows` keeps rescue running for more of each second, but each pass holds the leader for its whole budget, so promotion, rotation and prune wait as long. After a large drain the rings take a minute or two to move past the slots the backlog pinned, while promotion admits the rescued retries.
+
+How a pass chooses and paces its work:
+
+- **Oldest claims first.** Batches visit claim slots from the oldest to the current one, because the ring cannot rotate back into the oldest slot until its claims are closed. Every fourth batch visits the other slots first, so a long drain of one slot does not starve the rest. A slot a batch found nothing in is skipped for the rest of the pass.
+- **Stale-heartbeat acceleration uses runtime evidence.** A stale heartbeat cannot distinguish a dead runtime from a stalled one. Extra batches and early passes require every snapshot in `awa.runtime_instances` to be either fresh with its heartbeat loop alive or silent for at least `heartbeat_staleness`, with that condition observed for a full staleness window. Accelerated batches also require the claim's last heartbeat to precede the latest gone-runtime cutoff. The per-attempt staleness condition is unchanged.
+  This is a bounded heuristic, not proof that an owner has exited. To expose an unconfirmed phase between fresh and gone, each runtime needs `3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness`. With 5-second snapshots and 12-second staleness, a stalled live runtime goes directly from fresh to gone; steady evidence may predate the stall, so acceleration can rescue its stale claims faster than the ordinary one-batch cadence. The leader must also sample frequently enough: gaps longer than half the staleness reset the evidence window, and short stalls between samples can be missed. The defaults (10-second snapshots, 90-second staleness, 30-second rescue interval) provide an unconfirmed phase; after a runtime stops reporting, acceleration usually begins after about 3–3.5 minutes. A new maintenance leader resets the evidence window. Deadline and callback rescues use their expired deadline and do not need owner evidence.
+- **Retries retain their backoff.** Rescue bounds closures and retry writes per pass. Backoffs and promotion delays can make retries become due together; `rescue_pass_max_rows` does not cap the rate at which promotion admits them to the ready lanes.
+- **Exhausted attempts are dead-lettered in the same batches.** On a DLQ-enabled queue an attempt rescued on its last try goes to the DLQ in its batch's transaction (reason `heartbeat_stale`, `deadline_exceeded` or `callback_timeout`), so a drain can move many jobs to the DLQ at once. `awa.job.dlq_moved` counts them by reason.
+
+A pass holds the maintenance leader's loop for up to its budget plus one batch, so promotion and the other maintenance branches can wait about that long while a backlog drains. Watch a drain with `awa.maintenance.rescue.pass_size` (attempts per pass, by `awa.rescue.kind` and `awa.rescue.pass_end`: `drained`, `time_budget`, `row_limit`, `owners_unconfirmed` or `error`) and `awa.maintenance.rescue.oldest_attempt_age` (the age of the oldest attempt the latest pass rescued, `0` when it rescued nothing). An `oldest_attempt_age` far above `heartbeat_staleness` or the queue's deadline means rescue is behind.
+
 ### Retention and cleanup
 
 Retention depends on the storage path.
@@ -637,7 +668,7 @@ Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` i
 
 Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` for ordinary runtimes and `4` when the configured runtime worker capacity is at least `512` (`8` on canonical storage). Extra completion flushers can improve large single-process shapes, but they also multiply terminal-write contention across a worker fleet. Override this only after measuring the same north-star metrics for the target topology.
 
-`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS` defaults to `1`. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.
+`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS` defaults to `1`. A completion shard writes its batch when it holds `AWA_COMPLETION_BATCH_SIZE` attempts or `AWA_COMPLETION_FLUSH_MS` after the first of them arrived, whichever comes first. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.
 
 A runtime lets at most the larger of its worker capacity and `2 × AWA_COMPLETION_BATCH_SIZE × AWA_COMPLETION_SHARDS` finished attempts wait for their completion to commit: 1,024 with the queue-storage defaults below 512 workers. Each attempt's lifecycle hooks run within that allowance. A handler that finishes while it is used up keeps its worker slot until a completion commits, so a runtime whose completions or hooks fall behind claims more slowly instead of holding the backlog in memory. Each waiting attempt holds its job, payload included; for large payloads, lower `AWA_COMPLETION_BATCH_SIZE` to lower the bound in proportion.
 

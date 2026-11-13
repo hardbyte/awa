@@ -686,6 +686,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -738,6 +748,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -1516,6 +1666,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Lane ownership and v053">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-queue-lanes-during-the-roll" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New queue lanes during the roll
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1606,6 +1773,50 @@
     <span class="md-ellipsis">
       
         v055: batch compatibility insert
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v056-claim-batch-index-recognition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v056: claim batch index recognition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v057-batch-inserts-give-way-to-per-row-producers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v057: batch inserts give way to per-row producers
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v058-lane-row-before-lane-lock" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v058: lane row before lane lock
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v059-wider-retry-jitter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v059: wider retry jitter
       
     </span>
   </a>
@@ -2473,6 +2684,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Lane ownership and v053">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-queue-lanes-during-the-roll" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New queue lanes during the roll
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2563,6 +2791,50 @@
     <span class="md-ellipsis">
       
         v055: batch compatibility insert
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v056-claim-batch-index-recognition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v056: claim batch index recognition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v057-batch-inserts-give-way-to-per-row-producers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v057: batch inserts give way to per-row producers
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v058-lane-row-before-lane-lock" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v058: lane row before lane lock
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v059-wider-retry-jitter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v059: wider retry jitter
       
     </span>
   </a>
@@ -2808,6 +3080,8 @@ detects that <code>provision_lane</code> is missing and creates lanes as before.
 <p>External migration runners apply the generated <code>awa migrate --sql --from 52
 --to 53</code> bundle, which does not repair existing lane sequences, then run
 <code>awa storage lane-sequences --repair</code> as the migration role itself.</p>
+<h3 id="new-queue-lanes-during-the-roll">New queue lanes during the roll<a class="headerlink" href="#new-queue-lanes-during-the-roll" title="Permanent link">&para;</a></h3>
+<p>When <code>QueueStorage</code> is the first to use a <code>(queue, priority)</code> lane, through a batch enqueue or a worker promoting scheduled or retried jobs, it writes the lane's <code>queue_lanes</code> row before taking its provisioning lock, the order SQL inserts already use. 0.6.15 and earlier, and 0.7 builds before this fix, take them the other way round. Until every <code>QueueStorage</code> process is upgraded, an older one and any other producer that are both first to use the same lane can still deadlock, and one transaction fails with <code>40P01</code>. Lanes that already exist are unaffected. To avoid it during the roll, create the lanes of a queue or priority before traffic first reaches it with <code>awa storage prepare-queue</code>, or retry the failed transaction. No schema change is involved.</p>
 <h2 id="custom-schema-discovery-during-migration">Custom-schema discovery during migration<a class="headerlink" href="#custom-schema-discovery-during-migration" title="Permanent link">&para;</a></h2>
 <p>Migration bundles discover custom substrates using catalog metadata without
 evaluating their views or functions. Schemas, relations, routines and types
@@ -3024,7 +3298,7 @@ workers report not ready until the migration runs, as for any version bump.</p>
 <p>Do not build the index yourself on a populated partition: the build holds a <code>SHARE</code> lock, which blocks claim inserts into that partition, for about half a minute per 100k batches. Run the migration as the owner of the queue-storage tables, or as a migrator that can <code>SET ROLE</code> to it, so the function can create the index; see <a href="../security/database-roles/#claim-batch-index">Claim batch index</a>.</p>
 <p>Binaries before v054 neither use nor build the index, and binaries that use it read the same rows, by scan, from a partition without it. A database coming from 0.6.15 already has the function from the 0.6 <code>claim_batch_job_index</code> schema patch, and v054 replaces it in place. External migration runners apply the complete <code>awa migrate --sql --from 53 --to 54</code> bundle, which defines the helper before the tail installs the function.</p>
 <h2 id="v055-batch-compatibility-insert">v055: batch compatibility insert<a class="headerlink" href="#v055-batch-compatibility-insert" title="Permanent link">&para;</a></h2>
-<p>v055 adds one function, <code>awa.insert_jobs_compat_batch</code>, and changes nothing else: no table DDL, no table or sequence locks, no change to <code>awa.insert_job_compat</code> or to storage routing. It inserts a whole batch the way <code>awa.insert_job_compat</code> inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, scheduled rows, the result rows). Then, in <code>(queue, priority, shard)</code> order, it registers each lane it is the first to use, reserves each lane's range of positions once and writes the ready rows. Each lane's enqueue lock is therefore held only for the reservation, the ready-row write and the commit, instead of from the batch's first ready row to the commit, so concurrent producers and promotion on the same lane wait for that much shorter window.</p>
+<p>v055 adds one function, <code>awa.insert_jobs_compat_batch</code>, and changes nothing else: no table DDL, no table or sequence locks, no change to <code>awa.insert_job_compat</code> or to storage routing. It inserts a whole batch the way <code>awa.insert_job_compat</code> inserts one job, with the same validation, unique claims, lane assignment and storage routing. It does everything that does not depend on a lane first (job ids, unique claims in key order, scheduled rows, the result rows). Then, in <code>(queue, priority, shard)</code> order, it registers each lane it is the first to use, reserves each lane's range of positions once and writes the ready rows. Each lane's enqueue lock is therefore taken when the batch reaches that lane instead of at the batch's first ready row. The lock is transaction-scoped: it is held until the calling transaction commits or rolls back, including any work the caller does after the batch. Concurrent producers and promotion on the same lane no longer wait for the batch's lane-independent work or its earlier lanes.</p>
 <p>What callers see:</p>
 <ul>
 <li><code>insert_many_copy</code> (Rust) and <code>Client.insert_many_copy</code> (Python) use the function when it is installed and the connected role may execute it, otherwise the per-row path. They check on every call, so a running producer switches on its next call after the migration commits. Their results are unchanged: rows in input order, jobs whose unique key is already claimed skipped.</li>
@@ -3033,7 +3307,7 @@ workers report not ready until the migration runs, as for any version bump.</p>
 <li>A batch's rows in one lane occupy consecutive lane positions in input order, as before, and are described by one ready segment per run instead of one per row. A key repeated inside one batch keeps its first job in input order.</li>
 </ul>
 <p>Binaries before v055 never call the function. They keep calling <code>awa.insert_job_compat</code>, which takes the same lane lock, so old and new producers share a lane without reordering it. A database coming from 0.6.15 already has the function from the 0.6 <code>insert_jobs_compat_batch</code> schema patch, and v055 replaces it in place.</p>
-<p>The batch function takes all of a batch's unique claims before any lane lock, while per-row inserts (generic <code>insert_many</code>, single-job inserts, and binaries before v055) take each job's claim and its lane together, lane by lane. When a per-row transaction already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not yet committed, PostgreSQL aborts one of them with <code>deadlock detected</code> (SQLSTATE <code>40P01</code>), where before the per-row insert would have waited and then skipped the job or failed with a unique violation (<code>23505</code>). Retry the aborted transaction. Two batches through the function take claims in key order and lanes in lane order, so they do not deadlock with each other this way.</p>
+<p>The batch function takes all of a batch's unique claims before any lane lock, while per-row inserts (generic <code>insert_many</code>, single-job inserts, and binaries before v055) take each job's claim and its lane together, lane by lane. When a per-row transaction already holds a lane the batch needs and then inserts a job whose unique key the batch has claimed but not yet committed, PostgreSQL aborts one of them with <code>deadlock detected</code> (SQLSTATE <code>40P01</code>), where before the per-row insert would have waited and then skipped the job or failed with a unique violation (<code>23505</code>). <a href="#v057-batch-inserts-give-way-to-per-row-producers">v057</a> replaces the function's body so the batch gives way instead. Two batches through the function take claims in key order and lanes in lane order, so they do not deadlock with each other this way.</p>
 <p>New functions are executable by <code>PUBLIC</code> unless your deployment revokes that through default privileges. If it does and the runtime role's default privileges do not cover functions created by the migration role, grant it explicitly:</p>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">FUNCTION</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">insert_jobs_compat_batch</span><span class="p">(</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="n">jsonb</span><span class="p">[],</span><span class="w"> </span><span class="nb">text</span><span class="p">[],</span><span class="w"> </span><span class="nb">smallint</span><span class="p">[],</span><span class="w"> </span><span class="nb">smallint</span><span class="p">[],</span><span class="w"> </span><span class="n">timestamptz</span><span class="p">[],</span>
@@ -3042,6 +3316,33 @@ workers report not ready until the migration runs, as for any version bump.</p>
 </span></code></pre></div>
 <p>Without <code>EXECUTE</code>, <code>insert_many_copy</code> keeps the per-row path and <code>insert_many_skip_unique_conflicts</code> fails with <code>permission denied</code>.</p>
 <p>External migration runners apply the complete <code>awa migrate --sql --from 54 --to 55</code> bundle, which refreshes trusted queue-storage discovery before it replaces the function.</p>
+<h2 id="v056-claim-batch-index-recognition">v056: claim batch index recognition<a class="headerlink" href="#v056-claim-batch-index-recognition" title="Permanent link">&para;</a></h2>
+<p>v056 replaces <code>&lt;schema&gt;.ensure_claim_batch_job_index(slot)</code> in the default and every discovered custom queue-storage schema. The v054 function counted any valid GIN index whose definition named <code>job_ids</code> as the claim batch index, a partial one included, and treated another index or relation that already had the index's name as the index, so claim prune could skip building the real one. The function now accepts only a valid, non-partial GIN index on <code>job_ids</code> alone. When something else already has the name <code>lease_claim_batches_&lt;slot&gt;_job_ids_idx</code>, it raises a warning naming it, returns false and leaves it in place; drop or rename it and claim prune builds the index the next time it empties that slot.</p>
+<p>The migration also fixes who may execute the function after a refresh by a migration role that owns it but may only <code>SET ROLE</code> to the table owner (PostgreSQL 16+ membership <code>WITH INHERIT FALSE</code>). The refresh handed the function to the table owner first, after which the migration role could no longer revoke or grant on it, PostgreSQL only warned, and <code>EXECUTE</code> stayed with <code>PUBLIC</code>. It now resets <code>EXECUTE</code> after the transfer, acting as the new owner when it cannot as itself, so exactly the roles holding <code>TRUNCATE</code> on <code>lease_claim_batches</code> can execute it. Migrations run with the owner as the effective role, as <a href="../security/database-roles/">database roles</a> describes, were not affected.</p>
+<p>Like v054 it replaces functions only: it builds and drops no index and takes no lock on any <code>awa</code> or queue-storage table. Binaries before v056 call the new function unchanged, and an index the v054 function built is still recognised. A database coming from 0.6.16 already has this function from its <code>claim_batch_job_index</code> schema patch. External migration runners apply the complete <code>awa migrate --sql --from 55 --to 56</code> bundle, which defines the helper before the tail installs the function.</p>
+<h2 id="v057-batch-inserts-give-way-to-per-row-producers">v057: batch inserts give way to per-row producers<a class="headerlink" href="#v057-batch-inserts-give-way-to-per-row-producers" title="Permanent link">&para;</a></h2>
+<p>v057 replaces the body of <code>awa.insert_jobs_compat_batch</code>, which <code>insert_many_copy</code> and <code>insert_many_skip_unique_conflicts</code> call. It is one <code>CREATE OR REPLACE FUNCTION</code> with no table DDL and no table locks, and the function's signature, privileges and results are unchanged. The fix is in the function, so producers that already call it get it as soon as the migration commits, before or after their binaries roll.</p>
+<p>The function takes a batch's unique claims before its lane locks, while per-row inserts (generic <code>insert_many</code>, single-job inserts, and binaries before v055) take each job's claim and its lane together. With the v055 body, a per-row transaction that held a lane the batch needed and then inserted a key the batch had claimed but not committed waited on the batch while the batch waited on it, and PostgreSQL aborted one of them with <code>deadlock detected</code> (SQLSTATE <code>40P01</code>).</p>
+<p>From v057 the function takes its claims and lanes in a subtransaction and, while it holds any of them, waits at most 500 ms per lock, or half of its own session's <code>deadlock_timeout</code> if that is lower. When a wait would run longer, the batch rolls back what it took and tries again after a short randomised pause. The per-row transaction gets the key or the lane, proceeds and commits, and on its next attempt the batch skips the keys it committed, or fails with a unique violation when it does not skip conflicts, as it would for any key committed before it. The same applies to a transaction that enqueues lanes in separate statements in the opposite order to a batch. Two batches through the function still take claims in key order and lanes in lane order, so they cannot deadlock with each other.</p>
+<p>After 2 s of retries, the batch makes one last attempt that waits as the v055 function did. Contention that outlasts the retries is then served in lock order, and a cycle that rolling back cannot break ends in <code>deadlock detected</code> rather than endless retries. The protection therefore lasts only for the bounded phase: a per-row transaction that holds a lane for longer than about 2.5 s and only then inserts one of the batch's keys meets the ordinary attempt, and one of the two is aborted with <code>40P01</code> as before.</p>
+<p>What callers see:</p>
+<ul>
+<li>A batch insert and a per-row producer that share keys or lanes no longer abort each other with <code>40P01</code> when the batch call is the first thing its transaction locks and the per-row producer's <code>deadlock_timeout</code> is above 500 ms (PostgreSQL's default is 1 s). The batch cannot see another session's setting, so the cap is fixed; a per-row session configured at or below 500 ms can still be aborted by its own, earlier deadlock check.</li>
+<li>A per-row transaction that holds a lane longer than the bounded phase (about 2.5 s) before it inserts one of the batch's keys can still deadlock with the batch.</li>
+<li>A batch whose transaction already holds locks from earlier statements can still be part of a deadlock: rolling back the batch cannot release them. That cycle now ends later, after about 3 to 4 s instead of 1 to 2 s, and the transaction usually aborted is the batch's caller rather than the per-row producer.</li>
+<li>A batch can only give way while inserting its unique claims takes less than the 500 ms budget. Each claim costs roughly 20 µs on a fast database server and more on a slow or busy one, so the limit is in the range of 10,000 to 20,000 unique keys. A larger batch, or one whose claims are slowed by load, uses up each bounded attempt before it reaches its lanes and ends in the ordinary attempt, so it behaves as with the v055 body. Split such batches if they share keys or lanes with per-row producers.</li>
+<li>Under contention that outlasts the retries, a batch waits for its lanes in lock order, as before.</li>
+<li>A caller's <code>lock_timeout</code> applies to each of the batch's lock waits, as it does to any statement's, and a wait it ends fails the call with <code>lock_not_available</code> (SQLSTATE <code>55P03</code>). Time the batch spends on its own work or on retries does not count against it.</li>
+<li>The 500 ms budget applies to each wait, not to a statement: a claim statement that meets several keys still in flight, or a lane reservation that waits for the lane's provisioning lock and then its lock, can wait up to the remaining budget each time.</li>
+<li>The lane lock is still taken when the batch reaches the lane and held until the transaction ends.</li>
+</ul>
+<p>Binaries before v057 that call the function pass the same arguments, so they can run before or after the migration, and rolling binaries back needs no schema change. A database coming from 0.6.16 already has this body from its <code>insert_jobs_compat_batch</code> schema patch, and v057 replaces it in place. External migration runners apply the complete <code>awa migrate --sql --from 56 --to 57</code> bundle, which refreshes trusted queue-storage discovery before it replaces the function.</p>
+<h2 id="v058-lane-row-before-lane-lock">v058: lane row before lane lock<a class="headerlink" href="#v058-lane-row-before-lane-lock" title="Permanent link">&para;</a></h2>
+<p>v058 replaces <code>&lt;schema&gt;.provision_lane</code> in the default and every discovered custom queue-storage schema. The v053 function took the lane's advisory lock and then inserted its <code>queue_lanes</code> row, while producers and <code>QueueStorage</code> insert the row first and take the lock after it. A <code>provision_lane</code> call and a producer that were both first to use the same new <code>(queue, priority)</code> could each wait for the other until PostgreSQL aborted one with <code>deadlock detected</code> (<code>40P01</code>). The function now inserts the row first.</p>
+<p>It replaces functions only and takes no lock on any <code>awa</code> or queue-storage table. Binaries before v058 call the function with the same arguments, so they can run before or after the migration.</p>
+<h2 id="v059-wider-retry-jitter">v059: wider retry jitter<a class="headerlink" href="#v059-wider-retry-jitter" title="Permanent link">&para;</a></h2>
+<p>v059 replaces the body of <code>awa.backoff_duration(attempt, max_attempts)</code>, which sets the delay before an automatic retry. The delay was <code>2^attempt</code> seconds plus up to 25% of that, so jobs that failed together, for example while a dependency was down, retried within a quarter of their base delay of each other and reached the recovering dependency together. It is now <code>2^attempt</code> seconds multiplied by a random factor in [0.5, 1.5), still capped at 24 hours. The mean delay is the base delay (the old mean was 12.5% above it), the shortest delay for an attempt halves, and the retries from one failure spread over a window four times as wide, which cuts their peak arrival rate by about 3.5×. These figures hold while the whole range is below the cap, which is through attempt 15. From attempt 16 the top of the range is cut to 24 hours, and from attempt 18 every retry waits exactly 24 hours, with no jitter. The function sets every retry delay awa chooses itself: after a retryable handler error and after rescue of a stale heartbeat, an expired deadline or a callback timeout. <code>RetryAfter</code> and <code>Snooze</code> keep the delay the handler gives.</p>
+<p>It is one <code>CREATE OR REPLACE FUNCTION</code> that keeps the function's signature, volatility, owner and privileges, and takes no lock on any <code>awa</code> or queue-storage table. Binaries before v059 call the same function from the same statements, so they get the new delays as soon as the migration commits and can run before or after it. Jobs already waiting to retry keep their scheduled time. External migration runners apply <code>awa migrate --sql --from 58 --to 59</code>.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>

@@ -688,6 +688,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -743,6 +753,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2585,7 +2735,7 @@
 <p>Awa keeps application data and background work in one transactional system of record. Producers commit jobs with their business writes; workers claim attempts using lease-guarded PostgreSQL transitions; maintenance makes deferred work runnable, rescues abandoned attempts, and reclaims old ring partitions. There is no second broker whose acknowledgement state can diverge from the database transaction.</p>
 <p><img alt="Awa system architecture" src="../assets/architecture-system.svg" /></p>
 <p>The diagram is the useful boundary: application processes produce work, worker processes execute it, and PostgreSQL is authoritative for both job state and coordination. The admin surface observes and controls that system; it is not part of the dispatch hot path.</p>
-<p>For migration details see <a href="../migrations/">Migrations</a>. For user-facing knobs see <a href="../configuration/">Configuration</a>.</p>
+<p>This page is the reference description. For a visual walkthrough start with <a href="../concepts/">How AWA works</a>, <a href="../concepts/lanes-and-claiming/">lanes and claiming</a>, <a href="../concepts/claims-receipts-and-leases/">claims, receipts and leases</a> and <a href="../concepts/rings/">rings</a>. For migration details see <a href="../migrations/">Migrations</a>. For user-facing knobs see <a href="../configuration/">Configuration</a>.</p>
 <h2 id="terms">Terms<a class="headerlink" href="#terms" title="Permanent link">&para;</a></h2>
 <ul>
 <li>A <strong>claim</strong> is the storage transition that makes a ready job belong to one attempt. It increments <code>run_lease</code>; later completion, retry, rescue, and cancellation must match that lease number.</li>
@@ -2883,25 +3033,24 @@
 </ul>
 <p>Progress is cleared on successful completion and preserved across retry, snooze, cancel, fail, and rescue. On queue storage, mutable progress snapshots live in <code>attempt_state</code> once an attempt first needs that mutable state; they are not rewrites of the immutable ready row. Cancellation is cooperative for live handlers: Rust handlers can poll <code>ctx.is_cancelled()</code>, Python handlers can poll <code>job.is_cancelled()</code>, and stale storage writes are still rejected by the <code>run_lease</code> guard if a handler misses the signal.</p>
 <h2 id="enqueue-and-claim">Enqueue And Claim<a class="headerlink" href="#enqueue-and-claim" title="Permanent link">&para;</a></h2>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>sequenceDiagram
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    autonumber
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    participant P as Producer
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    participant Q as Queue storage
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    participant D as Dispatcher
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    participant R as Ring state
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    participant E as Executor
-</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
-</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    P-&gt;&gt;Q: single insert or direct COPY enqueue inside app transaction
-</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    Q-&gt;&gt;Q: append ready_entries or deferred_jobs
-</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    Q--&gt;&gt;D: NOTIFY awa:&lt;queue&gt;
-</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    D-&gt;&gt;D: pre-acquire local permits
-</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    D-&gt;&gt;Q: claim_runtime_batch_with_aging_for_instance
-</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>    Q-&gt;&gt;Q: lock queue_claim_heads FOR UPDATE SKIP LOCKED
-</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>    Q-&gt;&gt;R: read lease and claim ring cursors
-</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>    Q-&gt;&gt;Q: append receipt or materialize lease
-</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    Q--&gt;&gt;D: claimed jobs + run_lease snapshots
-</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>    D-&gt;&gt;E: execute handlers
-</span></code></pre></div>
+<pre class="mermaid"><code>sequenceDiagram
+    autonumber
+    participant P as Producer
+    participant Q as Queue storage
+    participant D as Dispatcher
+    participant R as Ring state
+    participant E as Executor
+
+    P-&gt;&gt;Q: single insert or direct COPY enqueue inside app transaction
+    Q-&gt;&gt;Q: append ready_entries or deferred_jobs
+    Q--&gt;&gt;D: NOTIFY awa:&lt;queue&gt;
+    D-&gt;&gt;D: pre-acquire local permits
+    D-&gt;&gt;Q: claim_runtime_batch_with_aging_for_instance
+    Q-&gt;&gt;Q: lock queue_claim_heads FOR UPDATE SKIP LOCKED
+    Q-&gt;&gt;R: read lease and claim ring cursors
+    Q-&gt;&gt;Q: append receipt or materialize lease
+    Q--&gt;&gt;D: claimed jobs + run_lease snapshots
+    D-&gt;&gt;E: execute handlers</code></pre>
 <p>Enqueue is transactional: if the producer's outer transaction rolls back, the job never becomes visible. Immediate jobs reserve a lane sequence range under a transaction-scoped lane lock, append to <code>ready_entries_*</code>, and append a compact <code>ready_segments</code> range for the committed lane sequence range; future scheduled or retryable jobs append to <code>deferred_jobs</code>. The lane lock is held until commit or rollback so a later producer cannot make lane <code>N+1</code> visible while lane <code>N</code> can still commit.</p>
 <p><code>deferred_jobs</code> is deliberately outside the claim path. The maintenance leader promotes due <code>scheduled</code> and <code>retryable</code> rows into <code>ready_entries_*</code> in batches and notifies the target queues. Re-enqueueing a row takes its lane lock, which producers hold until they commit, so each <code>(queue, priority)</code> lane's share of a batch is promoted in its own transaction under a short <code>lock_timeout</code>. A lane that times out is handed to a dedicated waiter task, which queues for the lock behind the producers already waiting, so a busy lane is still promoted in turn without holding up other lanes or the leader's rescue, rotation and prune. Cron schedules are just producers for ordinary jobs: when a schedule fires, the cron transaction records the fire and enqueues the job atomically, using <code>ready_entries_*</code> for immediate fires or <code>deferred_jobs</code> when the enqueue carries a future <code>run_at</code>.</p>
 <p>There are two COPY-shaped producer paths:</p>
@@ -2924,13 +3073,13 @@
 <p>Priority ordering is by effective priority first. Within one enqueue shard the lane sequence is FIFO; across enqueue shards, strict global lane order is not promised. With queue storage, priority aging is applied at claim time rather than by physically rewriting ready rows. Ready partitions serve lane probes from their primary key <code>(ready_slot, queue, priority, enqueue_shard, lane_seq)</code>, so every per-lane lookup on <code>ready_entries</code> pins <code>ready_slot</code>; done and lease partitions carry shard-aware lane indexes on <code>(queue, priority, enqueue_shard, lane_seq)</code>.</p>
 <h2 id="completion-and-callbacks">Completion And Callbacks<a class="headerlink" href="#completion-and-callbacks" title="Permanent link">&para;</a></h2>
 <p>Handler results finalize through guarded storage transitions:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>handler result
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    ├── Completed      -&gt; close attempt, append receipt_completion_batches or done_entries
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    ├── RetryAfter     -&gt; close attempt, append deferred retry or terminal failure
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    ├── Snooze         -&gt; close attempt, append deferred_jobs without attempt bump
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    ├── Cancel         -&gt; close attempt, append done_entries(cancelled)
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    ├── Terminal error -&gt; close attempt, append done_entries(failed) or dlq_entries
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    └── Retryable err  -&gt; close attempt, append deferred retry or terminal failure
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>handler result
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    ├── Completed      -&gt; close attempt, append receipt_completion_batches or done_entries
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    ├── RetryAfter     -&gt; close attempt, append deferred retry or terminal failure
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    ├── Snooze         -&gt; close attempt, append deferred_jobs without attempt bump
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    ├── Cancel         -&gt; close attempt, append done_entries(cancelled)
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    ├── Terminal error -&gt; close attempt, append done_entries(failed) or dlq_entries
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    └── Retryable err  -&gt; close attempt, append deferred retry or terminal failure
 </span></code></pre></div>
 <p>Two callback modes share the same attempt guard:</p>
 <ul>
@@ -3003,22 +3152,21 @@
 </ol>
 <p>This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.</p>
 <h2 id="maintenance-leader">Maintenance Leader<a class="headerlink" href="#maintenance-leader" title="Permanent link">&para;</a></h2>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>flowchart TB
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    subgraph Workers["Worker processes"]
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>        W1["worker"]
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        W2["worker"]
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        W3["worker"]
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    end
-</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    Lock["pg_try_advisory_lock(0x4157415f4d41494e)"]
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    W1 --&gt; Lock
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    W2 --&gt; Lock
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    W3 --&gt; Lock
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    Lock -- "one session wins" --&gt; Leader["maintenance leader"]
-</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>    Lock -- "retry later" --&gt; Followers["followers"]
-</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>
-</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    Leader --&gt; Tasks["promotion&lt;br/&gt;heartbeat/deadline/callback rescue&lt;br/&gt;queue/lease/claim rotate + prune&lt;br/&gt;DLQ cleanup&lt;br/&gt;descriptor cleanup&lt;br/&gt;cron eval&lt;br/&gt;metadata refresh&lt;br/&gt;queue health"]
-</span></code></pre></div>
+<pre class="mermaid"><code>flowchart TB
+    subgraph Workers["Worker processes"]
+        W1["worker"]
+        W2["worker"]
+        W3["worker"]
+    end
+
+    Lock["pg_try_advisory_lock(0x4157415f4d41494e)"]
+    W1 --&gt; Lock
+    W2 --&gt; Lock
+    W3 --&gt; Lock
+    Lock -- "one session wins" --&gt; Leader["maintenance leader"]
+    Lock -- "retry later" --&gt; Followers["followers"]
+
+    Leader --&gt; Tasks["promotion&lt;br/&gt;heartbeat/deadline/callback rescue&lt;br/&gt;queue/lease/claim rotate + prune&lt;br/&gt;DLQ cleanup&lt;br/&gt;descriptor cleanup&lt;br/&gt;cron eval&lt;br/&gt;metadata refresh&lt;br/&gt;queue health"]</code></pre>
 <p>The advisory lock is session-scoped. If the leader process or database connection dies, Postgres releases the lock and another worker can win the next election. Heartbeat refresh is not leader-elected; only cluster-wide rescue and maintenance scans are.</p>
 <h2 id="operator-surfaces">Operator Surfaces<a class="headerlink" href="#operator-surfaces" title="Permanent link">&para;</a></h2>
 <h3 id="descriptors-and-runtime-liveness">Descriptors And Runtime Liveness<a class="headerlink" href="#descriptors-and-runtime-liveness" title="Permanent link">&para;</a></h3>
@@ -3115,15 +3263,15 @@
 </table>
 <p>The storage model-to-code correspondence is maintained in <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md"><code>correctness/storage/MAPPING.md</code></a>. Runtime tests replay representative storage traces against these models, and the benchmark notes document long-horizon partition and dead-tuple validation for ADR-019 and ADR-023. Public SQL projections such as <code>awa.jobs</code> and admin counts are treated as refinements over the modeled storage state; they need code-level regression tests as well as TLA+ lifecycle coverage.</p>
 <h2 id="crate-structure">Crate Structure<a class="headerlink" href="#crate-structure" title="Permanent link">&para;</a></h2>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa (workspace)
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>├── awa-macros        proc macro: #[derive(JobArgs)]
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>├── awa-model         types, SQL, migrations, insert/admin/cron APIs
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>├── awa-worker        runtime: client, dispatcher, executor, heartbeat, maintenance
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>├── awa               facade crate re-exporting model + worker APIs
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>├── awa-testing       integration-test helpers
-</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>├── awa-ui            axum API + embedded React dashboard
-</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>├── awa-cli           migrations, admin, storage, and web UI CLI
-</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>└── awa-python        PyO3 Python bindings
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>awa (workspace)
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>├── awa-macros        proc macro: #[derive(JobArgs)]
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>├── awa-model         types, SQL, migrations, insert/admin/cron APIs
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>├── awa-worker        runtime: client, dispatcher, executor, heartbeat, maintenance
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>├── awa               facade crate re-exporting model + worker APIs
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>├── awa-testing       integration-test helpers
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>├── awa-ui            axum API + embedded React dashboard
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>├── awa-cli           migrations, admin, storage, and web UI CLI
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>└── awa-python        PyO3 Python bindings
 </span></code></pre></div>
 <p><code>awa-model</code> owns schema and storage APIs. <code>awa-worker</code> owns runtime behavior. <code>awa</code> is the normal Rust facade. <code>awa-python</code> embeds the same worker runtime behind Python bindings, so mixed Rust/Python fleets share storage semantics.</p>
 

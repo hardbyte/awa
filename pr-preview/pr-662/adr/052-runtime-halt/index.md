@@ -6,6 +6,8 @@
 
 Proposed. Phase 1 can be accepted independently. Timing defaults require rehearsal and measurement.
 
+The durable `maintenance.prune` control of Phase 1 (drain-only halt and resume, leader observation and `awa control`) shipped on 0.6 in 0.6.16 as the repeatable `prune_controls` schema patch. `main` does not have it yet. The permanent reclamation cap is not implemented on either line.
+
 ## Context
 
 Queue pause stops claims but leaves maintenance running. Containing reclamation lock pressure should leave dispatch, promotion and rescue available. Durable controls must survive runtime restart and leadership handoff without making application enqueue depend on them. The [source audit](../../design/runtime-control-source-audit/index.md) records the claim and maintenance paths on main and 0.6.
@@ -30,17 +32,18 @@ The cap is only safe when reclamation demand stays well below it. Each ring rota
 
 > Σ over every queue-storage schema the leader serves of (1/`queue_rotate_interval` + 1/`lease_rotate_interval` + 1/`claim_rotate_interval`), plus terminal-rollup slot transactions per second and any other capped housekeeping.
 
-`Blocked` attempts consume admissions too. Today's defaults rotate all three rings every 1 s, a demand of about three admissions per second against a cap below one. That configuration would exhaust free slots within seconds, rotation would report `SkippedBusy`, and the rings would stop recycling. Phase 1 therefore:
+`Blocked` attempts consume admissions too. The rotate intervals default to 1 s, and the default cadence seals a slot once it has filled for 5 s and holds 256 rows, reaches 2 MiB, or has been current for 60 s. Moderate load therefore rotates each ring about once every 5 s, but a slot that fills 2 MiB within a tick rotates on every tick, so at high throughput demand approaches three admissions per second against a cap below one. That would exhaust free slots within seconds, rotation would report `SkippedBusy`, and the rings would stop recycling. Phase 1 therefore:
 
 - Raises the default rotation intervals so default demand is at most half the cap. The rehearsal compares candidate defaults (for example 5 s, 10 s and 30 s) and the operator guidance states their cost: rows per slot grow with the interval, and retained history spans about the slot count multiplied by the interval.
 - Computes configured demand at leader start and on configuration change. Demand above half the cap logs a warning and is exported as a metric; demand at or above the cap fails validation, because the backlog would then grow without bound.
 - Keeps the cap fixed rather than scaling it with configuration, so the strong-lock ceiling stays predictable.
+- Ships the cap only after prune can win its locks under sustained claim load ([#721](https://github.com/hardbyte/awa/issues/721)). While claims starve prune of its 10 ms lock window, every blocked attempt spends an admission, and a cap would slow reclamation further.
 
 Install one `maintenance.prune` row in ordinary table `awa.runtime_controls`, with revision, halt ID, mode, reason, actor and update time. Support drain-only halt and halt-ID-checked resume through operator-only functions. Gate rotation, pruning, retention, terminal rollups, ledger folds, automatic storage-authority changes and the housekeeping assigned to this scope below. Other duties continue normally; unsupported scope or cancel requests fail explicitly.
 
 Use the existing leader session in an independently scheduled observer: read every 1 s with ±20% jitter and a 1 s query deadline. Require an initial read before gated work; stop new admissions when permission is 5 s old. Control-read failure is distinct from loss of the leader session. Keep observation and truthful requested/observed/draining status active while halted, with no extra observer connection.
 
-The control capability is enabled only after its additive migration. Before enablement the budget-only build performs no control reads; after enablement a missing or malformed row denies gated work. On 0.6, deliver only Phase 1: an additive repeatable table/function patch and compatible runtime changes, without refreshing claim functions or reinstalling substrates. All possible leaders must support it or be fenced before fleet coverage is claimed.
+The control capability is enabled only after its additive migration. Before enablement the budget-only build performs no control reads; after enablement a missing or malformed row denies gated work. On 0.6, deliver only Phase 1: an additive repeatable table/function patch and compatible runtime changes, without refreshing claim functions or reinstalling substrates. 0.6.16 delivered the control this way; the cap remains. All possible leaders must support it or be fenced before fleet coverage is claimed.
 
 The closed enum and complete branch classification below are Phase 1 requirements. Phase 1 enforces only `maintenance.prune`; the other scopes remain unrestricted until their controls are implemented.
 

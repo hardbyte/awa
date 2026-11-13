@@ -686,6 +686,16 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -738,6 +748,146 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/lanes-and-claiming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lanes and claiming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/claims-receipts-and-leases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Claims, receipts and leases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/rings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rings: rotation and prune
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/batching/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Batching
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/scaling-a-hot-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scaling a hot queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2465,7 +2615,7 @@
 </span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">lane_sequence_problems</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">)</span><span class="w"> </span><span class="err">\</span><span class="n">gexec</span>
 </span></code></pre></div>
 <h2 id="claim-batch-index">Claim batch index<a class="headerlink" href="#claim-batch-index" title="Permanent link">&para;</a></h2>
-<p>From schema v054 each queue-storage schema has <code>ensure_claim_batch_job_index(slot)</code>. Claim prune calls it right after truncating a claim slot to give that <code>lease_claim_batches</code> partition its GIN index on <code>job_ids</code>. It is <code>SECURITY DEFINER</code>, owned by the owner of <code>lease_claim_batches</code> (creating an index needs table ownership), with a pinned <code>search_path</code>. It only creates that one index, and only on a partition that is empty and unlocked. <code>PUBLIC</code> cannot execute it. Each time the migration or installer runs, <code>EXECUTE</code> is reset to exactly the roles that then hold <code>TRUNCATE</code> on <code>lease_claim_batches</code>: a runtime role given <code>TRUNCATE</code> later gets it on the next run (or from <code>GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA</code> above until then), and a role that has lost <code>TRUNCATE</code> loses it. A runtime that cannot execute it skips the step and claims keep working.</p>
+<p>From schema v054 each queue-storage schema has <code>ensure_claim_batch_job_index(slot)</code>. Claim prune calls it right after truncating a claim slot to give that <code>lease_claim_batches</code> partition its GIN index on <code>job_ids</code>. It is <code>SECURITY DEFINER</code>, owned by the owner of <code>lease_claim_batches</code> (creating an index needs table ownership), with a pinned <code>search_path</code>. It only creates that one index, and only on a partition that is empty and unlocked. From v056 only a valid, non-partial GIN index on <code>job_ids</code> counts; a different index or relation already named <code>lease_claim_batches_&lt;slot&gt;_job_ids_idx</code> is left in place with a warning naming it, and that slot keeps scanning until it is dropped or renamed. <code>PUBLIC</code> cannot execute it. Each time the migration or installer runs, <code>EXECUTE</code> is reset to exactly the roles that then hold <code>TRUNCATE</code> on <code>lease_claim_batches</code>: a runtime role given <code>TRUNCATE</code> later gets it on the next run (or from <code>GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA</code> above until then), and a role that has lost <code>TRUNCATE</code> loses it. A runtime that cannot execute it skips the step and claims keep working.</p>
 <h2 id="custom-queue-storage-schemas">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas" title="Permanent link">&para;</a></h2>
 <p>Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and <code>TRUNCATE</code>, but never DDL. Check lanes in a custom schema with <code>awa storage lane-sequences --schema &lt;name&gt;</code>. See <a href="../../queue-storage-substrate/">Queue storage</a>.</p>
 <h2 id="why-the-grants-are-broad">Why the grants are broad<a class="headerlink" href="#why-the-grants-are-broad" title="Permanent link">&para;</a></h2>
