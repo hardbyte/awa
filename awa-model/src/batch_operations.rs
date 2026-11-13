@@ -373,6 +373,27 @@ pub async fn run_one_batch_operation_chunk(
     runner_instance: Uuid,
     chunk_size: i64,
 ) -> Result<BatchOperationRunOutcome, AwaError> {
+    // The maintenance leader calls this every second. Without an operation
+    // to run, lock + claim + unlock would cost three round trips and three
+    // transactions; one indexed read answers the common case. An operation
+    // submitted after this read is picked up on the next call, as it would
+    // be after an empty claim.
+    let active: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM awa.batch_operations
+            WHERE state IN ('pending', 'scanning', 'running', 'cancelling')
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    if !active {
+        return Ok(BatchOperationRunOutcome::default());
+    }
+
     let mut lock_conn = pool.acquire().await.map_err(map_sqlx_error)?;
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(BATCH_RUNNER_LOCK_KEY)
