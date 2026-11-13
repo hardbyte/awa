@@ -497,10 +497,8 @@ impl Dispatcher {
                 // (ADR-038). An idle extra wake per cadence costs one claim
                 // round-trip — what short-poll queues do constantly anyway.
                 _ = tokio::time::sleep(sleep_for) => {
-                    // With wake-ups available, this timer is the fallback
-                    // for a lost NOTIFY. After an empty poll, a zero ready
-                    // signal settles it in one read instead of the claimer
-                    // lease and claim round trips.
+                    // After an empty poll, a zero ready signal ends this
+                    // fallback poll without claiming.
                     self.check_ready_signal = idle_polls > 0 && notify_wake.is_some();
                     let claimed = self.drain_ready(WakeReason::Poll, Instant::now()).await;
                     self.check_ready_signal = false;

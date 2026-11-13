@@ -373,11 +373,8 @@ pub async fn run_one_batch_operation_chunk(
     runner_instance: Uuid,
     chunk_size: i64,
 ) -> Result<BatchOperationRunOutcome, AwaError> {
-    // The maintenance leader calls this every second. Without an operation
-    // to run, lock + claim + unlock would cost three round trips and three
-    // transactions; one indexed read answers the common case. An operation
-    // submitted after this read is picked up on the next call, as it would
-    // be after an empty claim.
+    // Return early when no operation is active. An operation submitted
+    // after this read is picked up on the next call.
     let active: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS (

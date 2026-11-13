@@ -960,9 +960,7 @@ const IDLE_ROTATE_MAX_GAP: Duration = Duration::from_secs(4);
 /// check can only find work once new rows arrive. Each consecutive idle
 /// outcome doubles the ticks skipped before the next check, up to
 /// [`IDLE_ROTATE_MAX_GAP`]; any other outcome restores every-tick checks.
-/// Rotation is enablement rather than obligation, so the cost is that the
-/// first observation of new rows in an idle ring can come up to the gap
-/// later, which only shifts when the ring's first slot can seal.
+/// New rows in an idle ring can be observed up to the gap later.
 struct IdleRotateBackoff {
     idle_streak: u32,
     skip_remaining: u32,
@@ -1000,10 +998,8 @@ impl IdleRotateBackoff {
     }
 }
 
-/// An idle ring still at generation 0 has never sealed a slot, so a prune
-/// would select nothing and return `Noop`. Rings that never fill, such as
-/// the lease ring when every claim takes the receipt path, stay there, and
-/// without this check pay a prune transaction on every rotate tick.
+/// True for an idle ring still at generation 0, which has never sealed a
+/// slot and so has nothing to prune.
 fn idle_ring_at_genesis(idle_cursor: Option<(i32, i64)>) -> bool {
     matches!(idle_cursor, Some((_, 0)))
 }
@@ -3563,11 +3559,9 @@ impl MaintenanceService {
     /// Promote scheduled jobs that are now due.
     #[tracing::instrument(skip(self, promoters), name = "maintenance.promote")]
     async fn promote_scheduled(&self, promoters: &LeaderPromoters) {
-        // The tick keeps its cadence (#620), but an idle fleet should not pay
-        // one round trip per state and plane to learn there is nothing due.
-        // A row that becomes due or visible after the probe is promoted on
-        // the next tick, exactly as when the full pass finds nothing. If the
-        // probe fails, run the full pass so its own error handling applies.
+        // Skip the full pass when nothing is due. A row that becomes due or
+        // visible after the probe is promoted on the next tick. A failed
+        // probe runs the full pass.
         let probe_started = Instant::now();
         match sqlx::query_scalar::<_, bool>(audited_sql(promoters.due_probe_sql()))
             .fetch_one(&self.pool)

@@ -9996,8 +9996,7 @@ impl QueueStorage {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
         let signal_sql = claimer_signal_sql(schema);
-        // One statement, so a high-cadence poller costs one round trip and
-        // one transaction, and the three counts come from one snapshot.
+        // The three counts come from one statement and one snapshot.
         //
         // available: dispatcher signal — an index-only sum over the
         // (queue, priority, enqueue_shard) head tables.

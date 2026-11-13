@@ -12396,10 +12396,9 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
             .expect("install slow promotion trigger");
     }
 
-    // A promotion tick skips its full pass when nothing is due, and the slow
-    // trigger only fires inside that pass. A due row in a paused queue stays
-    // deferred (promotion skips paused queues) but keeps every tick's due
-    // probe true, so each tick runs, and overruns, the full pass.
+    // The slow trigger fires only inside the full promotion pass, which a
+    // tick runs only when something is due. A due row in a paused queue stays
+    // deferred and keeps every tick's due probe true.
     let paused_queue = "qs_promote_after_overrun_paused";
     awa_model::admin::pause_queue(&pool, paused_queue, None)
         .await
