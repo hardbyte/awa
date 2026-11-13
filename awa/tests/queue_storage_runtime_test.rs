@@ -12396,6 +12396,27 @@ async fn test_queue_storage_runtime_promotion_not_suppressed_after_overrunning_b
             .expect("install slow promotion trigger");
     }
 
+    // A promotion tick skips its full pass when nothing is due, and the slow
+    // trigger only fires inside that pass. A due row in a paused queue stays
+    // deferred (promotion skips paused queues) but keeps every tick's due
+    // probe true, so each tick runs, and overruns, the full pass.
+    let paused_queue = "qs_promote_after_overrun_paused";
+    awa_model::admin::pause_queue(&pool, paused_queue, None)
+        .await
+        .expect("pause the queue holding the due row");
+    enqueue_job(
+        &pool,
+        &store,
+        &PromoteAfterOverrunJob { retry_once: false },
+        InsertOpts {
+            queue: paused_queue.to_string(),
+            run_at: Some(Utc::now() + chrono::Duration::milliseconds(200)),
+            ..Default::default()
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     let overruns = branch_overruns();
     let saturating_interval = Duration::from_millis(1);
     let client = Client::builder(pool.clone())

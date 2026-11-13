@@ -1278,6 +1278,34 @@ struct LeaderPromoters {
     standby: Option<QueueStoragePromoter>,
 }
 
+impl LeaderPromoters {
+    /// One read-only statement that is true when any plane a promotion tick
+    /// covers holds a due scheduled or retryable row: canonical
+    /// `scheduled_jobs` and the deferred table of each queue-storage store.
+    /// Each arm matches the index its promotion path scans (the partial
+    /// `run_at` indexes on `scheduled_jobs`, `(state, run_at, …)` on
+    /// `deferred_jobs`) and uses the same clock as that path.
+    fn due_probe_sql(&self) -> String {
+        let mut arms = Vec::with_capacity(6);
+        for state in ["scheduled", "retryable"] {
+            arms.push(format!(
+                "EXISTS (SELECT 1 FROM awa.scheduled_jobs \
+                 WHERE state = '{state}'::awa.job_state AND run_at <= now())"
+            ));
+        }
+        for promoter in [&self.primary, &self.standby].into_iter().flatten() {
+            let schema = promoter.store.schema();
+            for state in ["scheduled", "retryable"] {
+                arms.push(format!(
+                    "EXISTS (SELECT 1 FROM {schema}.deferred_jobs \
+                     WHERE state = '{state}'::awa.job_state AND run_at <= clock_timestamp())"
+                ));
+            }
+        }
+        format!("SELECT {}", arms.join(" OR "))
+    }
+}
+
 impl MaintenanceService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -3460,6 +3488,29 @@ impl MaintenanceService {
     /// Promote scheduled jobs that are now due.
     #[tracing::instrument(skip(self, promoters), name = "maintenance.promote")]
     async fn promote_scheduled(&self, promoters: &LeaderPromoters) {
+        // The tick keeps its cadence (#620), but an idle fleet should not pay
+        // one round trip per state and plane to learn there is nothing due.
+        // A row that becomes due or visible after the probe is promoted on
+        // the next tick, exactly as when the full pass finds nothing. If the
+        // probe fails, run the full pass so its own error handling applies.
+        let probe_started = Instant::now();
+        match sqlx::query_scalar::<_, bool>(audited_sql(promoters.due_probe_sql()))
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(false) => {
+                let elapsed = probe_started.elapsed();
+                for state in [JobState::Scheduled, JobState::Retryable] {
+                    self.metrics
+                        .record_promotion_batch(state.as_str(), 0, elapsed);
+                }
+                return;
+            }
+            Ok(true) => {}
+            Err(err) => {
+                debug!(error = %err, "Promotion due probe failed; running the full pass");
+            }
+        }
         if let Err(err) = self
             .promote_due_state(JobState::Scheduled, "scheduled jobs", promoters)
             .await
