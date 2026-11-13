@@ -738,6 +738,66 @@ async fn acquire_prune_exclusive_lock_tx(
     }
 }
 
+/// The longest single wait of [`acquire_queue_retire_barrier_tx`].
+const RETIRE_BARRIER_CEILING: Duration = Duration::from_secs(2);
+
+/// The advisory key of the barrier that retires queue ring slot `slot`.
+///
+/// `claim_ready_runtime` computes the same key for the slot prune would
+/// retire next and tries it in shared mode; the format string must match the
+/// one in `awa.refresh_claim_runtime`.
+const QUEUE_RETIRE_BARRIER_KEY_SQL: &str =
+    "hashtextextended(format('awa.queue_storage.retire:%s:queue:%s', $1::text, $2::int), 0)";
+
+/// Take the retire barrier of queue slot `slot` exclusively.
+///
+/// A claim that sees the barrier held, or an exclusive request queued for
+/// it, leaves the slot out of its routing and so never locks the slot's
+/// children; claims never wait on it. Prune therefore only waits here for
+/// claims that started before it asked. A queued request blocks no claim, so
+/// the attempts escalate from `base` to [`RETIRE_BARRIER_CEILING`] without
+/// pausing between them.
+async fn acquire_queue_retire_barrier_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    slot: i32,
+    base: Duration,
+) -> Result<(), AwaError> {
+    let ceiling = base.max(RETIRE_BARRIER_CEILING);
+    let mut timeout = base;
+    loop {
+        sqlx::query("SAVEPOINT awa_prune_retire_barrier")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(tx, timeout).await?;
+        let locked = sqlx::query(&format!(
+            "SELECT pg_advisory_xact_lock({QUEUE_RETIRE_BARRIER_KEY_SQL})"
+        ))
+        .bind(schema)
+        .bind(slot)
+        .execute(tx.as_mut())
+        .await;
+        match locked {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT awa_prune_retire_barrier")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return set_lock_timeout_tx(tx, base).await;
+            }
+            Err(err) if is_prune_contention_error(&err) && timeout < ceiling => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_retire_barrier")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                timeout = timeout.saturating_mul(2).min(ceiling);
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        }
+    }
+}
+
 /// Commit or roll back a maintenance transaction that has set the prune
 /// `lock_timeout`.
 ///
@@ -18303,11 +18363,9 @@ impl QueueStorage {
         }
 
         // Beyond the emptiness gate above, queue prune has three liveness
-        // skip gates. Check them before taking ACCESS EXCLUSIVE on the
-        // ready/terminal child tables so a known-busy slot does not block hot
-        // claim reads behind a doomed truncate attempt. These are only MVCC
-        // snapshots; the same gates are checked again after the exclusive
-        // locks.
+        // skip gates. The two cheap ones run here, before the retire barrier,
+        // so a known-busy slot does not hold claims away from it. These are
+        // only MVCC snapshots; all three gates run under the slot locks.
         let active_leases =
             queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
 
@@ -18332,20 +18390,13 @@ impl QueueStorage {
             });
         }
 
-        let unclosed_claim_refs =
-            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
-
-        if unclosed_claim_refs {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueueUnclosedClaimRefs,
-                count: busy_indicator(unclosed_claim_refs),
-            });
-        }
-
         let locked: Result<PruneOutcome, AwaError> = async {
-            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+            // Pending ready rows were ruled out above, so a claim that leaves
+            // this slot out of its routing misses no work. Once the barrier is
+            // held no claim can reference the slot again, and the claim
+            // functions stop locking its children.
+            acquire_queue_retire_barrier_tx(&mut tx, schema, slot, self.prune_lock_timeout)
+                .await?;
 
             // Locks are requested in this order, and a statement that holds
             // a later child while it waits behind the request for an earlier
@@ -18374,7 +18425,10 @@ impl QueueStorage {
 
             // The pre-lock gates are only an MVCC snapshot. Writers that
             // touched the slot have committed by the time the lock is
-            // granted, so these gates see them.
+            // granted, so these gates see them. The claim-reference count is
+            // the expensive proof; it runs once, here, where it stalls no
+            // reader: the barrier keeps new claims from referencing the slot
+            // and closures only accumulate, so it still holds at the truncate.
             let active_leases =
                 queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
             if active_leases {
