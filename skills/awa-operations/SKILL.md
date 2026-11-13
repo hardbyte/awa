@@ -153,6 +153,28 @@ Late completions from a rescued attempt lose against the newer attempt via the
 (default 90s) to at least 3× the heartbeat interval; detection latency is
 roughly `heartbeat_staleness + heartbeat_rescue_interval`.
 
+On queue storage a killed runtime's open claims stop the claim ring rotating
+until rescue closes them. Rescue drains such a backlog in passes of 500-attempt
+batches, bounded by `rescue_pass_budget` (1s) and `rescue_pass_max_rows`
+(5000), with the next pass a second later while a backlog remains.
+Stale-heartbeat rescue runs extra batches and early passes only after runtime
+snapshots support a full settled staleness window. Steady evidence may predate a
+stall; it is a sampled heuristic, not proof that an owner has exited. An
+unconfirmed phase requires
+`3 × max(runtime_snapshot_interval, 1s) < heartbeat_staleness`; 5-second
+snapshots with 12-second staleness skip that phase and can accelerate rescue of
+stale live claims. See
+[rescue backlog](../../docs/configuration.md#rescue-backlog) for cutoff and
+sampling limits. The ordinary first batch keeps its configured interval. This
+evidence needs `heartbeat_rescue_interval` below half of `heartbeat_staleness`;
+at the defaults acceleration usually starts 3–3.5 minutes after a runtime's
+last snapshot. Leadership changes reset the evidence window. Zero for either
+rescue pass control keeps one batch per ordinary interval. Retried jobs retain
+their backoff, and due times can cluster; the pass row cap does not cap
+promotion throughput. Watch `awa.maintenance.rescue.pass_size` (by
+`awa.rescue.pass_end`) and `awa.maintenance.rescue.oldest_attempt_age`,
+filtering to the current leader.
+
 Finished handlers retry durable finalization for up to 120s from the first
 finalize attempt when database writes are unavailable, including connection,
 pool-acquire and read-only-session errors. Recovery requires a writable endpoint
@@ -178,6 +200,13 @@ Health signals:
 - `awa health [--json]`: database-only readiness (reachable, schema migrated for
   this binary, fleet heartbeat counts). Exit 0 ready, 1 unreachable or
   unmigrated.
+- Worker utilization (0.7+): `sum by (awa_job_queue) (awa_queue_worker_in_use)
+  / sum by (awa_job_queue) (awa_queue_worker_capacity)`. Waits climb steeply
+  once a queue stays above about 0.8; add `max_workers`, and put job kinds with
+  very different service times on separate queues. Weighted-mode capacity counts
+  the whole overflow pool, so a queue can be saturated at a low ratio while
+  other queues hold overflow permits; check its backlog too. See
+  [sizing workers from utilization](../../docs/configuration.md#sizing-workers-from-utilization).
 
 On Kubernetes, set `terminationGracePeriodSeconds` above the shutdown drain
 timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.

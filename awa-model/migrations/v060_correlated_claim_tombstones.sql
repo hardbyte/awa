@@ -1,4 +1,4 @@
--- v056: keep bounded claim tombstone checks correlated.
+-- v060: keep bounded claim tombstone checks correlated.
 -- N-1 binaries use the same function signatures, results and claim protocol.
 -- Function replacement only: no table DDL or substrate reinstallation. Work
 -- scales with installed claim functions, not job count. Apply with an owner-
@@ -42,5 +42,5 @@ END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (56, 'Keep claim tombstone checks correlated')
+VALUES (60, 'Keep claim tombstone checks correlated')
 ON CONFLICT (version) DO NOTHING;

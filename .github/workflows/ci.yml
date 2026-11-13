@@ -87,7 +87,7 @@ jobs:
 
           # Paths no code job reads. Leaving a path out of this list only costs
           # a re-run; listing one that a job reads lets a change to it skip the job.
-          not_code="docs mkdocs.yml requirements-docs.txt CHANGELOG.md AGENTS.md benchmarks correctness skills"
+          not_code=".coderabbit.yaml docs mkdocs.yml requirements-docs.txt CHANGELOG.md AGENTS.md benchmarks correctness skills"
           code=$(except $not_code | digest)
           tla=$(only correctness | digest)
           skills=$(only skills | digest)
@@ -259,7 +259,7 @@ jobs:
     # doctests run as `workspace`. Shard membership lives in
     # scripts/ci-test-shard.sh; the lint job runs its `check` mode so renames
     # can't silently drop coverage.
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -477,7 +477,7 @@ jobs:
       - name: Create venv and install deps
         run: |
           uv venv .venv --python "${{ matrix.python }}"
-          uv pip install maturin pytest pytest-asyncio asyncpg django greenlet psycopg psycopg-binary sqlalchemy
+          uv pip install maturin pytest pytest-asyncio asyncpg django greenlet "psycopg[binary]" sqlalchemy
       - name: Build extension (maturin develop)
         run: .venv/bin/maturin develop
       - name: Wait for Postgres

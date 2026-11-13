@@ -51,6 +51,8 @@ pub mod names {
     pub const JOB_DLQ_DEPTH: &str = "awa.job.dlq_depth";
     pub const QUEUE_DEPTH: &str = "awa.queue.depth";
     pub const QUEUE_LAG: &str = "awa.queue.lag";
+    pub const QUEUE_WORKER_IN_USE: &str = "awa.queue.worker.in_use";
+    pub const QUEUE_WORKER_CAPACITY: &str = "awa.queue.worker.capacity";
     pub const QUEUE_INFO: &str = "awa.queue.info";
     pub const JOB_KIND_INFO: &str = "awa.job_kind.info";
     pub const DISPATCH_CLAIM_BATCHES: &str = "awa.dispatch.claim_batches";
@@ -67,6 +69,8 @@ pub mod names {
     pub const COMPLETION_FLUSH_DURATION: &str = "awa.completion.flush_duration";
     pub const HEARTBEAT_BATCHES: &str = "awa.heartbeat.batches";
     pub const MAINTENANCE_RESCUES: &str = "awa.maintenance.rescues";
+    pub const MAINTENANCE_RESCUE_PASS_SIZE: &str = "awa.maintenance.rescue.pass_size";
+    pub const MAINTENANCE_RESCUE_OLDEST_AGE: &str = "awa.maintenance.rescue.oldest_attempt_age";
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
@@ -204,12 +208,27 @@ pub struct AwaMetrics {
     pub heartbeat_batches: Counter<u64>,
     /// Total maintenance rescue operations.
     pub maintenance_rescues: Counter<u64>,
+    /// Attempts rescued per queue-storage rescue pass, attributed by
+    /// `awa.rescue.kind` and why the pass stopped (`awa.rescue.pass_end`).
+    pub maintenance_rescue_pass_size: Histogram<u64>,
+    /// Age of the oldest attempt the latest queue-storage rescue pass
+    /// rescued, per `awa.rescue.kind`; 0 when it rescued nothing. Rescue
+    /// works oldest claim first, so a value well above the heartbeat
+    /// staleness or deadline means a backlog of abandoned claims.
+    pub maintenance_rescue_oldest_attempt_age_seconds: Gauge<f64>,
     /// Total jobs parked for external callback.
     pub jobs_waiting_external: Counter<u64>,
     /// Current queue depth per state — how many jobs are in each state per queue.
     pub queue_depth: Gauge<i64>,
     /// Queue lag — age of the oldest available job per queue.
     pub queue_lag_seconds: Gauge<f64>,
+    /// Worker slots of a queue held by attempts in this runtime: a handler
+    /// running, or a finished handler waiting for finalizer capacity.
+    pub queue_worker_in_use: Gauge<i64>,
+    /// Worker slots this runtime can give a queue: `max_workers` in
+    /// hard-reserved mode, `min_workers` plus the whole overflow pool in
+    /// weighted mode.
+    pub queue_worker_capacity: Gauge<i64>,
     /// Time from job creation to claim — the user-visible queuing latency.
     pub wait_duration_seconds: Histogram<f64>,
     /// Total jobs moved into the Dead Letter Queue.
@@ -508,6 +527,19 @@ impl AwaMetrics {
                 .with_description("Number of jobs rescued by maintenance")
                 .with_unit("{job}")
                 .build(),
+            maintenance_rescue_pass_size: meter
+                .u64_histogram(names::MAINTENANCE_RESCUE_PASS_SIZE)
+                .with_description("Attempts rescued per queue-storage rescue pass")
+                .with_unit("{job}")
+                .with_boundaries(COUNT_BUCKETS.to_vec())
+                .build(),
+            maintenance_rescue_oldest_attempt_age_seconds: meter
+                .f64_gauge(names::MAINTENANCE_RESCUE_OLDEST_AGE)
+                .with_description(
+                    "Age of the oldest attempt rescued by the latest queue-storage rescue pass",
+                )
+                .with_unit("s")
+                .build(),
             jobs_waiting_external: meter
                 .u64_counter(names::JOB_WAITING_EXTERNAL)
                 .with_description("Number of jobs parked for external callback")
@@ -522,6 +554,16 @@ impl AwaMetrics {
                 .f64_gauge(names::QUEUE_LAG)
                 .with_description("Age of the oldest available job per queue")
                 .with_unit("s")
+                .build(),
+            queue_worker_in_use: meter
+                .i64_gauge(names::QUEUE_WORKER_IN_USE)
+                .with_description("Worker slots per queue held by attempts in this runtime")
+                .with_unit("{worker}")
+                .build(),
+            queue_worker_capacity: meter
+                .i64_gauge(names::QUEUE_WORKER_CAPACITY)
+                .with_description("Worker slots per queue this runtime can run at once")
+                .with_unit("{worker}")
                 .build(),
             wait_duration_seconds: meter
                 .f64_histogram(names::JOB_WAIT_DURATION)
@@ -908,6 +950,28 @@ impl AwaMetrics {
             .record(duration.as_secs_f64(), &attrs);
     }
 
+    /// Record one queue-storage rescue pass: how many attempts it rescued,
+    /// why it stopped, and the age of the oldest attempt it rescued.
+    pub fn record_rescue_pass(
+        &self,
+        kind: &'static str,
+        pass_end: &'static str,
+        rescued: u64,
+        oldest_attempt_age: Duration,
+    ) {
+        self.maintenance_rescue_pass_size.record(
+            rescued,
+            &[
+                opentelemetry::KeyValue::new("awa.rescue.kind", kind),
+                opentelemetry::KeyValue::new("awa.rescue.pass_end", pass_end),
+            ],
+        );
+        self.maintenance_rescue_oldest_attempt_age_seconds.record(
+            oldest_attempt_age.as_secs_f64(),
+            &[opentelemetry::KeyValue::new("awa.rescue.kind", kind)],
+        );
+    }
+
     /// Record a scheduled/retryable promotion batch.
     pub fn record_promotion_batch(&self, state: &str, batch_size: u64, duration: Duration) {
         let attrs = [opentelemetry::KeyValue::new(
@@ -962,6 +1026,18 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.queue_lag_seconds.record(lag_seconds, &attrs);
+    }
+
+    /// Record a queue's worker slots in use and its capacity in this runtime,
+    /// sampled together so their ratio is the queue's utilization.
+    pub fn record_queue_workers(&self, queue: &str, in_use: u32, capacity: u32) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.queue_worker_in_use.record(i64::from(in_use), &attrs);
+        self.queue_worker_capacity
+            .record(i64::from(capacity), &attrs);
     }
 
     /// Record job wait duration (time from creation to claim).
@@ -1701,7 +1777,7 @@ mod tests {
                 &JOB_DURATION_BUCKETS_SECONDS,
             ),
         ];
-        let counts: [(&str, &Histogram<u64>); 7] = [
+        let counts: [(&str, &Histogram<u64>); 8] = [
             (names::ENQUEUE_BATCH_SIZE, &metrics.enqueue_batch_size),
             (
                 names::DISPATCH_CAPACITY_AVAILABLE,
@@ -1715,6 +1791,10 @@ mod tests {
             (
                 names::MAINTENANCE_PROMOTE_BATCH_SIZE,
                 &metrics.promotion_batch_size,
+            ),
+            (
+                names::MAINTENANCE_RESCUE_PASS_SIZE,
+                &metrics.maintenance_rescue_pass_size,
             ),
             (
                 names::MAINTENANCE_ROTATE_SKIPPED_ROWS,

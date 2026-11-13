@@ -84,6 +84,7 @@ Quantiles of the duration histograms (job duration, claim latency, wake-to-first
 | **Job Wait Time (p50/p95/p99)** | Time series | Time from job creation to claim |
 | **Job Throughput** | Time series | Completed, failed, retried, cancelled jobs/sec |
 | **In-Flight Jobs** | Time series | Currently executing jobs by queue (stacked) |
+| **Worker utilization by queue** | Time series | Worker slots in use ÷ worker capacity per queue, summed over runtimes; see [queue utilization](#queue-utilization) |
 | **Job Duration (p50/p95/p99)** | Time series | Execution time percentiles by queue |
 | **Throughput by Kind (top 10)** | Stacked bars | Completed jobs/sec by job kind (capped at 10) |
 | **Claim Latency** | Time series | Postgres dequeue query time (p50/p95) |
@@ -102,6 +103,24 @@ Quantiles of the duration histograms (job duration, claim latency, wake-to-first
 | **Rescues (5m)** | Stat | Recent rescue count with threshold colours |
 
 Color semantics are consistent across panels: green for healthy/fast paths, orange for warning/tail latency or retries, red for failures/high tail latency, blue for queue intake/backlog, and yellow for callback/external wait states.
+
+### Queue utilization
+
+Every runtime samples two gauges per queue on each runtime snapshot (every 10 s by default; `ClientBuilder::runtime_snapshot_interval` in Rust):
+
+| Metric | Prometheus name | Meaning |
+| --- | --- | --- |
+| `awa.queue.worker.in_use` | `awa_queue_worker_in_use` | Worker slots of the queue held in this runtime: a handler running, or a finished handler waiting for finalizer capacity. It is the same count as `awa_job_in_flight`, sampled at the same moment as the capacity. |
+| `awa.queue.worker.capacity` | `awa_queue_worker_capacity` | Worker slots this runtime can give the queue: `max_workers` in hard-reserved mode, `min_workers` plus the whole overflow pool (`global_max_workers` minus the sum of every queue's `min_workers`) in weighted mode. |
+
+Both carry `awa_job_queue`. Their ratio is the queue's utilization, the fraction of its workers that are busy:
+
+```promql
+sum by (awa_job_queue) (awa_queue_worker_in_use)
+  / sum by (awa_job_queue) (awa_queue_worker_capacity)
+```
+
+A weighted queue reaches its ceiling only while no other queue wants overflow, so it can be saturated below 1 when other queues hold part of the pool; for weighted runtimes also watch `sum(awa_queue_worker_in_use)` against `global_max_workers`. See [sizing workers from utilization](../configuration.md#sizing-workers-from-utilization) for how to read the number.
 
 ### What the dashboards cannot show
 
@@ -258,6 +277,8 @@ In Prometheus they appear under the OpenTelemetry [OTLP-to-Prometheus translatio
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
 | `awa.maintenance.prune.attempts` | Counter | ring, outcome, reason | Ring prune outcomes, including destructive `pruned` and no-DDL `already_pruned` |
 | `awa.maintenance.prune.duration` | Histogram (s) | ring, phase | Successful destructive prune time split into `lock`, `truncate`, and `commit` |
+| `awa.maintenance.rescue.pass_size` | Histogram | rescue_kind, rescue_pass_end | Attempts rescued per queue-storage rescue pass, and why the pass stopped (`drained`, `time_budget`, `row_limit`, `owners_unconfirmed`, `error`) |
+| `awa.maintenance.rescue.oldest_attempt_age` | Gauge (s) | rescue_kind | Age of the oldest attempt the latest queue-storage rescue pass on this process rescued; `0` when it rescued none. A former leader retains its last value until it runs another pass; filter to the current leader |
 
 ### Heartbeat
 

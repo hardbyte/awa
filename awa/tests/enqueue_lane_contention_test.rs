@@ -34,7 +34,7 @@
 //!                                 separately (insert_many mode only)
 //!   AWA_LANE_BENCH_WITHOUT_BATCH_FUNCTION
 //!                                 0|1: drop `awa.insert_jobs_compat_batch`
-//!                                 and its v055 version row first, so
+//!                                 and the version rows from v055 first, so
 //!                                 insert_many_copy measures its per-row path
 //!                                 (the next migration run puts the function
 //!                                 back)
@@ -124,7 +124,14 @@ struct Samples {
     /// transaction.
     statement_ms: Vec<f64>,
     commit_ms: Vec<f64>,
+    /// Jobs the producers asked to insert in the measured window.
+    requested: u64,
+    /// Jobs the inserts returned in the measured window: requested jobs less
+    /// those skipped for a unique conflict.
     jobs: u64,
+    /// Jobs the inserts returned over the whole run, warmup and the batches
+    /// still in flight at the end of the window included.
+    acknowledged_total: u64,
     batches: u64,
     duplicate_batches: u64,
     fallback_rows: u64,
@@ -136,7 +143,9 @@ impl Samples {
         self.fallback_row_ms.extend(other.fallback_row_ms);
         self.statement_ms.extend(other.statement_ms);
         self.commit_ms.extend(other.commit_ms);
+        self.requested += other.requested;
         self.jobs += other.jobs;
+        self.acknowledged_total += other.acknowledged_total;
         self.batches += other.batches;
         self.duplicate_batches += other.duplicate_batches;
         self.fallback_rows += other.fallback_rows;
@@ -288,7 +297,10 @@ const LEGACY_ROW_FUNCTION_SQL: &str = r#"
     ORDER BY input.ord
 "#;
 
-async fn legacy_row_function_insert(pool: &PgPool, jobs: &[InsertParams]) -> Result<(), AwaError> {
+async fn legacy_row_function_insert(
+    pool: &PgPool,
+    jobs: &[InsertParams],
+) -> Result<usize, AwaError> {
     let rows: Vec<_> = jobs
         .iter()
         .map(|job| {
@@ -296,7 +308,7 @@ async fn legacy_row_function_insert(pool: &PgPool, jobs: &[InsertParams]) -> Res
                 .expect("prepare row")
         })
         .collect();
-    sqlx::query(LEGACY_ROW_FUNCTION_SQL)
+    let inserted = sqlx::query(LEGACY_ROW_FUNCTION_SQL)
         .bind(rows.iter().map(|row| row.kind()).collect::<Vec<_>>())
         .bind(rows.iter().map(|row| row.queue()).collect::<Vec<_>>())
         .bind(rows.iter().map(|row| row.args()).collect::<Vec<_>>())
@@ -326,7 +338,7 @@ async fn legacy_row_function_insert(pool: &PgPool, jobs: &[InsertParams]) -> Res
         )
         .fetch_all(pool)
         .await?;
-    Ok(())
+    Ok(inserted.len())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,57 +381,65 @@ async fn producer_loop(
         let mut commit_ms = None;
         let mut fallback_rows_ms: Vec<f64> = Vec::new();
 
-        let outcome: Result<(), AwaError> = match scenario.mode {
+        // Rows the insert returned (or, for the queue-storage batch, reports):
+        // a skipping insert omits the jobs whose unique key is taken.
+        let outcome: Result<usize, AwaError> = match scenario.mode {
             Mode::InsertMany if scenario.split_commit => {
                 let mut tx = pool.begin().await.expect("begin");
                 let statement_started = Instant::now();
                 let result = insert_many(&mut *tx, &jobs).await;
                 let statement_elapsed = statement_started.elapsed();
                 match result {
-                    Ok(_) => {
+                    Ok(rows) => {
                         let commit_started = Instant::now();
                         tx.commit().await.expect("commit");
                         statement_ms = Some(statement_elapsed.as_secs_f64() * 1e3);
                         commit_ms = Some(commit_started.elapsed().as_secs_f64() * 1e3);
-                        Ok(())
+                        Ok(rows.len())
                     }
                     Err(err) => Err(err),
                 }
             }
-            Mode::InsertMany => insert_many(&pool, &jobs).await.map(|_| ()),
-            Mode::InsertManyCopy => insert_many_copy_from_pool(&pool, &jobs).await.map(|_| ()),
+            Mode::InsertMany => insert_many(&pool, &jobs).await.map(|rows| rows.len()),
+            Mode::InsertManyCopy => insert_many_copy_from_pool(&pool, &jobs)
+                .await
+                .map(|rows| rows.len()),
             Mode::InsertManySkip => insert_many_skip_unique_conflicts(&pool, &jobs)
                 .await
-                .map(|_| ()),
-            Mode::QueueStorage => store.enqueue_params_batch(&pool, &jobs).await.map(|_| ()),
+                .map(|rows| rows.len()),
+            Mode::QueueStorage => store.enqueue_params_batch(&pool, &jobs).await,
             Mode::LegacyRowFunction => legacy_row_function_insert(&pool, &jobs).await,
         };
 
         let mut fallback_count = 0u64;
-        match outcome {
-            Ok(()) => {}
+        let inserted: u64 = match outcome {
+            Ok(rows) => rows as u64,
             Err(err) if is_unique_violation(&err) => {
                 // What a replaying producer does on a unique conflict:
                 // insert the batch again one row at a time, skipping
                 // duplicates.
+                let mut fallback_inserted = 0u64;
                 for job in &jobs {
                     let row_started = Instant::now();
                     match insert_many(&pool, std::slice::from_ref(job)).await {
-                        Ok(_) => {}
+                        Ok(rows) => fallback_inserted += rows.len() as u64,
                         Err(err) if is_unique_violation(&err) => {}
                         Err(err) => panic!("fallback insert failed: {err}"),
                     }
                     fallback_rows_ms.push(row_started.elapsed().as_secs_f64() * 1e3);
                     fallback_count += 1;
                 }
+                fallback_inserted
             }
             Err(err) => panic!("enqueue failed: {err}"),
-        }
+        };
         let elapsed = started.elapsed();
 
+        samples.acknowledged_total += inserted;
         if started >= measure_from {
             samples.batch_ms.push(elapsed.as_secs_f64() * 1e3);
-            samples.jobs += scenario.batch_size as u64;
+            samples.requested += scenario.batch_size as u64;
+            samples.jobs += inserted;
             samples.batches += 1;
             if let Some(ms) = statement_ms {
                 samples.statement_ms.push(ms);
@@ -544,8 +564,8 @@ fn print_result(result: &ScenarioResult) {
     println!(
         "[lane-bench] {name} mode={mode} producers={producers} batch={batch} unique={unique} \
          shards={shards} dup_pct={dup} | {rate:.0} jobs/s | batch ms p50={p50:.1} p95={p95:.1} \
-         p99={p99:.1} max={max:.1} | waiters_mean={waiters:.1} | landed={landed} \
-         distinct_seqs={distinct}",
+         p99={p99:.1} max={max:.1} | waiters_mean={waiters:.1} | inserted={inserted} of \
+         requested={requested} | landed={landed} distinct_seqs={distinct}",
         name = scenario.name,
         mode = scenario.mode.label(),
         producers = scenario.producers,
@@ -559,6 +579,8 @@ fn print_result(result: &ScenarioResult) {
         p99 = result.p99_ms,
         max = result.max_ms,
         waiters = result.mean_waiters,
+        inserted = result.samples.jobs,
+        requested = result.samples.requested,
         landed = result.landed,
         distinct = result.distinct_lane_seqs,
     );
@@ -597,6 +619,7 @@ fn print_result(result: &ScenarioResult) {
 fn emit_json(result: &ScenarioResult) {
     let mut outcomes = HashMap::new();
     outcomes.insert("jobs".to_string(), result.samples.jobs);
+    outcomes.insert("requested".to_string(), result.samples.requested);
     outcomes.insert("batches".to_string(), result.samples.batches);
     BenchmarkResult {
         schema_version: SCHEMA_VERSION,
@@ -626,9 +649,9 @@ fn emit_json(result: &ScenarioResult) {
     .emit();
 }
 
-/// Lane integrity: every job that was acknowledged landed exactly once, under
-/// a distinct `(shard, lane_seq)`, and every shard's sequence numbers are
-/// dense (no producer lost or duplicated a reservation).
+/// Lane integrity: exactly the jobs the inserts returned landed, each once,
+/// under a distinct `(shard, lane_seq)` (no producer lost or duplicated a
+/// reservation).
 fn assert_lane_integrity(result: &ScenarioResult) {
     if let Some((claimed, _)) = result.drained {
         assert_eq!(
@@ -642,12 +665,10 @@ fn assert_lane_integrity(result: &ScenarioResult) {
         "{}: ready rows share a (shard, lane_seq)",
         result.scenario.name
     );
-    assert!(
-        result.landed as u64 >= result.samples.jobs,
-        "{}: {} jobs acknowledged in the window but only {} rows landed",
-        result.scenario.name,
-        result.samples.jobs,
-        result.landed
+    assert_eq!(
+        result.landed as u64, result.samples.acknowledged_total,
+        "{}: rows landed against jobs the inserts returned",
+        result.scenario.name
     );
 }
 
@@ -778,7 +799,7 @@ async fn test_enqueue_lane_contention_matrix() {
             "DROP FUNCTION IF EXISTS awa.insert_jobs_compat_batch(text[], text[], jsonb[], \
              text[], smallint[], smallint[], timestamptz[], jsonb[], jsonb[], bytea[], text[], \
              text[], boolean); \
-             DELETE FROM awa.schema_version WHERE version = 55",
+             DELETE FROM awa.schema_version WHERE version >= 55",
         )
         .execute(&pool)
         .await

@@ -144,8 +144,17 @@ def nav_sections(nav: list[object]) -> list[tuple[str, list[tuple[str, str]]]]:
     return sections
 
 
+class ConfigLoader(yaml.SafeLoader):
+    """Safe loader that reads MkDocs `!!python/...` tags as plain values."""
+
+
+ConfigLoader.add_multi_constructor(
+    "tag:yaml.org,2002:python/", lambda loader, suffix, node: loader.construct_scalar(node)
+)
+
+
 def build(docs_dir: Path, site_dir: Path, config_path: Path) -> None:
-    config = yaml.safe_load(config_path.read_text())
+    config = yaml.load(config_path.read_text(), Loader=ConfigLoader)
 
     repository_root = config_path.resolve().parent
     source_paths = sorted(docs_dir.rglob("*.md"))

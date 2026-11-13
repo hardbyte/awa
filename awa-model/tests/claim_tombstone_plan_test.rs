@@ -52,7 +52,7 @@ async fn claim_tombstone_upgrade_keeps_bounded_claims_on_index_probes(pool: PgPo
             assert_ne!(&old, definition, "fixture must restore the old lookup");
             sqlx::raw_sql(audited_sql(old)).execute(&pool).await?;
         }
-        for (_, _, sql) in migrations::migration_sql_range(55, 56) {
+        for (_, _, sql) in migrations::migration_sql_range(59, 60) {
             sqlx::raw_sql(audited_sql(sql)).execute(&pool).await?;
         }
         for (oid, _) in &functions {
@@ -62,7 +62,7 @@ async fn claim_tombstone_upgrade_keeps_bounded_claims_on_index_probes(pool: PgPo
                 .await?;
             assert!(upgraded.contains("AND tomb.lane_seq = ready.lane_seq OFFSET 0"));
             sqlx::raw_sql(include_str!(
-                "../migrations/v056_correlated_claim_tombstones.sql"
+                "../migrations/v060_correlated_claim_tombstones.sql"
             ))
             .execute(&pool)
             .await?;

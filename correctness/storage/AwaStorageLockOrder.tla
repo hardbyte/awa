@@ -129,6 +129,15 @@ Compatible(held, wanted) == held = ModeShared /\ wanted = ModeShared
 \* deadlock; two transactions on the same lane and shard reduce to
 \* the existing `LaneResource(q, p)` model.
 LaneResource(q, p) == [k |-> "queue_lane", q |-> q, p |-> p]
+\* Creating a new lane takes two more locks before the enqueue lock. The
+\* `queue_lanes` row: an uncommitted insert of a `(queue, priority)` key
+\* makes a second inserter of that key wait for its transaction. The
+\* provisioning advisory lock `{schema}:{queue}:{priority}:{shard}`, under
+\* which the lane's sequences and head rows are created. Once a lane
+\* exists neither blocks, so modelling both as held to commit
+\* over-approximates every enqueue after the first.
+LaneRowResource(q, p) == [k |-> "queue_lane_row", q |-> q, p |-> p]
+LaneProvisionResource(q, p) == [k |-> "queue_lane_provision", q |-> q, p |-> p]
 \* #371 staged upgrade: in compat authority the rotate/prune/rollup paths
 \* serialize on `{ring}_ring_state WHERE singleton FOR UPDATE` (a single-row
 \* lock target -> ModeExclusive, restoring the pre-#415 discipline) instead
@@ -166,6 +175,8 @@ ClosureChildResource(s) == [k |-> "closure_child", s |-> s]
 ClosureBatchChildResource(s) == [k |-> "closure_batch_child", s |-> s]
 
 LaneResources == { LaneResource(q, p) : q \in Queues, p \in Priorities }
+LaneRowResources == { LaneRowResource(q, p) : q \in Queues, p \in Priorities }
+LaneProvisionResources == { LaneProvisionResource(q, p) : q \in Queues, p \in Priorities }
 LeaseRingSlotResources == { LeaseRingSlotResource(s) : s \in LeaseSlots }
 LeaseChildResources == { LeaseChildResource(s) : s \in LeaseSlots }
 QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
@@ -185,6 +196,8 @@ ClosureBatchChildResources == { ClosureBatchChildResource(s) : s \in ClaimSlots 
 
 Resources ==
     LaneResources \cup
+    LaneRowResources \cup
+    LaneProvisionResources \cup
     {QueueRingStateResource} \cup
     {LeaseRingStateResource} \cup
     {ClaimRingStateResource} \cup
@@ -254,6 +267,31 @@ PrepareTwoStripePlan(p) == EnqueueTwoStripePlan(p)
 PrepareNumericStripePlan(p) ==
     << Step(LaneResource(StripeB, p), ModeExclusive),
        Step(LaneResource(StripeA, p), ModeExclusive) >>
+
+\* First enqueue to a `(queue, priority)` lane, by any producer:
+\*   SQL inserts (`awa.insert_job_compat`, `insert_jobs_compat_batch`):
+\*     INSERT INTO queue_lanes ... ON CONFLICT DO NOTHING
+\*     INSERT INTO queue_enqueue_heads, whose BEFORE INSERT trigger takes
+\*       the provisioning lock to create the lane's sequences
+\*     reserve_enqueue_seq takes the lane's enqueue lock
+\*   QueueStorage::ensure_lane_inserts (batch enqueue, promotion of
+\*   scheduled or retried jobs, prepare_queue):
+\*     INSERT INTO queue_lanes ... ON CONFLICT DO NOTHING
+\*     pg_advisory_xact_lock on the provisioning key, then provision_lane
+\*       or the head-row inserts
+\*     reserve_enqueue_seq takes the lane's enqueue lock
+ProvisionLanePlan(q, p) ==
+    << Step(LaneRowResource(q, p), ModeExclusive),
+       Step(LaneProvisionResource(q, p), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
+\* QueueStorage::ensure_lane_inserts once took the provisioning lock
+\* before writing the `queue_lanes` row, the reverse of the SQL inserts.
+\* Kept only as a negative regression harness.
+OldQueueStorageProvisionLanePlan(q, p) ==
+    << Step(LaneProvisionResource(q, p), ModeExclusive),
+       Step(LaneRowResource(q, p), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
 
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
@@ -827,6 +865,16 @@ StartPrepareNumericStripe(t, p) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
+StartProvisionLane(t, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = ProvisionLanePlan(q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
 StartComplete(t, claimSlot, readySlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -1086,6 +1134,7 @@ Stutter == /\ UNCHANGED vars
 Next ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
     \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities : StartProvisionLane(t, q, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -1226,6 +1275,37 @@ NextOldStripedClaimDeadlockDemo ==
 
 SpecOldStripedClaimDeadlockDemo ==
     ConfigOK /\ Init /\ [][NextOldStripedClaimDeadlockDemo]_vars
+
+\* ---- Historical lane-provisioning deadlock harness ----
+\*
+\* A QueueStorage process with the earlier order and a SQL producer that
+\* are both first to use a lane: QueueStorage holds the provisioning lock
+\* and waits for the SQL producer's uncommitted `queue_lanes` row, while
+\* the SQL producer holds that row and waits for the provisioning lock.
+\* TLC is expected to flag NoDeadlock on this spec.
+
+StartOldQueueStorageProvisionLane(t, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldQueueStorageProvisionLanePlan(q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+NextOldLaneProvisioningDeadlockDemo ==
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities : StartProvisionLane(t, q, p)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities :
+          StartOldQueueStorageProvisionLane(t, q, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldLaneProvisioningDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldLaneProvisioningDeadlockDemo]_vars
 
 \* ---- Invariants ----
 

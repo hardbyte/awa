@@ -325,12 +325,21 @@ BEGIN
         SET search_path = pg_catalog, pg_temp
         AS $func$
         BEGIN
-            -- Validates the lane and takes its lock before any row is written.
-            PERFORM %1$I.provision_lane_sequences(p_queue, p_priority, p_enqueue_shard);
+            IF p_queue IS NULL
+               OR p_priority IS NULL
+               OR p_enqueue_shard IS NULL OR p_enqueue_shard NOT BETWEEN 0 AND 63 THEN
+                RAISE EXCEPTION 'invalid queue lane: queue %%, priority %%, enqueue shard %%',
+                    quote_nullable(p_queue), p_priority, p_enqueue_shard
+                    USING ERRCODE = '22023';
+            END IF;
 
+            -- The lane row comes before the lane lock, the order every
+            -- producer takes them in.
             INSERT INTO %1$I.queue_lanes (queue, priority)
             VALUES (p_queue, p_priority)
             ON CONFLICT (queue, priority) DO NOTHING;
+
+            PERFORM %1$I.provision_lane_sequences(p_queue, p_priority, p_enqueue_shard);
 
             -- The head triggers fire before ON CONFLICT and set the lane's
             -- sequence, so rows that already exist are skipped outright.
@@ -798,7 +807,9 @@ REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_job_output(TEXT) FROM PUBLI
 -- index on a populated partition holds SHARE, which blocks claim inserts, for
 -- the whole build (minutes per million batches), so the index is only ever
 -- created on an empty partition: by the installer, or by claim prune right
--- after it truncates a slot.
+-- after it truncates a slot. A different relation that already has the
+-- index's name is never dropped: the function warns, naming it, and the slot
+-- keeps scanning until an operator removes or renames it.
 --
 -- fastupdate is off: job ids arrive in ascending order, so direct inserts
 -- append to the right edge of the entry tree and cost no more than the
@@ -822,6 +833,7 @@ DECLARE
     v_function REGPROCEDURE;
     v_function_owner OID;
     v_grantee TEXT;
+    v_previous_role TEXT;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
                             THEN 'SET' ELSE 'MEMBER' END;
 BEGIN
@@ -873,17 +885,42 @@ BEGIN
                     USING ERRCODE = '22023';
             END IF;
 
+            -- Only a valid, non-partial GIN index on job_ids alone, with the
+            -- default array_ops opclass, serves the by-job lookups.
             IF EXISTS (
                 SELECT 1
                 FROM pg_index AS idx
                 JOIN pg_class AS index_class ON index_class.oid = idx.indexrelid
                 JOIN pg_am AS method ON method.oid = index_class.relam
+                JOIN pg_attribute AS job_ids
+                  ON job_ids.attrelid = idx.indrelid
+                 AND job_ids.attname = 'job_ids'
+                 AND NOT job_ids.attisdropped
+                JOIN pg_opclass AS opclass ON opclass.oid = idx.indclass[0]
                 WHERE idx.indrelid = to_regclass(format('%%I.%%I', %1$L, v_child))
                   AND method.amname = 'gin'
                   AND idx.indisvalid
-                  AND pg_get_indexdef(idx.indexrelid) LIKE '%%USING gin (job_ids)%%'
+                  AND idx.indpred IS NULL
+                  AND idx.indexprs IS NULL
+                  AND idx.indnatts = 1
+                  AND idx.indkey[0] = job_ids.attnum
+                  AND opclass.opcname = 'array_ops'
+                  AND opclass.opcnamespace = 'pg_catalog'::regnamespace
             ) THEN
                 RETURN TRUE;
+            END IF;
+
+            -- Something else already has the index's name: a partial or
+            -- otherwise different index, or another relation. Leave it alone
+            -- and keep scanning; the operator decides what to do with it.
+            IF to_regclass(format('%%I.%%I', %1$L, v_index)) IS NOT NULL THEN
+                RAISE WARNING '%%.%% is not a GIN index on job_ids, so claim slot %% of schema %% keeps scanning for job ids',
+                    quote_ident(%1$L), quote_ident(v_index), p_slot, %1$L
+                    USING HINT = format(
+                        'Drop or rename %%s.%%s; claim prune builds the job_ids index the next time it empties claim slot %%s.',
+                        quote_ident(%1$L), quote_ident(v_index), p_slot
+                    );
+                RETURN FALSE;
             END IF;
 
             -- NOWAIT: a partition someone is writing to is not empty for long
@@ -899,11 +936,11 @@ BEGIN
                     RAISE EXCEPTION USING ERRCODE = 'object_not_in_prerequisite_state';
                 END IF;
                 EXECUTE format(
-                    'CREATE INDEX IF NOT EXISTS %%I ON %%I.%%I USING GIN (job_ids) WITH (fastupdate = off)',
+                    'CREATE INDEX %%I ON %%I.%%I USING GIN (job_ids) WITH (fastupdate = off)',
                     v_index, %1$L, v_child
                 );
             EXCEPTION
-                WHEN lock_not_available OR object_not_in_prerequisite_state THEN
+                WHEN lock_not_available OR object_not_in_prerequisite_state OR duplicate_table THEN
                     RETURN FALSE;
             END;
             RETURN TRUE;
@@ -928,6 +965,7 @@ BEGIN
                 v_function,
                 pg_get_userbyid(v_table_owner)
             );
+            v_function_owner := v_table_owner;
         ELSE
             RAISE WARNING '% is owned by %, not the owner % of %.lease_claim_batches, so it cannot create the job_ids index',
                 v_function, pg_get_userbyid(v_function_owner), pg_get_userbyid(v_table_owner), p_schema
@@ -939,6 +977,14 @@ BEGIN
         END IF;
     END IF;
 
+    -- Reset EXECUTE as the function's owner, after any transfer, so a former
+    -- owner that holds TRUNCATE keeps it. A role that may only SET ROLE to the
+    -- new owner cannot grant or revoke as itself, so it acts as the owner for
+    -- the reset and then restores its previous role.
+    IF NOT pg_has_role(current_user, v_function_owner, 'USAGE') THEN
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', pg_get_userbyid(v_function_owner), true);
+    END IF;
     FOR v_grantee IN
         SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
                              ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
@@ -958,6 +1004,9 @@ BEGIN
     LOOP
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', v_function, v_grantee);
     END LOOP;
+    IF v_previous_role IS NOT NULL THEN
+        PERFORM set_config('role', v_previous_role, true);
+    END IF;
 END;
 $refresh$;
 

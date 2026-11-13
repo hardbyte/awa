@@ -105,6 +105,18 @@ pub enum QueueCapacity {
     },
 }
 
+/// The most worker slots a queue can hold at once in this runtime.
+///
+/// Hard-reserved mode: `max_workers`. Weighted mode: `min_workers` plus the
+/// whole overflow pool, which the queue can hold while no other queue wants
+/// overflow; under contention its fair share of the pool is smaller.
+fn queue_worker_capacity(config: &QueueConfig, overflow_pool: Option<&OverflowPool>) -> u32 {
+    match overflow_pool {
+        Some(pool) => config.min_workers.saturating_add(pool.total()),
+        None => config.max_workers,
+    }
+}
+
 /// Temporary execution role used during a storage transition.
 ///
 /// This is not intended as a long-term “run either backend forever” feature.
@@ -156,6 +168,8 @@ pub struct ClientBuilder {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Vec<PeriodicJob>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     global_max_workers: Option<u32>,
@@ -220,6 +234,8 @@ impl ClientBuilder {
             heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
+            rescue_pass_budget: None,
+            rescue_pass_max_rows: None,
             periodic_jobs: Vec::new(),
             periodic_reconciliation: None,
             global_max_workers: None,
@@ -818,6 +834,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long one queue-storage rescue pass may keep starting batches of
+    /// 500 attempts, each in its own transaction (default: 1s, capped at half
+    /// the rescue interval). While a backlog remains the next pass runs
+    /// a second later. `Duration::ZERO` keeps every pass to one batch.
+    pub fn rescue_pass_budget(mut self, budget: Duration) -> Self {
+        self.rescue_pass_budget = Some(budget);
+        self
+    }
+
+    /// Set how many attempts one queue-storage rescue pass rescues before it
+    /// stops (default: 5000). With a pass a second while a backlog remains,
+    /// this bounds the number rescued per second per kind, allowing one
+    /// final batch beyond the cap. Zero disables follow-up batches and early
+    /// re-arms. Retried attempts retain their normal backoff; their due times
+    /// can cluster, so this does not cap the promotion rate.
+    pub fn rescue_pass_max_rows(mut self, max_rows: usize) -> Self {
+        self.rescue_pass_max_rows = Some(max_rows);
+        self
+    }
+
     /// Set the leader election retry interval (default: 10s).
     ///
     /// Controls how often a non-leader instance retries acquiring the maintenance
@@ -1272,6 +1308,8 @@ impl ClientBuilder {
             heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
+            rescue_pass_budget: self.rescue_pass_budget,
+            rescue_pass_max_rows: self.rescue_pass_max_rows,
             periodic_jobs: Arc::new(self.periodic_jobs),
             periodic_reconciliation: self.periodic_reconciliation,
             periodic_manifest,
@@ -1372,6 +1410,8 @@ pub struct Client {
     heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
+    rescue_pass_budget: Option<Duration>,
+    rescue_pass_max_rows: Option<usize>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     periodic_manifest: Option<Arc<awa_model::cron_reconciliation::PeriodicManifest>>,
@@ -1990,6 +2030,12 @@ impl Client {
         if let Some(interval) = self.callback_rescue_interval {
             maintenance = maintenance.callback_rescue_interval(interval);
         }
+        if let Some(budget) = self.rescue_pass_budget {
+            maintenance = maintenance.rescue_pass_budget(budget);
+        }
+        if let Some(max_rows) = self.rescue_pass_max_rows {
+            maintenance = maintenance.rescue_pass_max_rows(max_rows);
+        }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
         }
@@ -2231,6 +2277,10 @@ impl Client {
         };
         for handle in service_handles {
             let _ = handle.await;
+        }
+
+        for (queue, _) in &self.queues {
+            self.metrics.record_queue_workers(queue, 0, 0);
         }
 
         info!("Awa worker runtime stopped");
@@ -2815,7 +2865,21 @@ impl RuntimeReporterState {
         }
     }
 
+    /// Sample each queue's worker slots in use and its capacity.
+    fn record_queue_worker_metrics(&self) {
+        for (queue, config) in &self.queues {
+            let in_use = self
+                .queue_in_flight
+                .get(queue)
+                .map(|counter| counter.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            let capacity = queue_worker_capacity(config, self.overflow_pool.as_deref());
+            self.metrics.record_queue_workers(queue, in_use, capacity);
+        }
+    }
+
     async fn publish_snapshot(&self) {
+        self.record_queue_worker_metrics();
         let queue_descriptors = self.declared_queue_descriptors();
         let kind_descriptors = self.declared_job_kind_descriptors();
 
@@ -2947,6 +3011,18 @@ mod tests {
         let config = QueueConfig::default();
         assert_eq!(config.claimers, 1);
         assert_eq!(config.claim_batch_size, 512);
+    }
+
+    #[test]
+    fn queue_worker_capacity_follows_the_concurrency_mode() {
+        let config = QueueConfig {
+            max_workers: 7,
+            min_workers: 2,
+            ..Default::default()
+        };
+        assert_eq!(queue_worker_capacity(&config, None), 7);
+        let overflow = OverflowPool::new(10, HashMap::from([("q".to_string(), 1)]));
+        assert_eq!(queue_worker_capacity(&config, Some(&overflow)), 12);
     }
 
     #[tokio::test]

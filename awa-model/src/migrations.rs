@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 56;
+pub const CURRENT_VERSION: i32 = 60;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -309,8 +309,28 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     ),
     (
         56,
-        "Keep claim tombstone checks correlated",
+        "Recognise only a full job_ids index as the claim batch index",
         &[V23_UP, V56_UP],
+    ),
+    (
+        57,
+        "Batch producer insert that gives way instead of deadlocking",
+        &[V23_UP, V57_UP],
+    ),
+    (
+        58,
+        "Provision a lane's row before its lock",
+        &[V23_UP, V58_UP],
+    ),
+    (
+        59,
+        "Spread retry backoff over half to one and a half times the base delay",
+        &[V59_UP],
+    ),
+    (
+        60,
+        "Keep claim tombstone checks correlated",
+        &[V23_UP, V60_UP],
     ),
 ];
 
@@ -375,7 +395,11 @@ const V52_UP: &str = include_str!("../migrations/v052_retained_job_output.sql");
 const V53_UP: &str = include_str!("../migrations/v053_definer_lane_provisioning.sql");
 const V54_UP: &str = include_str!("../migrations/v054_claim_batch_job_index.sql");
 const V55_UP: &str = include_str!("../migrations/v055_insert_jobs_compat_batch.sql");
-const V56_UP: &str = include_str!("../migrations/v056_correlated_claim_tombstones.sql");
+const V56_UP: &str = include_str!("../migrations/v056_claim_batch_job_index_shape.sql");
+const V57_UP: &str = include_str!("../migrations/v057_insert_jobs_compat_batch_bounded_wait.sql");
+const V58_UP: &str = include_str!("../migrations/v058_provision_lane_row_first.sql");
+const V59_UP: &str = include_str!("../migrations/v059_backoff_wider_jitter.sql");
+const V60_UP: &str = include_str!("../migrations/v060_correlated_claim_tombstones.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
