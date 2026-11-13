@@ -19,6 +19,15 @@ Two rule sets, pick whichever matches your observability stack:
 | `awa_descriptor_drift_persistent` | info | descriptor drift detected for 15m | all live runtimes agree |
 | `awa_job_output_schema_missing` _(Prom only)_ | warning | a queue drops completion outputs because its schema predates migration v052, for 10m | `awa migrate` applies v052 |
 | `awa_staged_follow_ups_discarded` _(Prom only)_ | info | a kind discarded staged follow-ups (returned `WaitForCallback` after staging) in each of the last 15m | no discards for 15m |
+| `awa_ring_rotation_stalled` _(Prom only)_ | warning | a ring skipped every rotation as busy for 15m, for 5m | the ring rotates |
+| `awa_ring_prune_blocked` _(Prom only)_ | warning | every prune of a ring in 30m was blocked by a lock and none succeeded, for 5m | a prune succeeds |
+| `awa_maintenance_branch_overrunning` _(Prom only)_ | info | a maintenance branch overran its interval in every 10m window, for 15m | no overruns for 10m |
+| `awa_dlq_growing` _(Prom only)_ | info | a queue's DLQ depth rose over the last hour, for 30m | depth stops rising |
+| `awa_pg_long_transaction` _(Postgres only)_ | warning | the oldest open transaction on the database is older than 5m, for 2m | it commits or aborts |
+
+The ring rules read awa's maintenance counters. A lease or claim ring cannot rotate past an attempt that is still running, so workloads whose jobs routinely run longer than 15 minutes should lengthen `awa_ring_rotation_stalled`'s window or its `for`.
+
+Transaction age comes from `pg_stat_activity`, which awa doesn't export, so only the Postgres rule set has it. With postgres_exporter, `pg_stat_activity_max_tx_duration` gives the same signal in Prometheus.
 
 Every rule's `description` annotation names the dashboard panel an operator should look at and links to the relevant awa-ui page. The 2–15 minute `for` windows deliberately skip transient spikes (rolling deploys, CI runs).
 
