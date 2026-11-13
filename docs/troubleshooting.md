@@ -394,6 +394,23 @@ A snapshot that is no longer fresh but is younger than `heartbeat_staleness` hol
 
 To drain faster, raise `rescue_pass_budget` (at most half the rescue interval, so 15 s by default) and `rescue_pass_max_rows`, keeping in mind that a pass holds the maintenance leader for its budget and can exceed `rescue_pass_max_rows` by one final batch of closures and retry rows. The [measured rates](configuration.md#rescue-backlog) show what to expect. Retry due times can cluster; this cap does not bound promotion throughput.
 
+## Queue Ring Stops Rotating Under Claim Load
+
+Symptoms on queue storage while claims keep running:
+
+- `awa_maintenance_prune_attempts_total` for the queue ring reports `skipped_busy`, with blockers such as `queue.ready_rows` and `queue.ready_segments`, on almost every attempt, and `awa.ring.generation` for the queue ring stops advancing
+- the current queue slot keeps growing, and claims get slower as it does
+- `pg_locks` on the next slot's `ready_entries_<n>` or `ready_segments_<n>` always shows `AccessShareLock` holders running `claim_ready_runtime`
+
+Before 0.6.18 every claim locked every partition of the queue ring, so with claims always in flight prune never got its `ACCESS EXCLUSIVE` lock (#721). 0.6.18 fixes it with two parts, and both must be in place:
+
+- the `live_slot_claims` schema patch, applied by `awa migrate`. Check with `awa migrate` or `awa::migrations::schema_patch_status`; a schema still on the old function is named as `claim function <schema>.claim_ready_runtime`.
+- a 0.6.18 maintenance leader, whose prune takes the slot's retire barrier.
+
+Heartbeats and completions from older runtimes also lock sealed slots, so prune can still be blocked until every runtime runs 0.6.18. Schemas with `lease_claim_receipts = FALSE` keep the old claim function and can still be starved; move them to a schema with receipts.
+
+While prune holds the barrier, claims leave the slot out. A lane whose claim cursor is still behind the next segment outside that slot gets no jobs until the prune attempt ends, a few seconds at most.
+
 ## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means

@@ -852,6 +852,1303 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(TEXT) FROM PUBLIC;
 
+-- The claim functions of a queue-storage schema with lease claim receipts
+-- (#721): claim_ready_runtime picks a lane and the slot to claim from, and
+-- claim_slot_<n> claims from queue slot n. Every statement in them names the
+-- slot partitions it reads instead of a ring parent, so the cached generic
+-- plan of a statement locks only those partitions and a sealed slot is locked
+-- only by a claim that routes to it. Each lane-pick variant is a separate
+-- statement, planned on first use, so the variant that leaves out slot n
+-- never locks slot n.
+--
+-- claim_ready_runtime tries the retire barrier of the slot queue prune
+-- targets next in shared mode and never waits for it. While prune holds or
+-- requests it, the claim leaves that slot out, and a lane is claimed only
+-- from the segment that covers its claim cursor and only up to the first gap
+-- in its lane sequences. A row committed late into the retired slot therefore keeps
+-- the cursor at or before it, so prune's pending-ready check still sees it.
+--
+-- Function replacement only: no table is locked and no row is read. Schemas
+-- with lease_claim_receipts = FALSE keep their claim function; its legacy
+-- per-claim evidence reads ring parents by job id. The functions are created
+-- as the owner of claim_ready_runtime and carry its EXECUTE privileges.
+CREATE OR REPLACE FUNCTION awa.refresh_claim_functions(
+    p_schema TEXT,
+    p_lease_claim_receipts BOOLEAN
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $refresh$
+DECLARE
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+    v_s TEXT;
+    v_dispatcher REGPROCEDURE;
+    v_owner OID;
+    v_previous_role TEXT;
+    v_slot_count INT;
+    v_partitions INT;
+    v_slot INT;
+    v_other INT;
+    v_arms TEXT;
+    v_lane_arms TEXT;
+    v_route_arms TEXT;
+    v_lane_cases TEXT := '';
+    v_route_cases TEXT := '';
+    v_claim_cases TEXT := '';
+    v_child TEXT;
+    v_function REGPROCEDURE;
+    v_grantee TEXT;
+    t_arm CONSTANT TEXT := $tpl$
+                    (SELECT segment.ready_slot, segment.ready_generation, segment.first_lane_seq,
+                            segment.next_lane_seq, segment.first_run_at
+                     FROM __S__.ready_segments___K__ AS segment
+                     WHERE segment.queue = p_queue
+                       AND segment.priority = __PRIORITY__
+                       AND segment.enqueue_shard = __SHARD__
+                       AND segment.next_lane_seq > __CURSOR__
+                     ORDER BY segment.next_lane_seq ASC
+                     LIMIT 1)$tpl$;
+    t_lane CONSTANT TEXT := $tpl$
+            SELECT
+                claims.priority,
+                claims.enqueue_shard,
+                claims.seq_name,
+                cursors.claim_seq,
+                cursors.next_seq,
+                candidate.ready_slot,
+                candidate.ready_generation
+            INTO
+                v_lane_priority,
+                v_lane_shard,
+                v_claim_seq_name,
+                v_lane_claim_seq,
+                v_lane_next_seq,
+                v_target_slot,
+                v_target_generation
+            FROM __S__.queue_claim_heads AS claims
+            JOIN __S__.queue_enqueue_heads AS enqueues
+              ON enqueues.queue = claims.queue
+             AND enqueues.priority = claims.priority
+             AND enqueues.enqueue_shard = claims.enqueue_shard
+            CROSS JOIN LATERAL (
+                SELECT
+                    __S__.sequence_next_value(claims.seq_name) AS claim_seq,
+                    __S__.sequence_next_value(enqueues.seq_name) AS next_seq
+            ) AS cursors
+            -- Ready segments are non-overlapping, so the smallest
+            -- next_lane_seq above the cursor is the segment covering the
+            -- cursor or the first one after it.
+            LEFT JOIN LATERAL (
+                SELECT segments.*
+                FROM (__ARMS__
+                ) AS segments
+                ORDER BY segments.next_lane_seq ASC
+                LIMIT 1
+            ) AS candidate ON __COVERED__
+            WHERE claims.queue = p_queue
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM awa.queue_meta AS meta
+                  WHERE meta.queue = p_queue
+                    AND meta.paused = TRUE
+              )
+              AND cursors.claim_seq < cursors.next_seq
+            ORDER BY
+                CASE
+                    WHEN candidate.first_run_at IS NULL THEN NULL::smallint
+                    WHEN p_aging_secs > 0 THEN GREATEST(
+                        1,
+                        claims.priority - FLOOR(
+                            EXTRACT(EPOCH FROM (clock_timestamp() - candidate.first_run_at)) / p_aging_secs
+                        )::smallint
+                    )::smallint
+                    ELSE claims.priority
+                END ASC NULLS LAST,
+                candidate.first_run_at ASC NULLS LAST,
+                claims.priority ASC
+            LIMIT 1
+            FOR UPDATE OF claims SKIP LOCKED;$tpl$;
+    t_route CONSTANT TEXT := $tpl$
+                SELECT candidate.ready_slot, candidate.ready_generation
+                INTO v_target_slot, v_target_generation
+                FROM (
+                    SELECT segments.*
+                    FROM (__ARMS__
+                    ) AS segments
+                    ORDER BY segments.next_lane_seq ASC
+                    LIMIT 1
+                ) AS candidate
+                WHERE __COVERED__;$tpl$;
+    t_claim_slot CONSTANT TEXT := $tpl$
+        CREATE OR REPLACE FUNCTION __S__.claim_slot___K__(
+            p_queue TEXT,
+            p_generation BIGINT,
+            p_priority SMALLINT,
+            p_shard SMALLINT,
+            p_seq_name TEXT,
+            p_claim_seq BIGINT,
+            p_limit BIGINT,
+            p_contiguous BOOLEAN,
+            p_deadline_secs DOUBLE PRECISION,
+            p_aging_secs DOUBLE PRECISION
+        )
+        RETURNS TABLE(
+            ready_slot INT,
+            ready_generation BIGINT,
+            lane_seq BIGINT,
+            enqueue_shard SMALLINT,
+            lease_slot INT,
+            lease_generation BIGINT,
+            claim_slot INT,
+            receipt_id BIGINT,
+            claim_batch_id BIGINT,
+            claim_batch_index INT,
+            job_id BIGINT,
+            kind TEXT,
+            queue TEXT,
+            args JSONB,
+            lane_priority SMALLINT,
+            priority SMALLINT,
+            attempt SMALLINT,
+            run_lease BIGINT,
+            max_attempts SMALLINT,
+            run_at TIMESTAMPTZ,
+            heartbeat_at TIMESTAMPTZ,
+            deadline_at TIMESTAMPTZ,
+            attempted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ,
+            unique_key BYTEA,
+            unique_states TEXT,
+            payload JSONB
+        )
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, awa, public
+        AS $func$
+        -- awa:claim-routing:v2
+        -- Claims up to p_limit rows of one lane from queue slot __K__,
+        -- starting at the lane's claim cursor p_claim_seq. Called by
+        -- claim_ready_runtime, which holds the lane's claim head. With
+        -- p_contiguous, only rows whose lane sequences run without a gap
+        -- from the cursor are claimed: a missing sequence may belong to a
+        -- row in the slot left out of routing.
+        DECLARE
+            v_lane_shard SMALLINT := p_shard;
+            v_claimed_at TIMESTAMPTZ;
+            v_deadline_at TIMESTAMPTZ;
+            v_head_lane_seq BIGINT;
+            v_head_attempt_spent BOOLEAN;
+            v_spent_next_seq BIGINT;
+        BEGIN
+            SELECT ready.lane_seq
+            INTO v_head_lane_seq
+            FROM __S__.ready_entries___K__ AS ready
+            WHERE ready.queue = p_queue
+              AND ready.priority = p_priority
+              AND ready.enqueue_shard = p_shard
+              AND ready.ready_generation = p_generation
+              AND ready.lane_seq >= p_claim_seq
+            ORDER BY ready.lane_seq ASC
+            LIMIT 1;
+
+            IF NOT FOUND THEN
+                -- The segment row is committed by the same transaction as
+                -- the ready rows, so this should only happen during a rolling
+                -- upgrade or after manual catalog damage. Keep the claim
+                -- cursor conservative rather than advancing over unseen work.
+                RETURN;
+            END IF;
+
+            SELECT EXISTS (
+                SELECT 1 FROM __S__.ready_tombstones___K__ AS tomb
+                WHERE tomb.ready_generation = p_generation
+                  AND tomb.queue = p_queue
+                  AND tomb.priority = p_priority
+                  AND tomb.enqueue_shard = p_shard
+                  AND tomb.lane_seq = v_head_lane_seq
+                LIMIT 1
+            )
+            INTO v_head_attempt_spent;
+
+            IF NOT v_head_attempt_spent THEN
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM __S__.ready_claim_attempt_batches___K__ AS existing_attempts
+                    WHERE existing_attempts.ready_generation = p_generation
+                      AND existing_attempts.queue = p_queue
+                      AND existing_attempts.priority = p_priority
+                      AND existing_attempts.enqueue_shard = p_shard
+                      AND existing_attempts.first_lane_seq <= v_head_lane_seq
+                      AND existing_attempts.next_lane_seq > v_head_lane_seq
+                      AND existing_attempts.lane_ranges @> int8range(v_head_lane_seq, v_head_lane_seq + 1, '[)')
+                    LIMIT 1
+                )
+                INTO v_head_attempt_spent;
+            END IF;
+
+            IF v_head_attempt_spent THEN
+                WITH selected AS (
+                    SELECT
+                        ready.lane_seq,
+                        EXISTS (
+                            SELECT 1 FROM __S__.ready_tombstones___K__ AS tomb
+                            WHERE tomb.ready_generation = p_generation
+                              AND tomb.queue = ready.queue
+                              AND tomb.priority = ready.priority
+                              AND tomb.enqueue_shard = ready.enqueue_shard
+                              AND tomb.lane_seq = ready.lane_seq
+                            -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                            OFFSET 0
+                        ) AS is_tombstone
+                    FROM __S__.ready_entries___K__ AS ready
+                    WHERE ready.queue = p_queue
+                      AND ready.priority = p_priority
+                      AND ready.enqueue_shard = p_shard
+                      AND ready.ready_generation = p_generation
+                      AND ready.lane_seq >= p_claim_seq
+                    ORDER BY ready.lane_seq ASC
+                    LIMIT p_limit
+                ),
+                selected_with_spent AS (
+                    SELECT
+                        selected.lane_seq,
+                        (
+                            selected.is_tombstone
+                            OR EXISTS (
+                                SELECT 1
+                                FROM __S__.ready_claim_attempt_batches___K__ AS existing_attempts
+                                WHERE existing_attempts.ready_generation = p_generation
+                                  AND existing_attempts.queue = p_queue
+                                  AND existing_attempts.priority = p_priority
+                                  AND existing_attempts.enqueue_shard = p_shard
+                                  AND existing_attempts.first_lane_seq <= selected.lane_seq
+                                  AND existing_attempts.next_lane_seq > selected.lane_seq
+                                  AND existing_attempts.lane_ranges @> int8range(selected.lane_seq, selected.lane_seq + 1, '[)')
+                            )
+                        ) AS attempt_spent
+                    FROM selected
+                ),
+                spent_prefix AS (
+                    SELECT
+                        selected_with_spent.lane_seq,
+                        selected_with_spent.lane_seq
+                            - row_number() OVER (ORDER BY selected_with_spent.lane_seq)::bigint AS prefix_group
+                    FROM selected_with_spent
+                    WHERE attempt_spent
+                )
+                SELECT max(spent_prefix.lane_seq) + 1
+                INTO v_spent_next_seq
+                FROM spent_prefix
+                WHERE prefix_group = p_claim_seq - 1;
+
+                IF v_spent_next_seq IS NOT NULL THEN
+                    -- Only a contiguous prefix of attempts with committed
+                    -- evidence is skipped; the surrounding claim transaction
+                    -- could still abort, so live rows never move the cursor.
+                    PERFORM __S__.set_sequence_next(p_seq_name, v_spent_next_seq);
+                END IF;
+                RETURN;
+            END IF;
+
+            v_claimed_at := clock_timestamp();
+            IF p_deadline_secs > 0 THEN
+                v_deadline_at := v_claimed_at + make_interval(secs => p_deadline_secs);
+            ELSE
+                v_deadline_at := NULL::timestamptz;
+            END IF;
+
+            IF p_contiguous THEN
+                -- Only while a slot is left out of routing; planned on first
+                -- use, so the common claim below keeps its own plan.
+                RETURN QUERY
+                WITH lease_ring AS (
+                    SELECT current_slot AS lease_slot, generation AS lease_generation
+                    FROM __S__.lease_ring_state
+                    WHERE singleton = TRUE
+                ),
+                candidates AS (
+                    SELECT
+                        ready.ready_slot,
+                        ready.ready_generation,
+                        ready.job_id,
+                        ready.kind,
+                        ready.queue,
+                        ready.args,
+                        ready.priority AS lane_priority,
+                        CASE
+                            WHEN p_aging_secs > 0 THEN GREATEST(
+                                1,
+                                ready.priority - FLOOR(
+                                    EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
+                                )::smallint
+                            )::smallint
+                            ELSE ready.priority
+                        END AS effective_priority,
+                        ready.attempt,
+                        ready.run_lease,
+                        ready.max_attempts,
+                        ready.lane_seq,
+                        ready.run_at,
+                        ready.created_at,
+                        ready.unique_key,
+                        ready.unique_states,
+                        COALESCE(ready.payload, '{}'::jsonb) AS payload,
+                        EXISTS (
+                            SELECT 1 FROM __S__.ready_tombstones___K__ AS tomb
+                            WHERE tomb.ready_generation = p_generation
+                              AND tomb.queue = ready.queue
+                              AND tomb.priority = ready.priority
+                              AND tomb.enqueue_shard = ready.enqueue_shard
+                              AND tomb.lane_seq = ready.lane_seq
+                            -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                            OFFSET 0
+                        ) AS is_tombstone
+                    FROM __S__.ready_entries___K__ AS ready
+                    WHERE ready.queue = p_queue
+                      AND ready.priority = p_priority
+                      AND ready.enqueue_shard = p_shard
+                      AND ready.ready_generation = p_generation
+                      AND ready.lane_seq >= p_claim_seq
+                    ORDER BY ready.lane_seq ASC
+                    LIMIT p_limit
+                ),
+                selected AS (
+                    SELECT ranked.*
+                    FROM (
+                        SELECT
+                            candidates.*,
+                            row_number() OVER (ORDER BY candidates.lane_seq) AS lane_rank
+                        FROM candidates
+                    ) AS ranked
+                    WHERE ranked.lane_seq = p_claim_seq + ranked.lane_rank - 1
+                ),
+                selected_with_spent AS (
+                    SELECT
+                        selected.*,
+                        selected.is_tombstone AS attempt_spent
+                    FROM selected
+                ),
+                claim_ring AS (
+                    SELECT current_slot AS claim_slot
+                    FROM __S__.claim_ring_state
+                    WHERE singleton = TRUE
+                ),
+                claim_attempt_batches AS (
+                    INSERT INTO __S__.ready_claim_attempt_batches AS attempt_rows (
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        claim_slot,
+                        first_lane_seq,
+                        next_lane_seq,
+                        claimed_count,
+                        lane_ranges,
+                        claimed_at
+                    )
+                    SELECT
+                        selected.ready_slot,
+                        selected.ready_generation,
+                        selected.queue,
+                        selected.lane_priority,
+                        v_lane_shard,
+                        claim_ring.claim_slot,
+                        min(selected.lane_seq)::bigint AS first_lane_seq,
+                        (max(selected.lane_seq) + 1)::bigint AS next_lane_seq,
+                        count(*)::int AS claimed_count,
+                        range_agg(int8range(selected.lane_seq, selected.lane_seq + 1, '[)') ORDER BY selected.lane_seq)::int8multirange AS lane_ranges,
+                        v_claimed_at
+                    FROM selected_with_spent AS selected
+                    CROSS JOIN claim_ring
+                    WHERE NOT selected.attempt_spent
+                    GROUP BY
+                        selected.ready_slot,
+                        selected.ready_generation,
+                        selected.queue,
+                        selected.lane_priority,
+                        claim_ring.claim_slot
+                    RETURNING
+                        attempt_rows.claim_slot,
+                        attempt_rows.ready_slot,
+                        attempt_rows.ready_generation,
+                        attempt_rows.queue,
+                        attempt_rows.priority AS lane_priority,
+                        attempt_rows.enqueue_shard,
+                        attempt_rows.first_lane_seq,
+                        attempt_rows.next_lane_seq,
+                        attempt_rows.lane_ranges
+                ),
+                claim_items AS MATERIALIZED (
+                    SELECT
+                        attempts.claim_slot,
+                        selected.ready_slot,
+                        selected.ready_generation,
+                        selected.job_id,
+                        selected.queue,
+                        selected.effective_priority AS priority,
+                        selected.lane_seq,
+                        v_lane_shard AS enqueue_shard,
+                        (selected.attempt + 1)::smallint AS attempt,
+                        (selected.run_lease + 1)::bigint AS run_lease,
+                        selected.max_attempts::smallint AS max_attempts,
+                        nextval('__S__.lease_claim_receipt_id_seq'::regclass)::bigint AS receipt_id,
+                        row_number() OVER (
+                            PARTITION BY
+                                attempts.claim_slot,
+                                selected.ready_slot,
+                                selected.ready_generation,
+                                selected.queue,
+                                selected.effective_priority,
+                                v_lane_shard
+                            ORDER BY selected.lane_seq, selected.job_id
+                        )::int AS claim_batch_index
+                    FROM selected_with_spent AS selected
+                    JOIN claim_attempt_batches AS attempts
+                      ON attempts.ready_slot = selected.ready_slot
+                     AND attempts.ready_generation = selected.ready_generation
+                     AND attempts.queue = selected.queue
+                     AND attempts.lane_priority = selected.lane_priority
+                     AND attempts.enqueue_shard = v_lane_shard
+                     AND attempts.first_lane_seq <= selected.lane_seq
+                     AND attempts.next_lane_seq > selected.lane_seq
+                     AND attempts.lane_ranges @> int8range(selected.lane_seq, selected.lane_seq + 1, '[)')
+                    WHERE NOT selected.attempt_spent
+                ),
+                compact_claim_batches AS (
+                    INSERT INTO __S__.lease_claim_batches AS claim_batches (
+                        claim_slot,
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        claimed_count,
+                        job_ids,
+                        run_leases,
+                        receipt_ids,
+                        receipt_ranges,
+                        lane_seqs,
+                        attempts,
+                        max_attempts,
+                        deadline_at,
+                        claimed_at
+                    )
+                    SELECT
+                        claim_items.claim_slot,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.enqueue_shard,
+                        count(*)::int AS claimed_count,
+                        array_agg(claim_items.job_id ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.run_lease ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.receipt_id ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        range_agg(int8range(claim_items.receipt_id, claim_items.receipt_id + 1, '[)') ORDER BY claim_items.receipt_id),
+                        array_agg(claim_items.lane_seq ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.attempt ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.max_attempts ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        NULL::timestamptz,
+                        v_claimed_at
+                    FROM claim_items
+                    WHERE p_deadline_secs <= 0
+                    GROUP BY
+                        claim_items.claim_slot,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.enqueue_shard
+                    RETURNING
+                        claim_batches.claim_slot,
+                        claim_batches.batch_id,
+                        claim_batches.ready_slot,
+                        claim_batches.ready_generation,
+                        claim_batches.queue,
+                        claim_batches.priority,
+                        claim_batches.enqueue_shard
+                ),
+                row_claims AS (
+                    INSERT INTO __S__.lease_claims AS claim_rows (
+                        claim_slot,
+                        receipt_id,
+                        job_id,
+                        run_lease,
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        attempt,
+                        max_attempts,
+                        lane_seq,
+                        enqueue_shard,
+                        deadline_at
+                    )
+                    SELECT
+                        claim_items.claim_slot,
+                        claim_items.receipt_id,
+                        claim_items.job_id,
+                        claim_items.run_lease,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.attempt,
+                        claim_items.max_attempts,
+                        claim_items.lane_seq,
+                        claim_items.enqueue_shard,
+                        v_deadline_at
+                    FROM claim_items
+                    WHERE p_deadline_secs > 0
+                    RETURNING
+                        claim_rows.claim_slot,
+                        claim_rows.receipt_id,
+                        claim_rows.ready_slot,
+                        claim_rows.ready_generation,
+                        claim_rows.job_id,
+                        claim_rows.queue,
+                        claim_rows.priority,
+                        claim_rows.lane_seq,
+                        claim_rows.attempt,
+                        claim_rows.run_lease,
+                        claim_rows.max_attempts,
+                        NULL::bigint AS claim_batch_id,
+                        NULL::int AS claim_batch_index
+                ),
+                claimed AS (
+                    SELECT
+                        row_claims.claim_slot,
+                        row_claims.receipt_id,
+                        row_claims.claim_batch_id,
+                        row_claims.claim_batch_index,
+                        row_claims.ready_slot,
+                        row_claims.ready_generation,
+                        row_claims.job_id,
+                        row_claims.queue,
+                        row_claims.priority,
+                        row_claims.lane_seq,
+                        row_claims.attempt,
+                        row_claims.run_lease,
+                        row_claims.max_attempts
+                    FROM row_claims
+                    UNION ALL
+                    SELECT
+                        claim_items.claim_slot,
+                        claim_items.receipt_id,
+                        batches.batch_id AS claim_batch_id,
+                        claim_items.claim_batch_index,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.job_id,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.lane_seq,
+                        claim_items.attempt,
+                        claim_items.run_lease,
+                        claim_items.max_attempts
+                    FROM claim_items
+                    JOIN compact_claim_batches AS batches
+                      ON batches.claim_slot = claim_items.claim_slot
+                     AND batches.ready_slot = claim_items.ready_slot
+                     AND batches.ready_generation = claim_items.ready_generation
+                     AND batches.queue = claim_items.queue
+                     AND batches.priority = claim_items.priority
+                     AND batches.enqueue_shard = claim_items.enqueue_shard
+                )
+                SELECT
+                    claimed.ready_slot,
+                    claimed.ready_generation,
+                    claimed.lane_seq,
+                    v_lane_shard AS enqueue_shard,
+                    lease_ring.lease_slot,
+                    lease_ring.lease_generation,
+                    claimed.claim_slot,
+                    claimed.receipt_id,
+                    claimed.claim_batch_id,
+                    claimed.claim_batch_index,
+                    selected.job_id,
+                    selected.kind,
+                    selected.queue,
+                    selected.args,
+                    selected.lane_priority,
+                    selected.effective_priority,
+                    claimed.attempt,
+                    claimed.run_lease,
+                    claimed.max_attempts,
+                    selected.run_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN v_claimed_at
+                        ELSE NULL::timestamptz
+                    END AS heartbeat_at,
+                    v_deadline_at AS deadline_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN v_claimed_at
+                        ELSE NULL::timestamptz
+                    END AS attempted_at,
+                    selected.created_at,
+                    selected.unique_key,
+                    selected.unique_states,
+                    selected.payload
+                FROM claimed
+                CROSS JOIN lease_ring
+                JOIN selected
+                 ON selected.ready_slot = claimed.ready_slot
+                 AND selected.ready_generation = claimed.ready_generation
+                 AND selected.queue = claimed.queue
+                 AND selected.effective_priority = claimed.priority
+                 AND selected.lane_seq = claimed.lane_seq
+                ORDER BY selected.lane_seq ASC;
+            ELSE
+                RETURN QUERY
+                WITH lease_ring AS (
+                    SELECT current_slot AS lease_slot, generation AS lease_generation
+                    FROM __S__.lease_ring_state
+                    WHERE singleton = TRUE
+                ),
+                selected AS (
+                    SELECT
+                        ready.ready_slot,
+                        ready.ready_generation,
+                        ready.job_id,
+                        ready.kind,
+                        ready.queue,
+                        ready.args,
+                        ready.priority AS lane_priority,
+                        CASE
+                            WHEN p_aging_secs > 0 THEN GREATEST(
+                                1,
+                                ready.priority - FLOOR(
+                                    EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
+                                )::smallint
+                            )::smallint
+                            ELSE ready.priority
+                        END AS effective_priority,
+                        ready.attempt,
+                        ready.run_lease,
+                        ready.max_attempts,
+                        ready.lane_seq,
+                        ready.run_at,
+                        ready.created_at,
+                        ready.unique_key,
+                        ready.unique_states,
+                        COALESCE(ready.payload, '{}'::jsonb) AS payload,
+                        EXISTS (
+                            SELECT 1 FROM __S__.ready_tombstones___K__ AS tomb
+                            WHERE tomb.ready_generation = p_generation
+                              AND tomb.queue = ready.queue
+                              AND tomb.priority = ready.priority
+                              AND tomb.enqueue_shard = ready.enqueue_shard
+                              AND tomb.lane_seq = ready.lane_seq
+                            -- Keep this bounded claim on indexed probes, not a full-partition hash.
+                            OFFSET 0
+                        ) AS is_tombstone
+                    FROM __S__.ready_entries___K__ AS ready
+                    WHERE ready.queue = p_queue
+                      AND ready.priority = p_priority
+                      AND ready.enqueue_shard = p_shard
+                      AND ready.ready_generation = p_generation
+                      AND ready.lane_seq >= p_claim_seq
+                    ORDER BY ready.lane_seq ASC
+                    LIMIT p_limit
+                ),
+                selected_with_spent AS (
+                    SELECT
+                        selected.*,
+                        selected.is_tombstone AS attempt_spent
+                    FROM selected
+                ),
+                claim_ring AS (
+                    SELECT current_slot AS claim_slot
+                    FROM __S__.claim_ring_state
+                    WHERE singleton = TRUE
+                ),
+                claim_attempt_batches AS (
+                    INSERT INTO __S__.ready_claim_attempt_batches AS attempt_rows (
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        claim_slot,
+                        first_lane_seq,
+                        next_lane_seq,
+                        claimed_count,
+                        lane_ranges,
+                        claimed_at
+                    )
+                    SELECT
+                        selected.ready_slot,
+                        selected.ready_generation,
+                        selected.queue,
+                        selected.lane_priority,
+                        v_lane_shard,
+                        claim_ring.claim_slot,
+                        min(selected.lane_seq)::bigint AS first_lane_seq,
+                        (max(selected.lane_seq) + 1)::bigint AS next_lane_seq,
+                        count(*)::int AS claimed_count,
+                        range_agg(int8range(selected.lane_seq, selected.lane_seq + 1, '[)') ORDER BY selected.lane_seq)::int8multirange AS lane_ranges,
+                        v_claimed_at
+                    FROM selected_with_spent AS selected
+                    CROSS JOIN claim_ring
+                    WHERE NOT selected.attempt_spent
+                    GROUP BY
+                        selected.ready_slot,
+                        selected.ready_generation,
+                        selected.queue,
+                        selected.lane_priority,
+                        claim_ring.claim_slot
+                    RETURNING
+                        attempt_rows.claim_slot,
+                        attempt_rows.ready_slot,
+                        attempt_rows.ready_generation,
+                        attempt_rows.queue,
+                        attempt_rows.priority AS lane_priority,
+                        attempt_rows.enqueue_shard,
+                        attempt_rows.first_lane_seq,
+                        attempt_rows.next_lane_seq,
+                        attempt_rows.lane_ranges
+                ),
+                claim_items AS MATERIALIZED (
+                    SELECT
+                        attempts.claim_slot,
+                        selected.ready_slot,
+                        selected.ready_generation,
+                        selected.job_id,
+                        selected.queue,
+                        selected.effective_priority AS priority,
+                        selected.lane_seq,
+                        v_lane_shard AS enqueue_shard,
+                        (selected.attempt + 1)::smallint AS attempt,
+                        (selected.run_lease + 1)::bigint AS run_lease,
+                        selected.max_attempts::smallint AS max_attempts,
+                        nextval('__S__.lease_claim_receipt_id_seq'::regclass)::bigint AS receipt_id,
+                        row_number() OVER (
+                            PARTITION BY
+                                attempts.claim_slot,
+                                selected.ready_slot,
+                                selected.ready_generation,
+                                selected.queue,
+                                selected.effective_priority,
+                                v_lane_shard
+                            ORDER BY selected.lane_seq, selected.job_id
+                        )::int AS claim_batch_index
+                    FROM selected_with_spent AS selected
+                    JOIN claim_attempt_batches AS attempts
+                      ON attempts.ready_slot = selected.ready_slot
+                     AND attempts.ready_generation = selected.ready_generation
+                     AND attempts.queue = selected.queue
+                     AND attempts.lane_priority = selected.lane_priority
+                     AND attempts.enqueue_shard = v_lane_shard
+                     AND attempts.first_lane_seq <= selected.lane_seq
+                     AND attempts.next_lane_seq > selected.lane_seq
+                     AND attempts.lane_ranges @> int8range(selected.lane_seq, selected.lane_seq + 1, '[)')
+                    WHERE NOT selected.attempt_spent
+                ),
+                compact_claim_batches AS (
+                    INSERT INTO __S__.lease_claim_batches AS claim_batches (
+                        claim_slot,
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        claimed_count,
+                        job_ids,
+                        run_leases,
+                        receipt_ids,
+                        receipt_ranges,
+                        lane_seqs,
+                        attempts,
+                        max_attempts,
+                        deadline_at,
+                        claimed_at
+                    )
+                    SELECT
+                        claim_items.claim_slot,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.enqueue_shard,
+                        count(*)::int AS claimed_count,
+                        array_agg(claim_items.job_id ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.run_lease ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.receipt_id ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        range_agg(int8range(claim_items.receipt_id, claim_items.receipt_id + 1, '[)') ORDER BY claim_items.receipt_id),
+                        array_agg(claim_items.lane_seq ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.attempt ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        array_agg(claim_items.max_attempts ORDER BY claim_items.lane_seq, claim_items.job_id),
+                        NULL::timestamptz,
+                        v_claimed_at
+                    FROM claim_items
+                    WHERE p_deadline_secs <= 0
+                    GROUP BY
+                        claim_items.claim_slot,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.enqueue_shard
+                    RETURNING
+                        claim_batches.claim_slot,
+                        claim_batches.batch_id,
+                        claim_batches.ready_slot,
+                        claim_batches.ready_generation,
+                        claim_batches.queue,
+                        claim_batches.priority,
+                        claim_batches.enqueue_shard
+                ),
+                row_claims AS (
+                    INSERT INTO __S__.lease_claims AS claim_rows (
+                        claim_slot,
+                        receipt_id,
+                        job_id,
+                        run_lease,
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        attempt,
+                        max_attempts,
+                        lane_seq,
+                        enqueue_shard,
+                        deadline_at
+                    )
+                    SELECT
+                        claim_items.claim_slot,
+                        claim_items.receipt_id,
+                        claim_items.job_id,
+                        claim_items.run_lease,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.attempt,
+                        claim_items.max_attempts,
+                        claim_items.lane_seq,
+                        claim_items.enqueue_shard,
+                        v_deadline_at
+                    FROM claim_items
+                    WHERE p_deadline_secs > 0
+                    RETURNING
+                        claim_rows.claim_slot,
+                        claim_rows.receipt_id,
+                        claim_rows.ready_slot,
+                        claim_rows.ready_generation,
+                        claim_rows.job_id,
+                        claim_rows.queue,
+                        claim_rows.priority,
+                        claim_rows.lane_seq,
+                        claim_rows.attempt,
+                        claim_rows.run_lease,
+                        claim_rows.max_attempts,
+                        NULL::bigint AS claim_batch_id,
+                        NULL::int AS claim_batch_index
+                ),
+                claimed AS (
+                    SELECT
+                        row_claims.claim_slot,
+                        row_claims.receipt_id,
+                        row_claims.claim_batch_id,
+                        row_claims.claim_batch_index,
+                        row_claims.ready_slot,
+                        row_claims.ready_generation,
+                        row_claims.job_id,
+                        row_claims.queue,
+                        row_claims.priority,
+                        row_claims.lane_seq,
+                        row_claims.attempt,
+                        row_claims.run_lease,
+                        row_claims.max_attempts
+                    FROM row_claims
+                    UNION ALL
+                    SELECT
+                        claim_items.claim_slot,
+                        claim_items.receipt_id,
+                        batches.batch_id AS claim_batch_id,
+                        claim_items.claim_batch_index,
+                        claim_items.ready_slot,
+                        claim_items.ready_generation,
+                        claim_items.job_id,
+                        claim_items.queue,
+                        claim_items.priority,
+                        claim_items.lane_seq,
+                        claim_items.attempt,
+                        claim_items.run_lease,
+                        claim_items.max_attempts
+                    FROM claim_items
+                    JOIN compact_claim_batches AS batches
+                      ON batches.claim_slot = claim_items.claim_slot
+                     AND batches.ready_slot = claim_items.ready_slot
+                     AND batches.ready_generation = claim_items.ready_generation
+                     AND batches.queue = claim_items.queue
+                     AND batches.priority = claim_items.priority
+                     AND batches.enqueue_shard = claim_items.enqueue_shard
+                )
+                SELECT
+                    claimed.ready_slot,
+                    claimed.ready_generation,
+                    claimed.lane_seq,
+                    v_lane_shard AS enqueue_shard,
+                    lease_ring.lease_slot,
+                    lease_ring.lease_generation,
+                    claimed.claim_slot,
+                    claimed.receipt_id,
+                    claimed.claim_batch_id,
+                    claimed.claim_batch_index,
+                    selected.job_id,
+                    selected.kind,
+                    selected.queue,
+                    selected.args,
+                    selected.lane_priority,
+                    selected.effective_priority,
+                    claimed.attempt,
+                    claimed.run_lease,
+                    claimed.max_attempts,
+                    selected.run_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN v_claimed_at
+                        ELSE NULL::timestamptz
+                    END AS heartbeat_at,
+                    v_deadline_at AS deadline_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN v_claimed_at
+                        ELSE NULL::timestamptz
+                    END AS attempted_at,
+                    selected.created_at,
+                    selected.unique_key,
+                    selected.unique_states,
+                    selected.payload
+                FROM claimed
+                CROSS JOIN lease_ring
+                JOIN selected
+                 ON selected.ready_slot = claimed.ready_slot
+                 AND selected.ready_generation = claimed.ready_generation
+                 AND selected.queue = claimed.queue
+                 AND selected.effective_priority = claimed.priority
+                 AND selected.lane_seq = claimed.lane_seq
+                ORDER BY selected.lane_seq ASC;
+            END IF;
+        END;
+        $func$
+        $tpl$;
+    t_dispatcher CONSTANT TEXT := $tpl$
+        CREATE OR REPLACE FUNCTION __S__.claim_ready_runtime(
+            p_queue TEXT,
+            p_max_batch BIGINT,
+            p_deadline_secs DOUBLE PRECISION,
+            p_aging_secs DOUBLE PRECISION
+        )
+        RETURNS TABLE(
+            ready_slot INT,
+            ready_generation BIGINT,
+            lane_seq BIGINT,
+            enqueue_shard SMALLINT,
+            lease_slot INT,
+            lease_generation BIGINT,
+            claim_slot INT,
+            receipt_id BIGINT,
+            claim_batch_id BIGINT,
+            claim_batch_index INT,
+            job_id BIGINT,
+            kind TEXT,
+            queue TEXT,
+            args JSONB,
+            lane_priority SMALLINT,
+            priority SMALLINT,
+            attempt SMALLINT,
+            run_lease BIGINT,
+            max_attempts SMALLINT,
+            run_at TIMESTAMPTZ,
+            heartbeat_at TIMESTAMPTZ,
+            deadline_at TIMESTAMPTZ,
+            attempted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ,
+            unique_key BYTEA,
+            unique_states TEXT,
+            payload JSONB
+        )
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, awa, public
+        AS $func$
+        -- awa:claim-routing:v2
+        -- Generated by awa.refresh_claim_functions for __SLOTS__ queue slots.
+        -- Lease claim receipts: __S__.claim_slot_<n> runs
+        -- INSERT INTO __S__.lease_claim_batches (compact claims) and
+        -- INSERT INTO __S__.lease_claims (deadline-backed claims).
+        DECLARE
+            v_current_slot INT;
+            v_retire_slot INT;
+            v_excluded INT;
+            v_lane_priority SMALLINT;
+            v_lane_shard SMALLINT;
+            v_claim_seq_name TEXT;
+            v_lane_claim_seq BIGINT;
+            v_lane_next_seq BIGINT;
+            v_target_slot INT;
+            v_target_generation BIGINT;
+            v_claim_limit BIGINT;
+        BEGIN
+            SELECT ring.current_slot
+            INTO v_current_slot
+            FROM __S__.queue_ring_state AS ring
+            WHERE ring.singleton = TRUE;
+
+            -- The slot queue prune retires next, chosen as prune chooses it.
+            SELECT slots.slot
+            INTO v_retire_slot
+            FROM __S__.queue_ring_slots AS slots
+            WHERE slots.generation >= 0
+              AND slots.slot <> v_current_slot
+            ORDER BY slots.generation ASC, slots.slot ASC
+            LIMIT 1;
+
+            -- Prune takes the slot's retire barrier only once no lane has a
+            -- ready row in the slot at or after its claim cursor. While prune
+            -- holds or requests it, leave the slot out instead of waiting.
+            IF v_retire_slot IS NOT NULL
+               AND NOT pg_try_advisory_xact_lock_shared(hashtextextended(
+                   format('awa.queue_storage.retire:%s:queue:%s', __SCHEMA_LITERAL__::text, v_retire_slot),
+                   0
+               )) THEN
+                v_excluded := v_retire_slot;
+            END IF;
+
+            -- While a slot is left out, a lane is routed only to the segment
+            -- that covers its cursor, and claimed only up to the first gap in
+            -- its lane sequences: a row committed late into the left-out slot
+            -- must keep the cursor at or before it.
+            CASE v_excluded
+__LANE_CASES__
+            END CASE;
+
+            IF NOT FOUND THEN
+                RETURN;
+            END IF;
+
+            IF v_target_slot IS NULL THEN
+                CASE v_excluded
+__ROUTE_CASES__
+                END CASE;
+            END IF;
+
+            IF v_target_slot IS NULL THEN
+                -- No committed ready segment is visible yet. The enqueue
+                -- sequence may include uncommitted reservations, so do not
+                -- advance the claim cursor.
+                RETURN;
+            END IF;
+
+            v_claim_limit := LEAST(GREATEST(v_lane_next_seq - v_lane_claim_seq, 0), p_max_batch);
+            IF v_claim_limit <= 0 THEN
+                RETURN;
+            END IF;
+
+            CASE v_target_slot
+__CLAIM_CASES__
+                ELSE
+                    RAISE EXCEPTION 'claim_ready_runtime: no claim function for queue slot % in schema %',
+                        v_target_slot, __SCHEMA_LITERAL__
+                        USING HINT = 'Run awa migrate, or SELECT awa.refresh_claim_functions(schema, TRUE).';
+            END CASE;
+        END;
+        $func$
+        $tpl$;
+BEGIN
+    IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
+        RAISE EXCEPTION 'refresh_claim_functions: schema name must match ^[a-z_][a-z0-9_]*$; got %',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_lease_claim_receipts IS NULL THEN
+        RAISE EXCEPTION 'refresh_claim_functions: lease_claim_receipts must not be NULL'
+            USING ERRCODE = '22023';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(format('awa.queue_storage.install:%I', p_schema), 0)
+    );
+
+    IF NOT p_lease_claim_receipts THEN
+        RETURN;
+    END IF;
+
+    v_s := quote_ident(p_schema);
+    v_dispatcher := to_regprocedure(format(
+        '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+        p_schema
+    ));
+    IF v_dispatcher IS NULL THEN
+        RAISE EXCEPTION 'refresh_claim_functions: %.claim_ready_runtime does not exist', p_schema
+            USING ERRCODE = '42883',
+                  HINT = 'Install the substrate with awa.install_queue_storage_substrate first.';
+    END IF;
+
+    -- Create the functions as the owner of claim_ready_runtime, so that
+    -- CREATE OR REPLACE keeps working for whoever owns them and their
+    -- privileges can be aligned. set_config('role', ..., true) lasts until
+    -- the end of the transaction, so the caller's role is restored below.
+    SELECT routine.proowner INTO v_owner FROM pg_proc AS routine WHERE routine.oid = v_dispatcher;
+    IF v_owner <> (SELECT role.oid FROM pg_roles AS role WHERE role.rolname = current_user) THEN
+        IF NOT pg_has_role(current_user, v_owner, v_set_mode) THEN
+            RAISE EXCEPTION 'refresh_claim_functions: %.claim_ready_runtime is owned by %, and % cannot act as that role',
+                p_schema, pg_get_userbyid(v_owner), current_user
+                USING ERRCODE = '42501',
+                      HINT = format(
+                          'Run awa migrate as %s, or as a role that can SET ROLE to it.',
+                          quote_ident(pg_get_userbyid(v_owner))
+                      );
+        END IF;
+    END IF;
+
+    -- The queue ring's slots are ready_entries' partitions, ready_entries_0
+    -- to ready_entries_<n-1>. Read from the catalog so the refresh locks no
+    -- table, not even queue_ring_state.
+    SELECT count(*)::int,
+           count(DISTINCT substring(child.relname FROM '^ready_entries_([0-9]+)$')::int)::int,
+           max(substring(child.relname FROM '^ready_entries_([0-9]+)$')::int)
+    INTO v_partitions, v_slot_count, v_slot
+    FROM pg_class AS parent
+    JOIN pg_namespace AS ns ON ns.oid = parent.relnamespace
+    JOIN pg_inherits AS inh ON inh.inhparent = parent.oid
+    JOIN pg_class AS child ON child.oid = inh.inhrelid
+    WHERE ns.nspname = p_schema
+      AND parent.relname = 'ready_entries'
+      AND parent.relkind = 'p';
+    IF v_partitions = 0 OR v_slot_count <> v_partitions OR v_slot <> v_partitions - 1 THEN
+        RAISE EXCEPTION 'refresh_claim_functions: %.ready_entries has % partitions, not ready_entries_0 to ready_entries_%',
+            p_schema, v_partitions, GREATEST(v_partitions - 1, 0)
+            USING ERRCODE = '55000';
+    END IF;
+    FOR v_slot IN 0..(v_slot_count - 1) LOOP
+        FOREACH v_child IN ARRAY ARRAY[
+            'ready_entries', 'ready_segments', 'ready_tombstones', 'ready_claim_attempt_batches'
+        ] LOOP
+            IF to_regclass(format('%I.%I', p_schema, v_child || '_' || v_slot)) IS NULL THEN
+                RAISE EXCEPTION 'refresh_claim_functions: %.%_% is missing', p_schema, v_child, v_slot
+                    USING ERRCODE = '55000';
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    IF v_owner <> (SELECT role.oid FROM pg_roles AS role WHERE role.rolname = current_user) THEN
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', pg_get_userbyid(v_owner), true);
+    END IF;
+
+    FOR v_slot IN 0..(v_slot_count - 1) LOOP
+        EXECUTE replace(replace(t_claim_slot, '__K__', v_slot::text), '__S__', v_s);
+    END LOOP;
+
+    -- One lane-pick and one re-route statement per left-out slot, then one
+    -- of each for no left-out slot (v_slot = v_slot_count, the ELSE branch).
+    FOR v_slot IN 0..v_slot_count LOOP
+        v_arms := NULL;
+        FOR v_other IN 0..(v_slot_count - 1) LOOP
+            CONTINUE WHEN v_other = v_slot;
+            v_arms := CASE WHEN v_arms IS NULL THEN '' ELSE v_arms || E'\n                    UNION ALL' END
+                || replace(t_arm, '__K__', v_other::text);
+        END LOOP;
+        v_lane_arms := replace(replace(replace(v_arms,
+            '__PRIORITY__', 'claims.priority'),
+            '__SHARD__', 'claims.enqueue_shard'),
+            '__CURSOR__', 'cursors.claim_seq');
+        v_route_arms := replace(replace(replace(v_arms,
+            '__PRIORITY__', 'v_lane_priority'),
+            '__SHARD__', 'v_lane_shard'),
+            '__CURSOR__', 'v_lane_claim_seq');
+        IF v_slot = v_slot_count THEN
+            v_lane_cases := v_lane_cases || E'\n                ELSE'
+                || replace(replace(t_lane, '__ARMS__', v_lane_arms), '__COVERED__', 'TRUE');
+            v_route_cases := v_route_cases || E'\n                    ELSE'
+                || replace(replace(t_route, '__ARMS__', v_route_arms), '__COVERED__', 'TRUE');
+        ELSE
+            v_lane_cases := v_lane_cases || format(E'\n                WHEN %s THEN', v_slot)
+                || replace(replace(t_lane, '__ARMS__', v_lane_arms),
+                           '__COVERED__', 'candidate.first_lane_seq <= cursors.claim_seq');
+            v_route_cases := v_route_cases || format(E'\n                    WHEN %s THEN', v_slot)
+                || replace(replace(t_route, '__ARMS__', v_route_arms),
+                           '__COVERED__', 'candidate.first_lane_seq <= v_lane_claim_seq');
+            v_claim_cases := v_claim_cases || format(
+                E'\n                WHEN %1$s THEN'
+                || E'\n                    RETURN QUERY SELECT * FROM __S__.claim_slot_%1$s('
+                || E'\n                        p_queue, v_target_generation, v_lane_priority, v_lane_shard,'
+                || E'\n                        v_claim_seq_name, v_lane_claim_seq, v_claim_limit,'
+                || E'\n                        v_excluded IS NOT NULL,'
+                || E'\n                        p_deadline_secs, p_aging_secs);',
+                v_slot
+            );
+        END IF;
+    END LOOP;
+
+    EXECUTE replace(replace(replace(replace(replace(replace(t_dispatcher,
+        '__LANE_CASES__', v_lane_cases),
+        '__ROUTE_CASES__', v_route_cases),
+        '__CLAIM_CASES__', v_claim_cases),
+        '__SLOTS__', v_slot_count::text),
+        '__SCHEMA_LITERAL__', quote_literal(p_schema)),
+        '__S__', v_s);
+
+    EXECUTE format(
+        'COMMENT ON FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) IS %L',
+        p_schema,
+        'Queue-storage claim allocator. Claims committed ready lanes through the per-slot claim_slot_<n> functions, skips spent/tombstoned lanes, leaves the slot queue prune is retiring out while its barrier is held, and leaves claim-cursor advancement safe under transaction rollback.'
+    );
+
+    -- Each claim_slot_<n> carries the EXECUTE privileges of the dispatcher,
+    -- which calls it as the invoking role.
+    FOR v_slot IN 0..(v_slot_count - 1) LOOP
+        v_function := format(
+            '%I.claim_slot_%s(text,bigint,smallint,smallint,text,bigint,bigint,boolean,double precision,double precision)',
+            p_schema, v_slot
+        )::regprocedure;
+        FOR v_grantee IN
+            SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+            FROM pg_proc AS routine
+            CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+            WHERE routine.oid = v_function
+              AND acl.privilege_type = 'EXECUTE'
+              AND acl.grantee <> routine.proowner
+            EXCEPT
+            SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+            FROM pg_proc AS routine
+            CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+            WHERE routine.oid = v_dispatcher
+              AND acl.privilege_type = 'EXECUTE'
+              AND acl.grantee <> routine.proowner
+        LOOP
+            EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', v_function, v_grantee);
+        END LOOP;
+        FOR v_grantee IN
+            SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+            FROM pg_proc AS routine
+            CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+            WHERE routine.oid = v_dispatcher
+              AND acl.privilege_type = 'EXECUTE'
+              AND acl.grantee <> routine.proowner
+            EXCEPT
+            SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(acl.grantee)) END
+            FROM pg_proc AS routine
+            CROSS JOIN LATERAL aclexplode(COALESCE(routine.proacl, acldefault('f', routine.proowner))) AS acl
+            WHERE routine.oid = v_function
+              AND acl.privilege_type = 'EXECUTE'
+              AND acl.grantee <> routine.proowner
+        LOOP
+            EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', v_function, v_grantee);
+        END LOOP;
+    END LOOP;
+
+    IF v_previous_role IS NOT NULL THEN
+        PERFORM set_config('role', v_previous_role, true);
+    END IF;
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_claim_functions(TEXT, BOOLEAN) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -4343,6 +5640,10 @@ BEGIN
         p_schema,
         'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
     );
+
+    -- With receipts, the function above is replaced by the per-slot claim
+    -- functions, whose statements lock only the slots they read (#721).
+    PERFORM awa.refresh_claim_functions(p_schema, p_lease_claim_receipts);
 
     --------------------------------------------------------------------
     -- REPLICA IDENTITY FULL on the terminal-count delta parent and each
