@@ -3714,12 +3714,12 @@
 <tr>
 <td><code>max_workers</code></td>
 <td><code>50</code></td>
-<td>Always — this is your concurrency cap per queue</td>
+<td>Always — this is your concurrency cap per queue in each worker process</td>
 </tr>
 <tr>
 <td><code>rate_limit</code></td>
 <td><code>None</code></td>
-<td>External API rate limits, backpressure</td>
+<td>External API rate limits, backpressure. The token bucket is per worker process</td>
 </tr>
 <tr>
 <td><code>deadline_duration</code></td>
@@ -3748,6 +3748,7 @@
 </tr>
 </tbody>
 </table>
+<p>Each worker process applies its <code>QueueConfig</code> on its own: <code>max_workers</code> is a semaphore and <code>rate_limit</code> a token bucket inside one runtime. Three replicas each configured with <code>max_workers: 20</code> and a rate of 50 per second allow 60 concurrent jobs and 150 jobs per second across the fleet, so divide the values by the replica count when you need a fleet-wide cap.</p>
 <p>Defaults intentionally favor the smallest blast radius: <code>enqueue_shards = 1</code>, <code>claimers = 1</code>, and <code>claim_batch_size = 512</code>. Raise <code>enqueue_shards</code> only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark <code>claimers = 2</code> or <code>4</code> only when a single claimer cannot keep worker permits full.</p>
 <p>A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: <code>ClientBuilder::max_concurrent_claims</code> (default: a quarter of the pool, clamped to <code>4..=64</code>). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.</p>
 <p>With LISTEN available, consecutive empty polls back off to a 2 s cap (or <code>poll_interval</code> when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain <code>poll_interval</code>. The cap is internal, preserving existing <code>QueueConfig</code> struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.</p>
@@ -3761,20 +3762,21 @@
 </span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">client</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Client</span><span class="p">::</span><span class="n">builder</span><span class="p">(</span><span class="n">pool</span><span class="p">.</span><span class="n">clone</span><span class="p">())</span>
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span><span class="p">.</span><span class="n">partitioned_queue</span><span class="p">(</span><span class="o">&amp;</span><span class="n">customer_updates</span><span class="p">,</span><span class="w"> </span><span class="n">QueueConfig</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">        </span><span class="c1">// Applied per physical queue: 4 × 32 hard-reserved workers.</span>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">        </span><span class="n">max_workers</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="w">        </span><span class="o">..</span><span class="nb">Default</span><span class="p">::</span><span class="n">default</span><span class="p">()</span>
-</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="w">    </span><span class="p">})</span>
-</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="w">    </span><span class="p">.</span><span class="n">register</span><span class="p">::</span><span class="o">&lt;</span><span class="n">UpdateCustomer</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="n">handle_update</span><span class="p">)</span>
-</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
-</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>
-</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="kd">let</span><span class="w"> </span><span class="n">opts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">customer_updates</span><span class="p">.</span><span class="n">route_opts_by_key</span><span class="p">(</span>
-</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="w">    </span><span class="n">InsertOpts</span><span class="p">::</span><span class="n">default</span><span class="p">(),</span>
-</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="w">    </span><span class="fm">format!</span><span class="p">(</span><span class="s">"customer-{customer_id}"</span><span class="p">).</span><span class="n">into_bytes</span><span class="p">(),</span>
-</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="p">);</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">        </span><span class="c1">// Applied per physical queue in each worker process:</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">        </span><span class="c1">// 4 × 32 = 128 hard-reserved workers per process.</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="w">        </span><span class="n">max_workers</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="w">        </span><span class="o">..</span><span class="nb">Default</span><span class="p">::</span><span class="n">default</span><span class="p">()</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="w">    </span><span class="p">})</span>
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="w">    </span><span class="p">.</span><span class="n">register</span><span class="p">::</span><span class="o">&lt;</span><span class="n">UpdateCustomer</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="n">handle_update</span><span class="p">)</span>
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="kd">let</span><span class="w"> </span><span class="n">opts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">customer_updates</span><span class="p">.</span><span class="n">route_opts_by_key</span><span class="p">(</span>
+</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="w">    </span><span class="n">InsertOpts</span><span class="p">::</span><span class="n">default</span><span class="p">(),</span>
+</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="w">    </span><span class="fm">format!</span><span class="p">(</span><span class="s">"customer-{customer_id}"</span><span class="p">).</span><span class="n">into_bytes</span><span class="p">(),</span>
+</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a><span class="p">);</span>
 </span></code></pre></div>
 <p>With one partition, <code>PartitionedQueue::new("email", 1)</code> uses the plain <code>email</code> queue. With more than one partition, partition 0 remains the logical queue name and later partitions use stable suffixes: <code>email</code>, <code>email__p1</code>, <code>email__p2</code>, and so on. Key-based routing sets both the selected physical queue and <code>InsertOpts::ordering_key</code>, so related jobs keep per-key FIFO inside the selected partition even if each physical queue later raises <code>enqueue_shards</code>.</p>
-<p><code>partitioned_queue</code> applies the <code>QueueConfig</code> to each physical queue. In hard-reserved mode, total logical capacity is roughly <code>partitioned_queue.partitions() * max_workers</code>; <code>rate_limit</code> is also per physical queue. Divide those values yourself, or use <code>global_max_workers</code>, when you need a logical total cap across the partitioned queue.</p>
+<p><code>partitioned_queue</code> applies the <code>QueueConfig</code> to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly <code>partitioned_queue.partitions() * max_workers</code>; <code>rate_limit</code> is also per physical queue in each process. Divide those values yourself, or use <code>global_max_workers</code>, when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap.</p>
 <p>Python exposes the same deterministic router through the <code>awa.PartitionedQueue</code> class:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">queue</span> <span class="o">=</span> <span class="n">awa</span><span class="o">.</span><span class="n">PartitionedQueue</span><span class="p">(</span><span class="s2">"customer-updates"</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
 </span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
@@ -3797,34 +3799,7 @@
 <p>Register the handler once and pass explicit partition queue configs to <code>start()</code>. Python handlers are dispatched by job kind; the queue name on <code>@client.task</code> gives <code>start()</code> a declared queue to validate.</p>
 <p><code>route_by_key()</code> returns <code>{"queue": ..., "ordering_key": ...}</code> and can be passed directly to <code>insert()</code>. For <code>insert_many_copy()</code> and <code>enqueue_many_copy()</code>, pass <code>opts=[queue.route_by_key(key) for ...]</code> when a batch contains jobs for multiple partitions. <code>route_by_index()</code> returns only a queue for round-robin partitioning when per-key FIFO is not needed.</p>
 <h3 id="choosing-a-throughput-lever">Choosing a throughput lever<a class="headerlink" href="#choosing-a-throughput-lever" title="Permanent link">&para;</a></h3>
-<p>These knobs solve different bottlenecks:</p>
-<table>
-<thead>
-<tr>
-<th>Knob</th>
-<th>What changes</th>
-<th>Use it when</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>PartitionedQueue</code></td>
-<td>Routes one logical workload across multiple physical queues. Each physical queue has its own queue-level capacity, rate limit, claim cursor, completion stream, and metrics.</td>
-<td>The workload can be partitioned by key or round-robin, and you want more end-to-end throughput from independent queue coordination paths.</td>
-</tr>
-<tr>
-<td><code>enqueue_shards</code></td>
-<td>Keeps one physical queue name, but splits that queue into multiple ordered lanes. FIFO becomes per <code>(queue, priority, enqueue_shard)</code> instead of global per <code>(queue, priority)</code>.</td>
-<td>Operators should still see one queue, but the workload can accept partitioned FIFO inside that queue.</td>
-</tr>
-<tr>
-<td><code>claimers</code></td>
-<td>Adds more dispatcher/claimer loops for the same physical queue inside one worker runtime. They share the queue's worker permits and rate limiter.</td>
-<td>One claimer is leaving worker permits idle. This is not the first lever for a hot queue because extra claimers can add transaction pressure without creating independent capacity domains.</td>
-</tr>
-</tbody>
-</table>
-<p>For a hot workload that can be partitioned, start with <code>PartitionedQueue</code>. If the public queue should stay singular, consider <code>enqueue_shards</code>. Raise <code>claimers</code> only when measurements show the runtime is claim-starved rather than Postgres-bound.</p>
+<p>Separate queues, priority, <code>claimers</code>, <code>enqueue_shards</code> and <code>PartitionedQueue</code> each solve a different problem and give up something different. <a href="../concepts/queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a> explains when to use each and which combine, and <a href="../concepts/scaling-a-hot-queue/">Scaling a hot queue</a> gives the order to try them in for one busy queue.</p>
 <h3 id="python">Python<a class="headerlink" href="#python" title="Permanent link">&para;</a></h3>
 <p>Tuple form for simple cases, dict form for full control:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Hard-reserved — just (name, max_workers)</span>
@@ -3869,7 +3844,7 @@
 <tr>
 <td>Per queue</td>
 <td><code>max_workers</code>, <code>rate_limit</code>, <code>deadline_duration</code>, <code>priority_aging_interval</code>, <code>poll_interval</code>, <code>min_workers</code>, <code>weight</code></td>
-<td>Runtime dispatch policy. <code>deadline_duration</code> is the hard per-attempt wall-clock timeout for every job claimed from that queue.</td>
+<td>Runtime dispatch policy, applied by each worker process: <code>max_workers</code> and <code>rate_limit</code> limit one process, not the fleet. <code>deadline_duration</code> is the hard per-attempt wall-clock timeout for every job claimed from that queue.</td>
 </tr>
 <tr>
 <td>Per job enqueue</td>
@@ -3894,7 +3869,7 @@
 <tr>
 <td>Per runtime / fleet</td>
 <td>heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation</td>
-<td>Process or storage-engine policy, not job-kind policy. <code>queue_storage_queue_stripe_count</code> currently applies to the queue-storage engine rather than to one named queue.</td>
+<td>Process or storage-engine policy, not job-kind policy. <code>queue_storage_queue_stripe_count</code> applies to the queue-storage engine rather than to one named queue, and is planned for deprecation (<a href="https://github.com/hardbyte/awa/issues/752">#752</a>).</td>
 </tr>
 </tbody>
 </table>
@@ -4324,7 +4299,7 @@ pool waits and database errors; a retry count does not prove recovery.</p>
 <tr>
 <td><code>queue_stripe_count</code> / <code>queue_storage_queue_stripe_count</code></td>
 <td><code>1</code></td>
-<td>Number of physical stripes behind each logical queue. <code>1</code> is the normal unstriped path. For a single very hot queue on many small replicas, <code>2</code> is the current tuned recommendation; higher values should be benchmarked before use. A direct queue-storage enqueue puts a job with an <code>ordering_key</code> on the stripe its key hashes to, else a job with a unique key on its key's stripe, and rotates other jobs across stripes. Workers claim from every stripe and from the unstriped logical queue, which SQL compatibility inserts write. Workers with a lower count do not read the higher stripes, so drain those before lowering the count.</td>
+<td>Number of physical stripes behind each logical queue. <code>1</code> is the normal unstriped path. Planned for deprecation in 0.7 in favour of <code>enqueue_shards</code> and <code>PartitionedQueue</code> (<a href="https://github.com/hardbyte/awa/issues/752">#752</a>); do not adopt it for new deployments. A direct queue-storage enqueue puts a job with an <code>ordering_key</code> on the stripe its key hashes to, else a job with a unique key on its key's stripe, and rotates other jobs across stripes. Workers claim from every stripe and from the unstriped logical queue, which SQL compatibility inserts write. Workers with a lower count do not read the higher stripes, so drain those before lowering the count.</td>
 </tr>
 <tr>
 <td><code>lease_claim_receipts</code></td>
@@ -4367,7 +4342,7 @@ no claim interval override, the claim ring uses the queue decision interval.</p>
 <li>Increase <code>queue_slot_count</code> if queue partitions stay unprunable for too long because readers, active leases, or pending ready rows keep old segments live.</li>
 <li>Increase <code>lease_slot_count</code> if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.</li>
 <li>Increase <code>claim_slot_count</code> if the rotation cadence (<code>claim_rotate_interval</code>) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces <code>rotate_claims</code> to return <code>SkippedBusy</code> and the receipt-plane churn falls back onto a smaller working set of partitions.</li>
-<li>Increase <code>queue_stripe_count</code> only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue <code>QueueConfig</code> field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over <code>queue#N</code> physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. For single hot-queue workloads, benchmark <code>2</code> stripes first; higher values should be treated as workload-specific tuning rather than a general default.</li>
+<li>Do not raise <code>queue_stripe_count</code> for new deployments. It is planned for deprecation in 0.7 (<a href="https://github.com/hardbyte/awa/issues/752">#752</a>); for a hot queue, use <code>enqueue_shards</code> or <code>PartitionedQueue</code> instead (see <a href="../concepts/scaling-a-hot-queue/">Scaling a hot queue</a>). Deployments already using it should keep producers and workers on the same count.</li>
 <li>Increase <code>prune_lock_timeout</code> when <code>increase(awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}[15m])</code> stays above zero and the rings stop recycling, typically because frequent short reads of the ring partitions (admin or dashboard queries over the queue-storage tables) hold a conflicting lock at the instant prune tries. A stalled ring grows its current slot, which makes those queries slower and the contention worse. Among its initial partition locks, queue ring prune waits under the timeout only on <code>ready_segments</code> and takes the others with <code>NOWAIT</code>, so a longer timeout does not help when readers hold those. Later reads and writes also run under the timeout. Raise it in small steps (for example <code>50ms</code>, then <code>100ms</code>, then <code>250ms</code>) and keep it well below PostgreSQL's <code>deadlock_timeout</code> (default <code>1s</code>) and below any <code>statement_timeout</code> on the pool's connections. A single lock wait that reaches <code>deadlock_timeout</code> makes PostgreSQL run its deadlock detector, and if claims or enqueues are part of a lock cycle with it, the detector can cancel them rather than the prune; a short <code>lock_timeout</code> abandons the prune first, so the prune is always the one that gives way. A <code>statement_timeout</code> at or below the lock timeout cancels the prune statement before the lock timeout fires, so it fails with an error instead of reporting <code>blocked</code>. Startup logs a warning when the configured timeout is at or above either setting. While prune waits, new accesses to the same partition also queue behind its lock request, so a longer timeout trades claim latency for reclamation. Shortening the readers is the more durable fix when they run longer than a few hundred milliseconds. Watch <code>awa_maintenance_prune_attempts_total</code> by <code>awa_ring</code> and <code>awa_ring_outcome</code>: <code>pruned</code> should advance steadily, <code>blocked</code> means the lock timeout expired, <code>skipped_active</code> (with <code>awa_ring_reason</code>) means live rows kept the slot, <code>backed_off</code> means prune was skipped for a few ticks after repeated <code>skipped_active</code>, and <code>error</code> is a database failure.</li>
 <li>Consider increasing rotation intervals before raising <code>prune_lock_timeout</code>: longer intervals can reduce how often prune requests exclusive locks, while a longer timeout lets each request wait longer. Confirm the effect with workload measurements.</li>
 <li>Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.</li>
@@ -4386,7 +4361,7 @@ no claim interval override, the claim ring uses the queue decision interval.</p>
 <p>Use an upsert rather than a plain <code>UPDATE</code>: the first enqueue can create queue-storage lane rows before an operator-owned <code>queue_meta</code> row exists, so a plain <code>UPDATE</code> may quietly affect zero rows.</p>
 <p>A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S&gt;1 (per-customer, per-order, per-account) pass <code>InsertOpts::ordering_key</code> (Rust) or <code>ordering_key=...</code> (Python) on insert — jobs sharing the key always land on the same shard regardless of which producer batch emitted them.</p>
 <p>Observability: the <code>awa.job.claimed</code> OTel counter carries an <code>awa.enqueue.shard</code> attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.</p>
-<p>Lowering the value is safe at any time. See <a href="../adr/025-sharded-enqueue-heads/">ADR-025</a> for the full design and contract.</p>
+<p>Lowering the value never strands jobs: workers still claim the jobs on shards above the new count. Changing the value in either direction moves ordering keys to different shards, so a key's jobs enqueued before and after the change can run out of order until the older ones drain. Producers that enqueue directly into queue storage cache the count and read the new value only after a restart; the SQL insert path reads it on every insert. See <a href="../adr/025-sharded-enqueue-heads/">ADR-025</a> for the full design and contract.</p>
 <h3 id="hot-queue-claim-control">Hot-Queue Claim Control<a class="headerlink" href="#hot-queue-claim-control" title="Permanent link">&para;</a></h3>
 <p>Queue storage also uses a bounded-claimer control plane (<code>queue_claimer_state</code> / <code>queue_claimer_leases</code>) so not every replica hammers a hot queue's claim path at once. In 0.7, each instance may reuse its claimer lease and target check for up to 250 ms, bypassing the cache within one second of lease expiry. Target reductions constrain new acquisition; existing owned slots remain valid. These are coordination hints: job ownership still comes from the database claim transaction. Reset clears the local cache after truncating the coordination leases. For a single hot queue, raising <code>QueueConfig.claimers</code> lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's <code>max_workers</code> / <code>min_workers</code> permits.</p>
 <p>Keep <code>claimers</code> modest. In the hot-queue reference shape, <code>enqueue_shards = 4</code> is the change that turns overload into bounded end-to-end throughput; raising <code>claimers</code> to <code>4</code> increases transaction pressure and worsens tail latency in that shape. For extreme single-queue workloads, raise <code>enqueue_shards</code> first when the ordering contract allows partitioned FIFO. Benchmark <code>claimers = 2</code> or <code>4</code> only for a workload-specific reason, and judge the result by durable completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed job, transaction commits per completed job, and dead tuples. Lower <code>claim_batch_size</code> from <code>512</code> for small or latency-sensitive queues; raise claimers only with workload-specific evidence.</p>

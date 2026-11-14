@@ -964,10 +964,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-four-levers" class="md-nav__link">
+  <a href="#check-it-is-short-of-lanes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The four levers
+        Check it is short of lanes
       
     </span>
   </a>
@@ -986,10 +986,32 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#measured-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measured results
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#measuring-the-result" class="md-nav__link">
     <span class="md-ellipsis">
       
         Measuring the result
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#queue-stripes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue stripes
       
     </span>
   </a>
@@ -2451,10 +2473,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-four-levers" class="md-nav__link">
+  <a href="#check-it-is-short-of-lanes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The four levers
+        Check it is short of lanes
       
     </span>
   </a>
@@ -2473,10 +2495,32 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#measured-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measured results
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#measuring-the-result" class="md-nav__link">
     <span class="md-ellipsis">
       
         Measuring the result
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#queue-stripes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue stripes
       
     </span>
   </a>
@@ -2524,67 +2568,31 @@
 
 <h1 id="scaling-a-hot-queue">Scaling a hot queue<a class="headerlink" href="#scaling-a-hot-queue" title="Permanent link">&para;</a></h1>
 <p>One busy queue can outgrow the coordination around a single <a href="../lanes-and-claiming/">lane</a>. A lane admits one producer at a time, because a producer holds it until it commits, and one claimer at a time, because a claim locks the lane's cursor. When many producers and workers share one <code>(queue, priority)</code>, they queue behind those two locks while the database still has room.</p>
-<p><a href="../batching/">Batching</a> is the first answer: a larger claim or insert batch moves more jobs through each lock. When that is not enough, AWA can spread the queue so the work no longer funnels through one lane. Each way of spreading it gives up some ordering. <a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a> explains what each tool changes about a queue; this page covers which to try first and how to measure the result.</p>
-<div class="awa-diagram">
-<p><img alt="Enqueue shards add lanes inside one queue, PartitionedQueue spreads a workload over several queues, queue stripes split every queue in the engine, and claimers add claim loops over the same lanes" src="../../assets/how-it-works/scaling.svg" /></p>
-</div>
-<h2 id="the-four-levers">The four levers<a class="headerlink" href="#the-four-levers" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Lever</th>
-<th>What it splits</th>
-<th>Ordering afterwards</th>
-<th>Where it is set</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>enqueue_shards</code></td>
-<td>one queue into several lanes per priority</td>
-<td>FIFO within each shard; per key with an ordering key</td>
-<td>per queue, in <code>awa.queue_meta</code></td>
-</tr>
-<tr>
-<td><code>PartitionedQueue</code></td>
-<td>one workload into several ordinary queues, each with its own capacity, rate limit and metrics</td>
-<td>FIFO per key within a partition</td>
-<td>in producer and worker code</td>
-</tr>
-<tr>
-<td><code>queue_stripe_count</code></td>
-<td>every logical queue into physical stripes <code>queue#0</code>, <code>queue#1</code>, …</td>
-<td>order only within a stripe; jobs sharing an <code>ordering_key</code> share a stripe</td>
-<td>storage configuration, for the whole fleet</td>
-</tr>
-<tr>
-<td><code>claimers</code></td>
-<td>nothing: adds claim loops over the same lanes in one runtime</td>
-<td>unchanged</td>
-<td>per queue, in <code>QueueConfig</code></td>
-</tr>
-</tbody>
-</table>
-<p><strong>Enqueue shards</strong> keep one queue name for operators and spread it over up to 64 lanes per priority. A producer picks a shard by hashing the job's ordering key, so jobs with the same key stay in order; jobs without a key are spread across the shards. Lowering the shard count never strands jobs, but changing it in either direction moves keys to different shards, so a key's older and newer jobs can run out of order until the backlog drains. See <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head</a>.</p>
-<p><strong><code>PartitionedQueue</code></strong> spreads one logical workload over physical queues named <code>email</code>, <code>email__p1</code>, <code>email__p2</code> and so on. Each partition is a complete queue, so worker capacity and rate limits apply per partition: four partitions of 32 workers allow 128. It also routes by key, keeping jobs with the same key in one partition and in order. See <a href="../../configuration/#partitioned-queues">Partitioned queues</a>.</p>
-<p><strong>Queue stripes</strong> are a storage-engine setting that splits every queue the same way, for fleets of many small replicas contending on one queue. Producers that write to queue storage directly should use the same stripe count as the workers. Workers also claim from the unstriped <code>queue</code>, which SQL compatibility inserts and unstriped producers write, but jobs there do not share the stripes' load spreading, and an <code>ordering_key</code> keeps its order only across producers with the same stripe count.</p>
-<p><strong>Claimers</strong> add claim loops inside one runtime. They share the queue's worker permits and rate limit, so they help only when a single loop cannot keep the workers busy. They add transactions without adding lanes, and in measured hot-queue shapes more claimers made tail latency worse.</p>
+<p>This page is the tuning procedure: what to check first, which lever to try in which order, and how to tell whether it helped. <a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a> explains what each lever changes about a queue and what it gives up.</p>
+<h2 id="check-it-is-short-of-lanes">Check it is short of lanes<a class="headerlink" href="#check-it-is-short-of-lanes" title="Permanent link">&para;</a></h2>
+<p>Before spreading a queue, check that it is short of lane throughput rather than of workers. A queue whose <a href="../../configuration/#sizing-workers-from-utilization">utilization</a> stays above about 0.8 needs more workers or a split by service time. Raising <code>max_workers</code> adds workers, and so does a <code>PartitionedQueue</code>, whose partitions each get their own; enqueue shards and claimers add none.</p>
 <h2 id="which-to-try-first">Which to try first<a class="headerlink" href="#which-to-try-first" title="Permanent link">&para;</a></h2>
 <ol>
-<li>Check the claim batch is not the limit: workers sitting idle while the queue has a backlog points at claiming, not at the lane.</li>
-<li>If the workload has a natural key (customer, account, order) and can live with per-key ordering, use <code>PartitionedQueue</code>: it also gives each partition its own worker capacity and rate limit.</li>
-<li>If the queue must stay one queue to operators, raise <code>enqueue_shards</code>. In a 16-producer benchmark, 2, 4 and 8 shards gave 1.6, 2.75 and 3.7 times the throughput of one.</li>
-<li>Use queue stripes only for many small replicas on one queue, and benchmark 2 before going higher.</li>
-<li>Add claimers last, and only with evidence that one claim loop leaves workers idle.</li>
+<li><strong>Batch.</strong> A larger claim or insert <a href="../batching/">batch</a> moves more jobs through each lock. Workers sitting idle while the queue has a backlog points at claiming, not at the lane: raise <code>claim_batch_size</code> first.</li>
+<li><strong>Partition by key.</strong> If the workload has a natural key (customer, account, order) and can live with per-key ordering, use a <a href="../queues-lanes-and-splitting-work/#one-slice-needs-its-own-limits-partitioned-queues">partitioned queue</a>. It also gives each partition its own worker capacity and rate limit.</li>
+<li><strong>Shard.</strong> If the queue must stay one queue to operators, raise <a href="../queues-lanes-and-splitting-work/#producers-waiting-on-one-lane-enqueue-shards"><code>enqueue_shards</code></a>.</li>
+<li><strong>Add claimers last</strong>, and only with evidence that one claim loop leaves workers idle; see <a href="../queues-lanes-and-splitting-work/#idle-workers-with-a-backlog-claimers">claimers</a>.</li>
 </ol>
+<h2 id="measured-results">Measured results<a class="headerlink" href="#measured-results" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Enqueue shards.</strong> In a 16-producer benchmark on one queue, 2, 4 and 8 shards gave 1.6, 2.75 and 3.7 times the throughput of one shard. In the hot-queue reference shape, <code>enqueue_shards = 4</code> is the change that turned overload into bounded end-to-end throughput.</li>
+<li><strong>Claimers.</strong> In the same reference shape, raising <code>claimers</code> to 4 increased transaction pressure and made tail latency worse.</li>
+</ul>
 <h2 id="measuring-the-result">Measuring the result<a class="headerlink" href="#measuring-the-result" title="Permanent link">&para;</a></h2>
-<p>Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Before spreading a queue, check whether it is short of workers instead: a queue whose <a href="../../configuration/#sizing-workers-from-utilization">utilization</a> stays above about 0.8 needs more workers or a split by service time. Raising <code>max_workers</code> adds workers, and so does a <code>PartitionedQueue</code>, whose partitions each get their own; enqueue shards, stripes and claimers add none. The <code>awa.job.claimed</code> counter carries an <code>awa.enqueue.shard</code> attribute, so a dashboard can confirm that claims are spread evenly across shards.</p>
+<p>Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Compare against a run of the same workload before the change. The <code>awa.job.claimed</code> counter carries an <code>awa.enqueue.shard</code> attribute, so a dashboard can confirm that claims are spread evenly across shards.</p>
+<h2 id="queue-stripes">Queue stripes<a class="headerlink" href="#queue-stripes" title="Permanent link">&para;</a></h2>
+<p><code>queue_stripe_count</code> also splits queues into more lanes, but for every queue in the fleet at once. It is planned for deprecation in 0.7 in favour of enqueue shards and partitioned queues (<a href="https://github.com/hardbyte/awa/issues/752">#752</a>); do not adopt it for new deployments. Existing settings are described under <a href="../../configuration/#what-the-knobs-mean">Queue storage tuning</a>.</p>
 <h2 id="related">Related<a class="headerlink" href="#related" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a>: the problem each tool solves, what it gives up, and which combine.</li>
 <li><a href="../lanes-and-claiming/">Lanes and claiming</a>: what a lane is and how a claim takes from it.</li>
 <li><a href="../batching/">Batching</a>: moving more jobs through each statement.</li>
-<li><a href="../../configuration/#choosing-a-throughput-lever">Choosing a throughput lever</a> and <a href="../../adr/025-sharded-enqueue-heads/">ADR-025</a>: settings and design records.</li>
+<li><a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head</a>, <a href="../../configuration/#hot-queue-claim-control">Hot-queue claim control</a> and <a href="../../adr/025-sharded-enqueue-heads/">ADR-025</a>: settings and design records.</li>
 </ul>
 
 

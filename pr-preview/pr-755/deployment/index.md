@@ -45,8 +45,8 @@ Current Rust and Python worker starts default to the correct effective engine fo
 
 Practical starting point, based on the current runtime internals:
 
-- each active queue claimer keeps one `LISTEN` connection open for wakeups (`sum(queue.claimers)`, which equals `queue_count` with default claimers)
-- one cancel listener keeps a `LISTEN` connection open for admin-cancel notifications
+- each runtime (client) keeps one `LISTEN` connection that carries enqueue wakeups for all of its queues
+- each runtime (client) keeps a second `LISTEN` connection for admin-cancel notifications
 - the elected leader holds one advisory-lock connection while it remains leader
 - claim, heartbeat, completion, cleanup, and handler SQL all share the same pool
 
@@ -71,6 +71,28 @@ Examples:
 - combined API + worker process: either use separate pools or size for both workloads explicitly
 
 The Python client defaults to `max_connections=10`. `awa serve` defaults to a pool of `10` connections (configurable via `--pool-max` / `AWA_POOL_MAX`). Other CLI subcommands use a single connection.
+
+### Idle connections and Postgres memory
+
+Each pooled connection is a Postgres backend with its own relation, plan and function caches, and those caches only grow while the backend lives. Queue storage has several hundred partitions and indexes, and the claim path runs per-slot functions, so a backend that has run claims, completions and maintenance holds tens of MB of backend-local memory. Postgres memory for an Awa process is roughly the number of open backends times that size.
+
+The pool keeps every connection it opened at the busiest moment. sqlx hands out the connection that has been idle longest (its idle connections form a FIFO queue), so even an idle runtime, which acquires a connection several times a second for polling and maintenance, touches every pooled connection within seconds. While a runtime keeps using the pool this often, `idle_timeout` rarely closes any of them, and each one ends up having run every statement Awa issues. A process that holds a pool but seldom uses it, such as a client with no workers started, does have idle connections closed.
+
+To return memory after busy periods, set `max_lifetime` on the pool so connections are recycled. A connection past its lifetime is closed when it is next released or when the pool's reaper finds it idle, and the pool opens replacement connections as needed to maintain `min_connections` or to meet concurrent demand. The pool can therefore shrink toward what concurrent demand needs, but not below `min_connections`. A replacement's caches build up again as it is used.
+
+```rust
+let pool = PgPoolOptions::new()
+    .max_connections(20)
+    .max_lifetime(Duration::from_secs(300))
+    .connect(&database_url)
+    .await?;
+```
+
+sqlx's default lifetime is 30 minutes. Shorter lifetimes reconnect more often; at a few minutes the reconnect cost is negligible next to the memory returned.
+
+`awa serve` sets these from `--pool-max-lifetime` / `AWA_POOL_MAX_LIFETIME` (default 1800 seconds) and keeps at least `--pool-min` / `AWA_POOL_MIN` connections (default 2). The Python client takes only `max_connections`, so its pool uses sqlx's 30-minute lifetime and cannot be set shorter.
+
+Do not disable the statement cache with `PgConnectOptions::statement_cache_capacity(0)` to save memory. In sqlx 0.9 every query then leaves a named prepared statement on the server that is never closed, and backend memory grows without bound.
 
 ## Primary Database Hygiene
 
