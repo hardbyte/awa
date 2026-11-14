@@ -37,10 +37,11 @@ Ordering is only promised within a lane:
 
 ## Shards: more lanes for one hot queue
 
-One lane admits one claimer and one producer at a time. When a single `(queue, priority)` carries more traffic than that, raise the queue's `enqueue_shards`. Producers spread jobs across the shards and workers claim from all of them, at the cost of strict FIFO across the whole queue. See [Sharding the enqueue head per queue](../configuration.md#sharding-the-enqueue-head-per-queue) and [Choosing a throughput lever](../configuration.md#choosing-a-throughput-lever).
+One lane admits one claimer and one producer at a time. When a single `(queue, priority)` carries more traffic than that, raise the queue's `enqueue_shards`. Producers spread jobs across the shards and workers claim from all of them, at the cost of strict FIFO across the whole queue. [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md#producers-waiting-on-one-lane-enqueue-shards) compares shards with the other ways to divide work. See [Sharding the enqueue head per queue](../configuration.md#sharding-the-enqueue-head-per-queue) and [Choosing a throughput lever](../configuration.md#choosing-a-throughput-lever).
 
 ## Related
 
+- [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md): when to use separate queues, priority, claimers, shards or partitions, and which combine.
 - [Claims, receipts and leases](claims-receipts-and-leases.md): what a claim writes and how an attempt ends.
 - [Transactional enqueue](transactional-enqueue.md): enqueueing with the business write.
 - [Architecture: enqueue and claim](../architecture.md#enqueue-and-claim): the tables and functions behind each step.

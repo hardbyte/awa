@@ -207,6 +207,9 @@ Health signals:
   the whole overflow pool, so a queue can be saturated at a low ratio while
   other queues hold overflow permits; check its backlog too. See
   [sizing workers from utilization](../../docs/configuration.md#sizing-workers-from-utilization).
+  For a queue short of lanes rather than workers, follow
+  [scaling a hot queue](../../docs/concepts/scaling-a-hot-queue.md); do not
+  adopt `queue_stripe_count` for new deployments (deprecation planned, #752).
 
 On Kubernetes, set `terminationGracePeriodSeconds` above the shutdown drain
 timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.
