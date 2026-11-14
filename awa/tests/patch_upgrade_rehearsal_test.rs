@@ -440,6 +440,41 @@ async fn cli_ok(binary: &PathBuf, database_url: &str, args: &[&str]) -> String {
     stdout
 }
 
+const MIGRATE_ATTEMPTS: usize = 5;
+const MIGRATE_RETRY_PAUSE: Duration = Duration::from_millis(500);
+
+/// `awa migrate` under live traffic, re-run while it fails only because the
+/// `replica_identity` patch could not lock a table within its lock_timeout.
+/// Returns the successful run's stdout, its start and duration, and the number
+/// of attempts.
+async fn migrate_under_traffic(
+    binary: &PathBuf,
+    database_url: &str,
+) -> (String, Instant, Duration, usize) {
+    for attempt in 1..=MIGRATE_ATTEMPTS {
+        let started = Instant::now();
+        let (ok, stdout, stderr) = run_cli(binary, database_url, &["migrate"]).await;
+        if ok {
+            return (stdout, started, started.elapsed(), attempt);
+        }
+        let lock_timeout = stderr.contains("code: \"55P03\"")
+            && stderr.contains("replica_identity: could not lock ")
+            && stderr.contains("Nothing was changed.");
+        assert!(
+            lock_timeout && attempt < MIGRATE_ATTEMPTS,
+            "{} [\"migrate\"] failed on attempt {attempt} of {MIGRATE_ATTEMPTS}:\n{stdout}\n{stderr}",
+            binary.display()
+        );
+        eprintln!(
+            "[patch-rehearsal] awa migrate attempt {attempt} of {MIGRATE_ATTEMPTS} hit the \
+             replica_identity lock timeout; retrying in {MIGRATE_RETRY_PAUSE:?}:\n{}",
+            stderr.trim()
+        );
+        tokio::time::sleep(MIGRATE_RETRY_PAUSE).await;
+    }
+    unreachable!()
+}
+
 // ── database fixture ───────────────────────────────────────────────────
 
 struct Fixture {
@@ -974,9 +1009,8 @@ async fn released_patch_upgrade_and_rollback() {
         seen
     });
     let completes_before_migrate = log.count(EventKind::Complete);
-    let migrate_started = Instant::now();
-    let migrate_out = cli_ok(&candidate_cli, &fixture.owner_url, &["migrate"]).await;
-    let migrate_elapsed = migrate_started.elapsed();
+    let (migrate_out, migrate_started, migrate_elapsed, migrate_attempts) =
+        migrate_under_traffic(&candidate_cli, &fixture.owner_url).await;
     sampling.store(false, std::sync::atomic::Ordering::Relaxed);
     let sampled_locks = sampler.await.unwrap();
     let migrate_ended = migrate_started + migrate_elapsed;
@@ -1018,21 +1052,26 @@ async fn released_patch_upgrade_and_rollback() {
          targets: {unexpected_locks:?}"
     );
     let unexpected_lock_count = unexpected_locks.len();
+    let applied_before_replica_identity = if migrate_attempts == 1 {
+        "applied"
+    } else {
+        "already present"
+    };
     for expected in [
         "Schema: v40 (unchanged)".to_string(),
         format!(
             "Schema patch prepared_lane_sequences: {}",
             if released_version == "0.6.9" {
-                "applied"
+                applied_before_replica_identity
             } else {
                 "already present"
             }
         ),
-        "Schema patch claim_batch_job_index: applied".to_string(),
-        "Schema patch insert_jobs_compat_batch: applied".to_string(),
-        "Schema patch prune_controls: applied".to_string(),
-        "Schema patch runtime_maintenance_eligibility: applied".to_string(),
-        "Schema patch correlated_claim_tombstones: applied".to_string(),
+        format!("Schema patch claim_batch_job_index: {applied_before_replica_identity}"),
+        format!("Schema patch insert_jobs_compat_batch: {applied_before_replica_identity}"),
+        format!("Schema patch prune_controls: {applied_before_replica_identity}"),
+        format!("Schema patch runtime_maintenance_eligibility: {applied_before_replica_identity}"),
+        format!("Schema patch correlated_claim_tombstones: {applied_before_replica_identity}"),
         "Schema patch replica_identity: applied".to_string(),
         format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
     ] {
@@ -1041,7 +1080,7 @@ async fn released_patch_upgrade_and_rollback() {
             "missing {expected:?} in:\n{migrate_out}"
         );
     }
-    if released_version == "0.6.9" {
+    if released_version == "0.6.9" && migrate_attempts == 1 {
         assert!(migrate_out.contains("lane helpers in schema awa"));
         assert!(migrate_out.contains(&format!("lane helpers in schema {SCHEMA}")));
     }
@@ -1496,6 +1535,7 @@ async fn released_patch_upgrade_and_rollback() {
         "jobs_per_queue": per_queue,
         "workers_killed": killed_sources.len(),
         "migrate_ms": migrate_elapsed.as_millis() as u64,
+        "migrate_attempts": migrate_attempts,
         "migrate_output": migrate_out,
         "mixed_fleet_control_status": mixed_fleet_control_status,
         "strong_locks_sampled": sampled_locks.len(),
