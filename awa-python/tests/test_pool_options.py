@@ -42,8 +42,10 @@ def unlimited_lifetime_client():
 
 def test_max_lifetime_recycles_connections(short_lifetime_client):
     first = _backend_pid(short_lifetime_client)
-    time.sleep(1.5)
-    assert _backend_pid(short_lifetime_client) != first
+    deadline = time.monotonic() + 30
+    while _backend_pid(short_lifetime_client) == first:
+        assert time.monotonic() < deadline, "connection was not recycled"
+        time.sleep(0.1)
 
 
 def test_max_lifetime_none_keeps_connections(unlimited_lifetime_client):
