@@ -71,7 +71,7 @@ async def test_async_client_accepts_max_lifetime(async_client_with_lifetime):
 
 
 @pytest.mark.parametrize(
-    "value", [0, -1.0, math.inf, -math.inf, math.nan, 1e300]
+    "value", [0, -1.0, 1e-10, math.inf, -math.inf, math.nan, 1e300]
 )
 def test_invalid_max_lifetime_is_rejected(value):
     with pytest.raises(awa.ValidationError, match="max_lifetime_seconds"):

@@ -84,11 +84,17 @@ fn validate_max_lifetime_seconds(max_lifetime_seconds: f64) -> PyResult<Duration
         )));
     }
 
-    Duration::try_from_secs_f64(max_lifetime_seconds).map_err(|_| {
+    let lifetime = Duration::try_from_secs_f64(max_lifetime_seconds).map_err(|_| {
         map_awa_error(awa_model::AwaError::Validation(
             "max_lifetime_seconds is too large".into(),
         ))
-    })
+    })?;
+    if lifetime.is_zero() {
+        return Err(map_awa_error(awa_model::AwaError::Validation(
+            "max_lifetime_seconds must be at least one nanosecond".into(),
+        )));
+    }
+    Ok(lifetime)
 }
 
 fn parse_transition_worker_role(value: Option<&str>) -> PyResult<awa_worker::TransitionWorkerRole> {
