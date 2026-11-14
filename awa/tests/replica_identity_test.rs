@@ -6,6 +6,8 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+mod ci_timing;
+
 use awa::audited_sql;
 use awa::model::cron::{
     delete_cron_job, pause_cron_job, resume_cron_job, trigger_cron_job, upsert_cron_job,
@@ -18,9 +20,37 @@ use awa_testing::setup::TestDatabase;
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CUSTOM_SCHEMA: &str = "awa_ri_custom";
+
+/// Prune `slot`, retrying while it reports `Blocked` for that slot. Prune takes
+/// its locks NOWAIT, so a background session on the slot (autovacuum, or a
+/// hosted Postgres's own workers) blocks it; the maintenance loop retries the
+/// same way. Any other outcome, or `Blocked` past the deadline, is returned for
+/// the caller to assert on.
+async fn prune_retrying_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+    slot: i32,
+) -> PruneOutcome {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        let outcome = store
+            .prune_oldest(pool, retention)
+            .await
+            .expect("prune_oldest");
+        match outcome {
+            PruneOutcome::Blocked { slot: blocked }
+                if blocked == slot && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Tables that may use REPLICA IDENTITY FULL. Anything else must carry a
 /// primary key or a replica-identity index, so a new table cannot silently
@@ -427,10 +457,7 @@ async fn queue_storage_paths_work_with_an_all_tables_publication() {
         .rollup_terminal_count_deltas(pool, 16)
         .await
         .expect("roll up terminal count deltas");
-    let pruned = store
-        .prune_oldest(pool, Duration::ZERO)
-        .await
-        .expect("prune queue ring");
+    let pruned = prune_retrying_blocked(&store, pool, Duration::ZERO, 0).await;
     assert!(
         matches!(pruned, PruneOutcome::Pruned { .. }),
         "the sealed slot holding the completed jobs should be pruned, got {pruned:?}"
