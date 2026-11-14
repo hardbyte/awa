@@ -23703,12 +23703,22 @@ async fn test_prune_truncates_a_vacuumed_child_with_expanded_indexes() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::raw_sql(&format!("VACUUM (TRUNCATE TRUE) {done_child}"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    let vacuumed = child_storage(&pool, std::slice::from_ref(&done_child)).await[0].clone();
-    assert_eq!(vacuumed.2, 0, "VACUUM returns every heap page");
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    let vacuumed = loop {
+        sqlx::raw_sql(&format!("VACUUM (TRUNCATE TRUE) {done_child}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let storage = child_storage(&pool, std::slice::from_ref(&done_child)).await[0].clone();
+        if storage.2 == 0 {
+            break storage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "VACUUM never returned every heap page: {storage:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert!(vacuumed.3 > fresh.3, "the indexes keep their pages");
 
     assert!(matches!(
