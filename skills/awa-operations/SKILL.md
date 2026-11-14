@@ -389,8 +389,9 @@ lock. Size for steady-state completion rate, not burst.
   connection stays busy enough that `idle_timeout` rarely fires. Set
   `max_lifetime` (for example 5 minutes) to recycle connections: the pool can
   then shrink toward what concurrent demand needs, never below
-  `min_connections`, and ongoing queries open replacements. The Python client
-  does not expose it and uses sqlx's 30-minute default. Never set
+  `min_connections`, and ongoing queries open replacements. In Python pass
+  `max_lifetime_seconds=300` to `awa.Client` or `awa.AsyncClient` (default
+  1800; `None` disables it). Never set
   `statement_cache_capacity(0)`, which leaks prepared statements in sqlx 0.9.
 - **DDL creds.** Migrations and custom-schema prep need DDL-capable credentials.
   Cloud SQL IAM service accounts need a one-shot manual `cloudsqlsuperuser`

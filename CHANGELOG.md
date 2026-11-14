@@ -90,6 +90,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
+- **The Python client's pool connection lifetime is configurable.** `awa.Client` and `awa.AsyncClient` take a keyword-only `max_lifetime_seconds` (default `1800.0`, the lifetime the pool already used). A shorter lifetime recycles connections so the pool can shrink and Postgres can free each backend's caches after busy periods; `None` disables the lifetime, as `PgPoolOptions::max_lifetime(None)` does in Rust. Zero, negative and non-finite values raise `ValidationError`. See [idle connections and Postgres memory](docs/deployment.md#idle-connections-and-postgres-memory).
 - **One job filter ([ADR-049](docs/adr/049-job-filter-and-indexed-tags.md),
   [guide](docs/finding-jobs.md)).** `JobFilter` (kind, queue, any-of states,
   all-of tags, dead-lettered, ids, created-at bounds) drives job listing,
