@@ -498,13 +498,12 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
 
 /// Best-effort: give every empty, owned queue-storage partition its tag
 /// index (ADR-049), which is instant on an empty table. Populated ones are
-/// left to `awa storage build-tag-index`. Runs on a detached connection for
-/// the same reason as [`warm_admin_metadata_cache`].
+/// left to `awa storage build-tag-index`. Closes its connection the same way
+/// as [`warm_admin_metadata_cache`].
 async fn index_empty_tag_partitions(pool: &PgPool) {
-    let Ok(conn) = pool.acquire().await else {
+    let Ok(mut conn) = pool.acquire().await else {
         return;
     };
-    let mut conn = conn.detach();
     match crate::tag_index::index_empty_partitions(&mut conn).await {
         Ok(0) => {}
         Ok(built) => info!(
@@ -522,14 +521,22 @@ async fn run_migration_transaction(
     options: &MigrateOptions,
     lock_key: i64,
 ) -> Result<i32, AwaError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(lock_key)
-        .execute(&mut *tx)
-        .await?;
-    let version_before = apply_migrations(&mut tx, options).await?;
-    tx.commit().await?;
-    Ok(version_before)
+    // Runs on a pool connection that is closed afterwards instead of
+    // returned; the pool permit is held until the close completes.
+    let mut conn = pool.acquire().await?;
+    let result: Result<i32, AwaError> = async {
+        let mut tx = conn.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+        let version_before = apply_migrations(&mut tx, options).await?;
+        tx.commit().await?;
+        Ok(version_before)
+    }
+    .await;
+    let _ = conn.close().await;
+    result
 }
 
 /// The migration that makes lane sequences belong to the schema owner.
@@ -544,11 +551,10 @@ const LANE_PROVISIONING_VERSION: i32 = 53;
 /// with a bounded lock wait instead. Best-effort: the schema is committed, and
 /// whatever is left is reported with the command that finishes it.
 ///
-/// Uses a detached connection for the reason given on
-/// [`warm_admin_metadata_cache`].
+/// Closes its connection the same way as [`warm_admin_metadata_cache`].
 async fn repair_lane_sequences_after_migration(pool: &PgPool) {
     let mut conn = match pool.acquire().await {
-        Ok(conn) => conn.detach(),
+        Ok(conn) => conn,
         Err(error) => {
             warn!(%error, "Could not connect to repair lane sequences; run `awa storage lane-sequences --repair`");
             return;
@@ -686,11 +692,10 @@ async fn apply_migrations(
 /// `migrate()`. Best-effort: any failure is swallowed, since the schema is
 /// already committed and the leader will refresh the cache anyway.
 ///
-/// Runs on a *detached* connection, outside the migration transaction, so it
-/// neither holds the migration advisory lock nor risks rolling back committed
-/// schema on a slow refresh.
+/// Runs outside the migration transaction, so it neither holds the migration
+/// advisory lock nor risks rolling back committed schema on a slow refresh.
 ///
-/// ## Why a detached connection, not `pool.begin()`
+/// ## Why the connection is closed, not returned to the pool
 ///
 /// `migrations::run` may be driven on a short-lived runtime that is dropped the
 /// instant it returns — the Python bridge builds a throwaway `current_thread`
@@ -703,24 +708,21 @@ async fn apply_migrations(
 /// regression: the warmup's `pool.begin()` was the last pool op before the
 /// throwaway runtime dropped.)
 ///
-/// `acquire().detach()` hands us a `PgConnection` the pool no longer tracks:
-/// there is no return-to-pool step to race and no permit to strand. We close it
-/// explicitly with `close().await`, which completes inline before the runtime
-/// goes away. The pool is one connection smaller afterwards; it re-opens a
-/// replacement lazily on the next `acquire`. This runs once per `migrate()`, so
-/// the extra connect is negligible.
+/// `PoolConnection::close().await` closes the backend inline and releases the
+/// pool permit when the close completes, with no return-to-pool step to race.
+/// Unlike `detach()`, it keeps the permit while the connection is in use, so
+/// the pool stays within `max_connections`. The pool re-opens a replacement
+/// lazily on the next `acquire`. This runs once per `migrate()`, so the extra
+/// connect is negligible.
 async fn warm_admin_metadata_cache(pool: &PgPool) {
-    // Detach immediately so nothing borrowed from the pool outlives this
-    // function on a runtime that may be about to be dropped.
-    let Ok(conn) = pool.acquire().await else {
+    let Ok(mut conn) = pool.acquire().await else {
         return;
     };
-    let mut conn = conn.detach();
 
     let has_refresh: Result<bool, _> = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'refresh_admin_metadata' AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'awa'))",
     )
-    .fetch_one(&mut conn)
+    .fetch_one(&mut *conn)
     .await;
 
     if matches!(has_refresh, Ok(true)) {
@@ -747,8 +749,7 @@ async fn warm_admin_metadata_cache(pool: &PgPool) {
         }
     }
 
-    // Detached: nothing returns this to the pool, so close it explicitly (inline,
-    // before any short-lived runtime is dropped) rather than leaking the socket.
+    // Closed inline, before any short-lived runtime is dropped.
     let _ = conn.close().await;
 }
 

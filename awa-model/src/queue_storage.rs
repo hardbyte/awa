@@ -4639,7 +4639,11 @@ impl QueueStorage {
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        let mut install_tx = pool.begin().await.map_err(map_sqlx_error)?;
+        // Runs on a pool connection that is closed inline after the install
+        // and the tag-index pass instead of returned; the pool permit is held
+        // until the close completes.
+        let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?;
+        let mut install_tx = install_conn.begin().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
@@ -4933,24 +4937,28 @@ impl QueueStorage {
         }
         .await;
 
-        match install_result {
-            Ok(()) => {
-                install_tx.commit().await.map_err(map_sqlx_error)?;
-                // Best-effort (ADR-049): empty partitions get their tag
-                // index on the spot; populated ones wait for the migrator's
-                // `awa storage build-tag-index`.
-                if let Ok(mut conn) = pool.acquire().await {
-                    if let Err(error) = crate::tag_index::index_empty_partitions(&mut conn).await {
+        let outcome = match install_result {
+            Ok(()) => match install_tx.commit().await {
+                Ok(()) => {
+                    // Best-effort (ADR-049): empty partitions get their tag
+                    // index on the spot; populated ones wait for the migrator's
+                    // `awa storage build-tag-index`.
+                    if let Err(error) =
+                        crate::tag_index::index_empty_partitions(&mut install_conn).await
+                    {
                         tracing::warn!(%error, "Skipped creating tag indexes");
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
+                Err(err) => Err(map_sqlx_error(err)),
+            },
             Err(err) => {
                 let _ = install_tx.rollback().await;
                 Err(err)
             }
-        }
+        };
+        let _ = install_conn.close().await;
+        outcome
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.activate_backend")]
@@ -13163,6 +13171,7 @@ impl QueueStorage {
             "TRUNCATE TABLE {}",
             targets.join(", ")
         )))
+        .persistent(false)
         .execute(tx.as_mut())
         .await?;
         Ok(targets.len())
@@ -20257,6 +20266,8 @@ impl QueueStorage {
         }
     }
 
+    // Statements whose text names one ring child (probes, prune locks and
+    // truncates) are sent unprepared.
     async fn relation_has_rows_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         relation: &str,
@@ -20264,6 +20275,7 @@ impl QueueStorage {
         sqlx::query_scalar(audited_sql(format!(
             "SELECT EXISTS (SELECT 1 FROM {relation} LIMIT 1)"
         )))
+        .persistent(false)
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
@@ -20325,6 +20337,7 @@ impl QueueStorage {
             )))
             .bind(children)
             .bind(cursor.1)
+            .persistent(false)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -21121,6 +21134,7 @@ impl QueueStorage {
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
             )))
+            .persistent(false)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -21313,6 +21327,7 @@ impl QueueStorage {
             };
 
             sqlx::query(audited_sql(format!("TRUNCATE TABLE {delta_child}")))
+                .persistent(false)
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
@@ -21584,11 +21599,13 @@ impl QueueStorage {
                 sqlx::query(audited_sql(format!(
                     "LOCK TABLE {segment_child} IN ACCESS EXCLUSIVE MODE"
                 )))
+                .persistent(false)
                 .execute(tx.as_mut())
                 .await?;
                 sqlx::query(audited_sql(format!(
                     "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
                 )))
+                .persistent(false)
                 .execute(tx.as_mut())
                 .await
             }
@@ -21980,6 +21997,7 @@ impl QueueStorage {
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
             )))
+            .persistent(false)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -22345,6 +22363,7 @@ impl QueueStorage {
             sqlx::query(audited_sql(format!(
                 "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
             )))
+            .persistent(false)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
