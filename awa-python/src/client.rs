@@ -74,6 +74,29 @@ fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     Ok(Duration::from_secs_f64(timeout_seconds))
 }
 
+/// Default pool connection lifetime, equal to sqlx's own default.
+const DEFAULT_POOL_MAX_LIFETIME_SECONDS: f64 = 1800.0;
+
+fn validate_max_lifetime_seconds(max_lifetime_seconds: f64) -> PyResult<Duration> {
+    if !max_lifetime_seconds.is_finite() || max_lifetime_seconds <= 0.0 {
+        return Err(map_awa_error(awa_model::AwaError::Validation(
+            "max_lifetime_seconds must be a finite, positive number or None".into(),
+        )));
+    }
+
+    let lifetime = Duration::try_from_secs_f64(max_lifetime_seconds).map_err(|_| {
+        map_awa_error(awa_model::AwaError::Validation(
+            "max_lifetime_seconds is too large".into(),
+        ))
+    })?;
+    if lifetime.is_zero() {
+        return Err(map_awa_error(awa_model::AwaError::Validation(
+            "max_lifetime_seconds must be at least one nanosecond".into(),
+        )));
+    }
+    Ok(lifetime)
+}
+
 fn parse_transition_worker_role(value: Option<&str>) -> PyResult<awa_worker::TransitionWorkerRole> {
     match value.unwrap_or("auto") {
         "auto" => Ok(awa_worker::TransitionWorkerRole::Auto),
@@ -488,8 +511,16 @@ pub struct PyClient {
 #[pymethods]
 impl PyClient {
     #[new]
-    #[pyo3(signature = (database_url, max_connections=10))]
-    fn new(py: Python<'_>, database_url: String, max_connections: u32) -> PyResult<Self> {
+    #[pyo3(signature = (database_url, max_connections=10, *, max_lifetime_seconds=Some(DEFAULT_POOL_MAX_LIFETIME_SECONDS)))]
+    fn new(
+        py: Python<'_>,
+        database_url: String,
+        max_connections: u32,
+        max_lifetime_seconds: Option<f64>,
+    ) -> PyResult<Self> {
+        let max_lifetime = max_lifetime_seconds
+            .map(validate_max_lifetime_seconds)
+            .transpose()?;
         // Release the GIL during pool connect so other Python threads can
         // make progress. The block_on is unavoidable here (__init__ must be
         // sync) but is bounded by the 30s timeout.
@@ -501,6 +532,7 @@ impl PyClient {
                         PgPoolOptions::new()
                             .max_connections(max_connections)
                             .acquire_timeout(Duration::from_secs(30))
+                            .max_lifetime(max_lifetime)
                             .connect(&database_url),
                     )
                     .await

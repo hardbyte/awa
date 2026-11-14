@@ -335,7 +335,11 @@ class Client:
     async def cron_owner_action(self, action_json: str, *, actor: str = "python", apply: bool = False) -> str: ...
     def cron_owner_action_sync(self, action_json: str, *, actor: str = "python", apply: bool = False) -> str: ...
     def __init__(
-        self, database_url: str, max_connections: int = 10
+        self,
+        database_url: str,
+        max_connections: int = 10,
+        *,
+        max_lifetime_seconds: float | None = 1800.0,
     ) -> None: ...
     # Async methods
     async def insert(
