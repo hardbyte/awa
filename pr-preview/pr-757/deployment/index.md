@@ -45,8 +45,8 @@ Current Rust and Python worker starts default to the correct effective engine fo
 
 Practical starting point, based on the current runtime internals:
 
-- one `LISTEN` connection carries enqueue wakeups for every queue in the process
-- one cancel listener keeps a `LISTEN` connection open for admin-cancel notifications
+- each runtime (client) keeps one `LISTEN` connection that carries enqueue wakeups for all of its queues
+- each runtime (client) keeps a second `LISTEN` connection for admin-cancel notifications
 - the elected leader holds one advisory-lock connection while it remains leader
 - claim, heartbeat, completion, cleanup, and handler SQL all share the same pool
 
@@ -78,7 +78,7 @@ Each pooled connection is a Postgres backend with its own relation, plan and fun
 
 The pool keeps every connection it opened at the busiest moment. sqlx hands out the connection that has been idle longest (its idle connections form a FIFO queue), so even an idle runtime, which acquires a connection several times a second for polling and maintenance, touches every pooled connection within seconds. As a result `idle_timeout` never closes any of them, and each one ends up having run every statement Awa issues.
 
-To return memory after busy periods, set `max_lifetime` on the pool. A connection past its lifetime is closed when it is next released or when the pool's reaper finds it idle, and the pool only opens a replacement when concurrent demand needs one, so an idle process shrinks to the few connections it actually uses:
+To return memory after busy periods, set `max_lifetime` on the pool. A connection past its lifetime is closed when it is next released or when the pool's reaper finds it idle, and the pool only opens a replacement when concurrent demand needs one, so an idle process shrinks to the few connections it actually uses. The pool does not shrink below `min_connections`: sqlx reopens connections to keep that minimum.
 
 ```rust
 let pool = PgPoolOptions::new()
@@ -89,6 +89,8 @@ let pool = PgPoolOptions::new()
 ```
 
 sqlx's default lifetime is 30 minutes. Shorter lifetimes reconnect more often; at a few minutes the reconnect cost is negligible next to the memory returned.
+
+`awa serve` sets these from `--pool-max-lifetime` / `AWA_POOL_MAX_LIFETIME` (default 1800 seconds) and keeps at least `--pool-min` / `AWA_POOL_MIN` connections (default 2). The Python client takes only `max_connections`, so its pool uses sqlx's 30-minute lifetime and cannot be set shorter.
 
 Do not disable the statement cache with `PgConnectOptions::statement_cache_capacity(0)` to save memory. In sqlx 0.9 every query then leaves a named prepared statement on the server that is never closed, and backend memory grows without bound.
 
