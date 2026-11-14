@@ -102,13 +102,15 @@ The key `QueueConfig` fields:
 
 | Field | Default | When you'd change it |
 | --- | --- | --- |
-| `max_workers` | `50` | Always — this is your concurrency cap per queue |
-| `rate_limit` | `None` | External API rate limits, backpressure |
+| `max_workers` | `50` | Always — this is your concurrency cap per queue in each worker process |
+| `rate_limit` | `None` | External API rate limits, backpressure. The token bucket is per worker process |
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on the claim batch's shared `lease_claim_batches.deadline_at` and the maintenance rescue path force-closes expired claims. |
 | `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
+
+Each worker process applies its `QueueConfig` on its own: `max_workers` is a semaphore and `rate_limit` a token bucket inside one runtime. Three replicas each configured with `max_workers: 20` and a rate of 50 per second allow 60 concurrent jobs and 150 jobs per second across the fleet, so divide the values by the replica count when you need a fleet-wide cap.
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
@@ -131,7 +133,8 @@ let customer_updates = PartitionedQueue::new("customer-updates", 4)?;
 
 let client = Client::builder(pool.clone())
     .partitioned_queue(&customer_updates, QueueConfig {
-        // Applied per physical queue: 4 × 32 hard-reserved workers.
+        // Applied per physical queue in each worker process:
+        // 4 × 32 = 128 hard-reserved workers per process.
         max_workers: 32,
         ..Default::default()
     })
@@ -146,7 +149,7 @@ let opts = customer_updates.route_opts_by_key(
 
 With one partition, `PartitionedQueue::new("email", 1)` uses the plain `email` queue. With more than one partition, partition 0 remains the logical queue name and later partitions use stable suffixes: `email`, `email__p1`, `email__p2`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO inside the selected partition even if each physical queue later raises `enqueue_shards`.
 
-`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, total logical capacity is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue. Divide those values yourself, or use `global_max_workers`, when you need a logical total cap across the partitioned queue.
+`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue in each process. Divide those values yourself, or use `global_max_workers`, when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap.
 
 Python exposes the same deterministic router through the `awa.PartitionedQueue` class:
 
@@ -176,15 +179,7 @@ Register the handler once and pass explicit partition queue configs to `start()`
 
 ### Choosing a throughput lever
 
-These knobs solve different bottlenecks:
-
-| Knob | What changes | Use it when |
-| --- | --- | --- |
-| `PartitionedQueue` | Routes one logical workload across multiple physical queues. Each physical queue has its own queue-level capacity, rate limit, claim cursor, completion stream, and metrics. | The workload can be partitioned by key or round-robin, and you want more end-to-end throughput from independent queue coordination paths. |
-| `enqueue_shards` | Keeps one physical queue name, but splits that queue into multiple ordered lanes. FIFO becomes per `(queue, priority, enqueue_shard)` instead of global per `(queue, priority)`. | Operators should still see one queue, but the workload can accept partitioned FIFO inside that queue. |
-| `claimers` | Adds more dispatcher/claimer loops for the same physical queue inside one worker runtime. They share the queue's worker permits and rate limiter. | One claimer is leaving worker permits idle. This is not the first lever for a hot queue because extra claimers can add transaction pressure without creating independent capacity domains. |
-
-For a hot workload that can be partitioned, start with `PartitionedQueue`. If the public queue should stay singular, consider `enqueue_shards`. Raise `claimers` only when measurements show the runtime is claim-starved rather than Postgres-bound.
+Separate queues, priority, `claimers`, `enqueue_shards` and `PartitionedQueue` each solve a different problem and give up something different. [Queues, lanes and splitting work](concepts/queues-lanes-and-splitting-work.md) explains when to use each and which combine, and [Scaling a hot queue](concepts/scaling-a-hot-queue.md) gives the order to try them in for one busy queue.
 
 ### Python
 
@@ -235,12 +230,12 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 
 | Scope | Knobs | Notes |
 | --- | --- | --- |
-| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
+| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy, applied by each worker process: `max_workers` and `rate_limit` limit one process, not the fleet. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
 | Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, extra metadata and the declared [output type](job-output.md#typed-outputs). They do not set dispatch limits or timeouts. |
 | Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout). |
 | Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
-| Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` currently applies to the queue-storage engine rather than to one named queue. |
+| Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` applies to the queue-storage engine rather than to one named queue, and is planned for deprecation ([#752](https://github.com/hardbyte/awa/issues/752)). |
 
 There is no active per-job-kind hard timeout today. The hard timeout is the queue's `deadline_duration`; moving long-running kinds onto their own queue is the intended way to give them a different timeout without making every job on a busy queue slower to rescue.
 
@@ -610,7 +605,7 @@ await client.start(
 | `queue_slot_count` | `16` | Number of rotating ready, claim-attempt, tombstone, and terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows and claim-attempt evidence rely on the matching ready partition until queue prune reclaims the segment. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` children). All three tables share the same `claim_slot` so each partition's claims and closure evidence are reclaimed together by `TRUNCATE`; compact closure batches also carry ready segment metadata so prune can prove sealed segments by counts and skip conservatively when counts do not prove closure. Each slot has tiny stale-rescue and deadline-rescue cursors in `claim_ring_slots`. |
-| `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. A direct queue-storage enqueue puts a job with an `ordering_key` on the stripe its key hashes to, else a job with a unique key on its key's stripe, and rotates other jobs across stripes. Workers claim from every stripe and from the unstriped logical queue, which SQL compatibility inserts write. Workers with a lower count do not read the higher stripes, so drain those before lowering the count. |
+| `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. Planned for deprecation in 0.7 in favour of `enqueue_shards` and `PartitionedQueue` ([#752](https://github.com/hardbyte/awa/issues/752)); do not adopt it for new deployments. A direct queue-storage enqueue puts a job with an `ordering_key` on the stripe its key hashes to, else a job with a unique key on its key's stripe, and rotates other jobs across stripes. Workers claim from every stripe and from the unstriped logical queue, which SQL compatibility inserts write. Workers with a lower count do not read the higher stripes, so drain those before lowering the count. |
 | `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes compact attempt-emission range evidence into `ready_claim_attempt_batches` and receipt evidence into row-local `lease_claims` or compact `lease_claim_batches`; successful compact completion validates the returned receipt identity, writes `receipt_completion_batches` terminal history, and writes `lease_claim_closure_batches` closure evidence; non-success exits write explicit closures into `lease_claim_closures`; receipt tables are reclaimed by claim-ring prune, and attempt-emission evidence is reclaimed by queue-ring prune). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto the batch's `lease_claim_batches.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `1000ms` | How often lease segments rotate |
@@ -629,7 +624,7 @@ Use the defaults unless you have a reason not to:
 - Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers, active leases, or pending ready rows keep old segments live.
 - Increase `lease_slot_count` if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.
 - Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
-- Increase `queue_stripe_count` only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue `QueueConfig` field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. For single hot-queue workloads, benchmark `2` stripes first; higher values should be treated as workload-specific tuning rather than a general default.
+- Do not raise `queue_stripe_count` for new deployments. It is planned for deprecation in 0.7 ([#752](https://github.com/hardbyte/awa/issues/752)); for a hot queue, use `enqueue_shards` or `PartitionedQueue` instead (see [Scaling a hot queue](concepts/scaling-a-hot-queue.md)). Deployments already using it should keep producers and workers on the same count.
 - Increase `prune_lock_timeout` when `increase(awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}[15m])` stays above zero and the rings stop recycling, typically because frequent short reads of the ring partitions (admin or dashboard queries over the queue-storage tables) hold a conflicting lock at the instant prune tries. A stalled ring grows its current slot, which makes those queries slower and the contention worse. Among its initial partition locks, queue ring prune waits under the timeout only on `ready_segments` and takes the others with `NOWAIT`, so a longer timeout does not help when readers hold those. Later reads and writes also run under the timeout. Raise it in small steps (for example `50ms`, then `100ms`, then `250ms`) and keep it well below PostgreSQL's `deadlock_timeout` (default `1s`) and below any `statement_timeout` on the pool's connections. A single lock wait that reaches `deadlock_timeout` makes PostgreSQL run its deadlock detector, and if claims or enqueues are part of a lock cycle with it, the detector can cancel them rather than the prune; a short `lock_timeout` abandons the prune first, so the prune is always the one that gives way. A `statement_timeout` at or below the lock timeout cancels the prune statement before the lock timeout fires, so it fails with an error instead of reporting `blocked`. Startup logs a warning when the configured timeout is at or above either setting. While prune waits, new accesses to the same partition also queue behind its lock request, so a longer timeout trades claim latency for reclamation. Shortening the readers is the more durable fix when they run longer than a few hundred milliseconds. Watch `awa_maintenance_prune_attempts_total` by `awa_ring` and `awa_ring_outcome`: `pruned` should advance steadily, `blocked` means the lock timeout expired, `skipped_active` (with `awa_ring_reason`) means live rows kept the slot, `backed_off` means prune was skipped for a few ticks after repeated `skipped_active`, and `error` is a database failure.
 - Consider increasing rotation intervals before raising `prune_lock_timeout`: longer intervals can reduce how often prune requests exclusive locks, while a longer timeout lets each request wait longer. Confirm the effect with workload measurements.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
@@ -658,7 +653,7 @@ A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× / 3.69
 
 Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
 
-Lowering the value is safe at any time. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
+Lowering the value never strands jobs: workers still claim the jobs on shards above the new count. Changing the value in either direction moves ordering keys to different shards, so a key's jobs enqueued before and after the change can run out of order until the older ones drain. Producers that enqueue directly into queue storage cache the count and read the new value only after a restart; the SQL insert path reads it on every insert. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
 
 ### Hot-Queue Claim Control
 
