@@ -4615,9 +4615,10 @@ impl QueueStorage {
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        // Runs on a connection detached from the pool, closed inline after
-        // the install and the tag-index pass.
-        let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?.detach();
+        // Runs on a pool connection that is closed inline after the install
+        // and the tag-index pass instead of returned; the pool permit is held
+        // until the close completes.
+        let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?;
         let mut install_tx = install_conn.begin().await.map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -4932,7 +4933,7 @@ impl QueueStorage {
                 Err(err)
             }
         };
-        let _ = sqlx::Connection::close(install_conn).await;
+        let _ = install_conn.close().await;
         outcome
     }
 

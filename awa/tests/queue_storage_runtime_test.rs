@@ -282,6 +282,77 @@ async fn test_queue_storage_prepare_schema_completes_with_single_connection_pool
     );
 }
 
+/// Migrate and prepare_schema keep their pool permit until their connection
+/// is closed, so concurrent queries on a one-connection pool wait instead of
+/// opening a second backend. Closing backends report `idle`, so only busy
+/// backends are counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_migrate_and_prepare_schema_stay_within_a_one_connection_pool() {
+    use sqlx::Connection;
+
+    let (_db_guard, pool) = setup_pool(1).await;
+    let options = (*pool.connect_options()).clone();
+    let store =
+        QueueStorage::new(QueueStorageConfig::default()).expect("queue storage config is valid");
+
+    let mut sampler = sqlx::PgConnection::connect_with(&options)
+        .await
+        .expect("sampler connects");
+    let done = Arc::new(AtomicBool::new(false));
+    let querier = {
+        let pool = pool.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            while !done.load(Ordering::SeqCst) {
+                let _: i32 = sqlx::query_scalar("SELECT 1")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("concurrent query on the one-connection pool");
+            }
+        })
+    };
+    let work = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            migrations::run(&pool).await.expect("migrate");
+            store.prepare_schema(&pool).await.expect("prepare_schema");
+        })
+    };
+
+    let started = Instant::now();
+    let mut max_backends = 0_i64;
+    while !work.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "migrate and prepare_schema did not finish on a one-connection pool"
+        );
+        let backends: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND backend_type = 'client backend' \
+               AND state <> 'idle' \
+               AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut sampler)
+        .await
+        .expect("sample backends");
+        max_backends = max_backends.max(backends);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(60), work)
+        .await
+        .expect("migrate and prepare_schema finish on a one-connection pool")
+        .expect("migrate and prepare_schema task");
+    done.store(true, Ordering::SeqCst);
+    querier.await.expect("querier task");
+
+    assert!(
+        max_backends <= 1,
+        "a one-connection pool had {max_backends} busy backends during migrate and prepare_schema"
+    );
+    assert!(pool.size() <= 1);
+}
+
 #[tokio::test]
 async fn test_queue_storage_prepare_schema_concurrent_startups_serialize() {
     let (_db_guard, pool) = setup_pool(4).await;
