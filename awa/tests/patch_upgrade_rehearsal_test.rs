@@ -445,12 +445,17 @@ const MIGRATE_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
 /// `awa migrate` under live traffic, re-run while it fails only because the
 /// `replica_identity` patch could not lock a table within its lock_timeout.
-/// Returns the successful run's stdout and the number of attempts.
-async fn migrate_under_traffic(binary: &PathBuf, database_url: &str) -> (String, usize) {
+/// Returns the successful run's stdout, its start and duration, and the number
+/// of attempts.
+async fn migrate_under_traffic(
+    binary: &PathBuf,
+    database_url: &str,
+) -> (String, Instant, Duration, usize) {
     for attempt in 1..=MIGRATE_ATTEMPTS {
+        let started = Instant::now();
         let (ok, stdout, stderr) = run_cli(binary, database_url, &["migrate"]).await;
         if ok {
-            return (stdout, attempt);
+            return (stdout, started, started.elapsed(), attempt);
         }
         let lock_timeout = stderr.contains("code: \"55P03\"")
             && stderr.contains("replica_identity: could not lock ")
@@ -1004,10 +1009,8 @@ async fn released_patch_upgrade_and_rollback() {
         seen
     });
     let completes_before_migrate = log.count(EventKind::Complete);
-    let migrate_started = Instant::now();
-    let (migrate_out, migrate_attempts) =
+    let (migrate_out, migrate_started, migrate_elapsed, migrate_attempts) =
         migrate_under_traffic(&candidate_cli, &fixture.owner_url).await;
-    let migrate_elapsed = migrate_started.elapsed();
     sampling.store(false, std::sync::atomic::Ordering::Relaxed);
     let sampled_locks = sampler.await.unwrap();
     let migrate_ended = migrate_started + migrate_elapsed;
