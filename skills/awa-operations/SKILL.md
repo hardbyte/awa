@@ -381,8 +381,17 @@ lock. Size for steady-state completion rate, not burst.
   `idle_in_transaction_session_timeout` and `statement_timeout`; alert on
   `pg_stat_activity.xact_start` age.
 - **Pool sizing.** `max_connections >= sum(queue claimers) + 5`, plus headroom
-  for handler SQL, producers, and admin. Each claimer holds a LISTEN connection;
-  the leader holds one advisory-lock connection.
+  for handler SQL, producers, and admin. Each runtime (client) holds one LISTEN
+  connection for enqueue wakeups and one for admin cancels; the leader holds
+  one advisory-lock connection. Every pooled connection is a backend holding
+  tens of MB of caches once warm. sqlx reuses the longest-idle connection
+  first, and an awa runtime uses its pool several times a second, so every
+  connection stays busy enough that `idle_timeout` rarely fires. Set
+  `max_lifetime` (for example 5 minutes) to recycle connections: the pool can
+  then shrink toward what concurrent demand needs, never below
+  `min_connections`, and ongoing queries open replacements. The Python client
+  does not expose it and uses sqlx's 30-minute default. Never set
+  `statement_cache_capacity(0)`, which leaks prepared statements in sqlx 0.9.
 - **DDL creds.** Migrations and custom-schema prep need DDL-capable credentials.
   Cloud SQL IAM service accounts need a one-shot manual `cloudsqlsuperuser`
   grant; AlloyDB grants `alloydbsuperuser` automatically.
