@@ -329,6 +329,9 @@ pub struct Dispatcher {
     /// How long past the deadline a handler may keep running before the
     /// executor drops it; see [`Self::abandon_after`].
     abandon_grace: Duration,
+    /// Set for a timer wake that follows an empty poll: before claiming,
+    /// read the queue's ready signal and skip the claim when it is zero.
+    check_ready_signal: bool,
 }
 
 /// Two default deadline-rescue scans.
@@ -376,6 +379,7 @@ impl Dispatcher {
             claim_gate,
             claimer_owner_id,
             abandon_grace: DEFAULT_ABANDON_GRACE,
+            check_ready_signal: false,
         }
     }
 
@@ -435,7 +439,11 @@ impl Dispatcher {
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
                 _ = tokio::time::sleep(sleep_for) => {
+                    // After an empty poll, a zero ready signal ends this
+                    // fallback poll without claiming.
+                    self.check_ready_signal = idle_polls > 0 && notify_wake.is_some();
                     let claimed = self.drain_ready(WakeReason::Poll, Instant::now()).await;
+                    self.check_ready_signal = false;
                     if claimed || notify_wake.is_none() {
                         idle_polls = 0;
                     } else {
@@ -487,6 +495,18 @@ impl Dispatcher {
         permits
     }
 
+    /// In weighted mode, clear this queue's overflow demand.
+    fn clear_overflow_demand(&self) {
+        if let ConcurrencyMode::Weighted {
+            overflow_pool,
+            queue_name,
+            ..
+        } = &self.concurrency
+        {
+            overflow_pool.try_acquire(queue_name, 0);
+        }
+    }
+
     fn refund_rate_limit(&self, n: usize) {
         if n == 0 {
             return;
@@ -528,6 +548,8 @@ impl Dispatcher {
         fields(queue = %self.queue)
     )]
     async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
+        // Only the first claim of a drain is gated on the ready signal.
+        let check_ready_signal = std::mem::take(&mut self.check_ready_signal);
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
@@ -641,6 +663,27 @@ impl Dispatcher {
                 }
             },
             RuntimeStorage::QueueStorage(runtime) => {
+                if check_ready_signal {
+                    match runtime
+                        .store
+                        .queue_may_have_ready(&self.pool, &self.queue)
+                        .await
+                    {
+                        Ok(false) => {
+                            self.refund_rate_limit(batch_size);
+                            self.clear_overflow_demand();
+                            return false;
+                        }
+                        Ok(true) => {}
+                        Err(err) => {
+                            debug!(
+                                queue = %self.queue,
+                                error = %err,
+                                "Ready signal read failed; claiming"
+                            );
+                        }
+                    }
+                }
                 let claim_slot = tokio::select! {
                     biased;
                     _ = self.cancel.cancelled() => {
@@ -758,14 +801,7 @@ impl Dispatcher {
                 self.metrics
                     .record_dispatch_empty_claim(&self.queue, reason.as_str());
             }
-            if let ConcurrencyMode::Weighted {
-                overflow_pool,
-                queue_name,
-                ..
-            } = &self.concurrency
-            {
-                overflow_pool.try_acquire(queue_name, 0);
-            }
+            self.clear_overflow_demand();
             return false;
         }
 

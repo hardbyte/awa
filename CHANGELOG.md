@@ -14,6 +14,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- **An idle runtime costs the database fewer transactions (0.6 port of #756).** Promotion checks for due rows with one read-only query before running its full pass; the batch-operation runner checks for an active operation before taking its lock; and a dispatcher's fallback poll after an empty poll ends on a zero ready signal, read across every stripe and the unstriped queue, instead of refreshing its claimer lease and claiming. Promotion still runs every `promote_interval`, and the lost-NOTIFY fallback still polls every 2 seconds. `QueueStorage::queue_counts_fast` now reads its counts in one statement. No configuration or schema change.
 - Ring prune truncates only the children of the sealed slot that hold storage (0.6 port of #512). Queue, lease and claim prune take the same locks on every child of the slot, in the same order, as in 0.6.17, then `TRUNCATE` only the children with heap, TOAST, free-space-map or visibility-map pages, or index pages beyond an empty btree, GiST or BRIN index. A child that never held a row keeps its relfilenode, so a prune no longer swaps relfilenodes and writes WAL and catalog rows for empty partitions, such as the receipt children of a schema without receipts. A child emptied by `DELETE` and `VACUUM` that kept expanded indexes or TOAST is still truncated. The empty-slot fast path is unchanged. No configuration or schema change.
 
 ### Fixed
