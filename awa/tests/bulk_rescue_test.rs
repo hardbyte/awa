@@ -81,12 +81,53 @@ async fn count(pool: &PgPool, sql: String) -> i64 {
 /// Retry promotion transfers a row between these states in one transaction.
 /// Read both counts from one statement so a commit between reads cannot count
 /// the same job once in deferred storage and again in ready storage.
+///
+/// The overview's `available` is an estimate once a lane holds more than
+/// `AVAILABLE_LANE_EXACT_COUNT_CAP` rows; both counts are then read exactly
+/// from the queue-storage tables, still in one statement.
 async fn waiting_retry_counts(pool: &PgPool, queue: &str) -> (i64, i64) {
     let overview = awa::model::admin::queue_overview(pool, queue)
         .await
         .expect("retry accounting overview")
         .expect("retry accounting queue");
-    (overview.retryable, overview.available)
+    if !overview.available_is_estimate {
+        return (overview.retryable, overview.available);
+    }
+    let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let schema = store.schema();
+    sqlx::query_as(&format!(
+        r#"
+        SELECT
+            (
+                SELECT count(*)::bigint
+                FROM {schema}.deferred_jobs
+                WHERE queue = $1 AND state = 'retryable'
+            ),
+            (
+                SELECT count(*)::bigint
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                 AND claims.enqueue_shard = ready.enqueue_shard
+                WHERE ready.queue = $1
+                  AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
+            )
+        "#
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("exact retry accounting")
 }
 
 #[tokio::test]
