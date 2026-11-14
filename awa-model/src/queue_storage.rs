@@ -225,6 +225,37 @@ pub struct ClaimedRuntimeJob {
     pub unique_states: Option<String>,
 }
 
+/// Identity of a deadline-backed receipt claim for heartbeat purposes: the
+/// claim slot that holds its `lease_claims` row and the ready slot it was
+/// claimed from, so a heartbeat reads only those slots' children. Built with
+/// [`RowClaimHeartbeatRef::from_claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowClaimHeartbeatRef {
+    pub job_id: i64,
+    pub run_lease: i64,
+    pub claim_slot: i32,
+    pub ready_slot: i32,
+    pub receipt_id: i64,
+}
+
+impl RowClaimHeartbeatRef {
+    /// The heartbeat identity of a row-local receipt claim, or `None` for
+    /// compact or legacy claims.
+    pub fn from_claim(job_id: i64, run_lease: i64, claim: &ClaimedEntry) -> Option<Self> {
+        if !claim.lease_claim_receipt || claim.claim_batch_id.is_some() {
+            return None;
+        }
+        Some(Self {
+            job_id,
+            run_lease,
+            claim_slot: claim.claim_slot,
+            ready_slot: claim.ready_slot,
+            receipt_id: claim.receipt_id?,
+        })
+    }
+}
+
 /// Identity of a compact receipt claim for heartbeat purposes: addresses
 /// `lease_claim_batches` by primary key and the attempt by item index, so a
 /// heartbeat does not have to scan every open claim batch. Built with
@@ -745,6 +776,66 @@ async fn acquire_prune_exclusive_lock_tx(
     }
 }
 
+/// The longest single wait of [`acquire_queue_retire_barrier_tx`].
+const RETIRE_BARRIER_CEILING: Duration = Duration::from_secs(2);
+
+/// The advisory key of the barrier that retires queue ring slot `slot`.
+///
+/// `claim_ready_runtime` computes the same key for the slot prune would
+/// retire next and tries it in shared mode; the format string must match the
+/// one in `awa.refresh_claim_runtime`.
+const QUEUE_RETIRE_BARRIER_KEY_SQL: &str =
+    "hashtextextended(format('awa.queue_storage.retire:%s:queue:%s', $1::text, $2::int), 0)";
+
+/// Take the retire barrier of queue slot `slot` exclusively.
+///
+/// A claim that sees the barrier held, or an exclusive request queued for
+/// it, leaves the slot out of its routing and so never locks the slot's
+/// children; claims never wait on it. Prune therefore only waits here for
+/// claims that started before it asked. A queued request blocks no claim, so
+/// the attempts escalate from `base` to [`RETIRE_BARRIER_CEILING`] without
+/// pausing between them.
+async fn acquire_queue_retire_barrier_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    slot: i32,
+    base: Duration,
+) -> Result<(), AwaError> {
+    let ceiling = base.max(RETIRE_BARRIER_CEILING);
+    let mut timeout = base;
+    loop {
+        sqlx::query("SAVEPOINT awa_prune_retire_barrier")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(tx, timeout).await?;
+        let locked = sqlx::query(&format!(
+            "SELECT pg_advisory_xact_lock({QUEUE_RETIRE_BARRIER_KEY_SQL})"
+        ))
+        .bind(schema)
+        .bind(slot)
+        .execute(tx.as_mut())
+        .await;
+        match locked {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT awa_prune_retire_barrier")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return set_lock_timeout_tx(tx, base).await;
+            }
+            Err(err) if is_prune_contention_error(&err) && timeout < ceiling => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_prune_retire_barrier")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                timeout = timeout.saturating_mul(2).min(ceiling);
+            }
+            Err(err) => return Err(map_sqlx_error(err)),
+        }
+    }
+}
+
 /// Commit or roll back a maintenance transaction that has set the prune
 /// `lock_timeout`.
 ///
@@ -995,6 +1086,33 @@ fn receipt_closed_evidence_sql(
         schema,
         closure_rel,
         closure_batch_rel,
+        &format!("{schema}.done_entries"),
+        claims_alias,
+        ReceiptEvidence::Closed,
+    )
+}
+
+/// [`receipt_closed_evidence_sql`] for claims that all reference the ready
+/// slot whose `done_entries` child is `done_rel`.
+///
+/// A terminal row for an attempt is written into the ready slot its claim
+/// references, and the only move of a terminal row to another slot is prune
+/// carrying failed rows out of a slot it retires. Prune retires a slot only
+/// once every claim referencing it has a closure, and closures are checked
+/// before the terminal row, so the other children never decide the outcome.
+/// See ADR-023, "Slot-local terminal evidence".
+fn receipt_closed_evidence_in_slot_sql(
+    schema: &str,
+    closure_rel: &str,
+    closure_batch_rel: &str,
+    done_rel: &str,
+    claims_alias: &str,
+) -> String {
+    receipt_evidence_sql(
+        schema,
+        closure_rel,
+        closure_batch_rel,
+        done_rel,
         claims_alias,
         ReceiptEvidence::Closed,
     )
@@ -1004,6 +1122,7 @@ fn receipt_evidence_sql(
     schema: &str,
     closure_rel: &str,
     closure_batch_rel: &str,
+    done_rel: &str,
     claims_alias: &str,
     evidence: ReceiptEvidence,
 ) -> String {
@@ -1040,7 +1159,7 @@ fn receipt_evidence_sql(
                   AND closure_batches.receipt_ranges @> {claims_alias}.receipt_id{range_fence}
             )
             {join} {exists} (
-                SELECT 1 FROM {schema}.done_entries AS done
+                SELECT 1 FROM {done_rel} AS done
                 WHERE done.job_id = {claims_alias}.job_id
                   AND done.run_lease = {claims_alias}.run_lease
             )
@@ -1122,6 +1241,7 @@ fn open_receipt_running_claims_sql_from(
         schema,
         &closure_rel,
         &closure_batch_rel,
+        &format!("{schema}.done_entries"),
         "claims",
         ReceiptEvidence::Open,
     );
@@ -4894,6 +5014,32 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
         for advance in advances {
+            // The attempt batch is read from the claim's own slot child: a
+            // prepared statement over the parent switches to a generic plan,
+            // which locks every slot child, sealed ones included (#721).
+            let attempts_check = match advance.evidence {
+                Some(evidence) => {
+                    let attempts_rel = ready_claim_attempt_batch_child_name(
+                        schema,
+                        ring_slot_index(evidence.ready_slot, self.queue_slot_count(), "queue")?,
+                    );
+                    format!(
+                        r#"EXISTS (
+                          SELECT 1
+                          FROM {attempts_rel} AS attempts
+                          WHERE attempts.ready_slot = $6
+                            AND attempts.ready_generation = $7
+                            AND attempts.queue = $1
+                            AND attempts.priority = $2
+                            AND attempts.enqueue_shard = $3
+                            AND attempts.first_lane_seq <= $8
+                            AND attempts.next_lane_seq > $8
+                            AND attempts.lane_ranges @> int8range($8, $8 + 1, '[)')
+                      )"#
+                    )
+                }
+                None => "FALSE".to_string(),
+            };
             sqlx::query(&format!(
                 r#"
                 WITH head AS MATERIALIZED (
@@ -4909,18 +5055,7 @@ impl QueueStorage {
                 WHERE ($5::bigint IS NULL OR {schema}.sequence_next_value(seq_name) = $5)
                   AND (
                       $6::int IS NULL
-                      OR ($9::bigint IS NULL AND EXISTS (
-                          SELECT 1
-                          FROM {schema}.ready_claim_attempt_batches AS attempts
-                          WHERE attempts.ready_slot = $6
-                            AND attempts.ready_generation = $7
-                            AND attempts.queue = $1
-                            AND attempts.priority = $2
-                            AND attempts.enqueue_shard = $3
-                            AND attempts.first_lane_seq <= $8
-                            AND attempts.next_lane_seq > $8
-                            AND attempts.lane_ranges @> int8range($8, $8 + 1, '[)')
-                      ))
+                      OR ($9::bigint IS NULL AND {attempts_check})
                       OR EXISTS (
                           SELECT 1 FROM {schema}.leases AS leases
                           WHERE $9::bigint IS NOT NULL
@@ -7206,12 +7341,16 @@ impl QueueStorage {
         let finalized_at = Utc::now();
         let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
         let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
-        let mut by_partition: BTreeMap<usize, Vec<&ClaimedRuntimeJob>> = BTreeMap::new();
+        // Grouped by claim slot and ready slot, so each statement reads only
+        // the children those slots name and never a sealed one (#721).
+        let mut by_partition: BTreeMap<(usize, usize), Vec<&ClaimedRuntimeJob>> = BTreeMap::new();
         for entry in claimed {
             let claim_slot_index =
                 ring_slot_index(entry.claim.claim_slot, self.claim_slot_count(), "claim")?;
+            let ready_slot_index =
+                ring_slot_index(entry.claim.ready_slot, self.queue_slot_count(), "queue")?;
             by_partition
-                .entry(claim_slot_index)
+                .entry((claim_slot_index, ready_slot_index))
                 .or_default()
                 .push(entry);
         }
@@ -7235,14 +7374,20 @@ impl QueueStorage {
         }
 
         let mut rows = Vec::with_capacity(claimed.len());
-        for (claim_slot_index, group) in by_partition {
+        for ((claim_slot_index, ready_slot_index), group) in by_partition {
             let claim_rel = claim_child_name(schema, claim_slot_index);
             let claim_batch_rel = claim_batch_child_name(schema, claim_slot_index);
             let closure_rel = closure_child_name(schema, claim_slot_index);
             let closure_batch_rel = claim_closure_batch_child_name(schema, claim_slot_index);
+            let done_rel = done_child_name(schema, ready_slot_index);
             let receipt_batch_rel = format!("{schema}.receipt_completion_batches");
-            let closed_evidence =
-                receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+            let closed_evidence = receipt_closed_evidence_in_slot_sql(
+                schema,
+                &closure_rel,
+                &closure_batch_rel,
+                &done_rel,
+                "claims",
+            );
 
             let claim_slots: Vec<i32> = group.iter().map(|entry| entry.claim.claim_slot).collect();
             let ready_slots: Vec<i32> = group.iter().map(|entry| entry.claim.ready_slot).collect();
@@ -15252,75 +15397,226 @@ impl QueueStorage {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(0);
         }
-        let job_ids: Vec<i64> = claims.iter().map(|claim| claim.job_id).collect();
-        let run_leases: Vec<i64> = claims.iter().map(|claim| claim.run_lease).collect();
-        let claim_slots: Vec<i32> = claims.iter().map(|claim| claim.claim_slot).collect();
-        let batch_ids: Vec<i64> = claims.iter().map(|claim| claim.claim_batch_id).collect();
-        let batch_indices: Vec<i32> = claims.iter().map(|claim| claim.claim_batch_index).collect();
-        let receipt_ids: Vec<i64> = claims.iter().map(|claim| claim.receipt_id).collect();
-        let updated: i64 = sqlx::query_scalar(&format!(
-            r#"
-            WITH inflight(job_id, run_lease, claim_slot, batch_id, batch_index, receipt_id) AS (
-                SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::int[], $4::bigint[], $5::int[], $6::bigint[])
-            ),
-            open_claims AS (
-                SELECT inflight.job_id, inflight.run_lease
+        // Each claim slot's children are named, and the terminal check reads
+        // the done child of each claim's ready slot, so no statement here
+        // locks a sealed slot (#721). The attempt locks above are held to
+        // commit, so a closer that commits after the first statement has
+        // waited for this transaction, and the later statements see every
+        // closer that committed before it.
+        let mut by_claim_slot: BTreeMap<usize, Vec<&ClaimHeartbeatRef>> = BTreeMap::new();
+        for claim in claims {
+            let slot = ring_slot_index(claim.claim_slot, self.claim_slot_count(), "claim")?;
+            by_claim_slot.entry(slot).or_default().push(claim);
+        }
+        let mut open: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        for (claim_slot, group) in by_claim_slot {
+            let claim_batch_rel = claim_batch_child_name(schema, claim_slot);
+            let closure_rel = closure_child_name(schema, claim_slot);
+            let closure_batch_rel = claim_closure_batch_child_name(schema, claim_slot);
+            let job_ids: Vec<i64> = group.iter().map(|claim| claim.job_id).collect();
+            let run_leases: Vec<i64> = group.iter().map(|claim| claim.run_lease).collect();
+            let batch_ids: Vec<i64> = group.iter().map(|claim| claim.claim_batch_id).collect();
+            let batch_indices: Vec<i32> =
+                group.iter().map(|claim| claim.claim_batch_index).collect();
+            let receipt_ids: Vec<i64> = group.iter().map(|claim| claim.receipt_id).collect();
+            let rows: Vec<(i64, i64, i32)> = sqlx::query_as(&format!(
+                r#"
+                WITH inflight(job_id, run_lease, batch_id, batch_index, receipt_id) AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::int[], $5::bigint[])
+                )
+                SELECT inflight.job_id, inflight.run_lease, claim_batches.ready_slot
                 FROM inflight
-                JOIN {schema}.lease_claim_batches AS claim_batches
-                  ON claim_batches.claim_slot = inflight.claim_slot
+                JOIN {claim_batch_rel} AS claim_batches
+                  ON claim_batches.claim_slot = $6
                  AND claim_batches.batch_id = inflight.batch_id
                 WHERE inflight.batch_index BETWEEN 1 AND claim_batches.claimed_count
                   AND claim_batches.job_ids[inflight.batch_index] = inflight.job_id
                   AND claim_batches.run_leases[inflight.batch_index] = inflight.run_lease
                   AND claim_batches.receipt_ids[inflight.batch_index] = inflight.receipt_id
                   AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.claim_slot = inflight.claim_slot
+                      SELECT 1 FROM {closure_rel} AS closures
+                      WHERE closures.claim_slot = $6
                         AND closures.job_id = inflight.job_id
                         AND closures.run_lease = inflight.run_lease
                   )
                   AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
-                      WHERE closure_batches.claim_slot = inflight.claim_slot
+                      SELECT 1 FROM {closure_batch_rel} AS closure_batches
+                      WHERE closure_batches.claim_slot = $6
                         AND closure_batches.receipt_ranges @> inflight.receipt_id
                   )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.done_entries AS done
-                      WHERE done.job_id = inflight.job_id AND done.run_lease = inflight.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                      WHERE deferred.job_id = inflight.job_id AND deferred.run_lease = inflight.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.dlq_entries AS dlq
-                      WHERE dlq.job_id = inflight.job_id AND dlq.run_lease = inflight.run_lease
-                  )
-            ),
-            upserted AS (
-                INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
-                SELECT open_claims.job_id, open_claims.run_lease, clock_timestamp(), clock_timestamp()
-                FROM open_claims
-                ON CONFLICT (job_id, run_lease)
-                DO UPDATE SET
-                    heartbeat_at = clock_timestamp(),
-                    updated_at = clock_timestamp()
-                RETURNING job_id
-            )
-            SELECT count(*)::bigint FROM upserted
-            "#
-        ))
-        .bind(&job_ids)
-        .bind(&run_leases)
-        .bind(&claim_slots)
-        .bind(&batch_ids)
-        .bind(&batch_indices)
-        .bind(&receipt_ids)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                "#
+            ))
+            .bind(&job_ids)
+            .bind(&run_leases)
+            .bind(&batch_ids)
+            .bind(&batch_indices)
+            .bind(&receipt_ids)
+            .bind(claim_slot as i32)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            for (job_id, run_lease, ready_slot) in rows {
+                let ready_slot = ring_slot_index(ready_slot, self.queue_slot_count(), "queue")?;
+                open.entry(ready_slot)
+                    .or_default()
+                    .push((job_id, run_lease));
+            }
+        }
+        let updated = self
+            .upsert_open_attempt_heartbeats_tx(&mut tx, open)
+            .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(updated as usize)
+        Ok(updated)
+    }
+
+    /// Heartbeat the open attempts in `open`, keyed by the ready slot each
+    /// one's claim references, unless the attempt already has a terminal,
+    /// deferred or dead-letter row. The terminal check reads only the done
+    /// child of the attempt's own ready slot; see
+    /// [`receipt_closed_evidence_in_slot_sql`] for why that is complete.
+    async fn upsert_open_attempt_heartbeats_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        open: BTreeMap<usize, Vec<(i64, i64)>>,
+    ) -> Result<usize, AwaError> {
+        let schema = self.schema();
+        let mut updated = 0usize;
+        for (ready_slot, attempts) in open {
+            let done_rel = done_child_name(schema, ready_slot);
+            let job_ids: Vec<i64> = attempts.iter().map(|(job_id, _)| *job_id).collect();
+            let run_leases: Vec<i64> = attempts.iter().map(|(_, run_lease)| *run_lease).collect();
+            let count: i64 = sqlx::query_scalar(&format!(
+                r#"
+                WITH upserted AS (
+                    INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+                    SELECT inflight.job_id, inflight.run_lease, clock_timestamp(), clock_timestamp()
+                    FROM unnest($1::bigint[], $2::bigint[]) AS inflight(job_id, run_lease)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {done_rel} AS done
+                        WHERE done.job_id = inflight.job_id AND done.run_lease = inflight.run_lease
+                    )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                        WHERE deferred.job_id = inflight.job_id
+                          AND deferred.run_lease = inflight.run_lease
+                    )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {schema}.dlq_entries AS dlq
+                        WHERE dlq.job_id = inflight.job_id AND dlq.run_lease = inflight.run_lease
+                    )
+                    ON CONFLICT (job_id, run_lease)
+                    DO UPDATE SET
+                        heartbeat_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    RETURNING job_id
+                )
+                SELECT count(*)::bigint FROM upserted
+                "#
+            ))
+            .bind(&job_ids)
+            .bind(&run_leases)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            updated += count as usize;
+        }
+        Ok(updated)
+    }
+
+    /// Heartbeat deadline-backed receipt claims by their slots. Each claim
+    /// slot and ready slot pair is one statement over the children those
+    /// slots name, so a heartbeat never locks a sealed slot (#721). Attempts
+    /// that a closer holds right now are skipped rather than waited for.
+    pub async fn heartbeat_row_claims_batch(
+        &self,
+        pool: &PgPool,
+        claims: &[RowClaimHeartbeatRef],
+    ) -> Result<usize, AwaError> {
+        if claims.is_empty() {
+            return Ok(0);
+        }
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let pairs: Vec<(i64, i64)> = claims
+            .iter()
+            .map(|claim| (claim.job_id, claim.run_lease))
+            .collect();
+        let locked: HashSet<(i64, i64)> = self
+            .try_lock_receipt_attempt_keys_tx(&mut tx, &pairs)
+            .await?
+            .into_iter()
+            .collect();
+        let mut groups: BTreeMap<(usize, usize), Vec<&RowClaimHeartbeatRef>> = BTreeMap::new();
+        for claim in claims
+            .iter()
+            .filter(|claim| locked.contains(&(claim.job_id, claim.run_lease)))
+        {
+            let claim_slot = ring_slot_index(claim.claim_slot, self.claim_slot_count(), "claim")?;
+            let ready_slot = ring_slot_index(claim.ready_slot, self.queue_slot_count(), "queue")?;
+            groups
+                .entry((claim_slot, ready_slot))
+                .or_default()
+                .push(claim);
+        }
+        let mut updated = 0usize;
+        for ((claim_slot, ready_slot), group) in groups {
+            let claim_rel = claim_child_name(schema, claim_slot);
+            let closed_evidence = receipt_closed_evidence_in_slot_sql(
+                schema,
+                &closure_child_name(schema, claim_slot),
+                &claim_closure_batch_child_name(schema, claim_slot),
+                &done_child_name(schema, ready_slot),
+                "claims",
+            );
+            let job_ids: Vec<i64> = group.iter().map(|claim| claim.job_id).collect();
+            let run_leases: Vec<i64> = group.iter().map(|claim| claim.run_lease).collect();
+            let receipt_ids: Vec<i64> = group.iter().map(|claim| claim.receipt_id).collect();
+            let count: i64 = sqlx::query_scalar(&format!(
+                r#"
+                WITH inflight(job_id, run_lease, receipt_id) AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])
+                ),
+                row_claim_refs AS (
+                    SELECT claims.job_id, claims.run_lease
+                    FROM {claim_rel} AS claims
+                    JOIN inflight
+                      ON inflight.job_id = claims.job_id
+                     AND inflight.run_lease = claims.run_lease
+                     AND inflight.receipt_id = claims.receipt_id
+                    WHERE NOT {closed_evidence}
+                    FOR UPDATE OF claims
+                ),
+                upserted AS (
+                    INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+                    SELECT row_claim_refs.job_id, row_claim_refs.run_lease, clock_timestamp(), clock_timestamp()
+                    FROM row_claim_refs
+                    ON CONFLICT (job_id, run_lease)
+                    DO UPDATE SET
+                        heartbeat_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    RETURNING job_id
+                ),
+                marked AS (
+                    UPDATE {claim_rel} AS claims
+                    SET materialized_at = COALESCE(claims.materialized_at, clock_timestamp())
+                    FROM row_claim_refs
+                    WHERE claims.job_id = row_claim_refs.job_id
+                      AND claims.run_lease = row_claim_refs.run_lease
+                    RETURNING claims.job_id
+                )
+                SELECT count(*)::bigint FROM upserted
+                "#
+            ))
+            .bind(&job_ids)
+            .bind(&run_leases)
+            .bind(&receipt_ids)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            updated += count as usize;
+        }
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(updated)
     }
 
     /// Lock legacy lease rows without waiting behind a finalizer. Keep this
@@ -18374,11 +18670,9 @@ impl QueueStorage {
         }
 
         // Beyond the emptiness gate above, queue prune has three liveness
-        // skip gates. Check them before taking ACCESS EXCLUSIVE on the
-        // ready/terminal child tables so a known-busy slot does not block hot
-        // claim reads behind a doomed truncate attempt. These are only MVCC
-        // snapshots; the same gates are checked again after the exclusive
-        // locks.
+        // skip gates. The two cheap ones run here, before the retire barrier,
+        // so a known-busy slot does not hold claims away from it. These are
+        // only MVCC snapshots; all three gates run under the slot locks.
         let active_leases =
             queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
 
@@ -18403,20 +18697,13 @@ impl QueueStorage {
             });
         }
 
-        let unclosed_claim_refs =
-            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
-
-        if unclosed_claim_refs {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueueUnclosedClaimRefs,
-                count: busy_indicator(unclosed_claim_refs),
-            });
-        }
-
         let locked: Result<PruneOutcome, AwaError> = async {
-            set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+            // Pending ready rows were ruled out above, so a claim that leaves
+            // this slot out of its routing misses no work. Once the barrier is
+            // held no claim can reference the slot again, and the claim
+            // functions stop locking its children.
+            acquire_queue_retire_barrier_tx(&mut tx, schema, slot, self.prune_lock_timeout)
+                .await?;
 
             // Locks are requested in this order, and a statement that holds
             // a later child while it waits behind the request for an earlier
@@ -18445,7 +18732,10 @@ impl QueueStorage {
 
             // The pre-lock gates are only an MVCC snapshot. Writers that
             // touched the slot have committed by the time the lock is
-            // granted, so these gates see them.
+            // granted, so these gates see them. The claim-reference count is
+            // the expensive proof; it runs once, here, where it stalls no
+            // reader: the barrier keeps new claims from referencing the slot
+            // and closures only accumulate, so it still holds at the truncate.
             let active_leases =
                 queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
             if active_leases {

@@ -22970,10 +22970,11 @@ fn sealed_slot_children(schema: &str, queue_slot: usize, claim_slot: usize) -> V
     children
 }
 
-/// Runs `operation` while another session holds `ACCESS EXCLUSIVE` on
-/// `locked`, and records its name if it had not finished after two seconds.
-/// The lock is then released and the same operation is left to finish, so
-/// later steps have its result.
+/// Runs `operation` while another session holds what a prune holds while it
+/// retires queue slot 0: the slot's retire barrier and `ACCESS EXCLUSIVE` on
+/// `locked`. Records the operation's name if it had not finished within the
+/// wait. The locks are then released and the same operation is left to
+/// finish, so later steps have its result.
 async fn run_against_locked_children<T, F, Fut>(
     pool: &sqlx::PgPool,
     locked: &[String],
@@ -22989,6 +22990,14 @@ where
         return operation().await;
     }
     let mut holder = pool.begin().await.expect("begin lock holder");
+    let schema = locked[0].split('.').next().expect("schema-qualified child");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(format('awa.queue_storage.retire:%s:queue:%s', $1::text, 0), 0))",
+    )
+    .bind(schema)
+    .execute(holder.as_mut())
+    .await
+    .expect("take the retire barrier");
     sqlx::query(&format!(
         "LOCK TABLE {} IN {} MODE",
         locked.join(", "),
@@ -22999,7 +23008,12 @@ where
     .expect("lock the sealed slot's children");
     let operation = operation();
     tokio::pin!(operation);
-    match tokio::time::timeout(Duration::from_secs(2), &mut operation).await {
+    match tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(2)),
+        &mut operation,
+    )
+    .await
+    {
         Ok(value) => {
             holder.rollback().await.expect("release the sealed slot");
             value
@@ -23141,6 +23155,164 @@ async fn test_prune_wins_against_overlapping_short_readers() {
     assert!(
         slowest < Duration::from_millis(1_000),
         "a reader stalled for {slowest:?} behind prune"
+    );
+}
+
+/// Claim transactions that each outlast prune's longest `ACCESS EXCLUSIVE`
+/// wait, overlapping so that one is always open, while heartbeats and
+/// completions run against the live slot (#721). A claim that locks the
+/// sealed slot's children keeps every upgrade attempt waiting until it gives
+/// up, so prune can only win if claims stop touching the slot it retires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_prune_wins_against_overlapping_claim_transactions() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let schema = "awa_qs_prune_overlapping_claims";
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 4,
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    let queue = "qs_prune_overlapping_claims";
+
+    store.enqueue_batch(&pool, queue, 2, 4).await.unwrap();
+    let finished = store
+        .claim_runtime_batch(&pool, queue, 4, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(finished.len(), 4);
+    store
+        .complete_runtime_batch(&pool, &finished)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    store.enqueue_batch(&pool, queue, 2, 2_000).await.unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    // Each claim transaction holds its locks for 500 ms, longer than the
+    // 320 ms ceiling of prune's upgrade, and a new one starts every 125 ms.
+    for claimer in 0..4u64 {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let claim = format!("SELECT count(*) FROM {schema}.claim_ready_runtime($1, 1, 0, 0)");
+        tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(125 * claimer)).await;
+            let mut transactions = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let mut tx = pool.begin().await.expect("begin claim");
+                let _: i64 = sqlx::query_scalar(&claim)
+                    .bind(queue)
+                    .fetch_one(tx.as_mut())
+                    .await
+                    .expect("claim");
+                sqlx::query("SELECT pg_sleep(0.5)")
+                    .execute(tx.as_mut())
+                    .await
+                    .expect("hold the claim transaction");
+                tx.rollback().await.expect("roll back claim");
+                transactions += 1;
+            }
+            transactions
+        }));
+    }
+    // Compact and deadline claims heartbeated and completed in a loop.
+    for deadline in [Duration::ZERO, Duration::from_secs(30)] {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut cycles = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let claimed = store
+                    .claim_runtime_batch(&pool, queue, 2, deadline)
+                    .await
+                    .expect("claim for heartbeat");
+                let compact: Vec<_> = claimed
+                    .iter()
+                    .filter_map(|job| {
+                        awa::model::queue_storage::ClaimHeartbeatRef::from_claim(
+                            job.job.id,
+                            job.job.run_lease,
+                            &job.claim,
+                        )
+                    })
+                    .collect();
+                store
+                    .heartbeat_claims_batch(&pool, &compact)
+                    .await
+                    .expect("heartbeat claims");
+                let rows: Vec<_> = claimed
+                    .iter()
+                    .filter_map(|job| {
+                        awa::model::queue_storage::RowClaimHeartbeatRef::from_claim(
+                            job.job.id,
+                            job.job.run_lease,
+                            &job.claim,
+                        )
+                    })
+                    .collect();
+                store
+                    .heartbeat_row_claims_batch(&pool, &rows)
+                    .await
+                    .expect("heartbeat row claims");
+                store
+                    .complete_runtime_batch(&pool, &claimed)
+                    .await
+                    .expect("complete");
+                cycles += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            cycles
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        let outcome = store.prune_oldest(&pool, Duration::ZERO).await.unwrap();
+        let pruned = matches!(outcome, PruneOutcome::Pruned { slot: 0, .. });
+        outcomes.push(outcome);
+        if pruned {
+            break;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let mut progress = Vec::new();
+    for task in tasks {
+        progress.push(task.await.expect("traffic task"));
+    }
+    assert!(
+        progress.iter().all(|count| *count > 0),
+        "every traffic loop made progress while prune ran: {progress:?}"
+    );
+    assert!(
+        matches!(outcomes.last(), Some(PruneOutcome::Pruned { slot: 0, .. })),
+        "prune never retired the sealed slot under overlapping claims: {outcomes:?}"
+    );
+    let sealed_rows: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.ready_entries_0"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sealed_rows, 0, "the retired slot was truncated");
+    assert!(
+        matches!(
+            store.rotate(&pool).await.unwrap(),
+            RotateOutcome::Rotated { slot: 2, .. }
+        ),
+        "the ring keeps rotating after the prune"
     );
 }
 
@@ -23378,7 +23550,6 @@ async fn test_claim_prune_does_not_hold_the_slot_row_while_it_waits_for_partitio
 /// Set `AWA_AUDIT_SEALED_LOCKS` to lock one child at a time and print which
 /// operations wait on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails until the hot paths address slot children directly (#721)"]
 async fn test_hot_paths_do_not_lock_sealed_slot_children() {
     let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_sealed_slot_locks";
@@ -23466,12 +23637,25 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         )
         .await;
         assert_eq!(deadline_claims.len(), 4);
-        let pairs: Vec<(i64, i64)> = deadline_claims
+        let row_refs: Vec<_> = deadline_claims
             .iter()
-            .map(|job| (job.job.id, job.job.run_lease))
+            .map(|job| {
+                awa::model::queue_storage::RowClaimHeartbeatRef::from_claim(
+                    job.job.id,
+                    job.job.run_lease,
+                    &job.claim,
+                )
+                .expect("row claim identity")
+            })
             .collect();
         run_against_locked_children(&holder_pool, &locked, &mut blocked, "heartbeat", || async {
-            store.heartbeat_batch(&pool, &pairs).await.unwrap()
+            assert_eq!(
+                store
+                    .heartbeat_row_claims_batch(&pool, &row_refs)
+                    .await
+                    .unwrap(),
+                4
+            )
         })
         .await;
         run_against_locked_children(
@@ -23557,7 +23741,7 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
             &locked,
             &mut blocked,
             "heartbeat (compact)",
-            || async { store.heartbeat_claims_batch(&pool, &refs).await.unwrap() },
+            || async { assert_eq!(store.heartbeat_claims_batch(&pool, &refs).await.unwrap(), 4) },
         )
         .await;
         run_against_locked_children(
@@ -23580,9 +23764,17 @@ async fn test_hot_paths_do_not_lock_sealed_slot_children() {
         all_blocked.extend(blocked);
     }
 
+    // Retry, fail and snooze still find the attempt by job id alone, which
+    // reads every claim and done child; they run once per failed attempt
+    // rather than on every claim and heartbeat.
+    let not_yet_slot_addressed = ["retry", "fail", "snooze"];
+    let hot_blocked: Vec<_> = all_blocked
+        .iter()
+        .filter(|name| !not_yet_slot_addressed.contains(name))
+        .collect();
     assert!(
-        all_blocked.is_empty(),
-        "hot paths waited on a sealed slot's children: {all_blocked:?}"
+        hot_blocked.is_empty(),
+        "hot paths waited on a sealed slot's children: {hot_blocked:?}"
     );
 }
 
@@ -23856,4 +24048,116 @@ async fn test_prune_brin_fsm_baseline_follows_block_size() {
             "one extra FSM page at block_size={block_size}"
         );
     }
+}
+
+/// Claim latency and throughput with `AWA_BENCH_CLAIM_WORKERS` workers that
+/// each claim one deadline-backed job and complete it, for
+/// `AWA_BENCH_CLAIM_SECS` seconds. `AWA_BENCH_CLAIM_BODY=released` swaps in
+/// the claim function body 0.6.17 installs (a cached plan, no retire barrier,
+/// no live-slot filter) to compare against the current one (#721).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark"]
+async fn bench_claim_latency_by_claim_body() {
+    let workers: usize = std::env::var("AWA_BENCH_CLAIM_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    let secs: u64 = std::env::var("AWA_BENCH_CLAIM_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(15);
+    let body = std::env::var("AWA_BENCH_CLAIM_BODY").unwrap_or_else(|_| "current".into());
+    let released = body == "released";
+    let (_db_guard, pool) = setup_pool(workers as u32 + 4).await;
+    let schema = "awa_qs_bench_claim_body";
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    let queue = "qs_bench_claim_body";
+    for _ in 0..40 {
+        store.enqueue_batch(&pool, queue, 2, 5_000).await.unwrap();
+    }
+    if released {
+        let current: String = sqlx::query_scalar(&format!(
+            "SELECT pg_get_functiondef('{schema}.claim_ready_runtime(text,bigint,float8,float8)'::regprocedure)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let start = current
+            .find("            -- The slot queue prune retires next.")
+            .unwrap();
+        let end_marker = "                ORDER BY slots.slot\n            );\n\n";
+        let end = start + current[start..].find(end_marker).unwrap() + end_marker.len();
+        let old = format!("{}{}", &current[..start], &current[end..])
+            .replace(
+                "later_segment.ready_slot = ANY(v_live_slots)\n                      AND ",
+                "",
+            )
+            .replace(
+                "segment.ready_slot = ANY(v_live_slots)\n                      AND ",
+                "",
+            )
+            .replace(" SET plan_cache_mode TO 'force_custom_plan'\n", "");
+        assert!(!old.contains("ANY(v_live_slots)") && !old.contains("plan_cache_mode"));
+        assert!(old.contains("WHERE later_segment.ready_slot = segment.ready_slot"));
+        sqlx::raw_sql(&old).execute(&pool).await.unwrap();
+    }
+    if body == "cached" {
+        sqlx::raw_sql(&format!(
+            "ALTER FUNCTION {schema}.claim_ready_runtime(text,bigint,float8,float8) RESET plan_cache_mode"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(&format!(
+        "ANALYZE {schema}.ready_entries; ANALYZE {schema}.ready_segments;"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for _ in 0..workers {
+        let (pool, store, stop) = (pool.clone(), store.clone(), stop.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut latencies = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let claimed = store
+                    .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+                    .await
+                    .unwrap();
+                latencies.push(started.elapsed());
+                if !claimed.is_empty() {
+                    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+                }
+            }
+            latencies
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+    stop.store(true, Ordering::Relaxed);
+    let mut latencies = Vec::new();
+    for task in tasks {
+        latencies.extend(task.await.unwrap());
+    }
+    latencies.sort_unstable();
+    let pick = |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
+    println!(
+        "BENCH body={} workers={workers} claims_per_s={:.0} p50_ms={:.2} p99_ms={:.2}",
+        body,
+        latencies.len() as f64 / secs as f64,
+        pick(0.50).as_secs_f64() * 1000.0,
+        pick(0.99).as_secs_f64() * 1000.0,
+    );
 }

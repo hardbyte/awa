@@ -788,11 +788,12 @@ async fn released_patch_upgrade_and_rollback() {
                 "prune_controls",
                 "runtime_maintenance_eligibility",
                 "correlated_claim_tombstones",
+                "live_slot_claims",
                 "replica_identity"
             ],
             "a released 0.6.15 deployment needs the claim batch index fix, the bounded-wait \
              batch function, prune controls, the maintenance eligibility table, the \
-             correlated tombstone checks and replica identities"
+             correlated tombstone checks, live-slot claims and replica identities"
         );
     }
 
@@ -861,7 +862,7 @@ async fn released_patch_upgrade_and_rollback() {
     if released_version == "0.6.9" {
         assert!(patch_sql.contains("R__prepared_lane_sequences"));
     } else {
-        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 6);
+        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 7);
         assert!(!patch_sql.contains("R__prepared_lane_sequences"));
         assert!(
             patch_sql.contains("R__claim_batch_job_index"),
@@ -870,6 +871,7 @@ async fn released_patch_upgrade_and_rollback() {
         assert!(patch_sql.contains("R__insert_jobs_compat_batch"));
         assert!(patch_sql.contains("R__runtime_maintenance_eligibility"));
         assert!(patch_sql.contains("R__correlated_claim_tombstones"));
+        assert!(patch_sql.contains("R__live_slot_claims"));
         assert!(patch_sql.contains("R__replica_identity"));
     }
     assert!(
@@ -1033,6 +1035,7 @@ async fn released_patch_upgrade_and_rollback() {
         "Schema patch prune_controls: applied".to_string(),
         "Schema patch runtime_maintenance_eligibility: applied".to_string(),
         "Schema patch correlated_claim_tombstones: applied".to_string(),
+        "Schema patch live_slot_claims: applied".to_string(),
         "Schema patch replica_identity: applied".to_string(),
         format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
     ] {

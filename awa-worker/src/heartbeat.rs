@@ -1,6 +1,7 @@
+use crate::runtime::ClaimRef;
 use crate::runtime::{InFlightMap, RunLease};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
-use awa_model::queue_storage::ClaimHeartbeatRef;
+use awa_model::queue_storage::{ClaimHeartbeatRef, RowClaimHeartbeatRef};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -106,15 +107,27 @@ impl HeartbeatService {
                     .await;
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let (claimed, plain): (Vec<_>, Vec<_>) = in_flight
-                    .iter()
+                let mut claimed: Vec<ClaimHeartbeatRef> = Vec::new();
+                let mut row_claimed: Vec<RowClaimHeartbeatRef> = Vec::new();
+                let mut plain: Vec<(i64, RunLease)> = Vec::new();
+                for (key, claim) in in_flight
+                    .into_iter()
                     .filter(|(key, _)| !progress_keys.contains(key))
-                    .partition(|(_, claim)| claim.is_some());
-                let claimed: Vec<ClaimHeartbeatRef> =
-                    claimed.into_iter().filter_map(|(_, claim)| claim).collect();
-                let plain: Vec<(i64, RunLease)> = plain.into_iter().map(|(key, _)| key).collect();
-                self.heartbeat_once_queue_storage(runtime, &claimed, &plain, &pending_progress)
-                    .await;
+                {
+                    match claim {
+                        Some(ClaimRef::Compact(claim)) => claimed.push(claim),
+                        Some(ClaimRef::Row(claim)) => row_claimed.push(claim),
+                        None => plain.push(key),
+                    }
+                }
+                self.heartbeat_once_queue_storage(
+                    runtime,
+                    &claimed,
+                    &row_claimed,
+                    &plain,
+                    &pending_progress,
+                )
+                .await;
             }
         }
     }
@@ -238,6 +251,7 @@ impl HeartbeatService {
         &self,
         runtime: &QueueStorageRuntime,
         claimed: &[ClaimHeartbeatRef],
+        row_claimed: &[RowClaimHeartbeatRef],
         heartbeat_only: &[(i64, RunLease)],
         pending_progress: &[(i64, i64, u64, serde_json::Value)],
     ) {
@@ -253,6 +267,25 @@ impl HeartbeatService {
                 }
                 Err(err) => {
                     warn!(error = %err, "Failed to send heartbeat claim batch");
+                }
+            }
+        }
+
+        for chunk in row_claimed.chunks(self.batch_size) {
+            match runtime
+                .store
+                .heartbeat_row_claims_batch(&self.pool, chunk)
+                .await
+            {
+                Ok(updated) => {
+                    self.metrics.heartbeat_batches.add(1, &[]);
+                    debug!(
+                        count = chunk.len(),
+                        updated, "Heartbeat row claim batch sent"
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to send heartbeat row claim batch");
                 }
             }
         }
