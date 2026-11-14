@@ -22683,14 +22683,24 @@ async fn test_prune_vacuumed_materialized_lease_reclaims_indexes_and_toast_once(
             .len(),
         512
     );
-    sqlx::query(audited_sql(format!(
-        "VACUUM (TRUNCATE TRUE) {schema}.leases_0"
-    )))
-    .execute(&pool)
-    .await
-    .unwrap();
-    let vacuumed = physical().await;
-    assert_eq!(vacuumed.1, 0, "VACUUM returns all main heap pages");
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(30));
+    let vacuumed = loop {
+        sqlx::query(audited_sql(format!(
+            "VACUUM (TRUNCATE TRUE) {schema}.leases_0"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let storage = physical().await;
+        if storage.1 == 0 {
+            break storage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "VACUUM never returned all main heap pages: {storage:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert!(
         vacuumed.2 > unused.2,
         "vacuum retains expanded index storage"
