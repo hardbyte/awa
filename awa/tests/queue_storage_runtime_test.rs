@@ -2789,7 +2789,7 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     // already-empty partition (Pruned) — both are legitimate. What we
     // must NOT see is SkippedActive (would mean the safety check
     // reported an open claim where none exists) or Blocked.
-    let prune = prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await;
+    let prune = prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 1).await;
     assert!(
         matches!(prune, PruneOutcome::Noop | PruneOutcome::Pruned { .. }),
         "prune_oldest_claims on untouched ring must be Noop or Pruned, got {prune:?}"
