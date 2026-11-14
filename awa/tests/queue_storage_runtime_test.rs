@@ -2922,10 +2922,7 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     // already-empty partition (Pruned) — both are legitimate. What we
     // must NOT see is SkippedActive (would mean the safety check
     // reported an open claim where none exists) or Blocked.
-    let prune = store
-        .prune_oldest_claims(&pool)
-        .await
-        .expect("prune_oldest_claims should succeed");
+    let prune = prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await;
     assert!(
         matches!(prune, PruneOutcome::Noop | PruneOutcome::Pruned { .. }),
         "prune_oldest_claims on untouched ring must be Noop or Pruned, got {prune:?}"
@@ -3024,14 +3021,8 @@ async fn test_successful_prunes_report_database_phase_timings() {
 
     let before = filenodes().await;
     let queue_first = prune_retrying_blocked(&store, &pool, Duration::ZERO, 0).await;
-    let lease_first = store
-        .prune_oldest_leases(&pool)
-        .await
-        .expect("first lease prune");
-    let claim_first = store
-        .prune_oldest_claims(&pool)
-        .await
-        .expect("first claim prune");
+    let lease_first = prune_ring_retrying_blocked(&store, &pool, PruneRing::Lease, 0).await;
+    let claim_first = prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await;
     for (ring, outcome) in [
         ("queue", queue_first),
         ("lease", lease_first),
@@ -3942,7 +3933,7 @@ async fn test_rotation_cadence_empty_used_leases_reclaim_without_age_delay() {
         RotateOutcome::Rotated { slot: 1, .. }
     ));
     assert!(matches!(
-        store.prune_oldest_leases(&pool).await.unwrap(),
+        prune_ring_retrying_blocked(&store, &pool, PruneRing::Lease, 0).await,
         PruneOutcome::Pruned { slot: 0, .. }
     ));
     let reclaimed_bytes: i64 = sqlx::query_scalar(audited_sql(format!(
@@ -4115,7 +4106,7 @@ async fn test_rotation_cadence_claim_ring_drains_empty_current_slots() {
         RotateOutcome::Rotated { slot: 2, .. }
     ));
     assert!(matches!(
-        store.prune_oldest_claims(&pool).await.unwrap(),
+        prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await,
         PruneOutcome::Pruned { slot: 0, .. }
     ));
     assert!(matches!(
@@ -4451,10 +4442,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await
     .expect("seed non-default rescue cursor before claim prune");
 
-    let prune_outcome = store
-        .prune_oldest_claims(&pool)
-        .await
-        .expect("prune_oldest_claims");
+    let prune_outcome = prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await;
     match prune_outcome {
         PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
@@ -4573,10 +4561,7 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
     .await
     .expect("seed claim rescue cursor before lease prune");
 
-    let prune = store
-        .prune_oldest_leases(&pool)
-        .await
-        .expect("prune_oldest_leases");
+    let prune = prune_ring_retrying_blocked(&store, &pool, PruneRing::Lease, 0).await;
     assert!(
         matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
         "lease prune should truncate empty lease slot 0, got {prune:?}"
@@ -6027,11 +6012,7 @@ async fn test_drained_ring_rotation_skips_after_prune() {
         PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
         other => panic!("queue slot 0 should prune after drain, got {other:?}"),
     }
-    match store
-        .prune_oldest_claims(&pool)
-        .await
-        .expect("prune claim slot 0")
-    {
+    match prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await {
         PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
         other => panic!("claim slot 0 should prune after drain, got {other:?}"),
     }
@@ -8141,10 +8122,7 @@ async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_complet
         other => panic!("expected claim ring rotation after compat delete, got {other:?}"),
     }
 
-    match store
-        .prune_oldest_claims(&pool)
-        .await
-        .expect("claim prune after compat delete")
+    match prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await
     {
         PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
         other => panic!(
@@ -9232,10 +9210,7 @@ async fn test_queue_storage_expired_deadline_batch_blocks_prune_until_rescued() 
     assert_eq!(rescued.len(), 1);
     assert_eq!(rescued[0].id, job_id);
 
-    let pruned = store
-        .prune_oldest_claims(&pool)
-        .await
-        .expect("prune after rescue");
+    let pruned = prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await;
     match pruned {
         PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
@@ -17808,6 +17783,28 @@ async fn prune_ring(
     }
 }
 
+async fn prune_ring_retrying_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    ring: PruneRing,
+    slot: i32,
+) -> PruneOutcome {
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(5));
+    loop {
+        let outcome = prune_ring(store, pool, ring)
+            .await
+            .unwrap_or_else(|err| panic!("prune {ring:?} ring: {err}"));
+        match outcome {
+            PruneOutcome::Blocked { slot: blocked }
+                if blocked == slot && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A reader holds `locked_relation` so prune must wait for its exclusive lock.
 /// With a short timeout prune gives up as `Blocked` only after that timeout;
 /// with a long timeout it waits out a reader that releases part-way and then
@@ -22358,7 +22355,7 @@ async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
         RotateOutcome::Rotated { .. }
     ));
     assert!(matches!(
-        store.prune_oldest_leases(&pool).await.unwrap(),
+        prune_ring_retrying_blocked(&store, &pool, PruneRing::Lease, 0).await,
         PruneOutcome::Pruned { slot: 0, .. }
     ));
     let reclaimed = physical().await;
@@ -22718,7 +22715,7 @@ async fn test_prune_vacuumed_materialized_lease_reclaims_indexes_and_toast_once(
         RotateOutcome::Rotated { .. }
     ));
     assert!(matches!(
-        store.prune_oldest_leases(&pool).await.unwrap(),
+        prune_ring_retrying_blocked(&store, &pool, PruneRing::Lease, 0).await,
         PruneOutcome::Pruned { slot: 0, .. }
     ));
     let reclaimed = physical().await;
@@ -25070,12 +25067,12 @@ async fn point_read_snapshot_survives_ring_prune(receipts: bool) {
     );
     assert_eq!(snapshot.run_lease, claimed[0].job.run_lease);
     reader_pool.close().await;
-    let after_read = if receipts {
-        store.prune_oldest_claims(&pool).await
+    let ring = if receipts {
+        PruneRing::Claim
     } else {
-        store.prune_oldest_leases(&pool).await
-    }
-    .expect("prune after the reader releases its snapshot");
+        PruneRing::Lease
+    };
+    let after_read = prune_ring_retrying_blocked(&store, &pool, ring, 0).await;
     assert!(matches!(after_read, PruneOutcome::Pruned { slot: 0, .. }));
     assert_eq!(
         store.load_job(&pool, job_id).await.unwrap().unwrap().state,
@@ -28480,20 +28477,9 @@ async fn test_claim_batch_job_index_is_built_only_on_empty_partitions() {
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
         other => panic!("expected claim ring rotation to slot 1, got {other:?}"),
     }
-    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
-    loop {
-        match store
-            .prune_oldest_claims(&pool)
-            .await
-            .expect("prune oldest claim slot")
-        {
-            PruneOutcome::Pruned { slot, .. } => {
-                assert_eq!(slot, 0);
-                break;
-            }
-            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {}
-            other => panic!("unexpected claim prune outcome: {other:?}"),
-        }
+    match prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("unexpected claim prune outcome: {other:?}"),
     }
     assert_eq!(claim_batch_job_index_slots(&pool, schema).await, vec![0, 1]);
 }
@@ -28711,20 +28697,9 @@ async fn test_claim_batch_job_index_migration_leaves_indexing_to_claim_prune() {
         receipt_claim_count_in_child(&pool, schema, 1, second[0].job.id).await,
         1
     );
-    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
-    loop {
-        match store
-            .prune_oldest_claims(&pool)
-            .await
-            .expect("prune without the index function")
-        {
-            PruneOutcome::Pruned { slot, .. } => {
-                assert_eq!(slot, 0);
-                break;
-            }
-            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {}
-            other => panic!("unexpected claim prune outcome: {other:?}"),
-        }
+    match prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 0).await {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("unexpected claim prune outcome: {other:?}"),
     }
     assert_eq!(
         claim_batch_job_index_slots(&pool, schema).await,
@@ -28826,20 +28801,9 @@ async fn test_claim_batch_job_index_migration_leaves_indexing_to_claim_prune() {
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected claim ring rotation to slot 0, got {other:?}"),
     }
-    let prune_deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
-    loop {
-        match store
-            .prune_oldest_claims(&pool)
-            .await
-            .expect("prune with the index function")
-        {
-            PruneOutcome::Pruned { slot, .. } => {
-                assert_eq!(slot, 1);
-                break;
-            }
-            PruneOutcome::Blocked { slot: 1 } if Instant::now() < prune_deadline => {}
-            other => panic!("unexpected claim prune outcome: {other:?}"),
-        }
+    match prune_ring_retrying_blocked(&store, &pool, PruneRing::Claim, 1).await {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("unexpected claim prune outcome: {other:?}"),
     }
     assert_eq!(
         claim_batch_job_index_slots(&pool, schema).await,
