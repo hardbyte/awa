@@ -3523,6 +3523,414 @@ async fn test_prune_oldest_does_not_skip_committed_pending_ready() {
     );
 }
 
+/// Enqueue `count` jobs on one `(queue, priority)` lane, returning their ids in
+/// lane order.
+async fn enqueue_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    count: usize,
+) -> Vec<i64> {
+    let mut ids = Vec::with_capacity(count);
+    for n in 0..count {
+        ids.push(
+            enqueue_job(
+                pool,
+                store,
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    priority,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    ids
+}
+
+/// Move a lane's ready rows and segments `by` into the past, as if they had
+/// waited that long.
+async fn backdate_ready_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    by: Duration,
+) {
+    let schema = store.schema();
+    let by = by.as_secs_f64();
+    for statement in [
+        format!(
+            "UPDATE {schema}.ready_entries
+             SET run_at = run_at - make_interval(secs => $3)
+             WHERE queue = $1 AND priority = $2"
+        ),
+        format!(
+            "UPDATE {schema}.ready_segments
+             SET first_run_at = first_run_at - make_interval(secs => $3)
+             WHERE queue = $1 AND priority = $2"
+        ),
+    ] {
+        sqlx::query(&statement)
+            .bind(queue)
+            .bind(priority)
+            .bind(by)
+            .execute(pool)
+            .await
+            .expect("backdate ready lane");
+    }
+}
+
+/// A 4-slot queue ring with the default receipt claims.
+async fn create_ring_pin_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
+    create_store_with_config(
+        pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Claim up to `max` jobs from `queue` and complete them.
+async fn claim_and_complete(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    queue: &str,
+    max: i64,
+    aging_interval: Duration,
+) -> Vec<awa::model::ClaimedRuntimeJob> {
+    let claimed = store
+        .claim_runtime_batch_with_aging(pool, queue, max, Duration::from_secs(60), aging_interval)
+        .await
+        .expect("claim runtime batch");
+    if !claimed.is_empty() {
+        let completed = store
+            .complete_runtime_batch(pool, &claimed)
+            .await
+            .expect("complete runtime batch");
+        assert_eq!(completed.len(), claimed.len(), "every claim completes");
+    }
+    claimed
+}
+
+/// The per-lane form of queue prune's pending-ready gate: whether `slot` holds
+/// a ready row of the lane at or past its claim cursor.
+async fn lane_pins_slot(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    slot: i32,
+    queue: &str,
+    priority: i16,
+) -> bool {
+    let schema = store.schema();
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM {schema}.queue_claim_heads AS heads
+             JOIN {schema}.ready_entries AS ready
+               ON ready.queue = heads.queue
+              AND ready.priority = heads.priority
+              AND ready.enqueue_shard = heads.enqueue_shard
+             WHERE ready.ready_slot = $1
+               AND heads.queue = $2
+               AND heads.priority = $3
+               AND ready.lane_seq >= {schema}.sequence_next_value(heads.seq_name)
+         )"
+    ))
+    .bind(slot)
+    .bind(queue)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .expect("read lane pending-ready state")
+}
+
+async fn assert_rotated_to(store: &QueueStorage, pool: &sqlx::PgPool, expected_slot: i32) {
+    let outcome = store.rotate(pool).await.expect("rotate queue ring");
+    assert!(
+        matches!(outcome, RotateOutcome::Rotated { slot, .. } if slot == expected_slot),
+        "expected rotation to slot {expected_slot}, got {outcome:?}"
+    );
+}
+
+/// Rotate the 4-slot ring from slot 1 back round to slot 0, which must refuse.
+async fn assert_ring_cannot_wrap_to_slot_0(store: &QueueStorage, pool: &sqlx::PgPool) {
+    assert_rotated_to(store, pool, 2).await;
+    assert_rotated_to(store, pool, 3).await;
+    let outcome = store.rotate(pool).await.expect("rotate queue ring");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedBusy { slot: 0, busy } if busy.queue_ready > 0),
+        "rotation into the pinned slot must skip it as busy, got {outcome:?}"
+    );
+}
+
+async fn assert_queue_prune_pinned(store: &QueueStorage, pool: &sqlx::PgPool, slot: i32) {
+    let outcome = store
+        .prune_oldest(pool, Duration::ZERO)
+        .await
+        .expect("prune_oldest");
+    assert!(
+        matches!(
+            outcome,
+            PruneOutcome::SkippedActive {
+                slot: skipped,
+                reason: SkipReason::QueuePendingReady,
+                ..
+            } if skipped == slot
+        ),
+        "slot {slot} must be pinned by pending ready rows, got {outcome:?}"
+    );
+}
+
+async fn assert_queue_prune_reclaims(store: &QueueStorage, pool: &sqlx::PgPool, slot: i32) {
+    let outcome = prune_retrying_blocked(store, pool, Duration::ZERO, slot).await;
+    assert!(
+        matches!(outcome, PruneOutcome::Pruned { slot: pruned, .. } if pruned == slot),
+        "slot {slot} must be reclaimed once nothing pins it, got {outcome:?}"
+    );
+}
+
+/// #779: with priority aging off, a lower-priority lane is not claimed while a
+/// higher-priority lane stays backlogged, so its old rows pin the oldest
+/// sealed slot and the ring cannot wrap. Claiming the lane with aging on
+/// unpins it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pinned_by_strictly_starved_lane_until_aging_claims_it() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_ring_pin_starved";
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_starved").await;
+
+    let starved = enqueue_lane(&pool, &store, queue, 4, 3).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    enqueue_lane(&pool, &store, queue, 1, 2).await;
+
+    for _ in 0..3 {
+        let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].claim.priority, 1,
+            "strict priority serves the backlogged higher lane"
+        );
+        enqueue_lane(&pool, &store, queue, 1, 1).await;
+        assert_queue_prune_pinned(&store, &pool, 0).await;
+    }
+    assert!(lane_pins_slot(&pool, &store, 0, queue, 4).await);
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 1).await);
+
+    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+
+    backdate_ready_lane(&pool, &store, queue, 4, Duration::from_secs(3600)).await;
+    let claimed = claim_and_complete(&store, &pool, queue, 3, Duration::from_secs(60)).await;
+    let claimed_ids: Vec<i64> = claimed.iter().map(|job| job.job.id).collect();
+    assert_eq!(
+        claimed_ids, starved,
+        "aging lifts the hour-old priority-4 head above the fresh priority-1 backlog"
+    );
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    assert_rotated_to(&store, &pool, 0).await;
+}
+
+/// #779: with aging off, the starved lane is claimed, and the ring unpinned,
+/// only once the higher-priority lane drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_starved_lane_unpins_once_higher_lane_drains() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_ring_pin_drain";
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_drain").await;
+
+    let starved = enqueue_lane(&pool, &store, queue, 4, 2).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let backlog = enqueue_lane(&pool, &store, queue, 1, 3).await;
+
+    let mut claim_order = Vec::new();
+    for _ in 0..backlog.len() {
+        assert_queue_prune_pinned(&store, &pool, 0).await;
+        let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+        claim_order.extend(claimed.iter().map(|job| job.job.id));
+    }
+    assert_eq!(claim_order, backlog);
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+
+    let claimed = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO).await;
+    let claimed_ids: Vec<i64> = claimed.iter().map(|job| job.job.id).collect();
+    assert_eq!(claimed_ids, starved);
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
+/// #779: a paused queue's ready rows pin the slot that holds them until the
+/// queue is resumed and claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pinned_by_paused_queue_until_resumed() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_ring_pin_paused";
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_paused").await;
+
+    let paused = enqueue_lane(&pool, &store, queue, 2, 2).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    assert!(
+        claim_and_complete(&store, &pool, queue, 10, Duration::from_secs(60))
+            .await
+            .is_empty(),
+        "a paused queue is not claimed, with or without aging"
+    );
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+
+    admin::resume_queue(&pool, queue)
+        .await
+        .expect("resume queue");
+    let claimed = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO).await;
+    let claimed_ids: Vec<i64> = claimed.iter().map(|job| job.job.id).collect();
+    assert_eq!(claimed_ids, paused);
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    assert_rotated_to(&store, &pool, 0).await;
+}
+
+/// #779: whether making an unclaimed lane's rows unavailable unpins the ring.
+/// Cancel, move and reprioritise tombstone the ready row, and the pending
+/// gate counts tombstoned rows. A cancel advances the lane's claim cursor
+/// only when the cancelled row is exactly at it, so cancelling a lane in lane
+/// order, in one bulk cancel or by draining the queue releases it, while
+/// cancelling it out of order, cancelling inside the
+/// caller's transaction, moving it or reprioritising it leaves the rows
+/// pinning the slot. Claiming from the lane then moves the cursor over the
+/// tombstones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pin_after_cancelling_or_moving_unclaimed_rows() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_cancelled").await;
+
+    let in_order = "qs_ring_pin_cancel_in_order";
+    let bulk = "qs_ring_pin_bulk_cancel";
+    let reverse = "qs_ring_pin_cancel_reverse";
+    let in_tx = "qs_ring_pin_cancel_in_tx";
+    let drained = "qs_ring_pin_drain_queue";
+    let reprioritised = "qs_ring_pin_set_priority";
+    let moved = "qs_ring_pin_move_queue";
+    let moved_to = "qs_ring_pin_move_dest";
+
+    let mut lanes = HashMap::new();
+    for queue in [
+        in_order,
+        bulk,
+        reverse,
+        in_tx,
+        drained,
+        reprioritised,
+        moved,
+    ] {
+        lanes.insert(queue, enqueue_lane(&pool, &store, queue, 4, 3).await);
+    }
+    assert_rotated_to(&store, &pool, 1).await;
+
+    for job_id in &lanes[in_order] {
+        admin::cancel(&pool, *job_id)
+            .await
+            .expect("cancel")
+            .expect("available job cancels");
+    }
+    assert_eq!(
+        admin::bulk_cancel(&pool, &lanes[bulk])
+            .await
+            .expect("bulk cancel")
+            .len(),
+        3
+    );
+    for job_id in lanes[reverse].iter().rev() {
+        admin::cancel(&pool, *job_id)
+            .await
+            .expect("cancel")
+            .expect("available job cancels");
+    }
+    let mut conn = pool.acquire().await.expect("acquire connection");
+    for job_id in &lanes[in_tx] {
+        admin::cancel_tx(&mut conn, *job_id)
+            .await
+            .expect("cancel_tx")
+            .expect("available job cancels");
+    }
+    drop(conn);
+    assert_eq!(
+        admin::drain_queue(&pool, drained)
+            .await
+            .expect("drain queue"),
+        3
+    );
+    for job_id in &lanes[reprioritised] {
+        assert!(store
+            .set_priority(&pool, *job_id, 2)
+            .await
+            .expect("set priority"));
+    }
+    for job_id in &lanes[moved] {
+        assert!(store
+            .move_queue(&pool, *job_id, moved_to, None)
+            .await
+            .expect("move queue"));
+    }
+
+    let tombstoned: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_tombstones WHERE ready_slot = 0",
+        store.schema()
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count tombstones");
+    assert_eq!(tombstoned, 21, "every source row is tombstoned in slot 0");
+
+    assert!(!lane_pins_slot(&pool, &store, 0, in_order, 4).await);
+    assert!(!lane_pins_slot(&pool, &store, 0, bulk, 4).await);
+    assert!(!lane_pins_slot(&pool, &store, 0, drained, 4).await);
+    for queue in [reverse, in_tx, reprioritised, moved] {
+        assert!(
+            lane_pins_slot(&pool, &store, 0, queue, 4).await,
+            "{queue}: tombstoned rows past the claim cursor still pin the slot"
+        );
+    }
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
+
+    for queue in [reverse, in_tx, reprioritised, moved] {
+        let mut live = Vec::new();
+        for _ in 0..4 {
+            live.extend(
+                claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                    .await
+                    .into_iter()
+                    .map(|job| job.job.id),
+            );
+        }
+        let expected: Vec<i64> = if queue == reprioritised {
+            lanes[reprioritised].clone()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(live, expected, "{queue}: only live rows are claimed");
+        assert!(
+            !lane_pins_slot(&pool, &store, 0, queue, 4).await,
+            "{queue}: a claim on the lane moves its cursor over the tombstones"
+        );
+    }
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
 /// Admin-cancel wakes an in-flight handler via the `awa:cancel`
 /// NOTIFY channel. A slow handler checks `ctx.is_cancelled()` and exits
 /// with a cancel result as soon as the flag flips. The test enqueues a
