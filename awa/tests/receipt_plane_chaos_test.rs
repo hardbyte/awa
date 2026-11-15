@@ -188,12 +188,10 @@ async fn insert_synthetic_open_claim(
 }
 
 /// Seed both a `ready_entries` row and a matching `lease_claims` row.
-/// Required when the test exercises a rescue path: rescue closes the
-/// claim and hydrates the attempt from its ready body, matching on the
-/// (ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id)
-/// tuple and on the attempt itself. A claim takes `run_lease + 1` and
-/// `attempt + 1` of the ready row it claims, so the ready row is seeded
-/// one attempt behind the claim, as a real claim would leave it.
+/// Rescue looks up a claim's ready row by (ready_slot, ready_generation,
+/// queue, enqueue_shard, lane_seq, job_id) and
+/// `ready.run_lease + 1 = claim.run_lease`, so the ready row is seeded
+/// at `run_lease - 1`.
 async fn insert_synthetic_claim_with_ready_row(
     pool: &sqlx::PgPool,
     schema: &str,
