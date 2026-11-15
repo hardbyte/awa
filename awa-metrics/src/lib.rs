@@ -261,7 +261,8 @@ pub struct AwaMetrics {
     /// `queue.pending_ready`, the age of the first pending ready row of each
     /// lane holding that slot, by `awa.job.queue`, `awa.job.priority` and
     /// `awa.queue.enqueue_shard`. A lane drops to 0 once it no longer pins the
-    /// slot. Updated when queue prune runs.
+    /// slot. Updated when queue prune runs and, while a lane pins the slot, at
+    /// least every 15 seconds or queue rotation tick, whichever is longer.
     pub maintenance_prune_pinned_ready_age_seconds: Gauge<f64>,
     /// Per-branch wall-clock duration for the maintenance leader's main
     /// `tokio::select!` loop, attributed by `awa.maintenance.branch`. Records

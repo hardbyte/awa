@@ -919,6 +919,10 @@ impl PruneBackoffTracker {
 /// keep pinning the queue ring.
 const QUEUE_RING_PIN_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// While lanes pin the queue ring, the leader re-reads them at least this
+/// often, on queue rotation ticks where prune is backed off.
+const QUEUE_RING_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
 /// A `(queue, priority, enqueue_shard)` ready lane.
 type ReadyLaneKey = (String, i16, i16);
 
@@ -928,6 +932,7 @@ type ReadyLaneKey = (String, i16, i16);
 struct QueueRingPinReport {
     lanes: HashSet<ReadyLaneKey>,
     last_warned_at: Option<Instant>,
+    last_observed_at: Option<Instant>,
 }
 
 impl QueueRingPinReport {
@@ -954,6 +959,7 @@ impl QueueRingPinReport {
         }
         let new_lane = !lanes.is_subset(&self.lanes);
         self.lanes = lanes;
+        self.last_observed_at = Some(now);
         let warn = new_lane
             || self
                 .last_warned_at
@@ -964,8 +970,18 @@ impl QueueRingPinReport {
         warn
     }
 
+    /// Whether lanes were pinning the ring when last read and that read is
+    /// [`QUEUE_RING_PIN_REFRESH_INTERVAL`] old.
+    fn refresh_due(&self, now: Instant) -> bool {
+        !self.lanes.is_empty()
+            && self
+                .last_observed_at
+                .is_none_or(|at| now.duration_since(at) >= QUEUE_RING_PIN_REFRESH_INTERVAL)
+    }
+
     /// Zeroes the gauges of the lanes last reported. Returns whether any were.
     fn clear(&mut self, metrics: &AwaMetrics) -> bool {
+        self.last_observed_at = None;
         for (queue, priority, enqueue_shard) in self.lanes.drain() {
             metrics.record_queue_ring_pinned_ready_age(
                 &queue,
@@ -3725,6 +3741,14 @@ impl MaintenanceService {
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
             debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
             self.metrics.record_prune_backed_off("queue");
+            let refresh_due = self
+                .queue_ring_pin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refresh_due(Instant::now());
+            if refresh_due {
+                self.observe_queue_ring_pin(&runtime.store).await;
+            }
             return;
         }
 
@@ -6368,7 +6392,12 @@ mod tests {
             start + Duration::from_secs(2) + QUEUE_RING_PIN_WARN_INTERVAL
         ));
 
+        let observed = start + Duration::from_secs(2) + QUEUE_RING_PIN_WARN_INTERVAL;
+        assert!(!report.refresh_due(observed + Duration::from_secs(1)));
+        assert!(report.refresh_due(observed + QUEUE_RING_PIN_REFRESH_INTERVAL));
+
         assert!(report.clear(&metrics), "clearing a reported pin says so");
+        assert!(!report.refresh_due(start + QUEUE_RING_PIN_WARN_INTERVAL));
         assert!(!report.clear(&metrics));
         assert!(
             report.observe(std::slice::from_ref(&paused), &metrics, start),
