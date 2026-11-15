@@ -317,6 +317,8 @@ Aging is computed at claim time on queue-storage runtimes: ready rows keep their
 
 The admin UI shows the priority on the current job snapshot and, when `_awa_original_priority` is present, the original enqueue priority as `(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or `priority_aging_interval_ms: 0` (Python) to disable escalation entirely (strict static priority).
 
+Under queue storage, strict priority on a queue whose higher priorities stay backlogged leaves its lower-priority rows unclaimed, and unclaimed rows keep queue prune from reclaiming the oldest ring slot for every queue. Keep aging on for queues that mix priorities under sustained backlog; see [queue ring stops wrapping behind an unclaimed lane](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
+
 There is a separate top-level `ClientBuilder::priority_aging_interval` that controls the legacy canonical-storage maintenance pass that physically rewrites stored priorities. With queue storage (the 0.6 default) it is a no-op; the per-queue setting above is the one to tune.
 
 ### Changing priority after enqueue
