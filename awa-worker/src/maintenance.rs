@@ -3740,16 +3740,13 @@ impl MaintenanceService {
                 self.metrics.record_prune_outcome("queue", &outcome);
                 prune_tracker.record_outcome(PRUNE_BRANCH_QUEUE, &outcome);
                 match outcome {
+                    // Active leases are checked before pending ready rows, so
+                    // that outcome needs the same read.
                     PruneOutcome::SkippedActive {
-                        reason: SkipReason::QueuePendingReady,
+                        reason: SkipReason::QueuePendingReady | SkipReason::QueueActiveLeases,
                         ..
                     } => self.observe_queue_ring_pin(&runtime.store).await,
-                    // Neither outcome says whether ready rows are pending.
-                    PruneOutcome::SkippedActive {
-                        reason: SkipReason::QueueActiveLeases,
-                        ..
-                    }
-                    | PruneOutcome::Blocked { .. } => {}
+                    PruneOutcome::Blocked { .. } => {}
                     _ => self.clear_queue_ring_pin(),
                 }
                 match outcome {
@@ -3788,8 +3785,9 @@ impl MaintenanceService {
         }
     }
 
-    /// Reports the lanes behind a `queue.pending_ready` prune skip as
-    /// `awa.maintenance.prune.pinned_ready_age` and a rate-limited warning.
+    /// Reports the lanes with pending ready rows in the oldest sealed queue
+    /// ring slot as `awa.maintenance.prune.pinned_ready_age` and a
+    /// rate-limited warning.
     async fn observe_queue_ring_pin(&self, store: &QueueStorage) {
         let pin = match store.queue_ring_pin(&self.pool).await {
             Ok(Some(pin)) => pin,

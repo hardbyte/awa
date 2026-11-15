@@ -4052,16 +4052,44 @@ async fn wait_for_pinned_ready_age(
 }
 
 /// The warning the maintenance leader logged for `queue`.
-fn ring_pin_warning(queue: &str) -> Option<RingPinEvent> {
-    ring_pin_events()
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|event| {
-            event.message.starts_with("Queue ring prune is pinned")
-                && event.fields.get("queue").map(String::as_str) == Some(queue)
-        })
-        .cloned()
+async fn wait_for_ring_pin_warning(queue: &str) -> RingPinEvent {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    loop {
+        let warning = ring_pin_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.message.starts_with("Queue ring prune is pinned")
+                    && event.fields.get("queue").map(String::as_str) == Some(queue)
+            })
+            .cloned();
+        if let Some(warning) = warning {
+            return warning;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader warns about the pin on {queue}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_queue_drained(store: &QueueStorage, pool: &sqlx::PgPool, queue: &str) {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    loop {
+        let counts = store.queue_counts(pool, queue).await.expect("queue counts");
+        if (counts.available, counts.running) == (0, 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{queue} should drain, got available {} running {}",
+            counts.available,
+            counts.running
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn ring_pin_client<W: Worker + 'static>(
@@ -4147,7 +4175,7 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_starved_lane() {
             .all(|((_, priority, _), age)| *priority == 4 || *age == 0.0),
         "only the starved lane pins the ring: {ages:?}"
     );
-    let warning = ring_pin_warning(queue).expect("the leader warns about the pin");
+    let warning = wait_for_ring_pin_warning(queue).await;
     assert_eq!(warning.fields["priority"], "4");
     assert_eq!(warning.fields["enqueue_shard"], "0");
     assert_eq!(warning.fields["slot"], "0");
@@ -4168,11 +4196,7 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_starved_lane() {
         "the gauge drops to zero once the lane is claimed",
     )
     .await;
-    let counts = store
-        .queue_counts(&pool, queue)
-        .await
-        .expect("queue counts");
-    assert_eq!((counts.available, counts.running), (0, 0));
+    wait_for_queue_drained(&store, &pool, queue).await;
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4221,7 +4245,7 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_paused_queue() {
         (600.0..660.0).contains(&age),
         "pinned age {age} should be just over the ten minutes the lane has waited"
     );
-    let warning = ring_pin_warning(queue).expect("the leader warns about the pin");
+    let warning = wait_for_ring_pin_warning(queue).await;
     assert_eq!(warning.fields["priority"], "2");
     assert_eq!(warning.fields["enqueue_shard"], "0");
     let warned_age: u64 = warning.fields["oldest_ready_age_secs"]
@@ -4240,11 +4264,7 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_paused_queue() {
         "the gauge drops to zero once the queue is resumed and claimed",
     )
     .await;
-    let counts = store
-        .queue_counts(&pool, queue)
-        .await
-        .expect("queue counts");
-    assert_eq!((counts.available, counts.running), (0, 0));
+    wait_for_queue_drained(&store, &pool, queue).await;
 
     client.shutdown(Duration::from_secs(5)).await;
 }
