@@ -189,9 +189,11 @@ async fn insert_synthetic_open_claim(
 
 /// Seed both a `ready_entries` row and a matching `lease_claims` row.
 /// Required when the test exercises a rescue path: rescue closes the
-/// claim and tries to re-enqueue back to ready by JOINing on the
-/// (ready_slot, ready_generation, queue, priority, lane_seq) tuple,
-/// which has to actually exist.
+/// claim and hydrates the attempt from its ready body, matching on the
+/// (ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id)
+/// tuple and on the attempt itself. A claim takes `run_lease + 1` and
+/// `attempt + 1` of the ready row it claims, so the ready row is seeded
+/// one attempt behind the claim, as a real claim would leave it.
 async fn insert_synthetic_claim_with_ready_row(
     pool: &sqlx::PgPool,
     schema: &str,
@@ -209,7 +211,7 @@ async fn insert_synthetic_claim_with_ready_row(
             run_at, attempted_at, created_at, payload
         ) VALUES (
             0, 0, $1, 'qs_chaos_synth', $2,
-            '{{}}'::jsonb, 2, 1, $3, 25, $1,
+            '{{}}'::jsonb, 2, 0, $3 - 1, 25, $1,
             clock_timestamp(), clock_timestamp(), clock_timestamp(), '{{}}'::jsonb
         )
         "#
