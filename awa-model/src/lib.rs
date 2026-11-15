@@ -59,10 +59,10 @@ pub use partitioned_queue::{
     partition_for_ordering_key, partition_hash64, PartitionedQueue, PartitionedQueueError,
 };
 pub use queue_storage::{
-    ClaimedEntry, ClaimedRuntimeJob, PromoteOutcome, PromotionLane, PruneDurations, PruneOutcome,
-    QueueCounts, QueueStorage, QueueStorageConfig, RescueBatch, RescueBatchOptions,
-    RescueScanCursor, RescueScanProgress, RescueSlotOrder, RingLedgerFoldOutcome,
-    RingRotationCadence, RotateOutcome, RuntimeBatchCompletion, SkipReason,
+    ClaimedEntry, ClaimedRuntimeJob, PendingReadyLane, PromoteOutcome, PromotionLane,
+    PruneDurations, PruneOutcome, QueueCounts, QueueRingPin, QueueStorage, QueueStorageConfig,
+    RescueBatch, RescueBatchOptions, RescueScanCursor, RescueScanProgress, RescueSlotOrder,
+    RingLedgerFoldOutcome, RingRotationCadence, RotateOutcome, RuntimeBatchCompletion, SkipReason,
     TerminalDeltaRollupOutcome, TerminalRollupFoldOutcome,
 };
 pub use storage::StorageStatus;

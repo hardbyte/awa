@@ -81,6 +81,7 @@ pub mod names {
     pub const MAINTENANCE_ROTATE_SKIPPED_ROWS: &str = "awa.maintenance.rotate.skipped_rows";
     pub const MAINTENANCE_PRUNE_ATTEMPTS: &str = "awa.maintenance.prune.attempts";
     pub const MAINTENANCE_PRUNE_SKIPPED_ROWS: &str = "awa.maintenance.prune.skipped_rows";
+    pub const MAINTENANCE_PRUNE_PINNED_READY_AGE: &str = "awa.maintenance.prune.pinned_ready_age";
     pub const MAINTENANCE_PRUNE_DURATION: &str = "awa.maintenance.prune.duration";
     pub const STORAGE_TRANSITION_READY: &str = "awa.storage.transition_ready";
     pub const STORAGE_CANONICAL_LIVE_BACKLOG: &str = "awa.storage.canonical_live_backlog";
@@ -285,6 +286,12 @@ pub struct AwaMetrics {
     pub maintenance_prune_attempts: Counter<u64>,
     /// Magnitude of the reason count when prune returns SkippedActive.
     pub maintenance_prune_skipped_rows: Histogram<u64>,
+    /// While queue prune skips the oldest sealed queue ring slot with reason
+    /// `queue.pending_ready`, the age of the first pending ready row of each
+    /// lane holding that slot, by `awa.job.queue`, `awa.job.priority` and
+    /// `awa.queue.enqueue_shard`. A lane drops to 0 once it no longer pins the
+    /// slot. Updated when queue prune runs.
+    pub maintenance_prune_pinned_ready_age_seconds: Gauge<f64>,
     /// Successful destructive prune phase latency, attributed by ring and
     /// phase (`lock`, `truncate`, `commit`).
     pub maintenance_prune_duration_seconds: Histogram<f64>,
@@ -652,6 +659,13 @@ impl AwaMetrics {
                 .with_description("Magnitude of the reason count on a SkippedActive prune")
                 .with_unit("{row}")
                 .with_boundaries(COUNT_BUCKETS.to_vec())
+                .build(),
+            maintenance_prune_pinned_ready_age_seconds: meter
+                .f64_gauge(names::MAINTENANCE_PRUNE_PINNED_READY_AGE)
+                .with_description(
+                    "Age of the first pending ready row of each lane pinning the oldest sealed queue ring slot; 0 once the lane no longer pins it",
+                )
+                .with_unit("s")
                 .build(),
             maintenance_prune_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_PRUNE_DURATION)
@@ -1387,6 +1401,26 @@ impl AwaMetrics {
         self.maintenance_branch_overrun_total.add(1, &attrs);
     }
 
+    /// Record the age of the first pending ready row of a lane pinning the
+    /// oldest sealed queue ring slot. Record [`Duration::ZERO`] once the lane
+    /// no longer pins it.
+    pub fn record_queue_ring_pinned_ready_age(
+        &self,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+        age: Duration,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", "queue"),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.job.priority", i64::from(priority)),
+            opentelemetry::KeyValue::new("awa.queue.enqueue_shard", i64::from(enqueue_shard)),
+        ];
+        self.maintenance_prune_pinned_ready_age_seconds
+            .record(age.as_secs_f64(), &attrs);
+    }
+
     /// Record a ring prune outcome.
     pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
         let (label, reason, count) = match outcome {
@@ -1621,6 +1655,57 @@ mod tests {
                 (key("retryable", "emails", "waiter_limit"), 1),
                 (key("scheduled", "billing", "waiter_timed_out"), 1),
                 (key("scheduled", "emails", "handed_off"), 2),
+            ])
+        );
+    }
+
+    #[test]
+    fn queue_ring_pinned_ready_age_is_a_gauge_per_lane() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_queue_ring_pinned_ready_age("emails", 4, 0, Duration::from_secs(90));
+        metrics.record_queue_ring_pinned_ready_age("emails", 4, 0, Duration::from_secs(120));
+        metrics.record_queue_ring_pinned_ready_age("reports", 2, 3, Duration::ZERO);
+        provider.force_flush().expect("flush metrics");
+
+        let mut ages = BTreeMap::new();
+        for resource in &exporter.get_finished_metrics().expect("read metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let (
+                        names::MAINTENANCE_PRUNE_PINNED_READY_AGE,
+                        AggregatedMetrics::F64(MetricData::Gauge(gauge)),
+                    ) = (metric.name(), metric.data())
+                    else {
+                        continue;
+                    };
+                    for point in gauge.data_points() {
+                        let attrs: BTreeMap<String, String> = point
+                            .attributes()
+                            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                            .collect();
+                        ages.insert(attrs, point.value());
+                    }
+                }
+            }
+        }
+        let lane = |queue: &str, priority: &str, shard: &str| {
+            BTreeMap::from([
+                ("awa.ring".to_string(), "queue".to_string()),
+                ("awa.job.queue".to_string(), queue.to_string()),
+                ("awa.job.priority".to_string(), priority.to_string()),
+                ("awa.queue.enqueue_shard".to_string(), shard.to_string()),
+            ])
+        };
+        assert_eq!(
+            ages,
+            BTreeMap::from([
+                (lane("emails", "4", "0"), 120.0),
+                (lane("reports", "2", "3"), 0.0)
             ])
         );
     }

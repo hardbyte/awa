@@ -34,6 +34,7 @@ Every metric `awa-metrics/src/lib.rs` declares, including ring-rotation and prun
 - `awa_maintenance_rotate_skipped_rows_bucket` (histogram)
 - `awa_maintenance_prune_attempts_total{awa_ring,awa_ring_outcome,awa_ring_reason}`
 - `awa_maintenance_prune_skipped_rows_bucket` (histogram)
+- `awa_maintenance_prune_pinned_ready_age_seconds{awa_ring,awa_job_queue,awa_job_priority,awa_queue_enqueue_shard}`
 - `awa_maintenance_prune_duration_seconds_bucket{awa_ring,awa_maintenance_phase}` (histogram)
 - `awa_ring_current_slot{awa_ring}`
 - `awa_ring_generation{awa_ring}`
