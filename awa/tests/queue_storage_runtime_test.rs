@@ -4503,6 +4503,96 @@ async fn test_spent_claim_advance_crosses_rolled_back_reservations() {
     assert_queue_prune_reclaims(&store, &pool, 0).await;
 }
 
+/// #779 cost check, run by hand: the advance's probe and window statements on
+/// a lane whose backlog is spread over many ready segments, and a claim on a
+/// lane whose claim head another transaction holds. Prints timings.
+/// `AWA_MEASURE_SEGMENTS` sets the backlog's segment count (default 5,000).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement: run by hand with --ignored --nocapture"]
+async fn measure_spent_claim_head_advance_with_a_segment_backlog() {
+    let segments_wanted: usize = std::env::var("AWA_MEASURE_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_measure").await;
+    let schema = store.schema().to_string();
+    let queue = "qs_advance_measure";
+
+    // One enqueue per job: each is its own ready segment.
+    let jobs = enqueue_lane(&pool, &store, queue, 2, segments_wanted).await;
+    let segments: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.ready_segments WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count segments");
+    assert_eq!(segments, segments_wanted as i64);
+    assert_rotated_to(&store, &pool, 1).await;
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("the backlog pins slot 0");
+
+    let mut probe_only = Vec::new();
+    for _ in 0..7 {
+        let started = Instant::now();
+        let advanced = store
+            .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+            .await
+            .expect("advance");
+        probe_only.push(started.elapsed());
+        assert!(advanced.is_empty(), "a live head is not advanced");
+    }
+    let mut advance = Vec::new();
+    for job_id in &jobs[..7] {
+        assert!(store
+            .move_queue(&pool, *job_id, "qs_advance_measure_dest", None)
+            .await
+            .expect("move queue"));
+        let started = Instant::now();
+        let advanced = store
+            .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+            .await
+            .expect("advance");
+        advance.push(started.elapsed());
+        assert_eq!(advanced.len(), 1);
+        assert_eq!(advanced[0].to_seq - advanced[0].from_seq, 1);
+    }
+    probe_only.sort();
+    advance.sort();
+    eprintln!(
+        "[advance-measure] segments={segments_wanted} probe_only_median={:?} probe_only_max={:?} advance_median={:?} advance_max={:?}",
+        probe_only[3], probe_only[6], advance[3], advance[6]
+    );
+
+    let mut holder = pool.begin().await.expect("begin");
+    sqlx::query(&format!(
+        "SELECT 1 FROM {schema}.queue_claim_heads WHERE queue = $1 FOR UPDATE"
+    ))
+    .bind(queue)
+    .execute(&mut *holder)
+    .await
+    .expect("hold the claim head");
+    let started = Instant::now();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .expect("claim");
+    let held_claim = started.elapsed();
+    holder.rollback().await.expect("release");
+    assert!(
+        claimed.is_empty(),
+        "a claim skips a lane whose head is held"
+    );
+    eprintln!(
+        "[advance-measure] claim_with_head_held={held_claim:?} claimed={}",
+        claimed.len()
+    );
+}
+
 /// #779: the advance races live claims and moves on the same lane. Every job
 /// is claimed exactly once, from the queue it is in when claimed, and the
 /// lane stops pinning the slot.
@@ -4774,10 +4864,13 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     .await
     .expect("hold the tombstone child");
     let started = Instant::now();
-    let advanced = store
-        .advance_spent_claim_heads(&pool, &pin.lanes, 4)
-        .await
-        .expect("a locked table is not an error");
+    let advanced = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        store.advance_spent_claim_heads(&pool, &pin.lanes, 4),
+    )
+    .await
+    .expect("the advance does not wait behind a locked table")
+    .expect("a locked table is not an error");
     assert!(advanced.is_empty());
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -4794,10 +4887,13 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     .execute(&mut *holder)
     .await
     .expect("hold the claim head");
-    let advanced = store
-        .advance_spent_claim_heads(&pool, &pin.lanes, 4)
-        .await
-        .expect("a held head is not an error");
+    let advanced = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        store.advance_spent_claim_heads(&pool, &pin.lanes, 4),
+    )
+    .await
+    .expect("the advance does not wait behind a held claim head")
+    .expect("a held head is not an error");
     assert!(advanced.is_empty());
     holder.rollback().await.expect("release");
     assert_eq!(claim_cursor(&pool, &store, queue, 2).await, start);

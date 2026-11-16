@@ -1802,6 +1802,25 @@ async fn released_claimers_with_candidate_claim_cursor_advance() {
         }
     }
     wait_for_drain(&log, Duration::from_secs(180)).await;
+    // The worker reports a completion before writing it; wait for the writes.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.jobs WHERE id = ANY($1) AND state = 'completed'",
+        )
+        .bind(&jobs)
+        .fetch_one(&pool)
+        .await
+        .expect("count completed jobs");
+        if completed == JOBS as i64 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {completed} of {JOBS} completions became durable"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     advancer.await.expect("advancer");
     worker.kill().await;
