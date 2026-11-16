@@ -5155,9 +5155,12 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     )
     .await
     .expect("the advance does not wait behind a locked table")
-    .expect("a locked table is not an error")
-    .advanced;
-    assert!(advanced.is_empty());
+    .expect("a locked table is not an error");
+    assert!(
+        advanced.failed.is_empty(),
+        "contention on a locked table is not a lane failure: {advanced:?}"
+    );
+    assert!(advanced.advanced.is_empty());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the advance does not wait behind the lock"
@@ -5179,9 +5182,12 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     )
     .await
     .expect("the advance does not wait behind a held claim head")
-    .expect("a held head is not an error")
-    .advanced;
-    assert!(advanced.is_empty());
+    .expect("a held head is not an error");
+    assert!(
+        advanced.failed.is_empty(),
+        "contention on a held head is not a lane failure: {advanced:?}"
+    );
+    assert!(advanced.advanced.is_empty());
     holder.rollback().await.expect("release");
     assert_eq!(claim_cursor(&pool, &store, queue, 2).await, start);
 
