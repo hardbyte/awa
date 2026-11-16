@@ -456,8 +456,15 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
 \*     NOWAIT, in that order, which is prune's child exclusive-lock order
 \*   one statement over those tables that finds the lane's first unspent
 \*     row and raises the lane cursor with set_sequence_next
-\* Every acquire is SKIP LOCKED or NOWAIT, so the advance gives up instead
-\* of waiting; modelling the steps as blocking acquires over-approximates.
+\* The plan names one slot's children. The real LOCK TABLE covers every
+\* child of every slot; the statement also reads deferred_jobs,
+\* dlq_entries, queue_enqueue_heads and queue_claim_heads under a short
+\* transaction-local lock_timeout, and set_sequence_next takes a blocking
+\* session advisory lock on the lane cursor that is held only around its
+\* setval. Those omissions are safe because the advance never waits on a
+\* lock prune or rotation holds: the head is SKIP LOCKED, the queue-slot
+\* families are NOWAIT, and the remaining waits are bounded. Modelling
+\* the steps as blocking acquires over-approximates it.
 MaintenanceCursorAdvancePlan(q, p, readySlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
        Step(LeasesParentResource, ModeShared),

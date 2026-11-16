@@ -14,24 +14,34 @@ EXTENDS Naturals, FiniteSets, TLC
 \*           "tomb"      committed ready tombstone (cancel, move, reprioritise)
 \*
 \* A claim, a cancel and a move each hold the lane's queue_claim_heads row
-\* until they commit; a cursor advance takes it for its own statement. The
-\* sequence-backed cursor is non-transactional and set_sequence_next only
-\* raises it. Enqueue holds the lane reservation lock until it commits, so
-\* at most one reservation is in flight and enqueues commit in position
-\* order. Retry and rescue re-enqueue a job at a new position at the tail;
-\* that is a Reserve here, and the old position stays spent.
+\* until they commit; a post-commit cursor advance takes it for its own
+\* statement. Released compatibility SQL (`awa.delete_job_compat`) writes
+\* tombstones without the head, so safety must not rest on it: the
+\* unlocked config checks that. The sequence-backed cursor is
+\* non-transactional and set_sequence_next only raises it. Enqueue holds
+\* the lane reservation lock until it commits, so at most one reservation
+\* is in flight and enqueues commit in position order. Retry and rescue
+\* re-enqueue a job at a new position at the tail; that is a Reserve here,
+\* and the old position stays spent.
 \*
-\* Maintenance reads the lane in one statement under the head lock, taken
-\* with SKIP LOCKED, and computes the cursor target as the first visible
-\* unspent row, or one past the last visible row when every visible row from
-\* the cursor is spent; it then raises the cursor to that target.
+\* Maintenance reads committed lane state in one statement, under the head
+\* lock taken with SKIP LOCKED, over the window
+\* [cursor, min(cursor + WindowSize, enqueue head)). Among the window's
+\* visible untombstoned rows it checks at most CheckCap for claim evidence.
+\* The target is the first checked row that is unclaimed; else one past the
+\* last checked row when CheckCap rows were checked; else one past the last
+\* visible row; else no move. It then raises the cursor to the target.
 \*
-\* MaintLocksHead  maintenance takes the head lock (production: TRUE).
-\* SkipInvisible   broken: maintenance treats reserved-but-invisible
-\*                 positions as spent, i.e. advances to the enqueue head.
-\* DirtyTombstone  broken: maintenance treats a tombstone written by an
-\*                 uncommitted cancel or move as committed.
-CONSTANTS N, MaintLocksHead, SkipInvisible, DirtyTombstone
+\* MaintLocksHead   maintenance takes the head lock (production: TRUE).
+\* SkipInvisible    broken: maintenance treats reserved-but-invisible
+\*                  positions as spent, i.e. advances to the enqueue head.
+\* InOrderEnqueue   enqueues on the lane commit in position order
+\*                  (production: TRUE); FALSE drops the reservation lock.
+\* AllowCursorLoss  a crash or failover loses committed cursor movement and
+\*                  the cursor comes back lower; claims then pass the spent
+\*                  rows on their evidence.
+CONSTANTS N, WindowSize, CheckCap, MaintLocksHead, SkipInvisible,
+          InOrderEnqueue, AllowCursorLoss
 
 Positions == 1..N
 Spent == {"claimed", "tomb"}
@@ -65,7 +75,7 @@ Init ==
 
 Reserve ==
     /\ append <= N
-    /\ ~ \E p \in Positions : state[p] = "inflight"
+    /\ InOrderEnqueue => ~ \E p \in Positions : state[p] = "inflight"
     /\ state' = [state EXCEPT ![append] = "inflight"]
     /\ append' = append + 1
     /\ UNCHANGED <<cursor, headLock, claiming, tombing, tombAdvance,
@@ -190,24 +200,27 @@ CancelAdvance(p) ==
 
 \* ---- maintenance ---------------------------------------------------------
 
-\* What the maintenance statement reads at position p.
-Seen(p) ==
-    IF DirtyTombstone /\ tombing = p THEN "tomb"
-    ELSE IF SkipInvisible /\ state[p] \in {"inflight", "gap"} THEN "gap"
-    ELSE state[p]
-
-Window == {p \in Positions : p >= cursor /\ p < append}
-SeenLive == {p \in Window : Seen(p) = "live"}
-SeenVisible ==
-    IF SkipInvisible THEN Window
-    ELSE {p \in Window : Seen(p) \in Visible}
 SetMin(S) == CHOOSE p \in S : \A q \in S : p <= q
 SetMax(S) == CHOOSE p \in S : \A q \in S : p >= q
+Min(a, b) == IF a < b THEN a ELSE b
+
+WindowEnd == Min(cursor + WindowSize, append)
+InWindow == {p \in Positions : p >= cursor /\ p < WindowEnd}
+SeenVisible ==
+    IF SkipInvisible THEN InWindow
+    ELSE {p \in InWindow : state[p] \in Visible}
+Untombstoned == {p \in SeenVisible : state[p] # "tomb"}
+\* The first CheckCap untombstoned visible rows, in lane order.
+Checked ==
+    {p \in Untombstoned :
+        Cardinality({q \in Untombstoned : q < p}) < CheckCap}
+CheckedLive == {p \in Checked : state[p] = "live"}
 
 MaintTarget ==
-    IF SeenLive # {} THEN SetMin(SeenLive)
-    ELSE IF SeenVisible = {} THEN cursor
-    ELSE SetMax(SeenVisible) + 1
+    IF CheckedLive # {} THEN SetMin(CheckedLive)
+    ELSE IF Checked # {} /\ Cardinality(Checked) = CheckCap THEN SetMax(Checked) + 1
+    ELSE IF SeenVisible # {} THEN SetMax(SeenVisible) + 1
+    ELSE cursor
 
 MaintScan ==
     /\ maintPhase = "idle"
@@ -229,7 +242,16 @@ MaintSet ==
                    pendingClaimAdvance, pendingCancelAdvance, maintTarget,
                    claimCount>>
 
+\* A crash or failover loses committed cursor movement.
+LoseCursor ==
+    /\ AllowCursorLoss
+    /\ \E c \in 1..cursor : cursor' = c
+    /\ UNCHANGED <<state, append, headLock, claiming, tombing, tombAdvance,
+                   pendingClaimAdvance, pendingCancelAdvance, maintPhase,
+                   maintTarget, claimCount>>
+
 Next ==
+    \/ LoseCursor
     \/ Reserve
     \/ \E p \in Positions : EnqueueCommit(p) \/ EnqueueAbort(p)
     \/ ClaimBegin \/ ClaimCommit \/ ClaimAbort \/ ClaimRepair
@@ -265,8 +287,7 @@ NoDoubleClaim == \A p \in Positions : claimCount[p] <= 1
 \* The cursor never passes the enqueue head.
 CursorBounded == cursor <= append
 
-\* The cursor only moves forward, and spent or rolled-back positions never
-\* become claimable again.
+\* Outside a lost cursor, the cursor only moves forward.
 CursorMonotone == [][cursor' >= cursor]_vars
 \* Witness, expected to be violated: maintenance does move the cursor over
 \* a tombstoned row that no cancel advance moved it past.
@@ -277,6 +298,11 @@ MaintNeverPassesTombstone ==
        /\ cursor \notin pendingCancelAdvance
        /\ maintTarget > cursor)
 
+\* Spent and rolled-back positions never become claimable again. This holds
+\* by construction here, since no action rewrites such a position; it
+\* stands for the Rust fact that no path outside queue prune deletes a
+\* ready tombstone or claim-attempt batch, and catches a future action that
+\* would.
 SpentIsFinal ==
     [][\A p \in Positions :
         state[p] \in {"claimed", "tomb", "gap"} => state'[p] = state[p]]_vars
