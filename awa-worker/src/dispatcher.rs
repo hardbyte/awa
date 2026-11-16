@@ -922,6 +922,7 @@ mod tests {
             tokio_util::task::TaskTracker::new(),
             CancellationToken::new(),
             1,
+            4,
         ));
         let config = QueueConfig {
             max_workers: 1,
@@ -1255,6 +1256,7 @@ mod tests {
             tokio_util::task::TaskTracker::new(),
             CancellationToken::new(),
             jobs as u32,
+            4,
         ));
         let config = QueueConfig {
             max_workers: jobs as u32,
