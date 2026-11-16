@@ -5521,11 +5521,29 @@ fn ring_pin_client<W: Worker + 'static>(
     store_config: QueueStorageConfig,
     worker: W,
 ) -> Client {
+    ring_pin_client_rotating_every(
+        pool,
+        queue,
+        queue_config,
+        store_config,
+        worker,
+        Duration::from_millis(100),
+    )
+}
+
+fn ring_pin_client_rotating_every<W: Worker + 'static>(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    queue_config: QueueConfig,
+    store_config: QueueStorageConfig,
+    worker: W,
+    queue_rotate_interval: Duration,
+) -> Client {
     Client::builder(pool.clone())
         .queue(queue, queue_config)
         .queue_storage(
             store_config,
-            Duration::from_millis(100),
+            queue_rotate_interval,
             Duration::from_millis(100),
         )
         .register_worker(worker)
@@ -5687,6 +5705,85 @@ async fn test_queue_ring_pin_metric_and_warning_name_a_paused_queue() {
     )
     .await;
     wait_for_queue_drained(&store, &pool, queue).await;
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+fn pending_ready_prune_attempts(
+    exporter: &InMemoryMetricExporter,
+    meter_provider: &SdkMeterProvider,
+) -> u64 {
+    meter_provider.force_flush().expect("flush metrics");
+    let metrics = exporter.get_finished_metrics().expect("read metrics");
+    let Some(latest) = metrics.last() else {
+        return 0;
+    };
+    sum_counter_metric_with_attribute(
+        std::slice::from_ref(latest),
+        "awa.maintenance.prune.attempts",
+        "awa.ring.reason",
+        "queue.pending_ready",
+    )
+}
+
+/// #779: once prune backs off a pinned slot for up to 32 rotation ticks, the
+/// leader still re-reads the pinning lanes, so the gauge keeps ageing between
+/// prune attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_gauge_refreshes_while_prune_backs_off() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_metric_backoff";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_metric_backoff");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    enqueue_lane(&pool, &store, queue, 2, 1).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let client = ring_pin_client_rotating_every(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 1,
+            poll_interval: Duration::from_millis(25),
+            ..QueueConfig::default()
+        },
+        store_config,
+        CompleteWorker,
+        Duration::from_secs(1),
+    );
+    client.start().await.expect("start client");
+
+    // Prune runs on ticks 1, 4, 9, 18 and 35, then not again for 32 ticks.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(90));
+    while pending_ready_prune_attempts(&exporter, &meter_provider) < 5 {
+        assert!(
+            Instant::now() < deadline,
+            "prune should reach its longest backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let attempts = pending_ready_prune_attempts(&exporter, &meter_provider);
+    let age = pinned_ready_ages(&exporter, &meter_provider)[&(queue.to_string(), 2, 0)];
+    let refreshed = wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |later| later > age + 10.0,
+        "the gauge keeps ageing while prune is backed off",
+    )
+    .await;
+    assert_eq!(
+        pending_ready_prune_attempts(&exporter, &meter_provider),
+        attempts,
+        "the gauge moved from {age} to {refreshed} without another prune attempt"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
