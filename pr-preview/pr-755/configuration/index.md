@@ -151,7 +151,7 @@ let opts = customer_updates.route_opts_by_key(
 
 With one partition, `PartitionedQueue::new("email", 1)` uses the plain `email` queue. With more than one partition, partition 0 remains the logical queue name and later partitions use stable suffixes: `email`, `email__p1`, `email__p2`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO inside the selected partition even if each physical queue later raises `enqueue_shards`.
 
-`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue in each process. Divide those values yourself, or use `global_max_workers`, when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap.
+`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue in each process. Divide those values yourself when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap. `global_max_workers` can cap total concurrency instead, but not the combined rate; divide `rate_limit` either way.
 
 Python exposes the same deterministic router through the `awa.PartitionedQueue` class:
 
@@ -321,6 +321,8 @@ await client.start([
 Aging is computed at claim time on queue-storage runtimes: ready rows keep their stored lane priority, and the claim SQL compares candidate lanes by effective priority. When a job is claimed, the live attempt records the effective priority used for that claim. In canonical storage, the maintenance leader physically rewrites waiting rows from priority N to N-1 and preserves the enqueue priority in `metadata._awa_original_priority`.
 
 The admin UI shows the priority on the current job snapshot and, when `_awa_original_priority` is present, the original enqueue priority as `(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or `priority_aging_interval_ms: 0` (Python) to disable escalation entirely (strict static priority).
+
+Under queue storage, strict priority on a queue whose higher priorities stay backlogged leaves its lower-priority rows unclaimed, and unclaimed rows keep queue prune from reclaiming the oldest ring slot for every queue. Keep aging on for queues that mix priorities under sustained backlog; see [queue ring stops wrapping behind an unclaimed lane](../troubleshooting/index.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
 
 There is a separate top-level `ClientBuilder::priority_aging_interval` that controls the legacy canonical-storage maintenance pass that physically rewrites stored priorities. With queue storage (the 0.6 default) it is a no-op; the per-queue setting above is the one to tune.
 

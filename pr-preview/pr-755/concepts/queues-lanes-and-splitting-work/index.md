@@ -161,7 +161,7 @@ flowchart LR
     C --> W[worker process]
 ```
 
-A job with an `ordering_key` goes to the shard its key hashes to, so jobs with the same key stay in order. Jobs without a key are spread across the shards.
+A job with an `ordering_key` goes to the shard its key hashes to, so jobs with the same key and the same priority stay in order. The key does not override priority: a later priority 1 job can run before an earlier priority 2 job with the same key. Jobs without a key are spread across the shards.
 
 ```rust
 InsertOpts {
@@ -177,7 +177,7 @@ await client.insert(ChargeAccount(account_id=account_id), queue="billing",
 ```
 
 - **You get:** more producers and claimers working on one queue at the same time. The queue keeps one name, one policy and one set of metrics.
-- **You give up:** FIFO across the whole queue. Order holds within a shard, and per key when you pass `ordering_key`. Jobs without a key have no order relative to jobs on other shards.
+- **You give up:** FIFO across the whole queue. Order holds within a lane, and per key and priority when you pass `ordering_key`. Jobs without a key have no order relative to jobs on other shards.
 - **Changing it:** lowering the count never strands jobs; workers still claim the ones on higher shards. Changing the count in either direction moves keys to different shards, so a key's jobs enqueued before and after the change can run out of order until the older ones drain. A producer that enqueues directly into queue storage keeps the count it first read until it restarts; the SQL insert path reads it on every insert.
 
 [Scaling a hot queue](../scaling-a-hot-queue/index.md) has measured throughput for each shard count and how to confirm the change helped. See also [Sharding the enqueue head](../../configuration/index.md#sharding-the-enqueue-head-per-queue) and [ADR-025](../../adr/025-sharded-enqueue-heads/index.md).
@@ -235,7 +235,7 @@ await client.insert(ChargeAccount(account_id=account_id),
 ```
 
 - **You get:** N sets of policy and lanes. Each partition has its own capacity, rate limit, claim path, completion stream and metrics, so a burst of one key's work fills one partition rather than the whole workload. `route_by_index` and `route_opts_by_index` spread work round-robin when you do not need per-key order.
-- **You give up:** one queue in the admin views and metrics; operators see N queues. Keys that share a partition with a busy key still wait behind it. Capacity and rate limit multiply: four partitions with `max_workers: 16` and a rate of 50 per second allow 64 workers and 200 jobs per second in each worker process. Divide the values, or use weighted mode with `global_max_workers`, for a total cap. Retention and dead-letter overrides are keyed by queue name, so set them for each partition. Priority is compared only within a partition.
+- **You give up:** one queue in the admin views and metrics; operators see N queues. Keys that share a partition with a busy key still wait behind it. Capacity and rate limit multiply: four partitions with `max_workers: 16` and a rate of 50 per second allow 64 workers and 200 jobs per second in each worker process. For a total cap, divide both values; weighted mode with `global_max_workers` caps total concurrency only, not the combined rate, so divide `rate_limit` either way. Retention and dead-letter overrides are keyed by queue name, so set them for each partition. Priority is compared only within a partition.
 - **Changing it:** changing N moves keys to different partitions. Start workers for new partitions before producers route to them; when shrinking, move producers first and drain the removed partitions before stopping their workers. See [ADR-031](../../adr/031-partitioned-queues/index.md).
 
 See [Partitioned queues](../../configuration/index.md#partitioned-queues) for the full API.
@@ -249,7 +249,7 @@ See [Partitioned queues](../../configuration/index.md#partitioned-queues) for th
 | Urgent work to run ahead of bulk work on the same workers | Priority | A lane per priority, same policy, ordered by effective priority |
 | Workers sitting idle while the queue has a backlog | A larger `claim_batch_size`, then `claimers` | More jobs per claim, then more claim loops |
 | More enqueue or claim throughput on one queue, keeping one queue name | `enqueue_shards` | More lanes under the same policy |
-| Order per customer, account or order, with more throughput | `enqueue_shards` or `PartitionedQueue`, with an `ordering_key` | Same key, same lane |
+| Order per customer, account or order, with more throughput | `enqueue_shards` or `PartitionedQueue`, with an `ordering_key` | Same key and priority, same lane |
 | Capacity or rate limit per slice of one workload, or a busy key not to fill the whole workload | `PartitionedQueue` | Each partition is a complete queue |
 | Strict FIFO across the whole queue | One queue, one priority, `enqueue_shards = 1` | One lane is the only total order |
 
@@ -264,9 +264,9 @@ Before splitting a queue, check that it is short of lane throughput rather than 
 | Priority + `PartitionedQueue` | Composes, priority per partition | A priority 1 job in one partition does not run ahead of a priority 2 job in another |
 | `claimers` + `enqueue_shards` | Composes | More lanes mean claim loops skip each other's locked lanes less often; measure before raising claimers |
 | `claimers` + `PartitionedQueue` | Composes, multiplies | Claimers apply to each partition, multiplying claim loops and transactions |
-| `enqueue_shards` + `ordering_key` | Composes | Per-key FIFO within the queue; `ordering_key` has no effect at one shard |
+| `enqueue_shards` + `ordering_key` | Composes | Per-key FIFO within the queue for jobs of the same priority; `ordering_key` has no effect at one shard |
 | `PartitionedQueue` + `enqueue_shards` | Composes | Each partition can raise its own shard count. Key routing sets `ordering_key`, and the partition and shard hashes are independent, so a key keeps one partition and one shard while a partition's keys still use all its shards |
-| Strict global FIFO + shards or partitions | Conflict | Both give up order across lanes; only per-key order survives, and only with an `ordering_key` |
+| Strict global FIFO + shards or partitions | Conflict | Both give up order across lanes; only per-key order at one priority survives, and only with an `ordering_key` |
 
 Rate limit and capacity differ by tool. With separate queues and `PartitionedQueue`, each queue or partition has its own `max_workers` and `rate_limit`. With priority, claimers and `enqueue_shards`, the queue keeps one `max_workers` and one `rate_limit` across all its lanes. In every case the values apply per worker process.
 

@@ -2746,7 +2746,7 @@
     L20 --&gt; C
     L21 --&gt; C
     C --&gt; W[worker process]</code></pre>
-<p>A job with an <code>ordering_key</code> goes to the shard its key hashes to, so jobs with the same key stay in order. Jobs without a key are spread across the shards.</p>
+<p>A job with an <code>ordering_key</code> goes to the shard its key hashes to, so jobs with the same key and the same priority stay in order. The key does not override priority: a later priority 1 job can run before an earlier priority 2 job with the same key. Jobs without a key are spread across the shards.</p>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">InsertOpts</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span><span class="n">queue</span><span class="p">:</span><span class="w"> </span><span class="s">"billing"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
 </span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span><span class="n">ordering_key</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="fm">format!</span><span class="p">(</span><span class="s">"account-{account_id}"</span><span class="p">).</span><span class="n">into_bytes</span><span class="p">()),</span>
@@ -2758,7 +2758,7 @@
 </span></code></pre></div>
 <ul>
 <li><strong>You get:</strong> more producers and claimers working on one queue at the same time. The queue keeps one name, one policy and one set of metrics.</li>
-<li><strong>You give up:</strong> FIFO across the whole queue. Order holds within a shard, and per key when you pass <code>ordering_key</code>. Jobs without a key have no order relative to jobs on other shards.</li>
+<li><strong>You give up:</strong> FIFO across the whole queue. Order holds within a lane, and per key and priority when you pass <code>ordering_key</code>. Jobs without a key have no order relative to jobs on other shards.</li>
 <li><strong>Changing it:</strong> lowering the count never strands jobs; workers still claim the ones on higher shards. Changing the count in either direction moves keys to different shards, so a key's jobs enqueued before and after the change can run out of order until the older ones drain. A producer that enqueues directly into queue storage keeps the count it first read until it restarts; the SQL insert path reads it on every insert.</li>
 </ul>
 <p><a href="../scaling-a-hot-queue/">Scaling a hot queue</a> has measured throughput for each shard count and how to confirm the change helped. See also <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head</a> and <a href="../../adr/025-sharded-enqueue-heads/">ADR-025</a>.</p>
@@ -2806,7 +2806,7 @@
 </span></code></pre></div>
 <ul>
 <li><strong>You get:</strong> N sets of policy and lanes. Each partition has its own capacity, rate limit, claim path, completion stream and metrics, so a burst of one key's work fills one partition rather than the whole workload. <code>route_by_index</code> and <code>route_opts_by_index</code> spread work round-robin when you do not need per-key order.</li>
-<li><strong>You give up:</strong> one queue in the admin views and metrics; operators see N queues. Keys that share a partition with a busy key still wait behind it. Capacity and rate limit multiply: four partitions with <code>max_workers: 16</code> and a rate of 50 per second allow 64 workers and 200 jobs per second in each worker process. Divide the values, or use weighted mode with <code>global_max_workers</code>, for a total cap. Retention and dead-letter overrides are keyed by queue name, so set them for each partition. Priority is compared only within a partition.</li>
+<li><strong>You give up:</strong> one queue in the admin views and metrics; operators see N queues. Keys that share a partition with a busy key still wait behind it. Capacity and rate limit multiply: four partitions with <code>max_workers: 16</code> and a rate of 50 per second allow 64 workers and 200 jobs per second in each worker process. For a total cap, divide both values; weighted mode with <code>global_max_workers</code> caps total concurrency only, not the combined rate, so divide <code>rate_limit</code> either way. Retention and dead-letter overrides are keyed by queue name, so set them for each partition. Priority is compared only within a partition.</li>
 <li><strong>Changing it:</strong> changing N moves keys to different partitions. Start workers for new partitions before producers route to them; when shrinking, move producers first and drain the removed partitions before stopping their workers. See <a href="../../adr/031-partitioned-queues/">ADR-031</a>.</li>
 </ul>
 <p>See <a href="../../configuration/#partitioned-queues">Partitioned queues</a> for the full API.</p>
@@ -2848,7 +2848,7 @@
 <tr>
 <td>Order per customer, account or order, with more throughput</td>
 <td><code>enqueue_shards</code> or <code>PartitionedQueue</code>, with an <code>ordering_key</code></td>
-<td>Same key, same lane</td>
+<td>Same key and priority, same lane</td>
 </tr>
 <tr>
 <td>Capacity or rate limit per slice of one workload, or a busy key not to fill the whole workload</td>
@@ -2901,7 +2901,7 @@
 <tr>
 <td><code>enqueue_shards</code> + <code>ordering_key</code></td>
 <td>Composes</td>
-<td>Per-key FIFO within the queue; <code>ordering_key</code> has no effect at one shard</td>
+<td>Per-key FIFO within the queue for jobs of the same priority; <code>ordering_key</code> has no effect at one shard</td>
 </tr>
 <tr>
 <td><code>PartitionedQueue</code> + <code>enqueue_shards</code></td>
@@ -2911,7 +2911,7 @@
 <tr>
 <td>Strict global FIFO + shards or partitions</td>
 <td>Conflict</td>
-<td>Both give up order across lanes; only per-key order survives, and only with an <code>ordering_key</code></td>
+<td>Both give up order across lanes; only per-key order at one priority survives, and only with an <code>ordering_key</code></td>
 </tr>
 </tbody>
 </table>
