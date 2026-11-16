@@ -669,6 +669,34 @@ impl SkipReason {
     }
 }
 
+/// A ready lane with rows at or past its claim cursor in the oldest sealed
+/// queue ring slot, which keeps queue prune from reclaiming that slot. See
+/// [`QueueStorage::queue_ring_pin`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PendingReadyLane {
+    pub queue: String,
+    pub priority: i16,
+    pub enqueue_shard: i16,
+    /// `lane_seq` of the lane's first row at or past its claim cursor.
+    pub head_lane_seq: i64,
+    /// `run_at` of that row: when it became ready.
+    pub head_run_at: DateTime<Utc>,
+    /// How long that row has been ready, by the database clock.
+    pub head_age: Duration,
+}
+
+/// The oldest sealed queue ring slot and the lanes whose pending ready rows
+/// keep queue prune from reclaiming it. See [`QueueStorage::queue_ring_pin`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct QueueRingPin {
+    pub slot: i32,
+    pub generation: i64,
+    /// Oldest head first.
+    pub lanes: Vec<PendingReadyLane>,
+}
+
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     if let sqlx::Error::Database(ref db_err) = err {
         if db_err.code().as_deref() == Some("23505") {
@@ -18777,6 +18805,106 @@ impl QueueStorage {
             }
         }
         Ok(outcome)
+    }
+
+    /// The lanes keeping queue prune from reclaiming the oldest sealed queue
+    /// ring slot because they hold ready rows at or past their claim cursor:
+    /// the rows behind [`SkipReason::QueuePendingReady`]. `None` when there is
+    /// no sealed slot or no such lane.
+    ///
+    /// Read-only and lock-free on the ring state. It probes each lane's head
+    /// in the slot's ready partition, the same lanes the pending-ready gate
+    /// probes, so it costs about as much as that gate.
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.queue_ring_pin")]
+    pub async fn queue_ring_pin(&self, pool: &PgPool) -> Result<Option<QueueRingPin>, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+
+        let target: Option<(i32, i64)> = sqlx::query_as(&format!(
+            r#"
+            SELECT slots.slot, slots.generation
+            FROM {schema}.queue_ring_slots AS slots
+            WHERE slots.generation >= 0
+              AND slots.slot <> (
+                  SELECT current_slot
+                  FROM {schema}.queue_ring_state
+                  WHERE singleton = TRUE
+              )
+            ORDER BY slots.generation ASC, slots.slot ASC
+            LIMIT 1
+            "#
+        ))
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let Some((slot, generation)) = target else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(None);
+        };
+
+        let ready_child = ready_child_name(schema, slot as usize);
+        let rows: Vec<(String, i16, i16, i64, DateTime<Utc>, f64)> = sqlx::query_as(&format!(
+            r#"
+            WITH claim_cursors AS MATERIALIZED (
+                SELECT
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    {schema}.sequence_next_value(seq_name) AS claim_seq
+                FROM {schema}.queue_claim_heads
+            )
+            SELECT
+                claims.queue,
+                claims.priority,
+                claims.enqueue_shard,
+                head.lane_seq,
+                head.run_at,
+                GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - head.run_at)), 0)::float8
+            FROM claim_cursors AS claims
+            CROSS JOIN LATERAL (
+                SELECT ready.lane_seq, ready.run_at
+                FROM {ready_child} AS ready
+                WHERE ready.ready_generation = $1
+                  AND ready.queue = claims.queue
+                  AND ready.priority = claims.priority
+                  AND ready.enqueue_shard = claims.enqueue_shard
+                  AND ready.lane_seq >= claims.claim_seq
+                ORDER BY ready.lane_seq ASC
+                LIMIT 1
+            ) AS head
+            ORDER BY head.run_at ASC, claims.queue, claims.priority, claims.enqueue_shard
+            "#
+        ))
+        .bind(generation)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let lanes = rows
+            .into_iter()
+            .map(
+                |(queue, priority, enqueue_shard, head_lane_seq, head_run_at, age_secs)| {
+                    PendingReadyLane {
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        head_lane_seq,
+                        head_run_at,
+                        head_age: Duration::try_from_secs_f64(age_secs).unwrap_or_default(),
+                    }
+                },
+            )
+            .collect();
+        Ok(Some(QueueRingPin {
+            slot,
+            generation,
+            lanes,
+        }))
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_leases")]

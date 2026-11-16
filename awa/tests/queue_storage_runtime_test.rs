@@ -3523,6 +3523,849 @@ async fn test_prune_oldest_does_not_skip_committed_pending_ready() {
     );
 }
 
+/// Enqueue `count` jobs on one `(queue, priority)` lane, returning their ids in
+/// lane order.
+async fn enqueue_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    count: usize,
+) -> Vec<i64> {
+    let mut ids = Vec::with_capacity(count);
+    for n in 0..count {
+        ids.push(
+            enqueue_job(
+                pool,
+                store,
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    priority,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    ids
+}
+
+/// Move a lane's ready rows and segments `by` into the past, as if they had
+/// waited that long.
+async fn backdate_ready_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    by: Duration,
+) {
+    let schema = store.schema();
+    let by = by.as_secs_f64();
+    for statement in [
+        format!(
+            "UPDATE {schema}.ready_entries
+             SET run_at = run_at - make_interval(secs => $3)
+             WHERE queue = $1 AND priority = $2"
+        ),
+        format!(
+            "UPDATE {schema}.ready_segments
+             SET first_run_at = first_run_at - make_interval(secs => $3)
+             WHERE queue = $1 AND priority = $2"
+        ),
+    ] {
+        sqlx::query(&statement)
+            .bind(queue)
+            .bind(priority)
+            .bind(by)
+            .execute(pool)
+            .await
+            .expect("backdate ready lane");
+    }
+}
+
+/// A 4-slot queue ring with the default receipt claims.
+async fn create_ring_pin_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
+    create_store_with_config(
+        pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Claim up to `max` jobs from `queue` and complete them.
+async fn claim_and_complete(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    queue: &str,
+    max: i64,
+    aging_interval: Duration,
+) -> Vec<awa::model::ClaimedRuntimeJob> {
+    let claimed = store
+        .claim_runtime_batch_with_aging(pool, queue, max, Duration::from_secs(60), aging_interval)
+        .await
+        .expect("claim runtime batch");
+    if !claimed.is_empty() {
+        let completed = store
+            .complete_runtime_batch(pool, &claimed)
+            .await
+            .expect("complete runtime batch");
+        assert_eq!(completed.len(), claimed.len(), "every claim completes");
+    }
+    claimed
+}
+
+/// The per-lane form of queue prune's pending-ready gate: whether `slot` holds
+/// a ready row of the lane at or past its claim cursor.
+async fn lane_pins_slot(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    slot: i32,
+    queue: &str,
+    priority: i16,
+) -> bool {
+    let schema = store.schema();
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM {schema}.queue_claim_heads AS heads
+             JOIN {schema}.ready_entries AS ready
+               ON ready.queue = heads.queue
+              AND ready.priority = heads.priority
+              AND ready.enqueue_shard = heads.enqueue_shard
+             WHERE ready.ready_slot = $1
+               AND heads.queue = $2
+               AND heads.priority = $3
+               AND ready.lane_seq >= {schema}.sequence_next_value(heads.seq_name)
+         )"
+    ))
+    .bind(slot)
+    .bind(queue)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .expect("read lane pending-ready state")
+}
+
+async fn assert_rotated_to(store: &QueueStorage, pool: &sqlx::PgPool, expected_slot: i32) {
+    let outcome = store.rotate(pool).await.expect("rotate queue ring");
+    assert!(
+        matches!(outcome, RotateOutcome::Rotated { slot, .. } if slot == expected_slot),
+        "expected rotation to slot {expected_slot}, got {outcome:?}"
+    );
+}
+
+/// Rotate the 4-slot ring from slot 1 back round to slot 0, which must refuse.
+async fn assert_ring_cannot_wrap_to_slot_0(store: &QueueStorage, pool: &sqlx::PgPool) {
+    assert_rotated_to(store, pool, 2).await;
+    assert_rotated_to(store, pool, 3).await;
+    let outcome = store.rotate(pool).await.expect("rotate queue ring");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedBusy { slot: 0, busy } if busy.queue_ready > 0),
+        "rotation into the pinned slot must skip it as busy, got {outcome:?}"
+    );
+}
+
+async fn assert_queue_prune_pinned(store: &QueueStorage, pool: &sqlx::PgPool, slot: i32) {
+    let outcome = store
+        .prune_oldest(pool, Duration::ZERO)
+        .await
+        .expect("prune_oldest");
+    assert!(
+        matches!(
+            outcome,
+            PruneOutcome::SkippedActive {
+                slot: skipped,
+                reason: SkipReason::QueuePendingReady,
+                ..
+            } if skipped == slot
+        ),
+        "slot {slot} must be pinned by pending ready rows, got {outcome:?}"
+    );
+}
+
+/// `queue_ring_pin` names exactly `lane` as pinning `slot`, with a head
+/// ready between `min_age` and a minute longer ago.
+async fn assert_ring_pinned_by(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    slot: i32,
+    lane: (&str, i16, i16),
+    min_age: Duration,
+) {
+    let pin = store
+        .queue_ring_pin(pool)
+        .await
+        .expect("read queue ring pin")
+        .expect("the ring is pinned");
+    assert_eq!(pin.slot, slot);
+    let lanes: Vec<(&str, i16, i16)> = pin
+        .lanes
+        .iter()
+        .map(|pinning| {
+            (
+                pinning.queue.as_str(),
+                pinning.priority,
+                pinning.enqueue_shard,
+            )
+        })
+        .collect();
+    assert_eq!(lanes, vec![lane]);
+    let age = pin.lanes[0].head_age;
+    assert!(
+        age >= min_age && age < min_age + Duration::from_secs(60),
+        "head age {age:?} should be just over {min_age:?}"
+    );
+}
+
+async fn assert_queue_prune_reclaims(store: &QueueStorage, pool: &sqlx::PgPool, slot: i32) {
+    let outcome = prune_retrying_blocked(store, pool, Duration::ZERO, slot).await;
+    assert!(
+        matches!(outcome, PruneOutcome::Pruned { slot: pruned, .. } if pruned == slot),
+        "slot {slot} must be reclaimed once nothing pins it, got {outcome:?}"
+    );
+}
+
+/// #779: with priority aging off, a lower-priority lane is not claimed while a
+/// higher-priority lane stays backlogged, so its old rows pin the oldest
+/// sealed slot and the ring cannot wrap. Claiming the lane with aging on
+/// unpins it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pinned_by_strictly_starved_lane_until_aging_claims_it() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_ring_pin_starved";
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_starved").await;
+
+    let starved = enqueue_lane(&pool, &store, queue, 4, 3).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    enqueue_lane(&pool, &store, queue, 1, 2).await;
+    assert!(
+        store
+            .queue_ring_pin(&pool)
+            .await
+            .expect("read queue ring pin")
+            .is_some_and(|pin| pin.slot == 0),
+        "unclaimed rows in the sealed slot pin it"
+    );
+
+    for _ in 0..3 {
+        let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].claim.priority, 1,
+            "strict priority serves the backlogged higher lane"
+        );
+        enqueue_lane(&pool, &store, queue, 1, 1).await;
+        assert_queue_prune_pinned(&store, &pool, 0).await;
+    }
+    assert!(lane_pins_slot(&pool, &store, 0, queue, 4).await);
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 1).await);
+
+    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+
+    backdate_ready_lane(&pool, &store, queue, 4, Duration::from_secs(3600)).await;
+    assert_ring_pinned_by(&store, &pool, 0, (queue, 4, 0), Duration::from_secs(3600)).await;
+    let claimed = claim_and_complete(&store, &pool, queue, 3, Duration::from_secs(60)).await;
+    let claimed_ids: Vec<i64> = claimed.iter().map(|job| job.job.id).collect();
+    assert_eq!(
+        claimed_ids, starved,
+        "aging lifts the hour-old priority-4 head above the fresh priority-1 backlog"
+    );
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    assert_rotated_to(&store, &pool, 0).await;
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read queue ring pin");
+    assert!(
+        pin.as_ref()
+            .is_none_or(|pin| pin.lanes.iter().all(|lane| lane.priority != 4)),
+        "the claimed lane no longer pins the ring, got {pin:?}"
+    );
+}
+
+/// #779: with aging off, the starved lane is claimed, and the ring unpinned,
+/// only once the higher-priority lane drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_starved_lane_unpins_once_higher_lane_drains() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_ring_pin_drain";
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_drain").await;
+
+    let starved = enqueue_lane(&pool, &store, queue, 4, 2).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let backlog = enqueue_lane(&pool, &store, queue, 1, 3).await;
+
+    let mut claim_order = Vec::new();
+    for _ in 0..backlog.len() {
+        assert_queue_prune_pinned(&store, &pool, 0).await;
+        let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+        claim_order.extend(claimed.iter().map(|job| job.job.id));
+    }
+    assert_eq!(claim_order, backlog);
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+
+    let claimed = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO).await;
+    let claimed_ids: Vec<i64> = claimed.iter().map(|job| job.job.id).collect();
+    assert_eq!(claimed_ids, starved);
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
+/// #779: a paused queue's ready rows pin the slot that holds them until the
+/// queue is resumed and claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pinned_by_paused_queue_until_resumed() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_ring_pin_paused";
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_paused").await;
+
+    let paused = enqueue_lane(&pool, &store, queue, 2, 2).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    assert!(
+        claim_and_complete(&store, &pool, queue, 10, Duration::from_secs(60))
+            .await
+            .is_empty(),
+        "a paused queue is not claimed, with or without aging"
+    );
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+    assert_ring_pinned_by(&store, &pool, 0, (queue, 2, 0), Duration::from_secs(600)).await;
+
+    admin::resume_queue(&pool, queue)
+        .await
+        .expect("resume queue");
+    let claimed = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO).await;
+    let claimed_ids: Vec<i64> = claimed.iter().map(|job| job.job.id).collect();
+    assert_eq!(claimed_ids, paused);
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    assert_rotated_to(&store, &pool, 0).await;
+    assert_eq!(
+        store
+            .queue_ring_pin(&pool)
+            .await
+            .expect("read queue ring pin"),
+        None
+    );
+}
+
+/// #779: whether making an unclaimed lane's rows unavailable unpins the ring.
+/// Cancel, move and reprioritise tombstone the ready row, and the pending
+/// gate counts tombstoned rows. A cancel advances the lane's claim cursor
+/// only when the cancelled row is exactly at it, so cancelling a lane in lane
+/// order, in one bulk cancel or by draining the queue releases it, while
+/// cancelling it out of order, cancelling inside the
+/// caller's transaction, moving it or reprioritising it leaves the rows
+/// pinning the slot. Claiming from the lane then moves the cursor over the
+/// tombstones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_ring_pin_after_cancelling_or_moving_unclaimed_rows() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_ring_pin_cancelled").await;
+
+    let in_order = "qs_ring_pin_cancel_in_order";
+    let bulk = "qs_ring_pin_bulk_cancel";
+    let reverse = "qs_ring_pin_cancel_reverse";
+    let in_tx = "qs_ring_pin_cancel_in_tx";
+    let drained = "qs_ring_pin_drain_queue";
+    let reprioritised = "qs_ring_pin_set_priority";
+    let moved = "qs_ring_pin_move_queue";
+    let moved_to = "qs_ring_pin_move_dest";
+
+    let mut lanes = HashMap::new();
+    for queue in [
+        in_order,
+        bulk,
+        reverse,
+        in_tx,
+        drained,
+        reprioritised,
+        moved,
+    ] {
+        lanes.insert(queue, enqueue_lane(&pool, &store, queue, 4, 3).await);
+    }
+    assert_rotated_to(&store, &pool, 1).await;
+
+    for job_id in &lanes[in_order] {
+        admin::cancel(&pool, *job_id)
+            .await
+            .expect("cancel")
+            .expect("available job cancels");
+    }
+    assert_eq!(
+        admin::bulk_cancel(&pool, &lanes[bulk])
+            .await
+            .expect("bulk cancel")
+            .len(),
+        3
+    );
+    for job_id in lanes[reverse].iter().rev() {
+        admin::cancel(&pool, *job_id)
+            .await
+            .expect("cancel")
+            .expect("available job cancels");
+    }
+    let mut conn = pool.acquire().await.expect("acquire connection");
+    for job_id in &lanes[in_tx] {
+        admin::cancel_tx(&mut conn, *job_id)
+            .await
+            .expect("cancel_tx")
+            .expect("available job cancels");
+    }
+    drop(conn);
+    assert_eq!(
+        admin::drain_queue(&pool, drained)
+            .await
+            .expect("drain queue"),
+        3
+    );
+    for job_id in &lanes[reprioritised] {
+        assert!(store
+            .set_priority(&pool, *job_id, 2)
+            .await
+            .expect("set priority"));
+    }
+    for job_id in &lanes[moved] {
+        assert!(store
+            .move_queue(&pool, *job_id, moved_to, None)
+            .await
+            .expect("move queue"));
+    }
+
+    let tombstoned: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_tombstones WHERE ready_slot = 0",
+        store.schema()
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count tombstones");
+    assert_eq!(tombstoned, 21, "every source row is tombstoned in slot 0");
+
+    assert!(!lane_pins_slot(&pool, &store, 0, in_order, 4).await);
+    assert!(!lane_pins_slot(&pool, &store, 0, bulk, 4).await);
+    assert!(!lane_pins_slot(&pool, &store, 0, drained, 4).await);
+    for queue in [reverse, in_tx, reprioritised, moved] {
+        assert!(
+            lane_pins_slot(&pool, &store, 0, queue, 4).await,
+            "{queue}: tombstoned rows past the claim cursor still pin the slot"
+        );
+    }
+    assert_queue_prune_pinned(&store, &pool, 0).await;
+    assert_ring_cannot_wrap_to_slot_0(&store, &pool).await;
+
+    for queue in [reverse, in_tx, reprioritised, moved] {
+        let mut live = Vec::new();
+        for _ in 0..4 {
+            live.extend(
+                claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                    .await
+                    .into_iter()
+                    .map(|job| job.job.id),
+            );
+        }
+        let expected: Vec<i64> = if queue == reprioritised {
+            lanes[reprioritised].clone()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(live, expected, "{queue}: only live rows are claimed");
+        assert!(
+            !lane_pins_slot(&pool, &store, 0, queue, 4).await,
+            "{queue}: a claim on the lane moves its cursor over the tombstones"
+        );
+    }
+
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
+/// The latest value of each `awa.maintenance.prune.pinned_ready_age` series,
+/// keyed by `(queue, priority, enqueue_shard)`.
+fn pinned_ready_ages(
+    exporter: &InMemoryMetricExporter,
+    meter_provider: &SdkMeterProvider,
+) -> HashMap<(String, i64, i64), f64> {
+    meter_provider.force_flush().expect("flush metrics");
+    let mut ages = HashMap::new();
+    for resource in exporter.get_finished_metrics().expect("read metrics") {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "awa.maintenance.prune.pinned_ready_age" {
+                    continue;
+                }
+                let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = metric.data() else {
+                    panic!("pinned_ready_age must be an f64 gauge");
+                };
+                for point in gauge.data_points() {
+                    let mut queue = String::new();
+                    let (mut priority, mut shard) = (-1, -1);
+                    for kv in point.attributes() {
+                        match (kv.key.as_str(), &kv.value) {
+                            ("awa.job.queue", value) => queue = value.as_str().to_string(),
+                            ("awa.job.priority", opentelemetry::Value::I64(value)) => {
+                                priority = *value
+                            }
+                            ("awa.queue.enqueue_shard", opentelemetry::Value::I64(value)) => {
+                                shard = *value
+                            }
+                            _ => {}
+                        }
+                    }
+                    ages.insert((queue, priority, shard), point.value());
+                }
+            }
+        }
+    }
+    ages
+}
+
+async fn wait_for_pinned_ready_age(
+    exporter: &InMemoryMetricExporter,
+    meter_provider: &SdkMeterProvider,
+    lane: (&str, i64, i64),
+    accept: impl Fn(f64) -> bool,
+    message: &str,
+) -> f64 {
+    let key = (lane.0.to_string(), lane.1, lane.2);
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(20));
+    loop {
+        let ages = pinned_ready_ages(exporter, meter_provider);
+        if let Some(age) = ages.get(&key).copied().filter(|age| accept(*age)) {
+            return age;
+        }
+        assert!(Instant::now() < deadline, "{message}; gauges: {ages:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The warning the maintenance leader logged for `queue`.
+async fn wait_for_ring_pin_warning(queue: &str) -> RingPinEvent {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    loop {
+        let warning = ring_pin_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.message.starts_with("Queue ring prune is pinned")
+                    && event.fields.get("queue").map(String::as_str) == Some(queue)
+            })
+            .cloned();
+        if let Some(warning) = warning {
+            return warning;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader warns about the pin on {queue}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_queue_drained(store: &QueueStorage, pool: &sqlx::PgPool, queue: &str) {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    loop {
+        let counts = store.queue_counts(pool, queue).await.expect("queue counts");
+        if (counts.available, counts.running) == (0, 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{queue} should drain, got available {} running {}",
+            counts.available,
+            counts.running
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn ring_pin_client<W: Worker + 'static>(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    queue_config: QueueConfig,
+    store_config: QueueStorageConfig,
+    worker: W,
+) -> Client {
+    ring_pin_client_rotating_every(
+        pool,
+        queue,
+        queue_config,
+        store_config,
+        worker,
+        Duration::from_millis(100),
+    )
+}
+
+fn ring_pin_client_rotating_every<W: Worker + 'static>(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    queue_config: QueueConfig,
+    store_config: QueueStorageConfig,
+    worker: W,
+    queue_rotate_interval: Duration,
+) -> Client {
+    Client::builder(pool.clone())
+        .queue(queue, queue_config)
+        .queue_storage(
+            store_config,
+            queue_rotate_interval,
+            Duration::from_millis(100),
+        )
+        .register_worker(worker)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("build ring pin client")
+}
+
+fn ring_pin_store_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        ..Default::default()
+    }
+}
+
+/// #779: the maintenance leader names a strictly starved lane pinning the
+/// queue ring, with the age of its oldest pending row, as a gauge and a
+/// warning, and zeroes the gauge once the lane is claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_metric_and_warning_name_a_starved_lane() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_metric_starved";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_metric_starved");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    enqueue_lane(&pool, &store, queue, 4, 2).await;
+    backdate_ready_lane(&pool, &store, queue, 4, Duration::from_secs(3600)).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    enqueue_lane(&pool, &store, queue, 1, 3).await;
+
+    let gate = BlockingCompleteWorkerGate::new();
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 1,
+            poll_interval: Duration::from_millis(25),
+            priority_aging_interval: Duration::ZERO,
+            ..QueueConfig::default()
+        },
+        store_config,
+        gate.worker(),
+    );
+    client.start().await.expect("start client");
+    gate.wait_until_entered(Duration::from_secs(10)).await;
+
+    let age = wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 4, 0),
+        |age| age > 0.0,
+        "the starved lane is reported as pinning the ring",
+    )
+    .await;
+    assert!(
+        (3600.0..3660.0).contains(&age),
+        "pinned age {age} should be just over the hour the lane has waited"
+    );
+    let ages = pinned_ready_ages(&exporter, &meter_provider);
+    assert!(
+        ages.iter()
+            .all(|((_, priority, _), age)| *priority == 4 || *age == 0.0),
+        "only the starved lane pins the ring: {ages:?}"
+    );
+    let warning = wait_for_ring_pin_warning(queue).await;
+    assert_eq!(warning.fields["priority"], "4");
+    assert_eq!(warning.fields["enqueue_shard"], "0");
+    assert_eq!(warning.fields["slot"], "0");
+    let warned_age: u64 = warning.fields["oldest_ready_age_secs"]
+        .parse()
+        .expect("age is a number");
+    assert!(
+        (3600..3660).contains(&warned_age),
+        "warned age {warned_age}"
+    );
+
+    gate.release();
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 4, 0),
+        |age| age == 0.0,
+        "the gauge drops to zero once the lane is claimed",
+    )
+    .await;
+    wait_for_queue_drained(&store, &pool, queue).await;
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// #779: a paused queue's lane pinning the queue ring is reported until the
+/// queue is resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_metric_and_warning_name_a_paused_queue() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_metric_paused";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_metric_paused");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    enqueue_lane(&pool, &store, queue, 2, 2).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let client = ring_pin_client(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 4,
+            poll_interval: Duration::from_millis(25),
+            ..QueueConfig::default()
+        },
+        store_config,
+        CompleteWorker,
+    );
+    client.start().await.expect("start client");
+
+    let age = wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |age| age > 0.0,
+        "the paused lane is reported as pinning the ring",
+    )
+    .await;
+    assert!(
+        (600.0..660.0).contains(&age),
+        "pinned age {age} should be just over the ten minutes the lane has waited"
+    );
+    let warning = wait_for_ring_pin_warning(queue).await;
+    assert_eq!(warning.fields["priority"], "2");
+    assert_eq!(warning.fields["enqueue_shard"], "0");
+    let warned_age: u64 = warning.fields["oldest_ready_age_secs"]
+        .parse()
+        .expect("age is a number");
+    assert!((600..660).contains(&warned_age), "warned age {warned_age}");
+
+    admin::resume_queue(&pool, queue)
+        .await
+        .expect("resume queue");
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |age| age == 0.0,
+        "the gauge drops to zero once the queue is resumed and claimed",
+    )
+    .await;
+    wait_for_queue_drained(&store, &pool, queue).await;
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+fn pending_ready_prune_attempts(
+    exporter: &InMemoryMetricExporter,
+    meter_provider: &SdkMeterProvider,
+) -> u64 {
+    meter_provider.force_flush().expect("flush metrics");
+    let metrics = exporter.get_finished_metrics().expect("read metrics");
+    let Some(latest) = metrics.last() else {
+        return 0;
+    };
+    sum_counter_metric_with_attribute(
+        std::slice::from_ref(latest),
+        "awa.maintenance.prune.attempts",
+        "awa.ring.reason",
+        "queue.pending_ready",
+    )
+}
+
+/// #779: once prune backs off a pinned slot for up to 32 rotation ticks, the
+/// leader still re-reads the pinning lanes, so the gauge keeps ageing between
+/// prune attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_gauge_refreshes_while_prune_backs_off() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_metric_backoff";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_metric_backoff");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    enqueue_lane(&pool, &store, queue, 2, 1).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    let client = ring_pin_client_rotating_every(
+        &pool,
+        queue,
+        QueueConfig {
+            max_workers: 1,
+            poll_interval: Duration::from_millis(25),
+            ..QueueConfig::default()
+        },
+        store_config,
+        CompleteWorker,
+        Duration::from_secs(1),
+    );
+    client.start().await.expect("start client");
+
+    // Prune runs on ticks 1, 4, 9, 18 and 35, then not again for 32 ticks.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(90));
+    while pending_ready_prune_attempts(&exporter, &meter_provider) < 5 {
+        assert!(
+            Instant::now() < deadline,
+            "prune should reach its longest backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let attempts = pending_ready_prune_attempts(&exporter, &meter_provider);
+    let age = pinned_ready_ages(&exporter, &meter_provider)[&(queue.to_string(), 2, 0)];
+    let refreshed = wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |later| later > age + 10.0,
+        "the gauge keeps ageing while prune is backed off",
+    )
+    .await;
+    assert_eq!(
+        pending_ready_prune_attempts(&exporter, &meter_provider),
+        attempts,
+        "the gauge moved from {age} to {refreshed} without another prune attempt"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
 /// Admin-cancel wakes an in-flight handler via the `awa:cancel`
 /// NOTIFY channel. A slow handler checks `ctx.is_cancelled()` and exits
 /// with a cancel result as soon as the flag flips. The test enqueues a
@@ -8693,24 +9536,78 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BranchOverrunLayer
     }
 }
 
-/// Process-wide record of maintenance-branch overrun warnings. Installed once
-/// as the global subscriber; this binary installs no other.
-fn branch_overruns() -> Arc<std::sync::Mutex<Vec<BranchOverrun>>> {
+/// A queue ring pin report from the maintenance leader, with its fields
+/// rendered as strings.
+#[derive(Debug, Clone)]
+struct RingPinEvent {
+    message: String,
+    fields: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct RingPinVisitor(HashMap<String, String>);
+
+impl tracing::field::Visit for RingPinVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+struct RingPinLayer(Arc<std::sync::Mutex<Vec<RingPinEvent>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingPinLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = RingPinVisitor::default();
+        event.record(&mut visitor);
+        let message = visitor.0.remove("message").unwrap_or_default();
+        if message.starts_with("Queue ring prune is") {
+            self.0.lock().unwrap().push(RingPinEvent {
+                message,
+                fields: visitor.0,
+            });
+        }
+    }
+}
+
+struct CapturedEvents {
+    overruns: Arc<std::sync::Mutex<Vec<BranchOverrun>>>,
+    ring_pins: Arc<std::sync::Mutex<Vec<RingPinEvent>>>,
+}
+
+/// Process-wide record of the maintenance events these tests assert on.
+/// Installed once as the global subscriber; this binary installs no other.
+fn captured_events() -> &'static CapturedEvents {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    static OVERRUNS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<BranchOverrun>>>> =
-        std::sync::OnceLock::new();
-    OVERRUNS
-        .get_or_init(|| {
-            let overruns = Arc::new(std::sync::Mutex::new(Vec::new()));
-            tracing_subscriber::registry()
-                .with(BranchOverrunLayer(overruns.clone()))
-                .try_init()
-                .expect("no other tracing subscriber in this test binary");
-            overruns
-        })
-        .clone()
+    static EVENTS: std::sync::OnceLock<CapturedEvents> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| {
+        let events = CapturedEvents {
+            overruns: Arc::new(std::sync::Mutex::new(Vec::new())),
+            ring_pins: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        tracing_subscriber::registry()
+            .with(BranchOverrunLayer(events.overruns.clone()))
+            .with(RingPinLayer(events.ring_pins.clone()))
+            .try_init()
+            .expect("no other tracing subscriber in this test binary");
+        events
+    })
+}
+
+/// Process-wide record of maintenance-branch overrun warnings.
+fn branch_overruns() -> Arc<std::sync::Mutex<Vec<BranchOverrun>>> {
+    captured_events().overruns.clone()
+}
+
+/// Process-wide record of queue ring pin reports.
+fn ring_pin_events() -> Arc<std::sync::Mutex<Vec<RingPinEvent>>> {
+    captured_events().ring_pins.clone()
 }
 
 /// Promotion is cheap, idempotent and the only thing that makes scheduled,
