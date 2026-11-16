@@ -448,6 +448,25 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
        Step(LaneResource(dstQ, dstP), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared) >>
 
+\* Maintenance claim-cursor advance over a pinning lane's spent prefix
+\* (#779; `AwaMaintenanceCursorAdvance.tla`)
+\*   SELECT ... FROM queue_claim_heads FOR UPDATE SKIP LOCKED (lane row)
+\*   LOCK TABLE leases, ready_segments, done_entries, ready_entries,
+\*     ready_claim_attempt_batches, ready_tombstones IN ACCESS SHARE MODE
+\*     NOWAIT, in that order, which is prune's child exclusive-lock order
+\*   one statement over those tables that finds the lane's first unspent
+\*     row and raises the lane cursor with set_sequence_next
+\* Every acquire is SKIP LOCKED or NOWAIT, so the advance gives up instead
+\* of waiting; modelling the steps as blocking acquires over-approximates.
+MaintenanceCursorAdvancePlan(q, p, readySlot) ==
+    << Step(LaneResource(q, p), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ReadySegmentChildResource(readySlot), ModeShared),
+       Step(DoneChildResource(readySlot), ModeShared),
+       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
+       Step(ReadyTombstoneChildResource(readySlot), ModeShared) >>
+
 \* rotate_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT count(*) FROM lease_child[next_slot] (AccessShare on child)
@@ -658,6 +677,17 @@ StartComplete(t, claimSlot, readySlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartMaintenanceCursorAdvance(t, q, p, readySlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ readySlot \in ReadySlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = MaintenanceCursorAdvancePlan(q, p, readySlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 StartRotateLeases(t, nextSlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -865,6 +895,8 @@ Next ==
     \/ \E t \in TxIds, srcQ \in Queues, dstQ \in Queues,
          srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities, rs \in ReadySlots :
+          StartMaintenanceCursorAdvance(t, q, p, rs)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)

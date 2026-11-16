@@ -282,4 +282,6 @@ See [`../README.md`](../README.md) for the full Known Divergences list. Specific
 
 `AwaAsyncClaimCursor.tla` refines async claim acknowledgment, WAL durability, standby promotion and post-commit sequence replay. Its safe config checks no skipped jobs; `AwaAsyncClaimCursorUnguarded.cfg` preserves the lost-claim cursor-skip counterexample.
 
+`AwaMaintenanceCursorAdvance.tla` models the maintenance leader advancing a lane's claim cursor over a spent prefix outside a claim (#779), against enqueue, claim, cancel and move on the same lane. Its default and unlocked configs check that no claimable row falls behind the cursor; the skip-invisible and dirty-tombstone configs preserve the counterexamples, and the progress config is a witness that the advance passes tombstones.
+
 `AwaQueuePruneTwoPhase.tla` models queue prune's two lock phases against one claimer: `SHARE ROW EXCLUSIVE` for the skip gates, then `ACCESS EXCLUSIVE` and a recheck before the truncate. Its default config checks a claim that writes a lease directly; `AwaQueuePruneTwoPhaseReceiptBarrier.cfg` checks receipt claims without the recheck; `AwaQueuePruneTwoPhaseNoRecheck.cfg` preserves the counterexample of a lease claim committing during the upgrade.
