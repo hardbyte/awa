@@ -580,7 +580,7 @@
           "id": 701,
           "type": "timeseries",
           "title": "Rotation rate by ring + outcome",
-          "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Healthy rings show non-zero `rotated` on a regular cadence; pinned rings dominate `skipped_busy`.",
+          "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Rings holding rows show non-zero `rotated` on a regular cadence; empty rings report `skipped_idle`; pinned rings dominate `skipped_busy`.",
           "gridPos": {
             "x": 0,
             "y": 42,

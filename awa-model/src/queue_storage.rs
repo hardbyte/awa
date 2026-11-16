@@ -424,6 +424,19 @@ pub enum RotateOutcome {
     },
 }
 
+/// Outcome of an idle-gated rotation: [`QueueStorage::rotate_if_active`],
+/// [`QueueStorage::rotate_leases_if_active`] or
+/// [`QueueStorage::rotate_claims_if_active`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedRotateOutcome {
+    /// The ring held at least one row, so the rotation ran.
+    Attempted(RotateOutcome),
+    /// Every partition of the ring was empty. The rotation was not attempted
+    /// and no ring-state row was locked or written; `slot` and `generation`
+    /// are the unchanged cursor.
+    SkippedIdle { slot: i32, generation: i64 },
+}
+
 /// Per-table presence observed at a rotation gate. Each non-zero value means
 /// "this table was non-empty"; it is not an exact row count. Each ring populates
 /// only the fields meaningful for it; unused fields stay zero. The
@@ -17617,6 +17630,126 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
         }
         Ok(())
+    }
+
+    /// The ring's cursor when no partition of any table in `relations` holds a
+    /// row, otherwise `None`. Runs in a read-only transaction of its own, which
+    /// takes no row lock, assigns no transaction id and writes no WAL. It takes
+    /// `ACCESS SHARE` on the partitions in `relations` order, which must be the
+    /// order the ring's prune requests `ACCESS EXCLUSIVE`.
+    async fn idle_ring_cursor(
+        &self,
+        pool: &PgPool,
+        ring_state: &str,
+        relations: &[String],
+    ) -> Result<Option<(i32, i64)>, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let refs: Vec<&str> = relations.iter().map(String::as_str).collect();
+        if Self::any_relation_has_rows_tx(&mut tx, &refs).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(None);
+        }
+        let cursor: (i32, i64) = sqlx::query_as(&format!(
+            "SELECT current_slot, generation FROM {schema}.{ring_state} WHERE singleton = TRUE"
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(Some(cursor))
+    }
+
+    /// Every table of the queue ring, plus the per-slot terminal counters that
+    /// queue prune deletes with a slot, in queue prune's lock order.
+    fn queue_ring_relations(&self) -> Vec<String> {
+        let schema = self.schema();
+        [
+            "ready_segments",
+            "done_entries",
+            "ready_entries",
+            "ready_claim_attempt_batches",
+            "ready_tombstones",
+            "receipt_completion_batches",
+            "receipt_completion_tombstones",
+            "queue_terminal_count_deltas",
+            "queue_terminal_live_counts",
+        ]
+        .iter()
+        .map(|table| format!("{schema}.{table}"))
+        .collect()
+    }
+
+    fn claim_ring_relations(&self) -> Vec<String> {
+        let schema = self.schema();
+        [
+            "lease_claims",
+            "lease_claim_batches",
+            "lease_claim_closures",
+            "lease_claim_closure_batches",
+        ]
+        .iter()
+        .map(|table| format!("{schema}.{table}"))
+        .collect()
+    }
+
+    /// [`Self::rotate`], skipped when every partition of the queue ring is
+    /// empty.
+    ///
+    /// An empty ring has nothing to seal, and [`Self::prune_oldest`] on it
+    /// returns [`PruneOutcome::Noop`], so skipping leaves the cursor where it
+    /// is without stranding a row. Once any row lands the next call rotates
+    /// as [`Self::rotate`] does.
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_if_active")]
+    pub async fn rotate_if_active(&self, pool: &PgPool) -> Result<GatedRotateOutcome, AwaError> {
+        let relations = self.queue_ring_relations();
+        match self
+            .idle_ring_cursor(pool, "queue_ring_state", &relations)
+            .await?
+        {
+            Some((slot, generation)) => Ok(GatedRotateOutcome::SkippedIdle { slot, generation }),
+            None => self.rotate(pool).await.map(GatedRotateOutcome::Attempted),
+        }
+    }
+
+    /// [`Self::rotate_leases`], skipped when every lease partition is empty.
+    /// See [`Self::rotate_if_active`].
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_leases_if_active")]
+    pub async fn rotate_leases_if_active(
+        &self,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        let relations = [self.leases_table()];
+        match self
+            .idle_ring_cursor(pool, "lease_ring_state", &relations)
+            .await?
+        {
+            Some((slot, generation)) => Ok(GatedRotateOutcome::SkippedIdle { slot, generation }),
+            None => self
+                .rotate_leases(pool)
+                .await
+                .map(GatedRotateOutcome::Attempted),
+        }
+    }
+
+    /// [`Self::rotate_claims`], skipped when every partition of the claim
+    /// ring is empty. See [`Self::rotate_if_active`].
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_claims_if_active")]
+    pub async fn rotate_claims_if_active(
+        &self,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        let relations = self.claim_ring_relations();
+        match self
+            .idle_ring_cursor(pool, "claim_ring_state", &relations)
+            .await?
+        {
+            Some((slot, generation)) => Ok(GatedRotateOutcome::SkippedIdle { slot, generation }),
+            None => self
+                .rotate_claims(pool)
+                .await
+                .map(GatedRotateOutcome::Attempted),
+        }
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
