@@ -921,7 +921,10 @@ impl ClientBuilder {
     /// completions that fall back to a direct write when a completion batch
     /// fails. Completions written by the completion batcher and canonical
     /// storage are not counted. Defaults to a quarter of the pool, clamped
-    /// to `4..=64`. Independent of [`Self::max_concurrent_claims`].
+    /// to `4..=64`. Independent of [`Self::max_concurrent_claims`]. The
+    /// limit also caps direct finalize throughput; raise it for workloads
+    /// dominated by retries, snoozes or callback waits when the pool has
+    /// connections to spare.
     pub fn max_concurrent_finalizes(mut self, limit: usize) -> Self {
         self.max_concurrent_finalizes = Some(limit.max(1));
         self
