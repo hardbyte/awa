@@ -652,6 +652,7 @@ Useful actions:
 ```bash
 awa --database-url "$DATABASE_URL" dlq retry <job-id>
 awa --database-url "$DATABASE_URL" dlq retry-bulk --queue email
+awa --database-url "$DATABASE_URL" dlq retry-bulk --queue email --batch-size 1000
 awa --database-url "$DATABASE_URL" dlq purge --queue email
 awa --database-url "$DATABASE_URL" dlq move --queue email --reason backfill
 ```
@@ -662,6 +663,8 @@ If DLQ depth is growing quickly:
 - sample `awa job dump <id>` for the full error/progress chain
 - pause the upstream queue or producer if one failure mode is dominating
 - tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too long for the incident volume
+
+To drain a large DLQ, use `retry-bulk --batch-size` rather than a loop of single-job `retry` calls; see [draining a large DLQ](dead-letter-queue.md#draining-a-large-dlq). A script that does call the API once per job should hold one `QueueStorage` and call its methods.
 
 ## Common Error Cases
 

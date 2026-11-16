@@ -51,9 +51,25 @@ awa dlq retry-bulk --kind charge_card --tag manual_review
 
 # Retry the entire DLQ (safety guard requires --all)
 awa dlq retry-bulk --all
+
+# Retry in transactions of up to 1,000 rows until none match
+awa dlq retry-bulk --queue billing --batch-size 1000
+
+# Stop after 50,000 rows in total
+awa dlq retry-bulk --queue billing --batch-size 1000 --limit 50000
 ```
 
 Retry moves the row out of `dlq_entries` and back into the runnable path with `attempt = 0` and `run_lease = 0`, ready for fresh processing. The retry is recorded in the job's error history; the original failure trail is preserved.
+
+### Draining a large DLQ
+
+Without `--batch-size`, `retry-bulk` retries every matching row in one transaction. For a large DLQ, use `--batch-size`: each batch is its own transaction of at most that many rows, oldest first (by `dlq_at` when the filter names a queue, otherwise by job ID), and the command repeats until no matching row is left or `--limit` rows have been retried. Batches skip rows another transaction holds, so two drains of the same filter never retry a row twice.
+
+If a row's unique key is held by a live job, its batch is rolled back, nothing in that batch is retried, and the command exits non-zero naming the job. Retry or purge that job on its own, then run the command again.
+
+Prefer batches over calling `retry` once per job. Each retry is a separate enqueue into the job's lane and waits for that lane's in-flight enqueues to commit, so running many single-job retries in parallel slows the producers on the same queue. A batch revives each lane's rows with one reservation.
+
+The web UI's **Retry matching** action on the DLQ page retries in batches of 1,000 the same way, shows how many rows it has retried, and can be stopped between batches. The HTTP route `POST /api/dlq/bulk-retry` takes an optional `batch_size`; without it, every matching row is retried in one transaction.
 
 The CLI retries with the stored queue, priority, and immediate `run_at`. The programmatic APIs can override those when reviving a DLQ row; use Python `retry_from_dlq(job_id, priority=..., queue=..., run_at=...)` or Rust `RetryFromDlqOpts` when recovery should promote, demote, reroute, or delay the job.
 
@@ -89,9 +105,11 @@ The maintenance leader periodically prunes DLQ rows older than the configured re
 
 ## Programmatic access
 
-Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the facade crate, for DLQ list, retry, move, and purge helpers. Admin helpers such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and `bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
+Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the facade crate, for DLQ list, retry, move, and purge helpers. `dlq::bulk_retry_from_dlq_batch(pool, &filter, allow_all, batch_size)` retries one batch and returns `DlqRetryBatch::Revived { count }`, with a count of 0 once nothing matches, or `DlqRetryBatch::UniqueConflict { job_id }`.
 
-Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and `purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)` purges one DLQ row by job ID. These wrap the same SQL helpers the CLI uses.
+The module-level functions look up the active queue-storage schema and build a new `QueueStorage` on each call. Long-running tooling that makes many calls, such as a script that retries DLQ rows one at a time, should build one `QueueStorage` with `QueueStorage::from_existing_schema` and call its methods, such as `retry_from_dlq` and `bulk_retry_from_dlq_batch`, instead. Admin helpers such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and `bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
+
+Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and `purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)` purges one DLQ row by job ID. `bulk_retry_from_dlq(..., batch_size=n)` retries one batch of up to `n` rows and returns the count, 0 once nothing matches; a unique conflict raises `UniqueConflict` naming the job. These wrap the same SQL helpers the CLI uses.
 
 ## See also
 
