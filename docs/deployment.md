@@ -217,6 +217,39 @@ Use:
 - Rust: `ClientBuilder::queue("name", QueueConfig { ... })`
 - Python: `client.start([("name", 10)])` or dict configs in weighted mode
 
+Separate deployments isolate worker capacity and handler failures, but not storage reclamation: every queue in the database still shares one queue ring, one claim ring and one maintenance leader. To isolate those, see [Storage isolation](#storage-isolation).
+
+### Storage Isolation
+
+On queue storage, all queues in a database share one set of rings. A queue that stops being claimed while it holds ready jobs, such as a paused queue, a queue with no running workers, or a lower priority starved under strict priority, stops [queue-ring reclamation for every queue](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane) in that database until it is claimed again. [Claims that starve ring prune](troubleshooting.md#ring-prune-stays-blocked-under-claim-load) are also per ring: every runtime that claims from the database adds to the overlap that keeps prune from its lock. To keep workloads with different risk profiles from stalling each other's reclamation, for example long-paused, batch or strictly prioritised queues apart from latency-sensitive ones, give each its own database.
+
+The boundary is the database, not the queue-storage schema. A database holds one Awa installation: the `awa` control schema records a single active queue-storage schema, every producer path (Rust and Python inserts, `awa.insert_job` and the other SQL compatibility functions, cron, follow-up enqueues, retries, the DLQ and admin operations) writes to that schema, and a runtime configured with a `queue_storage_schema` other than the active one refuses to start. A [custom queue-storage schema](queue-storage-substrate.md#custom-queue-storage-schemas) replaces the default as the one active substrate; it does not run beside it.
+
+Each database has its own:
+
+- queue, lease and claim rings, so a lane pinned in one database does not hold back reclamation in another, and claims in one database do not lock another's partitions
+- maintenance leader, elected by an advisory lock that Postgres scopes to the database, so a long rescue pass or a stalled prune in one database does not delay rotation, promotion or rescue in another
+- cron schedules, unique-key claims, DLQ, queue controls and admin view
+
+The databases can share one Postgres server. Isolation then stops at the server: CPU, I/O, WAL, `max_connections` and autovacuum workers are shared, and a replication slot or a standby with `hot_standby_feedback` holds back vacuum in every database on it. Within one database, a stalled lane still pins that database's ring; the fixes in [the troubleshooting guide](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane) still apply there.
+
+To set it up:
+
+1. Create a database per isolation domain and run `awa migrate` against each. Every release's migrations, and any staged storage transition, must then be applied to each database.
+2. Assign each queue to exactly one database. Run its workers with a pool connected to that database: `Client::builder(pool)` in Rust, `awa.AsyncClient(database_url)` in Python. Make sure each database has at least one runtime that may lead maintenance (`maintenance_leader` is `true` by default).
+3. Route producers by queue: insert with a pool or client connected to the database that serves the queue. A job inserted into a database whose runtimes do not serve its queue waits there; nothing moves it to another database. Follow-up jobs that a handler enqueues, including lifecycle-hook follow-ups, go to the handler's own database, so keep a workflow's queues in one database.
+4. Declare periodic jobs on the clients of the database that serves their queue, since each database's leader evaluates only its own schedules.
+5. Run `awa serve` and the other `awa` commands once per database, with `--database-url` or `DATABASE_URL` set to it; one UI shows one database.
+
+Costs:
+
+- more partitions and maintenance work in total, since each database keeps its own rings and leader
+- a separate pool, and more server connections, in every process that serves or enqueues into more than one database
+- no transaction spans databases: a handler or a producer transaction can enqueue atomically only into its own database, unique keys deduplicate only within one database, and a job cannot be moved between databases with `move_queue`
+- Awa's metrics carry no database attribute, so tell the domains apart by the resource attributes of the processes that serve them
+
+When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero `priority_aging_interval`, queues are not left paused or unserved with jobs waiting, and you alert on `awa.maintenance.prune.pinned_ready_age`, one database is simpler and the stall is caught before it costs much storage.
+
 ## Web UI Deployment
 
 `awa serve` binds to `127.0.0.1:3000` by default. In containers, set:

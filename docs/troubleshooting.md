@@ -429,6 +429,8 @@ Moving the stuck jobs to another queue or changing their priority does not relea
 
 Pick the threshold above the longest time a healthy lane's oldest row waits to be claimed. To list the lanes from Rust, `QueueStorage::queue_ring_pin` returns the oldest sealed slot and each pinning lane with its first pending row's `lane_seq`, `run_at` and age.
 
+The ring is shared by every queue in the database. To keep queues that are expected to sit paused, unserved or starved from holding back reclamation for the rest, serve them from a separate database; see [storage isolation](deployment.md#storage-isolation). A separate queue-storage schema in the same database is not a boundary, since a database has one active queue-storage schema.
+
 ## Ring Prune Stays Blocked Under Claim Load
 
 Symptoms on queue storage under sustained claim traffic from several runtimes ([#721](https://github.com/hardbyte/awa/issues/721)):
@@ -503,6 +505,7 @@ None of these has been measured against this fault. Change one at a time and wat
 - **Reduce overlapping claims.** Serve each queue from fewer runtimes, especially queues that are usually idle, since every runtime that serves a queue claims on it. In 0.6.18 a dispatcher whose fallback poll finds no ready jobs no longer claims, which removes some idle claim calls.
 - **Raise `prune_lock_timeout` modestly**, for example to `50ms` or `100ms`. Queue prune's first lock (`SHARE ROW EXCLUSIVE`, which blocks writers of the slot but not readers) waits this long once; the `ACCESS EXCLUSIVE` request starts at this wait and already retries up to 320 ms. While an `ACCESS EXCLUSIVE` request waits, every new claim on that partition queues behind it, so a longer wait trades claim latency for reclamation. Keep it well below `deadlock_timeout` and `statement_timeout`; startup warns when the longest prune lock wait reaches either.
 - **Do not lengthen the rotation interval for this fault.** It does not help prune get its lock, and it makes each slot larger.
+- **Split workloads across databases.** Claims lock only their own database's ring partitions, so moving some queues and their runtimes to a [separate database](deployment.md#storage-isolation) leaves fewer overlapping claims on each ring, at the cost of a second installation to migrate and operate.
 
 Once prune gets its lock, for example when claim traffic drops, the ring rotates again and the oversized slot is reclaimed when the ring reaches it.
 
