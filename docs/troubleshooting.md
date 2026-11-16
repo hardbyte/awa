@@ -498,7 +498,21 @@ ORDER BY t.ring, c.relname, l.granted, a.xact_start;
 
 This fault shows as a few holders in every sample, each a different short transaction: on the queue ring, `AccessShareLock` from `claim_ready_runtime`; on the claim ring, claims and completions that read or write the claim tables. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
 
-Long readers of the queue-storage tables stall prune the same way, without any claim load. A query that scans `leases`, `lease_claims`, `lease_claim_closures`, `done_entries`, `ready_entries` or another ring table through its parent holds `ACCESS SHARE` on every partition of that table, sealed slots included, until its transaction ends, and prune cannot truncate the oldest slot until it finishes. Monitoring and dashboard queries are the usual source: a count over these tables can run for minutes with millions of jobs in the ring, and polls issued back to back keep prune `blocked` and the ring from rotating for as long as they run. The lock query above names them by `application_name` and query text. Run such queries against a replica or with a short `statement_timeout`, poll them less often, or use Awa's metrics instead.
+Long readers of the queue-storage tables stall prune the same way, without any claim load. A query that scans `leases`, `lease_claims`, `lease_claim_closures`, `done_entries`, `ready_entries` or another ring table through its parent holds `ACCESS SHARE` on every partition of that table, sealed slots included, until its transaction ends, and prune cannot truncate the oldest slot until it finishes. Monitoring and dashboard queries are the usual source: a count over these tables can run for minutes with millions of jobs in the ring, and polls issued back to back keep prune `blocked` and the ring from rotating for as long as they run. The query above covers only the queue and claim rings' prune targets; this one lists every transaction older than five seconds that holds a lock on any table in the queue-storage schema, for every ring:
+
+```sql
+SELECT a.pid, a.application_name, now() - a.xact_start AS xact_age,
+       count(DISTINCT l.relation) AS relations, left(a.query, 80) AS query
+FROM pg_locks l
+JOIN pg_class c ON c.oid = l.relation
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE a.xact_start < now() - interval '5 seconds'
+GROUP BY a.pid, a.application_name, a.xact_start, a.query
+ORDER BY xact_age DESC;
+```
+
+Run such readers against a replica or with a short `statement_timeout`, poll them less often, or use Awa's metrics instead.
 
 ### Mitigations
 
@@ -506,7 +520,7 @@ None of these has been measured against this fault. Change one at a time and wat
 
 - **Reduce overlapping claims.** Serve each queue from fewer runtimes, especially queues that are usually idle, since every runtime that serves a queue claims on it. In 0.6.18 a dispatcher whose fallback poll finds no ready jobs no longer claims, which removes some idle claim calls.
 - **Raise `prune_lock_timeout` modestly**, for example to `50ms` or `100ms`. Queue prune's first lock (`SHARE ROW EXCLUSIVE`, which blocks writers of the slot but not readers) waits this long once; the `ACCESS EXCLUSIVE` request starts at this wait and already retries up to 320 ms. While an `ACCESS EXCLUSIVE` request waits, every new claim on that partition queues behind it, so a longer wait trades claim latency for reclamation. Keep it well below `deadlock_timeout` and `statement_timeout`; startup warns when the longest prune lock wait reaches either.
-- **Stop long readers of the ring tables.** If the lock query shows a monitoring, dashboard or reporting query rather than claims, bound or move that query instead; see above.
+- **Stop long readers of the ring tables.** If either lock query shows a monitoring, dashboard or reporting query rather than claims, bound or move that query instead; see above.
 - **Do not lengthen the rotation interval for this fault.** It does not help prune get its lock, and it makes each slot larger.
 - **Split workloads across databases.** Claims lock only their own database's ring partitions, so moving some queues and their runtimes to a [separate database](deployment.md#storage-isolation) leaves fewer overlapping claims on each ring, at the cost of a second installation to migrate and operate.
 
