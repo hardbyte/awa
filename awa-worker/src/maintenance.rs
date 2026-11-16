@@ -6,12 +6,10 @@ use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
-#[cfg(test)]
-use awa_model::SkipReason;
 use awa_model::{
     AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
     RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
-    TerminalDeltaRollupOutcome,
+    SkipReason, TerminalDeltaRollupOutcome,
 };
 use chrono::{DateTime, Utc};
 use croner::Cron;
@@ -1004,6 +1002,85 @@ fn idle_ring_at_genesis(idle_cursor: Option<(i32, i64)>) -> bool {
     matches!(idle_cursor, Some((_, 0)))
 }
 
+/// How often the maintenance leader repeats its warning while the same lanes
+/// keep pinning the queue ring.
+const QUEUE_RING_PIN_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// While lanes pin the queue ring, the leader re-reads them at least this
+/// often, on queue rotation ticks where prune is backed off.
+const QUEUE_RING_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A `(queue, priority, enqueue_shard)` ready lane.
+type ReadyLaneKey = (String, i16, i16);
+
+/// The lanes the leader last reported as pinning the queue ring, so their
+/// gauges can be zeroed once they stop, and when it last warned.
+#[derive(Default)]
+struct QueueRingPinReport {
+    lanes: HashSet<ReadyLaneKey>,
+    last_warned_at: Option<Instant>,
+    last_observed_at: Option<Instant>,
+}
+
+impl QueueRingPinReport {
+    /// Records the pinning lanes and their head ages and returns whether to
+    /// warn: when a lane starts pinning the ring, or
+    /// [`QUEUE_RING_PIN_WARN_INTERVAL`] after the last warning.
+    fn observe(
+        &mut self,
+        pinning: &[(ReadyLaneKey, Duration)],
+        metrics: &AwaMetrics,
+        now: Instant,
+    ) -> bool {
+        let lanes: HashSet<ReadyLaneKey> = pinning.iter().map(|(lane, _)| lane.clone()).collect();
+        for (queue, priority, enqueue_shard) in self.lanes.difference(&lanes) {
+            metrics.record_queue_ring_pinned_ready_age(
+                queue,
+                *priority,
+                *enqueue_shard,
+                Duration::ZERO,
+            );
+        }
+        for ((queue, priority, enqueue_shard), age) in pinning {
+            metrics.record_queue_ring_pinned_ready_age(queue, *priority, *enqueue_shard, *age);
+        }
+        let new_lane = !lanes.is_subset(&self.lanes);
+        self.lanes = lanes;
+        self.last_observed_at = Some(now);
+        let warn = new_lane
+            || self
+                .last_warned_at
+                .is_none_or(|at| now.duration_since(at) >= QUEUE_RING_PIN_WARN_INTERVAL);
+        if warn {
+            self.last_warned_at = Some(now);
+        }
+        warn
+    }
+
+    /// Whether lanes were pinning the ring when last read and that read is
+    /// [`QUEUE_RING_PIN_REFRESH_INTERVAL`] old.
+    fn refresh_due(&self, now: Instant) -> bool {
+        !self.lanes.is_empty()
+            && self
+                .last_observed_at
+                .is_none_or(|at| now.duration_since(at) >= QUEUE_RING_PIN_REFRESH_INTERVAL)
+    }
+
+    /// Zeroes the gauges of the lanes last reported. Returns whether any were.
+    fn clear(&mut self, metrics: &AwaMetrics) -> bool {
+        self.last_observed_at = None;
+        for (queue, priority, enqueue_shard) in self.lanes.drain() {
+            metrics.record_queue_ring_pinned_ready_age(
+                &queue,
+                priority,
+                enqueue_shard,
+                Duration::ZERO,
+            );
+        }
+        std::mem::take(&mut self.last_warned_at).is_some()
+    }
+}
+
 /// Branch keys used by the prune backoff tracker. Kept as `&'static
 /// str` so the tracker's HashMap doesn't have to allocate per call.
 const PRUNE_BRANCH_LEASE: &str = "lease";
@@ -1054,6 +1131,7 @@ pub struct MaintenanceService {
     rescue_owner_evidence: std::sync::Mutex<RescueOwnerEvidence>,
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
+    queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
     /// Batches each rescue kind has started under this service, across
     /// passes, for the slot-order rotation.
     rescue_batches_started: std::sync::Mutex<HashMap<RescueKind, usize>>,
@@ -1403,6 +1481,7 @@ impl MaintenanceService {
             rescue_owner_evidence: std::sync::Mutex::new(RescueOwnerEvidence::default()),
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
+            queue_ring_pin: std::sync::Mutex::new(QueueRingPinReport::default()),
             rescue_batches_started: std::sync::Mutex::new(HashMap::new()),
             rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
@@ -1994,6 +2073,7 @@ impl MaintenanceService {
 
             tokio::join!(leader_check, recovery, hygiene);
             self.leader.store(false, Ordering::SeqCst);
+            self.clear_queue_ring_pin();
             Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
             if self.cancel.is_cancelled() {
                 debug!("Maintenance service shutting down");
@@ -3865,6 +3945,14 @@ impl MaintenanceService {
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
             debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
             self.metrics.record_prune_backed_off("queue");
+            let refresh_due = self
+                .queue_ring_pin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refresh_due(Instant::now());
+            if refresh_due {
+                self.observe_queue_ring_pin(&runtime.store).await;
+            }
             return idle;
         }
 
@@ -3876,6 +3964,16 @@ impl MaintenanceService {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("queue", &outcome);
                 prune_tracker.record_outcome(PRUNE_BRANCH_QUEUE, &outcome);
+                match outcome {
+                    // Active leases are checked before pending ready rows, so
+                    // that outcome needs the same read.
+                    PruneOutcome::SkippedActive {
+                        reason: SkipReason::QueuePendingReady | SkipReason::QueueActiveLeases,
+                        ..
+                    } => self.observe_queue_ring_pin(&runtime.store).await,
+                    PruneOutcome::Blocked { .. } => {}
+                    _ => self.clear_queue_ring_pin(),
+                }
                 match outcome {
                     PruneOutcome::Noop => {}
                     PruneOutcome::Pruned {
@@ -3917,6 +4015,61 @@ impl MaintenanceService {
             }
         }
         idle
+    }
+
+    /// Reports the lanes with pending ready rows in the oldest sealed queue
+    /// ring slot as `awa.maintenance.prune.pinned_ready_age` and a
+    /// rate-limited warning.
+    async fn observe_queue_ring_pin(&self, store: &QueueStorage) {
+        let pin = match store.queue_ring_pin(&self.pool).await {
+            Ok(Some(pin)) => pin,
+            Ok(None) => {
+                self.clear_queue_ring_pin();
+                return;
+            }
+            Err(err) => {
+                debug!(error = %err, "Failed to read the lanes pinning the queue ring");
+                return;
+            }
+        };
+        let pinning: Vec<(ReadyLaneKey, Duration)> = pin
+            .lanes
+            .iter()
+            .map(|lane| {
+                (
+                    (lane.queue.clone(), lane.priority, lane.enqueue_shard),
+                    lane.head_age,
+                )
+            })
+            .collect();
+        let warn = self
+            .queue_ring_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(&pinning, &self.metrics, Instant::now());
+        if warn {
+            let oldest = &pin.lanes[0];
+            warn!(
+                slot = pin.slot,
+                queue = %oldest.queue,
+                priority = oldest.priority,
+                enqueue_shard = oldest.enqueue_shard,
+                oldest_ready_age_secs = oldest.head_age.as_secs(),
+                pinning_lanes = pin.lanes.len(),
+                "Queue ring prune is pinned by unclaimed ready rows; queue-storage partitions are not reclaimed until this lane is claimed",
+            );
+        }
+    }
+
+    fn clear_queue_ring_pin(&self) {
+        let cleared = self
+            .queue_ring_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear(&self.metrics);
+        if cleared {
+            info!("Queue ring prune is no longer pinned by unclaimed ready rows");
+        }
     }
 
     async fn rotate_queue_storage_leases(&self, prune_tracker: &PruneBackoffTracker) -> bool {
@@ -6399,6 +6552,52 @@ mod tests {
             reason: SkipReason::LeaseActive,
             count: 1,
         }
+    }
+
+    #[test]
+    fn queue_ring_pin_warns_on_a_new_lane_and_then_once_per_interval() {
+        let metrics = AwaMetrics::from_global();
+        let mut report = QueueRingPinReport::default();
+        let low = (("emails".to_string(), 4, 0), Duration::from_secs(3600));
+        let paused = (("reports".to_string(), 2, 1), Duration::from_secs(60));
+        let start = Instant::now();
+
+        assert!(report.observe(std::slice::from_ref(&low), &metrics, start));
+        assert!(!report.observe(
+            std::slice::from_ref(&low),
+            &metrics,
+            start + Duration::from_secs(1)
+        ));
+        assert!(
+            report.observe(
+                &[low.clone(), paused.clone()],
+                &metrics,
+                start + Duration::from_secs(2)
+            ),
+            "a lane that starts pinning the ring warns at once"
+        );
+        assert!(!report.observe(
+            std::slice::from_ref(&paused),
+            &metrics,
+            start + Duration::from_secs(3)
+        ));
+        assert!(report.observe(
+            std::slice::from_ref(&paused),
+            &metrics,
+            start + Duration::from_secs(2) + QUEUE_RING_PIN_WARN_INTERVAL
+        ));
+
+        let observed = start + Duration::from_secs(2) + QUEUE_RING_PIN_WARN_INTERVAL;
+        assert!(!report.refresh_due(observed + Duration::from_secs(1)));
+        assert!(report.refresh_due(observed + QUEUE_RING_PIN_REFRESH_INTERVAL));
+
+        assert!(report.clear(&metrics), "clearing a reported pin says so");
+        assert!(!report.refresh_due(start + QUEUE_RING_PIN_WARN_INTERVAL));
+        assert!(!report.clear(&metrics));
+        assert!(
+            report.observe(std::slice::from_ref(&paused), &metrics, start),
+            "a pin after a clear warns again"
+        );
     }
 
     #[test]

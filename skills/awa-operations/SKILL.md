@@ -326,6 +326,8 @@ Rings rotate only when active — a frozen generation on an idle queue is health
 The condition to alert on is a frozen generation *with* accumulating rows
 (`skipped_busy`): a pinned ring, almost always caused by a long-held snapshot.
 
+A lane nobody claims also pins the queue ring: queue prune skips the oldest sealed slot with reason `queue.pending_ready` while any lane has ready rows there past its claim cursor, so a paused queue, a queue with no workers, or a lower priority starved under strict priority (`priority_aging_interval` of zero) stops reclamation for every queue. `awa.maintenance.prune.pinned_ready_age` (by `awa.job.queue`, `awa.job.priority`, `awa.queue.enqueue_shard`) and a leader warning name the lane and the age of its oldest pending row; alert when it stays above an hour. Only a claim on that lane releases it: turn priority aging on, resume the queue, or run workers for it. Moving or reprioritising the jobs leaves them pinning the slot, and so does cancelling them out of lane order; `drain_queue` or one `bulk_cancel` of the lane releases it. See [queue ring stops wrapping behind an unclaimed lane](../../docs/troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane).
+
 ## Prune Lock Timeout
 
 Ring prune installs its `lock_timeout` after the initial slot-row locks and
