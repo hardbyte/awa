@@ -72,7 +72,7 @@ async def run_worker(client: "awa.AsyncClient") -> None:
         heartbeat_interval_ms=100,
         promote_interval_ms=100,
         heartbeat_rescue_interval_ms=250,
-        heartbeat_staleness_ms=2000,
+        heartbeat_staleness_ms=int(os.environ.get("REHEARSAL_HEARTBEAT_STALENESS_MS", "2000")),
         queue_storage_schema=os.environ["REHEARSAL_SCHEMA"],
         # A long ready-ring rotation keeps completed jobs readable for the
         # harness's final accounting.
