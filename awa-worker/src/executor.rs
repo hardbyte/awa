@@ -8,10 +8,10 @@ use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, info_span, warn, Instrument};
@@ -273,6 +273,7 @@ pub struct JobExecutor {
     finalizers: TaskTracker,
     finalize_cancel: CancellationToken,
     finalize_capacity: Arc<Semaphore>,
+    finalize_gate: FinalizeGate,
 }
 
 impl JobExecutor {
@@ -297,10 +298,12 @@ impl JobExecutor {
         finalizers: TaskTracker,
         finalize_cancel: CancellationToken,
         runtime_worker_capacity: u32,
+        max_concurrent_finalizes: usize,
     ) -> Self {
         let finalize_capacity = Arc::new(Semaphore::new(
             completion_batcher.finalizer_capacity(runtime_worker_capacity),
         ));
+        let finalize_gate = FinalizeGate::new(max_concurrent_finalizes, finalize_cancel.clone());
         Self {
             pool,
             workers,
@@ -316,6 +319,7 @@ impl JobExecutor {
             finalizers,
             finalize_cancel,
             finalize_capacity,
+            finalize_gate,
         }
     }
 
@@ -345,6 +349,7 @@ impl JobExecutor {
         let finalizers = self.finalizers.clone();
         let finalize_cancel = self.finalize_cancel.clone();
         let finalize_capacity = self.finalize_capacity.clone();
+        let finalize_gate = self.finalize_gate.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -503,6 +508,7 @@ impl JobExecutor {
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
             finalizers.spawn(async move {
+                let gate_scope = finalize_gate.scope();
                 let outcome = finalize_with_retry(
                     || complete_job(
                         &pool,
@@ -518,6 +524,7 @@ impl JobExecutor {
                         &storage,
                         dlq_enabled,
                         &metrics,
+                        &gate_scope,
                     ),
                     &metrics,
                     job_id,
@@ -525,6 +532,7 @@ impl JobExecutor {
                     &job_queue,
                     COMPLETION_LOCK_WINDOW,
                     storage.queue_storage().is_some(),
+                    &gate_scope,
                 )
                 .await;
 
@@ -592,6 +600,12 @@ impl JobExecutor {
                         }
                     }
                     Ok(CompletionOutcome::IgnoredStale) => {}
+                    Err(FinalizeError::ShuttingDown) => {
+                        warn!(
+                            job_id,
+                            "Shutdown stopped a finalize waiting for the finalize gate; the attempt is left for rescue"
+                        );
+                    }
                     Err(err) => {
                         error!(job_id, error = %err, "Failed to complete job");
                     }
@@ -645,6 +659,10 @@ enum FinalizeAttemptError {
     /// written; the attempt is finalized again after a backoff.
     #[error("another transaction holds the attempt's completion lock")]
     LockHeld,
+    /// The runtime is shutting down and the attempt was still waiting for a
+    /// finalize gate permit. Nothing was written.
+    #[error("runtime shut down while waiting for the finalize gate")]
+    ShuttingDown,
 }
 
 /// How long an attempt may wait on a held completion lock before the wait is
@@ -658,8 +676,78 @@ enum FinalizeError {
     Operation(#[from] AwaError),
     #[error("durable finalization lock-retry window expired")]
     Deadline,
+    #[error("runtime shut down while waiting for the finalize gate")]
+    ShuttingDown,
 }
 
+/// Bounds how many direct finalize transactions a queue-storage runtime
+/// runs at once. A finalize holds one permit for the duration of one
+/// attempt's transaction and statements, never across a retry back-off.
+/// Completions written by the completion batcher do not take a permit.
+#[derive(Clone)]
+pub(crate) struct FinalizeGate {
+    permits: Arc<Semaphore>,
+    cancel: CancellationToken,
+}
+
+impl FinalizeGate {
+    /// `cancel` stops waits for a permit; it does not interrupt a finalize
+    /// that already holds one.
+    pub(crate) fn new(limit: usize, cancel: CancellationToken) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(
+                limit.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+            )),
+            cancel,
+        }
+    }
+
+    /// Per-finalize view of the gate that accumulates its permit waits.
+    fn scope(&self) -> FinalizeGateScope<'_> {
+        FinalizeGateScope {
+            gate: self,
+            waited_nanos: AtomicU64::new(0),
+        }
+    }
+}
+
+/// One finalize's use of the [`FinalizeGate`] across its attempts.
+struct FinalizeGateScope<'a> {
+    gate: &'a FinalizeGate,
+    waited_nanos: AtomicU64,
+}
+
+impl FinalizeGateScope<'_> {
+    /// Waits for a permit. Time spent waiting is added to
+    /// [`Self::waited`]. Returns [`FinalizeAttemptError::ShuttingDown`]
+    /// without a permit if the gate's cancel token fires while waiting.
+    async fn enter(&self) -> Result<SemaphorePermit<'_>, FinalizeAttemptError> {
+        if let Ok(permit) = self.gate.permits.try_acquire() {
+            return Ok(permit);
+        }
+        let started = tokio::time::Instant::now();
+        let permit = tokio::select! {
+            biased;
+            _ = self.gate.cancel.cancelled() => Err(FinalizeAttemptError::ShuttingDown),
+            permit = self.gate.permits.acquire() => {
+                Ok(permit.expect("finalize gate is never closed"))
+            }
+        };
+        let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.waited_nanos.fetch_add(waited, Ordering::Relaxed);
+        permit
+    }
+
+    /// Total time this finalize has spent waiting for gate permits.
+    fn waited(&self) -> Duration {
+        Duration::from_nanos(self.waited_nanos.load(Ordering::Relaxed))
+    }
+}
+
+/// Runs `finalize` until it succeeds, retrying deadlocks and, with
+/// `retry_lock_contention`, held completion locks within `window`. The window
+/// counts time spent in attempts and back-off sleeps; time an attempt spent
+/// waiting for a finalize gate permit, as reported by `gate`, extends it.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_with_retry<T, E, F, Fut>(
     mut finalize: F,
@@ -669,6 +757,7 @@ async fn finalize_with_retry<T, E, F, Fut>(
     queue: &str,
     window: Duration,
     retry_lock_contention: bool,
+    gate: &FinalizeGateScope<'_>,
 ) -> Result<T, FinalizeError>
 where
     F: FnMut() -> Fut,
@@ -676,13 +765,14 @@ where
     E: Into<FinalizeAttemptError>,
 {
     let started = tokio::time::Instant::now();
-    let deadline = retry_lock_contention.then(|| started + window);
+    let window_end = || started + window + gate.waited();
+    let deadline = || retry_lock_contention.then(window_end);
     let mut deadlock_retries = 0;
     let mut lock_retries = 0;
     let mut lock_held_retries = 0;
     let mut lock_held_warned = false;
     loop {
-        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        if deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(FinalizeError::Deadline);
         }
         let outcome = finalize().await;
@@ -690,10 +780,11 @@ where
             Ok(outcome) => return Ok(outcome),
             Err(error) => match error.into() {
                 FinalizeAttemptError::Operation(error) => error,
+                FinalizeAttemptError::ShuttingDown => return Err(FinalizeError::ShuttingDown),
                 FinalizeAttemptError::LockHeld => {
                     lock_held_retries += 1;
                     let delay = completion_contention_backoff(lock_held_retries);
-                    let waited = started.elapsed();
+                    let waited = started.elapsed().saturating_sub(gate.waited());
                     if waited >= COMPLETION_LOCK_HELD_WARN_AFTER && !lock_held_warned {
                         lock_held_warned = true;
                         warn!(
@@ -708,10 +799,10 @@ where
                             "Another transaction holds this attempt's completion lock; retrying"
                         );
                     }
-                    tokio::time::timeout_at(started + window, tokio::time::sleep(delay))
+                    tokio::time::timeout_at(window_end(), tokio::time::sleep(delay))
                         .await
                         .map_err(|_| FinalizeError::Deadline)?;
-                    if tokio::time::Instant::now() >= started + window {
+                    if tokio::time::Instant::now() >= window_end() {
                         return Err(FinalizeError::Deadline);
                     }
                     continue;
@@ -742,7 +833,7 @@ where
         } else {
             return Err(error.into());
         };
-        match deadline {
+        match deadline() {
             Some(deadline) => tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
                 .await
                 .map_err(|_| FinalizeError::Deadline)?,
@@ -779,10 +870,29 @@ fn is_completion_lock_contention(error: &AwaError) -> bool {
 
 const COMPLETION_LOCK_WINDOW: Duration = Duration::from_secs(120);
 
+/// Whether a queue-storage finalize of `result` is written by the completion
+/// batcher: a `Completed` outcome whose kind has no `Completed` follow-ups.
+fn completes_through_batcher(
+    result: &Result<JobResult, JobError>,
+    enqueue_specs: &EnqueueSpecsByOutcome,
+    kind: &str,
+) -> bool {
+    matches!(result, Ok(JobResult::Completed))
+        && enqueue_specs
+            .get(&crate::enqueue_specs::Outcome::Completed)
+            .and_then(|by_kind| by_kind.get(kind))
+            .is_none_or(|specs| specs.is_empty())
+}
+
 /// Update job state in the database based on handler result.
 ///
 /// Returns a `CompletionOutcome` indicating whether the state transition was
 /// applied (with an optional lifecycle event) or ignored as stale.
+///
+/// On queue storage, every database statement this attempt runs on `pool`
+/// runs under a `gate` permit, held until the attempt returns; a completion
+/// handed to the completion batcher takes a permit only if it falls back to
+/// a direct write. Canonical storage does not use the gate.
 #[allow(clippy::too_many_arguments)]
 async fn complete_job(
     pool: &PgPool,
@@ -803,6 +913,7 @@ async fn complete_job(
     storage: &RuntimeStorage,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
+    gate: &FinalizeGateScope<'_>,
 ) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match storage {
         RuntimeStorage::Canonical => complete_job_canonical(
@@ -820,6 +931,11 @@ async fn complete_job(
         .await
         .map_err(Into::into),
         RuntimeStorage::QueueStorage(runtime) => {
+            let _permit = if completes_through_batcher(result, enqueue_specs, &job.kind) {
+                None
+            } else {
+                Some(gate.enter().await?)
+            };
             complete_job_queue_storage(
                 runtime,
                 pool,
@@ -834,6 +950,7 @@ async fn complete_job(
                 enqueue_specs,
                 dlq_enabled,
                 metrics,
+                gate,
             )
             .await
         }
@@ -1859,6 +1976,7 @@ async fn complete_job_queue_storage(
     >,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
+    gate: &FinalizeGateScope<'_>,
 ) -> Result<CompletionOutcome, FinalizeAttemptError> {
     match result {
         Ok(JobResult::Completed) => {
@@ -1941,6 +2059,7 @@ async fn complete_job_queue_storage(
                         error = %err,
                         "Completion batch flush failed, falling back to direct finalize"
                     );
+                    let _permit = gate.enter().await?;
                     direct_complete_job_queue_storage(
                         runtime,
                         pool,
@@ -3299,6 +3418,10 @@ mod tests {
         }
     }
 
+    fn open_gate() -> FinalizeGate {
+        FinalizeGate::new(4, CancellationToken::new())
+    }
+
     fn finalize_sqlstate(code: &'static str) -> AwaError {
         AwaError::Database(sqlx::Error::Database(Box::new(FinalizeDatabaseError(code))))
     }
@@ -3326,6 +3449,7 @@ mod tests {
             "test",
             Duration::from_secs(2),
             true,
+            &open_gate().scope(),
         )
         .await
         .expect("contention must retry the saved outcome");
@@ -3349,6 +3473,7 @@ mod tests {
             "test",
             Duration::from_millis(100),
             true,
+            &open_gate().scope(),
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
@@ -3396,6 +3521,7 @@ mod tests {
                 "test",
                 Duration::from_millis(100),
                 true,
+                &open_gate().scope(),
             )
             .await?;
             let CompletionOutcome::Applied {
@@ -3448,6 +3574,7 @@ mod tests {
                 "test",
                 Duration::from_secs(2),
                 true,
+                &open_gate().scope(),
             )
             .await;
             assert!(
@@ -3476,6 +3603,7 @@ mod tests {
             "test",
             Duration::from_secs(2),
             true,
+            &open_gate().scope(),
         )
         .await;
         assert!(matches!(result, Ok(3)));
@@ -3497,6 +3625,7 @@ mod tests {
             "test",
             Duration::from_secs(2),
             true,
+            &open_gate().scope(),
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Deadline)));
@@ -3518,6 +3647,7 @@ mod tests {
             "test",
             Duration::from_secs(2),
             false,
+            &open_gate().scope(),
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Operation(_))));
@@ -3539,6 +3669,7 @@ mod tests {
             "test",
             Duration::ZERO,
             false,
+            &open_gate().scope(),
         )
         .await;
         assert!(matches!(result, Err(FinalizeError::Operation(_))));
@@ -3609,6 +3740,7 @@ mod tests {
             finalizers.clone(),
             CancellationToken::new(),
             1,
+            4,
         );
         executor
             .execute_task(
@@ -3725,6 +3857,7 @@ mod tests {
                 finalizers.clone(),
                 finalize_cancel.clone(),
                 1,
+                4,
             );
             // Occupy the entire budget without starting database work.
             let capacity = executor.finalize_capacity.clone();
@@ -3920,6 +4053,8 @@ mod tests {
         let intended = Ok(JobResult::RetryAfter(Duration::from_secs(60)));
         let calls = AtomicU32::new(0);
         let busy = tokio::sync::Notify::new();
+        let gate = open_gate();
+        let gate_scope = gate.scope();
         let finalize = finalize_with_retry(
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -3935,6 +4070,7 @@ mod tests {
                     &metrics,
                     &busy,
                 );
+                let gate_scope = &gate_scope;
                 async move {
                     let result = complete_job(
                         pool,
@@ -3950,6 +4086,7 @@ mod tests {
                         storage,
                         false,
                         metrics,
+                        gate_scope,
                     )
                     .await;
                     if let Err(error) = &result {
@@ -3969,6 +4106,7 @@ mod tests {
             queue,
             Duration::from_secs(5),
             true,
+            &gate_scope,
         );
         let release = async {
             tokio::time::timeout(Duration::from_secs(3), busy.notified())
@@ -4021,6 +4159,7 @@ mod tests {
             &storage,
             false,
             &metrics,
+            &gate.scope(),
         )
         .await
         .unwrap();
@@ -4039,5 +4178,492 @@ mod tests {
             "SELECT count(*) FROM {schema}.deferred_jobs WHERE job_id=$1 AND run_lease=$2 AND state='retryable'"
         )).bind(pair.0).bind(pair.1).fetch_one(&pool).await.unwrap();
         assert_eq!(deferred, 1);
+    }
+
+    fn gate_test_job(id: i64) -> JobRow {
+        let now = chrono::Utc::now();
+        serde_json::from_value(serde_json::json!({
+            "id": id, "kind": "finalize_parent", "queue": "test", "args": {},
+            "state": "running", "priority": 2, "attempt": 1, "run_lease": 1,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "metadata": {}, "tags": [],
+        }))
+        .unwrap()
+    }
+
+    /// A pool whose connections are always refused, so a test can tell
+    /// whether a finalize reached the database without one.
+    fn unreachable_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgres://postgres:test@127.0.0.1:1/awa_test")
+            .unwrap()
+    }
+
+    fn test_queue_storage() -> RuntimeStorage {
+        RuntimeStorage::QueueStorage(
+            QueueStorageRuntime::new(
+                awa_model::QueueStorageConfig::default(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_gate_wait_does_not_consume_the_lock_window() {
+        let gate = FinalizeGate::new(1, CancellationToken::new());
+        let held = gate.permits.clone().acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(held);
+        });
+        let scope = gate.scope();
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let outcome = finalize_with_retry(
+            || async {
+                let _permit = scope.enter().await?;
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(FinalizeAttemptError::from(finalize_sqlstate("55P03")))
+                } else {
+                    Ok(())
+                }
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_millis(100),
+            true,
+            &scope,
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(scope.waited(), Duration::from_secs(1));
+        assert!(started.elapsed() > Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_gate_wait_extends_the_lock_window_by_the_wait_only() {
+        let gate = FinalizeGate::new(1, CancellationToken::new());
+        let held = gate.permits.clone().acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(held);
+        });
+        let scope = gate.scope();
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            || async {
+                let _permit = scope.enter().await?;
+                Err::<(), _>(FinalizeAttemptError::from(finalize_sqlstate("55P03")))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_millis(100),
+            true,
+            &scope,
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1) + Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_gate_permit_is_released_before_each_retry_backoff() {
+        let gate = FinalizeGate::new(1, CancellationToken::new());
+        let scope = gate.scope();
+        let pool = unreachable_pool();
+        let storage = test_queue_storage();
+        let metrics = test_metrics();
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let job = gate_test_job(1);
+        let result: Result<JobResult, JobError> = Err(JobError::retryable_msg("downstream"));
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let attempts = AtomicU32::new(0);
+        // While the finalize backs off between attempts, another finalize
+        // must be able to take the only permit.
+        let backoff_acquisitions = AtomicU32::new(0);
+        let finalize = finalize_with_retry(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let outcome = complete_job(
+                    &pool,
+                    &job,
+                    None,
+                    None,
+                    &result,
+                    &handle,
+                    None,
+                    Duration::ZERO,
+                    false,
+                    &specs,
+                    &storage,
+                    false,
+                    &metrics,
+                    &scope,
+                )
+                .await;
+                assert!(
+                    matches!(outcome, Err(FinalizeAttemptError::Operation(_))),
+                    "the attempt must run its statements"
+                );
+                // Report the attempt as contended so it is retried.
+                Err::<(), _>(FinalizeAttemptError::from(finalize_sqlstate("55P03")))
+            },
+            &metrics,
+            1,
+            "test",
+            "test",
+            Duration::from_secs(5),
+            true,
+            &scope,
+        );
+        let observer = async {
+            loop {
+                if let Ok(permit) = gate.permits.try_acquire() {
+                    backoff_acquisitions.fetch_add(1, Ordering::SeqCst);
+                    drop(permit);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                result = finalize => result,
+                () = observer => unreachable!(),
+            }
+        })
+        .await
+        .expect("every attempt must get the permit back");
+        assert!(matches!(result, Err(FinalizeError::Deadline)), "{result:?}");
+        assert!(attempts.load(Ordering::SeqCst) > 3);
+        assert!(
+            backoff_acquisitions.load(Ordering::SeqCst) > 0,
+            "the permit must be free while the finalize backs off"
+        );
+        assert_eq!(gate.permits.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_waiting_on_the_gate_keeps_heartbeats_and_yields_to_shutdown() {
+        struct RetryWorker;
+
+        #[async_trait::async_trait]
+        impl Worker for RetryWorker {
+            fn kind(&self) -> &'static str {
+                "finalize_parent"
+            }
+
+            async fn perform(&self, _context: &JobContext) -> Result<JobResult, JobError> {
+                Err(JobError::retryable_msg("downstream"))
+            }
+        }
+
+        let metrics = test_metrics();
+        let job = gate_test_job(1);
+        let key = (job.id, job.run_lease);
+        let storage = test_queue_storage();
+        let pool = unreachable_pool();
+        let finalizers = TaskTracker::new();
+        let finalize_cancel = CancellationToken::new();
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let count = Arc::new(AtomicU32::new(0));
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let executor = JobExecutor::new(
+            pool.clone(),
+            Arc::new(HashMap::from([(
+                "finalize_parent".into(),
+                Box::new(RetryWorker) as BoxedWorker,
+            )])),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::from([("test".into(), count.clone())])),
+            Arc::new(HashMap::new()),
+            metrics,
+            handle,
+            storage,
+            DlqPolicy::default(),
+            finalizers.clone(),
+            finalize_cancel.clone(),
+            1,
+            1,
+        );
+        let held = executor
+            .finalize_gate
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        executor
+            .execute_task(
+                DispatchedJob {
+                    job,
+                    queue_storage_claim: None,
+                    queue_storage_unique_states: None,
+                    abandon_after: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "worker capacity is released"
+        );
+        assert_eq!(finalizers.len(), 1);
+
+        // Waiting past the lock window neither ends the finalize nor drops
+        // the attempt from the heartbeat set.
+        tokio::time::advance(COMPLETION_LOCK_WINDOW * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            finalizers.len(),
+            1,
+            "a gate wait is not a lock-window deadline"
+        );
+        assert!(
+            in_flight
+                .claim_refs()
+                .iter()
+                .any(|(entry, _)| *entry == key),
+            "a finalize waiting for the gate must stay in the heartbeat set"
+        );
+
+        // Shutdown cancels the wait and the attempt leaves the heartbeat set,
+        // so rescue settles it.
+        finalize_cancel.cancel();
+        finalizers.close();
+        tokio::time::timeout(Duration::from_secs(1), finalizers.wait())
+            .await
+            .expect("a gate wait must not hold up shutdown");
+        assert!(in_flight.claim_refs().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn canonical_finalize_does_not_take_a_gate_permit() {
+        let gate = FinalizeGate::new(1, CancellationToken::new());
+        let _held = gate.permits.try_acquire().unwrap();
+        let pool = unreachable_pool();
+        let metrics = test_metrics();
+        let (_unstarted, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let job = gate_test_job(1);
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let scope = gate.scope();
+        for result in [
+            Err(JobError::retryable_msg("downstream")),
+            Ok(JobResult::Snooze(Duration::from_secs(1))),
+            Ok(JobResult::Cancel("stop".into())),
+        ] {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                complete_job(
+                    &pool,
+                    &job,
+                    None,
+                    None,
+                    &result,
+                    &handle,
+                    None,
+                    Duration::ZERO,
+                    false,
+                    &specs,
+                    &RuntimeStorage::Canonical,
+                    false,
+                    &metrics,
+                    &scope,
+                ),
+            )
+            .await
+            .expect("a canonical finalize must not wait for the gate");
+            assert!(
+                matches!(outcome, Err(FinalizeAttemptError::Operation(_))),
+                "the canonical finalize must go straight to the database"
+            );
+        }
+        assert_eq!(scope.waited(), Duration::ZERO);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn batched_completions_bypass_the_gate_and_their_fallback_takes_it(pool: PgPool) {
+        awa_model::migrations::run(&pool).await.unwrap();
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig {
+                queue_stripe_count: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let queue = "finalize_gate_batched";
+        runtime.store.prepare_queue(&pool, queue, 1).await.unwrap();
+        let params = |n: i64| awa_model::job::InsertParams {
+            kind: "finalize_parent".into(),
+            args: serde_json::json!({ "n": n }),
+            opts: awa_model::InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        };
+        runtime
+            .store
+            .enqueue_params_batch(&pool, &[params(1), params(2)])
+            .await
+            .unwrap();
+        let mut claimed = runtime
+            .store
+            .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+        let fallback = claimed.pop().unwrap();
+        let batched = claimed.pop().unwrap();
+
+        let metrics = test_metrics();
+        let storage = RuntimeStorage::QueueStorage(runtime.clone());
+        let specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let completed: Result<JobResult, JobError> = Ok(JobResult::Completed);
+        let gate = FinalizeGate::new(1, CancellationToken::new());
+        let scope = gate.scope();
+        let held = gate.permits.try_acquire().unwrap();
+
+        // A completion the batcher writes finishes while the gate is full.
+        let batcher_cancel = CancellationToken::new();
+        let (batcher, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            batcher_cancel.clone(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let batcher_tasks = batcher.spawn();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            complete_job(
+                &pool,
+                &batched.job,
+                Some(&batched.claim),
+                None,
+                &completed,
+                &handle,
+                None,
+                Duration::ZERO,
+                false,
+                &specs,
+                &storage,
+                false,
+                &metrics,
+                &scope,
+            ),
+        )
+        .await
+        .expect("a batched completion must not wait for the gate")
+        .unwrap();
+        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+        assert_eq!(
+            runtime
+                .store
+                .load_job(&pool, batched.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Completed
+        );
+        batcher_cancel.cancel();
+        for task in batcher_tasks {
+            task.await.unwrap();
+        }
+
+        // A stopped batcher sends the completion to the direct fallback,
+        // which waits for the gate.
+        let (stopped, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        drop(stopped);
+        let direct = complete_job(
+            &pool,
+            &fallback.job,
+            Some(&fallback.claim),
+            None,
+            &completed,
+            &handle,
+            None,
+            Duration::ZERO,
+            false,
+            &specs,
+            &storage,
+            false,
+            &metrics,
+            &scope,
+        );
+        tokio::pin!(direct);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut direct)
+                .await
+                .is_err(),
+            "the direct fallback must wait for the gate"
+        );
+        assert_eq!(
+            runtime
+                .store
+                .load_job(&pool, fallback.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), direct)
+            .await
+            .expect("the fallback must proceed once a permit is free")
+            .unwrap();
+        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+        assert_eq!(
+            runtime
+                .store
+                .load_job(&pool, fallback.job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Completed
+        );
+        assert_eq!(gate.permits.available_permits(), 1);
     }
 }

@@ -162,6 +162,7 @@ pub struct ClientBuilder {
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
     max_concurrent_claims: Option<usize>,
+    max_concurrent_finalizes: Option<usize>,
     dlq_enabled_by_default: bool,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -224,6 +225,7 @@ impl ClientBuilder {
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
             max_concurrent_claims: None,
+            max_concurrent_finalizes: None,
             dlq_enabled_by_default: false,
             dlq_retention: None,
             dlq_cleanup_batch_size: None,
@@ -913,6 +915,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound the number of direct finalize transactions this runtime runs
+    /// concurrently on queue storage: retries, snoozes, cancels, callback
+    /// waits, failures and completions with follow-up enqueues, and
+    /// completions that fall back to a direct write when a completion batch
+    /// fails. Completions written by the completion batcher and canonical
+    /// storage are not counted. Defaults to a quarter of the pool, clamped
+    /// to `4..=64`. Independent of [`Self::max_concurrent_claims`].
+    pub fn max_concurrent_finalizes(mut self, limit: usize) -> Self {
+        self.max_concurrent_finalizes = Some(limit.max(1));
+        self
+    }
+
     /// Enable or disable DLQ routing by default.
     pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {
         self.dlq_enabled_by_default = enabled;
@@ -1196,6 +1210,7 @@ impl ClientBuilder {
             queue_retention_overrides: self.queue_retention_overrides,
             queue_stats_interval: self.queue_stats_interval,
             max_concurrent_claims: self.max_concurrent_claims,
+            max_concurrent_finalizes: self.max_concurrent_finalizes,
             dlq_policy,
             dlq_retention: self.dlq_retention,
             dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
@@ -1304,6 +1319,7 @@ pub struct Client {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Option<Duration>,
     max_concurrent_claims: Option<usize>,
+    max_concurrent_finalizes: Option<usize>,
     dlq_policy: DlqPolicy,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -1741,6 +1757,9 @@ impl Client {
             self.finalizers.clone(),
             self.service_cancel.clone(),
             runtime_worker_capacity,
+            self.max_concurrent_finalizes.unwrap_or_else(|| {
+                (self.pool.options().get_max_connections() as usize / 4).clamp(4, 64)
+            }),
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
