@@ -7,9 +7,9 @@ use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
 use awa_model::{
-    AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
-    RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
-    SkipReason, TerminalDeltaRollupOutcome,
+    AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueRingPin,
+    QueueStorage, RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder,
+    RotateOutcome, SkipReason, SpentClaimHeadAdvance, TerminalDeltaRollupOutcome,
 };
 use chrono::{DateTime, Utc};
 use croner::Cron;
@@ -885,6 +885,14 @@ impl PruneBackoffTracker {
         }
     }
 
+    /// Clears `branch`'s backoff, so its next tick runs prune.
+    fn reset(&self, branch: &'static str) {
+        let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let state = branches.entry(branch).or_default();
+        state.skip_remaining = 0;
+        state.backoff_level = 0;
+    }
+
     /// Update backoff state for a completed prune call. `Pruned` resets;
     /// `SkippedActive` / `Blocked` doubles; `Noop` is neutral.
     fn record_outcome(&self, branch: &'static str, outcome: &PruneOutcome) {
@@ -922,6 +930,14 @@ const QUEUE_RING_PIN_WARN_INTERVAL: Duration = Duration::from_secs(300);
 /// While lanes pin the queue ring, the leader re-reads them at least this
 /// often, on queue rotation ticks where prune is backed off.
 const QUEUE_RING_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The most lanes pinning the queue ring whose spent head rows the leader
+/// advances past per pin read.
+const QUEUE_RING_PIN_ADVANCE_LANES: usize = 32;
+
+/// The most windows of a lane's positions the leader advances past per pin
+/// read; each window is at most 1,000 positions.
+const QUEUE_RING_PIN_ADVANCE_WINDOWS: usize = 4;
 
 /// A `(queue, priority, enqueue_shard)` ready lane.
 type ReadyLaneKey = (String, i16, i16);
@@ -3747,7 +3763,8 @@ impl MaintenanceService {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_due(Instant::now());
             if refresh_due {
-                self.observe_queue_ring_pin(&runtime.store).await;
+                self.observe_queue_ring_pin(&runtime.store, prune_tracker)
+                    .await;
             }
             return;
         }
@@ -3769,7 +3786,10 @@ impl MaintenanceService {
                     PruneOutcome::SkippedActive {
                         reason: SkipReason::QueuePendingReady | SkipReason::QueueActiveLeases,
                         ..
-                    } => self.observe_queue_ring_pin(&runtime.store).await,
+                    } => {
+                        self.observe_queue_ring_pin(&runtime.store, prune_tracker)
+                            .await
+                    }
                     PruneOutcome::Blocked { .. } => {}
                     _ => self.clear_queue_ring_pin(),
                 }
@@ -3811,8 +3831,16 @@ impl MaintenanceService {
 
     /// Reports the lanes with pending ready rows in the oldest sealed queue
     /// ring slot as `awa.maintenance.prune.pinned_ready_age` and a
-    /// rate-limited warning.
-    async fn observe_queue_ring_pin(&self, store: &QueueStorage) {
+    /// rate-limited warning, after moving the claim cursors of those whose
+    /// head rows are spent (tombstoned or already claimed) over the spent
+    /// rows. When that releases a lane from the slot, or the slot itself, it
+    /// logs the release and clears queue prune's backoff so prune retries on
+    /// the next tick.
+    async fn observe_queue_ring_pin(
+        &self,
+        store: &QueueStorage,
+        prune_tracker: &PruneBackoffTracker,
+    ) {
         let pin = match store.queue_ring_pin(&self.pool).await {
             Ok(Some(pin)) => pin,
             Ok(None) => {
@@ -3823,6 +3851,14 @@ impl MaintenanceService {
                 debug!(error = %err, "Failed to read the lanes pinning the queue ring");
                 return;
             }
+        };
+        let (pin, released) = self.release_spent_pinning_lanes(store, pin).await;
+        if released {
+            prune_tracker.reset(PRUNE_BRANCH_QUEUE);
+        }
+        let Some(pin) = pin else {
+            self.clear_queue_ring_pin();
+            return;
         };
         let pinning: Vec<(ReadyLaneKey, Duration)> = pin
             .lanes
@@ -3851,6 +3887,69 @@ impl MaintenanceService {
                 "Queue ring prune is pinned by unclaimed ready rows; queue-storage partitions are not reclaimed until this lane is claimed",
             );
         }
+    }
+
+    /// Advances the claim cursors of `pin`'s lanes over spent head rows.
+    /// Returns the pin as it stands afterwards, `None` once no lane pins the
+    /// oldest sealed slot, and whether an advanced lane stopped pinning the
+    /// slot `pin` names, which it logs.
+    async fn release_spent_pinning_lanes(
+        &self,
+        store: &QueueStorage,
+        pin: QueueRingPin,
+    ) -> (Option<QueueRingPin>, bool) {
+        let lanes = &pin.lanes[..pin.lanes.len().min(QUEUE_RING_PIN_ADVANCE_LANES)];
+        let advanced = match store
+            .advance_spent_claim_heads(&self.pool, lanes, QUEUE_RING_PIN_ADVANCE_WINDOWS)
+            .await
+        {
+            Ok(advanced) => advanced,
+            Err(err) => {
+                debug!(error = %err, "Failed to advance the claim cursors of lanes pinning the queue ring");
+                return (Some(pin), false);
+            }
+        };
+        if advanced.is_empty() {
+            return (Some(pin), false);
+        }
+        for lane in &advanced {
+            self.metrics.record_queue_ring_claim_cursor_advance(
+                &lane.queue,
+                lane.priority,
+                lane.enqueue_shard,
+            );
+        }
+        let after = match store.queue_ring_pin(&self.pool).await {
+            Ok(after) => after,
+            Err(err) => {
+                debug!(error = %err, "Failed to read the lanes pinning the queue ring");
+                return (Some(pin), false);
+            }
+        };
+        let still_pinning = |lane: &SpentClaimHeadAdvance| {
+            after.as_ref().is_some_and(|after| {
+                after.slot == pin.slot
+                    && after.lanes.iter().any(|pinning| {
+                        pinning.queue == lane.queue
+                            && pinning.priority == lane.priority
+                            && pinning.enqueue_shard == lane.enqueue_shard
+                    })
+            })
+        };
+        let mut released = false;
+        for lane in advanced.iter().filter(|lane| !still_pinning(lane)) {
+            released = true;
+            info!(
+                slot = pin.slot,
+                queue = %lane.queue,
+                priority = lane.priority,
+                enqueue_shard = lane.enqueue_shard,
+                from_lane_seq = lane.from_seq,
+                to_lane_seq = lane.to_seq,
+                "Queue ring prune is no longer pinned by this lane: its claim cursor moved over cancelled, moved or claimed rows",
+            );
+        }
+        (after, released)
     }
 
     fn clear_queue_ring_pin(&self) {
@@ -6450,6 +6549,18 @@ mod tests {
         assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((2, 1)));
         tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Blocked { slot: 0 });
         assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((4, 2)));
+    }
+
+    #[test]
+    fn prune_backoff_reset_clears_only_its_branch() {
+        let tracker = PruneBackoffTracker::new();
+        tracker.record_outcome(PRUNE_BRANCH_QUEUE, &skip_active(0));
+        tracker.record_outcome(PRUNE_BRANCH_QUEUE, &skip_active(0));
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        tracker.reset(PRUNE_BRANCH_QUEUE);
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_QUEUE), Some((0, 0)));
+        assert!(!tracker.should_skip(PRUNE_BRANCH_QUEUE));
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((2, 1)));
     }
 
     #[test]

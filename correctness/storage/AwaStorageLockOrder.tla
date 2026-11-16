@@ -454,6 +454,8 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
 \*   LOCK TABLE leases, ready_segments, done_entries, ready_entries,
 \*     ready_claim_attempt_batches, ready_tombstones IN ACCESS SHARE MODE
 \*     NOWAIT, in that order, which is prune's child exclusive-lock order
+\*     (with lease-claim receipts it leaves out leases and done_entries,
+\*     which its scan does not read)
 \*   one statement over those tables that finds the lane's first unspent
 \*     row and raises the lane cursor with set_sequence_next
 \* The plan names one slot's children. The real LOCK TABLE covers every
