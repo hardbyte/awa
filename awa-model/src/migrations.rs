@@ -883,6 +883,7 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
     let mut patches = Vec::with_capacity(SCHEMA_PATCHES.len());
     if current <= CURRENT_VERSION {
         let before = schema_patch_status_conn(conn).await?;
+        let mut applied_this_run = Vec::new();
         for status in &before {
             if status.applied {
                 continue;
@@ -898,8 +899,17 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
             );
             // One simple-query round trip runs as one implicit transaction:
             // an error or a cancelled statement leaves nothing applied.
-            sqlx::raw_sql(patch.sql).execute(&mut *conn).await?;
+            if let Err(error) = sqlx::raw_sql(patch.sql).execute(&mut *conn).await {
+                tracing::error!(
+                    patch = patch.name,
+                    committed = ?applied_this_run,
+                    "Schema patch failed and changed nothing; the patches applied before it in \
+                     this run stay committed, and running the migration again resumes from it"
+                );
+                return Err(error.into());
+            }
             info!(patch = patch.name, "Schema patch applied");
+            applied_this_run.push(patch.name);
         }
         let after = schema_patch_status_conn(conn).await?;
         for (before, after) in before.into_iter().zip(after) {

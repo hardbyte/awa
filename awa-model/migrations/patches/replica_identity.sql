@@ -82,7 +82,7 @@ BEGIN
             RAISE EXCEPTION 'replica_identity: could not lock % within lock_timeout %',
                 v_target.relation, current_setting('lock_timeout')
                 USING ERRCODE = 'lock_not_available',
-                      HINT = 'Nothing was changed. Run awa migrate again, or raise lock_timeout for the migrating session.';
+                      HINT = 'This patch changed nothing and is safe to run again. Raise lock_timeout for the migrating session, or retry when the table is less busy.';
         END;
     END LOOP;
 
