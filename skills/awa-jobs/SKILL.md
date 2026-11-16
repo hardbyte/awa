@@ -73,6 +73,10 @@ client.start().await?;
 `QueueConfig` defaults worth knowing: `max_workers` 50, `poll_interval` 200ms,
 `deadline_duration` 300s, `claimers` 1, `claim_batch_size` 512. The trait form
 (`impl Worker` + `.register_worker(w)`) is equivalent to the typed closure.
+`max_workers` and `rate_limit` apply per worker process, not across the fleet.
+To choose between separate queues, priority, claimers, enqueue shards and
+`PartitionedQueue`, see
+[queues, lanes and splitting work](../../docs/concepts/queues-lanes-and-splitting-work.md).
 
 **Python** passes a queue list to `start`:
 
@@ -117,10 +121,13 @@ asyncpg / psycopg3 / SQLAlchemy / Django transaction.
 
 `InsertOpts` / keyword options: `queue`, `priority`, `max_attempts`, `run_at`
 (a future time starts the job `Scheduled` rather than `Available`),
-`deadline_duration`, `metadata`, `tags`, `unique`, `ordering_key`. Dispatch
-order is strict `priority ASC, run_at ASC, id ASC`. Priority aging then improves
-a waiting job's effective priority one level per aging interval (default 60s) so
-low-priority work cannot starve indefinitely.
+`deadline_duration`, `metadata`, `tags`, `unique`, `ordering_key`. On queue
+storage, order holds only within a lane, one per `(queue, priority,
+enqueue_shard)`: jobs in a lane come out in commit order, and a claim prefers
+the lane whose head has the best effective priority. Priority aging improves a
+waiting job's effective priority one level per aging interval (default 60s) so
+low-priority work cannot starve indefinitely. Scheduled, retried and snoozed
+jobs join their lane when promoted, not at their `run_at` position.
 
 To find the jobs about something later, tag them at insert (`order:123`,
 `tenant:acme`) and filter by tag: `admin::find_jobs` with `JobFilter`, Python

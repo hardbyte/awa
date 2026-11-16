@@ -36,11 +36,12 @@ Every worker process dispatches and heartbeats its own attempts. One of them als
 
 | Page | What it explains |
 | --- | --- |
+| [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md) | What a queue and a lane are, when to use separate queues, priority, claimers, shards or partitions, and which combine |
 | [Lanes and claiming](lanes-and-claiming.md) | How jobs are ordered, how a producer's commit makes them visible, and how workers pick the next one |
 | [Claims, receipts and leases](claims-receipts-and-leases.md) | What a claim writes, how heartbeats and rescue work, and how `run_lease` fences out stale workers |
 | [Rings: rotation and prune](rings.md) | How storage is reclaimed without vacuuming hot tables, and what stops a ring from moving |
 | [Batching](batching.md) | Where AWA handles jobs in groups to cut round trips and commits, and the settings for each |
-| [Scaling a hot queue](scaling-a-hot-queue.md) | Shards, partitions, stripes and claimers: what each splits and what ordering it gives up |
+| [Scaling a hot queue](scaling-a-hot-queue.md) | Which throughput lever to try first for one busy queue, and how to measure the result |
 | [Job lifecycle](job-lifecycle.md) | Every state a job can be in and how handlers move it between them |
 | [Transactional enqueue](transactional-enqueue.md) | Committing a job with the business write that caused it |
 | [Architecture](../architecture.md) | The reference description of every table, invariant and maintenance path |

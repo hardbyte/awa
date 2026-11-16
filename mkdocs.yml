@@ -107,6 +107,7 @@ nav:
       - CLI: start/cli.md
   - Concepts:
       - How AWA works: concepts/index.md
+      - Queues, lanes and splitting work: concepts/queues-lanes-and-splitting-work.md
       - Lanes and claiming: concepts/lanes-and-claiming.md
       - Claims, receipts and leases: concepts/claims-receipts-and-leases.md
       - "Rings: rotation and prune": concepts/rings.md
