@@ -978,29 +978,52 @@ async fn released_patch_upgrade_and_rollback() {
             .connect(&fixture.owner_url)
             .await
             .unwrap();
-        let mut tx = owner.begin().await.unwrap();
-        let patch_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+        let mut attempt = 0;
+        let locks: Vec<String> = loop {
+            attempt += 1;
+            let mut tx = owner.begin().await.unwrap();
+            let patch_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            if let Err(error) = sqlx::raw_sql(&patch_sql).execute(&mut *tx).await {
+                let lock_timeout = matches!(
+                    &error,
+                    sqlx::Error::Database(db)
+                        if db.code().as_deref() == Some("55P03")
+                            && db.message().starts_with("replica_identity: could not lock ")
+                );
+                assert!(
+                    lock_timeout && attempt < MIGRATE_ATTEMPTS,
+                    "exported patch failed on attempt {attempt} of {MIGRATE_ATTEMPTS}: {error:?}"
+                );
+                eprintln!(
+                    "[patch-rehearsal] exported patch attempt {attempt} of {MIGRATE_ATTEMPTS} hit \
+                     the replica_identity lock timeout; retrying in {MIGRATE_RETRY_PAUSE:?}: {error}"
+                );
+                tx.rollback().await.unwrap();
+                tokio::time::sleep(MIGRATE_RETRY_PAUSE).await;
+                continue;
+            }
+            let locks: Vec<String> = sqlx::query_scalar(
+                "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) \
+                 FROM pg_locks AS l \
+                 JOIN pg_class AS c ON c.oid = l.relation \
+                 JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+                 WHERE l.pid = $1 AND l.locktype = 'relation' \
+                   AND n.nspname IN ('awa', $2) \
+                   AND l.relation::bigint = ANY($3) \
+                 ORDER BY n.nspname, c.relname, l.mode",
+            )
+            .bind(patch_backend_pid)
+            .bind(SCHEMA)
+            .bind(&patch_relation_ids)
+            .fetch_all(&fixture.admin)
             .await
             .unwrap();
-        sqlx::raw_sql(&patch_sql).execute(&mut *tx).await.unwrap();
-        let locks: Vec<String> = sqlx::query_scalar(
-            "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) \
-             FROM pg_locks AS l \
-             JOIN pg_class AS c ON c.oid = l.relation \
-             JOIN pg_namespace AS n ON n.oid = c.relnamespace \
-             WHERE l.pid = $1 AND l.locktype = 'relation' \
-               AND n.nspname IN ('awa', $2) \
-               AND l.relation::bigint = ANY($3) \
-             ORDER BY n.nspname, c.relname, l.mode",
-        )
-        .bind(patch_backend_pid)
-        .bind(SCHEMA)
-        .bind(&patch_relation_ids)
-        .fetch_all(&fixture.admin)
-        .await
-        .unwrap();
-        tx.rollback().await.unwrap();
+            tx.rollback().await.unwrap();
+            break locks;
+        };
         owner.close().await;
         let (identity_locks, other_locks): (Vec<String>, Vec<String>) = locks
             .into_iter()
