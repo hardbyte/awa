@@ -32,6 +32,8 @@
 //! Every worker runs with a one-hour ready-ring rotation so completed jobs are
 //! still readable when the final accounting runs.
 
+mod ci_timing;
+
 use async_trait::async_trait;
 use awa::model::{admin, migrations, runtime_control, JobState, QueueStorage, QueueStorageConfig};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
@@ -298,7 +300,7 @@ fn candidate_client(runtime: &PgPool, log: &EventLog, source: &str, queues: &[&s
         )
         .heartbeat_interval(Duration::from_millis(100))
         .heartbeat_rescue_interval(Duration::from_millis(250))
-        .heartbeat_staleness(Duration::from_secs(2))
+        .heartbeat_staleness(rehearsal_heartbeat_staleness())
         .promote_interval(Duration::from_millis(100))
         .leader_election_interval(Duration::from_millis(200))
         .runtime_snapshot_interval(Duration::from_millis(100))
@@ -372,12 +374,23 @@ impl ReleasedWorker {
     }
 }
 
+/// Heartbeat staleness for every runtime in the rehearsal, candidate and
+/// released alike: stale-heartbeat rescue runs on whichever runtime leads
+/// maintenance, with that runtime's own staleness.
+fn rehearsal_heartbeat_staleness() -> Duration {
+    ci_timing::scaled_staleness(Duration::from_secs(2))
+}
+
 fn released_command(runtime_url: &str) -> Command {
     let mut command = Command::new(env_path("AWA_RELEASED_PYTHON"));
     command
         .arg(workspace_root().join("awa-python/tests/patch_rehearsal_worker.py"))
         .env("DATABASE_URL", runtime_url)
         .env("REHEARSAL_SCHEMA", SCHEMA)
+        .env(
+            "REHEARSAL_HEARTBEAT_STALENESS_MS",
+            rehearsal_heartbeat_staleness().as_millis().to_string(),
+        )
         .env("PYTHONUNBUFFERED", "1")
         .kill_on_drop(true);
     command
