@@ -900,12 +900,22 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
             // One simple-query round trip runs as one implicit transaction:
             // an error or a cancelled statement leaves nothing applied.
             if let Err(error) = sqlx::raw_sql(patch.sql).execute(&mut *conn).await {
-                tracing::error!(
-                    patch = patch.name,
-                    committed = ?applied_this_run,
-                    "Schema patch failed and changed nothing; the patches applied before it in \
-                     this run stay committed, and running the migration again resumes from it"
-                );
+                if matches!(error, sqlx::Error::Database(_)) {
+                    tracing::error!(
+                        patch = patch.name,
+                        committed = ?applied_this_run,
+                        "Schema patch failed and changed nothing; the patches applied before it in \
+                         this run stay committed, and running the migration again resumes from it"
+                    );
+                } else {
+                    tracing::error!(
+                        patch = patch.name,
+                        committed = ?applied_this_run,
+                        "Schema patch outcome is unknown because the connection failed; the patches \
+                         applied before it in this run stay committed, and running the migration \
+                         again checks this patch and resumes"
+                    );
+                }
                 return Err(error.into());
             }
             info!(patch = patch.name, "Schema patch applied");
