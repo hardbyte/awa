@@ -1364,7 +1364,7 @@ async fn released_patch_upgrade_and_rollback() {
         &[MAIN, BANKED, NEW_AFTER_PATCH],
     );
     candidate_b.start().await.expect("candidate restart");
-    wait_for_drain(&log, Duration::from_secs(120)).await;
+    wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
 
     // ── 4. roll back to released binaries ──────────────────────────────
     candidate_b.shutdown(Duration::from_secs(5)).await;
@@ -1405,7 +1405,7 @@ async fn released_patch_upgrade_and_rollback() {
         .await
         .unwrap_or_else(|error| panic!("released enqueue on {queue} after rollback: {error}"));
     }
-    wait_for_drain(&log, Duration::from_secs(120)).await;
+    wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
     // A released admin process reads the patched schema as the runtime role.
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(NEW_AFTER_ROLLBACK), "{stats}");
@@ -1520,7 +1520,7 @@ async fn released_patch_upgrade_and_rollback() {
         !new_lane_owners.is_empty() && new_lane_owners.iter().all(|owned| *owned),
         "the new lane's sequences belong to the schema owner: {new_lane_owners:?}"
     );
-    wait_for_drain(&log, Duration::from_secs(120)).await;
+    wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(PROVISIONED), "{stats}");
     for worker in [worker_e, worker_f] {
