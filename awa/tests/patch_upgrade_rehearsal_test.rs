@@ -524,7 +524,8 @@ async fn migrate_under_traffic(
         }
         let lock_timeout = stderr.contains("code: \"55P03\"")
             && stderr.contains("replica_identity: could not lock ")
-            && stderr.contains("Nothing was changed.");
+            && stderr.contains("This patch changed nothing and is safe to run again.")
+            && stdout.contains("Schema patch failed and changed nothing");
         assert!(
             lock_timeout && attempt < MIGRATE_ATTEMPTS,
             "{} [\"migrate\"] failed on attempt {attempt} of {MIGRATE_ATTEMPTS}:\n{stdout}\n{stderr}",

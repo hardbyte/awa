@@ -45,7 +45,7 @@ Each `ALTER` takes `ACCESS EXCLUSIVE` on its table, and the `USING INDEX` form a
 
 - Once granted, the locks last a few milliseconds: the change is catalog-only and rewrites no data.
 - The wait is bounded. Each lock wait is limited by the migrating session's `lock_timeout`, or 300 ms when it has none. While one lock waits, statements on that table queue behind it, so a writer can stall for up to that bound, plus the time the patch holds locks it has already taken.
-- A lock that cannot be granted in time, for example behind a long transaction that wrote to a mark table, fails the patch with SQLSTATE `55P03` naming the table. Nothing is changed; run `awa migrate` again, or end the long transaction first.
+- A lock that cannot be granted in time, for example behind a long transaction that wrote to a mark table, fails the patch with SQLSTATE `55P03` naming the table. The patch changes nothing. `awa migrate` commits each patch separately, so the patches it applied earlier in the run stay applied, and it logs their names. Running it again is safe and resumes from `replica_identity`; raise `lock_timeout` for the migrating session, end the long transaction, or pick a quieter moment.
 - A table that already has its identity is skipped, so a re-run after success takes no lock.
 - With `awa migrate --sql`, all pending patches run in one transaction and the locks are held until it commits; `R__replica_identity` comes last so that is immediately after it.
 

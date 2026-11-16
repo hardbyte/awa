@@ -1,6 +1,7 @@
 //! `awa migrate` against a 0.6.9-shaped schema: range flags are refused on the
 //! apply path, an interrupted patch leaves nothing behind and a retry
-//! completes it, and `--sql` output applies all or nothing under psql.
+//! completes it, `--sql` output applies all or nothing under psql, and a lock
+//! timeout in a later patch keeps the patches applied before it.
 //!
 //! Each test gets its own database. The pre-patch shape is a v40 schema whose
 //! queue-storage substrates (`awa` and a custom schema) carry the 0.6.9 lane
@@ -405,6 +406,109 @@ async fn exported_sql_applies_all_or_nothing() {
         .await
         .unwrap()
         .is_empty());
+    pool.close().await;
+    db.drop().await;
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+#[tokio::test]
+async fn lock_timeout_in_a_later_patch_keeps_earlier_patches_and_a_rerun_resumes() {
+    let db = TestDatabase::create().await;
+    let pool = db.pool().await;
+    migrations::run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "DROP TABLE awa.runtime_maintenance_eligibility; \
+         ALTER TABLE awa.admin_dirty_kind_marks REPLICA IDENTITY DEFAULT;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let pending: Vec<&str> = migrations::pending_schema_patches(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|patch| patch.name)
+        .collect();
+    assert_eq!(
+        pending,
+        ["runtime_maintenance_eligibility", "replica_identity"]
+    );
+
+    let mut holder = PgConnection::connect(&db.url).await.unwrap();
+    sqlx::raw_sql("BEGIN; INSERT INTO awa.admin_dirty_kind_marks (kind) VALUES ('held');")
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    let output = awa(&db.url, &["migrate"]);
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    holder.close().await.unwrap();
+
+    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("code: \"55P03\""), "{stderr}");
+    assert!(
+        stderr.contains("replica_identity: could not lock awa.admin_dirty_kind_marks"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("This patch changed nothing and is safe to run again."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Nothing was changed"), "{stderr}");
+    let failure = stdout
+        .lines()
+        .find(|line| line.contains("Schema patch failed and changed nothing"))
+        .unwrap_or_else(|| panic!("no patch failure line in:\n{stdout}"));
+    assert!(failure.contains("resumes from it"), "{failure}");
+    assert!(failure.contains("patch=\"replica_identity\""), "{failure}");
+    assert!(
+        failure.contains("committed=[\"runtime_maintenance_eligibility\"]"),
+        "{failure}"
+    );
+
+    let pending: Vec<&str> = migrations::pending_schema_patches(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|patch| patch.name)
+        .collect();
+    assert_eq!(pending, ["replica_identity"], "the earlier patch committed");
+
+    let output = awa(&db.url, &["migrate"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Schema patch runtime_maintenance_eligibility: already present"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Schema patch replica_identity: applied"),
+        "{stdout}"
+    );
     pool.close().await;
     db.drop().await;
 }
