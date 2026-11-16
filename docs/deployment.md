@@ -231,7 +231,7 @@ Each database has its own:
 - maintenance leader, elected by an advisory lock that Postgres scopes to the database, so a long rescue pass or a stalled prune in one database does not delay rotation, promotion or rescue in another
 - cron schedules, unique-key claims, DLQ, queue controls and admin view
 
-The databases can share one Postgres server. Isolation then stops at the server: CPU, I/O, WAL, `max_connections` and autovacuum workers are shared, and a replication slot or a standby with `hot_standby_feedback` holds back vacuum in every database on it. Within one database, a stalled lane still pins that database's ring; the fixes in [the troubleshooting guide](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane) still apply there.
+The databases can share one Postgres server. Isolation then stops at the server: CPU, I/O, WAL, `max_connections` and autovacuum workers are shared, and a replication slot whose `xmin` is set (in `pg_replication_slots`), or a standby with `hot_standby_feedback`, holds back vacuum of table rows in every database on it. A slot that only retains WAL, or a logical slot with only `catalog_xmin` set, does not hold back vacuum of Awa's table rows. Within one database, a stalled lane still pins that database's ring; the fixes in [the troubleshooting guide](troubleshooting.md#queue-ring-stops-wrapping-behind-an-unclaimed-lane) still apply there.
 
 To set it up:
 
@@ -248,7 +248,7 @@ Costs:
 - no transaction spans databases: a handler or a producer transaction can enqueue atomically only into its own database, unique keys deduplicate only within one database, and a job cannot be moved between databases with `move_queue`
 - Awa's metrics carry no database attribute, so tell the domains apart by the resource attributes of the processes that serve them
 
-When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero `priority_aging_interval`, queues are not left paused or unserved with jobs waiting, and you alert on `awa.maintenance.prune.pinned_ready_age`, one database is simpler and the stall is caught before it costs much storage.
+When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero `priority_aging_interval`, queues are not left paused or unserved with jobs waiting, and you alert on `awa.maintenance.prune.pinned_ready_age`, on prune attempts with outcome `blocked`, and on `awa.ring.generation` that stops advancing, one database is simpler and a stall is caught before it costs much storage. `pinned_ready_age` catches a lane pinning the ring; it stays at zero when [overlapping claims keep prune blocked](troubleshooting.md#ring-prune-stays-blocked-under-claim-load), which only the `blocked` count and a flat ring generation show.
 
 ## Web UI Deployment
 
