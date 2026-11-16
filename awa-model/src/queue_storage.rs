@@ -10271,6 +10271,7 @@ impl QueueStorage {
                         ORDER BY segment.next_lane_seq
                         LIMIT 1
                     ) AS first_visible ON TRUE
+                    WHERE first_visible.lane_seq IS NOT NULL
                 ),
                 scanned AS (
                     SELECT
@@ -10423,7 +10424,10 @@ impl QueueStorage {
         }
         let schema = self.schema();
         let claimed = self.ready_row_claimed_for_mode_sql("ready");
-        let mut probe = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut probe = pool
+            .begin_with(DRAIN_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         set_lock_timeout_tx(&mut probe, CLAIM_CURSOR_ADVANCE_LOCK_TIMEOUT).await?;
         let candidates: Result<Vec<(String, i16, i16)>, sqlx::Error> = sqlx::query_as(&format!(
             r#"
@@ -10596,9 +10600,9 @@ impl QueueStorage {
             tx.rollback().await.map_err(map_sqlx_error)?;
             return Ok(None);
         }
-        // Queue prune takes these families' children ACCESS EXCLUSIVE in
-        // this order; taking them first, without waiting, keeps this
-        // transaction out of any wait cycle with prune.
+        // The tables the advance statement reads in this mode, locked up
+        // front without waiting: a table another transaction holds
+        // exclusively ends this window instead of queueing behind it.
         let tables: &[&str] = if self.lease_claim_receipts() {
             &[
                 "ready_segments",
