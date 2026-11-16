@@ -396,7 +396,7 @@ A claim on the lane releases the slot:
 
 Moving the stuck jobs to another queue or changing their priority does not release the slot: the old ready rows stay in place, tombstoned, and count until a claim on their lane passes them. Cancelling them releases it only when the cancels reach the lane's claim cursor in lane order, as `drain_queue`, one `bulk_cancel` of all the lane's waiting jobs, or `cancel` one job at a time in enqueue order do. Jobs cancelled in another order, or with `cancel_tx`, keep pinning the slot until the lane is claimed.
 
-`awa.maintenance.prune.pinned_ready_age` is a gauge of the age of each pinning lane's first pending row, by `awa_job_queue`, `awa_job_priority` and `awa_queue_enqueue_shard`. The leader updates it whenever queue prune runs, which backs off to every 32 queue-ring maintenance ticks while the slot stays pinned, and sets a lane to `0` once it stops pinning the slot or the runtime loses leadership. A short-lived value is normal while a backlog drains through a full ring. Alert when a lane stays old:
+`awa.maintenance.prune.pinned_ready_age` is a gauge of the age of each pinning lane's first pending row, by `awa_job_queue`, `awa_job_priority` and `awa_queue_enqueue_shard`. The leader updates it when queue prune runs and, while a lane pins the slot, at least every 15 seconds or queue rotation tick, whichever is longer, even while prune backs off; it sets a lane to `0` once it stops pinning the slot or the runtime loses leadership. A short-lived value is normal while a backlog drains through a full ring. Alert when a lane stays old:
 
 ```yaml
 - alert: AwaQueueRingPinnedByLane
