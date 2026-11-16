@@ -1662,3 +1662,178 @@ async fn released_patch_upgrade_and_rollback() {
     }
     fixture.drop().await;
 }
+
+const ADVANCE: &str = "rh_advance";
+const ADVANCE_DEST: &str = "rh_advance_dest";
+
+/// #779: released workers keep claiming a lane while the candidate moves some
+/// of its jobs away and advances the lane's claim cursor over the tombstones,
+/// as the candidate's maintenance leader does for a lane pinning the queue
+/// ring. Every job completes exactly once, in the queue it was in when
+/// claimed, and a moved job never runs from its old queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "release gate: needs matching AWA_RELEASED_CLI and AWA_RELEASED_PYTHON artifacts"]
+async fn released_claimers_with_candidate_claim_cursor_advance() {
+    const JOBS: usize = 600;
+    const MOVED_PREFIX: usize = 30;
+    let released_cli = env_path("AWA_RELEASED_CLI");
+    let candidate_cli = candidate_cli();
+    assert!(
+        candidate_cli.exists(),
+        "candidate CLI not found at {}; run cargo build -p awa-cli or set AWA_CANDIDATE_CLI",
+        candidate_cli.display()
+    );
+    let fixture = Fixture::create().await;
+    let log = EventLog::default();
+
+    cli_ok(&released_cli, &fixture.owner_url, &["migrate"]).await;
+    for args in [
+        &[
+            "storage",
+            "prepare-queue-storage-schema",
+            "--schema",
+            SCHEMA,
+        ][..],
+        &[
+            "storage",
+            "prepare",
+            "--engine",
+            "queue_storage",
+            "--details",
+            &format!(r#"{{"schema":"{SCHEMA}"}}"#),
+        ][..],
+        &["storage", "enter-mixed-transition", "--quiesced"][..],
+        &["storage", "finalize"][..],
+    ] {
+        cli_ok(&released_cli, &fixture.owner_url, args).await;
+    }
+    grant_released_runtime(&fixture).await;
+    cli_ok(&candidate_cli, &fixture.owner_url, &["migrate"]).await;
+
+    released_produce(
+        &fixture.runtime_url,
+        &log,
+        ProduceSpec {
+            queue: ADVANCE,
+            seq_start: 0,
+            count: JOBS as i64,
+            modes: "ok",
+            delay_s: 0.0,
+            pause_ms: 0,
+        },
+    )
+    .await
+    .expect("released backlog");
+    let mut enqueued: Vec<(i64, i64)> = log
+        .snapshot()
+        .iter()
+        .filter(|event| event.kind == EventKind::Enqueued && event.queue == ADVANCE)
+        .map(|event| (event.seq, event.job_id))
+        .collect();
+    enqueued.sort_unstable();
+    let jobs: Vec<i64> = enqueued.into_iter().map(|(_, job_id)| job_id).collect();
+    assert_eq!(jobs.len(), JOBS);
+
+    let store = Arc::new(
+        QueueStorage::new(QueueStorageConfig {
+            schema: SCHEMA.to_string(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let pool = fixture.admin.clone();
+    store.rotate(&pool).await.expect("seal the backlog's slot");
+    let mut moved = Vec::new();
+    for job_id in jobs[..MOVED_PREFIX].iter().rev() {
+        assert!(store
+            .move_queue(&pool, *job_id, ADVANCE_DEST, None)
+            .await
+            .expect("move queue"));
+        moved.push(*job_id);
+    }
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let advances = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let advancer = {
+        let (store, pool, stop, advances) =
+            (store.clone(), pool.clone(), stop.clone(), advances.clone());
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            while !stop.load(Ordering::SeqCst) {
+                if let Some(pin) = store.queue_ring_pin(&pool).await.expect("read pin") {
+                    let advanced = store
+                        .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+                        .await
+                        .expect("advance spent claim heads");
+                    advances.fetch_add(advanced.len(), Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    wait_until(
+        "the candidate advance to pass the moved prefix",
+        Duration::from_secs(30),
+        || advances.load(std::sync::atomic::Ordering::SeqCst) > 0,
+    )
+    .await;
+
+    let worker = spawn_released_worker(&fixture.runtime_url, &log, &[ADVANCE, ADVANCE_DEST]).await;
+    for job_id in jobs[MOVED_PREFIX..].iter().rev().step_by(4) {
+        if store
+            .move_queue(&pool, *job_id, ADVANCE_DEST, None)
+            .await
+            .expect("move queue")
+        {
+            moved.push(*job_id);
+        }
+    }
+    wait_for_drain(&log, Duration::from_secs(180)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    advancer.await.expect("advancer");
+    worker.kill().await;
+
+    let mut completions: HashMap<i64, usize> = HashMap::new();
+    for event in log.snapshot() {
+        if event.kind == EventKind::Complete {
+            *completions.entry(event.job_id).or_default() += 1;
+        }
+    }
+    let duplicated: Vec<_> = completions.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        duplicated.is_empty(),
+        "jobs completed twice: {duplicated:?}"
+    );
+    assert_eq!(
+        completions.keys().copied().collect::<HashSet<_>>(),
+        jobs.iter().copied().collect::<HashSet<_>>(),
+        "every job completes"
+    );
+    let rows: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, queue, state::text FROM awa.jobs WHERE id = ANY($1)")
+            .bind(&jobs)
+            .fetch_all(&pool)
+            .await
+            .expect("read final job rows");
+    assert_eq!(rows.len(), JOBS);
+    let moved_set: HashSet<i64> = moved.iter().copied().collect();
+    for (job_id, queue, state) in &rows {
+        let expected = if moved_set.contains(job_id) {
+            ADVANCE_DEST
+        } else {
+            ADVANCE
+        };
+        assert_eq!(
+            (queue.as_str(), state.as_str()),
+            (expected, "completed"),
+            "job {job_id}"
+        );
+    }
+    eprintln!(
+        "[cursor-advance-rehearsal] released={} jobs={JOBS} moved={} advances={}",
+        released_version(),
+        moved.len(),
+        advances.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    fixture.drop().await;
+}
