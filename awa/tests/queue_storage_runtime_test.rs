@@ -4064,10 +4064,12 @@ async fn advance_pinning_lanes(
     else {
         return Vec::new();
     };
-    store
+    let outcome = store
         .advance_spent_claim_heads(pool, &pin.lanes, 4)
         .await
-        .expect("advance spent claim heads")
+        .expect("advance spent claim heads");
+    assert!(outcome.failed.is_empty(), "no lane fails: {outcome:?}");
+    outcome.advanced
 }
 
 /// The lane's claim cursor: the next lane position a claim reads.
@@ -4542,7 +4544,8 @@ async fn measure_spent_claim_head_advance_with_a_segment_backlog() {
         let advanced = store
             .advance_spent_claim_heads(&pool, &pin.lanes, 4)
             .await
-            .expect("advance");
+            .expect("advance")
+            .advanced;
         probe_only.push(started.elapsed());
         assert!(advanced.is_empty(), "a live head is not advanced");
     }
@@ -4556,7 +4559,8 @@ async fn measure_spent_claim_head_advance_with_a_segment_backlog() {
         let advanced = store
             .advance_spent_claim_heads(&pool, &pin.lanes, 4)
             .await
-            .expect("advance");
+            .expect("advance")
+            .advanced;
         advance.push(started.elapsed());
         assert_eq!(advanced.len(), 1);
         assert_eq!(advanced[0].to_seq - advanced[0].from_seq, 1);
@@ -4591,6 +4595,287 @@ async fn measure_spent_claim_head_advance_with_a_segment_backlog() {
         "[advance-measure] claim_with_head_held={held_claim:?} claimed={}",
         claimed.len()
     );
+}
+
+/// #779: a lane whose advance fails with an error other than lock
+/// contention is reported as failed, and the lanes after it are still
+/// advanced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_continues_past_a_failing_lane() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_failing_lane").await;
+    let schema = store.schema().to_string();
+    let failing = "qs_advance_a_failing";
+    let healthy = "qs_advance_b_healthy";
+
+    let mut lanes = HashMap::new();
+    for queue in [failing, healthy] {
+        lanes.insert(queue, enqueue_lane(&pool, &store, queue, 2, 2).await);
+    }
+    assert_rotated_to(&store, &pool, 1).await;
+    for queue in [failing, healthy] {
+        assert!(store
+            .move_queue(&pool, lanes[queue][0], "qs_advance_failing_dest", None)
+            .await
+            .expect("move queue"));
+    }
+    // A lane with no enqueue head fails its window read; the probe does not
+    // read enqueue heads, so the lane is still a candidate.
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.queue_enqueue_heads WHERE queue = $1"
+    ))
+    .bind(failing)
+    .execute(&pool)
+    .await
+    .expect("drop the failing lane's enqueue head");
+
+    let pin = store
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("both lanes pin slot 0");
+    let outcome = store
+        .advance_spent_claim_heads(&pool, &pin.lanes, 4)
+        .await
+        .expect("a failing lane does not fail the call");
+    assert_eq!(
+        outcome
+            .failed
+            .iter()
+            .map(|lane| lane.queue.as_str())
+            .collect::<Vec<_>>(),
+        vec![failing]
+    );
+    assert_eq!(
+        outcome
+            .advanced
+            .iter()
+            .map(|lane| lane.queue.as_str())
+            .collect::<Vec<_>>(),
+        vec![healthy],
+        "the lane after the failing one is still advanced"
+    );
+    let seqs = first_lane_seqs(&pool, &store, &lanes[healthy]).await;
+    assert_eq!(claim_cursor(&pool, &store, healthy, 2).await, seqs[1]);
+}
+
+/// #779: the advance reads which claim evidence to trust from the schema's
+/// installed claim function, not from the store's configuration: a store
+/// configured without receipts, on a schema installed with them, reads only
+/// the receipt evidence and so does not touch `leases`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_head_advance_uses_the_schema_claim_mode() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_advance_schema_mode";
+    let installed = create_ring_pin_store(&pool, schema).await;
+    let queue = "qs_advance_schema_mode";
+    let jobs = enqueue_lane(&pool, &installed, queue, 2, 2).await;
+    assert_rotated_to(&installed, &pool, 1).await;
+    assert!(installed
+        .move_queue(&pool, jobs[0], "qs_advance_schema_mode_dest", None)
+        .await
+        .expect("move queue"));
+    let pin = installed
+        .queue_ring_pin(&pool)
+        .await
+        .expect("read pin")
+        .expect("the moved row pins slot 0");
+
+    let misconfigured = QueueStorage::new(QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    })
+    .expect("store");
+    let mut holder = pool.begin().await.expect("begin");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.leases IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *holder)
+    .await
+    .expect("hold leases");
+    let outcome = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(5)),
+        misconfigured.advance_spent_claim_heads(&pool, &pin.lanes, 4),
+    )
+    .await
+    .expect("the advance does not wait")
+    .expect("advance");
+    holder.rollback().await.expect("release");
+    assert!(outcome.failed.is_empty(), "{outcome:?}");
+    assert_eq!(
+        outcome.advanced.len(),
+        1,
+        "the receipt-mode advance does not read leases, so it is not held back"
+    );
+    let seqs = first_lane_seqs(&pool, &installed, &jobs).await;
+    assert_eq!(claim_cursor(&pool, &installed, queue, 2).await, seqs[1]);
+}
+
+/// #779: `drain_queue` and the maintenance advance running at once on the
+/// same lane leave every drained job cancelled exactly once, never claimed,
+/// and the lane's cursor past them, so the next job enqueued is the next
+/// claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spent_claim_head_advance_racing_drain_queue() {
+    const JOBS: usize = 2_500;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store = Arc::new(create_ring_pin_store(&pool, "awa_qs_advance_drain_race").await);
+    let queue = "qs_advance_drain_race";
+
+    let params: Vec<_> = (0..JOBS)
+        .map(|n| {
+            insert::params_with(
+                &CompleteJob { id: n as i64 },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    priority: 2,
+                    ..Default::default()
+                },
+            )
+            .expect("insert params")
+        })
+        .collect();
+    store
+        .enqueue_params_batch(&pool, &params)
+        .await
+        .expect("enqueue");
+    assert_rotated_to(&store, &pool, 1).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let head: i64 = sqlx::query_scalar(&format!(
+        "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq LIMIT 1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read head");
+    admin::cancel_tx(&mut tx, head)
+        .await
+        .expect("cancel_tx")
+        .expect("available job cancels");
+    tx.commit().await.expect("commit");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let passes = Arc::new(AtomicUsize::new(0));
+    let advancer = {
+        let (store, pool, stop, passes) =
+            (store.clone(), pool.clone(), stop.clone(), passes.clone());
+        tokio::spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                advance_pinning_lanes(&store, &pool).await;
+                passes.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    while passes.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the advance loop runs");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let passes_before = passes.load(Ordering::SeqCst);
+    let drained = admin::drain_queue(&pool, queue).await.expect("drain queue");
+    let passes_during = passes.load(Ordering::SeqCst) - passes_before;
+    stop.store(true, Ordering::SeqCst);
+    advancer.await.expect("advancer");
+    assert_eq!(
+        drained as usize,
+        JOBS - 1,
+        "every available job is drained once"
+    );
+    assert!(passes_during >= 1, "the advance ran while the drain did");
+
+    let next = enqueue_lane(&pool, &store, queue, 2, 1).await;
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    assert_eq!(claimed, next, "no drained job is claimed");
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 2).await);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(
+        (counts.available, counts.running, counts.terminal),
+        (0, 0, JOBS as i64 + 1)
+    );
+}
+
+/// #779: `awa.delete_job_compat`, which tombstones a ready row without
+/// taking the lane's claim head, racing the advance on the same lane: the
+/// deleted jobs are never claimed, the live job behind them is claimed once,
+/// and the lane stops pinning the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spent_claim_head_advance_racing_compat_delete() {
+    const JOBS: usize = 200;
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store = Arc::new(create_ring_pin_store(&pool, "awa_qs_advance_compat_delete").await);
+    let queue = "qs_advance_compat_delete";
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, JOBS + 1).await;
+    assert_rotated_to(&store, &pool, 1).await;
+    let first: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+        .bind(jobs[0])
+        .fetch_one(&pool)
+        .await
+        .expect("delete_job_compat");
+    assert!(first);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let advancer = {
+        let (store, pool, stop) = (store.clone(), pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut advances = 0;
+            while !stop.load(Ordering::SeqCst) {
+                advances += advance_pinning_lanes(&store, &pool).await.len();
+                tokio::task::yield_now().await;
+            }
+            advances
+        })
+    };
+    for job_id in jobs[1..JOBS].iter().rev() {
+        let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("delete_job_compat");
+        assert!(deleted);
+    }
+    // Let the advance catch up with the last deletes.
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(10));
+    let live_seq = first_lane_seqs(&pool, &store, &jobs[JOBS..]).await[0];
+    while claim_cursor(&pool, &store, queue, 2).await != live_seq {
+        assert!(
+            Instant::now() < deadline,
+            "the advance reaches the live job"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.store(true, Ordering::SeqCst);
+    let advances = advancer.await.expect("advancer");
+    assert!(advances >= 1);
+
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.extend(
+            claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                .await
+                .into_iter()
+                .map(|job| job.job.id),
+        );
+    }
+    assert_eq!(claimed, vec![jobs[JOBS]], "only the live job is claimed");
+    assert!(!lane_pins_slot(&pool, &store, 0, queue, 2).await);
 }
 
 /// #779: the advance races live claims and moves on the same lane. Every job
@@ -4870,7 +5155,8 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     )
     .await
     .expect("the advance does not wait behind a locked table")
-    .expect("a locked table is not an error");
+    .expect("a locked table is not an error")
+    .advanced;
     assert!(advanced.is_empty());
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -4893,7 +5179,8 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     )
     .await
     .expect("the advance does not wait behind a held claim head")
-    .expect("a held head is not an error");
+    .expect("a held head is not an error")
+    .advanced;
     assert!(advanced.is_empty());
     holder.rollback().await.expect("release");
     assert_eq!(claim_cursor(&pool, &store, queue, 2).await, start);
@@ -4901,7 +5188,8 @@ async fn test_spent_claim_head_advance_skips_locked_tables_and_heads() {
     let advanced = store
         .advance_spent_claim_heads(&pool, &pin.lanes, 4)
         .await
-        .expect("advance");
+        .expect("advance")
+        .advanced;
     assert_eq!(advanced.len(), 1);
     assert_eq!(advanced[0].to_seq - advanced[0].from_seq, 3);
     assert_queue_prune_reclaims(&store, &pool, 0).await;
@@ -5364,6 +5652,116 @@ impl Worker for SlowRecordingWorker {
         self.seen.lock().unwrap().push(ctx.job.id);
         Ok(JobResult::Completed)
     }
+}
+
+/// #779: while queue-storage pruning is halted the leader does not advance a
+/// pinning lane's cursor, even after its jobs are moved; once the halt is
+/// lifted it releases the lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_ring_pin_not_released_while_prune_is_halted() {
+    let _metrics_guard = GLOBAL_METRICS_TEST_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    ring_pin_events();
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_ring_pin_halted";
+    let store_config = ring_pin_store_config("awa_qs_ring_pin_halted");
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 3).await;
+    backdate_ready_lane(&pool, &store, queue, 2, Duration::from_secs(600)).await;
+    admin::pause_queue(&pool, queue, Some("test"))
+        .await
+        .expect("pause queue");
+    assert_rotated_to(&store, &pool, 1).await;
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .runtime_snapshot_interval(Duration::from_millis(100))
+        .build()
+        .expect("build client");
+    client.start().await.expect("start client");
+    wait_for_pinned_ready_age(
+        &exporter,
+        &meter_provider,
+        (queue, 2, 0),
+        |age| age > 0.0,
+        "the paused lane is reported as pinning the ring",
+    )
+    .await;
+
+    let halt = awa::model::runtime_control::halt(
+        &pool,
+        awa::model::runtime_control::PRUNE_SCOPE,
+        "test",
+        "drain",
+    )
+    .await
+    .expect("halt prune");
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    loop {
+        let status = awa::model::runtime_control::status(&pool)
+            .await
+            .expect("read runtime control status");
+        if status.state == awa::model::runtime_control::RuntimeControlState::Halted {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime confirms the halt, last state {:?}",
+            status.state
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for job_id in jobs.iter().rev() {
+        assert!(store
+            .move_queue(&pool, *job_id, "qs_ring_pin_halted_dest", None)
+            .await
+            .expect("move queue"));
+    }
+    // Long enough for many queue rotation ticks and a pin refresh.
+    tokio::time::sleep(ci_timing::scaled_timeout(Duration::from_secs(3))).await;
+    assert_eq!(
+        claim_cursor(&pool, &store, queue, 2).await,
+        start,
+        "no advance runs while prune is halted"
+    );
+    assert!(!ring_pin_release_logged(queue));
+
+    awa::model::runtime_control::resume(
+        &pool,
+        awa::model::runtime_control::PRUNE_SCOPE,
+        halt.halt_id.expect("halt id"),
+    )
+    .await
+    .expect("resume prune");
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    while !ring_pin_release_logged(queue) {
+        assert!(
+            Instant::now() < deadline,
+            "the lane is released once the halt is lifted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(claim_cursor(&pool, &store, queue, 2).await > start);
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// #779: a lane that pins the oldest slot only because it is still draining

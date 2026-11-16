@@ -1778,7 +1778,8 @@ async fn released_claimers_with_candidate_claim_cursor_advance() {
                         .advance_spent_claim_heads(&pool, &pin.lanes, 4)
                         .await
                         .expect("advance spent claim heads");
-                    advances.fetch_add(advanced.len(), Ordering::SeqCst);
+                    assert!(advanced.failed.is_empty(), "{advanced:?}");
+                    advances.fetch_add(advanced.advanced.len(), Ordering::SeqCst);
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
