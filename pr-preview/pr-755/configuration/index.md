@@ -237,7 +237,7 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 | Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, extra metadata and the declared [output type](../job-output/index.md#typed-outputs). They do not set dispatch limits or timeouts. |
 | Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout). |
 | Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
-| Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` applies to the queue-storage engine rather than to one named queue, and is planned for deprecation ([#752](https://github.com/hardbyte/awa/issues/752)). |
+| Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots and rotation | Process or storage-engine policy, not job-kind policy. |
 
 There is no active per-job-kind hard timeout today. The hard timeout is the queue's `deadline_duration`; moving long-running kinds onto their own queue is the intended way to give them a different timeout without making every job on a busy queue slower to rescue.
 
@@ -572,7 +572,6 @@ let client = Client::builder(pool.clone())
             queue_slot_count: 16,
             lease_slot_count: 8,
             claim_slot_count: 8,
-            queue_stripe_count: 1,
             ..Default::default()
         },
         Duration::from_millis(1_000),
@@ -592,7 +591,6 @@ await client.start(
     queue_storage_queue_slot_count=16,
     queue_storage_lease_slot_count=8,
     queue_storage_claim_slot_count=8,
-    queue_storage_queue_stripe_count=1,
     queue_storage_queue_rotate_interval_ms=1000,
     queue_storage_lease_rotate_interval_ms=1000,
     queue_storage_claim_rotate_interval_ms=1000,

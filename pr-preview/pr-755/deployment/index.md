@@ -90,7 +90,11 @@ let pool = PgPoolOptions::new()
 
 sqlx's default lifetime is 30 minutes. Shorter lifetimes reconnect more often; at a few minutes the reconnect cost is negligible next to the memory returned.
 
-`awa serve` sets these from `--pool-max-lifetime` / `AWA_POOL_MAX_LIFETIME` (default 1800 seconds) and keeps at least `--pool-min` / `AWA_POOL_MIN` connections (default 2). The Python client takes only `max_connections`, so its pool uses sqlx's 30-minute lifetime and cannot be set shorter.
+`awa serve` sets these from `--pool-max-lifetime` / `AWA_POOL_MAX_LIFETIME` (default 1800 seconds) and keeps at least `--pool-min` / `AWA_POOL_MIN` connections (default 2). The Python client takes the lifetime as the keyword argument `max_lifetime_seconds` (default `1800.0`, sqlx's default). `None` disables it, as `PgPoolOptions::max_lifetime(None)` does in Rust, so connections stay open until closed for another reason. Zero, negative and non-finite values raise `ValidationError`.
+
+```python
+client = awa.AsyncClient(database_url, max_connections=20, max_lifetime_seconds=300)
+```
 
 Do not disable the statement cache with `PgConnectOptions::statement_cache_capacity(0)` to save memory. In sqlx 0.9 every query then leaves a named prepared statement on the server that is never closed, and backend memory grows without bound.
 

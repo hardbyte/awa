@@ -1008,17 +1008,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#queue-stripes" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Queue stripes
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#related" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2517,17 +2506,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#queue-stripes" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Queue stripes
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#related" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2585,8 +2563,6 @@
 </ul>
 <h2 id="measuring-the-result">Measuring the result<a class="headerlink" href="#measuring-the-result" title="Permanent link">&para;</a></h2>
 <p>Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Compare against a run of the same workload before the change. The <code>awa.job.claimed</code> counter carries an <code>awa.enqueue.shard</code> attribute, so a dashboard can confirm that claims are spread evenly across shards.</p>
-<h2 id="queue-stripes">Queue stripes<a class="headerlink" href="#queue-stripes" title="Permanent link">&para;</a></h2>
-<p><code>queue_stripe_count</code> also splits queues into more lanes, but for every queue in the fleet at once. It is planned for deprecation in 0.7 in favour of enqueue shards and partitioned queues (<a href="https://github.com/hardbyte/awa/issues/752">#752</a>); do not adopt it for new deployments. Existing settings are described under <a href="../../configuration/#what-the-knobs-mean">Queue storage tuning</a>.</p>
 <h2 id="related">Related<a class="headerlink" href="#related" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a>: the problem each tool solves, what it gives up, and which combine.</li>
