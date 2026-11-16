@@ -494,7 +494,7 @@ JOIN pg_stat_activity a ON a.pid = l.pid
 ORDER BY t.ring, c.relname, l.granted, a.xact_start;
 ```
 
-This fault shows as a few holders in every sample, each a different short transaction: on the queue ring, `AccessShareLock` from `claim_ready_runtime`; on the claim ring, the claims and completions writing to that slot. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
+This fault shows as a few holders in every sample, each a different short transaction: on the queue ring, `AccessShareLock` from `claim_ready_runtime`; on the claim ring, claims and completions that read or write the claim tables. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
 
 ### Mitigations
 
