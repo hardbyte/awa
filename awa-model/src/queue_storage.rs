@@ -10218,7 +10218,10 @@ impl QueueStorage {
     /// enqueue that rolled back: enqueues on a lane commit in position order.
     /// So each window starts at the lane's first visible row at or after the
     /// cursor, however many rolled-back positions lie before it, and a lane
-    /// with no visible row there does not move. The cursor moves to the first unclaimed checked row, else one past the
+    /// with no visible row there does not move. A lane's segments cover
+    /// disjoint position ranges, so that row is the first one in the first
+    /// segment, by `next_lane_seq`, that has a row at or after the cursor.
+    /// The cursor moves to the first unclaimed checked row, else one past the
     /// last checked row when the check limit was reached, else one past the
     /// last visible row, and never moves back.
     fn spent_claim_prefix_advance_sql(&self, claimed: &str) -> String {
@@ -10245,8 +10248,8 @@ impl QueueStorage {
                         cursors.*,
                         LEAST(first_visible.lane_seq + $5, cursors.to_seq) AS window_end
                     FROM cursors
-                    CROSS JOIN LATERAL (
-                        SELECT min(head.lane_seq) AS lane_seq
+                    LEFT JOIN LATERAL (
+                        SELECT head.lane_seq
                         FROM {schema}.ready_segments AS segment
                         CROSS JOIN LATERAL (
                             SELECT ready.lane_seq
@@ -10265,7 +10268,9 @@ impl QueueStorage {
                           AND segment.priority = cursors.priority
                           AND segment.enqueue_shard = cursors.enqueue_shard
                           AND segment.next_lane_seq > cursors.claim_seq
-                    ) AS first_visible
+                        ORDER BY segment.next_lane_seq
+                        LIMIT 1
+                    ) AS first_visible ON TRUE
                 ),
                 scanned AS (
                     SELECT
@@ -10465,7 +10470,7 @@ impl QueueStorage {
                   AND segment.priority = heads.priority
                   AND segment.enqueue_shard = heads.enqueue_shard
                   AND segment.next_lane_seq > heads.claim_seq
-                ORDER BY head.lane_seq
+                ORDER BY segment.next_lane_seq
                 LIMIT 1
             ) AS ready
             WHERE EXISTS (
