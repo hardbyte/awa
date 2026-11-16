@@ -6,7 +6,7 @@ This page is the tuning procedure: what to check first, which lever to try in wh
 
 ## Check it is short of lanes
 
-Before spreading a queue, check that it is short of lane throughput rather than of workers. A queue whose [utilization](../configuration.md#sizing-workers-from-utilization) stays above about 0.8 needs more workers or a split by service time. Raising `max_workers` adds workers, and so does a `PartitionedQueue`, whose partitions each get their own; enqueue shards and claimers add none.
+Before spreading a queue, check that it is short of lane throughput rather than of workers. A queue whose [utilization](../configuration.md#sizing-workers-from-utilization) stays above about 0.8 needs more workers or a split by service time. In hard-reserved mode, raising `max_workers` adds workers, and so does a `PartitionedQueue`, whose partitions each get their own; in [weighted mode](../configuration.md#weighted-mode) capacity comes from `global_max_workers`, `min_workers` and `weight` instead. Enqueue shards and claimers add none.
 
 ## Which to try first
 

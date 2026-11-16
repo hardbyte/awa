@@ -149,7 +149,7 @@ let opts = customer_updates.route_opts_by_key(
 
 With one partition, `PartitionedQueue::new("email", 1)` uses the plain `email` queue. With more than one partition, partition 0 remains the logical queue name and later partitions use stable suffixes: `email`, `email__p1`, `email__p2`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO inside the selected partition even if each physical queue later raises `enqueue_shards`.
 
-`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue in each process. Divide those values yourself, or use `global_max_workers`, when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap.
+`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, each worker process's capacity for the logical queue is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue in each process. Divide those values yourself when you need a total cap across the partitioned queue, and divide again by the replica count for a fleet-wide cap. `global_max_workers` can cap total concurrency instead, but not the combined rate; divide `rate_limit` either way.
 
 Python exposes the same deterministic router through the `awa.PartitionedQueue` class:
 
