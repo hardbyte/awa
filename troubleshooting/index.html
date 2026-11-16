@@ -2096,6 +2096,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#queue-ring-stops-wrapping-behind-an-unclaimed-lane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue Ring Stops Wrapping Behind An Unclaimed Lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#dead-tuples-growing-in-queue-storage" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3233,6 +3244,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#queue-ring-stops-wrapping-behind-an-unclaimed-lane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Queue Ring Stops Wrapping Behind An Unclaimed Lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#dead-tuples-growing-in-queue-storage" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3753,6 +3775,35 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </span></code></pre></div>
 <p>A snapshot that is no longer fresh but is younger than <code>heartbeat_staleness</code> holds acceleration back, as does a fresh snapshot with <code>heartbeat_alive = false</code>. The unconfirmed phase requires <code>3 × max(runtime_snapshot_interval, 1s) &lt; heartbeat_staleness</code> for every runtime; otherwise a stalled live runtime can pass directly from fresh to gone (<a href="../configuration/#rescue-backlog">owner-evidence limits</a>). The drain also needs <code>heartbeat_rescue_interval</code> below half of <code>heartbeat_staleness</code>. With the defaults, acceleration usually starts about 3–3.5 minutes after the last runtime snapshot, and a leadership change restarts the evidence window. Deadline rescue is not held back this way, so queues with a <code>deadline_duration</code> drain through it regardless.</p>
 <p>To drain faster, raise <code>rescue_pass_budget</code> (at most half the rescue interval, so 15 s by default) and <code>rescue_pass_max_rows</code>, keeping in mind that a pass holds the maintenance leader for its budget and can exceed <code>rescue_pass_max_rows</code> by one final batch of closures and retry rows. The <a href="../configuration/#rescue-backlog">measured rates</a> show what to expect. Retry due times can cluster; this cap does not bound promotion throughput.</p>
+<h2 id="queue-ring-stops-wrapping-behind-an-unclaimed-lane">Queue Ring Stops Wrapping Behind An Unclaimed Lane<a class="headerlink" href="#queue-ring-stops-wrapping-behind-an-unclaimed-lane" title="Permanent link">&para;</a></h2>
+<p>Symptoms on queue storage, while claims, completions and the other queues stay healthy:</p>
+<ul>
+<li><code>awa.maintenance.prune.attempts</code> for the queue ring reports <code>skipped_active</code> with reason <code>queue.pending_ready</code>, and once rotation reaches the same slot <code>awa.maintenance.rotate.attempts</code> reports <code>skipped_busy</code> with blocker <code>queue.ready_rows</code></li>
+<li><code>awa.ring.generation</code> for the queue ring stops advancing</li>
+<li>the current slot's <code>ready_entries_*</code>, <code>done_entries_*</code>, <code>ready_segments_*</code> and <code>ready_claim_attempt_batches_*</code> partitions grow at the cluster's enqueue rate, for every queue</li>
+<li>since 0.6.18, <code>awa.maintenance.prune.pinned_ready_age</code> reports the lane responsible, and the maintenance leader logs <code>Queue ring prune is pinned by unclaimed ready rows</code> with its <code>queue</code>, <code>priority</code>, <code>enqueue_shard</code> and <code>oldest_ready_age_secs</code></li>
+</ul>
+<p>Queue prune truncates the oldest sealed slot only once every lane's ready rows in it are behind that lane's claim cursor, and rotation cannot reuse a slot until prune has truncated it. A lane that nobody claims therefore holds the oldest slot, and with it storage reclamation for the whole ring, until it is claimed. The usual causes are:</p>
+<ul>
+<li>a paused queue with ready rows</li>
+<li>a queue no running worker serves, such as a deployment scaled to zero, or one rate-limited far below its arrival rate</li>
+<li>a lower priority under strict priority (<code>priority_aging_interval</code> of zero) while a higher priority of the same queue stays backlogged</li>
+</ul>
+<p>A claim on the lane releases the slot:</p>
+<ul>
+<li>on a queue with strict priority, set a non-zero <code>priority_aging_interval</code>; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed, which is the fastest fix for a starved lane</li>
+<li>resume a paused queue</li>
+<li>start workers for the queue, or raise its rate limit</li>
+</ul>
+<p>Moving the stuck jobs to another queue or changing their priority does not release the slot: the old ready rows stay in place, tombstoned, and count until a claim on their lane passes them. Cancelling them releases it only when the cancels reach the lane's claim cursor in lane order, as <code>drain_queue</code>, one <code>bulk_cancel</code> of all the lane's waiting jobs, or <code>cancel</code> one job at a time in enqueue order do. Jobs cancelled in another order, or with <code>cancel_tx</code>, keep pinning the slot until the lane is claimed.</p>
+<p><code>awa.maintenance.prune.pinned_ready_age</code> is a gauge of the age of each pinning lane's first pending row, by <code>awa_job_queue</code>, <code>awa_job_priority</code> and <code>awa_queue_enqueue_shard</code>. The leader updates it when queue prune runs and, while a lane pins the slot, at least every 15 seconds or queue rotation tick, whichever is longer, even while prune backs off; it sets a lane to <code>0</code> once it stops pinning the slot or the runtime loses leadership. A short-lived value is normal while a backlog drains through a full ring. Alert when a lane stays old:</p>
+<div class="language-yaml highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alert</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AwaQueueRingPinnedByLane</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span><span class="nt">expr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">max by (awa_job_queue, awa_job_priority) (awa_maintenance_prune_pinned_ready_age_seconds) &gt; 3600</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">  </span><span class="nt">for</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">15m</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span><span class="nt">annotations</span><span class="p">:</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">    </span><span class="nt">summary</span><span class="p">:</span><span class="w"> </span><span class="s">"Queue</span><span class="nv"> </span><span class="s">{{</span><span class="nv"> </span><span class="s">$labels.awa_job_queue</span><span class="nv"> </span><span class="s">}}</span><span class="nv"> </span><span class="s">priority</span><span class="nv"> </span><span class="s">{{</span><span class="nv"> </span><span class="s">$labels.awa_job_priority</span><span class="nv"> </span><span class="s">}}</span><span class="nv"> </span><span class="s">keeps</span><span class="nv"> </span><span class="s">the</span><span class="nv"> </span><span class="s">queue</span><span class="nv"> </span><span class="s">ring</span><span class="nv"> </span><span class="s">from</span><span class="nv"> </span><span class="s">being</span><span class="nv"> </span><span class="s">reclaimed"</span>
+</span></code></pre></div>
+<p>Pick the threshold above the longest time a healthy lane's oldest row waits to be claimed. To list the lanes from Rust, <code>QueueStorage::queue_ring_pin</code> returns the oldest sealed slot and each pinning lane with its first pending row's <code>lane_seq</code>, <code>run_at</code> and age.</p>
 <h2 id="dead-tuples-growing-in-queue-storage">Dead Tuples Growing In Queue Storage<a class="headerlink" href="#dead-tuples-growing-in-queue-storage" title="Permanent link">&para;</a></h2>
 <h3 id="what-it-usually-means_3">What It Usually Means<a class="headerlink" href="#what-it-usually-means_3" title="Permanent link">&para;</a></h3>
 <p>If queue throughput starts to sag while lease tables keep accumulating dead tuples, the usual cause is not duplicate dispatch. The more common pattern is:</p>
@@ -3764,36 +3815,36 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </ul>
 <p>This is the same general failure mode described in PlanetScale's "Keeping a Postgres queue healthy" post.</p>
 <h3 id="find-the-active-queue-storage-schema">Find The Active Queue-Storage Schema<a class="headerlink" href="#find-the-active-queue-storage-schema" title="Permanent link">&para;</a></h3>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">SELECT</span>
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">    </span><span class="n">backend</span><span class="p">,</span>
-</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">    </span><span class="k">schema_name</span><span class="p">,</span>
-</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">    </span><span class="n">updated_at</span>
-</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">runtime_storage_backends</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">SELECT</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">    </span><span class="n">backend</span><span class="p">,</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">    </span><span class="k">schema_name</span><span class="p">,</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">    </span><span class="n">updated_at</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">runtime_storage_backends</span><span class="p">;</span>
 </span></code></pre></div>
 <h3 id="inspect-table-churn">Inspect Table Churn<a class="headerlink" href="#inspect-table-churn" title="Permanent link">&para;</a></h3>
 <p>Replace <code>&lt;schema&gt;</code> with the active <code>schema_name</code> from the previous query.</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">SELECT</span>
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">    </span><span class="n">relname</span><span class="p">,</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">    </span><span class="n">n_live_tup</span><span class="p">,</span>
-</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">    </span><span class="n">n_dead_tup</span><span class="p">,</span>
-</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="w">    </span><span class="n">vacuum_count</span><span class="p">,</span>
-</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="w">    </span><span class="n">autovacuum_count</span><span class="p">,</span>
-</span><span id="__span-12-7"><a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="w">    </span><span class="n">last_vacuum</span><span class="p">,</span>
-</span><span id="__span-12-8"><a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a><span class="w">    </span><span class="n">last_autovacuum</span>
-</span><span id="__span-12-9"><a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a><span class="k">FROM</span><span class="w"> </span><span class="n">pg_stat_user_tables</span>
-</span><span id="__span-12-10"><a id="__codelineno-12-10" name="__codelineno-12-10" href="#__codelineno-12-10"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">schemaname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'&lt;schema&gt;'</span>
-</span><span id="__span-12-11"><a id="__codelineno-12-11" name="__codelineno-12-11" href="#__codelineno-12-11"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="p">(</span>
-</span><span id="__span-12-12"><a id="__codelineno-12-12" name="__codelineno-12-12" href="#__codelineno-12-12"></a><span class="w">      </span><span class="n">relname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'attempt_state'</span>
-</span><span id="__span-12-13"><a id="__codelineno-12-13" name="__codelineno-12-13" href="#__codelineno-12-13"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'deferred_jobs'</span>
-</span><span id="__span-12-14"><a id="__codelineno-12-14" name="__codelineno-12-14" href="#__codelineno-12-14"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'dlq_entries'</span>
-</span><span id="__span-12-15"><a id="__codelineno-12-15" name="__codelineno-12-15" href="#__codelineno-12-15"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'ready_segments_%'</span>
-</span><span id="__span-12-16"><a id="__codelineno-12-16" name="__codelineno-12-16" href="#__codelineno-12-16"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'ready_entries%'</span>
-</span><span id="__span-12-17"><a id="__codelineno-12-17" name="__codelineno-12-17" href="#__codelineno-12-17"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'ready_tombstones%'</span>
-</span><span id="__span-12-18"><a id="__codelineno-12-18" name="__codelineno-12-18" href="#__codelineno-12-18"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'done_entries%'</span>
-</span><span id="__span-12-19"><a id="__codelineno-12-19" name="__codelineno-12-19" href="#__codelineno-12-19"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'queue_terminal_count_deltas%'</span>
-</span><span id="__span-12-20"><a id="__codelineno-12-20" name="__codelineno-12-20" href="#__codelineno-12-20"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'leases%'</span>
-</span><span id="__span-12-21"><a id="__codelineno-12-21" name="__codelineno-12-21" href="#__codelineno-12-21"></a><span class="w">  </span><span class="p">)</span>
-</span><span id="__span-12-22"><a id="__codelineno-12-22" name="__codelineno-12-22" href="#__codelineno-12-22"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">n_dead_tup</span><span class="w"> </span><span class="k">DESC</span><span class="p">,</span><span class="w"> </span><span class="n">relname</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">SELECT</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">    </span><span class="n">relname</span><span class="p">,</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">    </span><span class="n">n_live_tup</span><span class="p">,</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">    </span><span class="n">n_dead_tup</span><span class="p">,</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="w">    </span><span class="n">vacuum_count</span><span class="p">,</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="w">    </span><span class="n">autovacuum_count</span><span class="p">,</span>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="w">    </span><span class="n">last_vacuum</span><span class="p">,</span>
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="w">    </span><span class="n">last_autovacuum</span>
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="k">FROM</span><span class="w"> </span><span class="n">pg_stat_user_tables</span>
+</span><span id="__span-13-10"><a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">schemaname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'&lt;schema&gt;'</span>
+</span><span id="__span-13-11"><a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-13-12"><a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a><span class="w">      </span><span class="n">relname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'attempt_state'</span>
+</span><span id="__span-13-13"><a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'deferred_jobs'</span>
+</span><span id="__span-13-14"><a id="__codelineno-13-14" name="__codelineno-13-14" href="#__codelineno-13-14"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'dlq_entries'</span>
+</span><span id="__span-13-15"><a id="__codelineno-13-15" name="__codelineno-13-15" href="#__codelineno-13-15"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'ready_segments_%'</span>
+</span><span id="__span-13-16"><a id="__codelineno-13-16" name="__codelineno-13-16" href="#__codelineno-13-16"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'ready_entries%'</span>
+</span><span id="__span-13-17"><a id="__codelineno-13-17" name="__codelineno-13-17" href="#__codelineno-13-17"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'ready_tombstones%'</span>
+</span><span id="__span-13-18"><a id="__codelineno-13-18" name="__codelineno-13-18" href="#__codelineno-13-18"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'done_entries%'</span>
+</span><span id="__span-13-19"><a id="__codelineno-13-19" name="__codelineno-13-19" href="#__codelineno-13-19"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'queue_terminal_count_deltas%'</span>
+</span><span id="__span-13-20"><a id="__codelineno-13-20" name="__codelineno-13-20" href="#__codelineno-13-20"></a><span class="w">      </span><span class="k">OR</span><span class="w"> </span><span class="n">relname</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'leases%'</span>
+</span><span id="__span-13-21"><a id="__codelineno-13-21" name="__codelineno-13-21" href="#__codelineno-13-21"></a><span class="w">  </span><span class="p">)</span>
+</span><span id="__span-13-22"><a id="__codelineno-13-22" name="__codelineno-13-22" href="#__codelineno-13-22"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">n_dead_tup</span><span class="w"> </span><span class="k">DESC</span><span class="p">,</span><span class="w"> </span><span class="n">relname</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Interpretation:</p>
 <ul>
@@ -3805,19 +3856,19 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>persistent dead tuples across many <code>leases%</code> tables usually means prune is blocked or the maintenance leader is unhealthy</li>
 </ul>
 <h3 id="inspect-long-transactions">Inspect Long Transactions<a class="headerlink" href="#inspect-long-transactions" title="Permanent link">&para;</a></h3>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">SELECT</span>
-</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">    </span><span class="n">pid</span><span class="p">,</span>
-</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">    </span><span class="n">usename</span><span class="p">,</span>
-</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">    </span><span class="n">application_name</span><span class="p">,</span>
-</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="w">    </span><span class="n">client_addr</span><span class="p">,</span>
-</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="w">    </span><span class="k">state</span><span class="p">,</span>
-</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="w">    </span><span class="n">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">xact_age</span><span class="p">,</span>
-</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="w">    </span><span class="n">wait_event_type</span><span class="p">,</span>
-</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="w">    </span><span class="n">query</span>
-</span><span id="__span-13-10"><a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="k">FROM</span><span class="w"> </span><span class="n">pg_stat_activity</span>
-</span><span id="__span-13-11"><a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">datname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">current_database</span><span class="p">()</span>
-</span><span id="__span-13-12"><a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span>
-</span><span id="__span-13-13"><a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">ASC</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">SELECT</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="w">    </span><span class="n">pid</span><span class="p">,</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="w">    </span><span class="n">usename</span><span class="p">,</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="w">    </span><span class="n">application_name</span><span class="p">,</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="w">    </span><span class="n">client_addr</span><span class="p">,</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="w">    </span><span class="k">state</span><span class="p">,</span>
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a><span class="w">    </span><span class="n">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">xact_age</span><span class="p">,</span>
+</span><span id="__span-14-8"><a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a><span class="w">    </span><span class="n">wait_event_type</span><span class="p">,</span>
+</span><span id="__span-14-9"><a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a><span class="w">    </span><span class="n">query</span>
+</span><span id="__span-14-10"><a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a><span class="k">FROM</span><span class="w"> </span><span class="n">pg_stat_activity</span>
+</span><span id="__span-14-11"><a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">datname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">current_database</span><span class="p">()</span>
+</span><span id="__span-14-12"><a id="__codelineno-14-12" name="__codelineno-14-12" href="#__codelineno-14-12"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span>
+</span><span id="__span-14-13"><a id="__codelineno-14-13" name="__codelineno-14-13" href="#__codelineno-14-13"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">xact_start</span><span class="w"> </span><span class="k">ASC</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Pay particular attention to:</p>
 <ul>
@@ -3838,9 +3889,9 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <h2 id="somethings-in-the-dlq">Something's In The DLQ<a class="headerlink" href="#somethings-in-the-dlq" title="Permanent link">&para;</a></h2>
 <p>The Dead Letter Queue is where terminal failures land when a queue has DLQ enabled. These rows are never claimed. Operators retry them, purge them, or let retention remove them.</p>
 <p>Quick checks:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>depth
-</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>list<span class="w"> </span>--limit<span class="w"> </span><span class="m">20</span>
-</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>list<span class="w"> </span>--queue<span class="w"> </span>email
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>depth
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>list<span class="w"> </span>--limit<span class="w"> </span><span class="m">20</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>list<span class="w"> </span>--queue<span class="w"> </span>email
 </span></code></pre></div>
 <p><code>dlq_reason</code> tells you how the row got there:</p>
 <ul>
@@ -3853,10 +3904,10 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </ul>
 <p>A burst of <code>heartbeat_stale</code> or <code>deadline_exceeded</code> from one kind usually means a poison job: one that crashes or hangs its worker on every attempt. See <a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>.</p>
 <p>Useful actions:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>retry<span class="w"> </span>&lt;job-id&gt;
-</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>retry-bulk<span class="w"> </span>--queue<span class="w"> </span>email
-</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>purge<span class="w"> </span>--queue<span class="w"> </span>email
-</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>move<span class="w"> </span>--queue<span class="w"> </span>email<span class="w"> </span>--reason<span class="w"> </span>backfill
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>retry<span class="w"> </span>&lt;job-id&gt;
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>retry-bulk<span class="w"> </span>--queue<span class="w"> </span>email
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>purge<span class="w"> </span>--queue<span class="w"> </span>email
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>move<span class="w"> </span>--queue<span class="w"> </span>email<span class="w"> </span>--reason<span class="w"> </span>backfill
 </span></code></pre></div>
 <p>If DLQ depth is growing quickly:</p>
 <ul>
@@ -3872,7 +3923,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>application code is newer than the database schema</li>
 </ul>
 <p>Fix:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate
 </span></code></pre></div>
 <h3 id="deadlock-detected-while-enqueueing"><code>deadlock detected</code> while enqueueing<a class="headerlink" href="#deadlock-detected-while-enqueueing" title="Permanent link">&para;</a></h3>
 <p>Cause:</p>
@@ -3891,10 +3942,10 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>retry on <code>40P01</code>: Postgres aborts one of the two transactions and the other proceeds</li>
 </ul>
 <p>Find the lane behind a key from the <code>DETAIL</code> line (<code>[database, high, low, 1]</code>, the key is <code>high &lt;&lt; 32 | low</code>):</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">queue</span><span class="p">,</span><span class="w"> </span><span class="n">priority</span><span class="p">,</span><span class="w"> </span><span class="n">enqueue_shard</span>
-</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">FROM</span><span class="w"> </span><span class="o">&lt;</span><span class="n">queue_storage_schema</span><span class="o">&gt;</span><span class="p">.</span><span class="n">queue_enqueue_heads</span>
-</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">hashtextextended</span><span class="p">(</span><span class="n">format</span><span class="p">(</span><span class="s1">'%I.%I'</span><span class="p">,</span><span class="w"> </span><span class="s1">'&lt;queue_storage_schema&gt;'</span><span class="p">,</span><span class="w"> </span><span class="n">seq_name</span><span class="p">),</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
-</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">high</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">bigint</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">32</span><span class="p">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">&lt;</span><span class="n">low</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">bigint</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">queue</span><span class="p">,</span><span class="w"> </span><span class="n">priority</span><span class="p">,</span><span class="w"> </span><span class="n">enqueue_shard</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="k">FROM</span><span class="w"> </span><span class="o">&lt;</span><span class="n">queue_storage_schema</span><span class="o">&gt;</span><span class="p">.</span><span class="n">queue_enqueue_heads</span>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">hashtextextended</span><span class="p">(</span><span class="n">format</span><span class="p">(</span><span class="s1">'%I.%I'</span><span class="p">,</span><span class="w"> </span><span class="s1">'&lt;queue_storage_schema&gt;'</span><span class="p">,</span><span class="w"> </span><span class="n">seq_name</span><span class="p">),</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">high</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">bigint</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">32</span><span class="p">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">&lt;</span><span class="n">low</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">bigint</span><span class="p">;</span>
 </span></code></pre></div>
 <h3 id="relation-awajob_id_seq-does-not-exist"><code>relation "awa.job_id_seq" does not exist</code><a class="headerlink" href="#relation-awajob_id_seq-does-not-exist" title="Permanent link">&para;</a></h3>
 <p>Cause:</p>
@@ -3907,12 +3958,12 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>Wait for the first consumer pod to log <code>Awa worker runtime started</code> before scaling up producers.</li>
 <li>If the schema was deliberately reset, re-run <code>awa migrate</code> <strong>and</strong> let one worker pod boot to completion before resuming producer traffic.</li>
 <li>If the error persists after both, the runtime may be pointing at a different schema than the producer. Confirm with:
-  <div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">active_queue_storage_schema</span><span class="p">();</span>
+  <div class="language-sql highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">active_queue_storage_schema</span><span class="p">();</span>
 </span></code></pre></div></li>
 </ul>
 <h3 id="cannot-delete-from-table-because-it-does-not-have-a-replica-identity"><code>cannot delete from table ... because it does not have a replica identity</code><a class="headerlink" href="#cannot-delete-from-table-because-it-does-not-have-a-replica-identity" title="Permanent link">&para;</a></h3>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>cannot delete from table "queue_terminal_rollup_deltas" because it does not
-</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>have a replica identity and publishes deletes
+<div class="language-text highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a>cannot delete from table "queue_terminal_rollup_deltas" because it does not
+</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>have a replica identity and publishes deletes
 </span></code></pre></div>
 <p>The awa schema is in a logical-replication publication (<code>CREATE PUBLICATION
 ... FOR ALL TABLES</code>, which Debezium creates by default, or <code>FOR TABLES IN
@@ -3941,17 +3992,17 @@ recommended publication shape and what to expect if the queue is published.</p>
 <li>Python <code>client.start(global_max_workers=...)</code> was used without explicit queue config dicts</li>
 </ul>
 <p>Fix:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
-</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>    <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"email"</span><span class="p">,</span> <span class="s2">"min_workers"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">:</span> <span class="mi">2</span><span class="p">}],</span>
-</span><span id="__span-20-3"><a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a>    <span class="n">global_max_workers</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
-</span><span id="__span-20-4"><a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
+</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a>    <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"email"</span><span class="p">,</span> <span class="s2">"min_workers"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">:</span> <span class="mi">2</span><span class="p">}],</span>
+</span><span id="__span-21-3"><a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a>    <span class="n">global_max_workers</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-21-4"><a id="__codelineno-21-4" name="__codelineno-21-4" href="#__codelineno-21-4"></a><span class="p">)</span>
 </span></code></pre></div>
 <h3 id="queue-or-job-kind-shows-stale-descriptor-in-the-ui">Queue or job-kind shows "stale descriptor" in the UI<a class="headerlink" href="#queue-or-job-kind-shows-stale-descriptor-in-the-ui" title="Permanent link">&para;</a></h3>
 <p>The descriptor catalog is refreshed by live workers on every runtime snapshot tick. A descriptor is flagged <strong>stale</strong> when no live runtime has touched <code>last_seen_at</code> within the snapshot window — typically because the code that declared it has been retired or no workers are currently running.</p>
 <ul>
 <li>If the queue/kind is genuinely retired, delete the row:
-  <div class="language-sql highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">queue_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">queue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired-queue'</span><span class="p">;</span>
-</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">job_kind_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">kind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired_kind'</span><span class="p">;</span>
+  <div class="language-sql highlight"><pre><span></span><code><span id="__span-22-1"><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">queue_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">queue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired-queue'</span><span class="p">;</span>
+</span><span id="__span-22-2"><a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">job_kind_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">kind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired_kind'</span><span class="p">;</span>
 </span></code></pre></div></li>
 <li>If workers <em>should</em> be running, check <code>/runtime</code> for missing instances.</li>
 <li>If the declaration moved to a different worker role that isn't deployed yet, the stale status will clear once that rollout completes.</li>

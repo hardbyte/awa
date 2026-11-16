@@ -3455,6 +3455,12 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Ring prune outcomes, including destructive <code>pruned</code> and no-DDL <code>already_pruned</code></td>
 </tr>
 <tr>
+<td><code>awa.maintenance.prune.pinned_ready_age</code></td>
+<td>Gauge (s)</td>
+<td>ring, queue, priority, enqueue_shard</td>
+<td>Age of the first pending ready row of each lane keeping queue prune from reclaiming the oldest sealed queue ring slot (prune reason <code>queue.pending_ready</code>); <code>0</code> once the lane no longer pins it. See <a href="../troubleshooting/#queue-ring-stops-wrapping-behind-an-unclaimed-lane">queue ring stops wrapping behind an unclaimed lane</a></td>
+</tr>
+<tr>
 <td><code>awa.maintenance.prune.duration</code></td>
 <td>Histogram (s)</td>
 <td>ring, phase</td>

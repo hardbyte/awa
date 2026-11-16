@@ -373,6 +373,41 @@ A snapshot that is no longer fresh but is younger than `heartbeat_staleness` hol
 
 To drain faster, raise `rescue_pass_budget` (at most half the rescue interval, so 15 s by default) and `rescue_pass_max_rows`, keeping in mind that a pass holds the maintenance leader for its budget and can exceed `rescue_pass_max_rows` by one final batch of closures and retry rows. The [measured rates](../configuration/index.md#rescue-backlog) show what to expect. Retry due times can cluster; this cap does not bound promotion throughput.
 
+## Queue Ring Stops Wrapping Behind An Unclaimed Lane
+
+Symptoms on queue storage, while claims, completions and the other queues stay healthy:
+
+- `awa.maintenance.prune.attempts` for the queue ring reports `skipped_active` with reason `queue.pending_ready`, and once rotation reaches the same slot `awa.maintenance.rotate.attempts` reports `skipped_busy` with blocker `queue.ready_rows`
+- `awa.ring.generation` for the queue ring stops advancing
+- the current slot's `ready_entries_*`, `done_entries_*`, `ready_segments_*` and `ready_claim_attempt_batches_*` partitions grow at the cluster's enqueue rate, for every queue
+- since 0.6.18, `awa.maintenance.prune.pinned_ready_age` reports the lane responsible, and the maintenance leader logs `Queue ring prune is pinned by unclaimed ready rows` with its `queue`, `priority`, `enqueue_shard` and `oldest_ready_age_secs`
+
+Queue prune truncates the oldest sealed slot only once every lane's ready rows in it are behind that lane's claim cursor, and rotation cannot reuse a slot until prune has truncated it. A lane that nobody claims therefore holds the oldest slot, and with it storage reclamation for the whole ring, until it is claimed. The usual causes are:
+
+- a paused queue with ready rows
+- a queue no running worker serves, such as a deployment scaled to zero, or one rate-limited far below its arrival rate
+- a lower priority under strict priority (`priority_aging_interval` of zero) while a higher priority of the same queue stays backlogged
+
+A claim on the lane releases the slot:
+
+- on a queue with strict priority, set a non-zero `priority_aging_interval`; the waiting lower-priority rows then age ahead of newer higher-priority work and are claimed, which is the fastest fix for a starved lane
+- resume a paused queue
+- start workers for the queue, or raise its rate limit
+
+Moving the stuck jobs to another queue or changing their priority does not release the slot: the old ready rows stay in place, tombstoned, and count until a claim on their lane passes them. Cancelling them releases it only when the cancels reach the lane's claim cursor in lane order, as `drain_queue`, one `bulk_cancel` of all the lane's waiting jobs, or `cancel` one job at a time in enqueue order do. Jobs cancelled in another order, or with `cancel_tx`, keep pinning the slot until the lane is claimed.
+
+`awa.maintenance.prune.pinned_ready_age` is a gauge of the age of each pinning lane's first pending row, by `awa_job_queue`, `awa_job_priority` and `awa_queue_enqueue_shard`. The leader updates it when queue prune runs and, while a lane pins the slot, at least every 15 seconds or queue rotation tick, whichever is longer, even while prune backs off; it sets a lane to `0` once it stops pinning the slot or the runtime loses leadership. A short-lived value is normal while a backlog drains through a full ring. Alert when a lane stays old:
+
+```yaml
+- alert: AwaQueueRingPinnedByLane
+  expr: max by (awa_job_queue, awa_job_priority) (awa_maintenance_prune_pinned_ready_age_seconds) > 3600
+  for: 15m
+  annotations:
+    summary: "Queue {{ $labels.awa_job_queue }} priority {{ $labels.awa_job_priority }} keeps the queue ring from being reclaimed"
+```
+
+Pick the threshold above the longest time a healthy lane's oldest row waits to be claimed. To list the lanes from Rust, `QueueStorage::queue_ring_pin` returns the oldest sealed slot and each pinning lane with its first pending row's `lane_seq`, `run_at` and age.
+
 ## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means
