@@ -462,27 +462,39 @@ The leader reads `awa.maintenance.prune.pinned_ready_age` only after a `skipped_
 sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
 ```
 
-To see what holds the slot prune wants, list the locks on the queue ring's oldest sealed slot. Replace `<schema>` with the active `schema_name` from [Find the active queue-storage schema](#find-the-active-queue-storage-schema). The query reads catalog and lock views only and takes no lock on the partitions; run it several times, since one sample can miss a short claim.
+To see what holds the slots prune wants, list the locks on the oldest sealed slot of the queue ring and of the claim ring; the query picks each slot the way prune does. Replace `<schema>` with the active `schema_name` from [Find the active queue-storage schema](#find-the-active-queue-storage-schema). The query reads catalog and lock views only and takes no lock on the partitions; run it several times, since one sample can miss a short claim. Look at the rows for the ring whose prune reports `blocked`.
 
 ```sql
-WITH next_slot AS (
-    SELECT (current_slot + 1) % slot_count AS slot
-    FROM <schema>.queue_ring_state
+WITH queue_target AS (
+    SELECT s.slot
+    FROM <schema>.queue_ring_slots s, <schema>.queue_ring_state r
+    WHERE s.generation >= 0 AND s.slot <> r.current_slot
+    ORDER BY s.generation, s.slot
+    LIMIT 1
+), claim_target AS (
+    SELECT ((current_slot - (LEAST(generation + 1, slot_count) - 1)) % slot_count + slot_count) % slot_count AS slot
+    FROM <schema>.claim_ring_state
+    WHERE LEAST(generation + 1, slot_count) > 1
+), targets AS (
+    SELECT 'queue' AS ring, p.prefix || q.slot AS relname
+    FROM queue_target q
+    CROSS JOIN (VALUES ('ready_entries_'), ('ready_segments_'), ('done_entries_')) AS p(prefix)
+    UNION ALL
+    SELECT 'claim', p.prefix || c.slot
+    FROM claim_target c
+    CROSS JOIN (VALUES ('lease_claims_'), ('lease_claim_batches_'), ('lease_claim_closures_'), ('lease_claim_closure_batches_')) AS p(prefix)
 )
-SELECT c.relname, l.mode, l.granted, a.pid, a.application_name,
+SELECT t.ring, c.relname, l.mode, l.granted, a.pid, a.application_name,
        now() - a.xact_start AS xact_age, left(a.query, 80) AS query
-FROM next_slot
-JOIN pg_class c
-  ON c.relname IN ('ready_entries_' || next_slot.slot,
-                   'ready_segments_' || next_slot.slot,
-                   'done_entries_' || next_slot.slot)
+FROM targets t
+JOIN pg_class c ON c.relname = t.relname
 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
 JOIN pg_locks l ON l.relation = c.oid
 JOIN pg_stat_activity a ON a.pid = l.pid
-ORDER BY c.relname, l.granted, a.xact_start;
+ORDER BY t.ring, c.relname, l.granted, a.xact_start;
 ```
 
-This fault shows as a few `AccessShareLock` holders in every sample, each a different short transaction running `claim_ready_runtime`. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
+This fault shows as a few holders in every sample, each a different short transaction: on the queue ring, `AccessShareLock` from `claim_ready_runtime`; on the claim ring, the claims and completions writing to that slot. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
 
 ### Mitigations
 
