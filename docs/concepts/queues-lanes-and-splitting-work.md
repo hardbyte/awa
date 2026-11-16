@@ -52,7 +52,7 @@ awa::insert_with(&pool, &SendWebhook { url, body },
 await client.insert(SendWebhook(url=url, body=body), queue="webhooks")
 ```
 
-- **You get:** isolation. A slow or failing `webhooks` handler cannot use `email`'s worker slots, rate limit or deadline. Each queue can run on its own worker processes, scale separately and be paused or drained on its own. The two queues never share an enqueue lock or claim cursor.
+- **You get:** isolation. A slow or failing `webhooks` handler cannot use `email`'s rate limit or deadline, and each queue can be paused or drained on its own. The two queues never share an enqueue lock or claim cursor. Worker slots are isolated when each queue has its own `max_workers` (hard-reserved mode) or its own worker processes; in [weighted mode](../configuration.md#weighted-mode) queues share the overflow pool and only each queue's `min_workers` is reserved for it.
 - **You give up:** nothing is ordered across queues, and the producer has to know which queue a job belongs on.
 
 Put job kinds with very different run times on separate queues too, so short jobs do not wait behind long ones; see [Sizing workers from utilization](../configuration.md#sizing-workers-from-utilization). Do not add queues only to spread the load of one kind of work: claimers, shards and partitions below do that without splitting its policy by accident.
