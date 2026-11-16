@@ -3,7 +3,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import {
   fetchDlq,
@@ -28,6 +28,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
+import { drainDlqRetry, DLQ_RETRY_BATCH_SIZE } from "@/lib/dlq-drain";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 
@@ -86,21 +87,47 @@ export function DlqPage() {
     staleTime: poll.staleTime,
   });
 
-  const retryFilterMutation = useMutation({
-    mutationFn: () =>
-      bulkRetryDlq({
-        kind: searchFilters.kind,
-        queue: searchFilters.queue,
-        tag: searchFilters.tag,
-      }),
-    onSuccess: (res) => {
-      void queryClient.invalidateQueries({ queryKey: ["dlq"] });
-      void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Retried ${res.count} DLQ row(s)`);
-    },
-    onError: () => toast.error("Failed to retry DLQ rows"),
-  });
+  const [retryDrain, setRetryDrain] = useState<{
+    revived: number;
+    total?: number;
+    stopping: boolean;
+  } | null>(null);
+  const stopRetryDrain = useRef(false);
+
+  const startRetryDrain = async () => {
+    const filter = {
+      kind: searchFilters.kind,
+      queue: searchFilters.queue,
+      tag: searchFilters.tag,
+    };
+    const total =
+      filter.queue && !filter.kind && !filter.tag
+        ? depthQuery.data?.by_queue.find((q) => q.queue === filter.queue)?.count
+        : undefined;
+    stopRetryDrain.current = false;
+    setRetryDrain({ revived: 0, total, stopping: false });
+    const outcome = await drainDlqRetry(
+      (batchSize) => bulkRetryDlq({ ...filter, batch_size: batchSize }),
+      {
+        shouldStop: () => stopRetryDrain.current,
+        onProgress: (revived) =>
+          setRetryDrain((current) => current && { ...current, revived }),
+      }
+    );
+    setRetryDrain(null);
+    void queryClient.invalidateQueries({ queryKey: ["dlq"] });
+    void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
+    void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    if (outcome.kind === "failed") {
+      toast.error(
+        `Retried ${outcome.revived} DLQ row(s), then stopped: ${outcome.error}`
+      );
+    } else if (outcome.kind === "stopped") {
+      toast.success(`Stopped after retrying ${outcome.revived} DLQ row(s)`);
+    } else {
+      toast.success(`Retried ${outcome.revived} DLQ row(s)`);
+    }
+  };
 
   const purgeFilterMutation = useMutation({
     mutationFn: () =>
@@ -172,7 +199,7 @@ export function DlqPage() {
           <Button
             size="xs"
             onPress={() => setShowRetryConfirm(true)}
-            isDisabled={retryFilterMutation.isPending}
+            isDisabled={retryDrain !== null}
           >
             Retry matching ({rows.length}+)
           </Button>
@@ -184,6 +211,32 @@ export function DlqPage() {
             isDisabled={purgeFilterMutation.isPending}
           >
             Purge matching
+          </Button>
+        </div>
+      )}
+
+      {retryDrain && (
+        <div
+          role="status"
+          className="flex items-center gap-3 text-sm"
+        >
+          <span>
+            Retrying matching DLQ rows: {retryDrain.revived.toLocaleString()}
+            {retryDrain.total !== undefined
+              ? ` of ${retryDrain.total.toLocaleString()}`
+              : ""}{" "}
+            retried
+          </span>
+          <Button
+            intent="outline"
+            size="xs"
+            onPress={() => {
+              stopRetryDrain.current = true;
+              setRetryDrain((current) => current && { ...current, stopping: true });
+            }}
+            isDisabled={retryDrain.stopping}
+          >
+            {retryDrain.stopping ? "Stopping" : "Stop"}
           </Button>
         </div>
       )}
@@ -265,10 +318,10 @@ export function DlqPage() {
         isOpen={showRetryConfirm}
         onOpenChange={setShowRetryConfirm}
         title="Retry DLQ rows"
-        description="This retries every DLQ row matching the current filter and resets each attempt back to a fresh runnable job."
+        description={`This retries every DLQ row matching the current filter, oldest first, in batches of up to ${DLQ_RETRY_BATCH_SIZE.toLocaleString()}, and resets each attempt back to a fresh runnable job. You can stop between batches. A row whose unique key a live job holds stops the retry and is named.`}
         confirmLabel="Retry"
         confirmIntent="primary"
-        onConfirm={() => retryFilterMutation.mutate()}
+        onConfirm={() => void startRetryDrain()}
       />
 
       <ConfirmDialog
