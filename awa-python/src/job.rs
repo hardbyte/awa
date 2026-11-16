@@ -522,14 +522,18 @@ impl PyJob {
                 }
             }
 
+            let is_cancelled = || {
+                cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            };
+            let mut pending_polls = 0u32;
             // Poll DB until the callback is resolved
             loop {
-                if let Some(ref flag) = cancelled {
-                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Err(map_awa_error(awa_model::AwaError::Validation(
-                            "job cancelled while waiting for callback".into(),
-                        )));
-                    }
+                if is_cancelled() {
+                    return Err(map_awa_error(awa_model::AwaError::Validation(
+                        "job cancelled while waiting for callback".into(),
+                    )));
                 }
 
                 match check_callback_state(&pool, job_id, token_uuid)
@@ -540,7 +544,19 @@ impl PyJob {
                         return Python::attach(|py| json_to_py(py, &payload));
                     }
                     CallbackPollResult::Pending => {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        pending_polls = pending_polls.saturating_add(1);
+                        let poll_at = tokio::time::Instant::now()
+                            + awa_model::admin::callback_poll_delay(pending_polls);
+                        while !is_cancelled() {
+                            let now = tokio::time::Instant::now();
+                            if now >= poll_at {
+                                break;
+                            }
+                            tokio::time::sleep(
+                                (poll_at - now).min(awa_model::admin::CALLBACK_POLL_MIN_DELAY),
+                            )
+                            .await;
+                        }
                     }
                     CallbackPollResult::Stale {
                         token,
