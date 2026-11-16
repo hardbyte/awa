@@ -3295,14 +3295,6 @@ pub struct QueueStorage {
     /// This instance's claimer lease per queue, as last read or written, so a
     /// claim does not re-read the lease and claimer target on every call.
     claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
-    /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
-    /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
-    /// queue_claim_heads) we have previously inserted. Skips the three
-    /// `INSERT … ON CONFLICT DO NOTHING` round-trips on subsequent enqueue
-    /// batches to a known lane/shard. Cleared on `reset()` because reset
-    /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
-    /// (head row gone after a rolled-back ensure_lane).
-    ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     /// Whether `{schema}.provision_lane` (the `definer_lane_provisioning`
     /// schema patch) was callable the last time a lane was created. Only a
     /// positive answer is kept: lane creation is rare, and the probe rides on
@@ -3355,7 +3347,6 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             claimer_gates: Mutex::new(HashMap::new()),
-            ensured_lanes: Mutex::new(HashSet::new()),
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
@@ -4344,9 +4335,8 @@ impl QueueStorage {
 
         // queue_lanes and queue_claimer_leases were TRUNCATEd above and
         // queue_meta may have a new shard configuration for the next round.
-        // Clear the caches so the next ensure_lane / shard_for_enqueue /
-        // claim calls re-observe DB state.
-        self.clear_lane_cache();
+        // Clear the caches so the next shard_for_enqueue / claim calls
+        // re-observe DB state.
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
@@ -4365,36 +4355,28 @@ impl QueueStorage {
         priority: i16,
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
-        // Fast path: this store has previously written the three lane
-        // rows for this `(queue, priority, shard)` triple. The cache is
-        // optimistic: another transaction may have marked the lane before
-        // commit, or the marking transaction may later roll back. Verify the
-        // head row is visible in this transaction before trusting the cache.
-        if self.lane_is_cached(queue, priority, enqueue_shard) {
-            let schema = self.schema();
-            let visible: bool = sqlx::query_scalar(&format!(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {schema}.queue_enqueue_heads
-                    WHERE queue = $1
-                      AND priority = $2
-                      AND enqueue_shard = $3
-                )
-                "#
-            ))
-            .bind(queue)
-            .bind(priority)
-            .bind(enqueue_shard)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        // A lane whose head row this transaction can see needs no provisioning.
+        let schema = self.schema();
+        let visible: bool = sqlx::query_scalar(&format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM {schema}.queue_enqueue_heads
+                WHERE queue = $1
+                  AND priority = $2
+                  AND enqueue_shard = $3
+            )
+            "#
+        ))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
-            if visible {
-                return Ok(());
-            }
-
-            self.invalidate_cached_lane(queue, priority, enqueue_shard);
+        if visible {
+            return Ok(());
         }
 
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
@@ -4432,11 +4414,8 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// Run the three lane-row inserts unconditionally and mark the
-    /// `(queue, priority)` pair as cached on success. Skips the cache
-    /// fast path so callers in the rollback-recovery path can force a
-    /// re-insert without racing another transaction that has marked
-    /// the lane but not yet committed its inserts.
+    /// Run the three lane-row inserts unconditionally under the lane's
+    /// provisioning lock.
     async fn ensure_lane_inserts<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4488,7 +4467,6 @@ impl QueueStorage {
                 .provision_lane(tx, queue, priority, enqueue_shard)
                 .await?
         {
-            self.mark_lane_ensured(queue, priority, enqueue_shard);
             return Ok(());
         }
 
@@ -4544,7 +4522,6 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        self.mark_lane_ensured(queue, priority, enqueue_shard);
         Ok(())
     }
 
@@ -4675,40 +4652,11 @@ impl QueueStorage {
         }
     }
 
-    fn lane_is_cached(&self, queue: &str, priority: i16, enqueue_shard: i16) -> bool {
-        let cache = self.ensured_lanes.lock().expect("ensured_lanes mutex");
-        cache.contains(&(queue.to_string(), priority, enqueue_shard))
-    }
-
-    fn mark_lane_ensured(&self, queue: &str, priority: i16, enqueue_shard: i16) {
-        self.ensured_lanes
-            .lock()
-            .expect("ensured_lanes mutex")
-            .insert((queue.to_string(), priority, enqueue_shard));
-    }
-
-    fn invalidate_cached_lane(&self, queue: &str, priority: i16, enqueue_shard: i16) {
-        self.ensured_lanes
-            .lock()
-            .expect("ensured_lanes mutex")
-            .remove(&(queue.to_string(), priority, enqueue_shard));
-    }
-
-    fn clear_lane_cache(&self) {
-        self.ensured_lanes
-            .lock()
-            .expect("ensured_lanes mutex")
-            .clear();
-    }
-
     // Reserve lane sequence numbers for a specific
     // `(queue, priority, shard)` triple and return the lane sequence at
-    // which the caller's range starts. If the head row is missing —
-    // typically because a previous ensure_lane ran inside a transaction
-    // that ultimately rolled back, leaving a stale cache entry behind —
-    // the cache entry is invalidated, ensure_lane is re-run, and the reserve
-    // is retried exactly once. A second miss surfaces as
-    // RowNotFound.
+    // which the caller's range starts. If the head row is missing, the lane
+    // rows are inserted again and the reserve is retried exactly once. A
+    // second miss surfaces as RowNotFound.
     async fn advance_enqueue_head<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4739,14 +4687,7 @@ impl QueueStorage {
             return Ok(start);
         }
 
-        // Recovery path: a prior ensure_lane marked the cache and
-        // then rolled back, leaving the head row missing. Bypass the
-        // cache fast path here and run the inserts unconditionally —
-        // calling `ensure_lane` would re-take the fast path if
-        // another concurrent transaction has re-marked the cache but
-        // not yet committed its inserts, leaving us in the same
-        // failure state.
-        self.invalidate_cached_lane(queue, priority, enqueue_shard);
+        // Recovery path: the head row was removed after ensure_lane saw it.
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
             .await?;
         let start: i64 = sqlx::query_scalar(&sql)
