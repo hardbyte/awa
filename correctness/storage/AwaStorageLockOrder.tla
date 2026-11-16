@@ -595,6 +595,44 @@ PruneClaimsPlan(slot) ==
        Step(ClosureBatchChildResource(slot), ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive) >>
 
+\* Ascending sequence of a finite set of slot numbers.
+RECURSIVE AscendingSeq(_)
+AscendingSeq(S) ==
+    IF S = {} THEN << >>
+    ELSE LET m == CHOOSE x \in S : \A y \in S : x <= y
+         IN <<m>> \o AscendingSeq(S \ {m})
+
+\* A shared lock on one family's partition for every slot, in slot order.
+SharedOnEachSlot(Res(_), slots) ==
+    LET order == AscendingSeq(slots)
+    IN [i \in 1..Len(order) |-> Step(Res(order[i]), ModeShared)]
+
+\* rotate_if_active / rotate_leases_if_active / rotate_claims_if_active
+\* idle probe: a read-only transaction of its own, run before the rotate
+\* transaction and holding no row lock, that reads every partition of the
+\* ring with `SELECT EXISTS` on each parent (AccessShare on every child).
+\* Parents are probed in the order the ring's prune locks its children, and
+\* the probe stops at the first parent with a row; the plans model the
+\* longest probe. The queue ring also reads queue_terminal_live_counts,
+\* which no modelled transaction locks.
+IdleProbeQueuePlan ==
+    SharedOnEachSlot(ReadySegmentChildResource, ReadySlots)
+    \o SharedOnEachSlot(DoneChildResource, ReadySlots)
+    \o SharedOnEachSlot(ReadyChildResource, ReadySlots)
+    \o SharedOnEachSlot(ReadyClaimAttemptBatchChildResource, ReadySlots)
+    \o SharedOnEachSlot(ReadyTombstoneChildResource, ReadySlots)
+    \o SharedOnEachSlot(ReceiptBatchChildResource, ReadySlots)
+    \o SharedOnEachSlot(ReceiptTombstoneChildResource, ReadySlots)
+    \o SharedOnEachSlot(TerminalDeltaChildResource, ReadySlots)
+
+IdleProbeLeasePlan == SharedOnEachSlot(LeaseChildResource, LeaseSlots)
+
+IdleProbeClaimPlan ==
+    SharedOnEachSlot(ClaimChildResource, ClaimSlots)
+    \o SharedOnEachSlot(ClaimBatchChildResource, ClaimSlots)
+    \o SharedOnEachSlot(ClosureChildResource, ClaimSlots)
+    \o SharedOnEachSlot(ClosureBatchChildResource, ClaimSlots)
+
 VARIABLES
     heldLocks,     \* [resource -> set of <<tx, mode>>]
     txState,       \* [tx -> "idle" | "running" | "committed"]
@@ -751,6 +789,14 @@ StartPruneClaims(t, slot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartIdleProbe(t, plan) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = plan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 StartCloseReceipt(t, claimSlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -888,6 +934,9 @@ Next ==
     \/ \E t \in TxIds, rs \in ReadySlots : StartPruneReady(t, rs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRotateClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
+    \/ \E t \in TxIds : StartIdleProbe(t, IdleProbeQueuePlan)
+    \/ \E t \in TxIds : StartIdleProbe(t, IdleProbeLeasePlan)
+    \/ \E t \in TxIds : StartIdleProbe(t, IdleProbeClaimPlan)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartCloseReceipt(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceiptDeadlines(t, cs)

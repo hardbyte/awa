@@ -233,8 +233,8 @@ pub struct AwaMetrics {
     /// One-hot info gauge for the current storage transition state and engines.
     pub storage_state: Gauge<i64>,
     /// Maintenance ring rotation attempts, attributed to (ring, outcome,
-    /// blocker). For Rotated outcomes the `awa.ring.blocker` attribute is
-    /// "none"; for SkippedBusy it carries the per-ring blocker label
+    /// blocker). For Rotated and skipped_idle outcomes the `awa.ring.blocker`
+    /// attribute is "none"; for SkippedBusy it carries the per-ring blocker label
     /// ("queue.ready_rows", "queue.claim_attempt_batches",
     /// "queue.done_rows", "queue.tombstone_rows", "queue.ready_segments",
     /// "queue.receipt_completion_batch_rows",
@@ -1205,6 +1205,21 @@ impl AwaMetrics {
                 }
             }
         }
+    }
+
+    /// Record a rotation skipped because every partition of the ring was
+    /// empty: one `awa.ring.outcome = "skipped_idle"` attempt, and the
+    /// unchanged slot and generation on the ring gauges.
+    pub fn record_rotate_skipped_idle(&self, ring: &'static str, slot: i32, generation: i64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", ring),
+            opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_idle"),
+            opentelemetry::KeyValue::new("awa.ring.blocker", "none"),
+        ];
+        self.maintenance_rotate_attempts.add(1, &attrs);
+        let slot_attrs = [opentelemetry::KeyValue::new("awa.ring", ring)];
+        self.ring_current_slot.record(slot as i64, &slot_attrs);
+        self.ring_generation.record(generation, &slot_attrs);
     }
 
     /// Record the wall-clock duration of one maintenance `tokio::select!`
