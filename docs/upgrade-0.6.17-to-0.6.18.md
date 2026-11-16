@@ -20,6 +20,8 @@ Binaries and the migration can roll in either order.
 
 0.6.17 binaries run unchanged against the patched schema.
 
+Every release-branch CI run rehearses the migrate-first order on PostgreSQL 17 and 18 from released 0.6.9, 0.6.15, 0.6.16 and 0.6.17 (`awa/tests/patch_upgrade_rehearsal_test.rs`): released workers and producers keep running while 0.6.18's `awa migrate` applies the pending patches, released and 0.6.18 workers then run together, and the fleet rolls back to the released binaries with every job accounted for.
+
 ### External migration runners
 
 `awa migrate --sql --pending` prints `R__replica_identity` on a 0.6.17 database. Apply it as a repeatable script after `V40` and after the other `R__` scripts, as the owner of the awa and queue-storage tables. Extract the full set with:
