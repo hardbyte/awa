@@ -186,8 +186,21 @@ class AsyncClient:
         """Preview an adopt, retire, retire_owner, restore, or restore_owner action; apply explicitly."""
         return json.loads(await self._raw.cron_owner_action(json.dumps(action), actor=actor, apply=apply))
 
-    def __init__(self, database_url: str, max_connections: int = 10) -> None:
-        self._raw = RawClient(database_url, max_connections)
+    def __init__(
+        self,
+        database_url: str,
+        max_connections: int = 10,
+        *,
+        max_lifetime_seconds: float | None = 1800.0,
+    ) -> None:
+        """Connect a pool of up to ``max_connections`` to ``database_url``.
+
+        ``max_lifetime_seconds`` closes a pooled connection once it has been
+        open that long. ``None`` disables the lifetime.
+        """
+        self._raw = RawClient(
+            database_url, max_connections, max_lifetime_seconds=max_lifetime_seconds
+        )
 
     async def __aenter__(self) -> "AsyncClient":
         return self
@@ -1128,8 +1141,21 @@ class Client:
         """Preview an adopt, retire, retire_owner, restore, or restore_owner action; apply explicitly."""
         return json.loads(self._raw.cron_owner_action_sync(json.dumps(action), actor=actor, apply=apply))
 
-    def __init__(self, database_url: str, max_connections: int = 10) -> None:
-        self._raw = RawClient(database_url, max_connections)
+    def __init__(
+        self,
+        database_url: str,
+        max_connections: int = 10,
+        *,
+        max_lifetime_seconds: float | None = 1800.0,
+    ) -> None:
+        """Connect a pool of up to ``max_connections`` to ``database_url``.
+
+        ``max_lifetime_seconds`` closes a pooled connection once it has been
+        open that long. ``None`` disables the lifetime.
+        """
+        self._raw = RawClient(
+            database_url, max_connections, max_lifetime_seconds=max_lifetime_seconds
+        )
 
     def __enter__(self) -> "Client":
         return self

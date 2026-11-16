@@ -969,7 +969,7 @@ struct IdleRotateBackoff {
 
 impl IdleRotateBackoff {
     fn new(interval: Duration) -> Self {
-        let ticks = IDLE_ROTATE_MAX_GAP.as_millis() / interval.as_millis().max(1);
+        let ticks = IDLE_ROTATE_MAX_GAP.as_nanos() / interval.as_nanos().max(1);
         Self {
             idle_streak: 0,
             skip_remaining: 0,
@@ -6528,6 +6528,24 @@ mod tests {
         let mut slow = IdleRotateBackoff::new(Duration::from_secs(5));
         slow.record(true);
         assert!(!slow.should_skip());
+    }
+
+    #[test]
+    fn idle_rotate_backoff_cap_is_the_largest_whole_multiple_within_the_gap() {
+        let cases = [
+            (Duration::from_millis(250), 15),
+            (Duration::from_secs(1), 3),
+            (Duration::from_secs(2), 1),
+            (Duration::from_micros(2_000_500), 0),
+            (Duration::from_secs(5), 0),
+        ];
+        for (interval, expected) in cases {
+            assert_eq!(
+                IdleRotateBackoff::new(interval).max_skip,
+                expected,
+                "max skipped ticks for a {interval:?} rotate interval"
+            );
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@
 #![recursion_limit = "256"]
 
 mod bench_output;
+mod ci_timing;
 
 use awa::audited_sql;
 use awa::model::{
@@ -114,6 +115,34 @@ async fn pool_with(max_conns: u32) -> sqlx::PgPool {
         .await
         .expect("Failed to run queue_storage benchmark migrations");
     pool
+}
+
+/// Prune `slot`, retrying while it reports `Blocked` for that slot. Prune takes
+/// its locks NOWAIT, so a background session on the slot (autovacuum, or a
+/// hosted Postgres's own workers) blocks it; the maintenance loop retries the
+/// same way. Any other outcome, or `Blocked` past the deadline, is returned for
+/// the caller to assert on.
+async fn prune_retrying_blocked(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    retention: Duration,
+    slot: i32,
+) -> PruneOutcome {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(5));
+    loop {
+        let outcome = store
+            .prune_oldest(pool, retention)
+            .await
+            .expect("prune_oldest");
+        match outcome {
+            PruneOutcome::Blocked { slot: blocked }
+                if blocked == slot && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -810,10 +839,7 @@ async fn test_queue_storage_round_trip_smoke() {
         .await
         .expect("Failed to rotate smoke queue slot");
     assert!(matches!(rotated_queue, RotateOutcome::Rotated { .. }));
-    let pruned_queue = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune smoke queue slot");
+    let pruned_queue = prune_retrying_blocked(&store, &pool, Duration::ZERO, 0).await;
     assert!(matches!(pruned_queue, PruneOutcome::Pruned { slot: 0, .. }));
 
     // Completed leases leave physical pages until pruning. Keep a live lease
