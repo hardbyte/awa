@@ -4421,6 +4421,88 @@ async fn test_spent_claim_head_advance_does_not_resurrect_retried_rescued_or_mov
         .is_empty());
 }
 
+/// Leave `count` rolled-back reservations on the lane: positions an enqueue
+/// reserved and never committed.
+async fn reserve_and_roll_back(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    count: i64,
+) {
+    let schema = store.schema();
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(&format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, 0::smallint, $3)"
+    ))
+    .bind(queue)
+    .bind(priority)
+    .bind(count)
+    .execute(&mut *tx)
+    .await
+    .expect("reserve lane positions");
+    tx.rollback().await.expect("roll back the reservation");
+}
+
+/// #779: a run of rolled-back reservations longer than one window, between
+/// the claim cursor and the lane's next committed rows, is crossed: the
+/// committed row behind it proves no earlier position can still commit. The
+/// maintenance advance then passes the moved row behind the gap and stops at
+/// the live one, and a drain moves its lane's cursor past the same shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spent_claim_advance_crosses_rolled_back_reservations() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_advance_gap").await;
+    let queue = "qs_advance_gap";
+    let drained = "qs_advance_gap_drained";
+
+    for lane in [queue, drained] {
+        let first = enqueue_lane(&pool, &store, lane, 2, 1).await;
+        let claimed = claim_and_complete(&store, &pool, lane, 1, Duration::ZERO).await;
+        assert_eq!(claimed[0].job.id, first[0]);
+        reserve_and_roll_back(&pool, &store, lane, 2, 2_500).await;
+    }
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 2).await;
+    let drained_jobs = enqueue_lane(&pool, &store, drained, 2, 3).await;
+    let seqs = first_lane_seqs(&pool, &store, &jobs).await;
+    let drained_seqs = first_lane_seqs(&pool, &store, &drained_jobs).await;
+    let start = claim_cursor(&pool, &store, queue, 2).await;
+    assert!(seqs[0] - start >= 2_500, "the gap is wider than one window");
+    assert_rotated_to(&store, &pool, 1).await;
+
+    assert!(store
+        .move_queue(&pool, jobs[0], "qs_advance_gap_dest", None)
+        .await
+        .expect("move queue"));
+    let advanced = advance_pinning_lanes(&store, &pool).await;
+    assert_eq!(advanced.len(), 1, "{advanced:?}");
+    assert_eq!(
+        (advanced[0].from_seq, advanced[0].to_seq),
+        (start, seqs[1]),
+        "the advance crosses the gap and the moved row, and stops at the live row"
+    );
+
+    assert_eq!(
+        admin::drain_queue(&pool, drained)
+            .await
+            .expect("drain queue"),
+        3
+    );
+    assert_eq!(
+        claim_cursor(&pool, &store, drained, 2).await,
+        drained_seqs[2] + 1,
+        "a drain moves its lane's cursor across the gap and its cancelled rows"
+    );
+
+    let claimed: Vec<i64> = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+        .await
+        .into_iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert_eq!(claimed, vec![jobs[1]]);
+    assert_queue_prune_reclaims(&store, &pool, 0).await;
+}
+
 /// #779: the advance races live claims and moves on the same lane. Every job
 /// is claimed exactly once, from the queue it is in when claimed, and the
 /// lane stops pinning the slot.

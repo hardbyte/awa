@@ -25,8 +25,10 @@ EXTENDS Naturals, FiniteSets, TLC
 \* and the old position stays spent.
 \*
 \* Maintenance reads committed lane state in one statement, under the head
-\* lock taken with SKIP LOCKED, over the window
-\* [cursor, min(cursor + WindowSize, enqueue head)). Among the window's
+\* lock taken with SKIP LOCKED, over the window from the cursor to
+\* min(first visible row + WindowSize, enqueue head), so a run of rolled-back
+\* reservations of any length is crossed once a committed row lies beyond
+\* it. Among the window's
 \* visible untombstoned rows it checks at most CheckCap for claim evidence.
 \* The target is the first checked row that is unclaimed; else one past the
 \* last checked row when CheckCap rows were checked; else one past the last
@@ -204,7 +206,14 @@ SetMin(S) == CHOOSE p \in S : \A q \in S : p <= q
 SetMax(S) == CHOOSE p \in S : \A q \in S : p >= q
 Min(a, b) == IF a < b THEN a ELSE b
 
-WindowEnd == Min(cursor + WindowSize, append)
+\* Committed rows at or after the cursor, in the window's lane.
+VisibleFromCursor ==
+    {p \in Positions : p >= cursor /\ p < append /\ state[p] \in Visible}
+\* The window starts at the first visible row, past any rolled-back
+\* reservations, and is empty when there is none.
+WindowEnd ==
+    IF VisibleFromCursor = {} THEN cursor
+    ELSE Min(SetMin(VisibleFromCursor) + WindowSize, append)
 InWindow == {p \in Positions : p >= cursor /\ p < WindowEnd}
 SeenVisible ==
     IF SkipInvisible THEN InWindow
