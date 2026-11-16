@@ -663,27 +663,6 @@ impl Dispatcher {
                 }
             },
             RuntimeStorage::QueueStorage(runtime) => {
-                if check_ready_signal {
-                    match runtime
-                        .store
-                        .queue_may_have_ready(&self.pool, &self.queue)
-                        .await
-                    {
-                        Ok(false) => {
-                            self.refund_rate_limit(batch_size);
-                            self.clear_overflow_demand();
-                            return false;
-                        }
-                        Ok(true) => {}
-                        Err(err) => {
-                            debug!(
-                                queue = %self.queue,
-                                error = %err,
-                                "Ready signal read failed; claiming"
-                            );
-                        }
-                    }
-                }
                 let claim_slot = tokio::select! {
                     biased;
                     _ = self.cancel.cancelled() => {
@@ -698,6 +677,28 @@ impl Dispatcher {
                         }
                     }
                 };
+                if check_ready_signal {
+                    match runtime
+                        .store
+                        .queue_may_have_ready(&self.pool, &self.queue)
+                        .await
+                    {
+                        Ok(false) => {
+                            drop(claim_slot);
+                            self.refund_rate_limit(batch_size);
+                            self.clear_overflow_demand();
+                            return false;
+                        }
+                        Ok(true) => {}
+                        Err(err) => {
+                            debug!(
+                                queue = %self.queue,
+                                error = %err,
+                                "Ready signal read failed; claiming"
+                            );
+                        }
+                    }
+                }
                 let claimed = runtime
                     .store
                     .claim_runtime_batch_with_aging_for_instance(
@@ -854,8 +855,14 @@ mod tests {
     use super::*;
 
     fn blocked_dispatcher() -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
+        blocked_dispatcher_on("postgres://postgres:test@localhost/awa_test")
+    }
+
+    fn blocked_dispatcher_on(
+        database_url: &str,
+    ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .connect_lazy(database_url)
             .unwrap();
         let metrics =
             crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
@@ -963,6 +970,33 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(dispatcher.claim_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn ready_signal_read_waits_for_the_claim_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut dispatcher, _capacity, cancel) = blocked_dispatcher_on(&format!(
+            "postgres://postgres:test@127.0.0.1:{port}/awa_test"
+        ));
+        dispatcher.check_ready_signal = true;
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block the ready signal read"),
+                accepted = listener.accept() => {
+                    panic!("ready signal read opened a connection past a saturated gate: {accepted:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(dispatcher.claim_gate.available_permits(), 0);
     }
 
     #[tokio::test]
