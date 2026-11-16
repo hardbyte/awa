@@ -52,10 +52,10 @@ NoPos == 0
 
 VARIABLES state, append, cursor, headLock, claiming, tombing, tombAdvance,
           pendingClaimAdvance, pendingCancelAdvance, maintPhase, maintTarget,
-          claimCount
+          claimCount, maintPassedTomb
 vars == <<state, append, cursor, headLock, claiming, tombing, tombAdvance,
           pendingClaimAdvance, pendingCancelAdvance, maintPhase, maintTarget,
-          claimCount>>
+          claimCount, maintPassedTomb>>
 
 Max(a, b) == IF a > b THEN a ELSE b
 
@@ -72,6 +72,7 @@ Init ==
     /\ maintPhase = "idle"
     /\ maintTarget = 1
     /\ claimCount = [p \in Positions |-> 0]
+    /\ maintPassedTomb = FALSE
 
 \* ---- enqueue -------------------------------------------------------------
 
@@ -82,21 +83,21 @@ Reserve ==
     /\ append' = append + 1
     /\ UNCHANGED <<cursor, headLock, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 EnqueueCommit(p) ==
     /\ state[p] = "inflight"
     /\ state' = [state EXCEPT ![p] = "live"]
     /\ UNCHANGED <<append, cursor, headLock, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 EnqueueAbort(p) ==
     /\ state[p] = "inflight"
     /\ state' = [state EXCEPT ![p] = "gap"]
     /\ UNCHANGED <<append, cursor, headLock, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 \* ---- claim ---------------------------------------------------------------
 
@@ -117,7 +118,7 @@ ClaimBegin ==
         /\ claiming' = p
     /\ UNCHANGED <<state, append, cursor, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 ClaimCommit ==
     /\ headLock = "claim"
@@ -127,7 +128,7 @@ ClaimCommit ==
     /\ headLock' = "none"
     /\ claiming' = NoPos
     /\ UNCHANGED <<append, cursor, tombing, tombAdvance, pendingCancelAdvance,
-                   maintPhase, maintTarget>>
+                   maintPhase, maintTarget, maintPassedTomb>>
 
 ClaimAbort ==
     /\ headLock = "claim"
@@ -135,7 +136,7 @@ ClaimAbort ==
     /\ claiming' = NoPos
     /\ UNCHANGED <<state, append, cursor, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 \* When the head row is already spent, the claim function moves the cursor
 \* over the contiguous spent prefix and returns without claiming.
@@ -146,7 +147,7 @@ ClaimRepair ==
     /\ cursor' = cursor + 1
     /\ UNCHANGED <<state, append, headLock, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 \* Post-commit advance of a committed claim, evidence-guarded and monotone.
 ClaimAdvance(p) ==
@@ -156,7 +157,7 @@ ClaimAdvance(p) ==
     /\ cursor' = Max(cursor, p + 1)
     /\ pendingClaimAdvance' = pendingClaimAdvance \ {p}
     /\ UNCHANGED <<state, append, headLock, claiming, tombing, tombAdvance,
-                   pendingCancelAdvance, maintPhase, maintTarget, claimCount>>
+                   pendingCancelAdvance, maintPhase, maintTarget, claimCount, maintPassedTomb>>
 
 \* ---- cancel / move / set_priority ----------------------------------------
 
@@ -169,7 +170,7 @@ TombBegin(p, withAdvance) ==
     /\ tombing' = p
     /\ tombAdvance' = withAdvance
     /\ UNCHANGED <<state, append, cursor, claiming, pendingClaimAdvance,
-                   pendingCancelAdvance, maintPhase, maintTarget, claimCount>>
+                   pendingCancelAdvance, maintPhase, maintTarget, claimCount, maintPassedTomb>>
 
 TombCommit ==
     /\ headLock = "tomb"
@@ -181,7 +182,7 @@ TombCommit ==
     /\ tombing' = NoPos
     /\ tombAdvance' = FALSE
     /\ UNCHANGED <<append, cursor, claiming, pendingClaimAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 TombAbort ==
     /\ headLock = "tomb"
@@ -189,7 +190,7 @@ TombAbort ==
     /\ tombing' = NoPos
     /\ tombAdvance' = FALSE
     /\ UNCHANGED <<state, append, cursor, claiming, pendingClaimAdvance,
-                   pendingCancelAdvance, maintPhase, maintTarget, claimCount>>
+                   pendingCancelAdvance, maintPhase, maintTarget, claimCount, maintPassedTomb>>
 
 \* only_if_current: moves the cursor by one only when it is at the row.
 CancelAdvance(p) ==
@@ -198,7 +199,7 @@ CancelAdvance(p) ==
     /\ cursor' = IF cursor = p THEN p + 1 ELSE cursor
     /\ pendingCancelAdvance' = pendingCancelAdvance \ {p}
     /\ UNCHANGED <<state, append, headLock, claiming, tombing, tombAdvance,
-                   pendingClaimAdvance, maintPhase, maintTarget, claimCount>>
+                   pendingClaimAdvance, maintPhase, maintTarget, claimCount, maintPassedTomb>>
 
 \* ---- maintenance ---------------------------------------------------------
 
@@ -240,13 +241,16 @@ MaintScan ==
     /\ maintTarget' = MaintTarget
     /\ maintPhase' = "scanned"
     /\ UNCHANGED <<state, append, cursor, claiming, tombing, tombAdvance,
-                   pendingClaimAdvance, pendingCancelAdvance, claimCount>>
+                   pendingClaimAdvance, pendingCancelAdvance, claimCount, maintPassedTomb>>
 
 MaintSet ==
     /\ maintPhase = "scanned"
     /\ cursor' = Max(cursor, maintTarget)
     /\ headLock' = IF MaintLocksHead THEN "none" ELSE headLock
     /\ maintPhase' = "idle"
+    /\ maintPassedTomb' =
+           (maintPassedTomb
+            \/ (cursor' > cursor /\ cursor <= N /\ state[cursor] = "tomb"))
     /\ UNCHANGED <<state, append, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintTarget,
                    claimCount>>
@@ -257,7 +261,7 @@ LoseCursor ==
     /\ \E c \in 1..cursor : cursor' = c
     /\ UNCHANGED <<state, append, headLock, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
-                   maintTarget, claimCount>>
+                   maintTarget, claimCount, maintPassedTomb>>
 
 Next ==
     \/ LoseCursor
@@ -285,6 +289,7 @@ TypeOK ==
     /\ pendingCancelAdvance \subseteq Positions
     /\ maintPhase \in {"idle", "scanned"}
     /\ maintTarget \in 1..(N + 1)
+    /\ maintPassedTomb \in BOOLEAN
 
 \* No row that is, or may yet become, claimable sits behind the cursor.
 NoSkippedLive ==
@@ -298,14 +303,9 @@ CursorBounded == cursor <= append
 
 \* Outside a lost cursor, the cursor only moves forward.
 CursorMonotone == [][cursor' >= cursor]_vars
-\* Witness, expected to be violated: maintenance does move the cursor over
-\* a tombstoned row that no cancel advance moved it past.
-MaintNeverPassesTombstone ==
-    ~ (/\ maintPhase = "scanned"
-       /\ cursor <= N
-       /\ state[cursor] = "tomb"
-       /\ cursor \notin pendingCancelAdvance
-       /\ maintTarget > cursor)
+\* Witness, expected to be violated: a maintenance advance moves the cursor
+\* off a tombstoned row.
+MaintNeverPassesTombstone == ~ maintPassedTomb
 
 \* Spent and rolled-back positions never become claimable again. This holds
 \* by construction here, since no action rewrites such a position; it
