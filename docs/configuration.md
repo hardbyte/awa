@@ -58,7 +58,7 @@ async def handle(job): ...
 await client.start([("email", 8)])
 ```
 
-Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per-queue scaling is just a deployment knob. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
+Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per-queue scaling is just a deployment knob. Queues in one database still share queue-storage reclamation, so a paused or unserved queue can still hold back storage for the others; [storage isolation](deployment.md#storage-isolation) covers separating them. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
 
 ### Targeting specific job kinds within a queue
 

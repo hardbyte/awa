@@ -295,6 +295,7 @@ impl JobContext {
             }
         }
 
+        let mut pending_polls = 0u32;
         loop {
             if self.is_cancelled() {
                 return Err(AwaError::Validation(
@@ -305,7 +306,19 @@ impl JobContext {
             match check_state().await? {
                 CallbackPollResult::Resolved(payload) => return Ok(payload),
                 CallbackPollResult::Pending => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    pending_polls = pending_polls.saturating_add(1);
+                    let poll_at = tokio::time::Instant::now()
+                        + awa_model::admin::callback_poll_delay(pending_polls);
+                    while !self.is_cancelled() {
+                        let now = tokio::time::Instant::now();
+                        if now >= poll_at {
+                            break;
+                        }
+                        tokio::time::sleep(
+                            (poll_at - now).min(awa_model::admin::CALLBACK_POLL_MIN_DELAY),
+                        )
+                        .await;
+                    }
                 }
                 CallbackPollResult::Stale {
                     token,

@@ -3,6 +3,8 @@
 //! These are intentionally ignored in normal CI and are meant for the slower
 //! nightly/manual chaos lane.
 
+mod ci_timing;
+
 use async_trait::async_trait;
 use awa::model::{insert_with, migrations, InsertOpts, QueueStorageConfig};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
@@ -19,6 +21,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use ci_timing::{scaled_staleness, scaled_timeout};
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -200,24 +204,6 @@ async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> 
 
 fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
     counts.get(state).copied().unwrap_or(0)
-}
-
-fn chaos_timeout_multiplier() -> f64 {
-    if let Ok(raw) = std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER") {
-        if let Ok(parsed) = raw.parse::<f64>() {
-            return parsed.max(1.0);
-        }
-    }
-
-    if std::env::var_os("CI").is_some() {
-        3.0
-    } else {
-        1.0
-    }
-}
-
-fn scaled_timeout(timeout: Duration) -> Duration {
-    timeout.mul_f64(chaos_timeout_multiplier())
 }
 
 async fn wait_for_counts(
@@ -936,7 +922,7 @@ fn complete_client(pool: sqlx::PgPool, queue: &str) -> Client {
         .heartbeat_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
         .register_worker(CompleteWorker)
@@ -1580,7 +1566,7 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
         .heartbeat_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
         .register_worker(MixedFleetRustWorker { tx })
@@ -1780,7 +1766,7 @@ async fn test_runtime_recovers_after_terminating_postgres_connections() {
         )
         .heartbeat_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
@@ -2180,7 +2166,7 @@ async fn test_full_postgres_outage_recovers_with_metrics() {
         )
         .heartbeat_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))

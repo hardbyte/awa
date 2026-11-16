@@ -36,6 +36,8 @@ awa storage prepare-queue-storage-schema \
 
 The CLI calls `awa.install_queue_storage_substrate('my_jobs', 32, 16, 8, TRUE)` under the per-schema advisory lock. Activate the schema as the queue-storage backend via `awa storage prepare`, `awa storage enter-mixed-transition`, and `awa storage finalize` once you're ready. See [the upgrade guide](upgrade-0.5-to-0.6.md) for the staged flow.
 
+A database has one active queue-storage schema. Producers write to it, and a runtime configured for any other schema refuses to start, so a custom schema replaces the default rather than running beside it. To isolate workloads from each other's ring stalls, use separate databases; see [storage isolation](deployment.md#storage-isolation).
+
 ## `--reset` is rejected for `--schema awa`
 
 `awa storage prepare-queue-storage-schema --reset` runs `DROP SCHEMA IF EXISTS <schema> CASCADE` before re-preparing. For `--schema awa` that would also drop `schema_version`, `runtime_instances`, `storage_transition_state`, and every other canonical migration table, leaving the database in an unrecoverable state.

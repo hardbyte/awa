@@ -32,6 +32,8 @@
 //! Every worker runs with a one-hour ready-ring rotation so completed jobs are
 //! still readable when the final accounting runs.
 
+mod ci_timing;
+
 use async_trait::async_trait;
 use awa::model::{admin, migrations, runtime_control, JobState, QueueStorage, QueueStorageConfig};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
@@ -298,7 +300,7 @@ fn candidate_client(runtime: &PgPool, log: &EventLog, source: &str, queues: &[&s
         )
         .heartbeat_interval(Duration::from_millis(100))
         .heartbeat_rescue_interval(Duration::from_millis(250))
-        .heartbeat_staleness(Duration::from_secs(2))
+        .heartbeat_staleness(rehearsal_heartbeat_staleness())
         .promote_interval(Duration::from_millis(100))
         .leader_election_interval(Duration::from_millis(200))
         .runtime_snapshot_interval(Duration::from_millis(100))
@@ -372,12 +374,23 @@ impl ReleasedWorker {
     }
 }
 
+/// Heartbeat staleness for every runtime in the rehearsal, candidate and
+/// released alike: stale-heartbeat rescue runs on whichever runtime leads
+/// maintenance, with that runtime's own staleness.
+fn rehearsal_heartbeat_staleness() -> Duration {
+    ci_timing::scaled_staleness(Duration::from_secs(2))
+}
+
 fn released_command(runtime_url: &str) -> Command {
     let mut command = Command::new(env_path("AWA_RELEASED_PYTHON"));
     command
         .arg(workspace_root().join("awa-python/tests/patch_rehearsal_worker.py"))
         .env("DATABASE_URL", runtime_url)
         .env("REHEARSAL_SCHEMA", SCHEMA)
+        .env(
+            "REHEARSAL_HEARTBEAT_STALENESS_MS",
+            rehearsal_heartbeat_staleness().as_millis().to_string(),
+        )
         .env("PYTHONUNBUFFERED", "1")
         .kill_on_drop(true);
     command
@@ -978,29 +991,52 @@ async fn released_patch_upgrade_and_rollback() {
             .connect(&fixture.owner_url)
             .await
             .unwrap();
-        let mut tx = owner.begin().await.unwrap();
-        let patch_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+        let mut attempt = 0;
+        let locks: Vec<String> = loop {
+            attempt += 1;
+            let mut tx = owner.begin().await.unwrap();
+            let patch_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            if let Err(error) = sqlx::raw_sql(&patch_sql).execute(&mut *tx).await {
+                let lock_timeout = matches!(
+                    &error,
+                    sqlx::Error::Database(db)
+                        if db.code().as_deref() == Some("55P03")
+                            && db.message().starts_with("replica_identity: could not lock ")
+                );
+                assert!(
+                    lock_timeout && attempt < MIGRATE_ATTEMPTS,
+                    "exported patch failed on attempt {attempt} of {MIGRATE_ATTEMPTS}: {error:?}"
+                );
+                eprintln!(
+                    "[patch-rehearsal] exported patch attempt {attempt} of {MIGRATE_ATTEMPTS} hit \
+                     the replica_identity lock timeout; retrying in {MIGRATE_RETRY_PAUSE:?}: {error}"
+                );
+                tx.rollback().await.unwrap();
+                tokio::time::sleep(MIGRATE_RETRY_PAUSE).await;
+                continue;
+            }
+            let locks: Vec<String> = sqlx::query_scalar(
+                "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) \
+                 FROM pg_locks AS l \
+                 JOIN pg_class AS c ON c.oid = l.relation \
+                 JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+                 WHERE l.pid = $1 AND l.locktype = 'relation' \
+                   AND n.nspname IN ('awa', $2) \
+                   AND l.relation::bigint = ANY($3) \
+                 ORDER BY n.nspname, c.relname, l.mode",
+            )
+            .bind(patch_backend_pid)
+            .bind(SCHEMA)
+            .bind(&patch_relation_ids)
+            .fetch_all(&fixture.admin)
             .await
             .unwrap();
-        sqlx::raw_sql(&patch_sql).execute(&mut *tx).await.unwrap();
-        let locks: Vec<String> = sqlx::query_scalar(
-            "SELECT format('%s.%s %s', n.nspname, c.relname, l.mode) \
-             FROM pg_locks AS l \
-             JOIN pg_class AS c ON c.oid = l.relation \
-             JOIN pg_namespace AS n ON n.oid = c.relnamespace \
-             WHERE l.pid = $1 AND l.locktype = 'relation' \
-               AND n.nspname IN ('awa', $2) \
-               AND l.relation::bigint = ANY($3) \
-             ORDER BY n.nspname, c.relname, l.mode",
-        )
-        .bind(patch_backend_pid)
-        .bind(SCHEMA)
-        .bind(&patch_relation_ids)
-        .fetch_all(&fixture.admin)
-        .await
-        .unwrap();
-        tx.rollback().await.unwrap();
+            tx.rollback().await.unwrap();
+            break locks;
+        };
         owner.close().await;
         let (identity_locks, other_locks): (Vec<String>, Vec<String>) = locks
             .into_iter()
@@ -1328,7 +1364,7 @@ async fn released_patch_upgrade_and_rollback() {
         &[MAIN, BANKED, NEW_AFTER_PATCH],
     );
     candidate_b.start().await.expect("candidate restart");
-    wait_for_drain(&log, Duration::from_secs(120)).await;
+    wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
 
     // ── 4. roll back to released binaries ──────────────────────────────
     candidate_b.shutdown(Duration::from_secs(5)).await;
@@ -1369,7 +1405,7 @@ async fn released_patch_upgrade_and_rollback() {
         .await
         .unwrap_or_else(|error| panic!("released enqueue on {queue} after rollback: {error}"));
     }
-    wait_for_drain(&log, Duration::from_secs(120)).await;
+    wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
     // A released admin process reads the patched schema as the runtime role.
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(NEW_AFTER_ROLLBACK), "{stats}");
@@ -1484,7 +1520,7 @@ async fn released_patch_upgrade_and_rollback() {
         !new_lane_owners.is_empty() && new_lane_owners.iter().all(|owned| *owned),
         "the new lane's sequences belong to the schema owner: {new_lane_owners:?}"
     );
-    wait_for_drain(&log, Duration::from_secs(120)).await;
+    wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(PROVISIONED), "{stats}");
     for worker in [worker_e, worker_f] {
