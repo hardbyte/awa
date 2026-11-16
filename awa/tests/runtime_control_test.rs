@@ -202,11 +202,16 @@ async fn prune_halt_survives_handoff_and_preserves_exact_job_accounting(pool: Pg
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let resumed: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT generation FROM awa.queue_ring_state WHERE singleton), (SELECT generation FROM awa.lease_ring_state WHERE singleton), (SELECT generation FROM awa.claim_ring_state WHERE singleton)").fetch_one(&pool).await.unwrap();
-            if resumed.0 > after.0 && resumed.1 > after.1 && resumed.2 > after.2 {
+            let lease_ring_empty: bool =
+                sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM awa.leases)")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if resumed.0 > after.0 && (resumed.1 > after.1 || lease_ring_empty) && resumed.2 > after.2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }).await.expect("all three rings must resume rotation after the current halt is lifted");
+    }).await.expect("rings holding rows must resume rotation after the current halt is lifted");
     second.shutdown(Duration::from_secs(5)).await;
 }

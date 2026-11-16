@@ -7,9 +7,9 @@ use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
 use awa_model::{
-    AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
-    RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
-    SkipReason, TerminalDeltaRollupOutcome,
+    AwaError, GatedRotateOutcome, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome,
+    QueueStorage, RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder,
+    RotateOutcome, SkipReason, TerminalDeltaRollupOutcome,
 };
 use chrono::{DateTime, Utc};
 use croner::Cron;
@@ -3709,8 +3709,15 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate(&self.pool).await {
-            Ok(outcome) => {
+        match runtime.store.rotate_if_active(&self.pool).await {
+            Ok(GatedRotateOutcome::SkippedIdle { slot, generation }) => {
+                self.metrics
+                    .record_rotate_skipped_idle("queue", slot, generation);
+                debug!(slot, generation, "Skipped idle queue storage queue ring");
+                self.clear_queue_ring_pin();
+                return;
+            }
+            Ok(GatedRotateOutcome::Attempted(outcome)) => {
                 self.metrics.record_rotate_outcome("queue", &outcome);
                 match outcome {
                     RotateOutcome::Rotated { slot, generation } => {
@@ -3869,8 +3876,14 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate_leases(&self.pool).await {
-            Ok(outcome) => {
+        match runtime.store.rotate_leases_if_active(&self.pool).await {
+            Ok(GatedRotateOutcome::SkippedIdle { slot, generation }) => {
+                self.metrics
+                    .record_rotate_skipped_idle("lease", slot, generation);
+                debug!(slot, generation, "Skipped idle queue storage lease ring");
+                return;
+            }
+            Ok(GatedRotateOutcome::Attempted(outcome)) => {
                 self.metrics.record_rotate_outcome("lease", &outcome);
                 match outcome {
                     RotateOutcome::Rotated { slot, generation } => {
@@ -3943,8 +3956,14 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate_claims(&self.pool).await {
-            Ok(outcome) => {
+        match runtime.store.rotate_claims_if_active(&self.pool).await {
+            Ok(GatedRotateOutcome::SkippedIdle { slot, generation }) => {
+                self.metrics
+                    .record_rotate_skipped_idle("claim", slot, generation);
+                debug!(slot, generation, "Skipped idle queue storage claim ring");
+                return;
+            }
+            Ok(GatedRotateOutcome::Attempted(outcome)) => {
                 self.metrics.record_rotate_outcome("claim", &outcome);
                 match outcome {
                     RotateOutcome::Rotated { slot, generation } => {

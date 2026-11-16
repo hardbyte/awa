@@ -1,6 +1,6 @@
 # Upgrading from 0.6.17 to 0.6.18
 
-0.6.18 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Every awa table gets a replica identity, so awa keeps working when its schema is in a logical-replication publication, and ring prune truncates only the partitions that hold rows.
+0.6.18 is a rolling patch upgrade: the schema stays at v40 and traffic keeps running throughout. Every awa table gets a replica identity, so awa keeps working when its schema is in a logical-replication publication, ring prune truncates only the partitions that hold rows, and the maintenance leader stops rotating rings that hold no rows.
 
 Binaries and the migration can roll in either order.
 
@@ -56,6 +56,12 @@ Keeping the awa schema out of publications remains the recommendation; see [logi
 ## Prune truncates only children that hold rows
 
 This part needs no migration and applies once the maintenance leader runs 0.6.18. Queue, lease and claim prune lock every child of the sealed slot exactly as 0.6.17 does, then `TRUNCATE` only the children that hold storage; empty children keep their relfilenode. Expect fewer relfilenode changes and less WAL per prune, most visibly on storage engines where each truncate costs I/O. Prune outcomes, metrics and lock waits are unchanged.
+
+## Empty rings stop rotating
+
+This part needs no migration and applies once the maintenance leader runs 0.6.18. On 0.6.17 the leader rotates and prunes each of the three rings on every tick, about once a second each, even with no jobs: every rotate updates the ring-state row and every prune locks it, so an idle runtime writes WAL and leaves dead tuples on those rows. A 0.6.18 leader first checks whether any partition of the ring holds a row, in a read-only transaction that writes nothing. If none does, it leaves the ring alone for that tick: `awa.maintenance.rotate.attempts` records `awa.ring.outcome="skipped_idle"`, no prune attempt is recorded, and `awa.ring.generation` stays flat. The first job, claim or lease written to the ring makes the next tick rotate, and the ring keeps rotating until prune has reclaimed everything in it.
+
+A dashboard or alert that expects `rotated` outcomes or a rising generation while the queues are empty will see them stop; a flat generation is a problem only together with `skipped_busy` outcomes. During the roll a 0.6.17 leader rotates empty rings and a 0.6.18 leader does not, and leadership can move between them in either direction: both advance the same cursor through the same rotate and prune transactions, so no step is needed. `QueueStorage::rotate`, `rotate_leases` and `rotate_claims` keep rotating unconditionally; the gated forms are `rotate_if_active`, `rotate_leases_if_active` and `rotate_claims_if_active`.
 
 ## Rollback
 

@@ -9,8 +9,8 @@ mod storage_footprint_sql;
 
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
-    BatchOperationSpec, PromotionLane, PruneOutcome, QueueStorage, QueueStorageConfig,
-    RotateOutcome, SkipReason, SubmitBatchOperation,
+    BatchOperationSpec, GatedRotateOutcome, PromotionLane, PruneOutcome, QueueStorage,
+    QueueStorageConfig, RotateOutcome, SkipReason, SubmitBatchOperation,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -24660,4 +24660,805 @@ async fn test_prune_brin_fsm_baseline_follows_block_size() {
             "one extra FSM page at block_size={block_size}"
         );
     }
+}
+
+fn idle_gate_store_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 4,
+        lease_claim_receipts: true,
+        ..Default::default()
+    }
+}
+
+/// `(current_slot, generation)` of the `queue`, `lease` or `claim` ring.
+async fn ring_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
+    sqlx::query_as::<_, (i32, i64)>(&format!(
+        "SELECT current_slot, generation FROM {schema}.{ring}_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read ring state")
+}
+
+/// `ctid` and `xmin` of a ring-state singleton; any UPDATE or row lock that
+/// writes the tuple changes one of them.
+async fn ring_row_identity(pool: &sqlx::PgPool, schema: &str, table: &str) -> (String, String) {
+    sqlx::query_as::<_, (String, String)>(&format!(
+        "SELECT ctid::text, xmax::text || '/' || xmin::text FROM {schema}.{table}"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read ring-state row identity")
+}
+
+async fn ring_slot_generations(pool: &sqlx::PgPool, schema: &str) -> Vec<(i32, i64)> {
+    sqlx::query_as::<_, (i32, i64)>(&format!(
+        "SELECT slot, generation FROM {schema}.queue_ring_slots ORDER BY slot"
+    ))
+    .fetch_all(pool)
+    .await
+    .expect("read queue ring slots")
+}
+
+/// The cursor every rotation path maintains: each ring's current slot is its
+/// generation modulo the slot count, and the queue ring's current slot row
+/// carries the current generation.
+async fn assert_ring_cursors_consistent(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    config: &QueueStorageConfig,
+    context: &str,
+) {
+    for (ring, slot_count) in [
+        ("queue", config.queue_slot_count),
+        ("lease", config.lease_slot_count),
+        ("claim", config.claim_slot_count),
+    ] {
+        let (slot, generation) = ring_cursor(pool, schema, ring).await;
+        assert_eq!(
+            i64::from(slot),
+            generation.rem_euclid(slot_count as i64),
+            "{context}: {ring} ring cursor ({slot}, {generation}) left the rotation sequence"
+        );
+    }
+    let (slot, generation) = ring_cursor(pool, schema, "queue").await;
+    let slots = ring_slot_generations(pool, schema).await;
+    assert!(
+        slots.contains(&(slot, generation)),
+        "{context}: queue_ring_slots {slots:?} does not record the current generation {generation} for slot {slot}"
+    );
+    for (other_slot, other_generation) in &slots {
+        assert!(
+            *other_generation <= generation,
+            "{context}: slot {other_slot} has generation {other_generation} ahead of the cursor {generation}"
+        );
+    }
+}
+
+async fn ring_row_total(pool: &sqlx::PgPool, schema: &str) -> i64 {
+    let mut total = 0;
+    for table in [
+        "ready_segments",
+        "done_entries",
+        "ready_entries",
+        "ready_claim_attempt_batches",
+        "ready_tombstones",
+        "receipt_completion_batches",
+        "receipt_completion_tombstones",
+        "queue_terminal_count_deltas",
+        "queue_terminal_live_counts",
+        "leases",
+        "lease_claims",
+        "lease_claim_batches",
+        "lease_claim_closures",
+        "lease_claim_closure_batches",
+    ] {
+        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {schema}.{table}"))
+            .fetch_one(pool)
+            .await
+            .expect("count ring rows");
+        total += rows;
+    }
+    total
+}
+
+async fn prune_all_rings(store: &QueueStorage, pool: &sqlx::PgPool) {
+    store
+        .prune_oldest(pool, Duration::ZERO)
+        .await
+        .expect("prune queue ring");
+    store
+        .prune_oldest_leases(pool)
+        .await
+        .expect("prune lease ring");
+    store
+        .prune_oldest_claims(pool)
+        .await
+        .expect("prune claim ring");
+}
+
+async fn gated_rotate_all(store: &QueueStorage, pool: &sqlx::PgPool) -> [GatedRotateOutcome; 3] {
+    [
+        store
+            .rotate_if_active(pool)
+            .await
+            .expect("gated queue rotate"),
+        store
+            .rotate_leases_if_active(pool)
+            .await
+            .expect("gated lease rotate"),
+        store
+            .rotate_claims_if_active(pool)
+            .await
+            .expect("gated claim rotate"),
+    ]
+}
+
+async fn ungated_rotate_all(store: &QueueStorage, pool: &sqlx::PgPool) -> [RotateOutcome; 3] {
+    [
+        store.rotate(pool).await.expect("queue rotate"),
+        store.rotate_leases(pool).await.expect("lease rotate"),
+        store.rotate_claims(pool).await.expect("claim rotate"),
+    ]
+}
+
+/// Rotate and prune with the gated paths until every ring reports
+/// `SkippedIdle`, the way the maintenance leader converges on a quiet queue.
+async fn drain_rings_until_idle(store: &QueueStorage, pool: &sqlx::PgPool) {
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(20));
+    loop {
+        let outcomes = gated_rotate_all(store, pool).await;
+        if outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, GatedRotateOutcome::SkippedIdle { .. }))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rings did not drain to idle; last outcomes {outcomes:?}"
+        );
+        prune_all_rings(store, pool).await;
+    }
+}
+
+/// Rotation of an empty ring is skipped without locking or writing its
+/// ring-state row, and the matching prune has nothing to reclaim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_idle_ring_rotation_skips_without_ring_state_churn() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_idle_rotation_skip";
+    let store = create_store_with_config(&pool, idle_gate_store_config(schema)).await;
+
+    let cursors_before = [
+        ring_cursor(&pool, schema, "queue").await,
+        ring_cursor(&pool, schema, "lease").await,
+        ring_cursor(&pool, schema, "claim").await,
+    ];
+    let rows_before = [
+        ring_row_identity(&pool, schema, "queue_ring_state").await,
+        ring_row_identity(&pool, schema, "lease_ring_state").await,
+        ring_row_identity(&pool, schema, "claim_ring_state").await,
+    ];
+    let slots_before = ring_slot_generations(&pool, schema).await;
+
+    for round in 0..25 {
+        let outcomes = gated_rotate_all(&store, &pool).await;
+        for (outcome, (slot, generation)) in outcomes.iter().zip(cursors_before) {
+            assert_eq!(
+                *outcome,
+                GatedRotateOutcome::SkippedIdle { slot, generation },
+                "round {round}: an empty ring must skip rotation at its current cursor"
+            );
+        }
+    }
+
+    assert_eq!(
+        [
+            ring_cursor(&pool, schema, "queue").await,
+            ring_cursor(&pool, schema, "lease").await,
+            ring_cursor(&pool, schema, "claim").await,
+        ],
+        cursors_before
+    );
+    assert_eq!(
+        [
+            ring_row_identity(&pool, schema, "queue_ring_state").await,
+            ring_row_identity(&pool, schema, "lease_ring_state").await,
+            ring_row_identity(&pool, schema, "claim_ring_state").await,
+        ],
+        rows_before,
+        "an idle skip must not update or lock a ring-state row"
+    );
+    assert_eq!(ring_slot_generations(&pool, schema).await, slots_before);
+}
+
+/// A ring that holds rows rotates through the gate exactly as the ungated
+/// rotation does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_active_ring_rotation_proceeds_despite_idle_gate() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_active_rotation_proceeds";
+    let queue = "qs_active_rotation_proceeds";
+    let store = create_store_with_config(&pool, idle_gate_store_config(schema)).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 371 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        store.rotate_if_active(&pool).await.expect("rotate queue"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated {
+            slot: 1,
+            generation: 1
+        })
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    store
+        .register_callback(
+            &pool,
+            claimed[0].job.id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+    assert_eq!(lease_count(&pool, &store).await, 1);
+
+    assert_eq!(
+        store
+            .rotate_leases_if_active(&pool)
+            .await
+            .expect("rotate leases"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated {
+            slot: 1,
+            generation: 1
+        })
+    );
+    assert_eq!(
+        store
+            .rotate_claims_if_active(&pool)
+            .await
+            .expect("rotate claims"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated {
+            slot: 1,
+            generation: 1
+        })
+    );
+}
+
+/// The gate looks at every partition, not just the current slot: rows left in
+/// sealed slots keep rotation going until prune has reclaimed them, because
+/// prune only reclaims the oldest sealed slot and only rotation moves which
+/// slot that is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_idle_reclaim";
+    let queue = "idle_reclaim_q";
+    let store = create_store_with_config(&pool, idle_gate_store_config(schema)).await;
+
+    for (slot, generation) in [(0_i32, 0_i64), (1, 1)] {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.done_entries (
+                ready_slot, ready_generation, job_id, kind, queue, state,
+                priority, attempt, run_lease, lane_seq, enqueue_shard,
+                attempted_at, finalized_at, payload
+            ) VALUES ($1, $2, $3, 'idle_reclaim_job', $4,
+                      'completed'::awa.job_state, 2::smallint, 1::smallint,
+                      1::bigint, $5::bigint, 0::smallint, now(), now(),
+                      '{{}}'::jsonb)"
+        ))
+        .bind(slot)
+        .bind(generation)
+        .bind(8_000_000_i64 + i64::from(slot))
+        .bind(queue)
+        .bind(100_i64 + i64::from(slot))
+        .execute(&pool)
+        .await
+        .expect("seed sealed done row");
+    }
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_slots SET generation = slot WHERE slot IN (1, 2)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seal slot 1 and open slot 2");
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 2, generation = 2 WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance cursor as two rotations would");
+
+    let outcome = store.rotate_if_active(&pool).await.expect("rotate");
+    assert!(
+        matches!(outcome, GatedRotateOutcome::Attempted(_)),
+        "rotation must stay live while sealed slots hold rows, got {outcome:?}"
+    );
+    let pruned = prune_retrying_blocked(&store, &pool, Duration::ZERO, 0).await;
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
+        "first prune should reclaim slot 0, got {pruned:?}"
+    );
+    let outcome = store.rotate_if_active(&pool).await.expect("rotate");
+    assert!(
+        matches!(outcome, GatedRotateOutcome::Attempted(_)),
+        "rotation must stay live while slot 1 still holds rows, got {outcome:?}"
+    );
+    let pruned = prune_retrying_blocked(&store, &pool, Duration::ZERO, 1).await;
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 1, .. }),
+        "second prune should reclaim slot 1, got {pruned:?}"
+    );
+
+    let cursor = ring_cursor(&pool, schema, "queue").await;
+    for _ in 0..3 {
+        assert_eq!(
+            store.rotate_if_active(&pool).await.expect("rotate"),
+            GatedRotateOutcome::SkippedIdle {
+                slot: cursor.0,
+                generation: cursor.1
+            },
+            "a fully reclaimed ring should skip rotation"
+        );
+    }
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, cursor);
+}
+
+/// A per-slot terminal counter left behind without its done rows keeps the
+/// queue ring rotating, so prune reaches its slot and deletes it as it did
+/// before the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_idle_gate_keeps_rotating_until_orphan_terminal_counts_are_cleared() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_idle_orphan_counts";
+    let config = idle_gate_store_config(schema);
+    let store = create_store_with_config(&pool, config.clone()).await;
+
+    for _ in 0..3 {
+        assert!(matches!(
+            store.rotate(&pool).await.expect("rotate"),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_terminal_live_counts \
+             (ready_slot, queue, priority, enqueue_shard, live_terminal_count) \
+         VALUES (1, 'orphan_counts_q', 2, 0, 1)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed an orphan terminal counter for sealed slot 1");
+
+    let outcome = store.rotate_if_active(&pool).await.expect("rotate");
+    assert!(
+        matches!(outcome, GatedRotateOutcome::Attempted(_)),
+        "an orphan counter must keep the ring rotating, got {outcome:?}"
+    );
+    drain_rings_until_idle(&store, &pool).await;
+    let (orphans,): (i64,) = sqlx::query_as(&format!(
+        "SELECT count(*) FROM {schema}.queue_terminal_live_counts"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count live counters");
+    assert_eq!(orphans, 0, "prune should have deleted the orphan counter");
+    assert_ring_cursors_consistent(&pool, schema, &config, "after drain").await;
+}
+
+/// A ring that carried traffic keeps rotating until prune has reclaimed it,
+/// then freezes; the first write after that rotates on the very next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_drained_ring_rotation_skips_after_prune_and_resumes_on_work() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_drained_rotation_skips";
+    let queue = "qs_drained_rotation_skips";
+    let config = idle_gate_store_config(schema);
+    let store = create_store_with_config(&pool, config.clone()).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete job");
+
+    assert!(matches!(
+        store.rotate_if_active(&pool).await.expect("rotate queue"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated { slot: 1, .. })
+    ));
+    assert!(matches!(
+        store
+            .rotate_claims_if_active(&pool)
+            .await
+            .expect("rotate claims"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated { slot: 1, .. })
+    ));
+    assert!(
+        matches!(
+            store
+                .rotate_leases_if_active(&pool)
+                .await
+                .expect("rotate leases"),
+            GatedRotateOutcome::SkippedIdle {
+                slot: 0,
+                generation: 0
+            }
+        ),
+        "receipt-path traffic never writes a lease row"
+    );
+
+    drain_rings_until_idle(&store, &pool).await;
+    assert_eq!(ring_row_total(&pool, schema).await, 0);
+    assert_ring_cursors_consistent(&pool, schema, &config, "drained").await;
+
+    let queue_cursor = ring_cursor(&pool, schema, "queue").await;
+    let lease_cursor = ring_cursor(&pool, schema, "lease").await;
+    let claim_cursor = ring_cursor(&pool, schema, "claim").await;
+    for _ in 0..3 {
+        let outcomes = gated_rotate_all(&store, &pool).await;
+        assert_eq!(
+            outcomes,
+            [
+                GatedRotateOutcome::SkippedIdle {
+                    slot: queue_cursor.0,
+                    generation: queue_cursor.1
+                },
+                GatedRotateOutcome::SkippedIdle {
+                    slot: lease_cursor.0,
+                    generation: lease_cursor.1
+                },
+                GatedRotateOutcome::SkippedIdle {
+                    slot: claim_cursor.0,
+                    generation: claim_cursor.1
+                },
+            ]
+        );
+        prune_all_rings(&store, &pool).await;
+    }
+
+    let revived = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        store.rotate_if_active(&pool).await.expect("rotate queue"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated {
+            slot: (queue_cursor.0 + 1).rem_euclid(config.queue_slot_count as i32),
+            generation: queue_cursor.1 + 1
+        }),
+        "the first enqueue after an idle period must un-idle the queue ring"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim revived job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, revived);
+    assert_eq!(
+        store
+            .rotate_claims_if_active(&pool)
+            .await
+            .expect("rotate claims"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated {
+            slot: (claim_cursor.0 + 1).rem_euclid(config.claim_slot_count as i32),
+            generation: claim_cursor.1 + 1
+        }),
+        "the first claim after an idle period must un-idle the claim ring"
+    );
+
+    store
+        .register_callback(
+            &pool,
+            claimed[0].job.id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+    assert_eq!(
+        store
+            .rotate_leases_if_active(&pool)
+            .await
+            .expect("rotate leases"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated {
+            slot: (lease_cursor.0 + 1).rem_euclid(config.lease_slot_count as i32),
+            generation: lease_cursor.1 + 1
+        }),
+        "the first lease after an idle period must un-idle the lease ring"
+    );
+    assert_ring_cursors_consistent(&pool, schema, &config, "resumed").await;
+}
+
+/// A fleet mixing leaders that rotate idle rings (0.6.17 and earlier) with
+/// leaders that skip them advances one consistent cursor per ring: either
+/// kind of rotation can follow the other, prune reclaims everything both
+/// leave behind, and jobs flow throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mixed_gated_and_ungated_rotation_keeps_ring_consistent() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_mixed_idle_gate";
+    let queue = "qs_mixed_idle_gate";
+    let config = idle_gate_store_config(schema);
+    let store = create_store_with_config(&pool, config.clone()).await;
+
+    let mut completed = Vec::new();
+    for round in 0..24_i64 {
+        let ungated = round % 3 != 1;
+        let traffic = (round / 4) % 2 == 0;
+        let mut in_flight = Vec::new();
+        if traffic {
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: round },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            in_flight = store
+                .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+                .await
+                .expect("claim");
+            assert_eq!(
+                in_flight.len(),
+                1,
+                "round {round}: the job must be claimable"
+            );
+            if round % 2 == 0 {
+                store
+                    .register_callback(
+                        &pool,
+                        in_flight[0].job.id,
+                        in_flight[0].job.run_lease,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("register callback");
+            }
+        }
+
+        let before = [
+            ring_cursor(&pool, schema, "queue").await,
+            ring_cursor(&pool, schema, "lease").await,
+            ring_cursor(&pool, schema, "claim").await,
+        ];
+        if ungated {
+            for (ring, outcome) in ["queue", "lease", "claim"]
+                .into_iter()
+                .zip(ungated_rotate_all(&store, &pool).await)
+            {
+                assert!(
+                    matches!(
+                        outcome,
+                        RotateOutcome::Rotated { .. } | RotateOutcome::SkippedBusy { .. }
+                    ),
+                    "round {round}: {ring} ungated rotate returned {outcome:?}"
+                );
+            }
+        } else {
+            for (index, outcome) in gated_rotate_all(&store, &pool)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                if let GatedRotateOutcome::SkippedIdle { slot, generation } = outcome {
+                    assert_eq!(
+                        (slot, generation),
+                        before[index],
+                        "round {round}: an idle skip must report the cursor it left"
+                    );
+                }
+            }
+        }
+
+        if !in_flight.is_empty() {
+            store
+                .complete_runtime_batch(&pool, &in_flight)
+                .await
+                .expect("complete");
+            completed.push(in_flight[0].job.id);
+        }
+        prune_all_rings(&store, &pool).await;
+        assert_ring_cursors_consistent(&pool, schema, &config, &format!("round {round}")).await;
+    }
+
+    for job_id in &completed {
+        let job = store.load_job(&pool, *job_id).await.expect("load job");
+        if let Some(job) = job {
+            assert_eq!(job.state, JobState::Completed, "job {job_id}");
+        }
+    }
+    assert!(!completed.is_empty());
+
+    drain_rings_until_idle(&store, &pool).await;
+    assert_eq!(
+        ring_row_total(&pool, schema).await,
+        0,
+        "every row either fleet left must be reclaimable"
+    );
+    assert_ring_cursors_consistent(&pool, schema, &config, "drained").await;
+
+    for _ in 0..3 {
+        ungated_rotate_all(&store, &pool).await;
+        prune_all_rings(&store, &pool).await;
+        assert!(gated_rotate_all(&store, &pool)
+            .await
+            .iter()
+            .all(|outcome| matches!(outcome, GatedRotateOutcome::SkippedIdle { .. })));
+    }
+    assert_ring_cursors_consistent(&pool, schema, &config, "idle after ungated laps").await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1_000 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        store.rotate_if_active(&pool).await.expect("rotate"),
+        GatedRotateOutcome::Attempted(RotateOutcome::Rotated { .. })
+    ));
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim after mixed laps");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+}
+
+/// The maintenance leader leaves an empty ring's cursor in place, rotates as
+/// soon as a job arrives, and freezes again once prune has reclaimed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_maintenance_idle_gate_freezes_and_resumes_rotation() {
+    struct CountingCompleteWorker(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Worker for CountingCompleteWorker {
+        fn kind(&self) -> &'static str {
+            "complete_job"
+        }
+
+        async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(JobResult::Completed)
+        }
+    }
+
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_maintenance_idle_gate";
+    let queue = "qs_maintenance_idle_gate";
+    let config = idle_gate_store_config(schema);
+    let store = create_store_with_config(&pool, config.clone()).await;
+
+    let performed = Arc::new(AtomicUsize::new(0));
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            config.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_millis(50))
+        .register_worker(CountingCompleteWorker(performed.clone()))
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("build client");
+    client.start().await.expect("start client");
+
+    let rows_before = [
+        ring_row_identity(&pool, schema, "queue_ring_state").await,
+        ring_row_identity(&pool, schema, "lease_ring_state").await,
+        ring_row_identity(&pool, schema, "claim_ring_state").await,
+    ];
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(
+        [
+            ring_row_identity(&pool, schema, "queue_ring_state").await,
+            ring_row_identity(&pool, schema, "lease_ring_state").await,
+            ring_row_identity(&pool, schema, "claim_ring_state").await,
+        ],
+        rows_before,
+        "the leader must not touch an empty ring's state rows"
+    );
+    let idle_queue_cursor = ring_cursor(&pool, schema, "queue").await;
+
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(30));
+    loop {
+        let advanced = ring_cursor(&pool, schema, "queue").await.1 > idle_queue_cursor.1;
+        if performed.load(Ordering::SeqCst) == 1
+            && advanced
+            && ring_row_total(&pool, schema).await == 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the job should run, and the leader should rotate the ring once it arrives and reclaim it afterwards"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let frozen = [
+        ring_cursor(&pool, schema, "queue").await,
+        ring_cursor(&pool, schema, "lease").await,
+        ring_cursor(&pool, schema, "claim").await,
+    ];
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        [
+            ring_cursor(&pool, schema, "queue").await,
+            ring_cursor(&pool, schema, "lease").await,
+            ring_cursor(&pool, schema, "claim").await,
+        ],
+        frozen,
+        "a reclaimed ring must stop rotating"
+    );
+    assert_ring_cursors_consistent(&pool, schema, &config, "after maintenance").await;
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
