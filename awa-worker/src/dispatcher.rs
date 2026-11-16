@@ -495,6 +495,29 @@ impl Dispatcher {
         permits
     }
 
+    /// Waits for a slot in this runtime's claim gate. Returns `None`, with the
+    /// batch's rate tokens refunded, when dispatch is cancelled or the gate is
+    /// closed first.
+    async fn acquire_claim_slot(
+        &self,
+        batch_size: usize,
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                self.refund_rate_limit(batch_size);
+                None
+            }
+            permit = self.claim_gate.acquire() => match permit {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.refund_rate_limit(batch_size);
+                    None
+                }
+            }
+        }
+    }
+
     /// In weighted mode, clear this queue's overflow demand.
     fn clear_overflow_demand(&self) {
         if let ConcurrencyMode::Weighted {
@@ -612,8 +635,12 @@ impl Dispatcher {
         let claim_start = Instant::now();
 
         let jobs: Vec<DispatchedJob> = match &self.storage {
-            RuntimeStorage::Canonical => match sqlx::query_as::<_, JobRow>(
-                r#"
+            RuntimeStorage::Canonical => {
+                let Some(claim_slot) = self.acquire_claim_slot(batch_size).await else {
+                    return false;
+                };
+                let claimed = sqlx::query_as::<_, JobRow>(
+                    r#"
                 WITH claimed AS (
                     SELECT id
                     FROM awa.jobs_hot
@@ -640,42 +667,33 @@ impl Dispatcher {
                   AND awa.jobs_hot.state = 'available'
                 RETURNING awa.jobs_hot.*
                 "#,
-            )
-            .bind(&self.queue)
-            .bind(batch_size as i32)
-            .bind(deadline_secs)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(jobs) => jobs
-                    .into_iter()
-                    .map(|job| DispatchedJob {
-                        job,
-                        queue_storage_claim: None,
-                        queue_storage_unique_states: None,
-                        abandon_after,
-                    })
-                    .collect(),
-                Err(err) => {
-                    warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
-                    self.refund_rate_limit(batch_size);
-                    return false;
-                }
-            },
-            RuntimeStorage::QueueStorage(runtime) => {
-                let claim_slot = tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => {
+                )
+                .bind(&self.queue)
+                .bind(batch_size as i32)
+                .bind(deadline_secs)
+                .fetch_all(&self.pool)
+                .await;
+                drop(claim_slot);
+                match claimed {
+                    Ok(jobs) => jobs
+                        .into_iter()
+                        .map(|job| DispatchedJob {
+                            job,
+                            queue_storage_claim: None,
+                            queue_storage_unique_states: None,
+                            abandon_after,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
                         self.refund_rate_limit(batch_size);
                         return false;
                     }
-                    permit = self.claim_gate.acquire() => match permit {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            self.refund_rate_limit(batch_size);
-                            return false;
-                        }
-                    }
+                }
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                let Some(claim_slot) = self.acquire_claim_slot(batch_size).await else {
+                    return false;
                 };
                 if check_ready_signal {
                     match runtime
@@ -861,11 +879,6 @@ mod tests {
     fn blocked_dispatcher_on(
         database_url: &str,
     ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(database_url)
-            .unwrap();
-        let metrics =
-            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
         let storage = RuntimeStorage::QueueStorage(
             crate::storage::QueueStorageRuntime::new(
                 awa_model::QueueStorageConfig::default(),
@@ -874,6 +887,18 @@ mod tests {
             )
             .unwrap(),
         );
+        blocked_dispatcher_with(database_url, storage)
+    }
+
+    fn blocked_dispatcher_with(
+        database_url: &str,
+        storage: RuntimeStorage,
+    ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(database_url)
+            .unwrap();
+        let metrics =
+            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
         let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
         let (_, completion) = crate::completion::CompletionBatcher::new(
             pool.clone(),
@@ -996,6 +1021,44 @@ mod tests {
                 .await
                 .unwrap());
         }
+        assert_eq!(dispatcher.claim_gate.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn canonical_claim_waits_for_the_claim_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher_with(
+            &format!("postgres://postgres:test@127.0.0.1:{port}/awa_test"),
+            RuntimeStorage::Canonical,
+        );
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block the canonical claim"),
+                accepted = listener.accept() => {
+                    panic!("canonical claim opened a connection past a saturated gate: {accepted:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
         assert_eq!(dispatcher.claim_gate.available_permits(), 0);
     }
 
