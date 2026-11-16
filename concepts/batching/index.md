@@ -22,7 +22,7 @@ A batch insert writes all its jobs in one statement, so they commit or roll back
 
 To enqueue in the same transaction as a business write, use an API that takes your transaction; see [transactional enqueue](../transactional-enqueue/index.md). The lane locks a batch takes are held until its transaction commits. A large batch in a long transaction holds every lane it touched for that long, and other producers on those lanes wait behind it. Commit large batches promptly, or split them.
 
-Direct producers must use the same queue-storage settings as the workers, in particular the stripe count; see [Producer path choice](../../configuration/index.md#producer-path-choice).
+Direct producers must use the same queue-storage settings as the workers; see [Producer path choice](../../configuration/index.md#producer-path-choice).
 
 ## Claim: one round trip per batch
 

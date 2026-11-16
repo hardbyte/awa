@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://hardbyte.github.io/awa/concepts/lanes-and-claiming/">
       
       
-        <link rel="prev" href="../">
+        <link rel="prev" href="../queues-lanes-and-splitting-work/">
       
       
         <link rel="next" href="../claims-receipts-and-leases/">
@@ -698,6 +698,8 @@
       
         
       
+        
+      
     
     
     
@@ -753,6 +755,34 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../queues-lanes-and-splitting-work/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queues, lanes and splitting work
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -2541,9 +2571,10 @@
 <li>Jobs at different priorities are ordered by effective priority, not by when they were enqueued.</li>
 </ul>
 <h2 id="shards-more-lanes-for-one-hot-queue">Shards: more lanes for one hot queue<a class="headerlink" href="#shards-more-lanes-for-one-hot-queue" title="Permanent link">&para;</a></h2>
-<p>One lane admits one claimer and one producer at a time. When a single <code>(queue, priority)</code> carries more traffic than that, raise the queue's <code>enqueue_shards</code>. Producers spread jobs across the shards and workers claim from all of them, at the cost of strict FIFO across the whole queue. See <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head per queue</a> and <a href="../../configuration/#choosing-a-throughput-lever">Choosing a throughput lever</a>.</p>
+<p>One lane admits one claimer and one producer at a time. When a single <code>(queue, priority)</code> carries more traffic than that, raise the queue's <code>enqueue_shards</code>. Producers spread jobs across the shards and workers claim from all of them, at the cost of strict FIFO across the whole queue. <a href="../queues-lanes-and-splitting-work/#producers-waiting-on-one-lane-enqueue-shards">Queues, lanes and splitting work</a> compares shards with the other ways to divide work. See <a href="../../configuration/#sharding-the-enqueue-head-per-queue">Sharding the enqueue head per queue</a> and <a href="../../configuration/#choosing-a-throughput-lever">Choosing a throughput lever</a>.</p>
 <h2 id="related">Related<a class="headerlink" href="#related" title="Permanent link">&para;</a></h2>
 <ul>
+<li><a href="../queues-lanes-and-splitting-work/">Queues, lanes and splitting work</a>: when to use separate queues, priority, claimers, shards or partitions, and which combine.</li>
 <li><a href="../claims-receipts-and-leases/">Claims, receipts and leases</a>: what a claim writes and how an attempt ends.</li>
 <li><a href="../transactional-enqueue/">Transactional enqueue</a>: enqueueing with the business write.</li>
 <li><a href="../../architecture/#enqueue-and-claim">Architecture: enqueue and claim</a>: the tables and functions behind each step.</li>
@@ -2586,7 +2617,7 @@
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../" class="md-footer__link md-footer__link--prev" aria-label="Previous: How AWA works">
+          <a href="../queues-lanes-and-splitting-work/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Queues, lanes and splitting work">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
@@ -2596,7 +2627,7 @@
                 Previous
               </span>
               <div class="md-ellipsis">
-                How AWA works
+                Queues, lanes and splitting work
               </div>
             </div>
           </a>
