@@ -55,7 +55,7 @@ pub use queue_storage::{
     PromotionLane, PruneOutcome, QueueCounts, QueueRingPin, QueueStorage, QueueStorageConfig,
     RescueBatch, RescueBatchOptions, RescueScanCursor, RescueScanProgress, RescueSlotOrder,
     RotateOutcome, RuntimeBatchCompletion, SkipReason, SpentClaimHeadAdvance,
-    TerminalDeltaRollupOutcome,
+    SpentClaimHeadAdvances, SpentClaimHeadFailure, TerminalDeltaRollupOutcome,
 };
 pub use storage::StorageStatus;
 

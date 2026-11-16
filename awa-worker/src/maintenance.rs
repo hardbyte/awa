@@ -1063,6 +1063,8 @@ pub struct MaintenanceService {
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
     queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
+    /// When the leader last warned that it could not advance a pinning lane.
+    queue_ring_advance_warned_at: std::sync::Mutex<Option<Instant>>,
     rescue_others_first_offset: AtomicUsize,
     promote_interval: Duration,
     cleanup_interval: Duration,
@@ -1402,6 +1404,7 @@ impl MaintenanceService {
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
             queue_ring_pin: std::sync::Mutex::new(QueueRingPinReport::default()),
+            queue_ring_advance_warned_at: std::sync::Mutex::new(None),
             rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
@@ -3859,7 +3862,11 @@ impl MaintenanceService {
                 return;
             }
         };
-        let (pin, released) = self.release_spent_pinning_lanes(store, pin).await;
+        let (pin, released) = if self.control.allowed() {
+            self.release_spent_pinning_lanes(store, pin).await
+        } else {
+            (Some(pin), false)
+        };
         if released {
             prune_tracker.reset(PRUNE_BRANCH_QUEUE);
         }
@@ -3906,16 +3913,44 @@ impl MaintenanceService {
         pin: QueueRingPin,
     ) -> (Option<QueueRingPin>, bool) {
         let lanes = &pin.lanes[..pin.lanes.len().min(QUEUE_RING_PIN_ADVANCE_LANES)];
-        let advanced = match store
+        let outcome = match store
             .advance_spent_claim_heads(&self.pool, lanes, QUEUE_RING_PIN_ADVANCE_WINDOWS)
             .await
         {
-            Ok(advanced) => advanced,
+            Ok(outcome) => outcome,
             Err(err) => {
-                debug!(error = %err, "Failed to advance the claim cursors of lanes pinning the queue ring");
+                if self.queue_ring_advance_warn_due() {
+                    warn!(
+                        slot = pin.slot,
+                        error = %err,
+                        "Failed to advance the claim cursors of lanes pinning the queue ring",
+                    );
+                }
                 return (Some(pin), false);
             }
         };
+        for lane in &outcome.failed {
+            self.metrics.record_queue_ring_claim_cursor_advance(
+                &lane.queue,
+                lane.priority,
+                lane.enqueue_shard,
+                "failed",
+            );
+        }
+        if let Some(lane) = outcome.failed.first() {
+            if self.queue_ring_advance_warn_due() {
+                warn!(
+                    slot = pin.slot,
+                    queue = %lane.queue,
+                    priority = lane.priority,
+                    enqueue_shard = lane.enqueue_shard,
+                    error = %lane.error,
+                    failed_lanes = outcome.failed.len(),
+                    "Failed to advance the claim cursor of a lane pinning the queue ring",
+                );
+            }
+        }
+        let advanced = outcome.advanced;
         if advanced.is_empty() {
             return (Some(pin), false);
         }
@@ -3924,6 +3959,7 @@ impl MaintenanceService {
                 &lane.queue,
                 lane.priority,
                 lane.enqueue_shard,
+                "advanced",
             );
         }
         let after = match store.queue_ring_pin(&self.pool).await {
@@ -3957,6 +3993,21 @@ impl MaintenanceService {
             );
         }
         (after, released)
+    }
+
+    /// Whether to warn about a failed claim-cursor advance: the first time,
+    /// then at most once per [`QUEUE_RING_PIN_WARN_INTERVAL`].
+    fn queue_ring_advance_warn_due(&self) -> bool {
+        let mut warned_at = self
+            .queue_ring_advance_warned_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let due = warned_at.is_none_or(|at| now.duration_since(at) >= QUEUE_RING_PIN_WARN_INTERVAL);
+        if due {
+            *warned_at = Some(now);
+        }
+        due
     }
 
     fn clear_queue_ring_pin(&self) {

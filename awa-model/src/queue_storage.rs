@@ -717,6 +717,26 @@ pub struct SpentClaimHeadAdvance {
     pub to_seq: i64,
 }
 
+/// A lane [`QueueStorage::advance_spent_claim_heads`] could not advance
+/// because of an error other than lock contention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpentClaimHeadFailure {
+    pub queue: String,
+    pub priority: i16,
+    pub enqueue_shard: i16,
+    pub error: String,
+}
+
+/// What one [`QueueStorage::advance_spent_claim_heads`] call did, lane by
+/// lane. A lane skipped for lock contention appears in neither list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpentClaimHeadAdvances {
+    pub advanced: Vec<SpentClaimHeadAdvance>,
+    pub failed: Vec<SpentClaimHeadFailure>,
+}
+
 /// The oldest sealed queue ring slot and the lanes whose pending ready rows
 /// keep queue prune from reclaiming it. See [`QueueStorage::queue_ring_pin`].
 #[derive(Debug, Clone, PartialEq)]
@@ -9210,10 +9230,10 @@ impl QueueStorage {
     }
 
     /// SQL true when the ready row `alias` was claimed, by the evidence the
-    /// claim path itself trusts for this store's mode: claim-attempt batches
-    /// with receipts, [`Self::ready_row_claimed_sql`] without.
-    fn ready_row_claimed_for_mode_sql(&self, alias: &str) -> String {
-        if self.lease_claim_receipts() {
+    /// schema's claim function trusts: claim-attempt batches with receipts,
+    /// [`Self::ready_row_claimed_sql`] without.
+    fn ready_row_claimed_for_mode_sql(&self, alias: &str, receipts: bool) -> String {
+        if receipts {
             self.ready_row_attempt_batch_sql(alias)
         } else {
             self.ready_row_claimed_sql(alias)
@@ -10418,17 +10438,19 @@ impl QueueStorage {
         pool: &PgPool,
         lanes: &[PendingReadyLane],
         max_windows: usize,
-    ) -> Result<Vec<SpentClaimHeadAdvance>, AwaError> {
+    ) -> Result<SpentClaimHeadAdvances, AwaError> {
+        let mut outcome = SpentClaimHeadAdvances::default();
         if lanes.is_empty() || max_windows == 0 {
-            return Ok(Vec::new());
+            return Ok(outcome);
         }
         let schema = self.schema();
-        let claimed = self.ready_row_claimed_for_mode_sql("ready");
         let mut probe = pool
             .begin_with(DRAIN_TRANSACTION_BEGIN)
             .await
             .map_err(map_sqlx_error)?;
         set_lock_timeout_tx(&mut probe, CLAIM_CURSOR_ADVANCE_LOCK_TIMEOUT).await?;
+        let receipts = self.schema_uses_lease_claim_receipts_tx(&mut probe).await?;
+        let claimed = self.ready_row_claimed_for_mode_sql("ready", receipts);
         let candidates: Result<Vec<(String, i16, i16)>, sqlx::Error> = sqlx::query_as(&format!(
             r#"
             WITH heads AS MATERIALIZED (
@@ -10512,19 +10534,25 @@ impl QueueStorage {
                     error = %err,
                     "Skipped claim-cursor advances behind a locked queue-storage table"
                 );
-                return Ok(Vec::new());
+                return Ok(outcome);
             }
             Err(err) => return Err(map_sqlx_error(err)),
         };
         probe.commit().await.map_err(map_sqlx_error)?;
 
         let sql = self.spent_claim_prefix_advance_sql(&claimed);
-        let mut advanced = Vec::new();
         for (queue, priority, enqueue_shard) in candidates {
             let mut moved: Option<SpentClaimHeadAdvance> = None;
             for _ in 0..max_windows {
                 let step = self
-                    .advance_spent_claim_head_window(pool, &sql, &queue, priority, enqueue_shard)
+                    .advance_spent_claim_head_window(
+                        pool,
+                        &sql,
+                        receipts,
+                        &queue,
+                        priority,
+                        enqueue_shard,
+                    )
                     .await;
                 let step = match step {
                     Ok(step) => step,
@@ -10538,7 +10566,15 @@ impl QueueStorage {
                         );
                         break;
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        outcome.failed.push(SpentClaimHeadFailure {
+                            queue: queue.clone(),
+                            priority,
+                            enqueue_shard,
+                            error: err.to_string(),
+                        });
+                        break;
+                    }
                 };
                 let Some(step) = step else {
                     break;
@@ -10560,9 +10596,35 @@ impl QueueStorage {
                     break;
                 }
             }
-            advanced.extend(moved);
+            outcome.advanced.extend(moved);
         }
-        Ok(advanced)
+        Ok(outcome)
+    }
+
+    /// Whether this store's schema claims with lease-claim receipts, read from
+    /// its installed claim function the way the schema migrations read it.
+    /// Falls back to this store's configuration when the function is missing.
+    async fn schema_uses_lease_claim_receipts_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+    ) -> Result<bool, AwaError> {
+        let receipts: Option<bool> = sqlx::query_scalar(
+            r#"
+            SELECT $1 = 'awa'
+                OR position(
+                    format('INSERT INTO %I.lease_claims', $1::text)
+                    IN pg_get_functiondef(to_regprocedure(format(
+                        '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+                        $1::text
+                    )))
+                ) > 0
+            "#,
+        )
+        .bind(self.schema())
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(receipts.unwrap_or_else(|| self.lease_claim_receipts()))
     }
 
     /// One window of [`Self::advance_spent_claim_heads`] for one lane, in its
@@ -10572,6 +10634,7 @@ impl QueueStorage {
         &self,
         pool: &PgPool,
         sql: &str,
+        receipts: bool,
         queue: &str,
         priority: i16,
         enqueue_shard: i16,
@@ -10600,10 +10663,10 @@ impl QueueStorage {
             tx.rollback().await.map_err(map_sqlx_error)?;
             return Ok(None);
         }
-        // The tables the advance statement reads in this mode, locked up
-        // front without waiting: a table another transaction holds
+        // The tables the advance statement reads in the schema's claim mode,
+        // locked up front without waiting: a table another transaction holds
         // exclusively ends this window instead of queueing behind it.
-        let tables: &[&str] = if self.lease_claim_receipts() {
+        let tables: &[&str] = if receipts {
             &[
                 "ready_segments",
                 "ready_entries",

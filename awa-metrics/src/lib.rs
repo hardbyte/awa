@@ -266,10 +266,11 @@ pub struct AwaMetrics {
     /// slot. Updated when queue prune runs and, while a lane pins the slot, at
     /// least every 15 seconds or queue rotation tick, whichever is longer.
     pub maintenance_prune_pinned_ready_age_seconds: Gauge<f64>,
-    /// Claim-cursor advances the maintenance leader made over the spent head
-    /// rows (tombstoned or already claimed) of a lane pinning the oldest
-    /// sealed queue ring slot, by `awa.job.queue`, `awa.job.priority` and
-    /// `awa.queue.enqueue_shard`. One per lane per advance, however many rows
+    /// Claim-cursor advances the maintenance leader made, or failed to make,
+    /// over the spent head rows (tombstoned or already claimed) of a lane
+    /// pinning the oldest sealed queue ring slot, by `awa.job.queue`,
+    /// `awa.job.priority`, `awa.queue.enqueue_shard` and `awa.ring.outcome`
+    /// (`advanced` or `failed`). One per lane per attempt, however many rows
     /// it passed.
     pub maintenance_prune_claim_cursor_advances: Counter<u64>,
     /// Per-branch wall-clock duration for the maintenance leader's main
@@ -1289,16 +1290,19 @@ impl AwaMetrics {
             .record(age.as_secs_f64(), &attrs);
     }
 
-    /// Record that the maintenance leader advanced the claim cursor of a lane
-    /// pinning the oldest sealed queue ring slot over its spent head rows.
+    /// Record that the maintenance leader advanced (`outcome` `advanced`) or
+    /// failed to advance (`failed`) the claim cursor of a lane pinning the
+    /// oldest sealed queue ring slot over its spent head rows.
     pub fn record_queue_ring_claim_cursor_advance(
         &self,
         queue: &str,
         priority: i16,
         enqueue_shard: i16,
+        outcome: &'static str,
     ) {
         let attrs = [
             opentelemetry::KeyValue::new("awa.ring", "queue"),
+            opentelemetry::KeyValue::new("awa.ring.outcome", outcome),
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
             opentelemetry::KeyValue::new("awa.job.priority", i64::from(priority)),
             opentelemetry::KeyValue::new("awa.queue.enqueue_shard", i64::from(enqueue_shard)),
@@ -1435,9 +1439,9 @@ mod tests {
             .build();
         let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
 
-        metrics.record_queue_ring_claim_cursor_advance("emails", 4, 0);
-        metrics.record_queue_ring_claim_cursor_advance("emails", 4, 0);
-        metrics.record_queue_ring_claim_cursor_advance("reports", 2, 3);
+        metrics.record_queue_ring_claim_cursor_advance("emails", 4, 0, "advanced");
+        metrics.record_queue_ring_claim_cursor_advance("emails", 4, 0, "advanced");
+        metrics.record_queue_ring_claim_cursor_advance("reports", 2, 3, "failed");
         provider.force_flush().expect("flush metrics");
 
         let mut advances = BTreeMap::new();
@@ -1462,9 +1466,10 @@ mod tests {
                 }
             }
         }
-        let lane = |queue: &str, priority: &str, shard: &str| {
+        let lane = |queue: &str, priority: &str, shard: &str, outcome: &str| {
             BTreeMap::from([
                 ("awa.ring".to_string(), "queue".to_string()),
+                ("awa.ring.outcome".to_string(), outcome.to_string()),
                 ("awa.job.queue".to_string(), queue.to_string()),
                 ("awa.job.priority".to_string(), priority.to_string()),
                 ("awa.queue.enqueue_shard".to_string(), shard.to_string()),
@@ -1473,8 +1478,8 @@ mod tests {
         assert_eq!(
             advances,
             BTreeMap::from([
-                (lane("emails", "4", "0"), 2),
-                (lane("reports", "2", "3"), 1)
+                (lane("emails", "4", "0", "advanced"), 2),
+                (lane("reports", "2", "3", "failed"), 1)
             ])
         );
     }
