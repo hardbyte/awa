@@ -24,10 +24,6 @@ Before spreading a queue, check that it is short of lane throughput rather than 
 
 Judge a change by durable completions per second, end-to-end p99 latency, queue depth, and WAL bytes and transactions per completed job. Compare against a run of the same workload before the change. The `awa.job.claimed` counter carries an `awa.enqueue.shard` attribute, so a dashboard can confirm that claims are spread evenly across shards.
 
-## Queue stripes
-
-`queue_stripe_count` also splits queues into more lanes, but for every queue in the fleet at once. It is planned for deprecation in 0.7 in favour of enqueue shards and partitioned queues ([#752](https://github.com/hardbyte/awa/issues/752)); do not adopt it for new deployments. Existing settings are described under [Queue storage tuning](../configuration.md#what-the-knobs-mean).
-
 ## Related
 
 - [Queues, lanes and splitting work](queues-lanes-and-splitting-work.md): the problem each tool solves, what it gives up, and which combine.

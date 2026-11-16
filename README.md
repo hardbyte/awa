@@ -69,7 +69,7 @@ The north-star benchmark is not enqueue-only speed. Awa is judged by end-to-end 
 
 Queue-storage soak reference, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95 pickup**, **417 exact final dead tuples**. Enqueue reference: ~30k/s single-producer, ~100k/s multi-producer.
 
-For high-volume queue-storage producers, use the direct queue-storage COPY path: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Configure direct-copy producers with the same queue-storage routing knobs as the worker fleet, especially `queue_stripe_count` / `queue_storage_queue_stripe_count`. The older `insert_many_copy()` API is the compatibility insert surface; it remains useful for canonical-storage compatibility and adapters, but it is not the queue-storage producer fast path.
+For high-volume queue-storage producers, use the direct queue-storage COPY path: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Configure direct-copy producers with the same queue-storage routing settings as the worker fleet. The older `insert_many_copy()` API is the compatibility insert surface; it remains useful for canonical-storage compatibility and adapters, but it is not the queue-storage producer fast path.
 
 A phase-driven portable benchmark harness comparing Awa against pgque, procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres instance lives in its own repository: [hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). It records producer, subscriber, and end-to-end delivery latency alongside throughput, queue depth, dead tuples, WAL pressure, and transaction pressure over time.
 
