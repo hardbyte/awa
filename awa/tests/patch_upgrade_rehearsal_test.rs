@@ -22,7 +22,8 @@
 //! on a later attempt, and per-queue counts match what was enqueued.
 //!
 //! Needs a superuser `DATABASE_URL` (it creates roles and a database) and:
-//! - `AWA_RELEASED_VERSION` (optional): `0.6.9` (default) or `0.6.15`
+//! - `AWA_RELEASED_VERSION` (optional): a version in `RELEASED`;
+//!   defaults to `0.6.9`
 //! - `AWA_RELEASED_CLI`: the matching released `awa` binary (`awa-cli` wheel)
 //! - `AWA_RELEASED_PYTHON`: a Python with the matching released `awa-pg` wheel
 //! - `AWA_CANDIDATE_CLI` (optional): the candidate `awa`; defaults to
@@ -83,13 +84,77 @@ fn env_path(var: &str) -> PathBuf {
     }
 }
 
-fn released_version() -> String {
+/// A released version the rehearsal runs against.
+struct Released {
+    version: &'static str,
+    /// The schema patches the candidate's `awa migrate` applies to a database
+    /// this version installed, in `migrations::SCHEMA_PATCHES` order.
+    pending_patches: &'static [&'static str],
+    /// Whether its runtimes report runtime-control observations.
+    observes_runtime_controls: bool,
+}
+
+const RELEASED: &[Released] = &[
+    Released {
+        version: "0.6.9",
+        pending_patches: &[
+            "prepared_lane_sequences",
+            "definer_lane_provisioning",
+            "claim_batch_job_index",
+            "insert_jobs_compat_batch",
+            "prune_controls",
+            "runtime_maintenance_eligibility",
+            "correlated_claim_tombstones",
+            "replica_identity",
+        ],
+        observes_runtime_controls: false,
+    },
+    Released {
+        version: "0.6.15",
+        pending_patches: &[
+            "claim_batch_job_index",
+            "insert_jobs_compat_batch",
+            "prune_controls",
+            "runtime_maintenance_eligibility",
+            "correlated_claim_tombstones",
+            "replica_identity",
+        ],
+        observes_runtime_controls: false,
+    },
+    Released {
+        version: "0.6.16",
+        pending_patches: &[
+            "runtime_maintenance_eligibility",
+            "correlated_claim_tombstones",
+            "replica_identity",
+        ],
+        observes_runtime_controls: true,
+    },
+    Released {
+        version: "0.6.17",
+        pending_patches: &["replica_identity"],
+        observes_runtime_controls: true,
+    },
+];
+
+fn released() -> &'static Released {
     let version = std::env::var("AWA_RELEASED_VERSION").unwrap_or_else(|_| "0.6.9".to_string());
-    assert!(
-        matches!(version.as_str(), "0.6.9" | "0.6.15"),
-        "AWA_RELEASED_VERSION must be 0.6.9 or 0.6.15"
-    );
-    version
+    RELEASED
+        .iter()
+        .find(|released| released.version == version)
+        .unwrap_or_else(|| {
+            panic!(
+                "AWA_RELEASED_VERSION must be one of {:?}",
+                RELEASED
+                    .iter()
+                    .map(|released| released.version)
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+fn released_version() -> &'static str {
+    released().version
 }
 
 fn candidate_cli() -> PathBuf {
@@ -763,6 +828,7 @@ async fn wait_for_drain(log: &EventLog, timeout: Duration) {
 #[ignore = "release gate: needs matching AWA_RELEASED_CLI and AWA_RELEASED_PYTHON artifacts"]
 async fn released_patch_upgrade_and_rollback() {
     let released_version = released_version();
+    let released_observes_controls = released().observes_runtime_controls;
     let released_cli = env_path("AWA_RELEASED_CLI");
     let candidate_cli = candidate_cli();
     assert!(
@@ -804,33 +870,28 @@ async fn released_patch_upgrade_and_rollback() {
         cli_ok(&released_cli, &fixture.owner_url, args).await;
     }
     grant_released_runtime(&fixture).await;
+    let expected_pending = released().pending_patches;
+    let lane_patch_pending = expected_pending.contains(&"prepared_lane_sequences");
     let before = lane_patch_applied(&fixture.admin).await;
-    if released_version == "0.6.9" {
-        assert!(!before.applied, "a 0.6.9 install lacks the lane patch");
+    assert_eq!(
+        before.applied, !lane_patch_pending,
+        "lane patch on a {released_version} install"
+    );
+    if lane_patch_pending {
         assert!(before
             .needs_repair
             .contains(&format!("lane helpers in schema {SCHEMA}")));
     } else {
-        assert!(before.applied, "0.6.15 already contains the lane patch");
         assert!(before.needs_repair.is_empty());
-        let pending = migrations::pending_schema_patches(&fixture.admin)
-            .await
-            .unwrap();
-        assert_eq!(
-            pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-            [
-                "claim_batch_job_index",
-                "insert_jobs_compat_batch",
-                "prune_controls",
-                "runtime_maintenance_eligibility",
-                "correlated_claim_tombstones",
-                "replica_identity"
-            ],
-            "a released 0.6.15 deployment needs the claim batch index fix, the bounded-wait \
-             batch function, prune controls, the maintenance eligibility table, the \
-             correlated tombstone checks and replica identities"
-        );
     }
+    let pending = migrations::pending_schema_patches(&fixture.admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
+        expected_pending,
+        "schema patches a released {released_version} deployment needs"
+    );
 
     let worker_a = spawn_released_worker(&fixture.runtime_url, &log, &[MAIN]).await;
     let worker_b = spawn_released_worker(&fixture.runtime_url, &log, &[MAIN]).await;
@@ -893,20 +954,17 @@ async fn released_patch_upgrade_and_rollback() {
         &["migrate", "--sql", "--pending", "--no-transaction"],
     )
     .await;
-    assert!(patch_sql.contains("R__prune_controls"));
-    if released_version == "0.6.9" {
-        assert!(patch_sql.contains("R__prepared_lane_sequences"));
-    } else {
-        assert_eq!(patch_sql.matches("-- Schema patch R__").count(), 6);
-        assert!(!patch_sql.contains("R__prepared_lane_sequences"));
-        assert!(
-            patch_sql.contains("R__claim_batch_job_index"),
-            "0.6.15's claim batch index function is replaced"
+    assert_eq!(
+        patch_sql.matches("-- Schema patch R__").count(),
+        expected_pending.len()
+    );
+    for patch in migrations::SCHEMA_PATCHES {
+        assert_eq!(
+            patch_sql.contains(&format!("-- Schema patch R__{}", patch.name)),
+            expected_pending.contains(&patch.name),
+            "R__{} in the patch exported for {released_version}",
+            patch.name
         );
-        assert!(patch_sql.contains("R__insert_jobs_compat_batch"));
-        assert!(patch_sql.contains("R__runtime_maintenance_eligibility"));
-        assert!(patch_sql.contains("R__correlated_claim_tombstones"));
-        assert!(patch_sql.contains("R__replica_identity"));
     }
     assert!(
         !patch_sql.contains("-- Migration V"),
@@ -1053,35 +1111,27 @@ async fn released_patch_upgrade_and_rollback() {
          targets: {unexpected_locks:?}"
     );
     let unexpected_lock_count = unexpected_locks.len();
-    let applied_before_replica_identity = if migrate_attempts == 1 {
-        "applied"
-    } else {
-        "already present"
-    };
-    for expected in [
-        "Schema: v40 (unchanged)".to_string(),
-        format!(
-            "Schema patch prepared_lane_sequences: {}",
-            if released_version == "0.6.9" {
-                applied_before_replica_identity
-            } else {
-                "already present"
-            }
-        ),
-        format!("Schema patch claim_batch_job_index: {applied_before_replica_identity}"),
-        format!("Schema patch insert_jobs_compat_batch: {applied_before_replica_identity}"),
-        format!("Schema patch prune_controls: {applied_before_replica_identity}"),
-        format!("Schema patch runtime_maintenance_eligibility: {applied_before_replica_identity}"),
-        format!("Schema patch correlated_claim_tombstones: {applied_before_replica_identity}"),
-        "Schema patch replica_identity: applied".to_string(),
-        format!("Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"),
-    ] {
+    let mut expected_lines = vec!["Schema: v40 (unchanged)".to_string()];
+    for patch in migrations::SCHEMA_PATCHES {
+        let outcome = if expected_pending.contains(&patch.name)
+            && (migrate_attempts == 1 || patch.name == "replica_identity")
+        {
+            "applied"
+        } else {
+            "already present"
+        };
+        expected_lines.push(format!("Schema patch {}: {outcome}", patch.name));
+    }
+    expected_lines.push(format!(
+        "Storage routing: unchanged (state active, engine queue_storage, schema {SCHEMA}"
+    ));
+    for expected in expected_lines {
         assert!(
             migrate_out.contains(&expected),
             "missing {expected:?} in:\n{migrate_out}"
         );
     }
-    if released_version == "0.6.9" && migrate_attempts == 1 {
+    if lane_patch_pending && migrate_attempts == 1 {
         assert!(migrate_out.contains("lane helpers in schema awa"));
         assert!(migrate_out.contains(&format!("lane helpers in schema {SCHEMA}")));
     }
@@ -1154,23 +1204,43 @@ async fn released_patch_upgrade_and_rollback() {
                 && !released_pids.contains(&runtime.pid)
                 && runtime.observes_current_request
         });
-        if released.len() == 2
+        let fleet_visible = released.len() == 2
             && released.iter().any(|runtime| runtime.leader)
             && released.iter().any(|runtime| !runtime.leader)
-            && candidate_observes
-        {
+            && candidate_observes;
+        let released_observe = released
+            .iter()
+            .all(|runtime| runtime.observes_current_request);
+        if fleet_visible && (!released_observes_controls || released_observe) {
             assert_eq!(status.requested.halt_id, Some(halt_id));
-            assert_eq!(
-                status.state,
-                runtime_control::RuntimeControlState::Unconfirmed
-            );
-            for runtime in released {
+            for runtime in &released {
                 assert_eq!(runtime.version, released_version);
-                assert!(runtime.observation.is_none());
-                assert!(status
-                    .unobserving_runtimes
-                    .iter()
-                    .any(|unobserving| unobserving.instance_id == runtime.instance_id));
+            }
+            if released_observes_controls {
+                assert!(
+                    matches!(
+                        status.state,
+                        runtime_control::RuntimeControlState::Draining
+                            | runtime_control::RuntimeControlState::Halted
+                    ),
+                    "a fleet that observes the halt drains or halts: {status:?}"
+                );
+                assert!(status.unobserving_runtimes.is_empty(), "{status:?}");
+                for runtime in &released {
+                    assert!(runtime.observation.is_some());
+                }
+            } else {
+                assert_eq!(
+                    status.state,
+                    runtime_control::RuntimeControlState::Unconfirmed
+                );
+                for runtime in &released {
+                    assert!(runtime.observation.is_none());
+                    assert!(status
+                        .unobserving_runtimes
+                        .iter()
+                        .any(|unobserving| unobserving.instance_id == runtime.instance_id));
+                }
             }
             break serde_json::to_value(&status).unwrap();
         }
@@ -1185,15 +1255,23 @@ async fn released_patch_upgrade_and_rollback() {
         .unwrap();
     assert!(resumed.halt_id.is_none());
     let resumed_status = runtime_control::status(&fixture.admin).await.unwrap();
-    assert_eq!(
-        resumed_status.state,
-        runtime_control::RuntimeControlState::Degraded
-    );
     assert!(resumed_status.requested.halt_id.is_none());
-    assert!(released_pids.iter().all(|pid| resumed_status
-        .unobserving_runtimes
-        .iter()
-        .any(|runtime| runtime.pid == *pid && runtime.live)));
+    if released_observes_controls {
+        assert_eq!(
+            resumed_status.state,
+            runtime_control::RuntimeControlState::Running
+        );
+        assert!(resumed_status.unobserving_runtimes.is_empty());
+    } else {
+        assert_eq!(
+            resumed_status.state,
+            runtime_control::RuntimeControlState::Degraded
+        );
+        assert!(released_pids.iter().all(|pid| resumed_status
+            .unobserving_runtimes
+            .iter()
+            .any(|runtime| runtime.pid == *pid && runtime.live)));
+    }
     candidate_produce(
         &runtime,
         &log,
