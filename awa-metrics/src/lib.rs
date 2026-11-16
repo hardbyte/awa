@@ -77,6 +77,8 @@ pub mod names {
     pub const MAINTENANCE_PRUNE_ATTEMPTS: &str = "awa.maintenance.prune.attempts";
     pub const MAINTENANCE_PRUNE_SKIPPED_ROWS: &str = "awa.maintenance.prune.skipped_rows";
     pub const MAINTENANCE_PRUNE_PINNED_READY_AGE: &str = "awa.maintenance.prune.pinned_ready_age";
+    pub const MAINTENANCE_PRUNE_CLAIM_CURSOR_ADVANCES: &str =
+        "awa.maintenance.prune.claim_cursor_advances";
     pub const STORAGE_TRANSITION_READY: &str = "awa.storage.transition_ready";
     pub const STORAGE_CANONICAL_LIVE_BACKLOG: &str = "awa.storage.canonical_live_backlog";
     pub const STORAGE_LIVE_RUNTIME_CAPABILITY: &str = "awa.storage.live_runtime_capability";
@@ -264,6 +266,13 @@ pub struct AwaMetrics {
     /// slot. Updated when queue prune runs and, while a lane pins the slot, at
     /// least every 15 seconds or queue rotation tick, whichever is longer.
     pub maintenance_prune_pinned_ready_age_seconds: Gauge<f64>,
+    /// Claim-cursor advances the maintenance leader made, or failed to make,
+    /// over the spent head rows (tombstoned or already claimed) of a lane
+    /// pinning the oldest sealed queue ring slot, by `awa.job.queue`,
+    /// `awa.job.priority`, `awa.queue.enqueue_shard` and `awa.ring.outcome`
+    /// (`advanced` or `failed`). One per lane per attempt, however many rows
+    /// it passed.
+    pub maintenance_prune_claim_cursor_advances: Counter<u64>,
     /// Per-branch wall-clock duration for the maintenance leader's main
     /// `tokio::select!` loop, attributed by `awa.maintenance.branch`. Records
     /// the time from the moment a select arm fires to the moment its body
@@ -596,6 +605,13 @@ impl AwaMetrics {
                     "Age of the first pending ready row of each lane pinning the oldest sealed queue ring slot; 0 once the lane no longer pins it",
                 )
                 .with_unit("s")
+                .build(),
+            maintenance_prune_claim_cursor_advances: meter
+                .u64_counter(names::MAINTENANCE_PRUNE_CLAIM_CURSOR_ADVANCES)
+                .with_description(
+                    "Claim-cursor advances over the spent head rows of a lane pinning the oldest sealed queue ring slot",
+                )
+                .with_unit("{advance}")
                 .build(),
             maintenance_branch_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_BRANCH_DURATION)
@@ -1274,6 +1290,26 @@ impl AwaMetrics {
             .record(age.as_secs_f64(), &attrs);
     }
 
+    /// Record that the maintenance leader advanced (`outcome` `advanced`) or
+    /// failed to advance (`failed`) the claim cursor of a lane pinning the
+    /// oldest sealed queue ring slot over its spent head rows.
+    pub fn record_queue_ring_claim_cursor_advance(
+        &self,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+        outcome: &'static str,
+    ) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", "queue"),
+            opentelemetry::KeyValue::new("awa.ring.outcome", outcome),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.job.priority", i64::from(priority)),
+            opentelemetry::KeyValue::new("awa.queue.enqueue_shard", i64::from(enqueue_shard)),
+        ];
+        self.maintenance_prune_claim_cursor_advances.add(1, &attrs);
+    }
+
     /// Record a ring prune outcome.
     pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
         let (label, reason, count) = match outcome {
@@ -1391,6 +1427,59 @@ mod tests {
             BTreeMap::from([
                 (lane("emails", "4", "0"), 120.0),
                 (lane("reports", "2", "3"), 0.0)
+            ])
+        );
+    }
+
+    #[test]
+    fn queue_ring_claim_cursor_advances_count_per_lane() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_queue_ring_claim_cursor_advance("emails", 4, 0, "advanced");
+        metrics.record_queue_ring_claim_cursor_advance("emails", 4, 0, "advanced");
+        metrics.record_queue_ring_claim_cursor_advance("reports", 2, 3, "failed");
+        provider.force_flush().expect("flush metrics");
+
+        let mut advances = BTreeMap::new();
+        for resource in &exporter.get_finished_metrics().expect("read metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let (
+                        names::MAINTENANCE_PRUNE_CLAIM_CURSOR_ADVANCES,
+                        AggregatedMetrics::U64(MetricData::Sum(sum)),
+                    ) = (metric.name(), metric.data())
+                    else {
+                        continue;
+                    };
+                    assert!(sum.is_monotonic(), "advances are a counter");
+                    for point in sum.data_points() {
+                        let attrs: BTreeMap<String, String> = point
+                            .attributes()
+                            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                            .collect();
+                        advances.insert(attrs, point.value());
+                    }
+                }
+            }
+        }
+        let lane = |queue: &str, priority: &str, shard: &str, outcome: &str| {
+            BTreeMap::from([
+                ("awa.ring".to_string(), "queue".to_string()),
+                ("awa.ring.outcome".to_string(), outcome.to_string()),
+                ("awa.job.queue".to_string(), queue.to_string()),
+                ("awa.job.priority".to_string(), priority.to_string()),
+                ("awa.queue.enqueue_shard".to_string(), shard.to_string()),
+            ])
+        };
+        assert_eq!(
+            advances,
+            BTreeMap::from([
+                (lane("emails", "4", "0", "advanced"), 2),
+                (lane("reports", "2", "3", "failed"), 1)
             ])
         );
     }

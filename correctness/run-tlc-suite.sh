@@ -20,6 +20,13 @@ SUITE='
 AwaAsyncClaimCursor.tla        ;; -                                      ;; pass ;; evidence-guarded async claim replay
 AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; NoSkippedJob is violated ;; lost claim on promoted standby witness
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
+AwaMaintenanceCursorAdvance.tla ;; -                                      ;; pass ;; maintenance advance over a spent lane prefix (#779)
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceWide.cfg     ;; pass ;; maintenance advance, uncapped window
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceUnlocked.cfg ;; pass ;; maintenance advance against writers that skip the head lock
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceCursorLoss.cfg ;; pass ;; cursor movement lost to a crash or failover
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceSkipInvisible.cfg ;; NoSkippedLive is violated ;; advance over an uncommitted enqueue witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceOutOfOrderEnqueue.cfg ;; NoSkippedLive is violated ;; enqueues committing out of lane order witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceProgress.cfg ;; MaintNeverPassesTombstone is violated ;; maintenance passes a tombstone witness
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRacesSafe.cfg        ;; pass ;; safe commit
