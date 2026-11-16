@@ -3919,6 +3919,7 @@ impl MaintenanceService {
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                self.control.record_reclamation_error(&err);
                 if self.queue_ring_advance_warn_due() {
                     warn!(
                         slot = pin.slot,

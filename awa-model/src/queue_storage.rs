@@ -718,7 +718,8 @@ pub struct SpentClaimHeadAdvance {
 }
 
 /// A lane [`QueueStorage::advance_spent_claim_heads`] could not advance
-/// because of an error other than lock contention.
+/// because of an error other than lock contention or a failed connection;
+/// a failed connection fails the whole call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SpentClaimHeadFailure {
@@ -764,6 +765,16 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
         err,
         sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("55P03")
     )
+}
+
+/// A failure of the connection itself, after which whether the statement
+/// took effect is unknown: an I/O, TLS or protocol error, or SQLSTATE class 08.
+fn is_connection_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(db_err) => db_err.code().is_some_and(|code| code.starts_with("08")),
+        _ => false,
+    }
 }
 
 /// A lock timeout, or a deadlock in which the prune was the victim.
@@ -10565,6 +10576,9 @@ impl QueueStorage {
                             "Skipped a claim-cursor advance on a locked queue-storage table"
                         );
                         break;
+                    }
+                    Err(AwaError::Database(err)) if is_connection_error(&err) => {
+                        return Err(AwaError::Database(err));
                     }
                     Err(err) => {
                         outcome.failed.push(SpentClaimHeadFailure {
