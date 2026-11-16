@@ -466,6 +466,7 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int: ...
     def bulk_retry_from_dlq_sync(
         self,
@@ -474,6 +475,7 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int: ...
     async def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None: ...
     def move_failed_to_dlq_sync(self, job_id: int, reason: str) -> DlqEntry | None: ...

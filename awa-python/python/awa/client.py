@@ -570,10 +570,17 @@ class AsyncClient:
         queue: str | None = None,
         tag: str | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-retry DLQ rows matching the filter. Returns revived count."""
+        """Bulk-retry DLQ rows matching the filter. Returns revived count.
+
+        With ``batch_size``, retries up to that many rows, oldest first, in one
+        transaction; call it until it returns 0 to drain a large DLQ. A row
+        whose unique key a live job holds raises ``UniqueConflict`` naming the
+        job, and nothing in that batch is retried.
+        """
         return await self._raw.bulk_retry_from_dlq(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
         )
 
     async def move_failed_to_dlq(
@@ -1455,10 +1462,17 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-retry DLQ rows matching the filter."""
+        """Bulk-retry DLQ rows matching the filter. Returns revived count.
+
+        With ``batch_size``, retries up to that many rows, oldest first, in one
+        transaction; call it until it returns 0 to drain a large DLQ. A row
+        whose unique key a live job holds raises ``UniqueConflict`` naming the
+        job, and nothing in that batch is retried.
+        """
         return self._raw.bulk_retry_from_dlq_sync(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
         )
 
     def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None:

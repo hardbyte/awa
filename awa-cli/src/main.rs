@@ -8,6 +8,8 @@ use sqlx::postgres::PgPoolOptions;
 
 mod storage_wait;
 
+const DLQ_RETRY_BATCH_SIZE: i64 = 1000;
+
 #[derive(Parser)]
 #[command(
     name = "awa",
@@ -312,6 +314,15 @@ enum DlqCommands {
         /// accidentally reviving the entire DLQ.
         #[arg(long)]
         all: bool,
+        /// Retry in transactions of at most this many rows, oldest first,
+        /// until none match. Without it, every matching row is retried in one
+        /// transaction.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        batch_size: Option<i64>,
+        /// Stop after retrying this many rows in total. Implies batches
+        /// (`--batch-size` defaults to 1000).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        limit: Option<i64>,
     },
     /// Move existing failed terminal rows into the DLQ
     Move {
@@ -1028,6 +1039,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             queue,
                             tag,
                             all,
+                            batch_size,
+                            limit,
                         } => {
                             let filter = awa_model::dlq::ListDlqFilter {
                                 kind,
@@ -1035,12 +1048,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            let count =
-                                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
-                            if count > 0 {
-                                metrics.record_dlq_retried(queue.as_deref(), count);
+                            if batch_size.is_none() && limit.is_none() {
+                                let count =
+                                    awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
+                                        .await?;
+                                if count > 0 {
+                                    metrics.record_dlq_retried(queue.as_deref(), count);
+                                }
+                                println!("Retried {count} DLQ rows.");
+                            } else {
+                                let batch_size = batch_size.unwrap_or(DLQ_RETRY_BATCH_SIZE);
+                                let mut total: u64 = 0;
+                                loop {
+                                    let take = match limit {
+                                        Some(limit) => {
+                                            let left = limit.saturating_sub(total as i64);
+                                            if left <= 0 {
+                                                break;
+                                            }
+                                            left.min(batch_size)
+                                        }
+                                        None => batch_size,
+                                    };
+                                    match awa_model::dlq::bulk_retry_from_dlq_batch(
+                                        &pool, &filter, all, take,
+                                    )
+                                    .await?
+                                    {
+                                        awa_model::DlqRetryBatch::Revived { count: 0 } => break,
+                                        awa_model::DlqRetryBatch::Revived { count } => {
+                                            total += count;
+                                            metrics.record_dlq_retried(queue.as_deref(), count);
+                                            eprintln!("Retried {count} DLQ rows ({total} so far).");
+                                        }
+                                        awa_model::DlqRetryBatch::UniqueConflict { job_id } => {
+                                            println!("Retried {total} DLQ rows.");
+                                            eprintln!(
+                                                "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried. Retry or purge it individually, then rerun."
+                                            );
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                }
+                                println!("Retried {total} DLQ rows.");
                             }
-                            println!("Retried {count} DLQ rows.");
                         }
                         DlqCommands::Move {
                             kind,

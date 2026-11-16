@@ -9,6 +9,7 @@ pub enum ApiError {
     ReadOnly,
     NotFound(String),
     Unauthorized(String),
+    Conflict(String),
 }
 
 impl From<awa_model::AwaError> for ApiError {
@@ -53,6 +54,7 @@ impl IntoResponse for ApiError {
             ),
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ApiError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
+            ApiError::Conflict(message) => (StatusCode::CONFLICT, message),
             ApiError::Awa(err) => match &err {
                 awa_model::AwaError::JobNotFound { .. } => (StatusCode::NOT_FOUND, err.to_string()),
                 awa_model::AwaError::CallbackNotFound { .. } => {
@@ -95,5 +97,9 @@ impl ApiError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         ApiError::NotFound(message.into())
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        ApiError::Conflict(message.into())
     }
 }

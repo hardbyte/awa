@@ -40,7 +40,7 @@ pub use batch_operations::{
 #[deprecated(since = "0.5.4", note = "use `QueueOverview` instead")]
 pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
-pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+pub use dlq::{DlqMetadata, DlqRetryBatch, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::{map_sqlx_error, AwaError};
 pub use insert::{
     insert, insert_many, insert_many_copy, insert_many_copy_from_pool,

@@ -2,7 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+use awa_model::dlq::{self, DlqRetryBatch, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -120,6 +120,22 @@ pub struct BulkFilterPayload {
     pub all: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkRetryPayload {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub queue: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+    /// Retry up to this many rows, oldest first, in one transaction. Without
+    /// it, every matching row is retried in one transaction.
+    #[serde(default)]
+    pub batch_size: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CountResponse {
     pub count: u64,
@@ -127,7 +143,7 @@ pub struct CountResponse {
 
 pub async fn bulk_retry_dlq(
     State(state): State<AppState>,
-    Json(payload): Json<BulkFilterPayload>,
+    Json(payload): Json<BulkRetryPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
     let queue_attr = payload.queue.clone();
@@ -137,7 +153,21 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
+    let count = match payload.batch_size {
+        None => dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?,
+        Some(batch_size) => {
+            match dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, batch_size)
+                .await?
+            {
+                DlqRetryBatch::Revived { count } => count,
+                DlqRetryBatch::UniqueConflict { job_id } => {
+                    return Err(ApiError::conflict(format!(
+                        "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried"
+                    )));
+                }
+            }
+        }
+    };
     if count > 0 {
         state
             .metrics

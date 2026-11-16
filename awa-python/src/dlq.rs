@@ -91,3 +91,31 @@ pub(crate) fn build_retry_opts(
         queue,
     }
 }
+
+/// Run a bulk DLQ retry: one transaction for every matching row, or up to
+/// `batch_size` rows when it is set. A unique conflict in a batch raises
+/// `UniqueConflict` naming the job.
+pub(crate) async fn bulk_retry(
+    pool: &sqlx::PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    use crate::errors::map_awa_error;
+    let Some(batch_size) = batch_size else {
+        return awa_model::dlq::bulk_retry_from_dlq(pool, filter, allow_all)
+            .await
+            .map_err(map_awa_error);
+    };
+    match awa_model::dlq::bulk_retry_from_dlq_batch(pool, filter, allow_all, batch_size)
+        .await
+        .map_err(map_awa_error)?
+    {
+        awa_model::DlqRetryBatch::Revived { count } => Ok(count),
+        awa_model::DlqRetryBatch::UniqueConflict { job_id } => {
+            Err(crate::UniqueConflict::new_err(format!(
+                "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried"
+            )))
+        }
+    }
+}

@@ -48,6 +48,18 @@ impl DlqRow {
     }
 }
 
+/// Result of one bounded bulk DLQ retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DlqRetryBatch {
+    /// The batch committed and revived `count` rows. Zero means no matching
+    /// row was left that another transaction did not hold.
+    Revived { count: u64 },
+    /// The row's unique key is claimed by a live job. The batch was rolled
+    /// back and every row in it stays in the DLQ.
+    UniqueConflict { job_id: i64 },
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListDlqFilter {
     pub kind: Option<String>,
@@ -372,6 +384,36 @@ pub async fn bulk_retry_from_dlq(
 
     let store = active_queue_storage(pool).await?;
     store.bulk_retry_from_dlq(pool, filter).await
+}
+
+/// Retry up to `batch_size` DLQ rows matching the filter in one transaction.
+///
+/// Call it repeatedly to drain a large DLQ in bounded transactions; it returns
+/// `Revived { count: 0 }` once no matching row is left. Rows are taken oldest
+/// first: by `(dlq_at, job_id)` when the filter names a queue, otherwise by
+/// `job_id`. Rows another transaction holds are skipped, so concurrent callers
+/// never revive a row twice. `filter.limit` is ignored.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`. If a row conflicts with a live unique claim, the batch is rolled
+/// back and the row is returned as [`DlqRetryBatch::UniqueConflict`].
+pub async fn bulk_retry_from_dlq_batch(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: i64,
+) -> Result<DlqRetryBatch, AwaError> {
+    if !allow_all && filter_requires_scope(filter) {
+        return Err(AwaError::Validation(
+            "bulk_retry_from_dlq_batch requires at least one of kind, queue, or tag (or allow_all=true)"
+                .into(),
+        ));
+    }
+
+    let store = active_queue_storage(pool).await?;
+    store
+        .bulk_retry_from_dlq_batch(pool, filter, batch_size)
+        .await
 }
 
 /// Purge DLQ rows matching the filter.
