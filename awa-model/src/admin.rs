@@ -5346,6 +5346,22 @@ pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Resu
 // so that both the Rust `JobContext` and the Python bridge call the same
 // code paths.
 
+/// Shortest wait between two `wait_for_callback` polls of a pending callback.
+pub const CALLBACK_POLL_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Longest wait between two `wait_for_callback` polls of a pending callback.
+pub const CALLBACK_POLL_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `wait_for_callback` waits after its `pending_polls`-th poll that
+/// found the callback still pending (counting from 1): the minimum delay,
+/// doubled per poll up to the maximum.
+pub fn callback_poll_delay(pending_polls: u32) -> std::time::Duration {
+    let doublings = pending_polls.saturating_sub(1).min(16);
+    CALLBACK_POLL_MIN_DELAY
+        .saturating_mul(1u32 << doublings)
+        .min(CALLBACK_POLL_MAX_DELAY)
+}
+
 /// Result of a single poll iteration inside `wait_for_callback`.
 #[derive(Debug)]
 pub enum CallbackPollResult {
@@ -6115,5 +6131,23 @@ mod tests {
             "tombstones are read by sequential scans: {scanned:?}\n{explained:#}"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod callback_poll_delay_tests {
+    use super::{callback_poll_delay, CALLBACK_POLL_MAX_DELAY, CALLBACK_POLL_MIN_DELAY};
+    use std::time::Duration;
+
+    #[test]
+    fn doubles_from_the_minimum_to_the_maximum() {
+        assert_eq!(callback_poll_delay(0), CALLBACK_POLL_MIN_DELAY);
+        assert_eq!(callback_poll_delay(1), Duration::from_millis(200));
+        assert_eq!(callback_poll_delay(2), Duration::from_millis(400));
+        assert_eq!(callback_poll_delay(3), Duration::from_millis(800));
+        assert_eq!(callback_poll_delay(4), Duration::from_millis(1600));
+        assert_eq!(callback_poll_delay(5), Duration::from_millis(3200));
+        assert_eq!(callback_poll_delay(6), CALLBACK_POLL_MAX_DELAY);
+        assert_eq!(callback_poll_delay(u32::MAX), CALLBACK_POLL_MAX_DELAY);
     }
 }
