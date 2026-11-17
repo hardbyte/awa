@@ -322,7 +322,7 @@ async fn a_batch_is_busy_not_done_while_every_matching_row_is_held() {
     let holder = hold(&pool, &ids).await;
     let held = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
     assert_eq!((held.count, held.busy, held.done), (0, true, false));
-    assert_eq!(held.cursor, BulkCursor::default());
+    assert_eq!((held.cursor.stage, held.cursor.after_job_id), (0, 0));
     holder.rollback().await.expect("release rows");
 
     let released = batch(&pool, &by_queue(&queue), 10, held.cursor).await;

@@ -7,6 +7,7 @@ Admin operations that change every job matching a filter run in bounded batches 
 - **Per-transaction bound.** Each batch is its own transaction of at most `batch_size` rows. The default is 1,000 (`awa_model::bulk::DEFAULT_BATCH_SIZE`), the same size `drain_queue` has always used on queue storage.
 - **Total cap.** `limit` stops a run after that many rows have changed. Without it, the run continues until no matching row is left.
 - **Order.** Rows are taken in job ID order, and a cursor records how far the run has got, so each batch starts where the previous one stopped.
+- **Scope.** A run covers the rows that matched when it started. Its first batch records the next job ID in the cursor (`below_job_id`), and no batch of the run touches a job with that ID or a higher one, so jobs enqueued during the run are left alone and a run against a busy producer still finishes. A job retried by the run that fails again is behind the cursor and is not retried a second time. A job that existed when the run started but only came to match during it, such as a running job that fails into the DLQ, is included if the run has not yet passed its ID.
 - **Not atomic.** Rows changed by earlier batches stay changed if a later batch fails or the run is stopped.
 - **Unique conflicts are skipped and reported.** A job whose retry would violate a unique claim held by a live job is skipped, counted and left as it was, and the run carries on. The first 10 skipped job IDs are reported. The cursor moves past a skipped job, so a run tries it once; a new run tries it again.
 - **Held rows are never skipped.** A batch skips rows another transaction holds (`FOR UPDATE SKIP LOCKED`), so two runs over the same rows never change a row twice. The cursor never moves past a held row: when every remaining matching row is held, the batch changes nothing and reports `busy`, and the run waits and tries again. It gives up after 60 seconds without progress.
@@ -32,7 +33,7 @@ Every command above takes `--batch-size` (default 1,000) and `--limit`. Each bat
 
 ### HTTP
 
-The bulk routes take an optional `batch_size`. Without it, the server runs every batch and returns `count`, `skipped`, `conflicts` and `done`. With it, the route runs one batch, resuming at an optional `cursor`, and also returns `busy` and the `cursor` for the next request; the web UI uses this to show progress and to stop between batches. A unique conflict no longer fails the request: it is reported in `skipped` and `conflicts`. The drain route takes `batch_size`, `stage` and `after_job_id` as query parameters and still returns `drained`. `GET /api/dlq/count` counts matching DLQ rows up to 10,000 and reports `capped` above that.
+The bulk routes take an optional `batch_size`. Without it, the server runs every batch and returns `count`, `skipped`, `conflicts` and `done`. With it, the route runs one batch, resuming at an optional `cursor`, and also returns `busy` and the `cursor` for the next request; the web UI uses this to show progress and to stop between batches. A unique conflict no longer fails the request: it is reported in `skipped` and `conflicts`. The drain route takes `batch_size` and the cursor's `stage`, `after_job_id` and `below_job_id` as query parameters and still returns `drained`. `GET /api/dlq/count` counts matching DLQ rows up to 10,000 and reports `capped` above that.
 
 The explicit-ID routes `/api/jobs/bulk-retry` and `/api/jobs/bulk-cancel` work in transactions of 1,000 IDs and still return the changed jobs. A job missing from the response was not changed, for example because a live job holds its unique key.
 
@@ -53,6 +54,8 @@ Bulk DLQ calls ignore `ListDlqFilter::limit`. It is the page size of `list_dlq`,
 On canonical storage, a batch updates its rows with one statement. When that statement hits a unique conflict, the batch is redone one row at a time, each in a savepoint, so only the conflicting rows are skipped.
 
 On queue storage, `drain_queue_batch` drains the whole queue in one call, in transactions of `batch_size` jobs, and returns `done`; it skips jobs another transaction holds, as it did before.
+
+A drain reads more than one table, and a job can move between them while it runs: a waiting job whose callback times out becomes retryable, and a scheduled or retryable job is promoted to available. On both engines the drain takes waiting jobs first, then scheduled and retryable jobs, then available jobs, so a job that moves is reached after it moves. Discard on queue storage takes failed jobs before DLQ rows, the direction a failed job moves.
 
 ## Not batched
 

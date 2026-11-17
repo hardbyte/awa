@@ -7,6 +7,8 @@ export const BULK_BUSY_TIMEOUT_MS = 60_000;
 export interface BulkCursor {
   stage: number;
   after_job_id: number;
+  /** The run's high-water mark: it leaves alone jobs with this ID or higher. */
+  below_job_id?: number;
 }
 
 export interface BulkBatchResult {

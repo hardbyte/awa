@@ -131,20 +131,51 @@ async fn queue_drain_runs_one_batch_from_a_cursor_or_every_batch() {
         (body["drained"].clone(), body["count"].clone()),
         (json!(2), json!(2))
     );
-    let cursor = &body["cursor"];
+    let cursor = body["cursor"].clone();
 
-    let (status, body) = request(
-        &app,
-        "POST",
-        &format!(
-            "/api/queues/{queue}/drain?batch_size=2&stage={}&after_job_id={}",
-            cursor["stage"], cursor["after_job_id"]
-        ),
-        None,
+    // A job enqueued after the run started is left alone by the rest of the
+    // run, which carries the run's high-water mark in its cursor.
+    let later = awa_model::insert_many(
+        &pool,
+        &[awa_model::InsertParams {
+            kind: "ui_bulk_job".to_string(),
+            args: json!({ "seq": "later" }),
+            opts: awa_model::InsertOpts {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+        }],
     )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["drained"], 2);
+    .await
+    .expect("insert later job")[0]
+        .id;
+    let mut drained = 0;
+    let mut cursor = cursor;
+    loop {
+        let (status, body) = request(
+            &app,
+            "POST",
+            &format!(
+                "/api/queues/{queue}/drain?batch_size=2&stage={}&after_job_id={}&below_job_id={}",
+                cursor["stage"], cursor["after_job_id"], cursor["below_job_id"]
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        drained += body["drained"].as_u64().expect("drained");
+        cursor = body["cursor"].clone();
+        if body["done"] == true {
+            break;
+        }
+    }
+    assert_eq!(drained, 3);
+    let later_state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
+        .bind(later)
+        .fetch_one(&pool)
+        .await
+        .expect("later job state");
+    assert_eq!(later_state, "available");
 
     let (status, body) = request(&app, "POST", &format!("/api/queues/{queue}/drain"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");

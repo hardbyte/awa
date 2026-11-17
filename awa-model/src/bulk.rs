@@ -9,6 +9,11 @@
 //! row because every remaining matching row is held reports
 //! [`BulkBatch::busy`]. [`run_batches`] drives a batched operation to
 //! completion.
+//!
+//! A run covers the jobs that existed when it started: its first batch
+//! records the next job ID in [`BulkCursor::below_job_id`], and no batch of
+//! the run touches a job with that ID or a higher one. A job enqueued during
+//! the run is left alone, so a run against a busy producer still finishes.
 
 use crate::error::AwaError;
 use crate::job::JobRow;
@@ -36,6 +41,10 @@ pub struct BulkCursor {
     /// The largest job ID this pass has already handled.
     #[serde(default)]
     pub after_job_id: i64,
+    /// The run handles only jobs with smaller IDs: the jobs that existed
+    /// when it started. Zero until the run's first batch sets it.
+    #[serde(default)]
+    pub below_job_id: i64,
 }
 
 /// What one batch did.
@@ -173,23 +182,26 @@ pub(crate) fn validate_batch_size(batch_size: i64) -> Result<(), AwaError> {
     Ok(())
 }
 
-/// One statement that locks up to `limit` matching rows past `after` in ID
-/// order, skipping rows another transaction holds. It returns the locked IDs,
-/// the lowest matching ID below the last locked one that another transaction
-/// holds, and whether any matching row past `after` was not locked.
+/// One statement that locks up to `limit` matching rows with IDs between
+/// `after` and `below` in ID order, skipping rows another transaction holds.
+/// It returns the locked IDs, the lowest matching ID below the last locked
+/// one that another transaction holds, and whether any matching row in the
+/// range was not locked.
 pub(crate) fn pick_sql(
     relation: &str,
     id_column: &str,
     filter: &str,
     after: &str,
+    below: &str,
     limit: &str,
 ) -> String {
+    let filter = format!("({filter}) AND {id_column} > {after} AND {id_column} < {below}");
     format!(
         r#"
         WITH picked AS MATERIALIZED (
             SELECT {id_column} AS id
             FROM {relation}
-            WHERE ({filter}) AND {id_column} > {after}
+            WHERE {filter}
             ORDER BY {id_column}
             LIMIT {limit}
             FOR UPDATE SKIP LOCKED
@@ -199,14 +211,14 @@ pub(crate) fn pick_sql(
             (
                 SELECT min({id_column})
                 FROM {relation}
-                WHERE ({filter}) AND {id_column} > {after}
+                WHERE {filter}
                   AND {id_column} < (SELECT max(id) FROM picked)
                   AND {id_column} <> ALL(ARRAY(SELECT id FROM picked))
             ) AS first_held,
             EXISTS (
                 SELECT 1
                 FROM {relation}
-                WHERE ({filter}) AND {id_column} > {after}
+                WHERE {filter}
                   AND {id_column} <> ALL(ARRAY(SELECT id FROM picked))
             ) AS more
         "#
@@ -244,6 +256,7 @@ impl Pick {
                     batch.cursor = BulkCursor {
                         stage,
                         after_job_id: 0,
+                        below_job_id: batch.cursor.below_job_id,
                     }
                 }
                 None => batch.done = true,
@@ -312,8 +325,8 @@ mod tests {
             busy,
             done,
             cursor: BulkCursor {
-                stage: 0,
                 after_job_id: after,
+                ..BulkCursor::default()
             },
             ..BulkBatch::default()
         }

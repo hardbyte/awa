@@ -9725,11 +9725,11 @@ impl QueueStorage {
     /// `queue` and its stripes (`queue#N`), returning how many were cancelled.
     ///
     /// Jobs enqueued after the drain starts are left alone, and so are running
-    /// jobs. Scheduled, retryable and available jobs are cancelled a chunk at
-    /// a time, each chunk in its own transaction, so a large backlog costs a
+    /// jobs. Waiting jobs go through [`Self::cancel_jobs_by_ids`], then
+    /// scheduled, retryable and available jobs are cancelled a chunk at a
+    /// time, each chunk in its own transaction, so a large backlog costs a
     /// few statements per chunk rather than per job and holds row locks for
     /// one chunk at a time. Rows another transaction has locked are skipped.
-    /// Waiting jobs go through [`Self::cancel_jobs_by_ids`].
     pub(crate) async fn drain_queue(&self, pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
         self.drain_queue_in_batches(pool, queue, DRAIN_BATCH_SIZE)
             .await
@@ -9752,6 +9752,30 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let mut drained = 0u64;
+        // Waiting jobs first, then deferred, then ready: the order jobs move
+        // between them. A waiting job whose callback times out becomes
+        // retryable, and a deferred job is promoted to ready, so a job that
+        // moves while the drain runs is still drained.
+        let waiting: Vec<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT job_id
+            FROM {schema}.leases
+            WHERE {queues}
+              AND state = 'waiting_external'
+              AND job_id < $2
+            ORDER BY job_id
+            "#,
+            queues = queue_and_stripes_sql("queue", "$1"),
+        ))
+        .bind(queue)
+        .bind(job_id_bound)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        for chunk in waiting.chunks(batch_size as usize) {
+            drained += self.cancel_jobs_by_ids(pool, chunk).await?.len() as u64;
+        }
+
         let mut after_job_id = i64::MIN;
         loop {
             let mut tx = pool
@@ -9802,7 +9826,7 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             self.lock_claim_heads_tx(&mut tx, &lanes).await?;
             let cancelled = self
-                .cancel_available_chunk_tx(&mut tx, &mut lanes, batch_size)
+                .cancel_available_chunk_tx(&mut tx, &mut lanes, job_id_bound, batch_size)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             self.skip_spent_claim_prefixes(pool, &lanes).await?;
@@ -9813,26 +9837,6 @@ impl QueueStorage {
             lanes.retain(|lane| lane.from_seq < lane.to_seq);
         }
         self.skip_spent_claim_prefixes(pool, &drained_lanes).await?;
-
-        let waiting: Vec<i64> = sqlx::query_scalar(&format!(
-            r#"
-            SELECT job_id
-            FROM {schema}.leases
-            WHERE {queues}
-              AND state = 'waiting_external'
-              AND job_id < $2
-            ORDER BY job_id
-            "#,
-            queues = queue_and_stripes_sql("queue", "$1"),
-        ))
-        .bind(queue)
-        .bind(job_id_bound)
-        .fetch_all(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-        for chunk in waiting.chunks(batch_size as usize) {
-            drained += self.cancel_jobs_by_ids(pool, chunk).await?.len() as u64;
-        }
 
         Ok(drained)
     }
@@ -9948,6 +9952,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         lanes: &mut [DrainLane],
+        job_id_bound: i64,
         batch_size: i64,
     ) -> Result<usize, AwaError> {
         let schema = self.schema();
@@ -10007,6 +10012,7 @@ impl QueueStorage {
                       AND ready.enqueue_shard = heads.enqueue_shard
                       AND ready.lane_seq >= segment.from_seq
                       AND ready.lane_seq < segment.to_seq
+                      AND ready.job_id < $7
                       AND NOT (
                           EXISTS (
                               SELECT 1 FROM {schema}.ready_tombstones AS tomb
@@ -10068,6 +10074,7 @@ impl QueueStorage {
         .bind(lanes.iter().map(|lane| lane.from_seq).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
         .bind(batch_size)
+        .bind(job_id_bound)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -17000,10 +17007,12 @@ impl QueueStorage {
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
         let schema = self.schema();
-        let mut batch = BulkBatch::new(cursor);
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::new(cursor);
         let pick = self
-            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor.after_job_id)
+            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor)
             .await?;
         if !pick.ids.is_empty() {
             let rows: Vec<DlqJobRow> = sqlx::query_as(&format!(
@@ -17075,13 +17084,40 @@ impl QueueStorage {
         Ok(batch)
     }
 
-    /// Lock the next DLQ rows matching `filter` past `after_job_id`.
+    /// On a run's first batch, record the next job ID as the run's
+    /// high-water mark, so the run leaves alone jobs enqueued after it
+    /// started. A failed or DLQ row with an ID above the sequence still
+    /// counts as existing.
+    async fn mark_bulk_run_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        cursor: &mut BulkCursor,
+    ) -> Result<(), AwaError> {
+        if cursor.below_job_id == 0 {
+            let schema = self.schema();
+            cursor.below_job_id = sqlx::query_scalar(&format!(
+                r#"
+                SELECT GREATEST(
+                    {schema}.sequence_next_value('job_id_seq'),
+                    (SELECT max(job_id) + 1 FROM {schema}.done_entries),
+                    (SELECT max(job_id) + 1 FROM {schema}.dlq_entries)
+                )
+                "#
+            ))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+        Ok(())
+    }
+
+    /// Lock the next DLQ rows matching `filter` in the cursor's range.
     async fn pick_dlq_batch_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         filter: &ListDlqFilter,
         batch_size: i64,
-        after_job_id: i64,
+        cursor: BulkCursor,
     ) -> Result<bulk::Pick, AwaError> {
         let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
             sqlx::query_as(&bulk::pick_sql(
@@ -17090,13 +17126,15 @@ impl QueueStorage {
                 DLQ_FILTER_SQL,
                 "$6",
                 "$7",
+                "$8",
             ))
             .bind(&filter.kind)
             .bind(&filter.queue)
             .bind(&filter.tag)
             .bind(filter.before_id)
             .bind(filter.before_dlq_at)
-            .bind(after_job_id)
+            .bind(cursor.after_job_id)
+            .bind(cursor.below_job_id)
             .bind(batch_size)
             .fetch_one(tx.as_mut())
             .await
@@ -17104,15 +17142,15 @@ impl QueueStorage {
         Ok(bulk::Pick::new(picked, first_held, more))
     }
 
-    /// Lock the next failed done rows matching `kind` and `queue` past
-    /// `after_job_id`.
+    /// Lock the next failed done rows matching `kind` and `queue` in the
+    /// cursor's range.
     async fn pick_failed_done_batch_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         kind: Option<&str>,
         queue: Option<&str>,
         batch_size: i64,
-        after_job_id: i64,
+        cursor: BulkCursor,
     ) -> Result<bulk::Pick, AwaError> {
         let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
             sqlx::query_as(&bulk::pick_sql(
@@ -17121,10 +17159,12 @@ impl QueueStorage {
                 "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
                 "$3",
                 "$4",
+                "$5",
             ))
             .bind(kind)
             .bind(queue)
-            .bind(after_job_id)
+            .bind(cursor.after_job_id)
+            .bind(cursor.below_job_id)
             .bind(batch_size)
             .fetch_one(tx.as_mut())
             .await
@@ -17218,10 +17258,12 @@ impl QueueStorage {
         cursor: BulkCursor,
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
-        let mut batch = BulkBatch::new(cursor);
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::new(cursor);
         let pick = self
-            .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor.after_job_id)
+            .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor)
             .await?;
         let mut skipped = Vec::new();
         let rows = self
@@ -17294,17 +17336,13 @@ impl QueueStorage {
         cursor: BulkCursor,
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
-        let mut batch = BulkBatch::new(cursor);
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::new(cursor);
         if cursor.stage == 0 {
             let pick = self
-                .pick_failed_done_batch_tx(
-                    &mut tx,
-                    Some(kind),
-                    None,
-                    batch_size,
-                    cursor.after_job_id,
-                )
+                .pick_failed_done_batch_tx(&mut tx, Some(kind), None, batch_size, cursor)
                 .await?;
             if !pick.ids.is_empty() {
                 batch.count = self
@@ -17318,7 +17356,7 @@ impl QueueStorage {
                 ..Default::default()
             };
             let pick = self
-                .pick_dlq_batch_tx(&mut tx, &filter, batch_size, cursor.after_job_id)
+                .pick_dlq_batch_tx(&mut tx, &filter, batch_size, cursor)
                 .await?;
             if !pick.ids.is_empty() {
                 batch.count = self
@@ -17343,10 +17381,12 @@ impl QueueStorage {
         cursor: BulkCursor,
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
-        let mut batch = BulkBatch::new(cursor);
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::new(cursor);
         let pick = self
-            .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor.after_job_id)
+            .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor)
             .await?;
         if !pick.ids.is_empty() {
             batch.count = self
@@ -17368,10 +17408,12 @@ impl QueueStorage {
         cursor: BulkCursor,
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
-        let mut batch = BulkBatch::new(cursor);
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::new(cursor);
         let pick = self
-            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor.after_job_id)
+            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor)
             .await?;
         if !pick.ids.is_empty() {
             batch.count = sqlx::query(&format!(

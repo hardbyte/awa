@@ -553,6 +553,9 @@ export function drainQueue(
     if (batch.cursor) {
       qs.set("stage", String(batch.cursor.stage));
       qs.set("after_job_id", String(batch.cursor.after_job_id));
+      if (batch.cursor.below_job_id) {
+        qs.set("below_job_id", String(batch.cursor.below_job_id));
+      }
     }
   }
   const query = qs.toString();

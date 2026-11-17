@@ -4917,8 +4917,33 @@ const CANONICAL_DRAIN_SQL: &str = r#"
     WHERE id = ANY($1) AND state IN ('available', 'scheduled', 'retryable', 'waiting_external')
 "#;
 
+/// On a run's first batch, record the next canonical job ID as the run's
+/// high-water mark, so the run leaves alone jobs enqueued after it started.
+/// A job inserted with an explicit ID above the sequence still counts as
+/// existing.
+async fn mark_canonical_run_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    cursor: &mut BulkCursor,
+) -> Result<(), AwaError> {
+    if cursor.below_job_id == 0 {
+        cursor.below_job_id = sqlx::query_scalar(
+            r#"
+            SELECT GREATEST(
+                (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
+                 FROM awa.jobs_id_seq),
+                (SELECT max(id) + 1 FROM awa.jobs_hot),
+                (SELECT max(id) + 1 FROM awa.scheduled_jobs)
+            )
+            "#,
+        )
+        .fetch_one(tx.as_mut())
+        .await?;
+    }
+    Ok(())
+}
+
 /// Lock the next canonical rows of `relation` matching `filter` (binding
-/// `$1` and `$2`) past `after`.
+/// `$1` and `$2`) in the cursor's range.
 async fn pick_canonical_batch_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     relation: &str,
@@ -4926,13 +4951,14 @@ async fn pick_canonical_batch_tx(
     first: Option<&str>,
     second: Option<&str>,
     batch_size: i64,
-    after: i64,
+    cursor: BulkCursor,
 ) -> Result<bulk::Pick, AwaError> {
     let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
-        sqlx::query_as(&bulk::pick_sql(relation, "id", filter, "$3", "$4"))
+        sqlx::query_as(&bulk::pick_sql(relation, "id", filter, "$3", "$4", "$5"))
             .bind(first)
             .bind(second)
-            .bind(after)
+            .bind(cursor.after_job_id)
+            .bind(cursor.below_job_id)
             .bind(batch_size)
             .fetch_one(tx.as_mut())
             .await?;
@@ -5012,10 +5038,11 @@ async fn canonical_retry_failed_batch(
     kind: Option<&str>,
     queue: Option<&str>,
     batch_size: i64,
-    cursor: BulkCursor,
+    mut cursor: BulkCursor,
 ) -> Result<BulkBatch, AwaError> {
-    let mut batch = BulkBatch::new(cursor);
     let mut tx = pool.begin().await?;
+    mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let mut batch = BulkBatch::new(cursor);
     let pick = pick_canonical_batch_tx(
         &mut tx,
         "awa.jobs_hot",
@@ -5023,7 +5050,7 @@ async fn canonical_retry_failed_batch(
         kind,
         queue,
         batch_size,
-        cursor.after_job_id,
+        cursor,
     )
     .await?;
     let mut skipped = Vec::new();
@@ -5095,8 +5122,10 @@ pub async fn discard_failed_batch(
             .discard_failed_batch(pool, kind, batch_size, cursor)
             .await;
     }
-    let mut batch = BulkBatch::new(cursor);
+    let mut cursor = cursor;
     let mut tx = pool.begin().await?;
+    mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let mut batch = BulkBatch::new(cursor);
     let pick = pick_canonical_batch_tx(
         &mut tx,
         "awa.jobs_hot",
@@ -5104,7 +5133,7 @@ pub async fn discard_failed_batch(
         Some(kind),
         None,
         batch_size,
-        cursor.after_job_id,
+        cursor,
     )
     .await?;
     if !pick.ids.is_empty() {
@@ -5120,13 +5149,17 @@ pub async fn discard_failed_batch(
 }
 
 /// Cancel the queue's available, scheduled, retryable and waiting jobs, up
-/// to `batch_size` per transaction.
+/// to `batch_size` per transaction. Jobs enqueued after the run started are
+/// left alone.
 ///
 /// On canonical storage one call cancels up to `batch_size` jobs past
-/// `cursor` in one transaction, available and waiting jobs first, then
-/// scheduled and retryable ones. On queue storage one call drains the whole
-/// queue and its stripes in transactions of `batch_size` jobs, skipping
-/// rows another transaction holds, and returns `done`.
+/// `cursor` in one transaction. The run takes waiting jobs first, then
+/// scheduled and retryable ones, then available ones: the order jobs move
+/// between them (a waiting job whose callback times out becomes retryable,
+/// and a scheduled or retryable job is promoted to available), so a job
+/// that moves during the run is still drained. On queue storage one call
+/// drains the whole queue and its stripes in transactions of `batch_size`
+/// jobs, skipping rows another transaction holds, and returns `done`.
 pub async fn drain_queue_batch(
     pool: &PgPool,
     queue: &str,
@@ -5134,48 +5167,54 @@ pub async fn drain_queue_batch(
     cursor: BulkCursor,
 ) -> Result<BulkBatch, AwaError> {
     bulk::validate_batch_size(batch_size)?;
-    let mut batch = BulkBatch::new(cursor);
     if let Some(store) = active_queue_storage(pool).await? {
+        let mut batch = BulkBatch::new(cursor);
         batch.count = store
             .drain_queue_in_batches(pool, queue, batch_size)
             .await?;
         batch.done = true;
         return Ok(batch);
     }
-    let (relation, states, next_stage) = if cursor.stage == 0 {
-        (
-            "awa.jobs_hot",
-            "state IN ('available', 'waiting_external')",
-            Some(1),
-        )
-    } else {
-        (
-            "awa.scheduled_jobs",
-            "state IN ('scheduled', 'retryable')",
-            None,
-        )
-    };
+    let mut cursor = cursor;
     let mut tx = pool.begin().await?;
-    let pick = pick_canonical_batch_tx(
-        &mut tx,
-        relation,
-        &format!("{states} AND queue = $1 AND $2::text IS NULL"),
-        Some(queue),
-        None,
-        batch_size,
-        cursor.after_job_id,
-    )
-    .await?;
-    if !pick.ids.is_empty() {
-        batch.count = sqlx::query(CANONICAL_DRAIN_SQL)
-            .bind(&pick.ids)
-            .execute(tx.as_mut())
-            .await?
-            .rows_affected();
+    mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    loop {
+        let (relation, states, next_stage) = match cursor.stage {
+            0 => ("awa.jobs_hot", "state = 'waiting_external'", Some(1)),
+            1 => (
+                "awa.scheduled_jobs",
+                "state IN ('scheduled', 'retryable')",
+                Some(2),
+            ),
+            _ => ("awa.jobs_hot", "state = 'available'", None),
+        };
+        let mut batch = BulkBatch::new(cursor);
+        let pick = pick_canonical_batch_tx(
+            &mut tx,
+            relation,
+            &format!("{states} AND queue = $1 AND $2::text IS NULL"),
+            Some(queue),
+            None,
+            batch_size,
+            cursor,
+        )
+        .await?;
+        pick.settle(&mut batch, next_stage);
+        if pick.ids.is_empty() && !batch.busy && !batch.done {
+            // This pass is finished; start the next in the same batch.
+            cursor = batch.cursor;
+            continue;
+        }
+        if !pick.ids.is_empty() {
+            batch.count = sqlx::query(CANONICAL_DRAIN_SQL)
+                .bind(&pick.ids)
+                .execute(tx.as_mut())
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+        return Ok(batch);
     }
-    tx.commit().await?;
-    pick.settle(&mut batch, next_stage);
-    Ok(batch)
 }
 
 /// Retry jobs by ID in transactions of at most `batch_size` jobs. Only
