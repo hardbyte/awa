@@ -97,20 +97,26 @@ pub(crate) fn build_retry_opts(
 /// changed, or `DatabaseError` if the run gave up on rows another transaction
 /// held.
 pub(crate) fn finish_bulk_run(run: awa_model::BulkRun, verb: &str) -> PyResult<u64> {
-    if run.busy_timed_out {
-        return Err(crate::DatabaseError::new_err(format!(
-            "{verb} {} row(s), then stopped: every remaining matching row has been held by another transaction for {}s",
-            run.count,
-            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs()
-        )));
-    }
-    if run.skipped > 0 {
+    let skipped = (run.skipped > 0).then(|| {
         let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
-        return Err(crate::UniqueConflict::new_err(format!(
-            "{verb} {} row(s); skipped {} job(s) whose unique key a live job holds: {}",
-            run.count,
+        format!(
+            "skipped {} job(s) whose unique key a live job holds: {}",
             run.skipped,
             ids.join(", ")
+        )
+    });
+    if run.busy_timed_out {
+        return Err(crate::DatabaseError::new_err(format!(
+            "{verb} {} row(s), then stopped: every remaining matching row has been held by another transaction for {}s{}",
+            run.count,
+            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs(),
+            skipped.map(|text| format!("; {text}")).unwrap_or_default()
+        )));
+    }
+    if let Some(text) = skipped {
+        return Err(crate::UniqueConflict::new_err(format!(
+            "{verb} {} row(s); {text}",
+            run.count
         )));
     }
     Ok(run.count)
