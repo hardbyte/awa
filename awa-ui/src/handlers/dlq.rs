@@ -185,11 +185,23 @@ impl BulkResponse {
 
     pub fn from_run(run: BulkRun) -> Result<Self, ApiError> {
         if run.busy_timed_out {
-            return Err(ApiError::conflict(format!(
+            let mut message = format!(
                 "every remaining matching row has been held by another transaction for {}s; changed {} row(s) before stopping",
                 bulk::DEFAULT_BUSY_TIMEOUT.as_secs(),
                 run.count
-            )));
+            );
+            if run.skipped > 0 {
+                message.push_str(&format!(
+                    "; skipped {} job(s) whose unique key a live job holds",
+                    run.skipped
+                ));
+            }
+            let mut detail = serde_json::Map::new();
+            detail.insert("count".into(), run.count.into());
+            detail.insert("skipped".into(), run.skipped.into());
+            detail.insert("conflicts".into(), run.conflicts.into());
+            detail.insert("done".into(), false.into());
+            return Err(ApiError::ConflictDetail { message, detail });
         }
         Ok(Self {
             count: run.count,
@@ -429,7 +441,10 @@ mod tests {
             |count| recorded.push(count),
         )
         .await;
-        assert!(matches!(result, Err(ApiError::Conflict(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(ApiError::ConflictDetail { .. })),
+            "{result:?}"
+        );
         assert_eq!(recorded, vec![2]);
     }
 
@@ -468,5 +483,49 @@ mod tests {
         .await
         .expect("batch");
         assert_eq!((response.count, recorded), (4, vec![4]));
+    }
+}
+
+#[cfg(test)]
+mod from_run_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn a_busy_timeout_reports_skipped_conflicts() {
+        let mut run = BulkRun::default();
+        run.count = 3;
+        run.skipped = 1;
+        run.conflicts = vec![42];
+        run.busy_timed_out = true;
+        let response = BulkResponse::from_run(run)
+            .expect_err("busy timeout")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            (
+                &body["count"],
+                &body["skipped"],
+                &body["conflicts"],
+                &body["done"]
+            ),
+            (
+                &serde_json::json!(3),
+                &serde_json::json!(1),
+                &serde_json::json!([42]),
+                &serde_json::json!(false)
+            )
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("skipped 1 job(s)"),
+            "{body}"
+        );
     }
 }

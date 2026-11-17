@@ -109,7 +109,8 @@ fn with_progress(err: PyErr, run: &awa_model::BulkRun) -> PyErr {
 /// carrying the run's `count`, `skipped` and `conflicts`. The exception is
 /// `UniqueConflict` naming the skipped jobs after every other row was
 /// changed, `DatabaseError` if the run gave up on rows another transaction
-/// held, or the mapped error of a batch that failed.
+/// held, naming any jobs it skipped, or the mapped error of a batch that
+/// failed.
 pub(crate) fn finish_bulk_run(
     result: Result<awa_model::BulkRun, awa_model::BulkError<awa_model::BulkRun>>,
     verb: &str,
@@ -123,24 +124,30 @@ pub(crate) fn finish_bulk_run(
             ))
         }
     };
+    let skipped = (run.skipped > 0).then(|| {
+        let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
+        format!(
+            "skipped {} job(s) whose unique key a live job holds: {}",
+            run.skipped,
+            ids.join(", ")
+        )
+    });
     if run.busy_timed_out {
         return Err(with_progress(
             crate::DatabaseError::new_err(format!(
-                "{verb} {} row(s), then stopped: every remaining matching row stayed held by another transaction",
+                "{verb} {} row(s), then stopped: every remaining matching row stayed held by another transaction{}",
                 run.count,
+                skipped
+                    .as_ref()
+                    .map(|text| format!("; {text}"))
+                    .unwrap_or_default()
             )),
             &run,
         ));
     }
-    if run.skipped > 0 {
-        let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
+    if let Some(text) = skipped {
         return Err(with_progress(
-            crate::UniqueConflict::new_err(format!(
-                "{verb} {} row(s); skipped {} job(s) whose unique key a live job holds: {}",
-                run.count,
-                run.skipped,
-                ids.join(", ")
-            )),
+            crate::UniqueConflict::new_err(format!("{verb} {} row(s); {text}", run.count)),
             &run,
         ));
     }

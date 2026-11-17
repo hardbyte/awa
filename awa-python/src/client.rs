@@ -1557,8 +1557,9 @@ impl PyClient {
     /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
     ///
     /// Requires at least one of `kind`, `queue`, or `tag` unless
-    /// `allow_all=True`. With `batch_size`, retries up to that many rows, oldest
-    /// first, in one transaction.
+    /// `allow_all=True`. Retries every matching row, in job ID order,
+    /// `batch_size` rows per transaction (1,000 when unset); `batch_size` is
+    /// the per-transaction bound, not a total.
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false, batch_size=None))]
     fn bulk_retry_from_dlq<'py>(
         &self,
