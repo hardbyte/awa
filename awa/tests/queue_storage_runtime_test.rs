@@ -27070,21 +27070,30 @@ async fn pooled_ring_index_footprint(
             .fetch_one(&mut **conn)
             .await
             .expect("backend pid");
-        let mut loaded = Vec::with_capacity(rings.len());
-        for indexes in rings {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT count(DISTINCT ident) FROM pg_backend_memory_contexts
-                 WHERE name = 'index info' AND ident = ANY($1)",
-            )
-            .bind(indexes)
-            .fetch_one(&mut **conn)
-            .await
-            .expect("read backend memory contexts");
-            loaded.push(count as usize);
-        }
-        footprint.push((pid, loaded));
+        footprint.push((pid, session_ring_index_footprint(conn, rings).await));
     }
     footprint
+}
+
+/// Per ring, how many of its partition indexes have relcache index info
+/// loaded in `conn`'s session.
+async fn session_ring_index_footprint(
+    conn: &mut sqlx::PgConnection,
+    rings: &[Vec<String>],
+) -> Vec<usize> {
+    let mut loaded = Vec::with_capacity(rings.len());
+    for indexes in rings {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT ident) FROM pg_backend_memory_contexts
+             WHERE name = 'index info' AND ident = ANY($1)",
+        )
+        .bind(indexes)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read backend memory contexts");
+        loaded.push(count as usize);
+    }
+    loaded
 }
 
 /// The rings, by index into `rings`, whose every partition index is loaded in
@@ -27227,14 +27236,34 @@ async fn test_maintenance_idle_checks_run_on_one_session() {
         "the idle check session must leave each check's transaction; open for {longest_transaction:?}s"
     );
 
-    // The detector sees sessions that ran the checks.
-    gated_rotate_all(&store, &runtime_pool).await;
-    let footprint = pooled_ring_index_footprint(&runtime_pool, &rings).await;
+    // The detector sees a session that ran the checks. A shared-invalidation
+    // reset from concurrent DDL elsewhere empties a session's relcache, so a
+    // pass that a reset interrupted is run again.
+    let mut control = runtime_pool.acquire().await.expect("control session");
+    let mut loaded = Vec::new();
+    for _ in 0..5 {
+        store
+            .rotate_if_active_on(&mut control, &runtime_pool)
+            .await
+            .expect("queue check");
+        store
+            .rotate_leases_if_active_on(&mut control, &runtime_pool)
+            .await
+            .expect("lease check");
+        store
+            .rotate_claims_if_active_on(&mut control, &runtime_pool)
+            .await
+            .expect("claim check");
+        loaded = session_ring_index_footprint(&mut control, &rings).await;
+        if loaded == ring_sizes {
+            break;
+        }
+    }
     assert_eq!(
-        fully_loaded_rings(&footprint, &rings),
-        vec![0, 1, 2],
-        "pooled sessions that ran the idle checks must hold their rings' indexes: {footprint:?} (ring sizes {ring_sizes:?})"
+        loaded, ring_sizes,
+        "a session that ran the idle checks must hold every partition index of its rings"
     );
+    drop(control);
     runtime_pool.close().await;
 }
 
