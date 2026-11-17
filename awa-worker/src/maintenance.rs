@@ -30,6 +30,13 @@ const MAINTENANCE_BRANCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// `application_name` of the connection the leader runs ring idle checks on.
 const IDLE_CHECK_APPLICATION_NAME: &str = "awa-maintenance-idle-check";
 
+/// Closes an idle check connection, giving up after a second on a session the
+/// server no longer answers.
+async fn close_idle_check_conn(conn: sqlx::PgConnection) {
+    use sqlx::Connection;
+    let _ = tokio::time::timeout(Duration::from_secs(1), conn.close()).await;
+}
+
 #[derive(Clone, Copy)]
 enum GatedRing {
     Queue,
@@ -1072,8 +1079,9 @@ pub struct MaintenanceService {
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
     queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
-    /// The connection the leader runs the ring idle checks on while it leads.
-    idle_check_conn: std::sync::Mutex<Option<PoolConnection<Postgres>>>,
+    /// The connection the leader runs the ring idle checks on while it leads,
+    /// detached from the pool so it does not take a pool slot.
+    idle_check_conn: std::sync::Mutex<Option<sqlx::PgConnection>>,
     /// When the leader last warned that it could not advance a pinning lane.
     queue_ring_advance_warned_at: std::sync::Mutex<Option<Instant>>,
     rescue_others_first_offset: AtomicUsize,
@@ -2072,7 +2080,7 @@ impl MaintenanceService {
             };
             run_leader_term(observer, &self.cancel, work).await;
             self.clear_queue_ring_pin();
-            self.release_idle_check_conn();
+            self.release_idle_check_conn().await;
             if self.cancel.is_cancelled() {
                 return;
             }
@@ -3737,8 +3745,8 @@ impl MaintenanceService {
     }
 
     /// Rotates `ring` unless it is idle, running the idle check on
-    /// [`Self::idle_check_conn`]. A failed call discards that connection, and
-    /// the next call takes a fresh one from the pool.
+    /// [`Self::idle_check_conn`]. A failed call closes that connection, and
+    /// the next call opens a fresh one.
     async fn gated_rotate(
         &self,
         store: &QueueStorage,
@@ -3758,19 +3766,27 @@ impl MaintenanceService {
                     .await
             }
         };
-        if outcome.is_ok() {
+        let surplus = if outcome.is_ok() {
             let mut slot = self
                 .idle_check_conn
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if slot.is_none() {
                 *slot = Some(conn);
+                None
+            } else {
+                Some(conn)
             }
+        } else {
+            Some(conn)
+        };
+        if let Some(conn) = surplus {
+            close_idle_check_conn(conn).await;
         }
         outcome
     }
 
-    async fn take_idle_check_conn(&self) -> Result<PoolConnection<Postgres>, AwaError> {
+    async fn take_idle_check_conn(&self) -> Result<sqlx::PgConnection, AwaError> {
         let held = self
             .idle_check_conn
             .lock()
@@ -3779,22 +3795,29 @@ impl MaintenanceService {
         if let Some(conn) = held {
             return Ok(conn);
         }
-        let mut conn = self.pool.acquire().await?;
-        conn.close_on_drop();
-        sqlx::query("SELECT set_config('application_name', $1, false)")
+        // Detached, the connection never returns to the pool and does not count
+        // against the pool's size, and the pool may open a replacement.
+        let mut conn = self.pool.acquire().await?.detach();
+        if let Err(err) = sqlx::query("SELECT set_config('application_name', $1, false)")
             .bind(IDLE_CHECK_APPLICATION_NAME)
-            .execute(&mut *conn)
-            .await?;
+            .execute(&mut conn)
+            .await
+        {
+            close_idle_check_conn(conn).await;
+            return Err(err.into());
+        }
         Ok(conn)
     }
 
-    fn release_idle_check_conn(&self) {
-        drop(
-            self.idle_check_conn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
-        );
+    async fn release_idle_check_conn(&self) {
+        let held = self
+            .idle_check_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(conn) = held {
+            close_idle_check_conn(conn).await;
+        }
     }
 
     async fn rotate_queue_storage_queue(&self, prune_tracker: &PruneBackoffTracker) {

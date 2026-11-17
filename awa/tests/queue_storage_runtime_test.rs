@@ -27238,8 +27238,9 @@ async fn test_maintenance_idle_checks_run_on_one_session() {
     runtime_pool.close().await;
 }
 
-/// When leadership moves, the old leader closes its idle check session and
-/// the new leader's checks gate rotation on their own session.
+/// When a leader term ends, its idle check session closes and the next
+/// term's checks gate rotation on a session of their own. Either runtime may
+/// win the next term.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_idle_check_session_follows_leadership() {
     let (_db_guard, pool) = setup_pool(12).await;
@@ -27287,18 +27288,18 @@ async fn test_idle_check_session_follows_leadership() {
     assert_eq!(terminated, vec![true]);
 
     let deadline = Instant::now() + ci_timing::scaled_timeout(Duration::from_secs(15));
-    let check_b = loop {
+    let check_next = loop {
         let sessions = idle_check_sessions(&pool).await;
         let a_leads = client_a.health_check().await.leader;
         let b_leads = client_b.health_check().await.leader;
         if let [(pid, _)] = sessions[..] {
-            if pid != check_a && b_leads && !a_leads {
+            if pid != check_a && a_leads != b_leads {
                 break pid;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "leadership should move to client b with a new idle check session; a leads {a_leads}, b leads {b_leads}, sessions {sessions:?}, old session {check_a}"
+            "a new term should start with a new idle check session; a leads {a_leads}, b leads {b_leads}, sessions {sessions:?}, old session {check_a}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -27310,15 +27311,15 @@ async fn test_idle_check_session_follows_leadership() {
             .expect("look up old idle check session");
     assert!(
         !old_session_open,
-        "client a must close its idle check session when it loses leadership"
+        "client a must close its idle check session when its term ends"
     );
-    let check_b_app: String =
+    let check_next_app: String =
         sqlx::query_scalar("SELECT application_name FROM pg_stat_activity WHERE pid = $1")
-            .bind(check_b)
+            .bind(check_next)
             .fetch_one(&pool)
             .await
             .expect("look up new idle check session");
-    assert_eq!(check_b_app, IDLE_CHECK_APPLICATION_NAME);
+    assert_eq!(check_next_app, IDLE_CHECK_APPLICATION_NAME);
 
     // The new leader's gate holds an idle ring, then rotates once a job lands.
     let idle_cursor = ring_cursor(&pool, schema, "queue").await;
@@ -27338,7 +27339,7 @@ async fn test_idle_check_session_follows_leadership() {
     while ring_cursor(&pool, schema, "queue").await.1 <= idle_cursor.1 {
         assert!(
             Instant::now() < deadline,
-            "the new leader should rotate the queue ring once job {job_id} lands"
+            "the next term's leader should rotate the queue ring once job {job_id} lands"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -27348,8 +27349,8 @@ async fn test_idle_check_session_follows_leadership() {
             .into_iter()
             .map(|(pid, _)| pid)
             .collect::<Vec<_>>(),
-        vec![check_b],
-        "the new leader keeps one idle check session"
+        vec![check_next],
+        "the next term's leader keeps one idle check session"
     );
 
     client_b.shutdown(Duration::from_secs(5)).await;
