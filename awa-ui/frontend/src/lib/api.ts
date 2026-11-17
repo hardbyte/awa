@@ -474,7 +474,7 @@ export function bulkRetryDlq(filter: {
   queue?: string;
   tag?: string;
   batch_size?: number;
-}): Promise<DlqBulkResult> {
+}): Promise<DlqBulkResult & { busy?: boolean }> {
   return apiFetch("/dlq/bulk-retry", {
     method: "POST",
     body: JSON.stringify(filter),

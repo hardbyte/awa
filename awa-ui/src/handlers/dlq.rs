@@ -139,6 +139,10 @@ pub struct BulkRetryPayload {
 #[derive(Debug, Serialize)]
 pub struct CountResponse {
     pub count: u64,
+    /// Set by a `batch_size` retry when every matching row is held by another
+    /// transaction; nothing was retried and the caller should try again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub busy: bool,
 }
 
 pub async fn bulk_retry_dlq(
@@ -153,16 +157,25 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let count = match payload.batch_size {
-        None => dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?,
+    let (count, busy) = match payload.batch_size {
+        None => (
+            dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?,
+            false,
+        ),
         Some(batch_size) => {
             match dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, batch_size)
                 .await?
             {
-                DlqRetryBatch::Revived { count } => count,
+                DlqRetryBatch::Revived { count } => (count, false),
+                DlqRetryBatch::Busy => (0, true),
                 DlqRetryBatch::UniqueConflict { job_id } => {
                     return Err(ApiError::conflict(format!(
                         "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried"
+                    )));
+                }
+                other => {
+                    return Err(ApiError::Awa(awa_model::AwaError::Database(
+                        sqlx::Error::Protocol(format!("unexpected DLQ retry outcome: {other:?}")),
                     )));
                 }
             }
@@ -174,7 +187,7 @@ pub async fn bulk_retry_dlq(
             .record_dlq_retried(queue_attr.as_deref(), count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count }))
+    Ok(Json(CountResponse { count, busy }))
 }
 
 pub async fn purge_dlq_job(
@@ -193,7 +206,7 @@ pub async fn purge_dlq_job(
         state.metrics.record_dlq_purged(queue.as_deref(), count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count }))
+    Ok(Json(CountResponse { count, busy: false }))
 }
 
 pub async fn bulk_purge_dlq(
@@ -215,7 +228,7 @@ pub async fn bulk_purge_dlq(
             .record_dlq_purged(queue_attr.as_deref(), count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count }))
+    Ok(Json(CountResponse { count, busy: false }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,5 +273,5 @@ pub async fn bulk_move_failed(
         );
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count }))
+    Ok(Json(CountResponse { count, busy: false }))
 }

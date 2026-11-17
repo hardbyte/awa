@@ -61,6 +61,35 @@ async function stubDlqPage(page: Page, retryResponses: Array<{ status: number; j
   return requests;
 }
 
+/**
+ * Hold each bulk-retry request until the test releases it, so a test can act
+ * between batches and count exactly how many batches started.
+ */
+async function gateBatches(page: Page) {
+  const pending: Array<(json: unknown) => void> = [];
+  const waiters: Array<() => void> = [];
+  let started = 0;
+  await page.route("**/api/dlq/bulk-retry", async (route) => {
+    started += 1;
+    waiters.splice(0).forEach((wake) => wake());
+    const json = await new Promise<unknown>((resolve) => pending.push(resolve));
+    await route.fulfill({ json });
+  });
+  return {
+    count: () => started,
+    async started(n: number) {
+      while (started < n) {
+        await new Promise<void>((resolve) => waiters.push(resolve));
+      }
+    },
+    release(json: unknown) {
+      const next = pending.shift();
+      if (!next) throw new Error("no batch is waiting");
+      next(json);
+    },
+  };
+}
+
 test.describe("DLQ bulk retry", () => {
   test("retries matching rows in batches until none remain", async ({ page }) => {
     const requests = await stubDlqPage(page, [
@@ -104,17 +133,50 @@ test.describe("DLQ bulk retry", () => {
 
   test("stops between batches when asked", async ({ page }) => {
     await stubDlqPage(page, []);
-    await page.route("**/api/dlq/bulk-retry", async (route) => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      await route.fulfill({ json: { count: 2 } });
-    });
+    const gate = await gateBatches(page);
 
     await page.goto(`/dlq?q=queue:${QUEUE}`);
     await page.getByRole("button", { name: /Retry matching/ }).click();
     await page.getByRole("button", { name: "Retry", exact: true }).click();
 
-    await expect(page.getByRole("status").getByText(/2 of 3 retried/)).toBeVisible();
+    await gate.started(1);
+    gate.release({ count: 2 });
+    await gate.started(2);
     await page.getByRole("button", { name: "Stop" }).click();
-    await expect(page.getByText(/Stopped after retrying \d+ DLQ row\(s\)/)).toBeVisible();
+    gate.release({ count: 2 });
+
+    await expect(page.getByText("Stopped after retrying 4 DLQ row(s)")).toBeVisible();
+    expect(gate.count()).toBe(2);
+  });
+
+  test("navigating away stops the retry", async ({ page }) => {
+    await stubDlqPage(page, []);
+    const gate = await gateBatches(page);
+
+    await page.goto(`/dlq?q=queue:${QUEUE}`);
+    await page.getByRole("button", { name: /Retry matching/ }).click();
+    await page.getByRole("button", { name: "Retry", exact: true }).click();
+
+    await gate.started(1);
+    await page.getByRole("link", { name: "Queues" }).first().click();
+    await page.waitForURL(/\/queues/);
+    gate.release({ count: 2 });
+
+    await expect(page.getByText("Stopped after retrying 2 DLQ row(s)")).toBeVisible();
+    expect(gate.count()).toBe(1);
+  });
+
+  test("waits while matching rows are held by another batch", async ({ page }) => {
+    await stubDlqPage(page, [
+      { status: 200, json: { count: 0, busy: true } },
+      { status: 200, json: { count: 3 } },
+      { status: 200, json: { count: 0 } },
+    ]);
+
+    await page.goto(`/dlq?q=queue:${QUEUE}`);
+    await page.getByRole("button", { name: /Retry matching/ }).click();
+    await page.getByRole("button", { name: "Retry", exact: true }).click();
+
+    await expect(page.getByText("Retried 3 DLQ row(s)")).toBeVisible();
   });
 });

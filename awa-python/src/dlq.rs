@@ -94,7 +94,9 @@ pub(crate) fn build_retry_opts(
 
 /// Run a bulk DLQ retry: one transaction for every matching row, or up to
 /// `batch_size` rows when it is set. A unique conflict in a batch raises
-/// `UniqueConflict` naming the job.
+/// `UniqueConflict` naming the job. While every matching row is held by
+/// another transaction, the batch is retried with backoff for up to 30
+/// seconds, then `DatabaseError` is raised.
 pub(crate) async fn bulk_retry(
     pool: &sqlx::PgPool,
     filter: &ListDlqFilter,
@@ -102,20 +104,39 @@ pub(crate) async fn bulk_retry(
     batch_size: Option<i64>,
 ) -> PyResult<u64> {
     use crate::errors::map_awa_error;
+    use std::time::{Duration, Instant};
     let Some(batch_size) = batch_size else {
         return awa_model::dlq::bulk_retry_from_dlq(pool, filter, allow_all)
             .await
             .map_err(map_awa_error);
     };
-    match awa_model::dlq::bulk_retry_from_dlq_batch(pool, filter, allow_all, batch_size)
-        .await
-        .map_err(map_awa_error)?
-    {
-        awa_model::DlqRetryBatch::Revived { count } => Ok(count),
-        awa_model::DlqRetryBatch::UniqueConflict { job_id } => {
-            Err(crate::UniqueConflict::new_err(format!(
-                "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried"
-            )))
+    let busy_since = Instant::now();
+    let mut busy_wait = Duration::from_millis(100);
+    loop {
+        match awa_model::dlq::bulk_retry_from_dlq_batch(pool, filter, allow_all, batch_size)
+            .await
+            .map_err(map_awa_error)?
+        {
+            awa_model::DlqRetryBatch::Revived { count } => return Ok(count),
+            awa_model::DlqRetryBatch::UniqueConflict { job_id } => {
+                return Err(crate::UniqueConflict::new_err(format!(
+                    "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried"
+                )));
+            }
+            awa_model::DlqRetryBatch::Busy if busy_since.elapsed() < Duration::from_secs(30) => {
+                tokio::time::sleep(busy_wait).await;
+                busy_wait = (busy_wait * 2).min(Duration::from_secs(2));
+            }
+            awa_model::DlqRetryBatch::Busy => {
+                return Err(crate::DatabaseError::new_err(
+                    "every matching DLQ row has been held by another transaction for 30s; try again later",
+                ));
+            }
+            other => {
+                return Err(crate::DatabaseError::new_err(format!(
+                    "unexpected DLQ retry outcome: {other:?}"
+                )));
+            }
         }
     }
 }
