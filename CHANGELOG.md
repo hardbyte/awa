@@ -2,7 +2,9 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
-## [Unreleased]
+## [0.6.18] — 2026-11-18
+
+Recommended for everyone on 0.6.17 using queue storage. An idle runtime stops rotating its rings and costs the database less: in a two-round comparison against 0.6.17 on PostgreSQL 18, idle transactions fell from 60 to 26 a second and idle WAL by about 60%, and with 200 idle queues from about 670 to 125 transactions a second. A retry storm no longer floods the connection pool, completing 230 to 300 jobs a second where 0.6.17 completed 90 to 150, and moving, reprioritising or cancelling the jobs of a lane that pins the queue ring now releases it. Saturation throughput and claim latency match or improve on 0.6.17. The `replica_identity` patch takes brief table locks when `awa migrate` applies it; see the [upgrade guide](docs/upgrade-0.6.17-to-0.6.18.md).
 
 ### Upgrading
 
