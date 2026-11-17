@@ -488,7 +488,9 @@ export function bulkPurgeDlq(filter: {
   kind?: string;
   queue?: string;
   tag?: string;
-}): Promise<DlqBulkResult> {
+  batch_size?: number;
+  cursor?: BulkCursor;
+}): Promise<BulkBatchResult> {
   return apiFetch("/dlq/bulk-purge", {
     method: "POST",
     body: JSON.stringify(filter),
@@ -499,7 +501,9 @@ export function bulkMoveFailedToDlq(body: {
   kind?: string;
   queue?: string;
   reason?: string;
-}): Promise<DlqBulkResult> {
+  batch_size?: number;
+  cursor?: BulkCursor;
+}): Promise<BulkBatchResult> {
   return apiFetch("/dlq/bulk-move", {
     method: "POST",
     body: JSON.stringify(body),
@@ -539,10 +543,34 @@ export function resumeQueue(queue: string): Promise<{ ok: boolean }> {
   });
 }
 
-export function drainQueue(queue: string): Promise<{ drained: number }> {
-  return apiFetch(`/queues/${encodeURIComponent(queue)}/drain`, {
+export function drainQueue(
+  queue: string,
+  batch?: { batch_size: number; cursor?: BulkCursor }
+): Promise<BulkBatchResult & { drained: number }> {
+  const qs = new URLSearchParams();
+  if (batch) {
+    qs.set("batch_size", String(batch.batch_size));
+    if (batch.cursor) {
+      qs.set("stage", String(batch.cursor.stage));
+      qs.set("after_job_id", String(batch.cursor.after_job_id));
+    }
+  }
+  const query = qs.toString();
+  return apiFetch(`/queues/${encodeURIComponent(queue)}/drain${query ? `?${query}` : ""}`, {
     method: "POST",
   });
+}
+
+export function fetchDlqCount(filter: {
+  kind?: string;
+  queue?: string;
+  tag?: string;
+}): Promise<{ count: number; capped: boolean }> {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(filter)) {
+    if (v) qs.set(k, v);
+  }
+  return apiFetch(`/dlq/count?${qs.toString()}`);
 }
 
 // Cron

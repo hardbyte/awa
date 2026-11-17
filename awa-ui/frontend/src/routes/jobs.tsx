@@ -16,6 +16,7 @@ import {
   drainQueue,
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
+import { useBulkRun, BulkRunProgress } from "@/hooks/use-bulk-run";
 import { toast } from "@/components/ui/toast";
 import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -136,11 +137,19 @@ export function JobsPage() {
 
   const retryMutation = useMutation({
     mutationFn: (ids: number[]) => bulkRetry(ids),
-    onSuccess: (_data, ids) => {
+    onSuccess: (retried, ids) => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       void queryClient.invalidateQueries({ queryKey: ["stats"] });
-      toast.success(`Retried ${ids.length} job(s)`);
+      const retriedIds = new Set(retried.map((job) => job.id));
+      const notRetried = ids.filter((id) => !retriedIds.has(id));
+      if (notRetried.length > 0) {
+        toast.error(
+          `Retried ${retried.length} job(s); ${notRetried.length} were not retried, because a live job holds their unique key or they changed state (${notRetried.slice(0, 10).join(", ")}${notRetried.length > 10 ? ", ..." : ""})`
+        );
+      } else {
+        toast.success(`Retried ${retried.length} job(s)`);
+      }
     },
     onError: () => {
       toast.error("Failed to retry jobs");
@@ -194,15 +203,18 @@ export function JobsPage() {
     },
     onError: () => toast.error("Failed to resume queue"),
   });
-  const drainQueueMutation = useMutation({
-    mutationFn: () => drainQueue(activeQueue!),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["queues"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${activeQueue}" drained`);
-    },
-    onError: () => toast.error("Failed to drain queue"),
-  });
+  const bulk = useBulkRun();
+  const startDrain = (queue: string) =>
+    void bulk.start({
+      label: `Draining queue "${queue}"`,
+      verb: "Drained",
+      noun: `job(s) from "${queue}"`,
+      runBatch: (batchSize, cursor) => drainQueue(queue, { batch_size: batchSize, cursor }),
+      onFinish: () => {
+        void queryClient.invalidateQueries({ queryKey: ["queues"] });
+        void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      },
+    });
 
   // Compute which selected jobs are retryable vs cancellable
   const { retryableIds, cancellableIds } = useMemo(() => {
@@ -324,13 +336,15 @@ export function JobsPage() {
               size="xs"
               className="text-danger"
               onPress={() => setShowDrainConfirm(true)}
-              isDisabled={readOnly}
+              isDisabled={readOnly || bulk.state !== null}
             >
               Drain
             </Button>
           </div>
         </div>
       )}
+
+      <BulkRunProgress state={bulk.state} onStop={bulk.requestStop} />
 
       {/* Compact state filter pills + search on same row */}
       <div className="flex flex-wrap items-center gap-2">
@@ -671,11 +685,14 @@ export function JobsPage() {
           isOpen={showDrainConfirm}
           onOpenChange={setShowDrainConfirm}
           title={`Drain queue "${activeQueue}"`}
-          description="This will cancel all available, scheduled, retryable, and waiting_external jobs in this queue. Running jobs will not be affected."
+          description="This will cancel all available, scheduled, retryable, and waiting_external jobs in this queue, in batches of up to 1,000. You can stop between batches. Running jobs will not be affected."
           confirmLabel="Drain queue"
           confirmIntent="danger"
-          onConfirm={() => drainQueueMutation.mutate()}
-          isPending={drainQueueMutation.isPending}
+          onConfirm={() => {
+            setShowDrainConfirm(false);
+            startDrain(activeQueue);
+          }}
+          isPending={bulk.state !== null}
         />
       )}
     </div>

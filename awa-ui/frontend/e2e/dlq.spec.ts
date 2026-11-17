@@ -36,7 +36,15 @@ function dlqRow(id: number) {
   };
 }
 
-async function stubDlqPage(page: Page, retryResponses: Array<{ status: number; json: unknown }>) {
+async function stubDlqPage(
+  page: Page,
+  retryResponses: Array<{ status: number; json: unknown }>,
+  options: {
+    count?: { count: number; capped: boolean };
+    purgeResponses?: Array<{ status: number; json: unknown }>;
+    purgeRequests?: unknown[];
+  } = {}
+) {
   const requests: unknown[] = [];
   await page.route("**/api/capabilities", (route) =>
     route.fulfill({ json: { read_only: false, poll_interval_ms: 2000 } })
@@ -47,6 +55,17 @@ async function stubDlqPage(page: Page, retryResponses: Array<{ status: number; j
       return route.fulfill({
         json: { total: 3, by_queue: [{ queue: QUEUE, count: 3 }] },
       });
+    }
+    if (url.pathname === "/api/dlq/count") {
+      return route.fulfill({ json: options.count ?? { count: 3, capped: false } });
+    }
+    if (url.pathname === "/api/dlq/bulk-purge") {
+      options.purgeRequests?.push(route.request().postDataJSON());
+      const next = options.purgeResponses?.shift() ?? {
+        status: 200,
+        json: { count: 0, skipped: 0, conflicts: [], done: true },
+      };
+      return route.fulfill(next);
     }
     if (url.pathname === "/api/dlq/bulk-retry") {
       requests.push(route.request().postDataJSON());
@@ -182,5 +201,35 @@ test.describe("DLQ bulk retry", () => {
     await page.getByRole("button", { name: "Retry", exact: true }).click();
 
     await expect(page.getByText("Retried 3 DLQ row(s)")).toBeVisible();
+  });
+
+  test("labels the actions with the matching count, capped on a large DLQ", async ({ page }) => {
+    await stubDlqPage(page, [], { count: { count: 10000, capped: true } });
+
+    await page.goto(`/dlq?q=queue:${QUEUE}`);
+
+    await expect(page.getByRole("button", { name: "Retry matching (10,000+)" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Purge matching (10,000+)" })).toBeVisible();
+  });
+
+  test("purges matching rows in batches until none remain", async ({ page }) => {
+    const purgeRequests: unknown[] = [];
+    await stubDlqPage(page, [], {
+      purgeRequests,
+      purgeResponses: [
+        { status: 200, json: batch(2, 700002) },
+        { status: 200, json: batch(1, 700003, { done: true }) },
+      ],
+    });
+
+    await page.goto(`/dlq?q=queue:${QUEUE}`);
+    await page.getByRole("button", { name: /Purge matching/ }).click();
+    await page.getByRole("button", { name: "Purge", exact: true }).click();
+
+    await expect(page.getByText("Purged 3 DLQ row(s)")).toBeVisible();
+    expect(purgeRequests).toEqual([
+      { queue: QUEUE, batch_size: 1000 },
+      { queue: QUEUE, batch_size: 1000, cursor: { stage: 0, after_job_id: 700002 } },
+    ]);
   });
 });

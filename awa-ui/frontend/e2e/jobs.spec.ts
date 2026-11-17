@@ -470,6 +470,36 @@ test.describe("Queue context banner", () => {
     await expect(dialog).not.toBeVisible();
   });
 
+  test("Drain runs in batches until the queue is drained", async ({ page }) => {
+    const drainRequests: string[] = [];
+    const responses = [
+      { drained: 2, count: 2, skipped: 0, conflicts: [], done: false, cursor: { stage: 0, after_job_id: 12 } },
+      { drained: 1, count: 1, skipped: 0, conflicts: [], done: true, cursor: { stage: 1, after_job_id: 0 } },
+    ];
+    await page.route("**/api/queues/e2e_test/drain**", async (route) => {
+      const url = new URL(route.request().url());
+      drainRequests.push(url.search);
+      await route.fulfill({ json: responses.shift() });
+    });
+    await Promise.all([
+      page.waitForResponse(isQueuesListResponse),
+      page.goto("/jobs?q=queue%3Ae2e_test"),
+    ]);
+
+    const banner = page.locator(".rounded-lg.border.bg-muted\\/30");
+    await banner.getByRole("button", { name: "Drain" }).click();
+    await page
+      .getByRole("alertdialog")
+      .getByRole("button", { name: "Drain queue" })
+      .click();
+
+    await expect(page.getByText('Drained 3 job(s) from "e2e_test"')).toBeVisible();
+    expect(drainRequests).toEqual([
+      "?batch_size=1000",
+      "?batch_size=1000&stage=0&after_job_id=12",
+    ]);
+  });
+
   test("banner does not appear without queue filter", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
