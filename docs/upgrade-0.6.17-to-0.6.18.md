@@ -63,6 +63,8 @@ This part needs no migration and applies once the maintenance leader runs 0.6.18
 
 A dashboard or alert that expects `rotated` outcomes or a rising generation while the queues are empty will see them stop; a flat generation is a problem only together with `skipped_busy` outcomes. During the roll a 0.6.17 leader rotates empty rings and a 0.6.18 leader does not, and leadership can move between them in either direction: both advance the same cursor through the same rotate and prune transactions, so no step is needed. `QueueStorage::rotate`, `rotate_leases` and `rotate_claims` keep rotating unconditionally; the gated forms are `rotate_if_active`, `rotate_leases_if_active` and `rotate_claims_if_active`.
 
+The 0.6.18 leader runs these checks on one pool connection it holds while it leads, shown in `pg_stat_activity` with `application_name` `awa-maintenance-idle-check`, so a leader holds two of its pool's connections, not one: the leader-lock connection and this one. Allow for it when sizing a small pool.
+
 ## Rollback
 
 Roll binaries back to 0.6.17 in any order. Leave the patch in place: 0.6.17 runs unchanged against tables with a replica identity.

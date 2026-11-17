@@ -27,6 +27,15 @@ use uuid::Uuid;
 /// Detached lifecycle hook tasks maintenance may have outstanding at once.
 const MAINTENANCE_LIFECYCLE_EVENT_CAPACITY: usize = 1024;
 const MAINTENANCE_BRANCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// `application_name` of the connection the leader runs ring idle checks on.
+const IDLE_CHECK_APPLICATION_NAME: &str = "awa-maintenance-idle-check";
+
+#[derive(Clone, Copy)]
+enum GatedRing {
+    Queue,
+    Lease,
+    Claim,
+}
 
 /// The canonical unique-claim conflict raised by `awa.sync_job_unique_claims`
 /// (SQLSTATE 23505, constraint reported as `idx_awa_jobs_unique`). See #388.
@@ -1063,6 +1072,8 @@ pub struct MaintenanceService {
     rescue_heartbeat_cadence: std::sync::Mutex<RescueHeartbeatCadence>,
     rescue_sweeps: std::sync::Mutex<HashMap<RescueKind, RescueSweep>>,
     queue_ring_pin: std::sync::Mutex<QueueRingPinReport>,
+    /// The connection the leader runs the ring idle checks on while it leads.
+    idle_check_conn: std::sync::Mutex<Option<PoolConnection<Postgres>>>,
     /// When the leader last warned that it could not advance a pinning lane.
     queue_ring_advance_warned_at: std::sync::Mutex<Option<Instant>>,
     rescue_others_first_offset: AtomicUsize,
@@ -1404,6 +1415,7 @@ impl MaintenanceService {
             rescue_heartbeat_cadence: std::sync::Mutex::new(RescueHeartbeatCadence::default()),
             rescue_sweeps: std::sync::Mutex::new(HashMap::new()),
             queue_ring_pin: std::sync::Mutex::new(QueueRingPinReport::default()),
+            idle_check_conn: std::sync::Mutex::new(None),
             queue_ring_advance_warned_at: std::sync::Mutex::new(None),
             rescue_others_first_offset: AtomicUsize::new(0),
             promote_interval: Duration::from_millis(250),
@@ -2060,6 +2072,7 @@ impl MaintenanceService {
             };
             run_leader_term(observer, &self.cancel, work).await;
             self.clear_queue_ring_pin();
+            self.release_idle_check_conn();
             if self.cancel.is_cancelled() {
                 return;
             }
@@ -3723,12 +3736,73 @@ impl MaintenanceService {
         Ok((promoted, queues))
     }
 
+    /// Rotates `ring` unless it is idle, running the idle check on
+    /// [`Self::idle_check_conn`]. A failed call discards that connection, and
+    /// the next call takes a fresh one from the pool.
+    async fn gated_rotate(
+        &self,
+        store: &QueueStorage,
+        ring: GatedRing,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        let mut conn = self.take_idle_check_conn().await?;
+        let outcome = match ring {
+            GatedRing::Queue => store.rotate_if_active_on(&mut conn, &self.pool).await,
+            GatedRing::Lease => {
+                store
+                    .rotate_leases_if_active_on(&mut conn, &self.pool)
+                    .await
+            }
+            GatedRing::Claim => {
+                store
+                    .rotate_claims_if_active_on(&mut conn, &self.pool)
+                    .await
+            }
+        };
+        if outcome.is_ok() {
+            let mut slot = self
+                .idle_check_conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(conn);
+            }
+        }
+        outcome
+    }
+
+    async fn take_idle_check_conn(&self) -> Result<PoolConnection<Postgres>, AwaError> {
+        let held = self
+            .idle_check_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(conn) = held {
+            return Ok(conn);
+        }
+        let mut conn = self.pool.acquire().await?;
+        conn.close_on_drop();
+        sqlx::query("SELECT set_config('application_name', $1, false)")
+            .bind(IDLE_CHECK_APPLICATION_NAME)
+            .execute(&mut *conn)
+            .await?;
+        Ok(conn)
+    }
+
+    fn release_idle_check_conn(&self) {
+        drop(
+            self.idle_check_conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+
     async fn rotate_queue_storage_queue(&self, prune_tracker: &PruneBackoffTracker) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
 
-        match runtime.store.rotate_if_active(&self.pool).await {
+        match self.gated_rotate(&runtime.store, GatedRing::Queue).await {
             Ok(GatedRotateOutcome::SkippedIdle { slot, generation }) => {
                 self.metrics
                     .record_rotate_skipped_idle("queue", slot, generation);
@@ -4027,7 +4101,7 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate_leases_if_active(&self.pool).await {
+        match self.gated_rotate(&runtime.store, GatedRing::Lease).await {
             Ok(GatedRotateOutcome::SkippedIdle { slot, generation }) => {
                 self.metrics
                     .record_rotate_skipped_idle("lease", slot, generation);
@@ -4107,7 +4181,7 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate_claims_if_active(&self.pool).await {
+        match self.gated_rotate(&runtime.store, GatedRing::Claim).await {
             Ok(GatedRotateOutcome::SkippedIdle { slot, generation }) => {
                 self.metrics
                     .record_rotate_skipped_idle("claim", slot, generation);
