@@ -19,7 +19,8 @@ use crate::error::AwaError;
 use crate::job::JobRow;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Rows a batched admin operation changes per transaction by default.
 pub const DEFAULT_BATCH_SIZE: i64 = 1_000;

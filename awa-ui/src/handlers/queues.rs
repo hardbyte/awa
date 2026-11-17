@@ -96,14 +96,13 @@ pub async fn drain_queue(
         after_job_id: params.after_job_id,
         below_job_id: params.below_job_id,
     };
-    let bulk =
-        crate::handlers::dlq::run_bulk_route(params.batch_size, Some(cursor), |size, cursor| {
-            admin::drain_queue_batch(&state.pool, &queue, size, cursor)
-        })
-        .await?;
-    if bulk.count > 0 {
-        state.invalidate_dashboard_caches();
-    }
+    let bulk = crate::handlers::dlq::run_bulk_route(
+        params.batch_size,
+        Some(cursor),
+        |size, cursor| admin::drain_queue_batch(&state.pool, &queue, size, cursor),
+        |_| state.invalidate_dashboard_caches(),
+    )
+    .await?;
     Ok(Json(DrainResponse {
         drained: bulk.count,
         bulk,

@@ -117,12 +117,14 @@ pub(crate) fn finish_bulk_run(run: awa_model::BulkRun, verb: &str) -> PyResult<u
 }
 
 /// Retry every matching DLQ row, `batch_size` rows per transaction
-/// (`bulk::DEFAULT_BATCH_SIZE` when unset).
+/// (`bulk::DEFAULT_BATCH_SIZE` when unset). `on_changed` sees the row count
+/// of each batch that retried rows, as the batch commits.
 pub(crate) async fn bulk_retry(
     pool: &sqlx::PgPool,
     filter: &ListDlqFilter,
     allow_all: bool,
     batch_size: Option<i64>,
+    mut on_changed: impl FnMut(u64),
 ) -> PyResult<u64> {
     use crate::errors::map_awa_error;
     let options = awa_model::BulkRunOptions::default()
@@ -132,7 +134,11 @@ pub(crate) async fn bulk_retry(
         |size, cursor| {
             awa_model::dlq::bulk_retry_from_dlq_batch(pool, filter, allow_all, size, cursor)
         },
-        |_, _| {},
+        |batch, _| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+        },
     )
     .await
     .map_err(map_awa_error)?;
@@ -176,7 +182,8 @@ pub(crate) async fn drain_queue(
     finish_bulk_run(run, "Drained")
 }
 
-/// Move failed jobs into the DLQ in batches.
+/// Move failed jobs into the DLQ in batches. `on_changed` sees the row
+/// count of each batch that moved rows, as the batch commits.
 pub(crate) async fn bulk_move(
     pool: &sqlx::PgPool,
     kind: Option<&str>,
@@ -184,6 +191,7 @@ pub(crate) async fn bulk_move(
     reason: &str,
     allow_all: bool,
     batch_size: Option<i64>,
+    mut on_changed: impl FnMut(u64),
 ) -> PyResult<u64> {
     let run = awa_model::bulk::run_batches(
         batch_options(batch_size),
@@ -192,24 +200,34 @@ pub(crate) async fn bulk_move(
                 pool, kind, queue, reason, allow_all, size, cursor,
             )
         },
-        |_, _| {},
+        |batch, _| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+        },
     )
     .await
     .map_err(crate::errors::map_awa_error)?;
     finish_bulk_run(run, "Moved")
 }
 
-/// Purge matching DLQ rows in batches.
+/// Purge matching DLQ rows in batches. `on_changed` sees the row count of
+/// each batch that purged rows, as the batch commits.
 pub(crate) async fn purge(
     pool: &sqlx::PgPool,
     filter: &ListDlqFilter,
     allow_all: bool,
     batch_size: Option<i64>,
+    mut on_changed: impl FnMut(u64),
 ) -> PyResult<u64> {
     let run = awa_model::bulk::run_batches(
         batch_options(batch_size),
         |size, cursor| awa_model::dlq::purge_dlq_batch(pool, filter, allow_all, size, cursor),
-        |_, _| {},
+        |batch, _| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+        },
     )
     .await
     .map_err(crate::errors::map_awa_error)?;

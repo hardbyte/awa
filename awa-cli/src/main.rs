@@ -19,14 +19,21 @@ struct BulkArgs {
     /// Stop after changing this many rows in total.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     limit: Option<u64>,
+    /// Give up after this many seconds without progress while every
+    /// remaining matching row is held by another transaction.
+    #[arg(long, hide = true, default_value_t = awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs())]
+    busy_timeout_secs: u64,
 }
 
 /// Run a batched admin operation, printing each batch to stderr.
+/// `on_changed` sees the row count of each batch that changed rows, as the
+/// batch commits, so a run that fails later still accounts for them.
 async fn run_bulk<F, Fut>(
     bulk: &BulkArgs,
     verb: &str,
     noun: &str,
     batch: F,
+    mut on_changed: impl FnMut(u64),
 ) -> Result<awa_model::BulkRun, awa_model::AwaError>
 where
     F: FnMut(i64, awa_model::BulkCursor) -> Fut,
@@ -35,9 +42,13 @@ where
     awa_model::bulk::run_batches(
         awa_model::BulkRunOptions::default()
             .batch_size(bulk.batch_size)
-            .limit(bulk.limit),
+            .limit(bulk.limit)
+            .busy_timeout(Duration::from_secs(bulk.busy_timeout_secs)),
         batch,
         |batch, run| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
             if batch.count > 0 || batch.skipped > 0 {
                 eprintln!(
                     "{verb} {} {noun} ({} so far){}.",
@@ -55,17 +66,12 @@ where
     .await
 }
 
-/// Print a bulk run's result. Exits 1 when the run gave up on rows another
-/// transaction held, and 2 when it skipped rows over a unique conflict.
+/// Print a bulk run's result, including any skipped jobs and whether it
+/// gave up on held rows. Exits 1 when the run gave up on rows another
+/// transaction held, otherwise 2 when it skipped rows over a unique
+/// conflict.
 fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
     println!("{verb} {} {noun}.", run.count);
-    if run.busy_timed_out {
-        eprintln!(
-            "Every remaining matching row has been held by another transaction for {}s; stopping. Rerun once it finishes.",
-            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs()
-        );
-        std::process::exit(1);
-    }
     if run.skipped > 0 {
         let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
         eprintln!(
@@ -78,6 +84,14 @@ fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
             },
             ids.join(", ")
         );
+    }
+    if run.busy_timed_out {
+        eprintln!(
+            "Every remaining matching row stayed held by another transaction past the busy timeout; stopping. Rerun once it finishes."
+        );
+        std::process::exit(1);
+    }
+    if run.skipped > 0 {
         std::process::exit(2);
     }
 }
@@ -964,18 +978,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bulk,
                     } => {
                         let run = if let Some(kind) = kind {
-                            run_bulk(&bulk, "Retried", "failed jobs", |size, cursor| {
-                                awa_model::admin::retry_failed_by_kind_batch(
-                                    &pool, &kind, size, cursor,
-                                )
-                            })
+                            run_bulk(
+                                &bulk,
+                                "Retried",
+                                "failed jobs",
+                                |size, cursor| {
+                                    awa_model::admin::retry_failed_by_kind_batch(
+                                        &pool, &kind, size, cursor,
+                                    )
+                                },
+                                |_| {},
+                            )
                             .await?
                         } else if let Some(queue) = queue {
-                            run_bulk(&bulk, "Retried", "failed jobs", |size, cursor| {
-                                awa_model::admin::retry_failed_by_queue_batch(
-                                    &pool, &queue, size, cursor,
-                                )
-                            })
+                            run_bulk(
+                                &bulk,
+                                "Retried",
+                                "failed jobs",
+                                |size, cursor| {
+                                    awa_model::admin::retry_failed_by_queue_batch(
+                                        &pool, &queue, size, cursor,
+                                    )
+                                },
+                                |_| {},
+                            )
                             .await?
                         } else {
                             unreachable!("clap requires exactly one retry-failed filter")
@@ -985,9 +1011,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     JobCommands::Discard { kind, bulk } => {
                         let noun = format!("failed jobs of kind '{kind}'");
-                        let run = run_bulk(&bulk, "Discarded", &noun, |size, cursor| {
-                            awa_model::admin::discard_failed_batch(&pool, &kind, size, cursor)
-                        })
+                        let run = run_bulk(
+                            &bulk,
+                            "Discarded",
+                            &noun,
+                            |size, cursor| {
+                                awa_model::admin::discard_failed_batch(&pool, &kind, size, cursor)
+                            },
+                            |_| {},
+                        )
                         .await?;
                         finish_bulk(&run, "Discarded", &noun);
                     }
@@ -1132,15 +1164,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            let run = run_bulk(&bulk, "Retried", "DLQ rows", |size, cursor| {
-                                awa_model::dlq::bulk_retry_from_dlq_batch(
-                                    &pool, &filter, all, size, cursor,
-                                )
-                            })
+                            let run = run_bulk(
+                                &bulk,
+                                "Retried",
+                                "DLQ rows",
+                                |size, cursor| {
+                                    awa_model::dlq::bulk_retry_from_dlq_batch(
+                                        &pool, &filter, all, size, cursor,
+                                    )
+                                },
+                                |count| metrics.record_dlq_retried(queue.as_deref(), count),
+                            )
                             .await?;
-                            if run.count > 0 {
-                                metrics.record_dlq_retried(queue.as_deref(), run.count);
-                            }
                             finish_bulk(&run, "Retried", "DLQ rows");
                         }
                         DlqCommands::Move {
@@ -1165,17 +1200,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         cursor,
                                     )
                                 },
+                                // Emit the same `awa.job.dlq_moved` counter the
+                                // executor uses for automatic routing, so
+                                // dashboards and alerting see admin bulk moves
+                                // too.
+                                |count| {
+                                    metrics.record_dlq_moved_bulk(
+                                        kind.as_deref(),
+                                        queue.as_deref(),
+                                        &reason,
+                                        count,
+                                    )
+                                },
                             )
                             .await?;
-                            // Emit the same `awa.job.dlq_moved` counter the
-                            // executor uses for automatic routing, so dashboards
-                            // and alerting see admin bulk moves too.
-                            metrics.record_dlq_moved_bulk(
-                                kind.as_deref(),
-                                queue.as_deref(),
-                                &reason,
-                                run.count,
-                            );
                             finish_bulk(&run, "Moved", "failed jobs into the DLQ");
                         }
                         DlqCommands::Purge {
@@ -1191,13 +1229,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            let run = run_bulk(&bulk, "Purged", "DLQ rows", |size, cursor| {
-                                awa_model::dlq::purge_dlq_batch(&pool, &filter, all, size, cursor)
-                            })
+                            let run = run_bulk(
+                                &bulk,
+                                "Purged",
+                                "DLQ rows",
+                                |size, cursor| {
+                                    awa_model::dlq::purge_dlq_batch(
+                                        &pool, &filter, all, size, cursor,
+                                    )
+                                },
+                                |count| metrics.record_dlq_purged(queue.as_deref(), count),
+                            )
                             .await?;
-                            if run.count > 0 {
-                                metrics.record_dlq_purged(queue.as_deref(), run.count);
-                            }
                             finish_bulk(&run, "Purged", "DLQ rows");
                         }
                     }
@@ -1558,9 +1601,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     QueueCommands::Drain { queue, bulk } => {
                         let noun = format!("jobs from queue '{queue}'");
-                        let run = run_bulk(&bulk, "Drained", &noun, |size, cursor| {
-                            awa_model::admin::drain_queue_batch(&pool, &queue, size, cursor)
-                        })
+                        let run = run_bulk(
+                            &bulk,
+                            "Drained",
+                            &noun,
+                            |size, cursor| {
+                                awa_model::admin::drain_queue_batch(&pool, &queue, size, cursor)
+                            },
+                            |_| {},
+                        )
                         .await?;
                         finish_bulk(&run, "Drained", &noun);
                     }

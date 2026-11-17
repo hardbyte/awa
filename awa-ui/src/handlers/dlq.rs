@@ -204,21 +204,36 @@ impl BulkResponse {
 
 /// Run one batch when `batch_size` is set, resuming at `cursor`; otherwise
 /// run batches of `bulk::DEFAULT_BATCH_SIZE` until no matching row remains.
+///
+/// `on_changed` sees the row count of each batch that changed rows, as the
+/// batch commits, so a run that stops on a later batch's error or busy
+/// timeout still accounts for the rows it changed. Routes record metrics and
+/// invalidate caches there rather than from the response.
 pub async fn run_bulk_route<F, Fut>(
     batch_size: Option<i64>,
     cursor: Option<BulkCursor>,
     mut batch: F,
+    mut on_changed: impl FnMut(u64),
 ) -> Result<BulkResponse, ApiError>
 where
     F: FnMut(i64, BulkCursor) -> Fut,
     Fut: std::future::Future<Output = Result<BulkBatch, awa_model::AwaError>>,
 {
     match batch_size {
-        Some(batch_size) => Ok(BulkResponse::from_batch(
-            batch(batch_size, cursor.unwrap_or_default()).await?,
-        )),
+        Some(batch_size) => {
+            let batch = batch(batch_size, cursor.unwrap_or_default()).await?;
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+            Ok(BulkResponse::from_batch(batch))
+        }
         None => BulkResponse::from_run(
-            bulk::run_batches(BulkRunOptions::default(), batch, |_, _| {}).await?,
+            bulk::run_batches(BulkRunOptions::default(), batch, |batch, _| {
+                if batch.count > 0 {
+                    on_changed(batch.count);
+                }
+            })
+            .await?,
         ),
     }
 }
@@ -236,16 +251,18 @@ pub async fn bulk_retry_dlq(
         ..Default::default()
     };
     let all = payload.all;
-    let response = run_bulk_route(payload.batch_size, payload.cursor, |size, cursor| {
-        dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, all, size, cursor)
-    })
+    let response = run_bulk_route(
+        payload.batch_size,
+        payload.cursor,
+        |size, cursor| dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, all, size, cursor),
+        |count| {
+            state
+                .metrics
+                .record_dlq_retried(queue_attr.as_deref(), count);
+            state.invalidate_dashboard_caches();
+        },
+    )
     .await?;
-    if response.count > 0 {
-        state
-            .metrics
-            .record_dlq_retried(queue_attr.as_deref(), response.count);
-        state.invalidate_dashboard_caches();
-    }
     Ok(Json(response))
 }
 
@@ -281,16 +298,18 @@ pub async fn bulk_purge_dlq(
         ..Default::default()
     };
     let all = payload.all;
-    let response = run_bulk_route(payload.batch_size, payload.cursor, |size, cursor| {
-        dlq::purge_dlq_batch(&state.pool, &filter, all, size, cursor)
-    })
+    let response = run_bulk_route(
+        payload.batch_size,
+        payload.cursor,
+        |size, cursor| dlq::purge_dlq_batch(&state.pool, &filter, all, size, cursor),
+        |count| {
+            state
+                .metrics
+                .record_dlq_purged(queue_attr.as_deref(), count);
+            state.invalidate_dashboard_caches();
+        },
+    )
     .await?;
-    if response.count > 0 {
-        state
-            .metrics
-            .record_dlq_purged(queue_attr.as_deref(), response.count);
-        state.invalidate_dashboard_caches();
-    }
     Ok(Json(response))
 }
 
@@ -325,27 +344,31 @@ pub async fn bulk_move_failed(
     Json(payload): Json<BulkMovePayload>,
 ) -> Result<Json<BulkResponse>, ApiError> {
     state.require_writable()?;
-    let response = run_bulk_route(payload.batch_size, payload.cursor, |size, cursor| {
-        dlq::bulk_move_failed_to_dlq_batch(
-            &state.pool,
-            payload.kind.as_deref(),
-            payload.queue.as_deref(),
-            &payload.reason,
-            payload.all,
-            size,
-            cursor,
-        )
-    })
+    let response = run_bulk_route(
+        payload.batch_size,
+        payload.cursor,
+        |size, cursor| {
+            dlq::bulk_move_failed_to_dlq_batch(
+                &state.pool,
+                payload.kind.as_deref(),
+                payload.queue.as_deref(),
+                &payload.reason,
+                payload.all,
+                size,
+                cursor,
+            )
+        },
+        |count| {
+            state.metrics.record_dlq_moved_bulk(
+                payload.kind.as_deref(),
+                payload.queue.as_deref(),
+                &payload.reason,
+                count,
+            );
+            state.invalidate_dashboard_caches();
+        },
+    )
     .await?;
-    if response.count > 0 {
-        state.metrics.record_dlq_moved_bulk(
-            payload.kind.as_deref(),
-            payload.queue.as_deref(),
-            &payload.reason,
-            response.count,
-        );
-        state.invalidate_dashboard_caches();
-    }
     Ok(Json(response))
 }
 
@@ -372,4 +395,77 @@ pub async fn dlq_count(
     Ok(Json(
         dlq::count_dlq(&state.pool, &filter, DLQ_COUNT_CAP).await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn changed(count: u64) -> BulkBatch {
+        let mut batch = BulkBatch::default();
+        batch.count = count;
+        batch
+    }
+
+    fn busy() -> BulkBatch {
+        let mut batch = BulkBatch::default();
+        batch.busy = true;
+        batch
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_whole_run_records_committed_batches_before_a_busy_timeout() {
+        let mut calls = 0;
+        let mut recorded = Vec::new();
+        let result = run_bulk_route(
+            None,
+            None,
+            |_, _| {
+                calls += 1;
+                let batch = if calls == 1 { changed(2) } else { busy() };
+                async move { Ok(batch) }
+            },
+            |count| recorded.push(count),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::Conflict(_))), "{result:?}");
+        assert_eq!(recorded, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn a_whole_run_records_committed_batches_before_an_error() {
+        let mut calls = 0;
+        let mut recorded = Vec::new();
+        let result = run_bulk_route(
+            None,
+            None,
+            |_, _| {
+                calls += 1;
+                let batch = if calls == 1 {
+                    Ok(changed(3))
+                } else {
+                    Err(awa_model::AwaError::Validation("later batch failed".into()))
+                };
+                async move { batch }
+            },
+            |count| recorded.push(count),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(recorded, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn one_batch_records_its_count() {
+        let mut recorded = Vec::new();
+        let response = run_bulk_route(
+            Some(5),
+            None,
+            |_, _| async { Ok(changed(4)) },
+            |count| recorded.push(count),
+        )
+        .await
+        .expect("batch");
+        assert_eq!((response.count, recorded), (4, vec![4]));
+    }
 }

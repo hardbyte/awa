@@ -126,3 +126,67 @@ async fn retry_bulk_skips_a_unique_conflict_and_names_the_job() {
         .expect("drop claim");
     awa_testing::setup::clean_queue(&pool, &queue).await;
 }
+
+#[tokio::test]
+async fn retry_bulk_reports_skipped_jobs_when_it_gives_up_on_a_held_row() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("cli_dlq_conflict_held");
+    let key = format!("cli-dlq-{queue}").into_bytes();
+    let keyed: i64 = sqlx::query_scalar(
+        "INSERT INTO awa.dlq_entries \
+             (job_id, kind, queue, priority, dlq_reason, original_run_lease, unique_key, unique_states) \
+         VALUES (nextval('awa.job_id_seq'), 'cli_dlq_job', $1, 2, 'seeded', 1, $2, '11000000') \
+         RETURNING job_id",
+    )
+    .bind(&queue)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("seed keyed dlq row");
+    let held = seed_dlq(&pool, &queue, 1).await[0];
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(&key)
+        .bind(i64::MAX - 4)
+        .execute(&pool)
+        .await
+        .expect("live job holds the key");
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT 1 FROM awa.dlq_entries WHERE job_id = $1 FOR UPDATE")
+        .bind(held)
+        .execute(holder.as_mut())
+        .await
+        .expect("hold the row");
+
+    let gave_up = run_cli(&[
+        "dlq",
+        "retry-bulk",
+        "--queue",
+        &queue,
+        "--batch-size",
+        "1",
+        "--busy-timeout-secs",
+        "1",
+    ])
+    .assert()
+    .code(1);
+    let stderr = String::from_utf8(gave_up.get_output().stderr.clone()).expect("stderr");
+    assert!(
+        stderr.contains(&format!(
+            "Skipped 1 job(s) whose unique key a live job holds: {keyed}"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("stayed held by another transaction"),
+        "{stderr}"
+    );
+
+    holder.rollback().await.expect("release the row");
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("drop claim");
+    awa_testing::setup::clean_queue(&pool, &queue).await;
+}
