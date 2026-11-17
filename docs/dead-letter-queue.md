@@ -60,6 +60,8 @@ Retry moves the row out of `dlq_entries` and back into the runnable path with `a
 
 ### Draining a large DLQ
 
+Bulk DLQ commands follow the shared [bulk admin model](bulk-admin.md).
+
 `retry-bulk` retries in batches: each batch is its own transaction of at most `--batch-size` rows (1,000 by default), taken in job ID order, and the command repeats until no matching row is left or `--limit` rows have been retried. The run is not atomic: rows retried by earlier batches stay retried if a later batch fails. Batches skip rows another transaction holds without passing them, so two drains of the same filter never retry a row twice and a held row is never left behind; when every remaining matching row is held, for example by another drain's batch that has not committed, the command waits and tries again, and gives up with exit code 1 after 60 seconds without progress.
 
 If a row's unique key is held by a live job, that row is skipped and stays in the DLQ, and the rest of the run carries on. The command prints how many rows it skipped and the first 10 of their job IDs, and exits with code 2. Retry or purge those jobs on their own once the live job finishes.

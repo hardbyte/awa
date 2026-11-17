@@ -398,6 +398,7 @@ All coordination through Postgres. The Rust runtime owns dispatch, leases, heart
 | [Lifecycle hooks](docs/lifecycle-hooks.md) | React to job start/finish/retry/callback events for metrics, alerting, cleanup |
 | [Security & Postgres roles](docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
 | [Troubleshooting](docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
+| [Bulk admin operations](docs/bulk-admin.md) | Bounded batches, total caps, conflict and lock handling for retry, drain, discard, move and purge |
 | [Architecture overview](docs/architecture.md) | System design, data flow, state machine, crash recovery |
 | [Web UI design](docs/ui-design.md) | API endpoints, pages, component library |
 | [Benchmarking notes](docs/benchmarking.md) | Methodology, headline numbers, how to run |

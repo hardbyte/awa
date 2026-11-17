@@ -664,7 +664,7 @@ If DLQ depth is growing quickly:
 - pause the upstream queue or producer if one failure mode is dominating
 - tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too long for the incident volume
 
-To drain a large DLQ, use `retry-bulk --batch-size` rather than a loop of single-job `retry` calls; see [draining a large DLQ](dead-letter-queue.md#draining-a-large-dlq). A script that does call the API once per job should hold one `QueueStorage` and call its methods.
+Bulk retry, move and purge run in bounded batches; see [bulk admin operations](bulk-admin.md). To drain a large DLQ, use `retry-bulk` rather than a loop of single-job `retry` calls; see [draining a large DLQ](dead-letter-queue.md#draining-a-large-dlq). A script that does call the API once per job should hold one `QueueStorage` and call its methods.
 
 ## Common Error Cases
 

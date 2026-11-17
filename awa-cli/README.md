@@ -56,17 +56,17 @@ awa --database-url $DATABASE_URL serve
 | `job dump-run <id> [--attempt N]` | Pretty-print one attempt run |
 | `job retry <id>` | Retry a failed or cancelled job |
 | `job cancel <id>` | Cancel a job |
-| `job retry-failed (--kind K \| --queue Q)` | Retry every failed job matching exactly one filter |
-| `job discard --kind K` | Delete every failed job of a given kind |
+| `job retry-failed (--kind K \| --queue Q)` | Retry every failed job matching exactly one filter, in batches |
+| `job discard --kind K` | Delete every failed job of a given kind, in batches |
 | `queue stats` | Per-queue depth, lag, and throughput |
-| `queue pause / resume / drain <queue>` | Queue admin |
+| `queue pause / resume / drain <queue>` | Queue admin; `drain` cancels in batches |
 | `cron list / remove` | List or remove cron schedules |
 | `dlq depth [--queue Q]` | Total DLQ rows, optionally split by queue |
 | `dlq list` | List DLQ entries with `--kind` / `--queue` / `--tag` / `--before-*` filters |
 | `dlq retry <id>` | Retry a single DLQ row |
 | `dlq retry-bulk` | Retry every DLQ row matching the filter (`--all` required if no filter is given), in transactions of `--batch-size` rows (default 1,000); `--limit` caps the total, and jobs skipped over a unique conflict exit 2 |
-| `dlq move` | Move existing failed terminal rows into the DLQ |
-| `dlq purge` | Delete DLQ rows matching the filter (`--all` required if no filter is given) |
+| `dlq move` | Move existing failed terminal rows into the DLQ, in batches |
+| `dlq purge` | Delete DLQ rows matching the filter (`--all` required if no filter is given), in batches |
 | `storage status` | Current storage-transition state |
 | `storage prepare --engine E` | Prepare a future storage engine without changing routing |
 | `storage prepare-queue-storage-schema` | Materialize the queue-storage schema (tables, indexes, functions) |
@@ -93,6 +93,8 @@ awa --database-url $DATABASE_URL storage finalize
 See [`docs/upgrade-0.5-to-0.6.md`](../docs/upgrade-0.5-to-0.6.md) for the full pre-flight checklist, gate semantics, and rollback notes. Fresh installs auto-finalize on first migrate and do not need this sequence.
 
 ## Dead Letter Queue
+
+The bulk commands (`job retry-failed`, `job discard`, `queue drain`, `dlq retry-bulk`, `dlq move`, `dlq purge`) work in transactions of `--batch-size` rows (default 1,000) and take `--limit` to cap the total; see [bulk admin operations](../docs/bulk-admin.md).
 
 `dlq retry-bulk` and `dlq purge` require an explicit filter (`--kind`, `--queue`, or `--tag`) or `--all`. This is intentional — a bare bulk retry / purge with no filter would touch every DLQ row, which is almost never what you want. See [`docs/dead-letter-queue.md`](../docs/dead-letter-queue.md).
 
