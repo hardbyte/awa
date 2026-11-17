@@ -3,9 +3,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
-use awa_model::admin;
 use awa_model::dlq::DlqMetadata;
 use awa_model::job::{JobRow, JobState};
+use awa_model::{admin, bulk};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -178,7 +178,9 @@ pub async fn bulk_retry(
     Json(payload): Json<BulkIdsPayload>,
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
-    let jobs = admin::bulk_retry(&state.pool, &payload.ids).await?;
+    let jobs = admin::bulk_retry_in_batches(&state.pool, &payload.ids, bulk::DEFAULT_BATCH_SIZE)
+        .await?
+        .jobs;
     if !jobs.is_empty() {
         state.invalidate_dashboard_caches();
     }
@@ -190,7 +192,9 @@ pub async fn bulk_cancel(
     Json(payload): Json<BulkIdsPayload>,
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
-    let jobs = admin::bulk_cancel(&state.pool, &payload.ids).await?;
+    let jobs = admin::bulk_cancel_in_batches(&state.pool, &payload.ids, bulk::DEFAULT_BATCH_SIZE)
+        .await?
+        .jobs;
     if !jobs.is_empty() {
         state.invalidate_dashboard_caches();
     }

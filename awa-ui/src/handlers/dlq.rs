@@ -119,6 +119,12 @@ pub struct BulkFilterPayload {
     /// provided. The model layer rejects empty filters otherwise.
     #[serde(default)]
     pub all: bool,
+    /// Run one batch of up to this many rows, resuming at `cursor`. Without
+    /// it, the server runs batches until no matching row remains.
+    #[serde(default)]
+    pub batch_size: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<BulkCursor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +202,27 @@ impl BulkResponse {
     }
 }
 
+/// Run one batch when `batch_size` is set, resuming at `cursor`; otherwise
+/// run batches of `bulk::DEFAULT_BATCH_SIZE` until no matching row remains.
+pub async fn run_bulk_route<F, Fut>(
+    batch_size: Option<i64>,
+    cursor: Option<BulkCursor>,
+    mut batch: F,
+) -> Result<BulkResponse, ApiError>
+where
+    F: FnMut(i64, BulkCursor) -> Fut,
+    Fut: std::future::Future<Output = Result<BulkBatch, awa_model::AwaError>>,
+{
+    match batch_size {
+        Some(batch_size) => Ok(BulkResponse::from_batch(
+            batch(batch_size, cursor.unwrap_or_default()).await?,
+        )),
+        None => BulkResponse::from_run(
+            bulk::run_batches(BulkRunOptions::default(), batch, |_, _| {}).await?,
+        ),
+    }
+}
+
 pub async fn bulk_retry_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkRetryPayload>,
@@ -208,28 +235,11 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let response = match payload.batch_size {
-        Some(batch_size) => BulkResponse::from_batch(
-            dlq::bulk_retry_from_dlq_batch(
-                &state.pool,
-                &filter,
-                payload.all,
-                batch_size,
-                payload.cursor.unwrap_or_default(),
-            )
-            .await?,
-        ),
-        None => BulkResponse::from_run(
-            bulk::run_batches(
-                BulkRunOptions::default(),
-                |size, cursor| {
-                    dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, size, cursor)
-                },
-                |_, _| {},
-            )
-            .await?,
-        )?,
-    };
+    let all = payload.all;
+    let response = run_bulk_route(payload.batch_size, payload.cursor, |size, cursor| {
+        dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, all, size, cursor)
+    })
+    .await?;
     if response.count > 0 {
         state
             .metrics
@@ -261,7 +271,7 @@ pub async fn purge_dlq_job(
 pub async fn bulk_purge_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkFilterPayload>,
-) -> Result<Json<CountResponse>, ApiError> {
+) -> Result<Json<BulkResponse>, ApiError> {
     state.require_writable()?;
     let queue_attr = payload.queue.clone();
     let filter = ListDlqFilter {
@@ -270,14 +280,18 @@ pub async fn bulk_purge_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
-    if count > 0 {
+    let all = payload.all;
+    let response = run_bulk_route(payload.batch_size, payload.cursor, |size, cursor| {
+        dlq::purge_dlq_batch(&state.pool, &filter, all, size, cursor)
+    })
+    .await?;
+    if response.count > 0 {
         state
             .metrics
-            .record_dlq_purged(queue_attr.as_deref(), count);
+            .record_dlq_purged(queue_attr.as_deref(), response.count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count }))
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +304,12 @@ pub struct BulkMovePayload {
     pub reason: String,
     #[serde(default)]
     pub all: bool,
+    /// Run one batch of up to this many rows, resuming at `cursor`. Without
+    /// it, the server runs batches until no matching row remains.
+    #[serde(default)]
+    pub batch_size: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<BulkCursor>,
 }
 
 fn default_move_reason() -> String {
@@ -303,24 +323,53 @@ fn default_move_reason() -> String {
 pub async fn bulk_move_failed(
     State(state): State<AppState>,
     Json(payload): Json<BulkMovePayload>,
-) -> Result<Json<CountResponse>, ApiError> {
+) -> Result<Json<BulkResponse>, ApiError> {
     state.require_writable()?;
-    let count = dlq::bulk_move_failed_to_dlq(
-        &state.pool,
-        payload.kind.as_deref(),
-        payload.queue.as_deref(),
-        &payload.reason,
-        payload.all,
-    )
+    let response = run_bulk_route(payload.batch_size, payload.cursor, |size, cursor| {
+        dlq::bulk_move_failed_to_dlq_batch(
+            &state.pool,
+            payload.kind.as_deref(),
+            payload.queue.as_deref(),
+            &payload.reason,
+            payload.all,
+            size,
+            cursor,
+        )
+    })
     .await?;
-    if count > 0 {
+    if response.count > 0 {
         state.metrics.record_dlq_moved_bulk(
             payload.kind.as_deref(),
             payload.queue.as_deref(),
             &payload.reason,
-            count,
+            response.count,
         );
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count }))
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DlqCountParams {
+    pub kind: Option<String>,
+    pub queue: Option<String>,
+    pub tag: Option<String>,
+}
+
+/// Matching DLQ rows are counted up to this many.
+pub const DLQ_COUNT_CAP: i64 = 10_000;
+
+pub async fn dlq_count(
+    State(state): State<AppState>,
+    Query(params): Query<DlqCountParams>,
+) -> Result<Json<dlq::DlqCount>, ApiError> {
+    let filter = ListDlqFilter {
+        kind: params.kind,
+        queue: params.queue,
+        tag: params.tag,
+        ..Default::default()
+    };
+    Ok(Json(
+        dlq::count_dlq(&state.pool, &filter, DLQ_COUNT_CAP).await?,
+    ))
 }

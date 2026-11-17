@@ -84,6 +84,12 @@ def main() -> None:
     p_retry_failed = sj.add_parser("retry-failed", help="Retry all failed jobs by kind or queue")
     p_retry_failed.add_argument("--kind")
     p_retry_failed.add_argument("--queue")
+    p_retry_failed.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Retry at most this many jobs per transaction (default 1000).",
+    )
     p_discard = sj.add_parser("discard", help="Discard failed jobs by kind")
     p_discard.add_argument("--kind", required=True)
     p_list = sj.add_parser("list", help="List jobs")
@@ -346,18 +352,10 @@ async def _dispatch_job(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         await client.cancel(args.id)
         print(f"Cancelled job {args.id}")
     elif jc == "retry-failed":
-        outcome = await client.retry_failed(kind=args.kind, queue=args.queue)
-        retried = len(outcome.jobs)
-        message = f"Retried {retried} failed jobs"
-        if outcome.matched != retried:
-            dropped = max(0, outcome.matched - retried)
-            message += f" (matched {outcome.matched}; {dropped} raced or pruned)"
-        if outcome.pruned_failed_count is not None and outcome.pruned_failed_count > 0:
-            message += (
-                f"; {outcome.pruned_failed_count} failed rows have been pruned "
-                "past retention and are no longer retryable"
-            )
-        print(message)
+        outcome = await client.retry_failed(
+            kind=args.kind, queue=args.queue, batch_size=args.batch_size
+        )
+        print(f"Retried {outcome.matched} failed jobs")
     elif jc == "discard":
         count = await client.discard_failed(args.kind)
         print(f"Discarded {count} failed jobs of kind '{args.kind}'")

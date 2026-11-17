@@ -330,11 +330,18 @@ enum JobCommands {
     /// Cancel a job
     Cancel { id: i64 },
     /// Retry all failed jobs by kind or queue
-    RetryFailed(RetryFailedArgs),
+    RetryFailed {
+        #[command(flatten)]
+        filter: RetryFailedArgs,
+        #[command(flatten)]
+        bulk: BulkArgs,
+    },
     /// Discard failed jobs by kind
     Discard {
         #[arg(long)]
         kind: String,
+        #[command(flatten)]
+        bulk: BulkArgs,
     },
     /// List jobs
     List {
@@ -400,6 +407,8 @@ enum DlqCommands {
         /// Move every failed row when no filter is provided.
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        bulk: BulkArgs,
     },
     /// Purge (delete) DLQ rows matching the filter
     Purge {
@@ -414,6 +423,8 @@ enum DlqCommands {
         /// accidentally wiping the DLQ.
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        bulk: BulkArgs,
     },
 }
 
@@ -463,8 +474,13 @@ enum BatchOpsCommands {
     Purge {
         #[arg(long)]
         before: DateTime<Utc>,
-        #[arg(long, default_value = "1000", value_parser = clap::value_parser!(i64).range(1..))]
-        limit: i64,
+        /// Purge in transactions of at most this many operations until none
+        /// match.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with = "limit")]
+        batch_size: Option<i64>,
+        /// Purge at most this many operations, in one transaction.
+        #[arg(long, hide = true, value_parser = clap::value_parser!(i64).range(1..))]
+        limit: Option<i64>,
     },
 }
 
@@ -566,7 +582,11 @@ enum QueueCommands {
     /// Resume a queue
     Resume { queue: String },
     /// Drain a queue (cancel all pending jobs)
-    Drain { queue: String },
+    Drain {
+        queue: String,
+        #[command(flatten)]
+        bulk: BulkArgs,
+    },
     /// Show queue statistics
     Stats,
 }
@@ -939,37 +959,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Cancelled job {id}");
                     }
 
-                    JobCommands::RetryFailed(RetryFailedArgs { kind, queue }) => {
-                        let outcome = if let Some(kind) = kind {
-                            awa_model::admin::retry_failed_by_kind(&pool, &kind).await?
+                    JobCommands::RetryFailed {
+                        filter: RetryFailedArgs { kind, queue },
+                        bulk,
+                    } => {
+                        let run = if let Some(kind) = kind {
+                            run_bulk(&bulk, "Retried", "failed jobs", |size, cursor| {
+                                awa_model::admin::retry_failed_by_kind_batch(
+                                    &pool, &kind, size, cursor,
+                                )
+                            })
+                            .await?
                         } else if let Some(queue) = queue {
-                            awa_model::admin::retry_failed_by_queue(&pool, &queue).await?
+                            run_bulk(&bulk, "Retried", "failed jobs", |size, cursor| {
+                                awa_model::admin::retry_failed_by_queue_batch(
+                                    &pool, &queue, size, cursor,
+                                )
+                            })
+                            .await?
                         } else {
                             unreachable!("clap requires exactly one retry-failed filter")
                         };
-                        let retried = outcome.retried.len() as u64;
-                        let mut message = format!("Retried {retried} failed jobs");
-                        if outcome.matched != retried {
-                            let dropped = outcome.matched.saturating_sub(retried);
-                            message.push_str(&format!(
-                                " (matched {}; {dropped} raced or pruned)",
-                                outcome.matched
-                            ));
-                        }
-                        if let Some(pruned) = outcome.pruned_failed_count {
-                            if pruned > 0 {
-                                message.push_str(&format!(
-                                    "; {pruned} failed rows have been pruned past retention \
-                                     and are no longer retryable"
-                                ));
-                            }
-                        }
-                        println!("{message}");
+                        finish_bulk(&run, "Retried", "failed jobs");
                     }
 
-                    JobCommands::Discard { kind } => {
-                        let count = awa_model::admin::discard_failed(&pool, &kind).await?;
-                        println!("Discarded {count} failed jobs of kind '{kind}'");
+                    JobCommands::Discard { kind, bulk } => {
+                        let noun = format!("failed jobs of kind '{kind}'");
+                        let run = run_bulk(&bulk, "Discarded", &noun, |size, cursor| {
+                            awa_model::admin::discard_failed_batch(&pool, &kind, size, cursor)
+                        })
+                        .await?;
+                        finish_bulk(&run, "Discarded", &noun);
                     }
 
                     JobCommands::List {
@@ -1128,13 +1148,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             queue,
                             reason,
                             all,
+                            bulk,
                         } => {
-                            let count = awa_model::dlq::bulk_move_failed_to_dlq(
-                                &pool,
-                                kind.as_deref(),
-                                queue.as_deref(),
-                                &reason,
-                                all,
+                            let run = run_bulk(
+                                &bulk,
+                                "Moved",
+                                "failed jobs into the DLQ",
+                                |size, cursor| {
+                                    awa_model::dlq::bulk_move_failed_to_dlq_batch(
+                                        &pool,
+                                        kind.as_deref(),
+                                        queue.as_deref(),
+                                        &reason,
+                                        all,
+                                        size,
+                                        cursor,
+                                    )
+                                },
                             )
                             .await?;
                             // Emit the same `awa.job.dlq_moved` counter the
@@ -1144,15 +1174,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 kind.as_deref(),
                                 queue.as_deref(),
                                 &reason,
-                                count,
+                                run.count,
                             );
-                            println!("Moved {count} failed jobs into the DLQ.");
+                            finish_bulk(&run, "Moved", "failed jobs into the DLQ");
                         }
                         DlqCommands::Purge {
                             kind,
                             queue,
                             tag,
                             all,
+                            bulk,
                         } => {
                             let filter = awa_model::dlq::ListDlqFilter {
                                 kind,
@@ -1160,11 +1191,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
-                            if count > 0 {
-                                metrics.record_dlq_purged(queue.as_deref(), count);
+                            let run = run_bulk(&bulk, "Purged", "DLQ rows", |size, cursor| {
+                                awa_model::dlq::purge_dlq_batch(&pool, &filter, all, size, cursor)
+                            })
+                            .await?;
+                            if run.count > 0 {
+                                metrics.record_dlq_purged(queue.as_deref(), run.count);
                             }
-                            println!("Purged {count} DLQ rows.");
+                            finish_bulk(&run, "Purged", "DLQ rows");
                         }
                     }
                 }
@@ -1234,11 +1268,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .await?;
                         println!("{}", serde_json::to_string_pretty(&operation)?);
                     }
-                    BatchOpsCommands::Purge { before, limit } => {
-                        let purged = awa_model::batch_operations::purge_batch_operations_before(
-                            &pool, before, limit,
-                        )
-                        .await?;
+                    BatchOpsCommands::Purge {
+                        before,
+                        batch_size,
+                        limit,
+                    } => {
+                        let purged = match batch_size {
+                            Some(batch_size) => {
+                                let mut purged = 0;
+                                loop {
+                                    let batch =
+                                        awa_model::batch_operations::purge_batch_operations_before(
+                                            &pool, before, batch_size,
+                                        )
+                                        .await?;
+                                    purged += batch;
+                                    if batch < batch_size as u64 {
+                                        break purged;
+                                    }
+                                    eprintln!("Purged {batch} batch operations ({purged} so far).");
+                                }
+                            }
+                            None => {
+                                awa_model::batch_operations::purge_batch_operations_before(
+                                    &pool,
+                                    before,
+                                    limit.unwrap_or(awa_model::bulk::DEFAULT_BATCH_SIZE),
+                                )
+                                .await?
+                            }
+                        };
                         println!("Purged {purged} batch operations.");
                     }
                 },
@@ -1497,9 +1556,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         awa_model::admin::resume_queue(&pool, &queue).await?;
                         println!("Resumed queue '{queue}'");
                     }
-                    QueueCommands::Drain { queue } => {
-                        let count = awa_model::admin::drain_queue(&pool, &queue).await?;
-                        println!("Drained {count} jobs from queue '{queue}'");
+                    QueueCommands::Drain { queue, bulk } => {
+                        let noun = format!("jobs from queue '{queue}'");
+                        let run = run_bulk(&bulk, "Drained", &noun, |size, cursor| {
+                            awa_model::admin::drain_queue_batch(&pool, &queue, size, cursor)
+                        })
+                        .await?;
+                        finish_bulk(&run, "Drained", &noun);
                     }
                     QueueCommands::Stats => {
                         let stats = awa_model::admin::queue_overviews(&pool).await?;

@@ -1,6 +1,6 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use awa_model::admin;
 
@@ -63,12 +63,45 @@ pub async fn resume_queue(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DrainParams {
+    /// Run one batch of up to this many jobs, resuming at `stage` and
+    /// `after_job_id`. Without it, the server drains in batches until no
+    /// matching job remains.
+    pub batch_size: Option<i64>,
+    #[serde(default)]
+    pub stage: u8,
+    #[serde(default)]
+    pub after_job_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DrainResponse {
+    pub drained: u64,
+    #[serde(flatten)]
+    pub bulk: crate::handlers::dlq::BulkResponse,
+}
+
 pub async fn drain_queue(
     State(state): State<AppState>,
     Path(queue): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Query(params): Query<DrainParams>,
+) -> Result<Json<DrainResponse>, ApiError> {
     state.require_writable()?;
-    let count = admin::drain_queue(&state.pool, &queue).await?;
-    state.invalidate_dashboard_caches();
-    Ok(Json(serde_json::json!({ "drained": count })))
+    let cursor = awa_model::BulkCursor {
+        stage: params.stage,
+        after_job_id: params.after_job_id,
+    };
+    let bulk =
+        crate::handlers::dlq::run_bulk_route(params.batch_size, Some(cursor), |size, cursor| {
+            admin::drain_queue_batch(&state.pool, &queue, size, cursor)
+        })
+        .await?;
+    if bulk.count > 0 {
+        state.invalidate_dashboard_caches();
+    }
+    Ok(Json(DrainResponse {
+        drained: bulk.count,
+        bulk,
+    }))
 }

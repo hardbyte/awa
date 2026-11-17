@@ -463,6 +463,52 @@ def test_bulk_retry_from_dlq_skips_a_unique_conflict_and_names_it(sync_client):
     assert sync_client.get_dlq_job(keyed_id) is not None
 
 
+def _failed(client: awa.Client, queue: str, value: str, **insert_kwargs) -> int:
+    job = client.insert(DlqPyJob(value=value), queue=queue, **insert_kwargs)
+    _move_ready_to_failed_done(client, job.id)
+    return job.id
+
+
+def test_bulk_move_and_purge_run_in_batches(sync_client):
+    queue = "pydlq_batched_move"
+    for i in range(5):
+        _failed(sync_client, queue, f"move{i}")
+
+    assert sync_client.bulk_move_failed_to_dlq(queue=queue, batch_size=2) == 5
+    assert sync_client.dlq_depth(queue=queue) == 5
+    assert sync_client.purge_dlq(queue=queue, batch_size=2) == 5
+    assert sync_client.dlq_depth(queue=queue) == 0
+
+
+def test_discard_and_drain_run_in_batches(sync_client):
+    queue = "pydlq_batched_discard"
+    ids = [_failed(sync_client, queue, f"discard{i}") for i in range(3)]
+    kind = sync_client.get_job(ids[0]).kind
+    assert sync_client.discard_failed(kind, batch_size=1) == 3
+
+    drain_queue = "pydlq_batched_drain"
+    for i in range(3):
+        sync_client.insert(DlqPyJob(value=f"drain{i}"), queue=drain_queue)
+    assert sync_client.drain_queue(drain_queue, batch_size=1) == 3
+
+
+def test_retry_failed_in_batches_skips_and_names_a_unique_conflict(sync_client):
+    queue = "pydlq_batched_retry"
+    unique_opts = {"by_queue": True, "by_args": True}
+    plain_ids = [_failed(sync_client, queue, f"plain{i}") for i in range(2)]
+    keyed_id = _failed(sync_client, queue, "same", unique_opts=unique_opts)
+    tx = sync_client.transaction()
+    tx.execute("DELETE FROM awa.job_unique_claims WHERE job_id = $1", keyed_id)
+    tx.commit()
+    sync_client.insert(DlqPyJob(value="same"), queue=queue, unique_opts=unique_opts)
+
+    with pytest.raises(awa.UniqueConflict, match=f"Retried 2 row.*skipped 1 job.*{keyed_id}"):
+        sync_client.retry_failed(queue=queue, batch_size=1)
+
+    for job_id in plain_ids:
+        assert str(sync_client.get_job(job_id).state) == "available"
+
+
 @pytest.mark.asyncio
 async def test_async_bulk_retry_from_dlq_batch_size():
     client = awa.AsyncClient(DATABASE_URL)

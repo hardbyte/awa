@@ -214,23 +214,20 @@ def test_job_retry_failed_rejects_ambiguous_filter_before_db():
 
 
 @pytest.mark.asyncio
-async def test_job_retry_failed_renders_outcome(capsys):
+async def test_job_retry_failed_retries_in_batches(capsys):
     class FakeClient:
-        async def retry_failed(self, *, kind=None, queue=None):
+        async def retry_failed(self, *, kind=None, queue=None, batch_size=None):
             assert kind is None
             assert queue == "email"
-            return SimpleNamespace(jobs=[object(), object()], matched=3, pruned_failed_count=5)
+            assert batch_size == 1000
+            return SimpleNamespace(jobs=[], matched=3, pruned_failed_count=None)
 
     await awa_main._dispatch_job(
         FakeClient(),
-        SimpleNamespace(job_cmd="retry-failed", kind=None, queue="email"),
+        SimpleNamespace(job_cmd="retry-failed", kind=None, queue="email", batch_size=1000),
     )
 
-    assert (
-        capsys.readouterr().out.strip()
-        == "Retried 2 failed jobs (matched 3; 1 raced or pruned); "
-        "5 failed rows have been pruned past retention and are no longer retryable"
-    )
+    assert capsys.readouterr().out.strip() == "Retried 3 failed jobs"
 
 
 # ── live integration ────────────────────────────────────────────────────

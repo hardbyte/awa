@@ -138,3 +138,115 @@ pub(crate) async fn bulk_retry(
     .map_err(map_awa_error)?;
     finish_bulk_run(run, "Retried")
 }
+
+fn batch_options(batch_size: Option<i64>) -> awa_model::BulkRunOptions {
+    awa_model::BulkRunOptions::default()
+        .batch_size(batch_size.unwrap_or(awa_model::bulk::DEFAULT_BATCH_SIZE))
+}
+
+/// Discard every failed job of `kind` in batches.
+pub(crate) async fn discard_failed(
+    pool: &sqlx::PgPool,
+    kind: &str,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| awa_model::admin::discard_failed_batch(pool, kind, size, cursor),
+        |_, _| {},
+    )
+    .await
+    .map_err(crate::errors::map_awa_error)?;
+    finish_bulk_run(run, "Discarded")
+}
+
+/// Drain `queue` in batches.
+pub(crate) async fn drain_queue(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| awa_model::admin::drain_queue_batch(pool, queue, size, cursor),
+        |_, _| {},
+    )
+    .await
+    .map_err(crate::errors::map_awa_error)?;
+    finish_bulk_run(run, "Drained")
+}
+
+/// Move failed jobs into the DLQ in batches.
+pub(crate) async fn bulk_move(
+    pool: &sqlx::PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    reason: &str,
+    allow_all: bool,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| {
+            awa_model::dlq::bulk_move_failed_to_dlq_batch(
+                pool, kind, queue, reason, allow_all, size, cursor,
+            )
+        },
+        |_, _| {},
+    )
+    .await
+    .map_err(crate::errors::map_awa_error)?;
+    finish_bulk_run(run, "Moved")
+}
+
+/// Purge matching DLQ rows in batches.
+pub(crate) async fn purge(
+    pool: &sqlx::PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| awa_model::dlq::purge_dlq_batch(pool, filter, allow_all, size, cursor),
+        |_, _| {},
+    )
+    .await
+    .map_err(crate::errors::map_awa_error)?;
+    finish_bulk_run(run, "Purged")
+}
+
+/// Retry every failed job of `kind` or in `queue` in batches.
+pub(crate) async fn retry_failed(
+    pool: &sqlx::PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    batch_size: i64,
+) -> PyResult<u64> {
+    let options = batch_options(Some(batch_size));
+    let run = match (kind, queue) {
+        (Some(kind), None) => {
+            awa_model::bulk::run_batches(
+                options,
+                |size, cursor| {
+                    awa_model::admin::retry_failed_by_kind_batch(pool, kind, size, cursor)
+                },
+                |_, _| {},
+            )
+            .await
+        }
+        (None, Some(queue)) => {
+            awa_model::bulk::run_batches(
+                options,
+                |size, cursor| {
+                    awa_model::admin::retry_failed_by_queue_batch(pool, queue, size, cursor)
+                },
+                |_, _| {},
+            )
+            .await
+        }
+        _ => unreachable!("validated by the caller"),
+    }
+    .map_err(crate::errors::map_awa_error)?;
+    finish_bulk_run(run, "Retried")
+}
