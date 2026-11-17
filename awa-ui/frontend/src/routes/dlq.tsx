@@ -28,7 +28,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
-import { drainDlqRetry, DLQ_RETRY_BATCH_SIZE } from "@/lib/dlq-drain";
+import { runBulk, describeBulkRun, BULK_BATCH_SIZE } from "@/lib/bulk-run";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 
@@ -112,26 +112,23 @@ export function DlqPage() {
         : undefined;
     stopRetryDrain.current = false;
     setRetryDrain({ revived: 0, total, stopping: false });
-    const outcome = await drainDlqRetry(
-      (batchSize) => bulkRetryDlq({ ...filter, batch_size: batchSize }),
+    const outcome = await runBulk(
+      (batchSize, cursor) => bulkRetryDlq({ ...filter, batch_size: batchSize, cursor }),
       {
         shouldStop: () => stopRetryDrain.current,
-        onProgress: (revived) =>
-          setRetryDrain((current) => current && { ...current, revived }),
+        onProgress: (progress) =>
+          setRetryDrain((current) => current && { ...current, revived: progress.count }),
       }
     );
     setRetryDrain(null);
     void queryClient.invalidateQueries({ queryKey: ["dlq"] });
     void queryClient.invalidateQueries({ queryKey: ["dlq-depth"] });
     void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-    if (outcome.kind === "failed") {
-      toast.error(
-        `Retried ${outcome.revived} DLQ row(s), then stopped: ${outcome.error}`
-      );
-    } else if (outcome.kind === "stopped") {
-      toast.success(`Stopped after retrying ${outcome.revived} DLQ row(s)`);
+    const message = describeBulkRun("Retried", "DLQ row(s)", outcome);
+    if (outcome.kind === "failed" || outcome.skipped > 0) {
+      toast.error(message);
     } else {
-      toast.success(`Retried ${outcome.revived} DLQ row(s)`);
+      toast.success(message);
     }
   };
 
@@ -324,7 +321,7 @@ export function DlqPage() {
         isOpen={showRetryConfirm}
         onOpenChange={setShowRetryConfirm}
         title="Retry DLQ rows"
-        description={`This retries every DLQ row matching the current filter, oldest first, in batches of up to ${DLQ_RETRY_BATCH_SIZE.toLocaleString()}, and resets each attempt back to a fresh runnable job. You can stop between batches. A row whose unique key a live job holds stops the retry and is named.`}
+        description={`This retries every DLQ row matching the current filter, oldest first, in batches of up to ${BULK_BATCH_SIZE.toLocaleString()}, and resets each attempt back to a fresh runnable job. You can stop between batches. A row whose unique key a live job holds is skipped, stays in the DLQ, and is named when the retry finishes.`}
         confirmLabel="Retry"
         confirmIntent="primary"
         onConfirm={() => void startRetryDrain()}

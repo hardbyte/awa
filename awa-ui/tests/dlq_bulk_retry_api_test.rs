@@ -67,10 +67,23 @@ async fn bulk_retry_route_honours_an_optional_batch_size() {
     let (status, body) = post_json(&app, json!({ "queue": queue, "batch_size": 2 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["count"], 2);
+    assert_eq!(body["done"], false);
+    let cursor = body["cursor"].clone();
+
+    let (status, body) = post_json(
+        &app,
+        json!({ "queue": queue, "batch_size": 2, "cursor": cursor }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 2);
 
     let (status, body) = post_json(&app, json!({ "queue": queue })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["count"], 3);
+    assert_eq!(
+        body,
+        json!({ "count": 1, "skipped": 0, "conflicts": [], "done": true })
+    );
 
     let key = format!("ui-dlq-{queue}").into_bytes();
     let keyed: i64 = sqlx::query_scalar(
@@ -84,6 +97,7 @@ async fn bulk_retry_route_honours_an_optional_batch_size() {
     .fetch_one(&pool)
     .await
     .expect("seed keyed dlq row");
+    seed_dlq(&pool, &queue, 1).await;
     sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
         .bind(&key)
         .bind(i64::MAX - 4)
@@ -92,23 +106,22 @@ async fn bulk_retry_route_honours_an_optional_batch_size() {
         .expect("live job holds the key");
 
     let (status, body) = post_json(&app, json!({ "queue": queue, "batch_size": 10 })).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|error| error.contains(&format!("DLQ job {keyed} "))),
-        "{body}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["skipped"], 1);
+    assert_eq!(body["conflicts"], json!([keyed]));
+    assert_eq!(body["done"], true);
 
     sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
         .bind(&key)
         .execute(&pool)
         .await
         .expect("drop claim");
-
-    let (status, body) = post_json(&app, json!({ "queue": queue, "batch_size": 10 })).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["count"], 1);
+    sqlx::query("DELETE FROM awa.dlq_entries WHERE queue = $1")
+        .bind(&queue)
+        .execute(&pool)
+        .await
+        .expect("clear dlq");
 
     seed_dlq(&pool, &queue, 2).await;
     let mut holder = pool.begin().await.expect("begin holder");
@@ -119,7 +132,9 @@ async fn bulk_retry_route_honours_an_optional_batch_size() {
         .expect("hold every matching row");
     let (status, body) = post_json(&app, json!({ "queue": queue, "batch_size": 10 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({ "count": 0, "busy": true }));
+    assert_eq!(body["count"], 0);
+    assert_eq!(body["busy"], true);
+    assert_eq!(body["done"], false);
     holder.rollback().await.expect("release rows");
 
     awa_testing::setup::clean_queue(&pool, &queue).await;

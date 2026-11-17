@@ -2,7 +2,8 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use awa_model::dlq::{self, DlqRetryBatch, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+use awa_model::bulk::{self, BulkBatch, BulkCursor, BulkRun, BulkRunOptions};
+use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -130,25 +131,75 @@ pub struct BulkRetryPayload {
     pub tag: Option<String>,
     #[serde(default)]
     pub all: bool,
-    /// Retry up to this many rows, oldest first, in one transaction. Without
-    /// it, every matching row is retried in one transaction.
+    /// Run one batch of up to this many rows, resuming at `cursor`, and
+    /// return its cursor. Without it, the server runs batches of
+    /// `bulk::DEFAULT_BATCH_SIZE` until no matching row remains.
     #[serde(default)]
     pub batch_size: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<BulkCursor>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CountResponse {
     pub count: u64,
-    /// Set by a `batch_size` retry when every matching row is held by another
-    /// transaction; nothing was retried and the caller should try again.
+}
+
+/// The result of a bulk route: one batch when the request set `batch_size`,
+/// otherwise the whole run.
+#[derive(Debug, Serialize)]
+pub struct BulkResponse {
+    pub count: u64,
+    /// Rows skipped because the change would violate a unique claim.
+    pub skipped: u64,
+    /// IDs of skipped jobs, at most `bulk::MAX_REPORTED_CONFLICTS`.
+    pub conflicts: Vec<i64>,
+    /// One batch: every remaining matching row is held by another
+    /// transaction; nothing changed and the caller should try again.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub busy: bool,
+    /// No matching row remains.
+    pub done: bool,
+    /// One batch: pass this back to resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<BulkCursor>,
+}
+
+impl BulkResponse {
+    pub fn from_batch(batch: BulkBatch) -> Self {
+        Self {
+            count: batch.count,
+            skipped: batch.skipped,
+            conflicts: batch.conflicts,
+            busy: batch.busy,
+            done: batch.done,
+            cursor: Some(batch.cursor),
+        }
+    }
+
+    pub fn from_run(run: BulkRun) -> Result<Self, ApiError> {
+        if run.busy_timed_out {
+            return Err(ApiError::conflict(format!(
+                "every remaining matching row has been held by another transaction for {}s; changed {} row(s) before stopping",
+                bulk::DEFAULT_BUSY_TIMEOUT.as_secs(),
+                run.count
+            )));
+        }
+        Ok(Self {
+            count: run.count,
+            skipped: run.skipped,
+            conflicts: run.conflicts,
+            busy: false,
+            done: run.complete,
+            cursor: None,
+        })
+    }
 }
 
 pub async fn bulk_retry_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkRetryPayload>,
-) -> Result<Json<CountResponse>, ApiError> {
+) -> Result<Json<BulkResponse>, ApiError> {
     state.require_writable()?;
     let queue_attr = payload.queue.clone();
     let filter = ListDlqFilter {
@@ -157,37 +208,35 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let (count, busy) = match payload.batch_size {
-        None => (
-            dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?,
-            false,
+    let response = match payload.batch_size {
+        Some(batch_size) => BulkResponse::from_batch(
+            dlq::bulk_retry_from_dlq_batch(
+                &state.pool,
+                &filter,
+                payload.all,
+                batch_size,
+                payload.cursor.unwrap_or_default(),
+            )
+            .await?,
         ),
-        Some(batch_size) => {
-            match dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, batch_size)
-                .await?
-            {
-                DlqRetryBatch::Revived { count } => (count, false),
-                DlqRetryBatch::Busy => (0, true),
-                DlqRetryBatch::UniqueConflict { job_id } => {
-                    return Err(ApiError::conflict(format!(
-                        "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried"
-                    )));
-                }
-                other => {
-                    return Err(ApiError::Awa(awa_model::AwaError::Database(
-                        sqlx::Error::Protocol(format!("unexpected DLQ retry outcome: {other:?}")),
-                    )));
-                }
-            }
-        }
+        None => BulkResponse::from_run(
+            bulk::run_batches(
+                BulkRunOptions::default(),
+                |size, cursor| {
+                    dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, size, cursor)
+                },
+                |_, _| {},
+            )
+            .await?,
+        )?,
     };
-    if count > 0 {
+    if response.count > 0 {
         state
             .metrics
-            .record_dlq_retried(queue_attr.as_deref(), count);
+            .record_dlq_retried(queue_attr.as_deref(), response.count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count, busy }))
+    Ok(Json(response))
 }
 
 pub async fn purge_dlq_job(
@@ -206,7 +255,7 @@ pub async fn purge_dlq_job(
         state.metrics.record_dlq_purged(queue.as_deref(), count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count, busy: false }))
+    Ok(Json(CountResponse { count }))
 }
 
 pub async fn bulk_purge_dlq(
@@ -228,7 +277,7 @@ pub async fn bulk_purge_dlq(
             .record_dlq_purged(queue_attr.as_deref(), count);
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count, busy: false }))
+    Ok(Json(CountResponse { count }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,5 +322,5 @@ pub async fn bulk_move_failed(
         );
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(CountResponse { count, busy: false }))
+    Ok(Json(CountResponse { count }))
 }

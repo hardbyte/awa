@@ -81,7 +81,7 @@ async fn retry_bulk_drains_in_batches_up_to_the_limit() {
 }
 
 #[tokio::test]
-async fn retry_bulk_stops_on_a_unique_conflict_and_names_the_job() {
+async fn retry_bulk_skips_a_unique_conflict_and_names_the_job() {
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
     let queue = unique_queue("cli_dlq_conflict");
@@ -105,12 +105,19 @@ async fn retry_bulk_stops_on_a_unique_conflict_and_names_the_job() {
         .await
         .expect("live job holds the key");
 
-    let failed = run_cli(&["dlq", "retry-bulk", "--queue", &queue, "--batch-size", "10"])
+    let skipped = run_cli(&["dlq", "retry-bulk", "--queue", &queue, "--batch-size", "1"])
         .assert()
-        .failure();
-    let stderr = String::from_utf8(failed.get_output().stderr.clone()).expect("stderr");
-    assert!(stderr.contains(&format!("DLQ job {keyed} ")), "{stderr}");
-    assert_eq!(dlq_depth(&pool, &queue).await, 3);
+        .code(2);
+    let stdout = String::from_utf8(skipped.get_output().stdout.clone()).expect("stdout");
+    let stderr = String::from_utf8(skipped.get_output().stderr.clone()).expect("stderr");
+    assert!(stdout.contains("Retried 2 DLQ rows."), "{stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "Skipped 1 job(s) whose unique key a live job holds: {keyed}"
+        )),
+        "{stderr}"
+    );
+    assert_eq!(dlq_depth(&pool, &queue).await, 1);
 
     sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
         .bind(&key)

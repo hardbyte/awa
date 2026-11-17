@@ -572,15 +572,14 @@ class AsyncClient:
         allow_all: bool = False,
         batch_size: int | None = None,
     ) -> int:
-        """Bulk-retry DLQ rows matching the filter. Returns revived count.
+        """Bulk-retry DLQ rows matching the filter. Returns the revived count.
 
-        With ``batch_size``, retries up to that many rows, oldest first, in one
-        transaction; call it until it returns 0 to drain a large DLQ. It
-        returns 0 only when no matching row remains: while every matching row
-        is held by another transaction, such as a concurrent batch, it waits
-        and tries again for up to 30 seconds, then raises ``DatabaseError``. A
-        row whose unique key a live job holds raises ``UniqueConflict`` naming
-        the job, and nothing in that batch is retried.
+        Rows are retried in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised. A row whose unique key a live job holds
+        is skipped and stays in the DLQ; after every other row is retried,
+        ``UniqueConflict`` is raised naming the skipped jobs.
         """
         return await self._raw.bulk_retry_from_dlq(
             kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
@@ -1467,15 +1466,14 @@ class Client:
         allow_all: bool = False,
         batch_size: int | None = None,
     ) -> int:
-        """Bulk-retry DLQ rows matching the filter. Returns revived count.
+        """Bulk-retry DLQ rows matching the filter. Returns the revived count.
 
-        With ``batch_size``, retries up to that many rows, oldest first, in one
-        transaction; call it until it returns 0 to drain a large DLQ. It
-        returns 0 only when no matching row remains: while every matching row
-        is held by another transaction, such as a concurrent batch, it waits
-        and tries again for up to 30 seconds, then raises ``DatabaseError``. A
-        row whose unique key a live job holds raises ``UniqueConflict`` naming
-        the job, and nothing in that batch is retried.
+        Rows are retried in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised. A row whose unique key a live job holds
+        is skipped and stays in the DLQ; after every other row is retried,
+        ``UniqueConflict`` is raised naming the skipped jobs.
         """
         return self._raw.bulk_retry_from_dlq_sync(
             kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
