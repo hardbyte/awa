@@ -27359,6 +27359,58 @@ async fn test_idle_check_session_follows_leadership() {
     pool_b.close().await;
 }
 
+/// Each claim slot's receipt rescue walk has its own SQL text, naming that
+/// slot's partition. The walks run unprepared, so a pooled session that runs
+/// them keeps neither their statements nor their generic plans.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_receipt_rescue_walks_are_not_prepared() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_rescue_walks_unprepared";
+    let store = create_store_with_config(&pool, idle_gate_store_config(schema)).await;
+    let session = runtime_pool(&pool, "rescue-walk-session", 1).await;
+
+    // Postgres switches a prepared statement to a generic plan on its sixth
+    // execution in a session.
+    for _ in 0..7 {
+        store
+            .rescue_stale_heartbeats_batch(
+                &session,
+                Duration::from_secs(90),
+                &|_| false,
+                &Default::default(),
+            )
+            .await
+            .expect("stale heartbeat rescue");
+        store
+            .rescue_expired_deadlines_batch(&session, &|_| false, &Default::default())
+            .await
+            .expect("deadline rescue");
+    }
+
+    // The patterns are concatenated so this statement does not match itself.
+    let walks: Vec<String> = sqlx::query_scalar(
+        "SELECT left(statement, 120) FROM pg_prepared_statements
+         WHERE statement LIKE '%rescue_cursor_' || 'claimed_at%'
+            OR statement LIKE '%deadline_cursor_' || 'deadline_at%'",
+    )
+    .fetch_all(&session)
+    .await
+    .expect("read prepared statements");
+    let prepared: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements")
+        .fetch_one(&session)
+        .await
+        .expect("count prepared statements");
+    assert!(
+        prepared > 0,
+        "the session should hold the rescue passes' other prepared statements"
+    );
+    assert!(
+        walks.is_empty(),
+        "receipt rescue walks must not be prepared: {walks:#?}"
+    );
+    session.close().await;
+}
+
 /// Opt-in: per-session relcache size of pooled sessions after an idle window,
 /// against a session that ran the idle checks and a fresh one. Set
 /// `AWA_IDLE_CHECK_MEMORY_SECS` to lengthen the window.
