@@ -16951,13 +16951,7 @@ impl QueueStorage {
         } else {
             "job_id"
         };
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut moved: Vec<DlqJobRow> = sqlx::query_as(&format!(
-            r#"
-            WITH picked AS (
-                SELECT job_id
-                FROM {schema}.dlq_entries
-                WHERE ($1::text IS NULL OR kind = $1)
+        let matching = r#"WHERE ($1::text IS NULL OR kind = $1)
                   AND ($2::text IS NULL OR queue = $2)
                   AND ($3::text IS NULL OR payload -> 'tags' ? $3)
                   AND (
@@ -16969,7 +16963,14 @@ impl QueueStorage {
                           AND $5::timestamptz IS NOT NULL
                           AND (dlq_at, job_id) < ($5, $4)
                       )
-                  )
+                  )"#;
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut moved: Vec<DlqJobRow> = sqlx::query_as(&format!(
+            r#"
+            WITH picked AS (
+                SELECT job_id
+                FROM {schema}.dlq_entries
+                {matching}
                 ORDER BY {order}
                 LIMIT $6
                 FOR UPDATE SKIP LOCKED
@@ -17010,8 +17011,23 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if moved.is_empty() {
+            let locked: bool = sqlx::query_scalar(&format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.dlq_entries {matching})"
+            ))
+            .bind(&filter.kind)
+            .bind(&filter.queue)
+            .bind(&filter.tag)
+            .bind(filter.before_id)
+            .bind(filter.before_dlq_at)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(DlqRetryBatch::Revived { count: 0 });
+            return Ok(if locked {
+                DlqRetryBatch::Busy
+            } else {
+                DlqRetryBatch::Revived { count: 0 }
+            });
         }
         if filter.queue.is_some() {
             moved.sort_by_key(|row| (row.dlq_at, row.job_id));
@@ -17058,7 +17074,7 @@ impl QueueStorage {
         }
 
         let revived = ready_rows.len() as u64;
-        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Failed))
+        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
         self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;

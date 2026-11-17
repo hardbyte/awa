@@ -9,6 +9,9 @@ use sqlx::postgres::PgPoolOptions;
 mod storage_wait;
 
 const DLQ_RETRY_BATCH_SIZE: i64 = 1000;
+const DLQ_RETRY_BUSY_WAIT_START: Duration = Duration::from_millis(100);
+const DLQ_RETRY_BUSY_WAIT_MAX: Duration = Duration::from_secs(2);
+const DLQ_RETRY_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(
@@ -315,8 +318,9 @@ enum DlqCommands {
         #[arg(long)]
         all: bool,
         /// Retry in transactions of at most this many rows, oldest first,
-        /// until none match. Without it, every matching row is retried in one
-        /// transaction.
+        /// until none match. Rows another transaction holds are waited for,
+        /// for up to 60 seconds without progress. Without it, every matching
+        /// row is retried in one transaction.
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         batch_size: Option<i64>,
         /// Stop after retrying this many rows in total. Implies batches
@@ -1059,6 +1063,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 let batch_size = batch_size.unwrap_or(DLQ_RETRY_BATCH_SIZE);
                                 let mut total: u64 = 0;
+                                let mut busy_since: Option<std::time::Instant> = None;
+                                let mut busy_wait = DLQ_RETRY_BUSY_WAIT_START;
                                 loop {
                                     let take = match limit {
                                         Some(limit) => {
@@ -1077,6 +1083,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     {
                                         awa_model::DlqRetryBatch::Revived { count: 0 } => break,
                                         awa_model::DlqRetryBatch::Revived { count } => {
+                                            busy_since = None;
+                                            busy_wait = DLQ_RETRY_BUSY_WAIT_START;
                                             total += count;
                                             metrics.record_dlq_retried(queue.as_deref(), count);
                                             eprintln!("Retried {count} DLQ rows ({total} so far).");
@@ -1087,6 +1095,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried. Retry or purge it individually, then rerun."
                                             );
                                             std::process::exit(1);
+                                        }
+                                        awa_model::DlqRetryBatch::Busy => {
+                                            let since = *busy_since
+                                                .get_or_insert_with(std::time::Instant::now);
+                                            if since.elapsed() >= DLQ_RETRY_BUSY_TIMEOUT {
+                                                println!("Retried {total} DLQ rows.");
+                                                eprintln!(
+                                                    "Every remaining matching DLQ row has been held by another transaction for {}s; stopping. Rerun once it finishes.",
+                                                    DLQ_RETRY_BUSY_TIMEOUT.as_secs()
+                                                );
+                                                std::process::exit(1);
+                                            }
+                                            tokio::time::sleep(busy_wait).await;
+                                            busy_wait =
+                                                (busy_wait * 2).min(DLQ_RETRY_BUSY_WAIT_MAX);
+                                        }
+                                        other => {
+                                            return Err(format!(
+                                                "unexpected DLQ retry outcome: {other:?}"
+                                            )
+                                            .into());
                                         }
                                     }
                                 }

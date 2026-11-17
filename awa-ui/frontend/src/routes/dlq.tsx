@@ -3,7 +3,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import {
   fetchDlq,
@@ -93,6 +93,12 @@ export function DlqPage() {
     stopping: boolean;
   } | null>(null);
   const stopRetryDrain = useRef(false);
+  useEffect(
+    () => () => {
+      stopRetryDrain.current = true;
+    },
+    []
+  );
 
   const startRetryDrain = async () => {
     const filter = {

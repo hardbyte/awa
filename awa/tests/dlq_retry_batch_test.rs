@@ -238,6 +238,9 @@ async fn concurrent_batches_revive_each_row_exactly_once() {
                 match batch(&pool, &filter, 7).await {
                     DlqRetryBatch::Revived { count: 0 } => return revived,
                     DlqRetryBatch::Revived { count } => revived += count,
+                    DlqRetryBatch::Busy => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                    }
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -314,6 +317,40 @@ async fn a_unique_conflict_rolls_back_its_batch_and_names_the_row() {
         .execute(&pool)
         .await
         .expect("drop claim");
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn a_batch_is_busy_not_done_while_every_matching_row_is_held() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_name("dlq_batch_busy");
+    let mut ids = Vec::new();
+    for age in [20, 10] {
+        ids.push(seed_plain(&pool, "dlq_batch_job", &queue, age).await);
+    }
+
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT job_id FROM awa.dlq_entries WHERE queue = $1 FOR UPDATE")
+        .bind(&queue)
+        .fetch_all(&mut *holder)
+        .await
+        .expect("hold every matching row");
+    assert_eq!(
+        batch(&pool, &by_queue(&queue), 10).await,
+        DlqRetryBatch::Busy
+    );
+    holder.rollback().await.expect("release rows");
+
+    assert_eq!(
+        batch(&pool, &by_queue(&queue), 10).await,
+        DlqRetryBatch::Revived { count: 2 }
+    );
+    assert!(in_dlq(&pool, &ids).await.is_empty());
+    assert_eq!(
+        batch(&pool, &by_queue(&queue), 10).await,
+        DlqRetryBatch::Revived { count: 0 }
+    );
     setup::clean_queue(&pool, &queue).await;
 }
 

@@ -55,4 +55,39 @@ describe("drainDlqRetry", () => {
       error: conflict.message,
     });
   });
+
+  it("waits while every matching row is held, then carries on", async () => {
+    const results: Array<{ count: number; busy?: boolean }> = [
+      { count: 0, busy: true },
+      { count: 0, busy: true },
+      { count: 4 },
+      { count: 0 },
+    ];
+    const slept: number[] = [];
+    const outcome = await drainDlqRetry(async () => results.shift()!, {
+      shouldStop: () => false,
+      onProgress: () => {},
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+      now: () => 0,
+    });
+    expect(outcome).toEqual({ kind: "done", revived: 4 });
+    expect(slept).toEqual([100, 200]);
+  });
+
+  it("gives up when rows stay held past the timeout", async () => {
+    let clock = 0;
+    const outcome = await drainDlqRetry(async () => ({ count: 0, busy: true }), {
+      busyTimeoutMs: 1000,
+      shouldStop: () => false,
+      onProgress: () => {},
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      now: () => clock,
+    });
+    expect(outcome.kind).toBe("failed");
+    expect(outcome.revived).toBe(0);
+  });
 });

@@ -51,10 +51,15 @@ impl DlqRow {
 /// Result of one bounded bulk DLQ retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DlqRetryBatch {
-    /// The batch committed and revived `count` rows. Zero means no matching
-    /// row was left that another transaction did not hold.
+    /// The batch committed and revived `count` rows. Zero means no row
+    /// matches the filter.
     Revived { count: u64 },
+    /// Every matching row is held by another transaction, such as a
+    /// concurrent batch, so this batch revived nothing. The rows stay in the
+    /// DLQ if that transaction rolls back; call again after a short wait.
+    Busy,
     /// The row's unique key is claimed by a live job. The batch was rolled
     /// back and every row in it stays in the DLQ.
     UniqueConflict { job_id: i64 },
@@ -392,7 +397,9 @@ pub async fn bulk_retry_from_dlq(
 /// `Revived { count: 0 }` once no matching row is left. Rows are taken oldest
 /// first: by `(dlq_at, job_id)` when the filter names a queue, otherwise by
 /// `job_id`. Rows another transaction holds are skipped, so concurrent callers
-/// never revive a row twice. `filter.limit` is ignored.
+/// never revive a row twice; when every matching row is held, it returns
+/// [`DlqRetryBatch::Busy`] and the caller should wait and call again.
+/// `filter.limit` is ignored.
 ///
 /// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
 /// `true`. If a row conflicts with a live unique claim, the batch is rolled

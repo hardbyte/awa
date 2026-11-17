@@ -105,5 +105,22 @@ async fn bulk_retry_route_honours_an_optional_batch_size() {
         .execute(&pool)
         .await
         .expect("drop claim");
+
+    let (status, body) = post_json(&app, json!({ "queue": queue, "batch_size": 10 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+
+    seed_dlq(&pool, &queue, 2).await;
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT job_id FROM awa.dlq_entries WHERE queue = $1 FOR UPDATE")
+        .bind(&queue)
+        .fetch_all(&mut *holder)
+        .await
+        .expect("hold every matching row");
+    let (status, body) = post_json(&app, json!({ "queue": queue, "batch_size": 10 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "count": 0, "busy": true }));
+    holder.rollback().await.expect("release rows");
+
     awa_testing::setup::clean_queue(&pool, &queue).await;
 }
