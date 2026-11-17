@@ -33,9 +33,10 @@ const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held b
 const DRAIN_BATCH_SIZE: i64 = crate::bulk::DEFAULT_BATCH_SIZE;
 
 /// Most jobs [`QueueStorage::cancel_jobs_in_batches`] cancels per
-/// transaction. Cancelling by ID costs several milliseconds a job on a large
-/// lane, and the transaction holds the lanes' claim heads, so 1,000 jobs held
-/// them for seconds; 250 keeps a chunk around two seconds.
+/// transaction. Cancelling by ID costs several milliseconds a job, most of
+/// it planning the job's statements against the partitioned ring tables,
+/// and the transaction holds the lanes' claim heads, so 1,000 jobs held them
+/// for seconds; 250 keeps a chunk around two seconds.
 pub const CANCEL_BY_ID_CHUNK: i64 = 250;
 
 /// Columns of a `DlqJobRow` read from `dlq_entries`.

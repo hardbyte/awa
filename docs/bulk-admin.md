@@ -55,7 +55,7 @@ On canonical storage, a batch updates its rows with one statement. When that sta
 
 On queue storage, `drain_queue_batch` cancels at most `batch_size` jobs per call, like every other batch, and takes the queue's stripes (`queue#N`) with it. Waiting jobs are cancelled through the per-job cancel. Scheduled and retryable jobs are cancelled a chunk at a time, and the cursor stops before one another transaction holds. Available jobs are cancelled from each lane's claim cursor; a batch that finds only rows another transaction holds reports `busy`. The library function `admin::drain_queue` still drains the whole queue in one call.
 
-Cancel by ID on queue storage works in transactions of at most 250 jobs (`queue_storage::CANCEL_BY_ID_CHUNK`, applied under any larger `batch_size`), in job ID order with duplicates removed. Cancelling by ID costs several milliseconds a job on a large lane, and the transaction holds the lanes' claim heads, so 1,000 jobs held them for seconds.
+Cancel by ID on queue storage works in transactions of at most 250 jobs (`queue_storage::CANCEL_BY_ID_CHUNK`, applied under any larger `batch_size`), in job ID order with duplicates removed. Cancelling by ID costs several milliseconds a job whatever the lane's size, most of it planning the job's statements, and the transaction holds the lanes' claim heads, so 1,000 jobs held them for seconds.
 
 ### Pause between batches on queue storage
 
