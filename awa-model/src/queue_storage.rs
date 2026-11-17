@@ -1,5 +1,6 @@
 use crate::admin::{CallbackConfig, CallbackPollResult};
-use crate::dlq::{DlqRetryBatch, ListDlqFilter, RetryFromDlqOpts};
+use crate::bulk::{self, BulkBatch, BulkCursor};
+use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
 use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
@@ -29,7 +30,28 @@ const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
-const DRAIN_BATCH_SIZE: i64 = 1_000;
+const DRAIN_BATCH_SIZE: i64 = crate::bulk::DEFAULT_BATCH_SIZE;
+
+/// Columns of a `DlqJobRow` read from `dlq_entries`.
+const DLQ_ROW_COLUMNS: &str = "job_id, kind, queue, args, state, priority, attempt, run_lease, \
+     max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, \
+     COALESCE(payload, '{}'::jsonb) AS payload, dlq_reason, dlq_at, original_run_lease";
+
+/// The `ListDlqFilter` predicate over `dlq_entries`, binding kind, queue,
+/// tag, before_id and before_dlq_at as `$1` to `$5`.
+const DLQ_FILTER_SQL: &str = r#"($1::text IS NULL OR kind = $1)
+    AND ($2::text IS NULL OR queue = $2)
+    AND ($3::text IS NULL OR payload -> 'tags' ? $3)
+    AND (
+        ($4::bigint IS NULL AND $5::timestamptz IS NULL)
+        OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
+        OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
+        OR (
+            $4::bigint IS NOT NULL
+            AND $5::timestamptz IS NOT NULL
+            AND (dlq_at, job_id) < ($5, $4)
+        )
+    )"#;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
 const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
@@ -16922,13 +16944,13 @@ impl QueueStorage {
         Ok(revived)
     }
 
-    /// Retry up to `batch_size` DLQ rows matching the filter in one transaction.
+    /// Retry up to `batch_size` DLQ rows matching the filter past `cursor`,
+    /// in job ID order, in one transaction.
     ///
-    /// Rows are taken oldest first: by `(dlq_at, job_id)` when the filter
-    /// names a queue, otherwise by `job_id`. Rows another transaction holds are
-    /// skipped. `filter.limit` is ignored. If a row's unique key is claimed by
-    /// a live job, the batch is rolled back and the row is named in the
-    /// result.
+    /// Rows another transaction holds are not taken and the cursor stops
+    /// before them; when no row can be taken the batch is `busy`. A row whose
+    /// unique key a live job holds is skipped and reported, and stays in the
+    /// DLQ. `filter.limit` is ignored.
     #[tracing::instrument(
         skip(self, pool, filter),
         fields(kind = ?filter.kind, queue = ?filter.queue, tag = ?filter.tag, batch_size),
@@ -16939,146 +16961,112 @@ impl QueueStorage {
         pool: &PgPool,
         filter: &ListDlqFilter,
         batch_size: i64,
-    ) -> Result<DlqRetryBatch, AwaError> {
-        if batch_size < 1 {
-            return Err(AwaError::Validation(
-                "bulk DLQ retry batch_size must be at least 1".into(),
-            ));
-        }
+        cursor: BulkCursor,
+    ) -> Result<BulkBatch, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
         let schema = self.schema();
-        let order = if filter.queue.is_some() {
-            "dlq_at, job_id"
-        } else {
-            "job_id"
-        };
-        let matching = r#"WHERE ($1::text IS NULL OR kind = $1)
-                  AND ($2::text IS NULL OR queue = $2)
-                  AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-                  AND (
-                      ($4::bigint IS NULL AND $5::timestamptz IS NULL)
-                      OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
-                      OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
-                      OR (
-                          $4::bigint IS NOT NULL
-                          AND $5::timestamptz IS NOT NULL
-                          AND (dlq_at, job_id) < ($5, $4)
-                      )
-                  )"#;
+        let mut batch = BulkBatch::new(cursor);
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut moved: Vec<DlqJobRow> = sqlx::query_as(&format!(
-            r#"
-            WITH picked AS (
-                SELECT job_id
+        let pick = self
+            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor.after_job_id)
+            .await?;
+        if !pick.ids.is_empty() {
+            let rows: Vec<DlqJobRow> = sqlx::query_as(&format!(
+                r#"
+                SELECT {DLQ_ROW_COLUMNS}
                 FROM {schema}.dlq_entries
-                {matching}
-                ORDER BY {order}
-                LIMIT $6
-                FOR UPDATE SKIP LOCKED
-            )
-            DELETE FROM {schema}.dlq_entries AS dlq
-            USING picked
-            WHERE dlq.job_id = picked.job_id
-            RETURNING
-                dlq.job_id,
-                dlq.kind,
-                dlq.queue,
-                dlq.args,
-                dlq.state,
-                dlq.priority,
-                dlq.attempt,
-                dlq.run_lease,
-                dlq.max_attempts,
-                dlq.run_at,
-                dlq.attempted_at,
-                dlq.finalized_at,
-                dlq.created_at,
-                dlq.unique_key,
-                dlq.unique_states,
-                COALESCE(dlq.payload, '{{}}'::jsonb) AS payload,
-                dlq.dlq_reason,
-                dlq.dlq_at,
-                dlq.original_run_lease
-            "#
-        ))
-        .bind(&filter.kind)
-        .bind(&filter.queue)
-        .bind(&filter.tag)
-        .bind(filter.before_id)
-        .bind(filter.before_dlq_at)
-        .bind(batch_size)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                WHERE job_id = ANY($1)
+                ORDER BY job_id
+                "#
+            ))
+            .bind(&pick.ids)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        if moved.is_empty() {
-            let locked: bool = sqlx::query_scalar(&format!(
-                "SELECT EXISTS (SELECT 1 FROM {schema}.dlq_entries {matching})"
+            let mut revived = Vec::with_capacity(rows.len());
+            for row in rows {
+                match self
+                    .sync_unique_claim(
+                        &mut tx,
+                        row.job_id,
+                        &row.unique_key,
+                        row.unique_states.as_deref(),
+                        Some(JobState::Failed),
+                        Some(JobState::Available),
+                    )
+                    .await
+                {
+                    Ok(()) => revived.push(row),
+                    Err(AwaError::UniqueConflict { .. }) => batch.skip(row.job_id),
+                    Err(err) => return Err(err),
+                }
+            }
+
+            if !revived.is_empty() {
+                let ids: Vec<i64> = revived.iter().map(|row| row.job_id).collect();
+                sqlx::query(&format!(
+                    "DELETE FROM {schema}.dlq_entries WHERE job_id = ANY($1)"
+                ))
+                .bind(&ids)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                let run_at = Utc::now();
+                let mut queues = BTreeSet::new();
+                let mut ready_rows = Vec::with_capacity(revived.len());
+                for row in revived {
+                    let queue = row.queue.clone();
+                    let priority = row.priority;
+                    queues.insert(queue.clone());
+                    let mut payload = RuntimePayload::from_json(row.payload.clone())?;
+                    payload.set_progress(None);
+                    ready_rows.push(row.into_retry_ready_row(
+                        queue,
+                        priority,
+                        run_at,
+                        payload.into_json(),
+                    ));
+                }
+                batch.count = ready_rows.len() as u64;
+                self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
+                    .await?;
+                self.notify_queues_tx(&mut tx, queues).await?;
+            }
+        }
+        pick.settle(&mut batch, None);
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(batch)
+    }
+
+    /// Lock the next DLQ rows matching `filter` past `after_job_id`.
+    async fn pick_dlq_batch_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        filter: &ListDlqFilter,
+        batch_size: i64,
+        after_job_id: i64,
+    ) -> Result<bulk::Pick, AwaError> {
+        let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
+            sqlx::query_as(&bulk::pick_sql(
+                &format!("{}.dlq_entries", self.schema()),
+                "job_id",
+                DLQ_FILTER_SQL,
+                "$6",
+                "$7",
             ))
             .bind(&filter.kind)
             .bind(&filter.queue)
             .bind(&filter.tag)
             .bind(filter.before_id)
             .bind(filter.before_dlq_at)
+            .bind(after_job_id)
+            .bind(batch_size)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(if locked {
-                DlqRetryBatch::Busy
-            } else {
-                DlqRetryBatch::Revived { count: 0 }
-            });
-        }
-        if filter.queue.is_some() {
-            moved.sort_by_key(|row| (row.dlq_at, row.job_id));
-        } else {
-            moved.sort_by_key(|row| row.job_id);
-        }
-
-        for row in &moved {
-            match self
-                .sync_unique_claim(
-                    &mut tx,
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    Some(JobState::Failed),
-                    Some(JobState::Available),
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(AwaError::UniqueConflict { .. }) => {
-                    tx.rollback().await.map_err(map_sqlx_error)?;
-                    return Ok(DlqRetryBatch::UniqueConflict { job_id: row.job_id });
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let run_at = Utc::now();
-        let mut queues = BTreeSet::new();
-        let mut ready_rows = Vec::with_capacity(moved.len());
-        for moved_row in moved {
-            let queue = moved_row.queue.clone();
-            let priority = moved_row.priority;
-            queues.insert(queue.clone());
-            let mut payload = RuntimePayload::from_json(moved_row.payload.clone())?;
-            payload.set_progress(None);
-            ready_rows.push(moved_row.into_retry_ready_row(
-                queue,
-                priority,
-                run_at,
-                payload.into_json(),
-            ));
-        }
-
-        let revived = ready_rows.len() as u64;
-        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
-            .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(DlqRetryBatch::Revived { count: revived })
+        Ok(bulk::Pick::new(picked, first_held, more))
     }
 
     pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {

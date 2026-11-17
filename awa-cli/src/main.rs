@@ -8,10 +8,79 @@ use sqlx::postgres::PgPoolOptions;
 
 mod storage_wait;
 
-const DLQ_RETRY_BATCH_SIZE: i64 = 1000;
-const DLQ_RETRY_BUSY_WAIT_START: Duration = Duration::from_millis(100);
-const DLQ_RETRY_BUSY_WAIT_MAX: Duration = Duration::from_secs(2);
-const DLQ_RETRY_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-transaction bound and total cap shared by the bulk commands.
+#[derive(Args, Clone, Copy, Debug)]
+struct BulkArgs {
+    /// Change at most this many rows per transaction, in job ID order, until
+    /// none match. Rows another transaction holds are waited for, for up to
+    /// 60 seconds without progress.
+    #[arg(long, default_value_t = awa_model::bulk::DEFAULT_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..))]
+    batch_size: i64,
+    /// Stop after changing this many rows in total.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    limit: Option<u64>,
+}
+
+/// Run a batched admin operation, printing each batch to stderr.
+async fn run_bulk<F, Fut>(
+    bulk: &BulkArgs,
+    verb: &str,
+    noun: &str,
+    batch: F,
+) -> Result<awa_model::BulkRun, awa_model::AwaError>
+where
+    F: FnMut(i64, awa_model::BulkCursor) -> Fut,
+    Fut: std::future::Future<Output = Result<awa_model::BulkBatch, awa_model::AwaError>>,
+{
+    awa_model::bulk::run_batches(
+        awa_model::BulkRunOptions::default()
+            .batch_size(bulk.batch_size)
+            .limit(bulk.limit),
+        batch,
+        |batch, run| {
+            if batch.count > 0 || batch.skipped > 0 {
+                eprintln!(
+                    "{verb} {} {noun} ({} so far){}.",
+                    batch.count,
+                    run.count,
+                    if batch.skipped > 0 {
+                        format!("; skipped {}", batch.skipped)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        },
+    )
+    .await
+}
+
+/// Print a bulk run's result. Exits 1 when the run gave up on rows another
+/// transaction held, and 2 when it skipped rows over a unique conflict.
+fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
+    println!("{verb} {} {noun}.", run.count);
+    if run.busy_timed_out {
+        eprintln!(
+            "Every remaining matching row has been held by another transaction for {}s; stopping. Rerun once it finishes.",
+            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs()
+        );
+        std::process::exit(1);
+    }
+    if run.skipped > 0 {
+        let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
+        eprintln!(
+            "Skipped {} job(s) whose unique key a live job holds{}: {}",
+            run.skipped,
+            if run.skipped as usize > run.conflicts.len() {
+                ", including"
+            } else {
+                ""
+            },
+            ids.join(", ")
+        );
+        std::process::exit(2);
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -317,16 +386,8 @@ enum DlqCommands {
         /// accidentally reviving the entire DLQ.
         #[arg(long)]
         all: bool,
-        /// Retry in transactions of at most this many rows, oldest first,
-        /// until none match. Rows another transaction holds are waited for,
-        /// for up to 60 seconds without progress. Without it, every matching
-        /// row is retried in one transaction.
-        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-        batch_size: Option<i64>,
-        /// Stop after retrying this many rows in total. Implies batches
-        /// (`--batch-size` defaults to 1000).
-        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-        limit: Option<i64>,
+        #[command(flatten)]
+        bulk: BulkArgs,
     },
     /// Move existing failed terminal rows into the DLQ
     Move {
@@ -1043,8 +1104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             queue,
                             tag,
                             all,
-                            batch_size,
-                            limit,
+                            bulk,
                         } => {
                             let filter = awa_model::dlq::ListDlqFilter {
                                 kind,
@@ -1052,75 +1112,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            if batch_size.is_none() && limit.is_none() {
-                                let count =
-                                    awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
-                                        .await?;
-                                if count > 0 {
-                                    metrics.record_dlq_retried(queue.as_deref(), count);
-                                }
-                                println!("Retried {count} DLQ rows.");
-                            } else {
-                                let batch_size = batch_size.unwrap_or(DLQ_RETRY_BATCH_SIZE);
-                                let mut total: u64 = 0;
-                                let mut busy_since: Option<std::time::Instant> = None;
-                                let mut busy_wait = DLQ_RETRY_BUSY_WAIT_START;
-                                loop {
-                                    let take = match limit {
-                                        Some(limit) => {
-                                            let left = limit.saturating_sub(total as i64);
-                                            if left <= 0 {
-                                                break;
-                                            }
-                                            left.min(batch_size)
-                                        }
-                                        None => batch_size,
-                                    };
-                                    match awa_model::dlq::bulk_retry_from_dlq_batch(
-                                        &pool, &filter, all, take,
-                                    )
-                                    .await?
-                                    {
-                                        awa_model::DlqRetryBatch::Revived { count: 0 } => break,
-                                        awa_model::DlqRetryBatch::Revived { count } => {
-                                            busy_since = None;
-                                            busy_wait = DLQ_RETRY_BUSY_WAIT_START;
-                                            total += count;
-                                            metrics.record_dlq_retried(queue.as_deref(), count);
-                                            eprintln!("Retried {count} DLQ rows ({total} so far).");
-                                        }
-                                        awa_model::DlqRetryBatch::UniqueConflict { job_id } => {
-                                            println!("Retried {total} DLQ rows.");
-                                            eprintln!(
-                                                "DLQ job {job_id} conflicts with a live unique claim; its batch was not retried. Retry or purge it individually, then rerun."
-                                            );
-                                            std::process::exit(1);
-                                        }
-                                        awa_model::DlqRetryBatch::Busy => {
-                                            let since = *busy_since
-                                                .get_or_insert_with(std::time::Instant::now);
-                                            if since.elapsed() >= DLQ_RETRY_BUSY_TIMEOUT {
-                                                println!("Retried {total} DLQ rows.");
-                                                eprintln!(
-                                                    "Every remaining matching DLQ row has been held by another transaction for {}s; stopping. Rerun once it finishes.",
-                                                    DLQ_RETRY_BUSY_TIMEOUT.as_secs()
-                                                );
-                                                std::process::exit(1);
-                                            }
-                                            tokio::time::sleep(busy_wait).await;
-                                            busy_wait =
-                                                (busy_wait * 2).min(DLQ_RETRY_BUSY_WAIT_MAX);
-                                        }
-                                        other => {
-                                            return Err(format!(
-                                                "unexpected DLQ retry outcome: {other:?}"
-                                            )
-                                            .into());
-                                        }
-                                    }
-                                }
-                                println!("Retried {total} DLQ rows.");
+                            let run = run_bulk(&bulk, "Retried", "DLQ rows", |size, cursor| {
+                                awa_model::dlq::bulk_retry_from_dlq_batch(
+                                    &pool, &filter, all, size, cursor,
+                                )
+                            })
+                            .await?;
+                            if run.count > 0 {
+                                metrics.record_dlq_retried(queue.as_deref(), run.count);
                             }
+                            finish_bulk(&run, "Retried", "DLQ rows");
                         }
                         DlqCommands::Move {
                             kind,

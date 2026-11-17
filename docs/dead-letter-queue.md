@@ -45,31 +45,28 @@ Each DLQ row carries:
 # Retry a single DLQ row
 awa dlq retry 800042
 
-# Retry every matching row in bulk
+# Retry every matching row, 1,000 rows per transaction
 awa dlq retry-bulk --queue billing
 awa dlq retry-bulk --kind charge_card --tag manual_review
 
 # Retry the entire DLQ (safety guard requires --all)
 awa dlq retry-bulk --all
 
-# Retry in transactions of up to 1,000 rows until none match
-awa dlq retry-bulk --queue billing --batch-size 1000
-
-# Stop after 50,000 rows in total
-awa dlq retry-bulk --queue billing --batch-size 1000 --limit 50000
+# Smaller transactions, and stop after 50,000 rows in total
+awa dlq retry-bulk --queue billing --batch-size 500 --limit 50000
 ```
 
 Retry moves the row out of `dlq_entries` and back into the runnable path with `attempt = 0` and `run_lease = 0`, ready for fresh processing. The retry is recorded in the job's error history; the original failure trail is preserved.
 
 ### Draining a large DLQ
 
-Without `--batch-size`, `retry-bulk` retries every matching row in one transaction. For a large DLQ, use `--batch-size`: each batch is its own transaction of at most that many rows, oldest first (by `dlq_at` when the filter names a queue, otherwise by job ID), and the command repeats until no matching row is left or `--limit` rows have been retried. Batches skip rows another transaction holds, so two drains of the same filter never retry a row twice. When every remaining matching row is held, for example by another drain's batch that has not committed, the command waits and tries again, and gives up with a non-zero exit after 60 seconds without progress; it never reports a drain as finished while matching rows remain.
+`retry-bulk` retries in batches: each batch is its own transaction of at most `--batch-size` rows (1,000 by default), taken in job ID order, and the command repeats until no matching row is left or `--limit` rows have been retried. The run is not atomic: rows retried by earlier batches stay retried if a later batch fails. Batches skip rows another transaction holds without passing them, so two drains of the same filter never retry a row twice and a held row is never left behind; when every remaining matching row is held, for example by another drain's batch that has not committed, the command waits and tries again, and gives up with exit code 1 after 60 seconds without progress.
 
-If a row's unique key is held by a live job, its batch is rolled back, nothing in that batch is retried, and the command exits non-zero naming the job. Retry or purge that job on its own, then run the command again.
+If a row's unique key is held by a live job, that row is skipped and stays in the DLQ, and the rest of the run carries on. The command prints how many rows it skipped and the first 10 of their job IDs, and exits with code 2. Retry or purge those jobs on their own once the live job finishes.
 
 Prefer batches over calling `retry` once per job. Each retry is a separate enqueue into the job's lane and waits for that lane's in-flight enqueues to commit, so running many single-job retries in parallel slows the producers on the same queue. A batch revives each lane's rows with one reservation.
 
-The web UI's **Retry matching** action on the DLQ page retries in batches of 1,000 the same way, shows how many rows it has retried, and can be stopped between batches. The HTTP route `POST /api/dlq/bulk-retry` takes an optional `batch_size`; without it, every matching row is retried in one transaction. With it, a response of `{"count": 0, "busy": true}` means every matching row is held by another transaction and the request should be repeated after a short wait.
+The web UI's **Retry matching** action on the DLQ page retries in batches of 1,000 the same way, shows how many rows it has retried, can be stopped between batches, and names skipped jobs when it finishes. The HTTP route `POST /api/dlq/bulk-retry` runs every batch itself and returns `{"count", "skipped", "conflicts", "done"}`. With `batch_size` it runs one batch from an optional `cursor` and also returns the `cursor` for the next request; `"busy": true` means every remaining matching row is held by another transaction and the request should be repeated after a short wait.
 
 The CLI retries with the stored queue, priority, and immediate `run_at`. The programmatic APIs can override those when reviving a DLQ row; use Python `retry_from_dlq(job_id, priority=..., queue=..., run_at=...)` or Rust `RetryFromDlqOpts` when recovery should promote, demote, reroute, or delay the job.
 
@@ -105,11 +102,11 @@ The maintenance leader periodically prunes DLQ rows older than the configured re
 
 ## Programmatic access
 
-Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the facade crate, for DLQ list, retry, move, and purge helpers. `dlq::bulk_retry_from_dlq_batch(pool, &filter, allow_all, batch_size)` retries one batch and returns `DlqRetryBatch::Revived { count }`, where a count of 0 means no matching row remains, `DlqRetryBatch::Busy` when every matching row is held by another transaction (wait and call again), or `DlqRetryBatch::UniqueConflict { job_id }`. The enum is `#[non_exhaustive]`.
+Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the facade crate, for DLQ list, retry, move, and purge helpers. `dlq::bulk_retry_from_dlq_batch(pool, &filter, allow_all, batch_size, cursor)` retries one batch and returns a `BulkBatch` with `count`, `skipped`, `conflicts`, `busy`, `done` and the `cursor` for the next batch; `awa::model::bulk::run_batches` drives a whole run. `bulk_retry_from_dlq` still retries every matching row in one transaction and aborts on a unique conflict; in 0.7 it runs in batches. Bulk DLQ calls ignore `ListDlqFilter::limit`, which is the page size of `list_dlq`; cap a run with `BulkRunOptions::limit`.
 
 The module-level functions look up the active queue-storage schema and build a new `QueueStorage` on each call. Long-running tooling that makes many calls, such as a script that retries DLQ rows one at a time, should build one `QueueStorage` with `QueueStorage::from_existing_schema` and call its methods, such as `retry_from_dlq` and `bulk_retry_from_dlq_batch`, instead. Admin helpers such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and `bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
 
-Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and `purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)` purges one DLQ row by job ID. `bulk_retry_from_dlq(..., batch_size=n)` retries one batch of up to `n` rows and returns the count, 0 only once no matching row remains; a unique conflict raises `UniqueConflict` naming the job. While every matching row is held by another transaction the call waits and tries again for up to 30 seconds, then raises `DatabaseError`. These wrap the same SQL helpers the CLI uses.
+Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`, `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and `purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)` purges one DLQ row by job ID. `bulk_retry_from_dlq(...)` retries every matching row, `batch_size` rows per transaction (1,000 by default), and returns the count. A row whose unique key a live job holds is skipped; after every other row is retried it raises `UniqueConflict` naming the skipped jobs. Rows another transaction holds are waited for, for up to 60 seconds, then it raises `DatabaseError`. These wrap the same SQL helpers the CLI uses.
 
 ## See also
 

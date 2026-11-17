@@ -4,6 +4,7 @@
 //! active queue_storage schema from `awa.runtime_storage_backends` and operates
 //! against that backend.
 
+use crate::bulk::{BulkBatch, BulkCursor};
 use crate::error::AwaError;
 use crate::job::JobRow;
 use crate::queue_storage::QueueStorage;
@@ -46,23 +47,6 @@ impl DlqRow {
         };
         (self.job, metadata)
     }
-}
-
-/// Result of one bounded bulk DLQ retry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DlqRetryBatch {
-    /// The batch committed and revived `count` rows. Zero means no row
-    /// matches the filter.
-    Revived { count: u64 },
-    /// Every matching row is held by another transaction, such as a
-    /// concurrent batch, so this batch revived nothing. The rows stay in the
-    /// DLQ if that transaction rolls back; call again after a short wait.
-    Busy,
-    /// The row's unique key is claimed by a live job. The batch was rolled
-    /// back and every row in it stays in the DLQ.
-    UniqueConflict { job_id: i64 },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -373,8 +357,11 @@ pub async fn retry_from_dlq(
 /// `true`. This guard prevents an empty payload from reviving the entire DLQ
 /// by accident.
 ///
-/// Like single-row retry, unique-claim conflicts abort the transaction and
-/// leave the affected DLQ rows untouched.
+/// Every matching row is retried in one transaction. Like single-row retry,
+/// a unique-claim conflict aborts the transaction and leaves every matching
+/// row in the DLQ. For a large DLQ use [`bulk_retry_from_dlq_batch`], which
+/// works in bounded transactions; in 0.7 this function runs in batches too.
+/// It ignores `filter.limit`.
 pub async fn bulk_retry_from_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
@@ -393,23 +380,23 @@ pub async fn bulk_retry_from_dlq(
 
 /// Retry up to `batch_size` DLQ rows matching the filter in one transaction.
 ///
-/// Call it repeatedly to drain a large DLQ in bounded transactions; it returns
-/// `Revived { count: 0 }` once no matching row is left. Rows are taken oldest
-/// first: by `(dlq_at, job_id)` when the filter names a queue, otherwise by
-/// `job_id`. Rows another transaction holds are skipped, so concurrent callers
-/// never revive a row twice; when every matching row is held, it returns
-/// [`DlqRetryBatch::Busy`] and the caller should wait and call again.
-/// `filter.limit` is ignored.
+/// Rows are taken in job ID order past `cursor`; start from
+/// `BulkCursor::default()` and pass each batch's cursor to the next call, or
+/// drive the whole run with [`crate::bulk::run_batches`]. Rows another
+/// transaction holds are never skipped: the cursor stops before them, and a
+/// batch that can take no row reports `busy`. A row whose unique key a live
+/// job holds is skipped, stays in the DLQ, and is reported in `conflicts`.
 ///
 /// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
-/// `true`. If a row conflicts with a live unique claim, the batch is rolled
-/// back and the row is returned as [`DlqRetryBatch::UniqueConflict`].
+/// `true`. Like every bulk DLQ call, it ignores `filter.limit`, which is the
+/// page size of [`list_dlq`]; cap a run with `BulkRunOptions::limit`.
 pub async fn bulk_retry_from_dlq_batch(
     pool: &PgPool,
     filter: &ListDlqFilter,
     allow_all: bool,
     batch_size: i64,
-) -> Result<DlqRetryBatch, AwaError> {
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
     if !allow_all && filter_requires_scope(filter) {
         return Err(AwaError::Validation(
             "bulk_retry_from_dlq_batch requires at least one of kind, queue, or tag (or allow_all=true)"
@@ -419,7 +406,7 @@ pub async fn bulk_retry_from_dlq_batch(
 
     let store = active_queue_storage(pool).await?;
     store
-        .bulk_retry_from_dlq_batch(pool, filter, batch_size)
+        .bulk_retry_from_dlq_batch(pool, filter, batch_size, cursor)
         .await
 }
 

@@ -1,9 +1,14 @@
 //! Bounded bulk DLQ retry: `dlq::bulk_retry_from_dlq_batch`.
 //!
+//! Each call changes at most `batch_size` rows in one transaction, walks the
+//! DLQ in job ID order, skips and reports unique conflicts, and reports
+//! `busy` rather than passing a row another transaction holds.
+//!
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test dlq_retry_batch_test -- --nocapture`
 
-use awa::model::{dlq, AwaError, DlqRetryBatch, ListDlqFilter};
+use awa::model::bulk::{run_batches, BulkBatch, BulkCursor, BulkRunOptions};
+use awa::model::{dlq, AwaError, ListDlqFilter};
 use awa_testing::setup;
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -92,10 +97,25 @@ async fn ready(pool: &PgPool, ids: &[i64]) -> Vec<i64> {
         .expect("ready rows")
 }
 
-async fn batch(pool: &PgPool, filter: &ListDlqFilter, limit: i64) -> DlqRetryBatch {
-    dlq::bulk_retry_from_dlq_batch(pool, filter, false, limit)
+async fn batch(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> BulkBatch {
+    dlq::bulk_retry_from_dlq_batch(pool, filter, false, batch_size, cursor)
         .await
         .expect("bulk retry batch")
+}
+
+async fn hold(pool: &PgPool, ids: &[i64]) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT job_id FROM awa.dlq_entries WHERE job_id = ANY($1) FOR UPDATE")
+        .bind(ids)
+        .fetch_all(&mut *holder)
+        .await
+        .expect("hold rows");
+    holder
 }
 
 fn by_queue(queue: &str) -> ListDlqFilter {
@@ -106,14 +126,12 @@ fn by_queue(queue: &str) -> ListDlqFilter {
 }
 
 #[tokio::test]
-async fn queue_batches_take_the_oldest_dead_letters_first() {
+async fn a_batch_takes_at_most_batch_size_rows_in_job_id_order() {
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
-    let queue = unique_name("dlq_batch_queue_order");
-    // Ids ascend while dlq_at ages descend, so the two orders disagree.
-    let ages = [10, 50, 30, 40, 20];
+    let queue = unique_name("dlq_batch_bound");
     let mut ids = Vec::new();
-    for age in ages {
+    for age in [10, 50, 30, 40, 20] {
         ids.push(seed_plain(&pool, "dlq_batch_job", &queue, age).await);
     }
     let filter = ListDlqFilter {
@@ -121,48 +139,17 @@ async fn queue_batches_take_the_oldest_dead_letters_first() {
         ..by_queue(&queue)
     };
 
-    assert_eq!(
-        batch(&pool, &filter, 2).await,
-        DlqRetryBatch::Revived { count: 2 }
-    );
-    let mut revived = ready(&pool, &ids).await;
-    revived.sort_unstable();
-    assert_eq!(revived, vec![ids[1], ids[3]], "ages 50 and 40 go first");
-
-    assert_eq!(
-        batch(&pool, &filter, 10).await,
-        DlqRetryBatch::Revived { count: 3 }
-    );
-    assert!(in_dlq(&pool, &ids).await.is_empty());
-    assert_eq!(
-        batch(&pool, &filter, 10).await,
-        DlqRetryBatch::Revived { count: 0 }
-    );
-    setup::clean_queue(&pool, &queue).await;
-}
-
-#[tokio::test]
-async fn batches_without_a_queue_take_the_lowest_job_ids_first() {
-    let _guard = GUARD.lock().await;
-    let pool = queue_storage_pool().await;
-    let queue = unique_name("dlq_batch_id_order");
-    let kind = unique_name("dlq_batch_kind");
-    let mut ids = Vec::new();
-    for age in [10, 20, 30, 40] {
-        ids.push(seed_plain(&pool, &kind, &queue, age).await);
-    }
-    let filter = ListDlqFilter {
-        kind: Some(kind.clone()),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        batch(&pool, &filter, 2).await,
-        DlqRetryBatch::Revived { count: 2 }
-    );
+    let first = batch(&pool, &filter, 2, BulkCursor::default()).await;
+    assert_eq!((first.count, first.done, first.busy), (2, false, false));
+    assert_eq!(first.cursor.after_job_id, ids[1]);
     let mut revived = ready(&pool, &ids).await;
     revived.sort_unstable();
     assert_eq!(revived, vec![ids[0], ids[1]]);
+    assert_eq!(in_dlq(&pool, &ids).await.len(), 3);
+
+    let second = batch(&pool, &filter, 10, first.cursor).await;
+    assert_eq!((second.count, second.done), (3, true));
+    assert!(in_dlq(&pool, &ids).await.is_empty());
     setup::clean_queue(&pool, &queue).await;
 }
 
@@ -194,8 +181,10 @@ async fn kind_and_tag_filters_limit_what_a_batch_revives() {
         ..by_queue(&queue)
     };
     assert_eq!(
-        batch(&pool, &by_kind, 10).await,
-        DlqRetryBatch::Revived { count: 1 }
+        batch(&pool, &by_kind, 10, BulkCursor::default())
+            .await
+            .count,
+        1
     );
     assert_eq!(ready(&pool, &all).await, vec![a]);
 
@@ -204,15 +193,15 @@ async fn kind_and_tag_filters_limit_what_a_batch_revives() {
         ..Default::default()
     };
     assert_eq!(
-        batch(&pool, &by_tag, 10).await,
-        DlqRetryBatch::Revived { count: 1 }
+        batch(&pool, &by_tag, 10, BulkCursor::default()).await.count,
+        1
     );
     assert_eq!(in_dlq(&pool, &all).await, BTreeSet::from([b]));
     setup::clean_queue(&pool, &queue).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_batches_revive_each_row_exactly_once() {
+async fn concurrent_runs_revive_each_row_exactly_once() {
     const ROWS: i64 = 300;
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
@@ -228,27 +217,25 @@ async fn concurrent_batches_revive_each_row_exactly_once() {
     .await
     .expect("seed dlq rows");
 
-    let mut drains = Vec::new();
+    let mut runs = Vec::new();
     for _ in 0..4 {
         let pool = pool.clone();
         let filter = by_queue(&queue);
-        drains.push(tokio::spawn(async move {
-            let mut revived = 0;
-            loop {
-                match batch(&pool, &filter, 7).await {
-                    DlqRetryBatch::Revived { count: 0 } => return revived,
-                    DlqRetryBatch::Revived { count } => revived += count,
-                    DlqRetryBatch::Busy => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await
-                    }
-                    other => panic!("unexpected {other:?}"),
-                }
-            }
+        runs.push(tokio::spawn(async move {
+            run_batches(
+                BulkRunOptions::default().batch_size(7),
+                |size, cursor| dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, size, cursor),
+                |batch, _| assert!(batch.count <= 7),
+            )
+            .await
+            .expect("run")
         }));
     }
     let mut total = 0;
-    for drain in drains {
-        total += drain.await.expect("drain task");
+    for run in runs {
+        let run = run.await.expect("run task");
+        assert!(run.complete, "{run:?}");
+        total += run.count;
     }
 
     assert_eq!(total, ROWS as u64);
@@ -264,12 +251,12 @@ async fn concurrent_batches_revive_each_row_exactly_once() {
 }
 
 #[tokio::test]
-async fn a_unique_conflict_rolls_back_its_batch_and_names_the_row() {
+async fn a_unique_conflict_is_skipped_reported_and_not_retried_again() {
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
     let queue = unique_name("dlq_batch_conflict");
     let key = format!("dlq-batch-{queue}").into_bytes();
-    let plain = seed_plain(&pool, "dlq_batch_job", &queue, 30).await;
+    let first = seed_plain(&pool, "dlq_batch_job", &queue, 30).await;
     let keyed = seed(
         &pool,
         Seed {
@@ -281,6 +268,7 @@ async fn a_unique_conflict_rolls_back_its_batch_and_names_the_row() {
         },
     )
     .await;
+    let last = seed_plain(&pool, "dlq_batch_job", &queue, 10).await;
     sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
         .bind(&key)
         .bind(i64::MAX - 2)
@@ -288,29 +276,30 @@ async fn a_unique_conflict_rolls_back_its_batch_and_names_the_row() {
         .await
         .expect("live job holds the key");
 
+    let result = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
     assert_eq!(
-        batch(&pool, &by_queue(&queue), 10).await,
-        DlqRetryBatch::UniqueConflict { job_id: keyed }
+        (
+            result.count,
+            result.skipped,
+            result.conflicts.clone(),
+            result.done
+        ),
+        (2, 1, vec![keyed], true)
     );
-    assert_eq!(in_dlq(&pool, &[plain, keyed]).await.len(), 2);
-    assert!(ready(&pool, &[plain, keyed]).await.is_empty());
-
-    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
-        .bind(&key)
-        .execute(&pool)
-        .await
-        .expect("release the key");
     assert_eq!(
-        batch(&pool, &by_queue(&queue), 10).await,
-        DlqRetryBatch::Revived { count: 2 }
+        in_dlq(&pool, &[first, keyed, last]).await,
+        BTreeSet::from([keyed])
     );
     let holder: i64 =
         sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
             .bind(&key)
             .fetch_one(&pool)
             .await
-            .expect("revived row holds its key");
-    assert_eq!(holder, keyed);
+            .expect("claim");
+    assert_eq!(holder, i64::MAX - 2, "the live job keeps its key");
+
+    let again = batch(&pool, &by_queue(&queue), 10, result.cursor).await;
+    assert_eq!((again.count, again.skipped, again.done), (0, 0, true));
 
     sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
         .bind(&key)
@@ -330,40 +319,62 @@ async fn a_batch_is_busy_not_done_while_every_matching_row_is_held() {
         ids.push(seed_plain(&pool, "dlq_batch_job", &queue, age).await);
     }
 
-    let mut holder = pool.begin().await.expect("begin holder");
-    sqlx::query("SELECT job_id FROM awa.dlq_entries WHERE queue = $1 FOR UPDATE")
-        .bind(&queue)
-        .fetch_all(&mut *holder)
-        .await
-        .expect("hold every matching row");
-    assert_eq!(
-        batch(&pool, &by_queue(&queue), 10).await,
-        DlqRetryBatch::Busy
-    );
+    let holder = hold(&pool, &ids).await;
+    let held = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
+    assert_eq!((held.count, held.busy, held.done), (0, true, false));
+    assert_eq!(held.cursor, BulkCursor::default());
     holder.rollback().await.expect("release rows");
 
-    assert_eq!(
-        batch(&pool, &by_queue(&queue), 10).await,
-        DlqRetryBatch::Revived { count: 2 }
-    );
+    let released = batch(&pool, &by_queue(&queue), 10, held.cursor).await;
+    assert_eq!((released.count, released.done), (2, true));
     assert!(in_dlq(&pool, &ids).await.is_empty());
-    assert_eq!(
-        batch(&pool, &by_queue(&queue), 10).await,
-        DlqRetryBatch::Revived { count: 0 }
-    );
     setup::clean_queue(&pool, &queue).await;
 }
 
 #[tokio::test]
-async fn batches_need_a_scope_and_a_positive_limit() {
+async fn a_held_row_is_never_passed_by_the_cursor() {
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
-    let unscoped = dlq::bulk_retry_from_dlq_batch(&pool, &ListDlqFilter::default(), false, 10)
-        .await
-        .expect_err("unscoped batch");
+    let queue = unique_name("dlq_batch_held_first");
+    let mut ids = Vec::new();
+    for age in [30, 20, 10] {
+        ids.push(seed_plain(&pool, "dlq_batch_job", &queue, age).await);
+    }
+
+    let holder = hold(&pool, &ids[..1]).await;
+    let held = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
+    assert_eq!((held.count, held.busy, held.done), (0, true, false));
+    assert_eq!(held.cursor.after_job_id, 0);
+    assert_eq!(in_dlq(&pool, &ids).await.len(), 3);
+    holder.rollback().await.expect("release row");
+
+    let released = batch(&pool, &by_queue(&queue), 10, held.cursor).await;
+    assert_eq!((released.count, released.done), (3, true));
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn batches_need_a_scope_and_a_positive_batch_size() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let unscoped = dlq::bulk_retry_from_dlq_batch(
+        &pool,
+        &ListDlqFilter::default(),
+        false,
+        10,
+        BulkCursor::default(),
+    )
+    .await
+    .expect_err("unscoped batch");
     assert!(matches!(unscoped, AwaError::Validation(_)), "{unscoped:?}");
-    let zero = dlq::bulk_retry_from_dlq_batch(&pool, &by_queue("dlq_batch_zero"), false, 0)
-        .await
-        .expect_err("zero limit");
+    let zero = dlq::bulk_retry_from_dlq_batch(
+        &pool,
+        &by_queue("dlq_batch_zero"),
+        false,
+        0,
+        BulkCursor::default(),
+    )
+    .await
+    .expect_err("zero batch size");
     assert!(matches!(zero, AwaError::Validation(_)), "{zero:?}");
 }

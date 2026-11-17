@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod admin;
 pub mod batch_operations;
 pub mod bridge;
+pub mod bulk;
 pub mod callback_contract;
 pub mod cron;
 pub mod dlq;
@@ -39,8 +40,9 @@ pub use batch_operations::{
 /// additional descriptor fields this alias predates.
 #[deprecated(since = "0.5.4", note = "use `QueueOverview` instead")]
 pub type QueueStats = QueueOverview;
+pub use bulk::{BulkBatch, BulkCursor, BulkRun, BulkRunOptions};
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
-pub use dlq::{DlqMetadata, DlqRetryBatch, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::{map_sqlx_error, AwaError};
 pub use insert::{
     insert, insert_many, insert_many_copy, insert_many_copy_from_pool,
