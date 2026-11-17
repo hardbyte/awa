@@ -11,6 +11,7 @@
 //! completion.
 
 use crate::error::AwaError;
+use crate::job::JobRow;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -64,6 +65,27 @@ impl BulkBatch {
         }
     }
 
+    pub(crate) fn skip(&mut self, job_id: i64) {
+        self.skipped += 1;
+        if self.conflicts.len() < MAX_REPORTED_CONFLICTS {
+            self.conflicts.push(job_id);
+        }
+    }
+}
+
+/// What a bulk call on explicit job IDs did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BulkIds {
+    /// The jobs changed.
+    pub jobs: Vec<JobRow>,
+    /// Jobs skipped because the change would violate a unique claim.
+    pub skipped: u64,
+    /// IDs of skipped jobs, at most [`MAX_REPORTED_CONFLICTS`].
+    pub conflicts: Vec<i64>,
+}
+
+impl BulkIds {
     pub(crate) fn skip(&mut self, job_id: i64) {
         self.skipped += 1;
         if self.conflicts.len() < MAX_REPORTED_CONFLICTS {
