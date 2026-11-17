@@ -27,7 +27,7 @@ Admin operations that change every job matching a filter run in bounded batches 
 
 ### CLI
 
-Every command above takes `--batch-size` (default 1,000) and `--limit`. Each batch prints a progress line to stderr and the total goes to stdout. The command exits 2 when it skipped jobs over a unique conflict, naming the first 10, and 1 when it gave up on rows another transaction held.
+Every command above takes `--batch-size` (default 1,000) and `--limit`. Each batch prints a progress line to stderr and the total goes to stdout. The command exits 2 when it skipped jobs over a unique conflict, naming the first 10, and 1 when it gave up on rows another transaction held; when both happen it names the skipped jobs and exits 1.
 
 `awa batch-ops purge` keeps its old behaviour by default: one call that purges at most 1,000 operations, or `--limit` operations. `--batch-size N` purges in transactions of `N` until none match. `--limit` is now hidden from help but still accepted.
 
