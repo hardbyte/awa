@@ -14,7 +14,7 @@ struct BulkArgs {
     /// Change at most this many rows per transaction, in job ID order, until
     /// none match. Rows another transaction holds are waited for, for up to
     /// 60 seconds without progress.
-    #[arg(long, default_value_t = awa_model::bulk::DEFAULT_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..))]
+    #[arg(long, default_value_t = awa_model::bulk::DEFAULT_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=awa_model::bulk::MAX_BATCH_SIZE))]
     batch_size: i64,
     /// Stop after changing this many rows in total.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -27,7 +27,9 @@ struct BulkArgs {
 
 /// Run a batched admin operation, printing each batch to stderr.
 /// `on_changed` sees the row count of each batch that changed rows, as the
-/// batch commits, so a run that fails later still accounts for them.
+/// batch commits, so a run that fails later still accounts for them. When a
+/// batch fails, the rows earlier batches changed and any skipped jobs are
+/// printed before the error is returned.
 async fn run_bulk<F, Fut>(
     bulk: &BulkArgs,
     verb: &str,
@@ -64,13 +66,15 @@ where
         },
     )
     .await
+    .map_err(|err| {
+        print_bulk(&err.partial, verb, noun);
+        eprintln!("Stopped by an error; the rows above stay changed.");
+        err.error
+    })
 }
 
-/// Print a bulk run's result, including any skipped jobs and whether it
-/// gave up on held rows. Exits 1 when the run gave up on rows another
-/// transaction held, otherwise 2 when it skipped rows over a unique
-/// conflict.
-fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
+/// Print how many rows a bulk run changed and the jobs it skipped.
+fn print_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
     println!("{verb} {} {noun}.", run.count);
     if run.skipped > 0 {
         let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
@@ -85,6 +89,14 @@ fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
             ids.join(", ")
         );
     }
+}
+
+/// Print a bulk run's result, including any skipped jobs and whether it
+/// gave up on held rows. Exits 1 when the run gave up on rows another
+/// transaction held, otherwise 2 when it skipped rows over a unique
+/// conflict.
+fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
+    print_bulk(run, verb, noun);
     if run.busy_timed_out {
         eprintln!(
             "Every remaining matching row stayed held by another transaction past the busy timeout; stopping. Rerun once it finishes."
@@ -490,7 +502,7 @@ enum BatchOpsCommands {
         before: DateTime<Utc>,
         /// Purge in transactions of at most this many operations until none
         /// match.
-        #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with = "limit")]
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=awa_model::bulk::MAX_BATCH_SIZE), conflicts_with = "limit")]
         batch_size: Option<i64>,
         /// Purge at most this many operations, in one transaction.
         #[arg(long, hide = true, value_parser = clap::value_parser!(i64).range(1..))]
@@ -1321,10 +1333,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut purged = 0;
                                 loop {
                                     let batch =
-                                        awa_model::batch_operations::purge_batch_operations_before(
+                                        match awa_model::batch_operations::purge_batch_operations_before(
                                             &pool, before, batch_size,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Ok(batch) => batch,
+                                            Err(err) => {
+                                                println!("Purged {purged} batch operations.");
+                                                eprintln!("Stopped by an error; the operations above stay purged.");
+                                                return Err(err.into());
+                                            }
+                                        };
                                     purged += batch;
                                     if batch < batch_size as u64 {
                                         break purged;

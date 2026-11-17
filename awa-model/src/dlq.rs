@@ -475,8 +475,9 @@ pub struct DlqCount {
     pub capped: bool,
 }
 
-/// Count DLQ rows matching `filter`, stopping at `cap` so the count stays
-/// cheap on a large DLQ. Ignores `filter.limit`.
+/// Count DLQ rows matching `filter`, including its `before_id` and
+/// `before_dlq_at` cursor, stopping at `cap` so the count stays cheap on a
+/// large DLQ. Ignores `filter.limit`.
 pub async fn count_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
@@ -488,17 +489,18 @@ pub async fn count_dlq(
         SELECT count(*)::bigint FROM (
             SELECT 1
             FROM {}.dlq_entries
-            WHERE ($1::text IS NULL OR kind = $1)
-              AND ($2::text IS NULL OR queue = $2)
-              AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-            LIMIT $4
+            WHERE {}
+            LIMIT $6
         ) AS matching
         "#,
-        store.schema()
+        store.schema(),
+        crate::queue_storage::DLQ_FILTER_SQL,
     ))
     .bind(&filter.kind)
     .bind(&filter.queue)
     .bind(&filter.tag)
+    .bind(filter.before_id)
+    .bind(filter.before_dlq_at)
     .bind(cap.max(0) + 1)
     .fetch_one(pool)
     .await?;
@@ -529,45 +531,13 @@ pub async fn purge_dlq(
     }
 
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(&format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE ($1::text IS NULL OR kind = $1)
-          AND ($2::text IS NULL OR queue = $2)
-          AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-          AND (
-              ($4::bigint IS NULL AND $5::timestamptz IS NULL)
-              OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
-              OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
-              OR (
-                  $4::bigint IS NOT NULL
-                  AND $5::timestamptz IS NOT NULL
-                  AND (dlq_at, job_id) < ($5, $4)
-              )
-          )
-        "#,
-        store.schema()
-    ))
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.before_id)
-    .bind(filter.before_dlq_at)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    store.purge_dlq(pool, filter).await
 }
 
+/// Delete one DLQ row, releasing its unique claim.
 pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(&format!(
-        "DELETE FROM {}.dlq_entries WHERE job_id = $1",
-        store.schema()
-    ))
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    store.purge_dlq_job(pool, job_id).await
 }
 
 /// Purge DLQ rows older than the configured retention horizon.
@@ -582,26 +552,7 @@ pub async fn cleanup_dlq(
     queue: Option<&str>,
 ) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let retention_secs = retention.as_secs().min(i64::MAX as u64) as i64;
-    let result = sqlx::query(&format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE job_id IN (
-            SELECT job_id
-            FROM {}.dlq_entries
-            WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-              AND ($3::text IS NULL OR queue = $3)
-            ORDER BY dlq_at ASC, job_id ASC
-            LIMIT $2
-        )
-        "#,
-        store.schema(),
-        store.schema()
-    ))
-    .bind(retention_secs)
-    .bind(batch_size)
-    .bind(queue)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    store
+        .delete_expired_dlq_rows(pool, retention, batch_size, queue, &[], true)
+        .await
 }

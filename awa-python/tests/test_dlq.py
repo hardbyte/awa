@@ -456,8 +456,9 @@ def test_bulk_retry_from_dlq_skips_a_unique_conflict_and_names_it(sync_client):
     tx.commit()
     sync_client.insert(DlqPyJob(value="same"), queue=queue, unique_opts=unique_opts)
 
-    with pytest.raises(awa.UniqueConflict, match=f"Retried 1 row.*skipped 1 job.*{keyed_id}"):
+    with pytest.raises(awa.UniqueConflict, match=f"Retried 1 row.*skipped 1 job.*{keyed_id}") as raised:
         sync_client.bulk_retry_from_dlq(queue=queue, batch_size=1)
+    assert (raised.value.count, raised.value.skipped, raised.value.conflicts) == (1, 1, [keyed_id])
 
     assert sync_client.get_dlq_job(plain_id) is None
     assert sync_client.get_dlq_job(keyed_id) is not None
@@ -502,8 +503,9 @@ def test_retry_failed_in_batches_skips_and_names_a_unique_conflict(sync_client):
     tx.commit()
     sync_client.insert(DlqPyJob(value="same"), queue=queue, unique_opts=unique_opts)
 
-    with pytest.raises(awa.UniqueConflict, match=f"Retried 2 row.*skipped 1 job.*{keyed_id}"):
+    with pytest.raises(awa.UniqueConflict, match=f"Retried 2 row.*skipped 1 job.*{keyed_id}") as raised:
         sync_client.retry_failed(queue=queue, batch_size=1)
+    assert (raised.value.count, raised.value.skipped, raised.value.conflicts) == (2, 1, [keyed_id])
 
     for job_id in plain_ids:
         assert str(sync_client.get_job(job_id).state) == "available"

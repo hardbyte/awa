@@ -233,7 +233,8 @@ where
                     on_changed(batch.count);
                 }
             })
-            .await?,
+            .await
+            .map_err(|err| ApiError::from(err.error))?,
         ),
     }
 }

@@ -40,7 +40,7 @@ pub use batch_operations::{
 /// additional descriptor fields this alias predates.
 #[deprecated(since = "0.5.4", note = "use `QueueOverview` instead")]
 pub type QueueStats = QueueOverview;
-pub use bulk::{BulkBatch, BulkCursor, BulkIds, BulkRun, BulkRunOptions};
+pub use bulk::{BulkBatch, BulkCursor, BulkError, BulkIds, BulkRun, BulkRunOptions};
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
 pub use dlq::{DlqCount, DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::{map_sqlx_error, AwaError};

@@ -66,7 +66,7 @@ pub async fn resume_queue(
 #[derive(Debug, Deserialize)]
 pub struct DrainParams {
     /// Run one batch of up to this many jobs, resuming at `stage`,
-    /// `after_job_id` and `below_job_id`, the fields of the previous batch's
+    /// `after_job_id` and `before_job_id`, the fields of the previous batch's
     /// cursor. Without it, the server drains in batches until no matching
     /// job remains.
     pub batch_size: Option<i64>,
@@ -75,7 +75,7 @@ pub struct DrainParams {
     #[serde(default)]
     pub after_job_id: i64,
     #[serde(default)]
-    pub below_job_id: i64,
+    pub before_job_id: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,7 +94,7 @@ pub async fn drain_queue(
     let cursor = awa_model::BulkCursor {
         stage: params.stage,
         after_job_id: params.after_job_id,
-        below_job_id: params.below_job_id,
+        before_job_id: params.before_job_id,
     };
     let bulk = crate::handlers::dlq::run_bulk_route(
         params.batch_size,

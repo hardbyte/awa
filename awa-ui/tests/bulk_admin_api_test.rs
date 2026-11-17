@@ -156,8 +156,8 @@ async fn queue_drain_runs_one_batch_from_a_cursor_or_every_batch() {
             &app,
             "POST",
             &format!(
-                "/api/queues/{queue}/drain?batch_size=2&stage={}&after_job_id={}&below_job_id={}",
-                cursor["stage"], cursor["after_job_id"], cursor["below_job_id"]
+                "/api/queues/{queue}/drain?batch_size=2&stage={}&after_job_id={}&before_job_id={}",
+                cursor["stage"], cursor["after_job_id"], cursor["before_job_id"]
             ),
             None,
         )
@@ -181,5 +181,92 @@ async fn queue_drain_runs_one_batch_from_a_cursor_or_every_batch() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["drained"], 1);
     assert_eq!(body["done"], true);
+    awa_testing::setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn bulk_routes_reject_a_batch_size_above_the_cap() {
+    let _guard = TEST_LOCK.lock().await;
+    let pool = awa_testing::setup::setup(4).await;
+    awa_testing::setup::activate_queue_storage(&pool).await;
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+    let too_big = awa_model::bulk::MAX_BATCH_SIZE + 1;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/dlq/bulk-purge",
+        Some(json!({ "queue": "any", "batch_size": too_big })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/queues/any/drain?batch_size={too_big}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn bulk_retry_by_id_reports_skipped_conflicts() {
+    let _guard = TEST_LOCK.lock().await;
+    let pool = awa_testing::setup::setup(4).await;
+    awa_testing::setup::reset_to_canonical(&pool).await;
+    let queue = unique_name("ui_bulk_retry_ids");
+    let unique = |key: &str| awa_model::InsertParams {
+        kind: "ui_bulk_unique_job".to_string(),
+        args: json!({ "key": key }),
+        opts: awa_model::InsertOpts {
+            queue: queue.clone(),
+            unique: Some(awa_model::UniqueOpts::default()),
+            ..Default::default()
+        },
+    };
+    let plain = awa_model::InsertParams {
+        kind: "ui_bulk_job".to_string(),
+        args: json!({ "seq": 1 }),
+        opts: awa_model::InsertOpts {
+            queue: queue.clone(),
+            ..Default::default()
+        },
+    };
+    let jobs = awa_model::insert_many(&pool, &[plain, unique("k")])
+        .await
+        .expect("insert jobs");
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'failed', attempt = 1, finalized_at = now() WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .execute(&pool)
+    .await
+    .expect("fail jobs");
+    awa_model::insert_many(&pool, &[unique("k")])
+        .await
+        .expect("a live job takes the key");
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/jobs/bulk-retry",
+        Some(json!({ "ids": ids })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["jobs"].as_array().expect("jobs").len(), 1, "{body}");
+    assert_eq!(body["jobs"][0]["id"], ids[0]);
+    assert_eq!(
+        (body["skipped"].clone(), body["conflicts"].clone()),
+        (json!(1), json!([ids[1]]))
+    );
     awa_testing::setup::clean_queue(&pool, &queue).await;
 }

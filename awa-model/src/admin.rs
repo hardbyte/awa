@@ -1,4 +1,4 @@
-use crate::bulk::{self, BulkBatch, BulkCursor, BulkIds};
+use crate::bulk::{self, BulkBatch, BulkCursor, BulkError, BulkIds};
 use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
@@ -4925,8 +4925,8 @@ async fn mark_canonical_run_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     cursor: &mut BulkCursor,
 ) -> Result<(), AwaError> {
-    if cursor.below_job_id == 0 {
-        cursor.below_job_id = sqlx::query_scalar(
+    if cursor.before_job_id == 0 {
+        cursor.before_job_id = sqlx::query_scalar(
             r#"
             SELECT GREATEST(
                 (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
@@ -4958,7 +4958,7 @@ async fn pick_canonical_batch_tx(
             .bind(first)
             .bind(second)
             .bind(cursor.after_job_id)
-            .bind(cursor.below_job_id)
+            .bind(cursor.before_job_id)
             .bind(batch_size)
             .fetch_one(tx.as_mut())
             .await?;
@@ -5148,18 +5148,17 @@ pub async fn discard_failed_batch(
     Ok(batch)
 }
 
-/// Cancel the queue's available, scheduled, retryable and waiting jobs, up
-/// to `batch_size` per transaction. Jobs enqueued after the run started are
-/// left alone.
+/// Cancel up to `batch_size` of the queue's waiting, scheduled, retryable
+/// and available jobs past `cursor`, in one step of a drain run. Jobs
+/// enqueued after the run started are left alone.
 ///
-/// On canonical storage one call cancels up to `batch_size` jobs past
-/// `cursor` in one transaction. The run takes waiting jobs first, then
-/// scheduled and retryable ones, then available ones: the order jobs move
-/// between them (a waiting job whose callback times out becomes retryable,
-/// and a scheduled or retryable job is promoted to available), so a job
-/// that moves during the run is still drained. On queue storage one call
-/// drains the whole queue and its stripes in transactions of `batch_size`
-/// jobs, skipping rows another transaction holds, and returns `done`.
+/// The run takes waiting jobs first, then scheduled and retryable ones,
+/// then available ones: the order jobs move between them (a waiting job
+/// whose callback times out becomes retryable, and a scheduled or retryable
+/// job is promoted to available), so a job that moves during the run is
+/// still drained. A job another transaction holds is never passed: when
+/// every remaining job of a pass is held, the batch reports `busy`. On queue
+/// storage the queue's stripes (`queue#N`) are drained with it.
 pub async fn drain_queue_batch(
     pool: &PgPool,
     queue: &str,
@@ -5168,12 +5167,9 @@ pub async fn drain_queue_batch(
 ) -> Result<BulkBatch, AwaError> {
     bulk::validate_batch_size(batch_size)?;
     if let Some(store) = active_queue_storage(pool).await? {
-        let mut batch = BulkBatch::new(cursor);
-        batch.count = store
-            .drain_queue_in_batches(pool, queue, batch_size)
-            .await?;
-        batch.done = true;
-        return Ok(batch);
+        return store
+            .drain_queue_batch(pool, queue, batch_size, cursor)
+            .await;
     }
     let mut cursor = cursor;
     let mut tx = pool.begin().await?;
@@ -5219,52 +5215,80 @@ pub async fn drain_queue_batch(
 
 /// Retry jobs by ID in transactions of at most `batch_size` jobs. Only
 /// retries failed, cancelled, or waiting_external jobs. A job whose retry
-/// would violate a unique claim is skipped and reported.
+/// would violate a unique claim is skipped and reported. When a chunk fails,
+/// the error carries the jobs earlier chunks committed.
 pub async fn bulk_retry_in_batches(
     pool: &PgPool,
     ids: &[i64],
     batch_size: i64,
-) -> Result<BulkIds, AwaError> {
-    bulk::validate_batch_size(batch_size)?;
-    if let Some(store) = active_queue_storage(pool).await? {
+) -> Result<BulkIds, BulkError<BulkIds>> {
+    let started = async {
+        bulk::validate_batch_size(batch_size)?;
+        active_queue_storage(pool).await
+    };
+    let store = match started.await {
+        Ok(store) => store,
+        Err(error) => return Err(bulk::BulkError::new(BulkIds::default(), error)),
+    };
+    if let Some(store) = store {
         return store.retry_jobs_in_batches(pool, ids, batch_size).await;
     }
     let mut outcome = BulkIds::default();
     for chunk in ids.chunks(batch_size as usize) {
-        let mut tx = pool.begin().await?;
         let mut skipped = Vec::new();
-        let rows = update_canonical_skipping_conflicts_tx(
-            &mut tx,
-            CANONICAL_RETRY_IDS_SQL,
-            chunk,
-            &mut |job_id| skipped.push(job_id),
-        )
-        .await?;
-        tx.commit().await?;
-        outcome.jobs.extend(rows);
-        skipped.into_iter().for_each(|job_id| outcome.skip(job_id));
+        let chunk_result = async {
+            let mut tx = pool.begin().await?;
+            let rows = update_canonical_skipping_conflicts_tx(
+                &mut tx,
+                CANONICAL_RETRY_IDS_SQL,
+                chunk,
+                &mut |job_id| skipped.push(job_id),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok::<_, AwaError>(rows)
+        }
+        .await;
+        match chunk_result {
+            Ok(rows) => {
+                outcome.jobs.extend(rows);
+                skipped.into_iter().for_each(|job_id| outcome.skip(job_id));
+            }
+            Err(error) => return Err(bulk::BulkError::new(outcome, error)),
+        }
     }
     Ok(outcome)
 }
 
 /// Cancel jobs by ID in transactions of at most `batch_size` jobs. Only
-/// cancels non-terminal jobs.
+/// cancels non-terminal jobs. When a chunk fails, the error carries the jobs
+/// earlier chunks committed.
 pub async fn bulk_cancel_in_batches(
     pool: &PgPool,
     ids: &[i64],
     batch_size: i64,
-) -> Result<BulkIds, AwaError> {
-    bulk::validate_batch_size(batch_size)?;
-    if let Some(store) = active_queue_storage(pool).await? {
+) -> Result<BulkIds, BulkError<BulkIds>> {
+    let started = async {
+        bulk::validate_batch_size(batch_size)?;
+        active_queue_storage(pool).await
+    };
+    let store = match started.await {
+        Ok(store) => store,
+        Err(error) => return Err(bulk::BulkError::new(BulkIds::default(), error)),
+    };
+    if let Some(store) = store {
         return store.cancel_jobs_in_batches(pool, ids, batch_size).await;
     }
     let mut outcome = BulkIds::default();
     for chunk in ids.chunks(batch_size as usize) {
-        let rows = sqlx::query_as::<_, JobRow>(CANONICAL_CANCEL_IDS_SQL)
+        match sqlx::query_as::<_, JobRow>(CANONICAL_CANCEL_IDS_SQL)
             .bind(chunk)
             .fetch_all(pool)
-            .await?;
-        outcome.jobs.extend(rows);
+            .await
+        {
+            Ok(rows) => outcome.jobs.extend(rows),
+            Err(error) => return Err(bulk::BulkError::new(outcome, error.into())),
+        }
     }
     Ok(outcome)
 }

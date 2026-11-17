@@ -144,19 +144,64 @@ async fn queue_drain_runs_in_batches() {
     awa_testing::setup::clean_queue(&pool, &queue).await;
 }
 
+/// Turn available queue-storage jobs into failed terminal jobs.
+async fn fail_queue_storage(pool: &PgPool, ids: &[i64]) {
+    sqlx::query(
+        r#"
+        WITH moved AS (
+            DELETE FROM awa.ready_entries
+            WHERE job_id = ANY($1)
+            RETURNING ready_slot, ready_generation, job_id, kind, queue, args,
+                      priority, attempt, run_lease, max_attempts, lane_seq, run_at,
+                      attempted_at, created_at, unique_key, unique_states, payload
+        )
+        INSERT INTO awa.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, args, state,
+            priority, attempt, run_lease, max_attempts, lane_seq, run_at,
+            attempted_at, finalized_at, created_at, unique_key, unique_states, payload
+        )
+        SELECT ready_slot, ready_generation, job_id, kind, queue, args,
+               'failed'::awa.job_state, priority, GREATEST(attempt, 1), run_lease,
+               max_attempts, lane_seq, run_at, COALESCE(attempted_at, now()), now(),
+               created_at, unique_key, unique_states, payload
+        FROM moved
+        "#,
+    )
+    .bind(ids)
+    .execute(pool)
+    .await
+    .expect("fail queue-storage jobs");
+}
+
+async fn dlq_depth(pool: &PgPool, queue: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM awa.dlq_entries WHERE queue = $1")
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("dlq depth")
+}
+
 #[tokio::test]
-async fn discard_dlq_move_and_purge_run_in_batches() {
+async fn dlq_move_purge_and_discard_run_in_batches() {
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
     let queue = unique_name("cli_dlq_bulk");
-    sqlx::query(
-        "INSERT INTO awa.dlq_entries (job_id, kind, queue, priority, dlq_reason, original_run_lease) \
-         SELECT nextval('awa.job_id_seq'), 'cli_job', $1, 2, 'seeded', 1 FROM generate_series(1, 5)",
-    )
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("seed dlq");
+    let failed = insert(&pool, &queue, "cli_job", 5, None).await;
+    fail_queue_storage(&pool, &failed).await;
+
+    let assert = run_cli(&["dlq", "move", "--queue", &queue, "--batch-size", "2"])
+        .assert()
+        .success();
+    let (stdout, stderr) = output(&assert);
+    assert!(
+        stdout.contains("Moved 5 failed jobs into the DLQ."),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("(2 so far)") && stderr.contains("(4 so far)"),
+        "{stderr}"
+    );
+    assert_eq!(dlq_depth(&pool, &queue).await, 5);
 
     let assert = run_cli(&[
         "dlq",
@@ -170,34 +215,50 @@ async fn discard_dlq_move_and_purge_run_in_batches() {
     ])
     .assert()
     .success();
-    let (stdout, _) = output(&assert);
+    let (stdout, stderr) = output(&assert);
     assert!(stdout.contains("Purged 3 DLQ rows."), "{stdout}");
+    assert!(
+        stderr.contains("(2 so far)") && stderr.contains("(3 so far)"),
+        "{stderr}"
+    );
+    assert_eq!(dlq_depth(&pool, &queue).await, 2);
 
+    // Discard covers the kind's failed jobs, then its DLQ rows.
     let kind = unique_name("cli_discard_kind");
+    let more = insert(&pool, &queue, &kind, 3, None).await;
+    fail_queue_storage(&pool, &more).await;
     sqlx::query("UPDATE awa.dlq_entries SET kind = $2 WHERE queue = $1")
         .bind(&queue)
         .bind(&kind)
         .execute(&pool)
         .await
         .expect("rekind dlq rows");
-    let assert = run_cli(&["job", "discard", "--kind", &kind, "--batch-size", "1"])
+    let assert = run_cli(&["job", "discard", "--kind", &kind, "--batch-size", "2"])
         .assert()
         .success();
-    let (stdout, _) = output(&assert);
+    let (stdout, stderr) = output(&assert);
     assert!(
-        stdout.contains(&format!("Discarded 2 failed jobs of kind '{kind}'.")),
+        stdout.contains(&format!("Discarded 5 failed jobs of kind '{kind}'.")),
         "{stdout}"
     );
-
-    let assert = run_cli(&["dlq", "move", "--queue", &queue, "--batch-size", "2"])
-        .assert()
-        .success();
-    let (stdout, _) = output(&assert);
+    // Three failed jobs in batches of two, then the two DLQ rows.
     assert!(
-        stdout.contains("Moved 0 failed jobs into the DLQ."),
-        "{stdout}"
+        stderr.contains("(2 so far)")
+            && stderr.contains("(3 so far)")
+            && stderr.contains("(5 so far)"),
+        "{stderr}"
     );
+    assert_eq!(dlq_depth(&pool, &queue).await, 0);
     awa_testing::setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn bulk_commands_reject_a_batch_size_above_the_cap() {
+    let assert = run_cli(&["queue", "drain", "any", "--batch-size", "10001"])
+        .assert()
+        .code(2);
+    let (_, stderr) = output(&assert);
+    assert!(stderr.contains("--batch-size"), "{stderr}");
 }
 
 #[tokio::test]

@@ -230,6 +230,48 @@ async def test_job_retry_failed_retries_in_batches(capsys):
     assert capsys.readouterr().out.strip() == "Retried 3 failed jobs"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,code",
+    [(awa.UniqueConflict, 2), (awa.DatabaseError, 1)],
+)
+async def test_job_retry_failed_reports_a_stopped_run_and_exits(capsys, error, code):
+    class FakeClient:
+        async def retry_failed(self, *, kind=None, queue=None, batch_size=None):
+            err = error("Retried 4 row(s); skipped 1 job(s) whose unique key a live job holds: 17")
+            err.count = 4
+            raise err
+
+    with pytest.raises(SystemExit) as exited:
+        await awa_main._dispatch_job(
+            FakeClient(),
+            SimpleNamespace(job_cmd="retry-failed", kind="email", queue=None, batch_size=1000),
+        )
+
+    assert exited.value.code == code
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "Retried 4 failed jobs"
+    assert "skipped 1 job(s)" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("size", ["0", "10001", "many"])
+def test_job_retry_failed_rejects_a_batch_size_out_of_range(size):
+    result = _cli(
+        "--database-url",
+        "postgres://127.0.0.1:1/nonexistent",
+        "job",
+        "retry-failed",
+        "--queue",
+        "email",
+        "--batch-size",
+        size,
+    )
+    assert result.returncode == 2
+    assert "--batch-size" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 # ── live integration ────────────────────────────────────────────────────
 #
 # These require a live Postgres at DATABASE_URL. On canonical backends the

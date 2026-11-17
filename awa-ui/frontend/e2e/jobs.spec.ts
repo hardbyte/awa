@@ -473,7 +473,7 @@ test.describe("Queue context banner", () => {
   test("Drain runs in batches until the queue is drained", async ({ page }) => {
     const drainRequests: string[] = [];
     const responses = [
-      { drained: 2, count: 2, skipped: 0, conflicts: [], done: false, cursor: { stage: 2, after_job_id: 12, below_job_id: 40 } },
+      { drained: 2, count: 2, skipped: 0, conflicts: [], done: false, cursor: { stage: 2, after_job_id: 12, before_job_id: 40 } },
       { drained: 1, count: 1, skipped: 0, conflicts: [], done: true, cursor: { stage: 1, after_job_id: 0 } },
     ];
     await page.route("**/api/queues/e2e_test/drain**", async (route) => {
@@ -496,7 +496,7 @@ test.describe("Queue context banner", () => {
     await expect(page.getByText('Drained 3 job(s) from "e2e_test"')).toBeVisible();
     expect(drainRequests).toEqual([
       "?batch_size=1000",
-      "?batch_size=1000&stage=2&after_job_id=12&below_job_id=40",
+      "?batch_size=1000&stage=2&after_job_id=12&before_job_id=40",
     ]);
   });
 

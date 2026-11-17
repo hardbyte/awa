@@ -8,7 +8,7 @@ export interface BulkCursor {
   stage: number;
   after_job_id: number;
   /** The run's high-water mark: it leaves alone jobs with this ID or higher. */
-  below_job_id?: number;
+  before_job_id?: number;
 }
 
 export interface BulkBatchResult {

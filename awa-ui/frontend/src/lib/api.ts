@@ -365,7 +365,16 @@ export function cancelJob(id: number): Promise<JobRow> {
   return apiFetch(`/jobs/${id}/cancel`, { method: "POST" });
 }
 
-export function bulkRetry(ids: number[]): Promise<JobRow[]> {
+export interface BulkRetryResult {
+  /** The jobs retried. */
+  jobs: JobRow[];
+  /** Jobs skipped because a live job holds their unique key. */
+  skipped: number;
+  /** IDs of skipped jobs, at most 10. */
+  conflicts: number[];
+}
+
+export function bulkRetry(ids: number[]): Promise<BulkRetryResult> {
   return apiFetch("/jobs/bulk-retry", {
     method: "POST",
     body: JSON.stringify({ ids }),
@@ -553,8 +562,8 @@ export function drainQueue(
     if (batch.cursor) {
       qs.set("stage", String(batch.cursor.stage));
       qs.set("after_job_id", String(batch.cursor.after_job_id));
-      if (batch.cursor.below_job_id) {
-        qs.set("below_job_id", String(batch.cursor.below_job_id));
+      if (batch.cursor.before_job_id) {
+        qs.set("before_job_id", String(batch.cursor.before_job_id));
       }
     }
   }

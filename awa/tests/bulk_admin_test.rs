@@ -296,7 +296,7 @@ async fn retry_failed_is_busy_while_held(engine: Engine) {
     );
     assert_eq!((held.cursor.stage, held.cursor.after_job_id), (0, 0));
     assert!(
-        held.cursor.below_job_id > ids[2],
+        held.cursor.before_job_id > ids[2],
         "the first batch records the run's high-water mark even when busy"
     );
     holder.rollback().await.expect("release");
@@ -477,16 +477,210 @@ async fn concurrent_drains_cancel_each_job_once_canonical() {
 }
 
 #[tokio::test]
-async fn drain_on_queue_storage_cancels_in_transactions_of_batch_size() {
+async fn drain_on_queue_storage_takes_at_most_batch_size_jobs_per_call_and_honours_the_limit() {
     let _guard = GUARD.lock().await;
     let pool = pool_for(Engine::QueueStorage).await;
     let queue = unique_name("bulk_drain_qs");
     let ids = insert_jobs(&pool, &queue, "bulk_job", 5).await;
-    let batch = admin::drain_queue_batch(&pool, &queue, 2, BulkCursor::default())
+
+    let first = admin::drain_queue_batch(&pool, &queue, 2, BulkCursor::default())
         .await
         .expect("drain");
-    assert_eq!((batch.count, batch.done), (5, true));
+    assert_eq!((first.count, first.done, first.busy), (2, false, false));
+    assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 2);
+
+    let limited = run_batches(
+        BulkRunOptions::default().batch_size(2).limit(Some(2)),
+        |size, cursor| admin::drain_queue_batch(&pool, &queue, size, cursor),
+        |batch, _| assert!(batch.count <= 2),
+    )
+    .await
+    .expect("limited run");
+    assert_eq!((limited.count, limited.complete), (2, false));
+    assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 4);
+
+    let rest = run_batches(
+        BulkRunOptions::default().batch_size(2),
+        |size, cursor| admin::drain_queue_batch(&pool, &queue, size, cursor),
+        |_, _| {},
+    )
+    .await
+    .expect("run");
+    assert_eq!((rest.count, rest.complete), (1, true));
     assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 5);
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn drain_on_queue_storage_is_busy_while_a_scheduled_job_is_held() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_drain_qs_held");
+    let scheduled = insert_scheduled_jobs(&pool, &queue, 3).await;
+    let available = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+
+    // Hold the middle scheduled job: the pass takes the first, then stops
+    // before the held one rather than passing it.
+    let holder = hold(&pool, "awa.deferred_jobs", "job_id", &scheduled[1..2]).await;
+    let first = admin::drain_queue_batch(&pool, &queue, 10, BulkCursor::default())
+        .await
+        .expect("first batch");
+    assert_eq!(
+        (first.count, first.busy, first.done, first.cursor.stage),
+        (2, false, false, 1),
+        "{first:?}"
+    );
+    assert!(first.cursor.after_job_id < scheduled[1], "{first:?}");
+    let held = admin::drain_queue_batch(&pool, &queue, 10, first.cursor)
+        .await
+        .expect("held batch");
+    assert_eq!(
+        (held.count, held.busy, held.done),
+        (0, true, false),
+        "{held:?}"
+    );
+    holder.rollback().await.expect("release");
+
+    let mut cursor = held.cursor;
+    let mut drained = first.count;
+    loop {
+        let batch = admin::drain_queue_batch(&pool, &queue, 10, cursor)
+            .await
+            .expect("batch");
+        drained += batch.count;
+        cursor = batch.cursor;
+        assert!(!batch.busy, "{batch:?}");
+        if batch.done {
+            break;
+        }
+    }
+    let all: Vec<i64> = scheduled.iter().chain(&available).copied().collect();
+    assert_eq!(drained, 5);
+    assert_eq!(count_of(&states(&pool, &all).await, "cancelled"), 5);
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn queue_storage_cancel_by_id_dedupes_and_sorts_ids() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_cancel_dedupe");
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 3).await;
+    let shuffled = vec![ids[2], ids[0], ids[2], ids[1], ids[0]];
+    let outcome = admin::bulk_cancel_in_batches(&pool, &shuffled, 2)
+        .await
+        .expect("cancel");
+    let cancelled: Vec<i64> = outcome.jobs.iter().map(|job| job.id).collect();
+    assert_eq!(cancelled, ids, "each job once, in job ID order");
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// Seed a DLQ row whose unique key claims only the `failed` state, with its
+/// claim, as a failed job with that key leaves when it moves to the DLQ.
+async fn seed_claimed_dlq_row(pool: &PgPool, queue: &str, key: &[u8], dlq_age_days: i32) -> i64 {
+    let job_id: i64 = sqlx::query_scalar(
+        "INSERT INTO awa.dlq_entries \
+             (job_id, kind, queue, priority, dlq_reason, original_run_lease, unique_key, unique_states, dlq_at) \
+         VALUES (nextval('awa.job_id_seq'), 'bulk_job', $1, 2, 'seeded', 1, $2, '00000100', \
+                 now() - make_interval(days => $3)) \
+         RETURNING job_id",
+    )
+    .bind(queue)
+    .bind(key)
+    .bind(dlq_age_days)
+    .fetch_one(pool)
+    .await
+    .expect("seed dlq row");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("seed claim");
+    job_id
+}
+
+async fn claim_holder(pool: &PgPool, key: &[u8]) -> Option<i64> {
+    sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .expect("read claim")
+}
+
+#[tokio::test]
+async fn every_dlq_delete_releases_the_rows_unique_claims() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_dlq_claims");
+    let key = |name: &str| format!("{queue}-{name}").into_bytes();
+    let filter = ListDlqFilter {
+        queue: Some(queue.clone()),
+        ..Default::default()
+    };
+
+    let batch_key = key("batch");
+    let row = seed_claimed_dlq_row(&pool, &queue, &batch_key, 0).await;
+    assert_eq!(claim_holder(&pool, &batch_key).await, Some(row));
+    dlq::purge_dlq_batch(&pool, &filter, false, 10, BulkCursor::default())
+        .await
+        .expect("purge batch");
+    assert_eq!(
+        claim_holder(&pool, &batch_key).await,
+        None,
+        "purge_dlq_batch"
+    );
+
+    let all_key = key("all");
+    seed_claimed_dlq_row(&pool, &queue, &all_key, 0).await;
+    assert_eq!(
+        dlq::purge_dlq(&pool, &filter, false).await.expect("purge"),
+        1
+    );
+    assert_eq!(claim_holder(&pool, &all_key).await, None, "purge_dlq");
+
+    let one_key = key("one");
+    let row = seed_claimed_dlq_row(&pool, &queue, &one_key, 0).await;
+    assert!(dlq::purge_dlq_job(&pool, row).await.expect("purge job"));
+    assert_eq!(claim_holder(&pool, &one_key).await, None, "purge_dlq_job");
+
+    let old_key = key("old");
+    seed_claimed_dlq_row(&pool, &queue, &old_key, 30).await;
+    let cleaned = dlq::cleanup_dlq(
+        &pool,
+        std::time::Duration::from_secs(86_400),
+        100,
+        Some(&queue),
+    )
+    .await
+    .expect("cleanup");
+    assert_eq!(cleaned, 1);
+    assert_eq!(claim_holder(&pool, &old_key).await, None, "cleanup_dlq");
+
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn dlq_count_applies_the_filters_cursor() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_dlq_count_cursor");
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO awa.dlq_entries (job_id, kind, queue, priority, dlq_reason, original_run_lease) \
+         SELECT nextval('awa.job_id_seq'), 'bulk_job', $1, 2, 'seeded', 1 FROM generate_series(1, 5) \
+         RETURNING job_id",
+    )
+    .bind(&queue)
+    .fetch_all(&pool)
+    .await
+    .expect("seed dlq");
+    let filter = ListDlqFilter {
+        queue: Some(queue.clone()),
+        before_id: Some(ids[3]),
+        ..Default::default()
+    };
+    let counted = dlq::count_dlq(&pool, &filter, 100).await.expect("count");
+    assert_eq!((counted.count, counted.capped), (3, false));
     setup::clean_queue(&pool, &queue).await;
 }
 
@@ -802,7 +996,7 @@ async fn retry_failed_leaves_jobs_failed_during_the_run(engine: Engine) {
             let later = &later;
             async move {
                 // From the second batch on, after the run has started.
-                if cursor.below_job_id != 0 {
+                if cursor.before_job_id != 0 {
                     let id = insert_failed_job(pool, engine, queue, "bulk_job").await;
                     later.lock().unwrap().push(id);
                 }
@@ -852,7 +1046,7 @@ async fn discard_leaves_jobs_failed_during_the_run(engine: Engine) {
         |size, cursor| {
             let (pool, queue, kind, later) = (&pool, &queue, &kind, &later);
             async move {
-                if cursor.below_job_id != 0 {
+                if cursor.before_job_id != 0 {
                     let id = insert_failed_job(pool, engine, queue, kind).await;
                     later.lock().unwrap().push(id);
                 }
@@ -884,10 +1078,9 @@ async fn discard_covers_the_jobs_failed_when_it_started_queue_storage() {
     discard_leaves_jobs_failed_during_the_run(Engine::QueueStorage).await;
 }
 
-#[tokio::test]
-async fn drain_finishes_and_leaves_jobs_enqueued_during_the_run_canonical() {
+async fn drain_leaves_jobs_enqueued_during_the_run(engine: Engine) {
     let _guard = GUARD.lock().await;
-    let pool = pool_for(Engine::Canonical).await;
+    let pool = pool_for(engine).await;
     let queue = unique_name("bulk_drain_mark");
     let ids = insert_jobs(&pool, &queue, "bulk_job", 6).await;
 
@@ -899,7 +1092,7 @@ async fn drain_finishes_and_leaves_jobs_enqueued_during_the_run_canonical() {
             async move {
                 // Two new jobs per batch of two: a producer the drain could
                 // never catch up with.
-                if cursor.below_job_id != 0 {
+                if cursor.before_job_id != 0 {
                     let ids = insert_jobs(pool, queue, "bulk_job", 2).await;
                     later.lock().unwrap().extend(ids);
                 }
@@ -917,9 +1110,19 @@ async fn drain_finishes_and_leaves_jobs_enqueued_during_the_run_canonical() {
     assert_eq!(
         count_of(&states(&pool, &later).await, "available"),
         later.len() as i64,
-        "jobs enqueued during the drain are not cancelled"
+        "{engine:?}: jobs enqueued during the drain are not cancelled"
     );
     setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn drain_finishes_and_leaves_jobs_enqueued_during_the_run_canonical() {
+    drain_leaves_jobs_enqueued_during_the_run(Engine::Canonical).await;
+}
+
+#[tokio::test]
+async fn drain_finishes_and_leaves_jobs_enqueued_during_the_run_queue_storage() {
+    drain_leaves_jobs_enqueued_during_the_run(Engine::QueueStorage).await;
 }
 
 /// Insert jobs into `queue` that run an hour from now: scheduled jobs.
@@ -1070,7 +1273,7 @@ async fn dlq_purge_leaves_rows_added_during_the_run() {
         |size, cursor| {
             let (seed, filter, later, pool) = (&seed, &filter, &later, &pool);
             async move {
-                if cursor.below_job_id != 0 {
+                if cursor.before_job_id != 0 {
                     let added = seed(2).await;
                     later.lock().unwrap().extend(added);
                 }

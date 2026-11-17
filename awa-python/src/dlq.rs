@@ -92,26 +92,57 @@ pub(crate) fn build_retry_opts(
     }
 }
 
-/// Finish a bulk run for Python: the count of changed rows, or
+/// Set `count`, `skipped` and `conflicts` on `err` from `run`, so a caller
+/// that catches it knows what the run changed before it stopped.
+fn with_progress(err: PyErr, run: &awa_model::BulkRun) -> PyErr {
+    Python::attach(|py| {
+        let value = err.value(py);
+        // Setting attributes on an exception instance does not fail.
+        let _ = value.setattr("count", run.count);
+        let _ = value.setattr("skipped", run.skipped);
+        let _ = value.setattr("conflicts", run.conflicts.clone());
+    });
+    err
+}
+
+/// Finish a bulk run for Python: the count of changed rows, or an exception
+/// carrying the run's `count`, `skipped` and `conflicts`. The exception is
 /// `UniqueConflict` naming the skipped jobs after every other row was
-/// changed, or `DatabaseError` if the run gave up on rows another transaction
-/// held.
-pub(crate) fn finish_bulk_run(run: awa_model::BulkRun, verb: &str) -> PyResult<u64> {
+/// changed, `DatabaseError` if the run gave up on rows another transaction
+/// held, or the mapped error of a batch that failed.
+pub(crate) fn finish_bulk_run(
+    result: Result<awa_model::BulkRun, awa_model::BulkError<awa_model::BulkRun>>,
+    verb: &str,
+) -> PyResult<u64> {
+    let run = match result {
+        Ok(run) => run,
+        Err(err) => {
+            return Err(with_progress(
+                crate::errors::map_awa_error(err.error),
+                &err.partial,
+            ))
+        }
+    };
     if run.busy_timed_out {
-        return Err(crate::DatabaseError::new_err(format!(
-            "{verb} {} row(s), then stopped: every remaining matching row has been held by another transaction for {}s",
-            run.count,
-            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs()
-        )));
+        return Err(with_progress(
+            crate::DatabaseError::new_err(format!(
+                "{verb} {} row(s), then stopped: every remaining matching row stayed held by another transaction",
+                run.count,
+            )),
+            &run,
+        ));
     }
     if run.skipped > 0 {
         let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
-        return Err(crate::UniqueConflict::new_err(format!(
-            "{verb} {} row(s); skipped {} job(s) whose unique key a live job holds: {}",
-            run.count,
-            run.skipped,
-            ids.join(", ")
-        )));
+        return Err(with_progress(
+            crate::UniqueConflict::new_err(format!(
+                "{verb} {} row(s); skipped {} job(s) whose unique key a live job holds: {}",
+                run.count,
+                run.skipped,
+                ids.join(", ")
+            )),
+            &run,
+        ));
     }
     Ok(run.count)
 }
@@ -126,7 +157,6 @@ pub(crate) async fn bulk_retry(
     batch_size: Option<i64>,
     mut on_changed: impl FnMut(u64),
 ) -> PyResult<u64> {
-    use crate::errors::map_awa_error;
     let options = awa_model::BulkRunOptions::default()
         .batch_size(batch_size.unwrap_or(awa_model::bulk::DEFAULT_BATCH_SIZE));
     let run = awa_model::bulk::run_batches(
@@ -140,8 +170,7 @@ pub(crate) async fn bulk_retry(
             }
         },
     )
-    .await
-    .map_err(map_awa_error)?;
+    .await;
     finish_bulk_run(run, "Retried")
 }
 
@@ -161,8 +190,7 @@ pub(crate) async fn discard_failed(
         |size, cursor| awa_model::admin::discard_failed_batch(pool, kind, size, cursor),
         |_, _| {},
     )
-    .await
-    .map_err(crate::errors::map_awa_error)?;
+    .await;
     finish_bulk_run(run, "Discarded")
 }
 
@@ -177,8 +205,7 @@ pub(crate) async fn drain_queue(
         |size, cursor| awa_model::admin::drain_queue_batch(pool, queue, size, cursor),
         |_, _| {},
     )
-    .await
-    .map_err(crate::errors::map_awa_error)?;
+    .await;
     finish_bulk_run(run, "Drained")
 }
 
@@ -206,8 +233,7 @@ pub(crate) async fn bulk_move(
             }
         },
     )
-    .await
-    .map_err(crate::errors::map_awa_error)?;
+    .await;
     finish_bulk_run(run, "Moved")
 }
 
@@ -229,8 +255,7 @@ pub(crate) async fn purge(
             }
         },
     )
-    .await
-    .map_err(crate::errors::map_awa_error)?;
+    .await;
     finish_bulk_run(run, "Purged")
 }
 
@@ -264,7 +289,6 @@ pub(crate) async fn retry_failed(
             .await
         }
         _ => unreachable!("validated by the caller"),
-    }
-    .map_err(crate::errors::map_awa_error)?;
+    };
     finish_bulk_run(run, "Retried")
 }

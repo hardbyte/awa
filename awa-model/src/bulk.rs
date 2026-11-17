@@ -11,7 +11,7 @@
 //! completion.
 //!
 //! A run covers the jobs that existed when it started: its first batch
-//! records the next job ID in [`BulkCursor::below_job_id`], and no batch of
+//! records the next job ID in [`BulkCursor::before_job_id`], and no batch of
 //! the run touches a job with that ID or a higher one. A job enqueued during
 //! the run is left alone, so a run against a busy producer still finishes.
 
@@ -24,6 +24,26 @@ use tokio::time::Instant;
 
 /// Rows a batched admin operation changes per transaction by default.
 pub const DEFAULT_BATCH_SIZE: i64 = 1_000;
+
+/// Largest `batch_size` a batched admin operation accepts. A larger batch
+/// is one transaction holding row locks, and on queue storage the ring
+/// partitions it reads, for longer than an operator action should; a run
+/// over more rows takes more batches.
+pub const MAX_BATCH_SIZE: i64 = 10_000;
+
+/// How long [`run_batches`] waits by default between batches on queue
+/// storage, so the maintenance leader's ring prune gets its lock.
+///
+/// A queue-storage batch reads ring partitions, holding `ACCESS SHARE` on
+/// them until it commits, and prune truncates a sealed partition under
+/// `ACCESS EXCLUSIVE`, waiting 10 ms for it at first and retrying with
+/// longer waits up to 320 ms. A prune that is waiting when a batch commits
+/// gets the lock, because its request is queued ahead of the next batch's;
+/// one that starts while a batch runs and gives up first reports `Blocked`.
+/// Back-to-back batches leave no gap, so a long run can stop ring prune for
+/// its whole length. In a 100 ms gap a prune that starts gets the lock on its
+/// first try, and the gap costs about a tenth of a one-second batch.
+pub const DEFAULT_QUEUE_STORAGE_PAUSE: Duration = Duration::from_millis(100);
 
 /// Most conflicting job IDs a batch or a run reports.
 pub const MAX_REPORTED_CONFLICTS: usize = 10;
@@ -45,7 +65,7 @@ pub struct BulkCursor {
     /// The run handles only jobs with smaller IDs: the jobs that existed
     /// when it started. Zero until the run's first batch sets it.
     #[serde(default)]
-    pub below_job_id: i64,
+    pub before_job_id: i64,
 }
 
 /// What one batch did.
@@ -65,12 +85,26 @@ pub struct BulkBatch {
     pub done: bool,
     /// Where the next batch resumes.
     pub cursor: BulkCursor,
+    /// How long a run should wait before the next batch so other work gets
+    /// the locks this batch held; [`DEFAULT_QUEUE_STORAGE_PAUSE`] on queue
+    /// storage, zero on canonical storage. Not sent over HTTP.
+    #[serde(skip)]
+    pub pause_hint: Duration,
 }
 
 impl BulkBatch {
     pub(crate) fn new(cursor: BulkCursor) -> Self {
         Self {
             cursor,
+            ..Self::default()
+        }
+    }
+
+    /// A queue-storage batch, which asks the run to pause before the next.
+    pub(crate) fn queue_storage(cursor: BulkCursor) -> Self {
+        Self {
+            cursor,
+            pause_hint: DEFAULT_QUEUE_STORAGE_PAUSE,
             ..Self::default()
         }
     }
@@ -101,6 +135,42 @@ impl BulkIds {
         if self.conflicts.len() < MAX_REPORTED_CONFLICTS {
             self.conflicts.push(job_id);
         }
+    }
+}
+
+/// A bulk call that failed partway, with what it had committed before the
+/// error. Batches are separate transactions, so the rows in `partial` stay
+/// changed: report them, record their metrics and invalidate caches before
+/// surfacing `error`.
+#[derive(Debug)]
+pub struct BulkError<T> {
+    /// What committed before the error.
+    pub partial: T,
+    /// The error that stopped the call.
+    pub error: AwaError,
+}
+
+impl<T> BulkError<T> {
+    pub(crate) fn new(partial: T, error: AwaError) -> Self {
+        Self { partial, error }
+    }
+}
+
+impl<T> std::fmt::Display for BulkError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for BulkError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl<T> From<BulkError<T>> for AwaError {
+    fn from(err: BulkError<T>) -> Self {
+        err.error
     }
 }
 
@@ -147,6 +217,10 @@ pub struct BulkRunOptions {
     /// Give up after this long without progress while every remaining
     /// matching row is held by another transaction.
     pub busy_timeout: Duration,
+    /// Wait this long between batches that made progress. `None`, the
+    /// default, uses each batch's [`BulkBatch::pause_hint`]: a pause on
+    /// queue storage, none on canonical storage.
+    pub pause_between_batches: Option<Duration>,
 }
 
 impl Default for BulkRunOptions {
@@ -155,6 +229,7 @@ impl Default for BulkRunOptions {
             batch_size: DEFAULT_BATCH_SIZE,
             limit: None,
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
+            pause_between_batches: None,
         }
     }
 }
@@ -174,11 +249,19 @@ impl BulkRunOptions {
         self.busy_timeout = busy_timeout;
         self
     }
+
+    pub fn pause_between_batches(mut self, pause: Option<Duration>) -> Self {
+        self.pause_between_batches = pause;
+        self
+    }
 }
 
-pub(crate) fn validate_batch_size(batch_size: i64) -> Result<(), AwaError> {
-    if batch_size < 1 {
-        return Err(AwaError::Validation("batch_size must be at least 1".into()));
+/// Reject a `batch_size` below 1 or above [`MAX_BATCH_SIZE`].
+pub fn validate_batch_size(batch_size: i64) -> Result<(), AwaError> {
+    if !(1..=MAX_BATCH_SIZE).contains(&batch_size) {
+        return Err(AwaError::Validation(format!(
+            "batch_size must be between 1 and {MAX_BATCH_SIZE}"
+        )));
     }
     Ok(())
 }
@@ -257,7 +340,7 @@ impl Pick {
                     batch.cursor = BulkCursor {
                         stage,
                         after_job_id: 0,
-                        below_job_id: batch.cursor.below_job_id,
+                        before_job_id: batch.cursor.before_job_id,
                     }
                 }
                 None => batch.done = true,
@@ -268,19 +351,26 @@ impl Pick {
 
 /// Run `batch` until no matching row remains, `options.limit` rows have
 /// changed, or the remaining rows stay held past `options.busy_timeout`.
-/// `on_batch` sees each batch and the running total.
+/// `on_batch` sees each batch as it commits, with the running total, so a
+/// caller can record metrics and invalidate caches per committed batch. When
+/// a batch fails, the error carries the run so far.
 pub async fn run_batches<F, Fut, P>(
     options: BulkRunOptions,
     mut batch: F,
     mut on_batch: P,
-) -> Result<BulkRun, AwaError>
+) -> Result<BulkRun, BulkError<BulkRun>>
 where
     F: FnMut(i64, BulkCursor) -> Fut,
     Fut: Future<Output = Result<BulkBatch, AwaError>>,
     P: FnMut(&BulkBatch, &BulkRun),
 {
-    validate_batch_size(options.batch_size)?;
     let mut run = BulkRun::default();
+    if let Err(error) = validate_batch_size(options.batch_size) {
+        return Err(BulkError {
+            partial: run,
+            error,
+        });
+    }
     let mut cursor = BulkCursor::default();
     let mut busy_since: Option<Instant> = None;
     let mut busy_wait = Duration::from_millis(100);
@@ -292,7 +382,15 @@ where
                 .min(i64::try_from(limit - run.count).unwrap_or(i64::MAX)),
             None => options.batch_size,
         };
-        let result = batch(take, cursor).await?;
+        let result = match batch(take, cursor).await {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(BulkError {
+                    partial: run,
+                    error,
+                })
+            }
+        };
         run.batches += 1;
         run.absorb(&result);
         cursor = result.cursor;
@@ -312,6 +410,10 @@ where
         } else {
             busy_since = None;
             busy_wait = Duration::from_millis(100);
+            let pause = options.pause_between_batches.unwrap_or(result.pause_hint);
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
         }
     }
 }
@@ -380,6 +482,82 @@ mod tests {
         .unwrap();
         assert!(run.busy_timed_out);
         assert!(!run.complete);
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_returns_the_run_so_far() {
+        let mut calls = 0;
+        let err = run_batches(
+            BulkRunOptions::default().batch_size(2),
+            |_, _| {
+                calls += 1;
+                let result = if calls == 1 {
+                    Ok(batch(2, false, false, 4))
+                } else {
+                    Err(AwaError::Validation("second batch failed".into()))
+                };
+                async move { result }
+            },
+            |_, _| {},
+        )
+        .await
+        .expect_err("second batch fails");
+        assert_eq!((err.partial.count, err.partial.batches), (2, 1));
+        assert!(matches!(err.error, AwaError::Validation(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pauses_between_batches_as_each_batch_asks() {
+        let mut calls = 0;
+        let started = Instant::now();
+        let mut at = Vec::new();
+        run_batches(
+            BulkRunOptions::default(),
+            |_, _| {
+                calls += 1;
+                at.push(started.elapsed());
+                let mut next = batch(1, false, calls == 3, 0);
+                next.pause_hint = Duration::from_millis(100);
+                async move { Ok(next) }
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            at,
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(100),
+                Duration::from_millis(200)
+            ]
+        );
+
+        let started = Instant::now();
+        let mut at = Vec::new();
+        let mut calls = 0;
+        run_batches(
+            BulkRunOptions::default().pause_between_batches(Some(Duration::ZERO)),
+            |_, _| {
+                calls += 1;
+                at.push(started.elapsed());
+                let mut next = batch(1, false, calls == 2, 0);
+                next.pause_hint = Duration::from_millis(100);
+                async move { Ok(next) }
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(at, vec![Duration::ZERO, Duration::ZERO]);
+    }
+
+    #[test]
+    fn rejects_batch_sizes_outside_the_bounds() {
+        assert!(validate_batch_size(0).is_err());
+        assert!(validate_batch_size(1).is_ok());
+        assert!(validate_batch_size(MAX_BATCH_SIZE).is_ok());
+        assert!(validate_batch_size(MAX_BATCH_SIZE + 1).is_err());
     }
 
     #[test]

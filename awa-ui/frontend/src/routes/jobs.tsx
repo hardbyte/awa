@@ -137,16 +137,22 @@ export function JobsPage() {
 
   const retryMutation = useMutation({
     mutationFn: (ids: number[]) => bulkRetry(ids),
-    onSuccess: (retried, ids) => {
+    onSuccess: ({ jobs: retried, skipped, conflicts }, ids) => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       void queryClient.invalidateQueries({ queryKey: ["stats"] });
-      const retriedIds = new Set(retried.map((job) => job.id));
-      const notRetried = ids.filter((id) => !retriedIds.has(id));
-      if (notRetried.length > 0) {
-        toast.error(
-          `Retried ${retried.length} job(s); ${notRetried.length} were not retried, because a live job holds their unique key or they changed state (${notRetried.slice(0, 10).join(", ")}${notRetried.length > 10 ? ", ..." : ""})`
+      const unchanged = ids.length - retried.length - skipped;
+      const notes: string[] = [];
+      if (skipped > 0) {
+        notes.push(
+          `skipped ${skipped} whose unique key a live job holds (${conflicts.join(", ")}${skipped > conflicts.length ? ", ..." : ""})`
         );
+      }
+      if (unchanged > 0) {
+        notes.push(`${unchanged} were not retried because they changed state`);
+      }
+      if (notes.length > 0) {
+        toast.error(`Retried ${retried.length} job(s); ${notes.join("; ")}`);
       } else {
         toast.success(`Retried ${retried.length} job(s)`);
       }
