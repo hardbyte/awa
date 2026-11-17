@@ -19,14 +19,21 @@ struct BulkArgs {
     /// Stop after changing this many rows in total.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     limit: Option<u64>,
+    /// Give up after this many seconds without progress while every
+    /// remaining matching row is held by another transaction.
+    #[arg(long, hide = true, default_value_t = awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs())]
+    busy_timeout_secs: u64,
 }
 
 /// Run a batched admin operation, printing each batch to stderr.
+/// `on_changed` sees the row count of each batch that changed rows, as the
+/// batch commits, so a run that fails later still accounts for them.
 async fn run_bulk<F, Fut>(
     bulk: &BulkArgs,
     verb: &str,
     noun: &str,
     batch: F,
+    mut on_changed: impl FnMut(u64),
 ) -> Result<awa_model::BulkRun, awa_model::AwaError>
 where
     F: FnMut(i64, awa_model::BulkCursor) -> Fut,
@@ -35,9 +42,13 @@ where
     awa_model::bulk::run_batches(
         awa_model::BulkRunOptions::default()
             .batch_size(bulk.batch_size)
-            .limit(bulk.limit),
+            .limit(bulk.limit)
+            .busy_timeout(Duration::from_secs(bulk.busy_timeout_secs)),
         batch,
         |batch, run| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
             if batch.count > 0 || batch.skipped > 0 {
                 eprintln!(
                     "{verb} {} {noun} ({} so far){}.",
@@ -55,17 +66,12 @@ where
     .await
 }
 
-/// Print a bulk run's result. Exits 1 when the run gave up on rows another
-/// transaction held, and 2 when it skipped rows over a unique conflict.
+/// Print a bulk run's result, including any skipped jobs and whether it
+/// gave up on held rows. Exits 1 when the run gave up on rows another
+/// transaction held, otherwise 2 when it skipped rows over a unique
+/// conflict.
 fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
     println!("{verb} {} {noun}.", run.count);
-    if run.busy_timed_out {
-        eprintln!(
-            "Every remaining matching row has been held by another transaction for {}s; stopping. Rerun once it finishes.",
-            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs()
-        );
-        std::process::exit(1);
-    }
     if run.skipped > 0 {
         let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
         eprintln!(
@@ -78,6 +84,14 @@ fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
             },
             ids.join(", ")
         );
+    }
+    if run.busy_timed_out {
+        eprintln!(
+            "Every remaining matching row stayed held by another transaction past the busy timeout; stopping. Rerun once it finishes."
+        );
+        std::process::exit(1);
+    }
+    if run.skipped > 0 {
         std::process::exit(2);
     }
 }
@@ -1112,15 +1126,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            let run = run_bulk(&bulk, "Retried", "DLQ rows", |size, cursor| {
-                                awa_model::dlq::bulk_retry_from_dlq_batch(
-                                    &pool, &filter, all, size, cursor,
-                                )
-                            })
+                            let run = run_bulk(
+                                &bulk,
+                                "Retried",
+                                "DLQ rows",
+                                |size, cursor| {
+                                    awa_model::dlq::bulk_retry_from_dlq_batch(
+                                        &pool, &filter, all, size, cursor,
+                                    )
+                                },
+                                |count| metrics.record_dlq_retried(queue.as_deref(), count),
+                            )
                             .await?;
-                            if run.count > 0 {
-                                metrics.record_dlq_retried(queue.as_deref(), run.count);
-                            }
                             finish_bulk(&run, "Retried", "DLQ rows");
                         }
                         DlqCommands::Move {

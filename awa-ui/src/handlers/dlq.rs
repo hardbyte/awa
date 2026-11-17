@@ -208,34 +208,42 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
+    let record = |count: u64| {
+        if count > 0 {
+            state
+                .metrics
+                .record_dlq_retried(queue_attr.as_deref(), count);
+            state.invalidate_dashboard_caches();
+        }
+    };
     let response = match payload.batch_size {
-        Some(batch_size) => BulkResponse::from_batch(
-            dlq::bulk_retry_from_dlq_batch(
-                &state.pool,
-                &filter,
-                payload.all,
-                batch_size,
-                payload.cursor.unwrap_or_default(),
-            )
-            .await?,
-        ),
+        Some(batch_size) => {
+            let response = BulkResponse::from_batch(
+                dlq::bulk_retry_from_dlq_batch(
+                    &state.pool,
+                    &filter,
+                    payload.all,
+                    batch_size,
+                    payload.cursor.unwrap_or_default(),
+                )
+                .await?,
+            );
+            record(response.count);
+            response
+        }
+        // Record each batch as it commits, so a run that stops on a later
+        // batch's error or busy timeout still counts the rows it changed.
         None => BulkResponse::from_run(
             bulk::run_batches(
                 BulkRunOptions::default(),
                 |size, cursor| {
                     dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, size, cursor)
                 },
-                |_, _| {},
+                |batch, _| record(batch.count),
             )
             .await?,
         )?,
     };
-    if response.count > 0 {
-        state
-            .metrics
-            .record_dlq_retried(queue_attr.as_deref(), response.count);
-        state.invalidate_dashboard_caches();
-    }
     Ok(Json(response))
 }
 

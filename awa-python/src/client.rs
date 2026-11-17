@@ -1549,11 +1549,10 @@ impl PyClient {
         crate::async_bridge::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
-            let count = crate::dlq::bulk_retry(&pool, &filter, allow_all, batch_size).await?;
-            if count > 0 {
-                metrics.record_dlq_retried(queue_attr.as_deref(), count);
-            }
-            Ok(count)
+            crate::dlq::bulk_retry(&pool, &filter, allow_all, batch_size, |count| {
+                metrics.record_dlq_retried(queue_attr.as_deref(), count)
+            })
+            .await
         })
     }
 
@@ -3123,11 +3122,10 @@ impl PyClient {
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = crate::dlq::bulk_retry(&pool, &filter, allow_all, batch_size).await?;
-                if count > 0 {
-                    metrics.record_dlq_retried(queue_attr.as_deref(), count);
-                }
-                Ok(count)
+                crate::dlq::bulk_retry(&pool, &filter, allow_all, batch_size, |count| {
+                    metrics.record_dlq_retried(queue_attr.as_deref(), count)
+                })
+                .await
             })
         })
     }
