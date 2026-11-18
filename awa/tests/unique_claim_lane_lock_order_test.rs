@@ -251,6 +251,78 @@ async fn admin_retry_and_fresh_enqueue_of_one_key_do_not_deadlock() {
     setup::clean_queue(&pool, &queue).await;
 }
 
+/// A cancelled job whose unique mask names `cancelled` and `available` reads
+/// as holding its key, but another job may hold it, as after a duplicate
+/// cancellation. Retrying it must check ownership, not assume it.
+#[tokio::test]
+async fn retry_of_a_terminal_row_rechecks_key_ownership() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_terminal_retry");
+    let job = insert_many(
+        &pool,
+        &[InsertParams {
+            kind: "claim_lane_job".to_string(),
+            args: serde_json::json!({ "queue": queue }),
+            opts: InsertOpts {
+                queue: queue.clone(),
+                priority: PRIORITY,
+                unique: Some(UniqueOpts {
+                    by_queue: true,
+                    // scheduled | available | retryable | cancelled
+                    states: 0b0101_0011,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }],
+    )
+    .await
+    .expect("insert unique job")
+    .pop()
+    .expect("inserted job");
+    let key = job.unique_key.clone().expect("unique key");
+    admin::cancel(&pool, job.id)
+        .await
+        .expect("cancel")
+        .expect("cancelled job");
+    let holder = i64::MAX - 7;
+    sqlx::query("UPDATE awa.job_unique_claims SET job_id = $2 WHERE unique_key = $1")
+        .bind(&key)
+        .bind(holder)
+        .execute(&pool)
+        .await
+        .expect("another job holds the key");
+
+    assert_unique_conflict(admin::retry(&pool, job.id).await, "admin::retry");
+    let state: JobState = sqlx::query_scalar("SELECT state FROM awa.jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(&pool)
+        .await
+        .expect("job state");
+    assert_eq!(state, JobState::Cancelled);
+    let owner: i64 =
+        sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("claim");
+    assert_eq!(owner, holder, "the other job keeps its key");
+
+    sqlx::query("UPDATE awa.job_unique_claims SET job_id = $2 WHERE unique_key = $1")
+        .bind(&key)
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .expect("the job owns its key again");
+    admin::retry(&pool, job.id)
+        .await
+        .expect("retry of the key's owner succeeds");
+
+    drop_claim(&pool, &key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promotion_and_fresh_enqueue_of_one_key_do_not_deadlock() {
     let _guard = GUARD.lock().await;

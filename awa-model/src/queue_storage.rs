@@ -5551,7 +5551,11 @@ impl QueueStorage {
                 let states = row.unique_states.as_deref();
                 let old_claim = old_state.is_some_and(|state| unique_state_claims(states, state));
                 let new_claim = unique_state_claims(states, JobState::Available);
-                (old_claim != new_claim).then_some((key, new_claim, row.job_id))
+                // A terminal row's mask can name its state while another job
+                // holds the key, as for a cancelled duplicate, so reviving it
+                // re-checks ownership through the claim upsert.
+                let recheck = new_claim && old_state.is_some_and(|state| state.is_terminal());
+                (old_claim != new_claim || recheck).then_some((key, new_claim, row.job_id))
             })
             .collect();
         let mut conflicts = HashSet::new();
