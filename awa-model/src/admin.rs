@@ -4833,21 +4833,10 @@ pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaEr
         return Ok(rows);
     }
 
-    let rows = sqlx::query_as::<_, JobRow>(
-        r#"
-        UPDATE awa.jobs
-        SET state = 'available', attempt = 0, run_at = now(),
-            finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
-            callback_id = NULL, callback_timeout_at = NULL,
-            callback_filter = NULL, callback_on_complete = NULL,
-            callback_on_fail = NULL, callback_transform = NULL
-        WHERE id = ANY($1) AND state IN ('failed', 'cancelled', 'waiting_external')
-        RETURNING *
-        "#,
-    )
-    .bind(ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query_as::<_, JobRow>(CANONICAL_RETRY_IDS_SQL)
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows)
 }
@@ -4887,6 +4876,8 @@ const CANONICAL_RETRY_FAILED_SQL: &str = r#"
     RETURNING *
 "#;
 
+/// Revive failed, cancelled and waiting jobs by ID: the one statement
+/// behind [`bulk_retry`] and [`bulk_retry_in_batches`] on canonical storage.
 const CANONICAL_RETRY_IDS_SQL: &str = r#"
     UPDATE awa.jobs
     SET state = 'available', attempt = 0, run_at = now(),
