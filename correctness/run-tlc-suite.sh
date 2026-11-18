@@ -57,7 +57,8 @@ AwaStorageTransition.tla       ;; AwaStorageTransitionCurrentGate.cfg     ;; Mix
 AwaStorageTransition.tla       ;; AwaStorageTransitionRescheduleStaysCanonical.cfg ;; MixedTransitionCanReduceCanonicalBacklog is violated ;; pre-#456 canonical re-schedule wedge witness
 AwaMigratedRescheduleUnique.tla ;; -                                      ;; pass ;; migrated re-schedule duplicate cancellation
 AwaMigratedRescheduleUnique.tla ;; AwaMigratedRescheduleUniqueBroken.cfg  ;; NoUnclaimedExecutable is violated ;; old lost-claim successor witness
-AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
+AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; canonical per-row rescue fallback converges
+AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueQueueStorage.cfg ;; pass ;; queue-storage single settle pass converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
 '
 
