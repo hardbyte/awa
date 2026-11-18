@@ -425,7 +425,7 @@ Claims lock every child of the ring tables they read, sealed slots included, so 
 
 A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue ring on one slot for about two days this way, with that slot's ready partition at about 55M rows (64 GB). Sampling `pg_locks` on the next slot's partitions every 25 ms never found them free: each sample showed four to six `AccessShareLock` holders, all short transactions running the claim function, including claims for a queue with no backlog.
 
-This branch does not fix it yet, and does not carry 0.6.17's partial change either, which keeps queue prune's checks off `ACCESS EXCLUSIVE` and retries the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms.
+This branch does not fix it. Queue prune already runs its skip checks before it requests `ACCESS EXCLUSIVE` (and checks them again once it holds it), but it makes one request per attempt: it does not have 0.6.17's retry of the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms.
 
 ### Confirm It
 
@@ -464,6 +464,9 @@ WITH cursors AS (
     FROM oldest o
     CROSS JOIN (VALUES
         ('queue', 'ready_entries_'), ('queue', 'ready_segments_'), ('queue', 'done_entries_'),
+        ('queue', 'ready_claim_attempt_batches_'), ('queue', 'ready_tombstones_'),
+        ('queue', 'receipt_completion_batches_'), ('queue', 'receipt_completion_tombstones_'),
+        ('queue', 'queue_terminal_count_deltas_'),
         ('claim', 'lease_claims_'), ('claim', 'lease_claim_batches_'),
         ('claim', 'lease_claim_closures_'), ('claim', 'lease_claim_closure_batches_')
     ) AS p(ring, prefix)
