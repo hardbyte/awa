@@ -1,7 +1,7 @@
 import { hashKey, type QueryKey } from "@tanstack/react-query";
 import { queryClient } from "../query";
 import { fetchCapabilities } from "../api";
-import { apiPath } from "../base-path";
+import { apiPath } from "../base-path.ts";
 import { RefreshScheduler } from "./scheduler.ts";
 import { onHttpFailure, readWithFence, withReadSignal } from "./read-control.ts";
 import { ObservationDriver } from "./driver.ts";

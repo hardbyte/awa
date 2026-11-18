@@ -1,6 +1,6 @@
 import { checkedJson, currentReadSignal, ReadProtocolError } from "./observation/read-control.ts";
 /** Typed fetch wrapper for the AWA API. */
-import { apiPath } from "./base-path";
+import { apiPath } from "./base-path.ts";
 
 export interface JobRow {
   id: number;
