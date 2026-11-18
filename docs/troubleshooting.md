@@ -441,7 +441,7 @@ Do not use `awa.maintenance.prune.pinned_ready_age` to rule this fault in or out
 sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
 ```
 
-To see what holds the slots prune wants, list the locks on the oldest sealed slot of the queue ring and of the claim ring; the query picks each slot the way prune does, from the ring cursor that `ring_cursor` resolves for either cursor authority. Replace `<schema>` with the active `schema_name` from [Find the active queue-storage schema](#find-the-active-queue-storage-schema), and run it as a role that may execute `<schema>.ring_cursor`, such as the migration role. The query reads catalog and lock views, the ring state rows and the rotation ledger only, and takes no lock on the partitions; run it several times, since one sample can miss a short claim. Look at the rows for the ring whose prune reports `blocked`.
+To see what holds the slots prune wants, list the locks on the oldest sealed slot of the queue ring and of the claim ring; the query picks each slot the way prune does, from the ring cursor that `ring_cursor` resolves for either cursor authority. Replace `<schema>` with the active `schema_name` from [Find the active queue-storage schema](#find-the-active-queue-storage-schema), and run it as a role that may execute `<schema>.ring_cursor`, such as the migration role, and that can see other roles' sessions (a superuser, or a member of `pg_read_all_stats`): without that, `pg_stat_activity` hides the query, `xact_start` and age of the runtime role's sessions, and the second query below leaves them out. The query reads catalog and lock views, the ring state rows and the rotation ledger only, and takes no lock on the partitions; run it several times, since one sample can miss a short claim. Look at the rows for the ring whose prune reports `blocked`.
 
 ```sql
 WITH cursors AS (
@@ -498,7 +498,7 @@ GROUP BY a.pid, a.application_name, a.xact_start, a.query
 ORDER BY xact_age DESC;
 ```
 
-Run such readers against a replica or with a short `statement_timeout`, poll them less often, or use Awa's metrics instead.
+Run such readers against a replica or with a short `statement_timeout`, poll them less often, or use Awa's metrics instead. A reader that finished its query but left its transaction open (`state = 'idle in transaction'`) keeps its locks until the transaction ends, which `statement_timeout` does not do: end it, or set `idle_in_transaction_session_timeout` for the reporting role.
 
 ### Mitigations
 
