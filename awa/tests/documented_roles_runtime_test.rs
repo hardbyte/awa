@@ -120,8 +120,12 @@ impl CapturedLogs {
         logs
     }
 
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
     fn permission_errors(&self) -> Vec<String> {
-        String::from_utf8_lossy(&self.0.lock().unwrap())
+        self.text()
             .lines()
             .filter(|line| {
                 // PostgreSQL's wording, e.g. "permission denied for table x".
@@ -277,14 +281,35 @@ async fn wait_for_states(
         if reached.len() == expected.len() {
             return reached;
         }
-        let missing: Vec<_> = expected
-            .iter()
-            .filter(|(id, _)| !reached.contains_key(id))
-            .collect();
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "jobs never reached their expected states: {missing:?}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let mut missing = Vec::new();
+            for (id, want) in expected {
+                if reached.contains_key(id) {
+                    continue;
+                }
+                let row = store.load_job(pool, *id).await.unwrap().map(|job| {
+                    format!(
+                        "args {}, state {:?}, attempt {}/{}, run_at {}, errors {:?}, progress {:?}",
+                        job.args,
+                        job.state,
+                        job.attempt,
+                        job.max_attempts,
+                        job.run_at,
+                        job.errors,
+                        job.progress
+                    )
+                });
+                missing.push(format!(
+                    "job {id}, want {want:?}: {}",
+                    row.unwrap_or_else(|| "no row".into())
+                ));
+            }
+            panic!(
+                "jobs never reached their expected states:\n{}\nruntime warnings and errors:\n{}",
+                missing.join("\n"),
+                logs.text()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
