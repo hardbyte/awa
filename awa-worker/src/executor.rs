@@ -2006,9 +2006,8 @@ fn rescheduled_event_row(
     row
 }
 
-/// Re-schedule a canonical attempt in its own transaction. When it is
-/// cancelled as a duplicate, the stored row is read in the same
-/// transaction, so the event carries what was committed.
+/// Re-schedule a canonical attempt in its own transaction, returning the
+/// stored row when it is cancelled as a duplicate.
 #[allow(clippy::too_many_arguments)]
 async fn reschedule_reading_successor(
     pool: &sqlx::PgPool,
@@ -2020,40 +2019,13 @@ async fn reschedule_reading_successor(
     unique_key: Option<&[u8]>,
 ) -> Result<(RescheduleOutcome, Option<Box<JobRow>>), awa_model::AwaError> {
     let mut tx = pool.begin().await.map_err(awa_model::map_sqlx_error)?;
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique_tx(
-        &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
-    )
-    .await?;
-    let successor = match &outcome {
-        RescheduleOutcome::CancelledDuplicate {
-            job_id: successor_id,
-        } => sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
-            .bind(successor_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(awa_model::map_sqlx_error)?
-            .map(Box::new),
-        _ => None,
-    };
+    let (outcome, cancelled) =
+        awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
+            &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
+        )
+        .await?;
     tx.commit().await.map_err(awa_model::map_sqlx_error)?;
-    Ok((outcome, successor))
-}
-
-/// The stored row of an attempt cancelled as a duplicate, in place or under
-/// a new job ID.
-async fn stored_duplicate_successor<'e, E>(
-    executor: E,
-    job_id: i64,
-) -> Result<Option<Box<JobRow>>, awa_model::AwaError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let row = sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
-        .bind(job_id)
-        .fetch_optional(executor)
-        .await
-        .map_err(awa_model::map_sqlx_error)?;
-    Ok(row.map(Box::new))
+    Ok((outcome, cancelled.map(Box::new)))
 }
 
 /// The job as a read returns it after a canonical snooze or retry was
@@ -3357,18 +3329,19 @@ async fn retry_after_canonical_with_followups(
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique_tx(
-        &mut tx,
-        job.id,
-        job.run_lease,
-        Reschedule::RetryAfter {
-            delay_secs: seconds,
-        },
-        None,
-        progress_snapshot,
-        job.unique_key.as_deref(),
-    )
-    .await?;
+    let (outcome, cancelled) =
+        awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            Reschedule::RetryAfter {
+                delay_secs: seconds,
+            },
+            None,
+            progress_snapshot,
+            job.unique_key.as_deref(),
+        )
+        .await?;
     let (job_id, run_at, attempt) = match outcome {
         RescheduleOutcome::Rescheduled {
             job_id,
@@ -3381,7 +3354,7 @@ async fn retry_after_canonical_with_followups(
             attempt,
         } => (job_id, run_at, attempt),
         RescheduleOutcome::CancelledDuplicate { job_id } => {
-            let persisted = stored_duplicate_successor(&mut *tx, job_id).await?;
+            let persisted = cancelled.map(Box::new);
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,
@@ -3536,16 +3509,17 @@ async fn retry_backoff_canonical_with_followups(
         "attempt": job.attempt,
         "at": chrono::Utc::now().to_rfc3339()
     });
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique_tx(
-        &mut tx,
-        job.id,
-        job.run_lease,
-        Reschedule::RetryBackoff,
-        Some(&error_entry),
-        progress_snapshot,
-        job.unique_key.as_deref(),
-    )
-    .await?;
+    let (outcome, cancelled) =
+        awa_model::reschedule::reschedule_canonical_attempt_returning_cancelled_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            Reschedule::RetryBackoff,
+            Some(&error_entry),
+            progress_snapshot,
+            job.unique_key.as_deref(),
+        )
+        .await?;
     let (job_id, run_at, attempt) = match outcome {
         RescheduleOutcome::Rescheduled {
             job_id,
@@ -3558,7 +3532,7 @@ async fn retry_backoff_canonical_with_followups(
             attempt,
         } => (job_id, run_at, attempt),
         RescheduleOutcome::CancelledDuplicate { job_id } => {
-            let persisted = stored_duplicate_successor(&mut *tx, job_id).await?;
+            let persisted = cancelled.map(Box::new);
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,

@@ -171,6 +171,26 @@ pub async fn reschedule_canonical_attempt_with_unique_tx(
     progress: Option<&serde_json::Value>,
     unique_key: Option<&[u8]>,
 ) -> Result<RescheduleOutcome, AwaError> {
+    reschedule_canonical_attempt_returning_cancelled_tx(
+        tx, job_id, run_lease, reschedule, error, progress, unique_key,
+    )
+    .await
+    .map(|(outcome, _)| outcome)
+}
+
+/// [`reschedule_canonical_attempt_with_unique_tx`] that also returns the
+/// row written when the attempt is cancelled as a duplicate.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn reschedule_canonical_attempt_returning_cancelled_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+    run_lease: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<&serde_json::Value>,
+    unique_key: Option<&[u8]>,
+) -> Result<(RescheduleOutcome, Option<JobRow>), AwaError> {
     reschedule_attempt_tx(
         tx,
         job_id,
@@ -193,7 +213,9 @@ pub async fn reschedule_canonical_attempt_tx(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
 ) -> Result<RescheduleOutcome, AwaError> {
-    reschedule_attempt_tx(tx, job_id, run_lease, reschedule, error, progress, true).await
+    reschedule_attempt_tx(tx, job_id, run_lease, reschedule, error, progress, true)
+        .await
+        .map(|(outcome, _)| outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -205,7 +227,7 @@ async fn reschedule_attempt_tx(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
     may_conflict: bool,
-) -> Result<RescheduleOutcome, AwaError> {
+) -> Result<(RescheduleOutcome, Option<JobRow>), AwaError> {
     // Lock the transition singleton FOR SHARE for the rest of this
     // transaction before deciding where the attempt goes. `storage_abort`,
     // `storage_enter_mixed_transition`, and `storage_finalize` all take
@@ -270,9 +292,11 @@ async fn reschedule_canonical(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
     may_conflict: bool,
-) -> Result<RescheduleOutcome, AwaError> {
+) -> Result<(RescheduleOutcome, Option<JobRow>), AwaError> {
     if !may_conflict {
-        return move_canonical(tx.as_mut(), job_id, run_lease, reschedule, error, progress).await;
+        return move_canonical(tx.as_mut(), job_id, run_lease, reschedule, error, progress)
+            .await
+            .map(|outcome| (outcome, None));
     }
     {
         let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
@@ -288,7 +312,7 @@ async fn reschedule_canonical(
         {
             Ok(outcome) => {
                 savepoint.commit().await.map_err(map_sqlx_error)?;
-                return Ok(outcome);
+                return Ok((outcome, None));
             }
             Err(AwaError::UniqueConflict { .. }) => {
                 savepoint.rollback().await.map_err(map_sqlx_error)?;
@@ -297,7 +321,7 @@ async fn reschedule_canonical(
         }
     }
 
-    let cancelled: Option<i64> = sqlx::query_scalar(
+    let cancelled: Option<JobRow> = sqlx::query_as(
         r#"
         UPDATE awa.jobs_hot
         SET state = 'cancelled',
@@ -318,7 +342,7 @@ async fn reschedule_canonical(
                     'duplicate_unique_states', unique_states::text
                 )
         WHERE id = $1 AND state = 'running' AND run_lease = $2
-        RETURNING id
+        RETURNING *
         "#,
     )
     .bind(job_id)
@@ -331,8 +355,11 @@ async fn reschedule_canonical(
     .map_err(map_sqlx_error)?;
 
     Ok(match cancelled {
-        Some(job_id) => RescheduleOutcome::CancelledDuplicate { job_id },
-        None => RescheduleOutcome::Stale,
+        Some(row) => (
+            RescheduleOutcome::CancelledDuplicate { job_id: row.id },
+            Some(row),
+        ),
+        None => (RescheduleOutcome::Stale, None),
     })
 }
 
@@ -416,7 +443,7 @@ async fn migrate_to_queue_storage(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
     may_conflict: bool,
-) -> Result<RescheduleOutcome, AwaError> {
+) -> Result<(RescheduleOutcome, Option<JobRow>), AwaError> {
     // The jobs_hot delete trigger releases the job's unique claim.
     //
     // Jobs carrying callback wiring are deliberately excluded: `deferred_jobs`
@@ -536,14 +563,20 @@ async fn migrate_to_queue_storage(
         .await?;
 
     if inserted.state == JobState::Cancelled {
-        Ok(RescheduleOutcome::CancelledDuplicate {
-            job_id: inserted.id,
-        })
+        Ok((
+            RescheduleOutcome::CancelledDuplicate {
+                job_id: inserted.id,
+            },
+            Some(inserted),
+        ))
     } else {
-        Ok(RescheduleOutcome::Migrated {
-            job_id: inserted.id,
-            run_at: inserted.run_at,
-            attempt: inserted.attempt,
-        })
+        Ok((
+            RescheduleOutcome::Migrated {
+                job_id: inserted.id,
+                run_at: inserted.run_at,
+                attempt: inserted.attempt,
+            },
+            None,
+        ))
     }
 }
