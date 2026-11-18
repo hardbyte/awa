@@ -152,6 +152,8 @@ Configs:
 - [`AwaStorageLockOrderOldStripedClaimDeadlock.cfg`](./AwaStorageLockOrderOldStripedClaimDeadlock.cfg): the historical claim shape that walked several physical stripes against the enqueue order — **NoDeadlock tripped**.
 - [`AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg`](./AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg): the historical `QueueStorage` order for a new lane, provisioning lock before the `queue_lanes` row, against a SQL producer of the same lane — **NoDeadlock tripped in 5 steps** (#692).
 - [`AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg`](./AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg): the 0.6.18 re-enqueue order, lane before the job's unique claim, against a fresh enqueue of the same key into the same lane — **NoDeadlock tripped in 5 steps** (#799).
+- [`AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg`](./AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg): the 0.6.18 row-order claim pass of bulk cancel, drain, batch completion, claim, rescue and discard against a fresh enqueue of both keys in key order — **NoDeadlock tripped**.
+- [`AwaStorageLockOrderCompletionFollowUpDeadlock.cfg`](./AwaStorageLockOrderCompletionFollowUpDeadlock.cfg): a known gap, not a historical order. A completion that enqueues ADR-029 follow-ups releases the parent's key in one pass and claims each follow-up's key in a second; two parents whose follow-ups take each other's keys — **NoDeadlock tripped**. `CompleteWithFollowUpPlan` is not in `Next`, so the main config does not cover it.
 - [`AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg`](./AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg): the 0.6.16 claim prune order, the slot's `claim_ring_slots` row before the slot's partitions, against stale receipt rescue, which takes the partitions and then the row — **NoDeadlock tripped** (#721).
 
 Run:
@@ -162,6 +164,8 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderCompletionFollowUpDeadlock.cfg
 ```
 
 Plan order follows PostgreSQL, not the SQL text: a statement takes every relation lock when it is planned and its row locks afterwards, so a `FOR UPDATE` written in a leading CTE is still acquired after the locks on every table the statement reads. The rescue plans listed the cursor row first until #721, which hid their cycle with claim prune.

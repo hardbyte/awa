@@ -45,6 +45,7 @@ AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldStripedClaimDeadlock.cfg
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg ;; NoDeadlock is violated ;; old QueueStorage lane-provisioning order witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg ;; NoDeadlock is violated ;; old lane-first re-enqueue against a fresh unique enqueue witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg ;; NoDeadlock is violated ;; old row-order claim pass against a fresh unique enqueue witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderCompletionFollowUpDeadlock.cfg ;; NoDeadlock is violated ;; completion follow-up claiming a key across two passes (known gap)
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg ;; NoDeadlock is violated ;; old claim-prune slot-row order against rescue witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + #456 reschedule drain

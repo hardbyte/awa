@@ -307,6 +307,20 @@ UniqueClaimPassPlan(q, p) ==
        Step(UniqueClaimResource(2), ModeExclusive),
        Step(LaneResource(q, p), ModeExclusive) >>
 
+\* A transition that also enqueues ADR-029 follow-ups in its transaction
+\* (`complete_queue_storage_with_followups` and the other executor
+\* `*_with_followups` paths) makes two claim passes: the parent's
+\* transition changes its claim, then each follow-up insert
+\* (`awa.insert_job_compat`) claims the follow-up's key and takes its lane.
+\* The key-order rule holds within each pass but not across them, so a
+\* parent releasing key `a` with a follow-up claiming key `b < a` breaks it.
+\* Not part of `Next`: this is a known gap, checked only by the
+\* counterexample harness below.
+CompleteWithFollowUpPlan(a, b, q, p) ==
+    << Step(UniqueClaimResource(a), ModeExclusive),
+       Step(UniqueClaimResource(b), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
 \* Through 0.6.18 those paths changed claims in row order, one pass per
 \* group of rows. Kept only as a negative regression harness.
 OldRowOrderClaimPassPlan ==
@@ -1227,6 +1241,39 @@ NextOldRowOrderClaimPassDeadlockDemo ==
 
 SpecOldRowOrderClaimPassDeadlockDemo ==
     ConfigOK /\ Init /\ [][NextOldRowOrderClaimPassDeadlockDemo]_vars
+
+\* ---- Completion follow-up deadlock harness (known gap) ----
+\*
+\* Two parents, holding keys 1 and 2, each complete with a mask that releases
+\* on completion and register a uniquely keyed follow-up for the other's key.
+\* Each releases its own key, then waits to claim the key the other has just
+\* released and not committed. TLC is expected to flag NoDeadlock: the
+\* key-order rule covers one claim pass, and a transition with follow-ups
+\* takes two.
+
+StartCompleteWithFollowUp(t, a, b, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ a \in UniqueKeys
+    /\ b \in UniqueKeys
+    /\ a # b
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = CompleteWithFollowUpPlan(a, b, q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+NextCompletionFollowUpDeadlockDemo ==
+    \/ \E t \in TxIds, a, b \in UniqueKeys, q \in Queues, p \in Priorities :
+          StartCompleteWithFollowUp(t, a, b, q, p)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecCompletionFollowUpDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextCompletionFollowUpDeadlockDemo]_vars
 
 \* ---- Historical claim-prune slot-row deadlock harness ----
 \*
