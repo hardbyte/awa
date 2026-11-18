@@ -4917,27 +4917,38 @@ const CANONICAL_DRAIN_SQL: &str = r#"
     WHERE id = ANY($1) AND state IN ('available', 'scheduled', 'retryable', 'waiting_external')
 "#;
 
-/// On a run's first batch, record the next canonical job ID as the run's
-/// high-water mark, so the run leaves alone jobs enqueued after it started.
-/// A job inserted with an explicit ID above the sequence still counts as
-/// existing.
+/// On a run's first batch, record its bounds: the next value of the job ID
+/// sequence, the database time, and one past the highest existing job ID, so
+/// the run reaches a job inserted with an explicit ID above the sequence and
+/// leaves alone jobs enqueued after it started.
 async fn mark_canonical_run_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     cursor: &mut BulkCursor,
 ) -> Result<(), AwaError> {
     if cursor.before_job_id == 0 {
-        cursor.before_job_id = sqlx::query_scalar(
-            r#"
-            SELECT GREATEST(
-                (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
-                 FROM awa.jobs_id_seq),
-                (SELECT max(id) + 1 FROM awa.jobs_hot),
-                (SELECT max(id) + 1 FROM awa.scheduled_jobs)
+        let (before_job_id, sequence_bound, started_at): (i64, i64, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as(
+                r#"
+                WITH sequence AS (
+                    SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END AS next
+                    FROM awa.jobs_id_seq
+                )
+                SELECT
+                    GREATEST(
+                        sequence.next,
+                        (SELECT max(id) + 1 FROM awa.jobs_hot),
+                        (SELECT max(id) + 1 FROM awa.scheduled_jobs)
+                    ),
+                    sequence.next,
+                    now()
+                FROM sequence
+                "#,
             )
-            "#,
-        )
-        .fetch_one(tx.as_mut())
-        .await?;
+            .fetch_one(tx.as_mut())
+            .await?;
+        cursor.before_job_id = before_job_id;
+        cursor.sequence_bound = sequence_bound;
+        cursor.started_at = Some(started_at);
     }
     Ok(())
 }
@@ -4953,15 +4964,18 @@ async fn pick_canonical_batch_tx(
     batch_size: i64,
     cursor: BulkCursor,
 ) -> Result<bulk::Pick, AwaError> {
-    let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
-        sqlx::query_as(&bulk::pick_sql(relation, "id", filter, "$3", "$4", "$5"))
-            .bind(first)
-            .bind(second)
-            .bind(cursor.after_job_id)
-            .bind(cursor.before_job_id)
-            .bind(batch_size)
-            .fetch_one(tx.as_mut())
-            .await?;
+    let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) = sqlx::query_as(
+        &bulk::pick_sql(relation, "id", filter, "$3", ["$4", "$6", "$7"], "$5"),
+    )
+    .bind(first)
+    .bind(second)
+    .bind(cursor.after_job_id)
+    .bind(cursor.before_job_id)
+    .bind(batch_size)
+    .bind(cursor.sequence_bound)
+    .bind(cursor.started_at)
+    .fetch_one(tx.as_mut())
+    .await?;
     Ok(bulk::Pick::new(picked, first_held, more))
 }
 

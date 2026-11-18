@@ -565,6 +565,12 @@ export function drainQueue(
       if (batch.cursor.before_job_id) {
         qs.set("before_job_id", String(batch.cursor.before_job_id));
       }
+      if (batch.cursor.sequence_bound) {
+        qs.set("sequence_bound", String(batch.cursor.sequence_bound));
+      }
+      if (batch.cursor.started_at) {
+        qs.set("started_at", batch.cursor.started_at);
+      }
     }
   }
   const query = qs.toString();

@@ -1293,3 +1293,99 @@ async fn dlq_purge_leaves_rows_added_during_the_run() {
     );
     setup::clean_queue(&pool, &queue).await;
 }
+
+/// Add a row with an explicit job ID far above the job ID sequence: an
+/// available canonical job in `queue`, or a queue-storage DLQ row, the kind
+/// of row a migration from canonical storage leaves above the sequence.
+async fn insert_explicit_id_row(pool: &PgPool, engine: Engine, queue: &str) -> i64 {
+    match engine {
+        Engine::Canonical => sqlx::query_scalar(
+            "INSERT INTO awa.jobs (id, kind, queue, args) \
+             VALUES (nextval('awa.jobs_id_seq') + 1000000000, 'bulk_job', $1, '{}') \
+             RETURNING id",
+        )
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("insert explicit-ID job"),
+        Engine::QueueStorage => sqlx::query_scalar(
+            "INSERT INTO awa.dlq_entries (
+                 job_id, kind, queue, priority, dlq_reason, original_run_lease
+             )
+             VALUES (nextval('awa.job_id_seq') + 1000000000, 'bulk_job', $1, 2, 'seeded', 1)
+             RETURNING job_id",
+        )
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("insert explicit-ID DLQ row"),
+    }
+}
+
+/// A row with an explicit ID above the sequence widens the run's paging
+/// bound, but a job enqueued after the run started still is not drained.
+async fn drain_leaves_new_jobs_beside_an_explicit_id(engine: Engine) {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(engine).await;
+    let queue = unique_name("bulk_drain_explicit");
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+    let explicit = insert_explicit_id_row(&pool, engine, &queue).await;
+
+    let first = admin::drain_queue_batch(&pool, &queue, 1, BulkCursor::default())
+        .await
+        .expect("first batch");
+    assert_eq!(first.count, 1, "{engine:?}");
+    assert!(
+        first.cursor.before_job_id > explicit,
+        "{engine:?} {first:?}"
+    );
+    let later = insert_jobs(&pool, &queue, "bulk_job", 1).await;
+
+    let mut cursor = first.cursor;
+    for _ in 0..20 {
+        let batch = admin::drain_queue_batch(&pool, &queue, 1, cursor)
+            .await
+            .expect("resumed batch");
+        cursor = batch.cursor;
+        if batch.done {
+            break;
+        }
+    }
+    assert_eq!(
+        count_of(&states(&pool, &ids).await, "cancelled"),
+        2,
+        "{engine:?}"
+    );
+    assert_eq!(
+        count_of(&states(&pool, &later).await, "available"),
+        1,
+        "{engine:?}: a job enqueued after the drain started is not cancelled"
+    );
+    if engine == Engine::Canonical {
+        assert_eq!(
+            count_of(&states(&pool, &[explicit]).await, "cancelled"),
+            1,
+            "the explicit-ID job existed when the drain started"
+        );
+    }
+    let delete = match engine {
+        Engine::Canonical => "DELETE FROM awa.jobs WHERE id = $1",
+        Engine::QueueStorage => "DELETE FROM awa.dlq_entries WHERE job_id = $1",
+    };
+    sqlx::query(delete)
+        .bind(explicit)
+        .execute(&pool)
+        .await
+        .expect("delete the explicit-ID row");
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn drain_leaves_new_jobs_beside_an_explicit_id_canonical() {
+    drain_leaves_new_jobs_beside_an_explicit_id(Engine::Canonical).await;
+}
+
+#[tokio::test]
+async fn drain_leaves_new_jobs_beside_an_explicit_id_queue_storage() {
+    drain_leaves_new_jobs_beside_an_explicit_id(Engine::QueueStorage).await;
+}

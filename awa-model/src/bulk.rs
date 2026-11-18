@@ -10,13 +10,20 @@
 //! [`BulkBatch::busy`]. [`run_batches`] drives a batched operation to
 //! completion.
 //!
-//! A run covers the jobs that existed when it started: its first batch
-//! records the next job ID in [`BulkCursor::before_job_id`], and no batch of
-//! the run touches a job with that ID or a higher one. A job enqueued during
-//! the run is left alone, so a run against a busy producer still finishes.
+//! A run covers the jobs that existed when it started. Its first batch
+//! records the next value of the job ID sequence in
+//! [`BulkCursor::sequence_bound`], the database time in
+//! [`BulkCursor::started_at`], and one past the highest existing job ID in
+//! [`BulkCursor::before_job_id`]. A job with an ID below the sequence bound
+//! belongs to the run; a job at or above it, which only an explicit ID can
+//! produce before the run starts, belongs to the run when it was created no
+//! later than the run started. No batch passes `before_job_id`. A job
+//! enqueued during the run is left alone, so a run against a busy producer
+//! still finishes.
 
 use crate::error::AwaError;
 use crate::job::JobRow;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::time::Duration;
@@ -62,10 +69,51 @@ pub struct BulkCursor {
     /// The largest job ID this pass has already handled.
     #[serde(default)]
     pub after_job_id: i64,
-    /// The run handles only jobs with smaller IDs: the jobs that existed
-    /// when it started. Zero until the run's first batch sets it.
+    /// The run pages through job IDs below this: one past the highest job
+    /// ID that existed when it started. Zero until the run's first batch
+    /// sets it.
     #[serde(default)]
     pub before_job_id: i64,
+    /// The next value of the job ID sequence when the run started. A job
+    /// with a smaller ID belongs to the run; a job with this ID or a higher
+    /// one belongs to it only if it was created no later than
+    /// [`Self::started_at`]. Zero in a cursor from a release without it,
+    /// when every job below `before_job_id` belongs to the run.
+    #[serde(default)]
+    pub sequence_bound: i64,
+    /// The database time when the run started.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+impl BulkCursor {
+    /// The cursor for the start of pass `stage` of the same run.
+    pub(crate) fn next_pass(self, stage: u8) -> Self {
+        Self {
+            stage,
+            after_job_id: 0,
+            ..self
+        }
+    }
+}
+
+/// SQL predicate that a row with job ID `id` and creation time `created_at`
+/// belongs to the run whose bounds `below`, `sequence_bound` and
+/// `started_at` (a `bigint`, a `bigint` and a `timestamptz`) bind. An ID
+/// below the sequence bound decides it alone, so in the usual case, with no
+/// explicit IDs above the sequence, the predicate is on job IDs only.
+/// `created_at` is read only for IDs at or above the sequence bound.
+pub(crate) fn run_scope_sql(
+    id: &str,
+    created_at: &str,
+    below: &str,
+    sequence_bound: &str,
+    started_at: &str,
+) -> String {
+    format!(
+        "{id} < {below} AND ({sequence_bound}::bigint = 0 OR {id} < {sequence_bound}::bigint \
+         OR {created_at} <= {started_at}::timestamptz)"
+    )
 }
 
 /// What one batch did.
@@ -266,8 +314,10 @@ pub fn validate_batch_size(batch_size: i64) -> Result<(), AwaError> {
     Ok(())
 }
 
-/// One statement that locks up to `limit` matching rows with IDs between
-/// `after` and `below` in ID order, skipping rows another transaction holds.
+/// One statement that locks up to `limit` matching rows with IDs after
+/// `after` that belong to the run (`scope` binds its `below`,
+/// `sequence_bound` and `started_at`, see [`run_scope_sql`]) in ID order,
+/// skipping rows another transaction holds.
 /// It returns the locked IDs, the lowest matching ID below the last locked
 /// one that another transaction holds, and whether any matching row in the
 /// range was not locked.
@@ -276,10 +326,14 @@ pub(crate) fn pick_sql(
     id_column: &str,
     filter: &str,
     after: &str,
-    below: &str,
+    scope: [&str; 3],
     limit: &str,
 ) -> String {
-    let filter = format!("({filter}) AND {id_column} > {after} AND {id_column} < {below}");
+    let [below, sequence_bound, started_at] = scope;
+    let filter = format!(
+        "({filter}) AND {id_column} > {after} AND {}",
+        run_scope_sql(id_column, "created_at", below, sequence_bound, started_at)
+    );
     format!(
         r#"
         WITH picked AS MATERIALIZED (
@@ -336,13 +390,7 @@ impl Pick {
         batch.busy = self.ids.is_empty() && self.more;
         if !self.more {
             match next_stage {
-                Some(stage) => {
-                    batch.cursor = BulkCursor {
-                        stage,
-                        after_job_id: 0,
-                        before_job_id: batch.cursor.before_job_id,
-                    }
-                }
+                Some(stage) => batch.cursor = batch.cursor.next_pass(stage),
                 None => batch.done = true,
             }
         }

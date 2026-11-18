@@ -10000,6 +10000,10 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        let scope = BulkCursor {
+            before_job_id: job_id_bound,
+            ..BulkCursor::default()
+        };
         let mut drained = 0u64;
         // Waiting jobs first, then deferred, then ready: the order jobs move
         // between them. A waiting job whose callback times out becomes
@@ -10032,7 +10036,7 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             let (cancelled, last_job_id) = self
-                .cancel_deferred_chunk_tx(&mut tx, queue, after_job_id, job_id_bound, batch_size)
+                .cancel_deferred_chunk_tx(&mut tx, queue, after_job_id, scope, batch_size)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             drained += cancelled as u64;
@@ -10054,7 +10058,7 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             self.lock_claim_heads_tx(&mut tx, &lanes).await?;
             let cancelled = self
-                .cancel_available_chunk_tx(&mut tx, &mut lanes, job_id_bound, batch_size)
+                .cancel_available_chunk_tx(&mut tx, &mut lanes, scope, batch_size)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             self.skip_spent_claim_prefixes(pool, &lanes).await?;
@@ -10124,32 +10128,45 @@ impl QueueStorage {
             self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
         }
-        let next_pass = |cursor: BulkCursor, stage: u8| BulkCursor {
-            stage,
-            after_job_id: 0,
-            before_job_id: cursor.before_job_id,
-        };
+        let next_pass = |cursor: BulkCursor, stage: u8| cursor.next_pass(stage);
         loop {
             let mut batch = BulkBatch::queue_storage(cursor);
             match cursor.stage {
                 0 => {
                     let waiting: Vec<i64> = sqlx::query_scalar(&format!(
                         r#"
-                        SELECT job_id
-                        FROM {schema}.leases
+                        SELECT lease.job_id
+                        FROM {schema}.leases AS lease
                         WHERE {queues}
-                          AND state = 'waiting_external'
-                          AND job_id > $2
-                          AND job_id < $3
-                        ORDER BY job_id
+                          AND lease.state = 'waiting_external'
+                          AND lease.job_id > $2
+                          AND {scope}
+                        ORDER BY lease.job_id
                         LIMIT $4
                         "#,
-                        queues = queue_and_stripes_sql("queue", "$1"),
+                        queues = queue_and_stripes_sql("lease.queue", "$1"),
+                        scope = bulk::run_scope_sql(
+                            "lease.job_id",
+                            &format!(
+                                "(SELECT ready.created_at FROM {schema}.ready_entries AS ready \
+                                 WHERE ready.ready_slot = lease.ready_slot \
+                                   AND ready.ready_generation = lease.ready_generation \
+                                   AND ready.queue = lease.queue \
+                                   AND ready.priority = lease.priority \
+                                   AND ready.enqueue_shard = lease.enqueue_shard \
+                                   AND ready.lane_seq = lease.lane_seq)"
+                            ),
+                            "$3",
+                            "$5",
+                            "$6",
+                        ),
                     ))
                     .bind(queue)
                     .bind(cursor.after_job_id)
                     .bind(cursor.before_job_id)
                     .bind(batch_size)
+                    .bind(cursor.sequence_bound)
+                    .bind(cursor.started_at)
                     .fetch_all(pool)
                     .await
                     .map_err(map_sqlx_error)?;
@@ -10174,7 +10191,7 @@ impl QueueStorage {
                             &mut tx,
                             queue,
                             cursor.after_job_id,
-                            cursor.before_job_id,
+                            cursor,
                             batch_size,
                         )
                         .await?;
@@ -10188,13 +10205,16 @@ impl QueueStorage {
                         WHERE {queues}
                           AND state IN ('scheduled', 'retryable')
                           AND job_id > $2
-                          AND job_id < $3
+                          AND {scope}
                         "#,
                         queues = queue_and_stripes_sql("queue", "$1"),
+                        scope = bulk::run_scope_sql("job_id", "created_at", "$3", "$4", "$5"),
                     ))
                     .bind(queue)
                     .bind(cursor.after_job_id)
                     .bind(cursor.before_job_id)
+                    .bind(cursor.sequence_bound)
+                    .bind(cursor.started_at)
                     .fetch_one(tx.as_mut())
                     .await
                     .map_err(map_sqlx_error)?;
@@ -10231,16 +10251,11 @@ impl QueueStorage {
                     self.lock_claim_heads_tx(&mut tx, &lanes).await?;
                     let mut chunk_lanes = lanes.clone();
                     let cancelled = self
-                        .cancel_available_chunk_tx(
-                            &mut tx,
-                            &mut chunk_lanes,
-                            cursor.before_job_id,
-                            batch_size,
-                        )
+                        .cancel_available_chunk_tx(&mut tx, &mut chunk_lanes, cursor, batch_size)
                         .await?;
                     let remaining = (cancelled as i64) >= batch_size
                         || self
-                            .drain_ready_remaining_tx(&mut tx, &lanes, cursor.before_job_id)
+                            .drain_ready_remaining_tx(&mut tx, &lanes, cursor)
                             .await?;
                     tx.commit().await.map_err(map_sqlx_error)?;
                     self.skip_spent_claim_prefixes(pool, &lanes).await?;
@@ -10254,14 +10269,15 @@ impl QueueStorage {
     }
 
     /// Cancel up to `batch_size` scheduled and retryable jobs of
-    /// `queue` with ids in `(after_job_id, job_id_bound)`, returning how many
-    /// were cancelled and the largest cancelled id.
+    /// `queue` with ids after `after_job_id` that belong to the run `scope`
+    /// bounds, returning how many were cancelled and the largest cancelled
+    /// id.
     async fn cancel_deferred_chunk_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queue: &str,
         after_job_id: i64,
-        job_id_bound: i64,
+        scope: BulkCursor,
         batch_size: i64,
     ) -> Result<(usize, i64), AwaError> {
         let schema = self.schema();
@@ -10274,7 +10290,7 @@ impl QueueStorage {
                 WHERE {queues}
                   AND state IN ('scheduled', 'retryable')
                   AND job_id > $2
-                  AND job_id < $3
+                  AND {scope}
                 ORDER BY job_id
                 LIMIT $4
                 FOR UPDATE SKIP LOCKED
@@ -10298,11 +10314,14 @@ impl QueueStorage {
                 COALESCE(payload, '{{}}'::jsonb) AS payload
             "#,
             queues = queue_and_stripes_sql("queue", "$1"),
+            scope = bulk::run_scope_sql("job_id", "created_at", "$3", "$5", "$6"),
         ))
         .bind(queue)
         .bind(after_job_id)
-        .bind(job_id_bound)
+        .bind(scope.before_job_id)
         .bind(batch_size)
+        .bind(scope.sequence_bound)
+        .bind(scope.started_at)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10368,6 +10387,7 @@ impl QueueStorage {
     fn drain_ready_target_ctes(&self, lock: bool) -> String {
         let schema = self.schema();
         let claimed = self.ready_row_claimed_sql("ready");
+        let scope = bulk::run_scope_sql("ready.job_id", "ready.created_at", "$7", "$8", "$9");
         let lock = if lock {
             "FOR UPDATE OF ready SKIP LOCKED"
         } else {
@@ -10416,7 +10436,7 @@ impl QueueStorage {
                       AND ready.enqueue_shard = heads.enqueue_shard
                       AND ready.lane_seq >= segment.from_seq
                       AND ready.lane_seq < segment.to_seq
-                      AND ready.job_id < $7
+                      AND {scope}
                       AND NOT (
                           EXISTS (
                               SELECT 1 FROM {schema}.ready_tombstones AS tomb
@@ -10438,13 +10458,13 @@ impl QueueStorage {
         )
     }
 
-    /// Whether any unclaimed ready row of `lanes` with a job ID below
-    /// `job_id_bound` remains, counting rows another transaction holds.
+    /// Whether any unclaimed ready row of `lanes` that belongs to the run
+    /// `scope` bounds remains, counting rows another transaction holds.
     async fn drain_ready_remaining_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         lanes: &[DrainLane],
-        job_id_bound: i64,
+        scope: BulkCursor,
     ) -> Result<bool, AwaError> {
         sqlx::query_scalar(&format!(
             "WITH {} SELECT EXISTS (SELECT 1 FROM target)",
@@ -10466,7 +10486,9 @@ impl QueueStorage {
         .bind(lanes.iter().map(|lane| lane.from_seq).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
         .bind(1_i64)
-        .bind(job_id_bound)
+        .bind(scope.before_job_id)
+        .bind(scope.sequence_bound)
+        .bind(scope.started_at)
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
@@ -10476,7 +10498,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         lanes: &mut [DrainLane],
-        job_id_bound: i64,
+        scope: BulkCursor,
         batch_size: i64,
     ) -> Result<usize, AwaError> {
         let schema = self.schema();
@@ -10540,7 +10562,9 @@ impl QueueStorage {
         .bind(lanes.iter().map(|lane| lane.from_seq).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
         .bind(batch_size)
-        .bind(job_id_bound)
+        .bind(scope.before_job_id)
+        .bind(scope.sequence_bound)
+        .bind(scope.started_at)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -17549,10 +17573,11 @@ impl QueueStorage {
         Ok(batch)
     }
 
-    /// On a run's first batch, record the next job ID as the run's
-    /// high-water mark, so the run leaves alone jobs enqueued after it
-    /// started. A failed or DLQ row with an ID above the sequence still
-    /// counts as existing.
+    /// On a run's first batch, record its bounds: the next value of the job
+    /// ID sequence, the database time, and one past the highest existing job
+    /// ID, so the run reaches a done or DLQ row whose ID is above the
+    /// sequence, such as one migrated from canonical storage, and leaves
+    /// alone jobs enqueued after it started.
     async fn mark_bulk_run_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -17560,18 +17585,32 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         if cursor.before_job_id == 0 {
             let schema = self.schema();
-            cursor.before_job_id = sqlx::query_scalar(&format!(
+            let (before_job_id, sequence_bound, started_at): (
+                i64,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ) = sqlx::query_as(&format!(
                 r#"
-                SELECT GREATEST(
-                    {schema}.sequence_next_value('job_id_seq'),
-                    (SELECT max(job_id) + 1 FROM {schema}.done_entries),
-                    (SELECT max(job_id) + 1 FROM {schema}.dlq_entries)
+                WITH sequence AS (
+                    SELECT {schema}.sequence_next_value('job_id_seq') AS next
                 )
+                SELECT
+                    GREATEST(
+                        sequence.next,
+                        (SELECT max(job_id) + 1 FROM {schema}.done_entries),
+                        (SELECT max(job_id) + 1 FROM {schema}.dlq_entries)
+                    ),
+                    sequence.next,
+                    now()
+                FROM sequence
                 "#
             ))
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+            cursor.before_job_id = before_job_id;
+            cursor.sequence_bound = sequence_bound;
+            cursor.started_at = Some(started_at);
         }
         Ok(())
     }
@@ -17590,7 +17629,7 @@ impl QueueStorage {
                 "job_id",
                 DLQ_FILTER_SQL,
                 "$6",
-                "$7",
+                ["$7", "$9", "$10"],
                 "$8",
             ))
             .bind(&filter.kind)
@@ -17601,6 +17640,8 @@ impl QueueStorage {
             .bind(cursor.after_job_id)
             .bind(cursor.before_job_id)
             .bind(batch_size)
+            .bind(cursor.sequence_bound)
+            .bind(cursor.started_at)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -17623,7 +17664,7 @@ impl QueueStorage {
                 "job_id",
                 "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
                 "$3",
-                "$4",
+                ["$4", "$6", "$7"],
                 "$5",
             ))
             .bind(kind)
@@ -17631,6 +17672,8 @@ impl QueueStorage {
             .bind(cursor.after_job_id)
             .bind(cursor.before_job_id)
             .bind(batch_size)
+            .bind(cursor.sequence_bound)
+            .bind(cursor.started_at)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;

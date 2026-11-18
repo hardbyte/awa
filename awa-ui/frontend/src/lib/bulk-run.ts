@@ -7,8 +7,12 @@ export const BULK_BUSY_TIMEOUT_MS = 60_000;
 export interface BulkCursor {
   stage: number;
   after_job_id: number;
-  /** The run's high-water mark: it leaves alone jobs with this ID or higher. */
+  /** One past the highest job ID when the run started; the run pages below it. */
   before_job_id?: number;
+  /** The job ID sequence's next value when the run started. */
+  sequence_bound?: number;
+  /** The database time when the run started; a job at or above `sequence_bound` belongs to the run only if created by then. */
+  started_at?: string | null;
 }
 
 export interface BulkBatchResult {

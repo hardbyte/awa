@@ -66,9 +66,9 @@ pub async fn resume_queue(
 #[derive(Debug, Deserialize)]
 pub struct DrainParams {
     /// Run one batch of up to this many jobs, resuming at `stage`,
-    /// `after_job_id` and `before_job_id`, the fields of the previous batch's
-    /// cursor. Without it, the server drains in batches until no matching
-    /// job remains.
+    /// `after_job_id`, `before_job_id`, `sequence_bound` and `started_at`,
+    /// the fields of the previous batch's cursor. Without it, the server
+    /// drains in batches until no matching job remains.
     pub batch_size: Option<i64>,
     #[serde(default)]
     pub stage: u8,
@@ -76,6 +76,10 @@ pub struct DrainParams {
     pub after_job_id: i64,
     #[serde(default)]
     pub before_job_id: i64,
+    #[serde(default)]
+    pub sequence_bound: i64,
+    #[serde(default)]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +99,8 @@ pub async fn drain_queue(
         stage: params.stage,
         after_job_id: params.after_job_id,
         before_job_id: params.before_job_id,
+        sequence_bound: params.sequence_bound,
+        started_at: params.started_at,
     };
     let bulk = crate::handlers::dlq::run_bulk_route(
         params.batch_size,
