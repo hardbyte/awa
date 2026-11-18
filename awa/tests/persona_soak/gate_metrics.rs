@@ -141,6 +141,11 @@ impl MeterProvider for ScopedProvider {
     }
 }
 
+/// Whether OTLP capture is installed in this process.
+pub fn active() -> bool {
+    state().is_some()
+}
+
 fn state() -> Option<&'static Telemetry> {
     STATE
         .get()
