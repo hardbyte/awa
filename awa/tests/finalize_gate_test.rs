@@ -88,10 +88,12 @@ async fn a_retry_storm_stays_within_the_finalize_gate(pool: PgPool) {
     // Finalize transactions block at their deferred_jobs insert while this
     // lock is held; heartbeats and claims do not write that table.
     let mut stall = pool.begin().await.unwrap();
-    sqlx::query(&format!("LOCK TABLE {deferred} IN SHARE MODE"))
-        .execute(stall.as_mut())
-        .await
-        .unwrap();
+    sqlx::query(awa::model::audited_sql(format!(
+        "LOCK TABLE {deferred} IN SHARE MODE"
+    )))
+    .execute(stall.as_mut())
+    .await
+    .unwrap();
 
     let mut ids = Vec::new();
     for n in 0..JOBS {
