@@ -875,6 +875,12 @@ impl Dispatcher {
                             );
                         }
                     }
+                    // Shutdown may have begun while the read waited.
+                    if self.cancel.is_cancelled() {
+                        drop(claim_slot);
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
                 }
                 let claimed = runtime
                     .store
@@ -1184,6 +1190,90 @@ mod tests {
                 .unwrap());
         }
         assert_eq!(dispatcher.claim_gate.available_permits(), 0);
+    }
+
+    /// Cancelling the dispatcher while its ready-signal read waits must not
+    /// let a claim start once the read returns.
+    #[tokio::test]
+    async fn cancellation_during_the_ready_signal_read_starts_no_claim() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .unwrap();
+        awa_model::migrations::run(&pool).await.unwrap();
+        let config = awa_model::QueueStorageConfig {
+            schema: "awa_dispatch_cancel_signal".into(),
+            ..Default::default()
+        };
+        let store = awa_model::QueueStorage::new(config.clone()).unwrap();
+        store.install(&pool).await.unwrap();
+        store.reset(&pool).await.unwrap();
+        store
+            .enqueue_params_batch(
+                &pool,
+                &[awa_model::job::InsertParams {
+                    kind: "signal_job".into(),
+                    args: serde_json::json!({}),
+                    opts: awa_model::InsertOpts {
+                        queue: "blocked".into(),
+                        ..Default::default()
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let storage = RuntimeStorage::QueueStorage(
+            crate::storage::QueueStorageRuntime::new(
+                config,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher_with(&url, storage);
+        dispatcher.check_ready_signal = true;
+        dispatcher.claim_gate.add_permits(1);
+
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query(
+            "LOCK TABLE awa_dispatch_cancel_signal.queue_enqueue_heads IN ACCESS EXCLUSIVE MODE",
+        )
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("the ready signal read must wait for the lock"),
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            lock.commit().await.unwrap();
+            assert!(!tokio::time::timeout(Duration::from_secs(10), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        let claimed = store
+            .claim_runtime_batch(&pool, "blocked", 10, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "a claim started after cancellation");
     }
 
     #[tokio::test]

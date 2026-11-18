@@ -3346,12 +3346,45 @@ mod ready_segment_tests {
         let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
         let probes = (0..16).map(|_| {
             let (store, pool) = (store.clone(), pool.clone());
-            tokio::spawn(async move { store.supports_job_output(&pool).await })
+            tokio::spawn(async move { store.supports_job_output_from_pool(&pool).await })
         });
         for probe in probes.collect::<Vec<_>>() {
             assert!(probe.await.unwrap().unwrap());
         }
         assert_eq!(store.job_output_probe_count(), 1);
+    }
+
+    /// A pool probe holding the single-flight lock while it waits for the
+    /// only connection must not block a transaction holding that connection
+    /// from probing on it.
+    #[sqlx::test(migrations = false)]
+    async fn a_transaction_probe_does_not_wait_for_a_pool_probe(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+        use std::time::Duration;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let mut tx = single.begin().await.unwrap();
+        let pool_probe = {
+            let (store, single) = (store.clone(), single.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&single).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let in_tx = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.supports_job_output(tx.as_mut()),
+        )
+        .await
+        .expect("the transaction's probe waited for the pool probe");
+        assert!(in_tx.unwrap());
+        tx.commit().await.unwrap();
+        assert!(pool_probe.await.unwrap().unwrap());
     }
 
     #[sqlx::test(migrations = false)]
@@ -4192,6 +4225,11 @@ impl QueueStorage {
         })
     }
 
+    ///
+    /// This probes on `executor` whenever the cache misses, without waiting
+    /// for a concurrent probe: a caller inside a transaction must not wait on
+    /// a pool probe that may need its connection. Pool callers should use
+    /// [`Self::supports_job_output_from_pool`].
     pub async fn supports_job_output<'e, E>(&self, executor: E) -> Result<bool, AwaError>
     where
         E: sqlx::PgExecutor<'e>,
@@ -4199,10 +4237,29 @@ impl QueueStorage {
         if let Some(supported) = self.cached_job_output_columns() {
             return Ok(supported);
         }
+        self.probe_job_output_columns(executor).await
+    }
+
+    /// [`Self::supports_job_output`] for a pool caller: concurrent cache
+    /// misses wait for one probe instead of each taking a connection for
+    /// their own. The probe holds the single-flight lock while it waits for a
+    /// connection; transaction callers never wait on that lock, so the
+    /// connection they hold is always released.
+    pub async fn supports_job_output_from_pool(&self, pool: &PgPool) -> Result<bool, AwaError> {
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
         let _probe = self.job_output_probe.lock().await;
         if let Some(supported) = self.cached_job_output_columns() {
             return Ok(supported);
         }
+        self.probe_job_output_columns(pool).await
+    }
+
+    async fn probe_job_output_columns<'e, E>(&self, executor: E) -> Result<bool, AwaError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
         self.job_output_probes.fetch_add(1, Ordering::Relaxed);
         let supported: bool = sqlx::query_scalar(
             r#"
@@ -16068,7 +16125,7 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
         let schema = self.schema();
-        let output_column = if include_output && self.supports_job_output(pool).await? {
+        let output_column = if include_output && self.supports_job_output_from_pool(pool).await? {
             ",\n                output"
         } else {
             ""

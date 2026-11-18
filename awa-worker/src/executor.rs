@@ -1264,7 +1264,9 @@ async fn output_storable(
     match storage {
         RuntimeStorage::Canonical => Ok(false),
         RuntimeStorage::QueueStorage(_) if !matches!(result, Ok(JobResult::Completed)) => Ok(true),
-        RuntimeStorage::QueueStorage(runtime) => runtime.store.supports_job_output(pool).await,
+        RuntimeStorage::QueueStorage(runtime) => {
+            runtime.store.supports_job_output_from_pool(pool).await
+        }
     }
 }
 

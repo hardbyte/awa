@@ -341,7 +341,7 @@ impl TestClient {
         // schema has the output columns; a failure's rides its error entry.
         let mut claimed = claimed;
         claimed.job.output = match &output {
-            Some(_) if store.supports_job_output(&self.pool).await? => output.clone(),
+            Some(_) if store.supports_job_output_from_pool(&self.pool).await? => output.clone(),
             _ => None,
         };
         let failure =
