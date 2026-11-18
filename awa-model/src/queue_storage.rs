@@ -10061,14 +10061,16 @@ impl QueueStorage {
                 .cancel_available_chunk_tx(&mut tx, &mut lanes, scope, batch_size)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
-            self.skip_spent_claim_prefixes(pool, &lanes).await?;
             drained += cancelled as u64;
+            self.skip_spent_claim_prefixes_after_commit(pool, &lanes)
+                .await;
             if (cancelled as i64) < batch_size {
                 break;
             }
             lanes.retain(|lane| lane.from_seq < lane.to_seq);
         }
-        self.skip_spent_claim_prefixes(pool, &drained_lanes).await?;
+        self.skip_spent_claim_prefixes_after_commit(pool, &drained_lanes)
+            .await;
 
         Ok(drained)
     }
@@ -10258,8 +10260,9 @@ impl QueueStorage {
                             .drain_ready_remaining_tx(&mut tx, &lanes, cursor)
                             .await?;
                     tx.commit().await.map_err(map_sqlx_error)?;
-                    self.skip_spent_claim_prefixes(pool, &lanes).await?;
                     batch.count = cancelled as u64;
+                    self.skip_spent_claim_prefixes_after_commit(pool, &lanes)
+                        .await;
                     batch.done = !remaining;
                     batch.busy = remaining && cancelled == 0;
                     return Ok(batch);
@@ -10711,6 +10714,22 @@ impl QueueStorage {
             });
         }
         Ok(())
+    }
+
+    /// [`Self::skip_spent_claim_prefixes`] after the cancellations of
+    /// `lanes` have committed. Moving the cursors only saves claims from
+    /// crossing rows that are already spent, so a failure is logged, not
+    /// returned: the caller must still see the committed count. The next
+    /// drain batch moves the cursors over the same rows again, and a claim
+    /// crosses them in any case.
+    async fn skip_spent_claim_prefixes_after_commit(&self, pool: &PgPool, lanes: &[DrainLane]) {
+        if let Err(err) = self.skip_spent_claim_prefixes(pool, lanes).await {
+            tracing::warn!(
+                error = ?err,
+                lanes = lanes.len(),
+                "failed to move queue-storage claim cursors over drained rows after the drain committed"
+            );
+        }
     }
 
     /// The statement behind [`Self::skip_spent_claim_prefixes`] and

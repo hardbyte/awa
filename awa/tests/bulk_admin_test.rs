@@ -1389,3 +1389,86 @@ async fn drain_leaves_new_jobs_beside_an_explicit_id_canonical() {
 async fn drain_leaves_new_jobs_beside_an_explicit_id_queue_storage() {
     drain_leaves_new_jobs_beside_an_explicit_id(Engine::QueueStorage).await;
 }
+
+/// Make every claim-cursor move of `queue`'s lanes fail, by wrapping
+/// `awa.set_sequence_next`, until [`restore_claim_cursor_moves`].
+async fn break_claim_cursor_moves(pool: &PgPool, queue: &str) {
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT seq_name FROM awa.queue_claim_heads WHERE queue = $1")
+            .bind(queue)
+            .fetch_all(pool)
+            .await
+            .expect("claim sequence names");
+    assert!(!names.is_empty(), "the queue has a lane");
+    let names = names
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(
+        "ALTER FUNCTION awa.set_sequence_next(text, bigint) RENAME TO set_sequence_next_unbroken",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("rename set_sequence_next");
+    sqlx::query(&format!(
+        r#"
+        CREATE FUNCTION awa.set_sequence_next(p_seq_name TEXT, p_next BIGINT)
+        RETURNS VOID LANGUAGE plpgsql AS $$
+        BEGIN
+            IF p_seq_name IN ({names}) THEN
+                RAISE EXCEPTION 'claim cursor move refused by the test';
+            END IF;
+            PERFORM awa.set_sequence_next_unbroken(p_seq_name, p_next);
+        END
+        $$
+        "#
+    ))
+    .execute(&mut *tx)
+    .await
+    .expect("wrap set_sequence_next");
+    tx.commit().await.expect("commit");
+}
+
+async fn restore_claim_cursor_moves(pool: &PgPool) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("DROP FUNCTION awa.set_sequence_next(text, bigint)")
+        .execute(&mut *tx)
+        .await
+        .expect("drop wrapper");
+    sqlx::query(
+        "ALTER FUNCTION awa.set_sequence_next_unbroken(text, bigint) RENAME TO set_sequence_next",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("restore set_sequence_next");
+    tx.commit().await.expect("commit");
+}
+
+/// A queue-storage drain moves the claim cursors over the rows it cancelled
+/// after it commits them. When that move fails, the drain still reports the
+/// committed cancellations instead of an error that would hide them.
+#[tokio::test]
+async fn drain_reports_committed_cancellations_when_moving_claim_cursors_fails() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_drain_cursor_move");
+
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 3).await;
+    break_claim_cursor_moves(&pool, &queue).await;
+    let batch = admin::drain_queue_batch(&pool, &queue, 10, BulkCursor::default()).await;
+    restore_claim_cursor_moves(&pool).await;
+    let batch = batch.expect("drain_queue_batch reports the committed batch");
+    assert_eq!((batch.count, batch.done), (3, true));
+    assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 3);
+
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+    break_claim_cursor_moves(&pool, &queue).await;
+    let drained = admin::drain_queue(&pool, &queue).await;
+    restore_claim_cursor_moves(&pool).await;
+    assert_eq!(drained.expect("drain_queue reports the committed count"), 2);
+    assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 2);
+
+    setup::clean_queue(&pool, &queue).await;
+}
