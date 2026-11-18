@@ -374,3 +374,127 @@ async fn promotion_and_fresh_enqueue_of_one_key_do_not_deadlock() {
     drop_claim(&pool, &key).await;
     setup::clean_queue(&pool, &queue).await;
 }
+
+/// A batch with a ready job and a scheduled unique job claims the scheduled
+/// job's key before reserving the ready job's lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_batch_claims_scheduled_keys_before_reserving_lanes() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    for copy in [false, true] {
+        let queue = unique_queue("claim_lane_mixed_batch");
+        let key =
+            awa::model::unique::compute_unique_key("claim_lane_job", Some(&queue), None, None);
+        provision_lane(&pool, &queue).await;
+        let jobs = vec![
+            InsertParams {
+                kind: "claim_lane_ready".to_string(),
+                args: serde_json::json!({}),
+                opts: InsertOpts {
+                    queue: queue.clone(),
+                    priority: PRIORITY,
+                    ..Default::default()
+                },
+            },
+            InsertParams {
+                kind: "claim_lane_job".to_string(),
+                args: serde_json::json!({}),
+                opts: InsertOpts {
+                    queue: queue.clone(),
+                    priority: PRIORITY,
+                    run_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    unique: Some(UniqueOpts {
+                        by_queue: true,
+                        by_args: false,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let result = race_fresh_enqueue(&pool, &queue, &key, {
+            let pool = pool.clone();
+            async move {
+                let storage =
+                    QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+                if copy {
+                    storage.enqueue_params_copy(&pool, &jobs).await
+                } else {
+                    storage.enqueue_params_batch(&pool, &jobs).await
+                }
+            }
+        })
+        .await;
+        assert_unique_conflict(
+            result,
+            if copy {
+                "enqueue_params_copy"
+            } else {
+                "enqueue_params_batch"
+            },
+        );
+
+        drop_claim(&pool, &key).await;
+        setup::clean_queue(&pool, &queue).await;
+    }
+}
+
+/// Of two DLQ rows with one unique key, the one that owns the key is retried
+/// even when the other has the lower job ID.
+#[tokio::test]
+async fn dlq_batch_retry_keeps_the_key_owner_among_same_key_rows() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_dlq_owner");
+    let key = format!("claim-lane-{queue}").into_bytes();
+    let mut ids = Vec::new();
+    // available only, then failed | available
+    for mask in ["01000000", "01000100"] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO awa.dlq_entries (
+                 job_id, kind, queue, priority, dlq_reason, original_run_lease,
+                 unique_key, unique_states
+             )
+             VALUES (nextval('awa.job_id_seq'), 'claim_lane_job', $1, $2, 'seeded', 1, $3, $4::bit(8))
+             RETURNING job_id",
+        )
+        .bind(&queue)
+        .bind(PRIORITY)
+        .bind(&key)
+        .bind(mask)
+        .fetch_one(&pool)
+        .await
+        .expect("seed dlq row");
+        ids.push(id);
+    }
+    let (other, owner) = (ids[0], ids[1]);
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(&key)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("the failed row owns the key");
+
+    let filter = ListDlqFilter {
+        queue: Some(queue.clone()),
+        ..Default::default()
+    };
+    let result = dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, BulkCursor::default())
+        .await
+        .expect("batch retry");
+    assert_eq!(
+        (result.count, result.skipped, result.conflicts.clone()),
+        (1, 1, vec![other])
+    );
+    let claim: i64 =
+        sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("claim");
+    assert_eq!(claim, owner);
+
+    drop_claim(&pool, &key).await;
+    setup::clean_queue(&pool, &queue).await;
+}

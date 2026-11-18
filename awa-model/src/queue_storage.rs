@@ -5564,13 +5564,44 @@ impl QueueStorage {
         }
         changes.sort_unstable();
 
+        let contested: Vec<&[u8]> = changes
+            .windows(2)
+            .filter(|pair| pair[0].1 && pair[1].1 && pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+            .collect();
+        let owners: HashMap<Vec<u8>, i64> = if contested.is_empty() {
+            HashMap::new()
+        } else {
+            sqlx::query_as::<_, (Vec<u8>, i64)>(
+                "SELECT unique_key, job_id FROM awa.job_unique_claims WHERE unique_key = ANY($1)",
+            )
+            .bind(&contested)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .collect()
+        };
+        // Among rows claiming the same key, the one that owns it wins;
+        // otherwise the lowest job ID does.
+        let mut winners: HashMap<&[u8], i64> = HashMap::new();
+        for (key, claim, job_id) in &changes {
+            if !*claim {
+                continue;
+            }
+            let winner = winners.entry(*key).or_insert(*job_id);
+            if owners.get(*key) == Some(job_id) {
+                *winner = *job_id;
+            }
+        }
+
         let mut pending: Vec<(&[u8], i64)> = Vec::new();
         for (key, claim, job_id) in changes {
             if claim {
-                if pending.last().is_some_and(|(last, _)| *last == key) {
-                    conflicts.insert(job_id);
-                } else {
+                if winners.get(key) == Some(&job_id) {
                     pending.push((key, job_id));
+                } else {
+                    conflicts.insert(job_id);
                 }
                 continue;
             }
@@ -6461,11 +6492,8 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
-        if !ready_rows.is_empty() {
-            total += self
-                .insert_ready_rows_tx(&mut tx, ready_rows.clone())
-                .await?;
-        }
+        // Deferred rows claim unique keys without reserving a lane, so they
+        // go first: no key is claimed after a lane is held.
         if !deferred_rows.is_empty() {
             let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
             let deferred_rows: Vec<_> = deferred_rows
@@ -6475,6 +6503,11 @@ impl QueueStorage {
                 .collect();
             total += self
                 .insert_deferred_rows_tx(&mut tx, deferred_rows, None)
+                .await?;
+        }
+        if !ready_rows.is_empty() {
+            total += self
+                .insert_ready_rows_tx(&mut tx, ready_rows.clone())
                 .await?;
         }
 
@@ -6568,11 +6601,8 @@ impl QueueStorage {
             .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
             .await?;
         let (ready_job_ids, deferred_job_ids) = job_ids.split_at(ready_rows.len());
-        if !ready_rows.is_empty() {
-            total += self
-                .insert_ready_rows_copy_tx(&mut tx, ready_rows, ready_job_ids.to_vec())
-                .await?;
-        }
+        // As in `enqueue_params_batch`, deferred rows claim their keys
+        // before any ready row reserves a lane.
         if !deferred_rows.is_empty() {
             let deferred_rows: Vec<_> = deferred_rows
                 .into_iter()
@@ -6581,6 +6611,11 @@ impl QueueStorage {
                 .collect();
             total += self
                 .insert_deferred_rows_copy_tx(&mut tx, deferred_rows)
+                .await?;
+        }
+        if !ready_rows.is_empty() {
+            total += self
+                .insert_ready_rows_copy_tx(&mut tx, ready_rows, ready_job_ids.to_vec())
                 .await?;
         }
 
