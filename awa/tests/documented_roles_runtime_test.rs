@@ -287,8 +287,8 @@ async fn wait_for_states(
                 if reached.contains_key(id) {
                     continue;
                 }
-                let row = store.load_job(pool, *id).await.unwrap().map(|job| {
-                    format!(
+                let row = match store.load_job(pool, *id).await {
+                    Ok(Some(job)) => format!(
                         "args {}, state {:?}, attempt {}/{}, run_at {}, errors {:?}, progress {:?}",
                         job.args,
                         job.state,
@@ -297,12 +297,11 @@ async fn wait_for_states(
                         job.run_at,
                         job.errors,
                         job.progress
-                    )
-                });
-                missing.push(format!(
-                    "job {id}, want {want:?}: {}",
-                    row.unwrap_or_else(|| "no row".into())
-                ));
+                    ),
+                    Ok(None) => "no row".into(),
+                    Err(err) => format!("read failed: {err}"),
+                };
+                missing.push(format!("job {id}, want {want:?}: {row}"));
             }
             panic!(
                 "jobs never reached their expected states:\n{}\nruntime warnings and errors:\n{}",
