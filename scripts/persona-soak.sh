@@ -33,6 +33,15 @@
 #   AWA_SOAK_HEARTBEAT_SECONDS, AWA_SOAK_STALENESS_SECONDS
 #                             heartbeat interval and heartbeat staleness of every runtime (default 2 s
 #                             and 12 s, so rescues happen often; the library's are 30 s and 90 s)
+#   AWA_SOAK_MEMORY_SLOPE_MIB_PER_100K, AWA_SOAK_MEMORY_WARMUP_SECONDS,
+#   AWA_SOAK_MEMORY_MIN_EXECUTIONS, AWA_SOAK_MEMORY_SAMPLE_SECONDS
+#                             memory growth gate: largest accepted growth of the soak process's
+#                             resident memory per 100k executions after the warm-up (default 64 MiB,
+#                             120 s warm-up, evaluated from 20000 executions, sampled every 5 s)
+#   AWA_SOAK_COMPLETION_STALL_SECONDS, AWA_SOAK_COMPLETION_STALL_MEMORY_MIB
+#                             halfway through the load, hold back queue-storage completions for this
+#                             many seconds while claims continue (default 0: off); resident memory
+#                             may rise by at most the given MiB over the stall (default 128)
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)
