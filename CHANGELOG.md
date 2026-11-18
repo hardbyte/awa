@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-- `awa migrate` applies one new repeatable patch, `spent_claim_prefix_gaps`, which replaces `awa.install_queue_storage_substrate` and `claim_ready_runtime` in every queue-storage schema and takes no table lock. Versioned migration files are byte-for-byte those of 0.6.18. External migration runners apply `R__spent_claim_prefix_gaps.sql` after `V40` and after every other `R__` script (its name sorts last but for `R__wait_free_dirty_marks.sql`, which it does not depend on), as the owner of the installer and claim functions. 0.6.18 binaries run unchanged on the patched schema.
+- `awa migrate` applies one new repeatable patch, `spent_claim_prefix_gaps`, which replaces `awa.install_queue_storage_substrate` and `claim_ready_runtime` in every queue-storage schema and takes no table lock. Versioned migration files are byte-for-byte those of 0.6.18. External migration runners apply `R__spent_claim_prefix_gaps.sql` after `V40` and after every other `R__` script (its name sorts last but for `R__wait_free_dirty_marks.sql`, which it does not depend on), as the owner of the installer and claim functions. A runner that re-runs only changed repeatables, such as Flyway, must re-run it whenever it re-runs a patch that embeds the installer; with Flyway, also install it as an `afterMigrate` callback. 0.6.18 binaries run unchanged on the patched schema.
 
 ### Fixed
 

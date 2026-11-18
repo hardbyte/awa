@@ -943,15 +943,12 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
     if current <= CURRENT_VERSION {
         let before = schema_patch_status_conn(conn).await?;
         let mut applied_this_run = Vec::new();
-        for patch in SCHEMA_PATCHES {
-            // Probed just before applying, since an earlier patch in this
-            // run may have undone it.
-            let applied: bool = sqlx::query_scalar(patch.applied_probe)
-                .fetch_one(&mut *conn)
-                .await?;
-            if applied {
+        let mut installer_restored = false;
+        for (status, patch) in before.iter().zip(SCHEMA_PATCHES) {
+            if status.applied && !(installer_restored && rewrites_installer(patch)) {
                 continue;
             }
+            installer_restored |= embeds_installer(patch);
             info!(
                 patch = patch.name,
                 description = patch.description,

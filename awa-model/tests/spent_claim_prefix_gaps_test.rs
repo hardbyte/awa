@@ -203,3 +203,59 @@ async fn claim_spent_prefix_patch_crosses_rolled_back_reservations(pool: PgPool)
     }
     Ok(())
 }
+
+#[sqlx::test(migrations = false)]
+async fn patch_waits_for_a_held_install_lock_only_up_to_lock_timeout(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    let patch = migrations::SCHEMA_PATCHES
+        .iter()
+        .find(|patch| patch.name == PATCH)
+        .expect("the patch is registered");
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "gap_locked".into(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        ..Default::default()
+    })?;
+    store.install(&pool).await?;
+    let (_, installed) = claim_function(&pool, "gap_locked").await?;
+    sqlx::raw_sql(&installed.replace(PATCHED_PREFIX, RELEASED_PREFIX))
+        .execute(&pool)
+        .await?;
+
+    let mut holder = pool.begin().await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('awa.queue_storage.install:gap_locked', 0))",
+    )
+    .execute(&mut *holder)
+    .await?;
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SET lock_timeout = 0")
+        .execute(&mut *conn)
+        .await?;
+    let started = std::time::Instant::now();
+    let error = sqlx::raw_sql(patch.sql)
+        .execute(&mut *conn)
+        .await
+        .expect_err("the held install lock times the patch out");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let database = error.as_database_error().expect("a database error");
+    assert_eq!(database.code().as_deref(), Some("55P03"));
+    assert!(database.message().contains("gap_locked"), "{database}");
+    let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+        .fetch_one(&mut *conn)
+        .await?;
+    assert_eq!(lock_timeout, "0", "the session setting is unchanged");
+    assert_eq!(
+        patch_pending(&pool).await?,
+        vec!["claim function gap_locked.claim_ready_runtime".to_string()],
+        "a timed-out patch changes nothing"
+    );
+
+    holder.rollback().await?;
+    sqlx::raw_sql(patch.sql).execute(&mut *conn).await?;
+    assert!(patch_pending(&pool).await?.is_empty());
+    Ok(())
+}

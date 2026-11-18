@@ -1153,7 +1153,9 @@ async fn released_patch_upgrade_and_rollback() {
     let mut expected_lines = vec!["Schema: v40 (unchanged)".to_string()];
     for patch in migrations::SCHEMA_PATCHES {
         let outcome = if expected_pending.contains(&patch.name)
-            && (migrate_attempts == 1 || patch.name == "replica_identity")
+            && (migrate_attempts == 1
+                || patch.name == "replica_identity"
+                || patch.name == "spent_claim_prefix_gaps")
         {
             "applied"
         } else {
