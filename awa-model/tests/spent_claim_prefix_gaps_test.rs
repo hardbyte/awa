@@ -3,7 +3,7 @@ use sqlx::PgPool;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const PATCH: &str = "claim_spent_prefix_gaps";
+const PATCH: &str = "spent_claim_prefix_gaps";
 const RELEASED_PREFIX: &str = "                    selected_with_spent.lane_seq
                         - row_number() OVER (ORDER BY selected_with_spent.lane_seq)::bigint AS prefix_group
                 FROM selected_with_spent
@@ -30,6 +30,15 @@ async fn patch_pending(pool: &PgPool) -> Result<Vec<String>, Box<dyn std::error:
         .find(|status| status.name == PATCH)
         .expect("the patch is registered")
         .needs_repair)
+}
+
+async fn installer(pool: &PgPool) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT pg_get_functiondef(
+             'awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn claim_function(pool: &PgPool, schema: &str) -> Result<(i64, String), sqlx::Error> {
@@ -114,6 +123,28 @@ async fn claim_spent_prefix_patch_crosses_rolled_back_reservations(pool: PgPool)
         .find(|patch| patch.name == PATCH)
         .expect("the patch is registered");
 
+    // An earlier patch that embeds the released v023 installer puts the
+    // released installer back.
+    sqlx::raw_sql(include_str!(
+        "../migrations/v023_install_queue_storage_substrate.sql"
+    ))
+    .execute(&pool)
+    .await?;
+    let released_installer = installer(&pool).await?;
+    assert!(released_installer.contains(RELEASED_PREFIX));
+    assert_eq!(
+        patch_pending(&pool).await?,
+        vec!["awa.install_queue_storage_substrate".to_string()],
+        "the probe names the released installer"
+    );
+    sqlx::raw_sql(patch.sql).execute(&pool).await?;
+    assert!(patch_pending(&pool).await?.is_empty());
+    assert_eq!(
+        installer(&pool).await?,
+        released_installer.replace(RELEASED_PREFIX, PATCHED_PREFIX),
+        "the patch changes only the installer's spent prefix"
+    );
+
     for receipts in [false, true] {
         let schema = if receipts {
             "gap_receipts"
@@ -130,10 +161,13 @@ async fn claim_spent_prefix_patch_crosses_rolled_back_reservations(pool: PgPool)
         })?;
         store.install(&pool).await?;
         let (oid, installed) = claim_function(&pool, schema).await?;
-        assert!(installed.contains(PATCHED_PREFIX));
+        assert!(
+            installed.contains(PATCHED_PREFIX),
+            "{schema}: a substrate installed after the patch carries the new claim"
+        );
 
-        // Put the released function body back, so the patch is exercised on
-        // an installed function and not only through the new installer.
+        // Put the released function body back, as a substrate installed
+        // before the patch has it.
         let released = installed.replace(PATCHED_PREFIX, RELEASED_PREFIX);
         sqlx::raw_sql(&released).execute(&pool).await?;
         assert_eq!(
@@ -151,7 +185,7 @@ async fn claim_spent_prefix_patch_crosses_rolled_back_reservations(pool: PgPool)
         assert_eq!(patched_oid, oid, "{schema}: replaced in place");
         assert_eq!(
             patched, installed,
-            "{schema}: patched body matches the installer"
+            "{schema}: patched body matches a fresh install"
         );
         sqlx::raw_sql(patch.sql).execute(&pool).await?;
         assert_eq!(

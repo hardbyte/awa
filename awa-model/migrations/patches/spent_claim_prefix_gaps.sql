@@ -1,4 +1,4 @@
--- Schema patch claim_spent_prefix_gaps: let a claim cross rolled-back
+-- Schema patch spent_claim_prefix_gaps: let a claim cross rolled-back
 -- reservations ahead of spent ready rows.
 --
 -- When the first ready row at or after a lane's claim cursor is spent
@@ -13,12 +13,19 @@
 -- hold its reservation lock until they end. Tracking:
 -- https://github.com/hardbyte/awa/issues/813
 --
--- Applied after the v023 definitions, whose installer writes the new spent
--- prefix into new substrates. The block below rewrites the claim functions
--- already installed in each queue-storage schema: <schema>.claim_ready_runtime
--- and each <schema>.claim_ready_slot_<n>. It replaces each function from its
--- own definition, so signature, owner, privileges and settings are unchanged,
--- and a function that already carries the new spent prefix is left alone.
+-- The versioned v023 installer is unchanged, so checksum-validating runners
+-- see the same versioned files as 0.6.18. This patch rewrites the installed
+-- definitions instead: awa.install_queue_storage_substrate, so substrates
+-- installed later carry the new claim, and, in each queue-storage schema,
+-- <schema>.claim_ready_runtime and each <schema>.claim_ready_slot_<n>. Each
+-- function is replaced from its own definition, so signature, owner,
+-- privileges, settings and comment are unchanged, and a function that already
+-- carries the new spent prefix is left alone.
+--
+-- Order: the other schema patches that embed the v023 installer replace
+-- awa.install_queue_storage_substrate with the released body, so this patch
+-- runs after all of them. `awa migrate` applies it last, and its R__ name
+-- sorts after theirs for runners that order repeatables by name.
 --
 -- Live load: function replacement only. It takes no lock on any awa or
 -- queue-storage table and its work scales with the number of claim functions,
@@ -33,8 +40,8 @@
 -- runners. Function names, arguments, results and the claim protocol are
 -- unchanged, so released 0.6 binaries run the same against a patched or an
 -- unpatched schema, and maintenance cursor advances of either release read
--- the same evidence. Run it as the owner of the claim functions, or as a
--- migrator that can SET ROLE to it.
+-- the same evidence. Run it as the owner of the installer and the claim
+-- functions, or as a migrator that can SET ROLE to them.
 
 DO $$
 DECLARE
@@ -42,7 +49,20 @@ DECLARE
     v_function RECORD;
     v_definition TEXT;
     v_updated TEXT;
+    v_old CONSTANT TEXT := 'selected_with_spent[.]lane_seq[[:space:]]+-[[:space:]]+row_number[(][)][[:space:]]+OVER[[:space:]]+[(]ORDER BY selected_with_spent[.]lane_seq[)]::bigint[[:space:]]+AS[[:space:]]+prefix_group([[:space:]]+)FROM[[:space:]]+selected_with_spent[[:space:]]+WHERE[[:space:]]+attempt_spent([[:space:]]+[)][[:space:]]+SELECT[[:space:]]+max[(]spent_prefix[.]lane_seq[)][[:space:]]+[+][[:space:]]+1[[:space:]]+INTO[[:space:]]+v_spent_next_seq[[:space:]]+FROM[[:space:]]+spent_prefix[[:space:]]+)WHERE[[:space:]]+prefix_group[[:space:]]+=[[:space:]]+v_lane_claim_seq[[:space:]]+-[[:space:]]+1;';
+    v_new CONSTANT TEXT := 'count(*) FILTER (WHERE NOT selected_with_spent.attempt_spent)
+                        OVER (ORDER BY selected_with_spent.lane_seq) AS unspent_through\1FROM selected_with_spent\2WHERE unspent_through = 0;';
 BEGIN
+    IF to_regprocedure('awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)') IS NOT NULL THEN
+        v_definition := pg_get_functiondef(
+            'awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)'::regprocedure
+        );
+        v_updated := regexp_replace(v_definition, v_old, v_new, 'g');
+        IF v_updated <> v_definition THEN
+            EXECUTE v_updated;
+        END IF;
+    END IF;
+
     FOR v_schema IN
         SELECT n.nspname
         FROM pg_namespace AS n
@@ -79,13 +99,7 @@ BEGIN
             ORDER BY p.oid
         LOOP
             v_definition := pg_get_functiondef(v_function.oid);
-            v_updated := regexp_replace(
-                v_definition,
-                'selected_with_spent[.]lane_seq[[:space:]]+-[[:space:]]+row_number[(][)][[:space:]]+OVER[[:space:]]+[(]ORDER BY selected_with_spent[.]lane_seq[)]::bigint[[:space:]]+AS[[:space:]]+prefix_group([[:space:]]+)FROM[[:space:]]+selected_with_spent[[:space:]]+WHERE[[:space:]]+attempt_spent([[:space:]]+[)][[:space:]]+SELECT[[:space:]]+max[(]spent_prefix[.]lane_seq[)][[:space:]]+[+][[:space:]]+1[[:space:]]+INTO[[:space:]]+v_spent_next_seq[[:space:]]+FROM[[:space:]]+spent_prefix[[:space:]]+)WHERE[[:space:]]+prefix_group[[:space:]]+=[[:space:]]+v_lane_claim_seq[[:space:]]+-[[:space:]]+1;',
-                'count(*) FILTER (WHERE NOT selected_with_spent.attempt_spent)
-                        OVER (ORDER BY selected_with_spent.lane_seq) AS unspent_through\1FROM selected_with_spent\2WHERE unspent_through = 0;',
-                'g'
-            );
+            v_updated := regexp_replace(v_definition, v_old, v_new, 'g');
             IF v_updated <> v_definition THEN
                 EXECUTE v_updated;
             END IF;
