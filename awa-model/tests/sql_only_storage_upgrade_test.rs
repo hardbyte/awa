@@ -837,7 +837,7 @@ async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
     .await
     .expect("duplicate-claim snooze");
     let successor2 = match outcome {
-        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
+        RescheduleOutcome::CancelledDuplicate { job_id, .. } => job_id,
         other => panic!("expected CancelledDuplicate, got {other:?}"),
     };
     assert_eq!(
@@ -1061,5 +1061,96 @@ async fn callback_carrying_job_is_not_migrated_to_queue_storage() {
         .execute(&pool)
         .await
         .expect("cleanup callback job");
+    finalize_after_test(&pool).await;
+}
+
+/// A migrated snooze cancelled as a duplicate under a mask that claims
+/// `cancelled` keeps its unique key, so a retry of the successor re-checks
+/// ownership; the outcome carries the stored row.
+#[tokio::test]
+async fn migrated_duplicate_cancellation_keeps_its_key_for_retry() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+    use awa_model::{admin, AwaError, JobState};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    enter_mixed_transition_for_test(&pool).await;
+
+    let key = b"reschedule-dup-cancelled-mask-key";
+    // scheduled | available | cancelled; running does not claim.
+    let job = seed_canonical_running_job_with_mask(&pool, key, 8, "11000010").await;
+    let holder: i64 = 987_655;
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key.to_vec())
+        .bind(holder)
+        .execute(&pool)
+        .await
+        .expect("newer duplicate takes the claim");
+
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job,
+        8,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("duplicate-claim snooze");
+    let (successor, persisted) = match outcome {
+        RescheduleOutcome::CancelledDuplicate {
+            job_id,
+            job: Some(job),
+        } => (job_id, *job),
+        other => panic!("expected CancelledDuplicate with its stored row, got {other:?}"),
+    };
+    let stored = admin::get_job(&pool, successor)
+        .await
+        .expect("stored successor");
+    assert_eq!(
+        (
+            persisted.id,
+            persisted.state,
+            persisted.attempt,
+            persisted.run_at,
+            persisted.errors.clone(),
+            persisted.unique_key.clone(),
+        ),
+        (
+            stored.id,
+            stored.state,
+            stored.attempt,
+            stored.run_at,
+            stored.errors.clone(),
+            stored.unique_key.clone(),
+        ),
+        "the outcome carries the row a read returns"
+    );
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert_eq!(stored.unique_key.as_deref(), Some(&key[..]));
+
+    let retried = admin::retry(&pool, successor).await;
+    assert!(
+        matches!(retried, Err(AwaError::UniqueConflict { .. })),
+        "retry while the newer job holds the key must conflict, got {retried:?}"
+    );
+    assert_eq!(claim_holder(&pool, key).await, Some(holder));
+
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(key.to_vec())
+        .execute(&pool)
+        .await
+        .expect("the newer job releases the key");
+    admin::retry(&pool, successor)
+        .await
+        .expect("retry once the key is free")
+        .expect("retried successor");
+    assert_eq!(claim_holder(&pool, key).await, Some(successor));
+
+    sqlx::query("SELECT awa.delete_job_compat($1)")
+        .bind(successor)
+        .execute(&pool)
+        .await
+        .expect("delete retried successor");
     finalize_after_test(&pool).await;
 }

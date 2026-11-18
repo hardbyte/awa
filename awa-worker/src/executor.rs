@@ -1394,10 +1394,15 @@ async fn complete_job_canonical(
                 job.unique_key.as_deref(),
             )
             .await?;
-            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+            if let RescheduleOutcome::CancelledDuplicate {
+                job_id,
+                job: persisted,
+            } = outcome
+            {
                 let cancelled = duplicate_cancelled_event_row(
                     job,
                     job_id,
+                    persisted,
                     Reschedule::RetryAfter {
                         delay_secs: seconds,
                     },
@@ -1470,10 +1475,15 @@ async fn complete_job_canonical(
                 job.unique_key.as_deref(),
             )
             .await?;
-            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+            if let RescheduleOutcome::CancelledDuplicate {
+                job_id,
+                job: persisted,
+            } = outcome
+            {
                 let cancelled = duplicate_cancelled_event_row(
                     job,
                     job_id,
+                    persisted,
                     Reschedule::Snooze {
                         delay_secs: seconds,
                     },
@@ -1909,10 +1919,15 @@ async fn complete_job_canonical(
                     job.unique_key.as_deref(),
                 )
                 .await?;
-                if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                if let RescheduleOutcome::CancelledDuplicate {
+                    job_id,
+                    job: persisted,
+                } = outcome
+                {
                     let cancelled = duplicate_cancelled_event_row(
                         job,
                         job_id,
+                        persisted,
                         Reschedule::RetryBackoff,
                         Some(&error_entry),
                         progress_snapshot.clone(),
@@ -2001,14 +2016,19 @@ fn rescheduled_event_row(
 }
 
 /// The job as a read returns it after a canonical snooze or retry was
-/// cancelled because a newer duplicate holds its unique claim.
+/// cancelled because a newer duplicate holds its unique claim: the stored
+/// row when there is one, otherwise the canonical row as cancelled in place.
 fn duplicate_cancelled_event_row(
     job: &JobRow,
     job_id: i64,
+    persisted: Option<Box<JobRow>>,
     reschedule: Reschedule,
     error: Option<&serde_json::Value>,
     progress: Option<serde_json::Value>,
 ) -> JobRow {
+    if let Some(persisted) = persisted {
+        return *persisted;
+    }
     let now = chrono::Utc::now();
     let mut row = job.clone();
     row.id = job_id;
@@ -3319,11 +3339,15 @@ async fn retry_after_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate { job_id } => {
+        RescheduleOutcome::CancelledDuplicate {
+            job_id,
+            job: persisted,
+        } => {
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,
                 job_id,
+                persisted,
                 Reschedule::RetryAfter {
                     delay_secs: seconds,
                 },
@@ -3494,11 +3518,15 @@ async fn retry_backoff_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate { job_id } => {
+        RescheduleOutcome::CancelledDuplicate {
+            job_id,
+            job: persisted,
+        } => {
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,
                 job_id,
+                persisted,
                 Reschedule::RetryBackoff,
                 Some(&error_entry),
                 progress_snapshot.cloned(),

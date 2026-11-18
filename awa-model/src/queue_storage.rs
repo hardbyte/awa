@@ -1893,6 +1893,15 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+/// `unique_states` with `state`'s bit cleared.
+fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
+    let mut bitmask = unique_states?.into_bytes();
+    if let Some(bit) = bitmask.get_mut(state.bit_position() as usize) {
+        *bit = b'0';
+    }
+    String::from_utf8(bitmask).ok()
+}
+
 fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
     if value.contains(',')
         || value.contains('"')
@@ -16213,10 +16222,8 @@ impl QueueStorage {
         }
 
         // If `cancelled` itself claims uniqueness, the newer holder still
-        // wins. The cancelled evidence carries no claim to release, so strip
-        // the uniqueness fields exactly like rescue duplicate cancellation.
-        done.unique_key = None;
-        done.unique_states = None;
+        // wins. The row keeps its key, so a retry re-checks ownership.
+        done.unique_states = unique_states_without(done.unique_states, JobState::Cancelled);
         self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
             .await?;
         done.into_job_row()
@@ -16519,10 +16526,8 @@ impl QueueStorage {
     /// its unique claim to a newer duplicate. `cancelled` normally sits
     /// outside the claiming mask so the insert is conflict-free; a mask that
     /// claims `cancelled` as well conflicts again, and then the row is
-    /// written with its unique key stripped — the attempt held no claim
-    /// (that is what made it conflict), so there is nothing to release, and
-    /// losing the key on this terminal row beats aborting rescue for the
-    /// whole cluster.
+    /// written with `cancelled` cleared from its mask. It keeps its unique
+    /// key, so a later retry re-checks ownership of it.
     async fn cancel_rescued_duplicate_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -16553,8 +16558,7 @@ impl QueueStorage {
         }
 
         let mut stripped = done;
-        stripped.unique_key = None;
-        stripped.unique_states = None;
+        stripped.unique_states = unique_states_without(stripped.unique_states, JobState::Cancelled);
         self.insert_done_rows_tx(tx, std::slice::from_ref(&stripped), Some(old_state))
             .await?;
         stripped.into_job_row()
