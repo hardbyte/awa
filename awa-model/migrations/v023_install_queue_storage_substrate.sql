@@ -4187,20 +4187,23 @@ BEGIN
             spent_prefix AS (
                 SELECT
                     selected_with_spent.lane_seq,
-                    selected_with_spent.lane_seq
-                        - row_number() OVER (ORDER BY selected_with_spent.lane_seq)::bigint AS prefix_group
+                    count(*) FILTER (WHERE NOT selected_with_spent.attempt_spent)
+                        OVER (ORDER BY selected_with_spent.lane_seq) AS unspent_through
                 FROM selected_with_spent
-                WHERE attempt_spent
             )
             SELECT max(spent_prefix.lane_seq) + 1
             INTO v_spent_next_seq
             FROM spent_prefix
-            WHERE prefix_group = v_lane_claim_seq - 1;
+            WHERE unspent_through = 0;
 
                 IF v_spent_next_seq IS NOT NULL THEN
-                    -- Safe in-transaction sequence movement: only skip a
-                    -- contiguous prefix of attempts with already-committed
-                    -- evidence. Later spent/tombstoned lanes cannot move the
+                    -- Safe in-transaction sequence movement: only skip the
+                    -- leading run of committed rows with already-committed
+                    -- spent evidence, and the rolled-back reservations before
+                    -- and between them: a lane's enqueues hold its
+                    -- reservation lock until they end, so a committed row
+                    -- follows only ended reservations. Later
+                    -- spent/tombstoned lanes cannot move the
                     -- cursor past an earlier live row, because the surrounding
                     -- claim transaction could still abort.
                     PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_spent_next_seq);

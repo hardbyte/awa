@@ -2,6 +2,16 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [Unreleased]
+
+### Upgrading
+
+- `awa migrate` applies one new repeatable patch, `claim_spent_prefix_gaps`, which replaces `claim_ready_runtime` in every queue-storage schema and takes no table lock. External migration runners apply `R__claim_spent_prefix_gaps.sql` after `V40` and before `R__replica_identity.sql`, as the owner of the claim functions. 0.6.18 binaries run unchanged on the patched schema.
+
+### Fixed
+
+- **A rolled-back insert followed by a cancelled or deleted job no longer stops a queue-storage queue from claiming (#813).** When a lane's next position belonged to an insert that rolled back and the job after it had been cancelled, deleted, moved or reprioritised before anything claimed it, every claim on that queue returned no jobs, on every priority and enqueue shard. On 0.6.18 the maintenance leader released the queue after about 15 s with default settings (`queue_slot_count` × `queue_rotate_interval`), and not at all while `maintenance.prune` was halted; on earlier 0.6 releases the queue stayed stuck until something else moved the lane's cursor. Claims now step over the rolled-back positions once the schema patch is applied. Canonical storage was not affected.
+
 ## [0.6.18] — 2026-11-18
 
 Recommended for everyone on 0.6.17 using queue storage, and especially if you run more than one queue stripe, publish the awa schema for logical replication, or see retry storms. Jobs inserted through the compatibility path into a striped queue were never claimed; that is fixed. An idle runtime now costs the database far less: in a comparison against 0.6.17 on PostgreSQL 18, idle transactions fell from 60 to 26 a second and idle WAL by about 60%, and with 200 idle queues from about 670 to 125 transactions a second. A retry storm no longer floods the connection pool, completing 230 to 300 jobs a second where 0.6.17 completed 90 to 150. Moving, reprioritising or cancelling the jobs of a stuck lane now lets the queue ring reclaim storage again. Saturation throughput and claim latency match or improve on 0.6.17. One new schema patch takes brief table locks when `awa migrate` applies it; see the [upgrade guide](docs/upgrade-0.6.17-to-0.6.18.md).

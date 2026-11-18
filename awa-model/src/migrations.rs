@@ -423,6 +423,32 @@ macro_rules! correlated_claim_tombstones_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `claim_spent_prefix_gaps` patch: the
+/// installer, and each claim function of an installed queue-storage substrate
+/// (found as for `correlated_claim_tombstones`) whose spent prefix still has to
+/// start at the claim cursor.
+macro_rules! claim_spent_prefix_gaps_pending_sql {
+    () => {
+        "SELECT 'awa.install_queue_storage_substrate'::text AS target \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc ~ 'prefix_group[[:space:]]+=[[:space:]]+v_lane_claim_seq') \
+         UNION ALL \
+         SELECT format('claim function %s.%s', n.nspname, p.proname) \
+         FROM pg_proc AS p \
+         JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+         WHERE p.prokind = 'f' \
+           AND (p.proname = 'claim_ready_runtime' OR p.proname ~ '^claim_ready_slot_[0-9]+$') \
+           AND p.prosrc ~ 'prefix_group[[:space:]]+=[[:space:]]+v_lane_claim_seq' \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'ready_tombstones' \
+                         AND c.relkind = 'p')"
+    };
+}
+
 /// Rows naming what still lacks the `replica_identity` patch: the installer,
 /// the awa tables without a primary key, and each `queue_terminal_count_deltas`
 /// table or partition of an installed queue-storage substrate (found as for
@@ -481,6 +507,10 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
         }
         "correlated_claim_tombstones" => Some(concat!(
             correlated_claim_tombstones_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        "claim_spent_prefix_gaps" => Some(concat!(
+            claim_spent_prefix_gaps_pending_sql!(),
             " ORDER BY 1"
         )),
         "replica_identity" => Some(concat!(replica_identity_pending_sql!(), " ORDER BY 1")),
@@ -604,6 +634,23 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         applied_probe: concat!(
             "SELECT NOT EXISTS (",
             correlated_claim_tombstones_pending_sql!(),
+            ")"
+        ),
+    },
+    SchemaPatch {
+        name: "claim_spent_prefix_gaps",
+        description: "Let a claim cross rolled-back reservations ahead of spent ready rows",
+        // The v023 definitions first, so the installer writes the new spent
+        // prefix into new substrates; the patch then rewrites the claim
+        // functions of every installed queue-storage schema.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/claim_spent_prefix_gaps.sql"),
+        ),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            claim_spent_prefix_gaps_pending_sql!(),
             ")"
         ),
     },

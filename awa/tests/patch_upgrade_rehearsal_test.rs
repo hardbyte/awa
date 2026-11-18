@@ -107,6 +107,7 @@ const RELEASED: &[Released] = &[
             "prune_controls",
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
+            "claim_spent_prefix_gaps",
             "replica_identity",
         ],
         observes_runtime_controls: false,
@@ -119,6 +120,7 @@ const RELEASED: &[Released] = &[
             "prune_controls",
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
+            "claim_spent_prefix_gaps",
             "replica_identity",
         ],
         observes_runtime_controls: false,
@@ -128,13 +130,14 @@ const RELEASED: &[Released] = &[
         pending_patches: &[
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
+            "claim_spent_prefix_gaps",
             "replica_identity",
         ],
         observes_runtime_controls: true,
     },
     Released {
         version: "0.6.17",
-        pending_patches: &["replica_identity"],
+        pending_patches: &["claim_spent_prefix_gaps", "replica_identity"],
         observes_runtime_controls: true,
     },
 ];
