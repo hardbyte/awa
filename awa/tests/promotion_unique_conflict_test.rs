@@ -4,15 +4,21 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+use awa::model::QueueStorage;
+use awa::worker::maintenance::QueueStoragePromoter;
+use awa::worker::AwaMetrics;
 use awa::{Client, JobArgs, JobEvent, JobResult, QueueConfig, UniqueOpts};
-use awa_model::{insert_with, migrations, InsertOpts};
+use awa::{JobState, QueueStorageConfig};
+use awa_model::{insert_many, insert_with, migrations, InsertOpts, InsertParams};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 const PROMOTION_TEST_LOCK_KEY: i64 = 0x6177_6170_726f_6d31;
@@ -206,5 +212,81 @@ async fn test_queue_storage_promotion_cancels_a_unique_duplicate_and_promotes_th
     let pool = connect().await;
     awa_testing::setup::activate_queue_storage(&pool).await;
     run_case(&pool).await;
+    awa_testing::setup::reset_runtime_backend(&pool).await;
+}
+
+/// More due rows than one promotion batch takes.
+const BACKLOG: i64 = 4_200;
+
+/// A conflict in the first batch of a backlog larger than one batch still
+/// lets one promotion pass promote the whole backlog. The canonical
+/// counterpart is a unit test of the maintenance service.
+#[tokio::test]
+async fn test_queue_storage_promotion_pass_continues_past_a_batch_with_a_duplicate() {
+    let _guard = acquire_engine_guard().await;
+    let pool = connect().await;
+    awa_testing::setup::activate_queue_storage(&pool).await;
+    clean(&pool).await;
+
+    let due = Utc::now() - chrono::Duration::seconds(60);
+    let unique = Some(UniqueOpts {
+        states: AVAILABLE_ONLY_STATES,
+        ..Default::default()
+    });
+    let job = |n: i64, run_at, unique| InsertParams {
+        kind: UcPromoteJob { n }.kind_str().to_string(),
+        args: serde_json::json!({ "n": n }),
+        opts: InsertOpts {
+            queue: PARKED_QUEUE.into(),
+            run_at,
+            unique,
+            ..Default::default()
+        },
+    };
+    let duplicate = insert_many(
+        &pool,
+        &[job(
+            1_000_000,
+            Some(due - chrono::Duration::seconds(1)),
+            unique.clone(),
+        )],
+    )
+    .await
+    .expect("insert duplicate")[0]
+        .id;
+    let holder = insert_many(&pool, &[job(1_000_000, None, unique)])
+        .await
+        .expect("insert holder")[0]
+        .id;
+    let backlog: Vec<InsertParams> = (1..=BACKLOG).map(|n| job(n, Some(due), None)).collect();
+    for chunk in backlog.chunks(1_000) {
+        insert_many(&pool, chunk).await.expect("insert backlog");
+    }
+
+    let store = Arc::new(QueueStorage::new(QueueStorageConfig::default()).expect("queue storage"));
+    let promoter = QueueStoragePromoter::new(pool.clone(), store, AwaMetrics::from_global());
+    let promoted = promoter
+        .promote_due(JobState::Scheduled, &CancellationToken::new())
+        .await
+        .expect("one promotion pass");
+    assert_eq!(promoted as i64, BACKLOG);
+    let cancelled = promoter.take_cancelled();
+    assert_eq!(
+        cancelled.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![duplicate]
+    );
+
+    let scheduled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'scheduled'",
+    )
+    .bind(PARKED_QUEUE)
+    .fetch_one(&pool)
+    .await
+    .expect("scheduled count");
+    assert_eq!(scheduled, 0);
+    assert_eq!(job_state(&pool, duplicate).await, "cancelled");
+    assert_eq!(job_state(&pool, holder).await, "available");
+
+    clean(&pool).await;
     awa_testing::setup::reset_runtime_backend(&pool).await;
 }

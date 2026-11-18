@@ -3684,7 +3684,7 @@ impl MaintenanceService {
             if self.cancel.is_cancelled() {
                 break;
             }
-            let (promoted, queues) = match self.promote_due_batch(state).await {
+            let (promoted, cancelled, queues) = match self.promote_due_batch(state).await {
                 Err(err) if is_unique_violation(&err) => {
                     warn!(
                         error = %err,
@@ -3695,16 +3695,16 @@ impl MaintenanceService {
                         self.promote_canonical_per_row(state).await?;
                     self.handle_duplicate_cancellations("promotion", &cancelled, false)
                         .await;
-                    (promoted, queues)
+                    (promoted, cancelled.len(), queues)
                 }
-                other => other.map_err(AwaError::Database)?,
+                other => {
+                    let (promoted, queues) = other.map_err(AwaError::Database)?;
+                    (promoted, 0, queues)
+                }
             };
-            if promoted == 0 {
-                break;
-            }
             promoted_total += promoted;
             notified_queues.extend(queues);
-            if promoted < PROMOTE_BATCH_SIZE as usize {
+            if promoted + cancelled < PROMOTE_BATCH_SIZE as usize {
                 break;
             }
         }
@@ -5518,6 +5518,99 @@ mod tests {
             .rollback()
             .await
             .expect("release receipt table locks");
+    }
+
+    /// A canonical promotion pass whose first batch meets a unique duplicate
+    /// cancels it and goes on to promote the rest of a backlog larger than
+    /// one batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn canonical_promotion_pass_continues_past_a_batch_with_a_duplicate() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+
+        let queue = "canonical_promote_backlog";
+        let due = Utc::now() - chrono::Duration::seconds(60);
+        let unique = Some(awa_model::UniqueOpts {
+            states: 1 << JobState::Available.bit_position(),
+            ..Default::default()
+        });
+        let job = |n: i64, run_at, unique| awa_model::InsertParams {
+            kind: "canonical_promote_backlog".to_string(),
+            args: serde_json::json!({ "n": n }),
+            opts: awa_model::InsertOpts {
+                queue: queue.to_string(),
+                run_at,
+                unique,
+                ..Default::default()
+            },
+        };
+        let duplicate = awa_model::insert_many(
+            &pool,
+            &[job(
+                0,
+                Some(due - chrono::Duration::seconds(1)),
+                unique.clone(),
+            )],
+        )
+        .await
+        .expect("insert duplicate")[0]
+            .id;
+        let holder = awa_model::insert_many(&pool, &[job(0, None, unique)])
+            .await
+            .expect("insert holder")[0]
+            .id;
+        let backlog = PROMOTE_BATCH_SIZE + 100;
+        let rows: Vec<_> = (1..=backlog).map(|n| job(n, Some(due), None)).collect();
+        for chunk in rows.chunks(1_000) {
+            awa_model::insert_many(&pool, chunk)
+                .await
+                .expect("insert backlog");
+        }
+
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::Canonical,
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        );
+        let mut queues = HashSet::new();
+        let promoted = service
+            .promote_canonical_due("scheduled", &mut queues)
+            .await
+            .expect("one promotion pass");
+        assert_eq!(promoted as i64, backlog);
+
+        let scheduled: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM awa.scheduled_jobs WHERE queue = $1")
+                .bind(queue)
+                .fetch_one(&pool)
+                .await
+                .expect("scheduled count");
+        assert_eq!(scheduled, 0);
+        let states: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, state::text FROM awa.jobs WHERE id IN ($1, $2) ORDER BY id")
+                .bind(duplicate)
+                .bind(holder)
+                .fetch_all(&pool)
+                .await
+                .expect("states");
+        assert_eq!(
+            states,
+            vec![
+                (duplicate, "cancelled".to_string()),
+                (holder, "available".to_string())
+            ]
+        );
     }
 
     /// #456 mirror: a queue-storage-resolved maintenance leader must keep
