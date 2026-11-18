@@ -205,7 +205,7 @@ async fn claim_spent_prefix_patch_crosses_rolled_back_reservations(pool: PgPool)
 }
 
 #[sqlx::test(migrations = false)]
-async fn patch_waits_for_a_held_install_lock_only_up_to_lock_timeout(pool: PgPool) -> TestResult {
+async fn patch_does_not_wait_for_a_held_install_lock(pool: PgPool) -> TestResult {
     migrations::run(&pool).await?;
     let patch = migrations::SCHEMA_PATCHES
         .iter()
@@ -232,7 +232,7 @@ async fn patch_waits_for_a_held_install_lock_only_up_to_lock_timeout(pool: PgPoo
     .await?;
 
     let mut conn = pool.acquire().await?;
-    sqlx::query("SET lock_timeout = 0")
+    sqlx::query("SET lock_timeout = '1h'")
         .execute(&mut *conn)
         .await?;
     let started = std::time::Instant::now();
@@ -244,10 +244,6 @@ async fn patch_waits_for_a_held_install_lock_only_up_to_lock_timeout(pool: PgPoo
     let database = error.as_database_error().expect("a database error");
     assert_eq!(database.code().as_deref(), Some("55P03"));
     assert!(database.message().contains("gap_locked"), "{database}");
-    let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
-        .fetch_one(&mut *conn)
-        .await?;
-    assert_eq!(lock_timeout, "0", "the session setting is unchanged");
     assert_eq!(
         patch_pending(&pool).await?,
         vec!["claim function gap_locked.claim_ready_runtime".to_string()],

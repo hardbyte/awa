@@ -31,12 +31,11 @@
 -- queue-storage table and its work scales with the number of claim functions,
 -- not with job count. A claim in flight finishes on the old body; the next
 -- call uses the new one. A claim whose head row is live runs the same
--- statements as before. It waits for each schema's install lock, which
--- prepare_schema() holds while it runs the installer, for at most the
--- session's lock_timeout, or 300ms when none is set. In an `awa migrate --sql`
--- bundle the earlier replica_identity patch still holds its table locks, which
--- that installer also takes, so the bounded wait fails the bundle instead of
--- deadlocking with it. A timeout changes nothing and can be run again. A
+-- statements as before. It does not wait for a schema's install lock, which
+-- prepare_schema() holds while it runs the installer: when the lock is taken
+-- the patch fails with 55P03, changes nothing, and can be run again. In an
+-- `awa migrate --sql` bundle the earlier replica_identity patch still holds
+-- table locks that installer takes, so waiting there could deadlock. A
 -- schema whose prepare_schema() commits while this patch runs can keep the
 -- released claim; the patch probe names it until the patch runs again.
 --
@@ -52,7 +51,6 @@
 
 DO $$
 DECLARE
-    v_lock_timeout TEXT := current_setting('lock_timeout');
     v_schema TEXT;
     v_function RECORD;
     v_definition TEXT;
@@ -61,10 +59,6 @@ DECLARE
     v_new CONSTANT TEXT := 'count(*) FILTER (WHERE NOT selected_with_spent.attempt_spent)
                         OVER (ORDER BY selected_with_spent.lane_seq) AS unspent_through\1FROM selected_with_spent\2WHERE unspent_through = 0;';
 BEGIN
-    IF v_lock_timeout = '0' THEN
-        PERFORM set_config('lock_timeout', '300ms', true);
-    END IF;
-
     IF to_regprocedure('awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)') IS NOT NULL THEN
         v_definition := pg_get_functiondef(
             'awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)'::regprocedure
@@ -97,16 +91,13 @@ BEGIN
         -- Serialize with a concurrent prepare_schema() of the same schema. This
         -- is an advisory lock, not a table lock: claims and completions do not
         -- take it.
-        BEGIN
-            PERFORM pg_advisory_xact_lock(
-                hashtextextended(format('awa.queue_storage.install:%I', v_schema), 0)
-            );
-        EXCEPTION WHEN lock_not_available THEN
-            RAISE EXCEPTION 'spent_claim_prefix_gaps: could not take the install lock of schema % within lock_timeout %',
-                v_schema, current_setting('lock_timeout')
+        IF NOT pg_try_advisory_xact_lock(
+            hashtextextended(format('awa.queue_storage.install:%I', v_schema), 0)
+        ) THEN
+            RAISE EXCEPTION 'spent_claim_prefix_gaps: schema % is being prepared', v_schema
                 USING ERRCODE = 'lock_not_available',
-                      HINT = 'A prepare_schema() of that schema is running. This patch changed nothing and is safe to run again.';
-        END;
+                      HINT = 'A prepare_schema() of that schema holds its install lock. This patch changed nothing and is safe to run again.';
+        END IF;
         FOR v_function IN
             SELECT p.oid
             FROM pg_proc AS p
@@ -124,7 +115,5 @@ BEGIN
             END IF;
         END LOOP;
     END LOOP;
-
-    PERFORM set_config('lock_timeout', v_lock_timeout, true);
 END;
 $$;
