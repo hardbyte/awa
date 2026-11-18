@@ -398,10 +398,25 @@ Environment:
 | `AWA_SOAK_PG_LOG` / `AWA_SOAK_PG_CONTAINER` / `AWA_SOAK_PG_CONTAINER_LOG` | where to read the server log for the crash scan: a file on this host, or a Docker container (with an optional log path inside it, otherwise `docker logs`) |
 | `AWA_SOAK_REPORT_DIR` | where `report.md`, `report.json` and, for a failed run, `reproducer.md` are written |
 | `AWA_SOAK_STALL_SECONDS`, `AWA_SOAK_PROMOTION_OVERDUE_SECONDS`, `AWA_SOAK_CHAOS_SLACK_SECONDS` | oracle thresholds |
+| `AWA_SOAK_GATE_PROOF` | default `0`; `1` adds logged handler-return and committed-completion witnesses that survive terminal pruning |
+| `AWA_SOAK_METRICS_ENDPOINT`, `AWA_SOAK_METRICS_DIR` | optional OTLP gRPC endpoint and absolute output directory for per-process metric receipts |
+| `AWA_PRESSURE_ROTATE_MULTIPLIER` | pressure comparison setting: `1` (default) or `4`; scales the harness's queue, lease and claim rotation intervals; keeps configured generation rates unchanged |
 
 The report records the engine, server version, `max_connections`, connections at start and the per-persona connection budget. A failed run leaves `reproducer.md` with the seed, personas and duration, the violating rows, the timeline around each violation and the relevant server log excerpt. `scripts/persona-soak.sh` runs the engine matrix (`postgres:17`, `postgres:18`, and an assert-enabled PostgreSQL 18 image) in private containers on separate ports and removes them afterwards.
 
 After-exit retained-session findings require a successful `CLOSED` acknowledgement and a valid final session observation. Forced or unproven exits remain incomplete evidence. Pool-budget and idle-transaction checks after readiness remain independent.
+
+### Optional completion proof and metric capture
+
+`AWA_SOAK_GATE_PROOF=1` installs audit triggers in the disposable soak database. The logged audit heaps retain handler returns and committed completion inserts independently of terminal pruning. The oracle checks duplicate completion and materialized lease identities. A handler return alone does not prove completion; a stale attempt may return without committing. Witness failures make the oracle incomplete. The probes add SQL, WAL, locks and up to 18 parent connections plus one connection per Rust or Python child. Python proof capture also needs `asyncpg` and a binding exposing the read-only `Job.run_lease` property.
+
+Metric capture uses a five-second cumulative OTLP export interval and emits process/runtime identity receipts. It does not wait for a final export when a runtime exits or is killed. Validate transport delivery and missing tails against the collector output before comparing metric totals. The collector wrapper in `awa/tests/persona_soak/metrics_capture/run_collector.py` requires Docker Compose, a locally available `otel/opentelemetry-collector-contrib:0.115.1` image, and these variables in addition to `AWA_SOAK_METRICS_DIR`:
+
+- `AWA_SOAK_METRICS_PROJECT`: a unique `awa-gate-*` project name.
+- `AWA_SOAK_METRICS_GRPC_PORT`: an available localhost OTLP port matching `AWA_SOAK_METRICS_ENDPOINT`.
+- `AWA_SOAK_METRICS_PROM_PORT`: an available localhost Prometheus port.
+
+Record the collector image digest separately. The wrapper writes raw metric JSON, a collector log and a coverage receipt. Its size caps stop capture; they do not rotate or discard evidence, and the receipt requires delivery validation.
 
 ## Running Tests
 
