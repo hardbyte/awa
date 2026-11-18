@@ -1916,19 +1916,19 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
 /// unique mask from before `cancelled` was cleared from it.
 pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "unique_states";
 
-/// Whether `error` records a cancellation as a duplicate.
-fn is_duplicate_cancel_error(error: &serde_json::Value) -> bool {
-    error
-        .get("error")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|message| message.contains("as duplicate: unique claim held by"))
-}
+/// The messages releases before 0.6.19 wrote when they cancelled a duplicate
+/// and stored it without its unique key.
+const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] = [
+    RESCUED_DUPLICATE_ERROR,
+    "rescheduled as duplicate: unique claim held by a newer job",
+];
 
 /// The unique mask a revived job takes. A row cancelled as a duplicate
-/// carries its original mask in the duplicate error entry, and gets it back.
-/// A cancelled duplicate stored without its unique key, as releases before
-/// 0.6.19 wrote it, cannot be revived: nothing would keep it from running
-/// beside the job that holds its key.
+/// carries its original mask under [`DUPLICATE_CANCEL_MASK_KEY`] in the
+/// duplicate error entry, and gets it back. A cancelled duplicate that a
+/// release before 0.6.19 stored without its unique key cannot be revived:
+/// nothing would keep it from running beside the job that holds its key.
+/// Neither can a recorded duplicate whose key is gone.
 fn revived_unique_states(
     state: JobState,
     unique_key: Option<&[u8]>,
@@ -1938,28 +1938,38 @@ fn revived_unique_states(
     if state != JobState::Cancelled {
         return Ok(unique_states);
     }
-    let Some(duplicate) = payload
+    let errors = payload
         .get("errors")
         .and_then(serde_json::Value::as_array)
-        .and_then(|errors| {
-            errors
-                .iter()
-                .rev()
-                .find(|error| is_duplicate_cancel_error(error))
-        })
-    else {
-        return Ok(unique_states);
-    };
-    if unique_key.is_none() && unique_states.is_none() {
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(original) = errors.iter().rev().find_map(|error| {
+        error
+            .get(DUPLICATE_CANCEL_MASK_KEY)
+            .and_then(serde_json::Value::as_str)
+    }) {
+        if unique_key.is_none() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        return Ok(Some(original.to_string()));
+    }
+    let legacy_keyless_duplicate = unique_key.is_none()
+        && unique_states.is_none()
+        && errors.last().is_some_and(|error| {
+            error.get("terminal") == Some(&serde_json::Value::Bool(true))
+                && error
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| LEGACY_KEYLESS_DUPLICATE_ERRORS.contains(&message))
+        });
+    if legacy_keyless_duplicate {
         return Err(AwaError::UniqueConflict {
             constraint: Some("idx_awa_jobs_unique".to_string()),
         });
     }
-    Ok(duplicate
-        .get(DUPLICATE_CANCEL_MASK_KEY)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or(unique_states))
+    Ok(unique_states)
 }
 
 /// Clear `cancelled` from `done`'s mask and record the original mask in its
@@ -20711,6 +20721,63 @@ mod writer_bind_tests {
             offenders.is_empty(),
             "queue_storage.rs builds a per-row VALUES insert at lines {offenders:?}; \
              use INSERT ... SELECT FROM unnest(...) with one array bind per column"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revived_unique_states_tests {
+    use super::*;
+
+    fn payload(error: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "errors": [error] })
+    }
+
+    #[test]
+    fn a_handler_cancel_reason_mentioning_duplicates_does_not_block_retry() {
+        let reason = payload(serde_json::json!({
+            "error": "remote job rejected as duplicate: unique claim held by another job",
+            "attempt": 1,
+            "terminal": true,
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &reason).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyless_legacy_duplicate_cancellation_is_refused() {
+        for message in LEGACY_KEYLESS_DUPLICATE_ERRORS {
+            let legacy = payload(serde_json::json!({
+                "error": message,
+                "attempt": 1,
+                "terminal": true,
+            }));
+            assert!(matches!(
+                revived_unique_states(JobState::Cancelled, None, None, &legacy),
+                Err(AwaError::UniqueConflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_recorded_mask_is_restored() {
+        let recorded = payload(serde_json::json!({
+            "error": PROMOTED_DUPLICATE_ERROR,
+            "attempt": 1,
+            "terminal": true,
+            DUPLICATE_CANCEL_MASK_KEY: "11000010",
+        }));
+        assert_eq!(
+            revived_unique_states(
+                JobState::Cancelled,
+                Some(b"key"),
+                Some("11000000".to_string()),
+                &recorded
+            )
+            .unwrap(),
+            Some("11000010".to_string())
         );
     }
 }
