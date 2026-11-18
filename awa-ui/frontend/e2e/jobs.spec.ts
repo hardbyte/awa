@@ -500,6 +500,49 @@ test.describe("Queue context banner", () => {
     ]);
   });
 
+  for (const shape of ["report", "array"] as const) {
+    test(`bulk retry reads the ${shape} a server returns`, async ({ page }) => {
+      // Show the first listed job as failed, so it can be retried.
+      let retryable: { id: number } | undefined;
+      await page.route("**/api/jobs?**", async (route) => {
+        const response = await route.fetch();
+        const body = await response.json();
+        const rows = Array.isArray(body) ? body : body.jobs;
+        if (rows?.length) {
+          rows[0].state = "failed";
+          retryable = rows[0];
+        }
+        await route.fulfill({ response, json: body });
+      });
+      const requests: unknown[] = [];
+      await page.route("**/api/jobs/bulk-retry", async (route) => {
+        requests.push(route.request().postDataJSON());
+        // A server from before `report_skipped` ignores it and returns the
+        // array of retried jobs.
+        await route.fulfill({
+          json:
+            shape === "report"
+              ? { jobs: [retryable], skipped: 0, conflicts: [] }
+              : [retryable],
+        });
+      });
+      await Promise.all([
+        page.waitForResponse(
+          (r) => r.url().includes("/api/jobs") && r.url().includes("queue=e2e_test") && r.ok()
+        ),
+        page.goto("/jobs?q=queue%3Ae2e_test"),
+      ]);
+
+      const jobTable = page.getByRole("grid", { name: "Jobs" });
+      await jobTable.getByRole("checkbox").nth(1).click({ force: true });
+      await page.getByRole("button", { name: "Retry (1)" }).click();
+
+      await expect(page.getByText("Retried 1 job(s)", { exact: true })).toBeVisible();
+      expect(requests).toEqual([{ ids: [retryable!.id], report_skipped: true }]);
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+    });
+  }
+
   test("banner does not appear without queue filter", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
