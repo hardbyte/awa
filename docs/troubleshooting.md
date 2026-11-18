@@ -412,7 +412,7 @@ The ring is shared by every queue in the database. To keep queues that are expec
 
 Symptoms on queue storage under sustained claim traffic from several runtimes ([#721](https://github.com/hardbyte/awa/issues/721)):
 
-- `awa.maintenance.prune.attempts` for the queue ring, the claim ring or both keeps rising with outcome `blocked` (reason `none`), alternating with `backed_off`, and `pruned` stops advancing
+- `awa.maintenance.prune.attempts` for the queue ring, the claim ring or both keeps rising with outcome `blocked` (reason `none`), and `pruned` stops advancing; prune retries every tick, since a `blocked` outcome does not back it off
 - `awa.maintenance.rotate.attempts` for the same ring reports `skipped_busy`, usually with several blockers at once (`queue.ready_rows`, `queue.ready_segments`, `queue.done_rows` and the other slot tables, or `claim.rows`, `claim.closure_rows` and `claim.closure_batch_rows`)
 - `awa.ring.generation` for that ring stops advancing
 - the current slot's `ready_entries_*` and `ready_segments_*` partitions keep growing, and `awa.dispatch.claim_duration` rises as they grow
@@ -429,13 +429,13 @@ This branch does not fix it yet, and does not carry 0.6.17's partial change eith
 
 Tell it apart from the other ring stalls by the prune outcome:
 
-| Fault | `awa.maintenance.prune.attempts` | `awa.maintenance.prune.pinned_ready_age` |
-| --- | --- | --- |
-| Claims starve prune (this section) | `blocked`, reason `none` | absent or `0` |
-| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` | positive for the pinning lane |
-| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` | absent or `0` |
+| Fault | `awa.maintenance.prune.attempts` |
+| --- | --- |
+| Claims starve prune (this section) | `blocked`, reason `none` |
+| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` |
+| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` |
 
-The leader reads `awa.maintenance.prune.pinned_ready_age` only after a `skipped_active` prune, so it does not report this fault.
+Do not use `awa.maintenance.prune.pinned_ready_age` to rule this fault in or out. The leader updates the gauge only after a `skipped_active` prune and leaves it unchanged when prune is `blocked`, so during this fault it can keep showing a lane's age from an earlier pin, or `0`.
 
 ```promql
 sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))

@@ -350,8 +350,9 @@ timeout only on `ready_segments` and takes its other partitions with `NOWAIT`.
 `backed_off` means prune was skipped for a few ticks
 after repeated `skipped_active`.
 
-Prune that stays `blocked` (reason `none`) with no pinned lane while
-`awa.ring.generation` stays flat has two known causes, neither fixed on this
+Prune that stays `blocked` (reason `none`) while `awa.ring.generation` stays
+flat, whatever `pinned_ready_age` shows (the leader leaves it unchanged on
+`blocked`), has two known causes, neither fixed on this
 release: overlapping claims from several runtimes that always hold the oldest
 sealed slot's partitions (#721), and long readers such as monitoring counts
 over `leases`, `lease_claims` or `done_entries` through the parent table, which
