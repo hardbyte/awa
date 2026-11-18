@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use sqlx::Acquire;
 use sqlx::{FromRow, PgPool, Postgres, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -3339,6 +3339,22 @@ mod ready_segment_tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn concurrent_job_output_probes_share_one_catalog_read(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let probes = (0..16).map(|_| {
+            let (store, pool) = (store.clone(), pool.clone());
+            tokio::spawn(async move { store.supports_job_output(&pool).await })
+        });
+        for probe in probes.collect::<Vec<_>>() {
+            assert!(probe.await.unwrap().unwrap());
+        }
+        assert_eq!(store.job_output_probe_count(), 1);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
         use super::{QueueStorageConfig, RuntimeReadyRow};
         use crate::audited_sql;
@@ -4078,6 +4094,10 @@ pub struct QueueStorage {
     /// Whether this schema has migration v052's output columns (ADR-048),
     /// and when that was last checked.
     job_output_columns: Mutex<Option<(bool, std::time::Instant)>>,
+    /// Held while one caller probes for the output columns, so concurrent
+    /// cache misses wait for its answer instead of probing on their own.
+    job_output_probe: tokio::sync::Mutex<()>,
+    job_output_probes: AtomicU64,
 }
 
 /// How long a negative answer about the output columns is trusted before
@@ -4134,6 +4154,8 @@ impl QueueStorage {
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
             cancel_phase_hook: CancelPhaseHookSlot(None),
             job_output_columns: Mutex::new(None),
+            job_output_probe: tokio::sync::Mutex::new(()),
+            job_output_probes: AtomicU64::new(0),
         })
     }
 
@@ -4154,19 +4176,34 @@ impl QueueStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// How many catalog probes [`Self::supports_job_output`] has run.
+    #[doc(hidden)]
+    pub fn job_output_probe_count(&self) -> u64 {
+        self.job_output_probes.load(Ordering::Relaxed)
+    }
+
+    fn cached_job_output_columns(&self) -> Option<bool> {
+        let cached = *self
+            .job_output_columns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached.and_then(|(supported, checked_at)| {
+            (supported || checked_at.elapsed() < JOB_OUTPUT_PROBE_INTERVAL).then_some(supported)
+        })
+    }
+
     pub async fn supports_job_output<'e, E>(&self, executor: E) -> Result<bool, AwaError>
     where
         E: sqlx::PgExecutor<'e>,
     {
-        if let Some((supported, checked_at)) = *self
-            .job_output_columns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            if supported || checked_at.elapsed() < JOB_OUTPUT_PROBE_INTERVAL {
-                return Ok(supported);
-            }
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
         }
+        let _probe = self.job_output_probe.lock().await;
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        self.job_output_probes.fetch_add(1, Ordering::Relaxed);
         let supported: bool = sqlx::query_scalar(
             r#"
             SELECT count(*) = 2
