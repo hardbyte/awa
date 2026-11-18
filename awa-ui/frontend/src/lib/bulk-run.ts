@@ -7,11 +7,11 @@ export const BULK_BUSY_TIMEOUT_MS = 60_000;
 export interface BulkCursor {
   stage: number;
   after_job_id: number;
-  /** One past the highest job ID when the run started; the run pages below it. */
+  /** The run covers job IDs below this and below `sequence_bound`. */
   before_job_id?: number;
-  /** The job ID sequence's next value when the run started. */
+  /** A second bound on the run's job IDs. */
   sequence_bound?: number;
-  /** The database time when the run started; a job at or above `sequence_bound` belongs to the run only if created by then. */
+  /** Ignored by the server; an older server sets it. */
   started_at?: string | null;
 }
 
@@ -22,12 +22,15 @@ export interface BulkBatchResult {
   busy?: boolean;
   done: boolean;
   cursor?: BulkCursor;
+  /** Matching rows with an explicit job ID above the job ID sequence that the run leaves alone, because the database role may not advance the sequence. An older server omits it. */
+  left_above_sequence?: number;
 }
 
 export interface BulkRunProgress {
   count: number;
   skipped: number;
   conflicts: number[];
+  leftAboveSequence: number;
 }
 
 export type BulkRunOutcome = BulkRunProgress &
@@ -59,7 +62,7 @@ export async function runBulk(
   const sleep =
     options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = options.now ?? Date.now;
-  const progress: BulkRunProgress = { count: 0, skipped: 0, conflicts: [] };
+  const progress: BulkRunProgress = { count: 0, skipped: 0, conflicts: [], leftAboveSequence: 0 };
   let cursor: BulkCursor | undefined;
   let busySince: number | undefined;
   let busyWaitMs = 100;
@@ -77,6 +80,7 @@ export async function runBulk(
     cursor = result.cursor ?? cursor;
     progress.count += result.count;
     progress.skipped += result.skipped;
+    progress.leftAboveSequence += result.left_above_sequence ?? 0;
     for (const id of result.conflicts) {
       if (progress.conflicts.length < MAX_CONFLICTS) progress.conflicts.push(id);
     }
@@ -110,7 +114,11 @@ export function describeBulkRun(verb: string, noun: string, outcome: BulkRunOutc
     outcome.skipped > 0
       ? `; skipped ${outcome.skipped.toLocaleString()} whose unique key a live job holds (${outcome.conflicts.join(", ")}${outcome.skipped > outcome.conflicts.length ? ", ..." : ""})`
       : "";
-  if (outcome.kind === "failed") return `${done}${skipped}, then stopped: ${outcome.error}`;
-  if (outcome.kind === "stopped") return `${done} before stopping${skipped}`;
-  return `${done}${skipped}`;
+  const left =
+    outcome.leftAboveSequence > 0
+      ? `; left ${outcome.leftAboveSequence.toLocaleString()} with an explicit ID above the job ID sequence, which the database role may not advance`
+      : "";
+  if (outcome.kind === "failed") return `${done}${skipped}${left}, then stopped: ${outcome.error}`;
+  if (outcome.kind === "stopped") return `${done} before stopping${skipped}${left}`;
+  return `${done}${skipped}${left}`;
 }

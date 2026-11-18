@@ -57,6 +57,21 @@ describe("runBulk", () => {
     );
   });
 
+  it("reports rows left above the job ID sequence", async () => {
+    const { runBatch } = scripted([
+      batch(2, { left_above_sequence: 3 }),
+      batch(1, { done: true }),
+    ]);
+    const outcome = await runBulk(runBatch, {
+      shouldStop: () => false,
+      onProgress: () => {},
+    });
+    expect(outcome).toMatchObject({ kind: "done", count: 3, leftAboveSequence: 3 });
+    expect(describeBulkRun("Drained", "job(s)", outcome)).toBe(
+      "Drained 3 job(s); left 3 with an explicit ID above the job ID sequence, which the database role may not advance"
+    );
+  });
+
   it("stops between batches when asked", async () => {
     const { runBatch, calls } = scripted([batch(5), batch(5), batch(5)]);
     let stop = false;

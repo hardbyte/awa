@@ -11,15 +11,19 @@
 //! completion.
 //!
 //! A run covers the jobs that existed when it started. Its first batch
-//! records the next value of the job ID sequence in
-//! [`BulkCursor::sequence_bound`], the database time in
-//! [`BulkCursor::started_at`], and one past the highest existing job ID in
-//! [`BulkCursor::before_job_id`]. A job with an ID below the sequence bound
-//! belongs to the run; a job at or above it, which only an explicit ID can
-//! produce before the run starts, belongs to the run when it was created no
-//! later than the run started. No batch passes `before_job_id`. A job
-//! enqueued during the run is left alone, so a run against a busy producer
-//! still finishes.
+//! fences the job ID sequence: when a job holds an explicit ID at or above
+//! the sequence's next value, such as one migrated from canonical storage,
+//! it advances the sequence past the highest existing job ID. Every job
+//! allocated after the fence then has an ID at or above
+//! [`BulkCursor::before_job_id`], and every job below it existed before the
+//! run, so the run covers exactly the IDs below that bound. A job enqueued
+//! during the run is left alone, so a run against a busy producer still
+//! finishes.
+//!
+//! When the database role may not advance the sequence, the run is bounded
+//! at the sequence's next value instead, leaves the jobs with explicit IDs
+//! above it, and reports how many of them match in
+//! [`BulkBatch::left_above_sequence`].
 
 use crate::error::AwaError;
 use crate::job::JobRow;
@@ -69,19 +73,20 @@ pub struct BulkCursor {
     /// The largest job ID this pass has already handled.
     #[serde(default)]
     pub after_job_id: i64,
-    /// The run pages through job IDs below this: one past the highest job
-    /// ID that existed when it started. Zero until the run's first batch
-    /// sets it.
+    /// The run covers job IDs below this and below
+    /// [`Self::sequence_bound`]: every ID below it was allocated before the
+    /// run started. Zero until the run's first batch sets it.
     #[serde(default)]
     pub before_job_id: i64,
-    /// The next value of the job ID sequence when the run started. A job
-    /// with a smaller ID belongs to the run; a job with this ID or a higher
-    /// one belongs to it only if it was created no later than
-    /// [`Self::started_at`]. Zero in a cursor from a release without it,
-    /// when every job below `before_job_id` belongs to the run.
+    /// A second bound on the run's job IDs, equal to
+    /// [`Self::before_job_id`] in a cursor this release writes. A cursor
+    /// from an earlier build of this release recorded the sequence's next
+    /// value here without fencing the sequence, so its run stays below this
+    /// bound. Zero places no bound.
     #[serde(default)]
     pub sequence_bound: i64,
-    /// The database time when the run started.
+    /// Ignored. Kept so cursors that carry it still deserialize; this
+    /// release leaves it `None`.
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
 }
@@ -97,22 +102,114 @@ impl BulkCursor {
     }
 }
 
-/// SQL predicate that a row with job ID `id` and creation time `created_at`
-/// belongs to the run whose bounds `below`, `sequence_bound` and
-/// `started_at` (a `bigint`, a `bigint` and a `timestamptz`) bind. An ID
-/// below the sequence bound decides it alone, so in the usual case, with no
-/// explicit IDs above the sequence, the predicate is on job IDs only.
-/// `created_at` is read only for IDs at or above the sequence bound.
-pub(crate) fn run_scope_sql(
-    id: &str,
-    created_at: &str,
-    below: &str,
-    sequence_bound: &str,
-    started_at: &str,
+/// SQL predicate that a row with job ID `id` belongs to the run whose
+/// bounds `below` and `sequence_bound` (both `bigint`) bind.
+pub(crate) fn run_scope_sql(id: &str, below: &str, sequence_bound: &str) -> String {
+    format!("{id} < {below} AND ({sequence_bound}::bigint = 0 OR {id} < {sequence_bound}::bigint)")
+}
+
+/// Where a run's first batch left the job ID sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fence {
+    /// Every job ID allocated from now on is at or above `before`, and every
+    /// existing job ID is below it.
+    Fenced { before: i64 },
+    /// The role may not advance the sequence. The run is bounded at
+    /// `bound`, so the jobs with explicit IDs in `bound..top` are outside it.
+    Refused { bound: i64, top: i64 },
+}
+
+impl Fence {
+    pub(crate) fn before_job_id(self) -> i64 {
+        match self {
+            Fence::Fenced { before } => before,
+            Fence::Refused { bound, .. } => bound,
+        }
+    }
+}
+
+/// Fence the job ID sequence for a run's first batch. `bounds_sql` returns
+/// the sequence's next value and one past the highest existing job ID (or
+/// the next value when that is higher); `advance_sql` moves the sequence so
+/// its next value is at least `$1`. The advance runs in a savepoint, and a
+/// role without the privilege for it gets [`Fence::Refused`] rather than an
+/// error.
+pub(crate) async fn fence_sequence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    bounds_sql: &str,
+    advance_sql: &str,
+) -> Result<Fence, AwaError> {
+    let (next, top): (i64, i64) = sqlx::query_as(bounds_sql)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(crate::error::map_sqlx_error)?;
+    if top <= next {
+        return Ok(Fence::Fenced { before: next });
+    }
+    sqlx::query("SAVEPOINT awa_bulk_fence")
+        .execute(tx.as_mut())
+        .await
+        .map_err(crate::error::map_sqlx_error)?;
+    let advanced = sqlx::query(advance_sql)
+        .bind(top)
+        .execute(tx.as_mut())
+        .await;
+    match advanced {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT awa_bulk_fence")
+                .execute(tx.as_mut())
+                .await
+                .map_err(crate::error::map_sqlx_error)?;
+            Ok(Fence::Fenced { before: top })
+        }
+        Err(err) if is_permission_error(&err) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_fence")
+                .execute(tx.as_mut())
+                .await
+                .map_err(crate::error::map_sqlx_error)?;
+            sqlx::query("RELEASE SAVEPOINT awa_bulk_fence")
+                .execute(tx.as_mut())
+                .await
+                .map_err(crate::error::map_sqlx_error)?;
+            tracing::warn!(
+                sequence_next = next,
+                highest_job_id = top - 1,
+                error = %err,
+                "bulk run may not advance the job ID sequence; it leaves the jobs with explicit IDs above it"
+            );
+            Ok(Fence::Refused { bound: next, top })
+        }
+        Err(err) => Err(crate::error::map_sqlx_error(err)),
+    }
+}
+
+/// `insufficient_privilege`, which Postgres raises for a missing grant on a
+/// sequence or function.
+fn is_permission_error(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|err| err.code())
+        .is_some_and(|code| code == "42501")
+}
+
+/// Record a run's first-batch fence in `cursor`.
+pub(crate) fn apply_fence(cursor: &mut BulkCursor, fence: Fence) {
+    cursor.before_job_id = fence.before_job_id();
+    cursor.sequence_bound = fence.before_job_id();
+    cursor.started_at = None;
+}
+
+/// SQL counting the rows of `relation` matching `filter` whose `id_column`
+/// lies in `bound..top` (both `bigint` placeholders).
+pub(crate) fn count_between_sql(
+    relation: &str,
+    id_column: &str,
+    filter: &str,
+    bound: &str,
+    top: &str,
 ) -> String {
     format!(
-        "{id} < {below} AND ({sequence_bound}::bigint = 0 OR {id} < {sequence_bound}::bigint \
-         OR {created_at} <= {started_at}::timestamptz)"
+        "SELECT count(*) FROM {relation} WHERE ({filter}) \
+         AND {id_column} >= {bound}::bigint AND {id_column} < {top}::bigint"
     )
 }
 
@@ -131,6 +228,11 @@ pub struct BulkBatch {
     pub busy: bool,
     /// No matching row remains past the cursor.
     pub done: bool,
+    /// Matching rows with an explicit job ID above the job ID sequence that
+    /// the run leaves alone, because the database role may not advance the
+    /// sequence past them. Set only by a run's first batch.
+    #[serde(default)]
+    pub left_above_sequence: u64,
     /// Where the next batch resumes.
     pub cursor: BulkCursor,
     /// How long a run should wait before the next batch so other work gets
@@ -240,12 +342,17 @@ pub struct BulkRun {
     /// The run gave up because every remaining matching row stayed held by
     /// another transaction for the busy timeout.
     pub busy_timed_out: bool,
+    /// Matching rows with an explicit job ID above the job ID sequence that
+    /// the run left alone; see [`BulkBatch::left_above_sequence`].
+    #[serde(default)]
+    pub left_above_sequence: u64,
 }
 
 impl BulkRun {
     fn absorb(&mut self, batch: &BulkBatch) {
         self.count += batch.count;
         self.skipped += batch.skipped;
+        self.left_above_sequence += batch.left_above_sequence;
         for job_id in &batch.conflicts {
             if self.conflicts.len() < MAX_REPORTED_CONFLICTS {
                 self.conflicts.push(*job_id);
@@ -315,8 +422,8 @@ pub fn validate_batch_size(batch_size: i64) -> Result<(), AwaError> {
 }
 
 /// One statement that locks up to `limit` matching rows with IDs after
-/// `after` that belong to the run (`scope` binds its `below`,
-/// `sequence_bound` and `started_at`, see [`run_scope_sql`]) in ID order,
+/// `after` that belong to the run (`scope` binds its `below` and
+/// `sequence_bound`, see [`run_scope_sql`]) in ID order,
 /// skipping rows another transaction holds.
 /// It returns the locked IDs, the lowest matching ID below the last locked
 /// one that another transaction holds, and whether any matching row in the
@@ -326,13 +433,13 @@ pub(crate) fn pick_sql(
     id_column: &str,
     filter: &str,
     after: &str,
-    scope: [&str; 3],
+    scope: [&str; 2],
     limit: &str,
 ) -> String {
-    let [below, sequence_bound, started_at] = scope;
+    let [below, sequence_bound] = scope;
     let filter = format!(
         "({filter}) AND {id_column} > {after} AND {}",
-        run_scope_sql(id_column, "created_at", below, sequence_bound, started_at)
+        run_scope_sql(id_column, below, sequence_bound)
     );
     format!(
         r#"

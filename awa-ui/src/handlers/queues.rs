@@ -66,8 +66,8 @@ pub async fn resume_queue(
 #[derive(Debug, Deserialize)]
 pub struct DrainParams {
     /// Run one batch of up to this many jobs, resuming at `stage`,
-    /// `after_job_id`, `before_job_id`, `sequence_bound` and `started_at`,
-    /// the fields of the previous batch's cursor. Without it, the server
+    /// `after_job_id`, `before_job_id` and `sequence_bound`, the fields of
+    /// the previous batch's cursor (`started_at` is accepted and ignored). Without it, the server
     /// drains in batches until no matching job remains.
     pub batch_size: Option<i64>,
     #[serde(default)]

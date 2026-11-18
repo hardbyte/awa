@@ -11,6 +11,7 @@
 //! Run with: `cargo test --package awa --test bulk_admin_test -- --nocapture`
 
 use awa::model::bulk::{run_batches, BulkBatch, BulkCursor, BulkRunOptions};
+use awa::model::queue_storage::QueueStorage;
 use awa::model::{admin, dlq, insert_many, AwaError, ListDlqFilter};
 use awa::{InsertOpts, InsertParams, UniqueOpts};
 use awa_testing::setup;
@@ -1388,6 +1389,403 @@ async fn drain_leaves_new_jobs_beside_an_explicit_id_canonical() {
 #[tokio::test]
 async fn drain_leaves_new_jobs_beside_an_explicit_id_queue_storage() {
     drain_leaves_new_jobs_beside_an_explicit_id(Engine::QueueStorage).await;
+}
+
+/// The engine's job ID sequence.
+fn job_id_sequence(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Canonical => "awa.jobs_id_seq",
+        Engine::QueueStorage => "awa.job_id_seq",
+    }
+}
+
+/// The sequence's state, read without advancing it.
+async fn sequence_state(pool: &PgPool, engine: Engine) -> (i64, bool) {
+    sqlx::query_as(&format!(
+        "SELECT last_value, is_called FROM {}",
+        job_id_sequence(engine)
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read the job ID sequence")
+}
+
+/// Drop an explicit-ID row [`insert_explicit_id_row`] added.
+async fn delete_explicit_id_row(pool: &PgPool, engine: Engine, job_id: i64) {
+    let delete = match engine {
+        Engine::Canonical => "DELETE FROM awa.jobs WHERE id = $1",
+        Engine::QueueStorage => "DELETE FROM awa.dlq_entries WHERE job_id = $1",
+    };
+    sqlx::query(delete)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("delete the explicit-ID row");
+}
+
+/// Resume a drain run at `cursor` until it is done.
+async fn finish_drain(pool: &PgPool, queue: &str, mut cursor: BulkCursor) -> BulkBatch {
+    for _ in 0..20 {
+        let batch = admin::drain_queue_batch(pool, queue, 1, cursor)
+            .await
+            .expect("resumed batch");
+        cursor = batch.cursor;
+        if batch.done {
+            return batch;
+        }
+    }
+    panic!("the drain did not finish");
+}
+
+/// A producer that starts before a drain, and takes its job ID after the
+/// drain's first batch, does not have its job cancelled, even with a row
+/// whose explicit ID is above the sequence. On canonical storage the
+/// producer's transaction, and so its `created_at`, starts before the drain;
+/// on queue storage `enqueue_params_copy` takes `created_at` before it waits
+/// for a connection.
+async fn drain_leaves_a_job_allocated_after_it_started(engine: Engine) {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(engine).await;
+    let queue = unique_name("bulk_drain_producer");
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+    let explicit = insert_explicit_id_row(&pool, engine, &queue).await;
+
+    let (first, late) = match engine {
+        Engine::Canonical => {
+            let mut producer = pool.begin().await.expect("begin producer");
+            sqlx::query("SELECT now()")
+                .execute(&mut *producer)
+                .await
+                .expect("start the producer's transaction");
+            let first = admin::drain_queue_batch(&pool, &queue, 1, BulkCursor::default())
+                .await
+                .expect("first batch");
+            let late: i64 = sqlx::query_scalar(
+                "INSERT INTO awa.jobs (kind, queue, args) VALUES ('bulk_job', $1, '{}') RETURNING id",
+            )
+            .bind(&queue)
+            .fetch_one(&mut *producer)
+            .await
+            .expect("insert the producer's job");
+            producer.commit().await.expect("commit producer");
+            (first, late)
+        }
+        Engine::QueueStorage => {
+            let single = setup::pool(1).await;
+            let held = single
+                .acquire()
+                .await
+                .expect("hold the producer's connection");
+            let producer = tokio::spawn({
+                let single = single.clone();
+                let params = vec![InsertParams {
+                    kind: "bulk_job".to_string(),
+                    args: serde_json::json!({ "late": true }),
+                    opts: InsertOpts {
+                        queue: queue.clone(),
+                        ..Default::default()
+                    },
+                }];
+                async move {
+                    QueueStorage::from_existing_schema("awa")
+                        .expect("queue storage")
+                        .enqueue_params_copy(&single, &params)
+                        .await
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let first = admin::drain_queue_batch(&pool, &queue, 1, BulkCursor::default())
+                .await
+                .expect("first batch");
+            drop(held);
+            assert_eq!(producer.await.expect("producer task").expect("enqueue"), 1);
+            single.close().await;
+            let late: i64 =
+                sqlx::query_scalar("SELECT id FROM awa.jobs WHERE queue = $1 AND args ? 'late'")
+                    .bind(&queue)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("the producer's job");
+            (first, late)
+        }
+    };
+    assert_eq!(first.count, 1, "{engine:?}");
+    assert!(
+        late > explicit,
+        "{engine:?}: {late} allocated above {explicit}"
+    );
+    finish_drain(&pool, &queue, first.cursor).await;
+
+    assert_eq!(
+        count_of(&states(&pool, &ids).await, "cancelled"),
+        2,
+        "{engine:?}"
+    );
+    assert_eq!(
+        count_of(&states(&pool, &[late]).await, "available"),
+        1,
+        "{engine:?}: a job allocated after the drain started is not cancelled"
+    );
+    delete_explicit_id_row(&pool, engine, explicit).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn drain_leaves_a_job_allocated_after_it_started_canonical() {
+    drain_leaves_a_job_allocated_after_it_started(Engine::Canonical).await;
+}
+
+#[tokio::test]
+async fn drain_leaves_a_job_allocated_after_it_started_queue_storage() {
+    drain_leaves_a_job_allocated_after_it_started(Engine::QueueStorage).await;
+}
+
+/// Run a bulk operation that reaches the explicit-ID row: a drain on
+/// canonical storage, a DLQ purge on queue storage.
+async fn run_reaching_explicit_rows(pool: &PgPool, engine: Engine, queue: &str) -> BulkBatch {
+    let mut cursor = BulkCursor::default();
+    let mut total = BulkBatch::default();
+    for _ in 0..20 {
+        let batch = match engine {
+            Engine::Canonical => admin::drain_queue_batch(pool, queue, 1, cursor).await,
+            Engine::QueueStorage => {
+                let filter = ListDlqFilter {
+                    queue: Some(queue.to_string()),
+                    ..Default::default()
+                };
+                dlq::purge_dlq_batch(pool, &filter, false, 1, cursor).await
+            }
+        }
+        .expect("batch");
+        if cursor.before_job_id == 0 {
+            total.left_above_sequence = batch.left_above_sequence;
+        } else {
+            assert_eq!(batch.left_above_sequence, 0, "only the first batch reports");
+        }
+        total.count += batch.count;
+        cursor = batch.cursor;
+        total.cursor = cursor;
+        if batch.done {
+            total.done = true;
+            return total;
+        }
+    }
+    panic!("the run did not finish");
+}
+
+/// Rows the run reaches: available jobs on canonical storage, DLQ rows on
+/// queue storage.
+async fn insert_reachable_rows(pool: &PgPool, engine: Engine, queue: &str) -> Vec<i64> {
+    match engine {
+        Engine::Canonical => insert_jobs(pool, queue, "bulk_job", 2).await,
+        Engine::QueueStorage => sqlx::query_scalar(
+            "INSERT INTO awa.dlq_entries (
+                 job_id, kind, queue, priority, dlq_reason, original_run_lease
+             )
+             SELECT nextval('awa.job_id_seq'), 'bulk_job', $1, 2, 'seeded', 1
+             FROM generate_series(1, 2)
+             RETURNING job_id",
+        )
+        .bind(queue)
+        .fetch_all(pool)
+        .await
+        .expect("insert DLQ rows"),
+    }
+}
+
+/// How many of `ids` the run has not reached: still available on canonical
+/// storage, still in the DLQ on queue storage.
+async fn unreached(pool: &PgPool, engine: Engine, ids: &[i64]) -> i64 {
+    match engine {
+        Engine::Canonical => count_of(&states(pool, ids).await, "available"),
+        Engine::QueueStorage => {
+            sqlx::query_scalar("SELECT count(*) FROM awa.dlq_entries WHERE job_id = ANY($1)")
+                .bind(ids)
+                .fetch_one(pool)
+                .await
+                .expect("count DLQ rows")
+        }
+    }
+}
+
+/// A run reaches a row whose explicit ID is above the sequence, and
+/// advances the sequence past it, so the next job allocated gets a higher
+/// ID.
+async fn run_fences_the_sequence_past_an_explicit_id(engine: Engine) {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(engine).await;
+    let queue = unique_name("bulk_fence");
+    let ids = insert_reachable_rows(&pool, engine, &queue).await;
+    let explicit = insert_explicit_id_row(&pool, engine, &queue).await;
+
+    let run = run_reaching_explicit_rows(&pool, engine, &queue).await;
+    assert_eq!(run.count, 3, "{engine:?}");
+    assert_eq!(run.left_above_sequence, 0, "{engine:?}");
+    assert_eq!(run.cursor.before_job_id, explicit + 1, "{engine:?}");
+    assert_eq!(unreached(&pool, engine, &ids).await, 0, "{engine:?}");
+    assert_eq!(unreached(&pool, engine, &[explicit]).await, 0, "{engine:?}");
+    let next: i64 = sqlx::query_scalar(&format!("SELECT nextval('{}')", job_id_sequence(engine)))
+        .fetch_one(&pool)
+        .await
+        .expect("nextval");
+    assert!(next > explicit, "{engine:?}: {next} above {explicit}");
+
+    delete_explicit_id_row(&pool, engine, explicit).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn run_fences_the_sequence_past_an_explicit_id_canonical() {
+    run_fences_the_sequence_past_an_explicit_id(Engine::Canonical).await;
+}
+
+#[tokio::test]
+async fn run_fences_the_sequence_past_an_explicit_id_queue_storage() {
+    run_fences_the_sequence_past_an_explicit_id(Engine::QueueStorage).await;
+}
+
+/// A role that may not advance the sequence runs below the sequence's next
+/// value, leaves the explicit-ID row alone, and reports it.
+async fn run_without_sequence_update_leaves_and_reports_explicit_ids(engine: Engine) {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(engine).await;
+    let queue = unique_name("bulk_unfenced");
+    let ids = insert_reachable_rows(&pool, engine, &queue).await;
+    let explicit = insert_explicit_id_row(&pool, engine, &queue).await;
+    let sequence_before = sequence_state(&pool, engine).await;
+
+    let role = unique_name("awa_bulk_no_seq_update");
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {role} NOLOGIN;
+         GRANT USAGE ON SCHEMA awa TO {role};
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA awa TO {role};
+         GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {role};
+         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {role};
+         REVOKE UPDATE ON SEQUENCE awa.jobs_id_seq, awa.job_id_seq FROM {role};"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create a role without UPDATE on the job ID sequences");
+
+    // The role is cluster-wide, so it is dropped even when an assertion fails.
+    let outcome = tokio::spawn({
+        let role = role.clone();
+        let queue = queue.clone();
+        let ids = ids.clone();
+        let pool = pool.clone();
+        async move {
+            let restricted = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(move |conn, _| {
+                    let role = role.clone();
+                    Box::pin(async move {
+                        sqlx::query(&format!("SET ROLE {role}"))
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&setup::database_url())
+                .await
+                .expect("connect as the restricted role");
+            let run = run_reaching_explicit_rows(&restricted, engine, &queue).await;
+            restricted.close().await;
+            assert!(run.done, "{engine:?}");
+            assert_eq!(run.count, 2, "{engine:?}");
+            assert_eq!(run.left_above_sequence, 1, "{engine:?}");
+            assert!(run.cursor.before_job_id <= explicit, "{engine:?} {run:?}");
+            assert_eq!(unreached(&pool, engine, &ids).await, 0, "{engine:?}");
+            assert_eq!(
+                unreached(&pool, engine, &[explicit]).await,
+                1,
+                "{engine:?}: the explicit-ID row is left"
+            );
+            assert_eq!(
+                sequence_state(&pool, engine).await,
+                sequence_before,
+                "{engine:?}"
+            );
+        }
+    })
+    .await;
+
+    sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role};"))
+        .execute(&pool)
+        .await
+        .expect("drop role");
+    delete_explicit_id_row(&pool, engine, explicit).await;
+    setup::clean_queue(&pool, &queue).await;
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
+
+#[tokio::test]
+async fn run_without_sequence_update_leaves_and_reports_explicit_ids_canonical() {
+    run_without_sequence_update_leaves_and_reports_explicit_ids(Engine::Canonical).await;
+}
+
+#[tokio::test]
+async fn run_without_sequence_update_leaves_and_reports_explicit_ids_queue_storage() {
+    run_without_sequence_update_leaves_and_reports_explicit_ids(Engine::QueueStorage).await;
+}
+
+/// A run with no explicit ID above the sequence leaves the sequence as it
+/// was.
+async fn run_without_explicit_ids_leaves_the_sequence(engine: Engine) {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(engine).await;
+    let queue = unique_name("bulk_no_fence");
+    let ids = insert_reachable_rows(&pool, engine, &queue).await;
+    let sequence_before = sequence_state(&pool, engine).await;
+
+    let run = run_reaching_explicit_rows(&pool, engine, &queue).await;
+    assert_eq!(run.count, 2, "{engine:?}");
+    assert_eq!(unreached(&pool, engine, &ids).await, 0, "{engine:?}");
+    assert_eq!(
+        sequence_state(&pool, engine).await,
+        sequence_before,
+        "{engine:?}"
+    );
+    setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
+async fn run_without_explicit_ids_leaves_the_sequence_canonical() {
+    run_without_explicit_ids_leaves_the_sequence(Engine::Canonical).await;
+}
+
+#[tokio::test]
+async fn run_without_explicit_ids_leaves_the_sequence_queue_storage() {
+    run_without_explicit_ids_leaves_the_sequence(Engine::QueueStorage).await;
+}
+
+/// A cursor an earlier build of this release wrote, which recorded the
+/// sequence's next value in `sequence_bound` and a higher `before_job_id`
+/// without fencing the sequence, resumes below `sequence_bound`.
+#[tokio::test]
+async fn an_unfenced_cursor_resumes_below_its_sequence_bound() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::Canonical).await;
+    let queue = unique_name("bulk_old_cursor");
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+    let above = insert_jobs(&pool, &queue, "bulk_job", 1).await;
+    let cursor: BulkCursor = serde_json::from_value(serde_json::json!({
+        "stage": 0,
+        "after_job_id": 0,
+        "before_job_id": above[0] + 1000,
+        "sequence_bound": above[0],
+        "started_at": "2026-11-18T09:00:00.123456Z",
+    }))
+    .expect("deserialize an earlier cursor");
+    finish_drain(&pool, &queue, cursor).await;
+    assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 2);
+    assert_eq!(
+        count_of(&states(&pool, &above).await, "available"),
+        1,
+        "a job at or above sequence_bound is outside the earlier cursor's run"
+    );
+    setup::clean_queue(&pool, &queue).await;
 }
 
 /// Make every claim-cursor move of `queue`'s lanes fail, by wrapping

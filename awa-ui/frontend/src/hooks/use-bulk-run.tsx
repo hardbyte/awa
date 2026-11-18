@@ -51,7 +51,7 @@ export function useBulkRun() {
     setState(null);
     options.onFinish?.(outcome);
     const message = describeBulkRun(options.verb, options.noun, outcome);
-    if (outcome.kind === "failed" || outcome.skipped > 0) {
+    if (outcome.kind === "failed" || outcome.skipped > 0 || outcome.leftAboveSequence > 0) {
       toast.error(message);
     } else {
       toast.success(message);

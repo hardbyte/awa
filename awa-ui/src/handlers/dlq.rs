@@ -160,6 +160,10 @@ pub struct BulkResponse {
     pub skipped: u64,
     /// IDs of skipped jobs, at most `bulk::MAX_REPORTED_CONFLICTS`.
     pub conflicts: Vec<i64>,
+    /// Matching rows with an explicit job ID above the job ID sequence that
+    /// the run leaves alone, because the database role may not advance the
+    /// sequence past them.
+    pub left_above_sequence: u64,
     /// One batch: every remaining matching row is held by another
     /// transaction; nothing changed and the caller should try again.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -177,6 +181,7 @@ impl BulkResponse {
             count: batch.count,
             skipped: batch.skipped,
             conflicts: batch.conflicts,
+            left_above_sequence: batch.left_above_sequence,
             busy: batch.busy,
             done: batch.done,
             cursor: Some(batch.cursor),
@@ -200,6 +205,7 @@ impl BulkResponse {
             detail.insert("count".into(), run.count.into());
             detail.insert("skipped".into(), run.skipped.into());
             detail.insert("conflicts".into(), run.conflicts.into());
+            detail.insert("left_above_sequence".into(), run.left_above_sequence.into());
             detail.insert("done".into(), false.into());
             return Err(ApiError::ConflictDetail { message, detail });
         }
@@ -207,6 +213,7 @@ impl BulkResponse {
             count: run.count,
             skipped: run.skipped,
             conflicts: run.conflicts,
+            left_above_sequence: run.left_above_sequence,
             busy: false,
             done: run.complete,
             cursor: None,

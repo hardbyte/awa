@@ -82,7 +82,7 @@ async fn bulk_retry_route_honours_an_optional_batch_size() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({ "count": 1, "skipped": 0, "conflicts": [], "done": true })
+        json!({ "count": 1, "skipped": 0, "conflicts": [], "left_above_sequence": 0, "done": true })
     );
 
     let key = format!("ui-dlq-{queue}").into_bytes();

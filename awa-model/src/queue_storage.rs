@@ -10125,14 +10125,17 @@ impl QueueStorage {
         bulk::validate_batch_size(batch_size)?;
         let schema = self.schema();
         let mut cursor = cursor;
+        let mut fence = None;
         if cursor.before_job_id == 0 {
             let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-            self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+            fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
         }
+        let left_above_sequence = self.drain_left_above(pool, fence, queue).await?;
         let next_pass = |cursor: BulkCursor, stage: u8| cursor.next_pass(stage);
         loop {
             let mut batch = BulkBatch::queue_storage(cursor);
+            batch.left_above_sequence = left_above_sequence;
             match cursor.stage {
                 0 => {
                     let waiting: Vec<i64> = sqlx::query_scalar(&format!(
@@ -10147,28 +10150,13 @@ impl QueueStorage {
                         LIMIT $4
                         "#,
                         queues = queue_and_stripes_sql("lease.queue", "$1"),
-                        scope = bulk::run_scope_sql(
-                            "lease.job_id",
-                            &format!(
-                                "(SELECT ready.created_at FROM {schema}.ready_entries AS ready \
-                                 WHERE ready.ready_slot = lease.ready_slot \
-                                   AND ready.ready_generation = lease.ready_generation \
-                                   AND ready.queue = lease.queue \
-                                   AND ready.priority = lease.priority \
-                                   AND ready.enqueue_shard = lease.enqueue_shard \
-                                   AND ready.lane_seq = lease.lane_seq)"
-                            ),
-                            "$3",
-                            "$5",
-                            "$6",
-                        ),
+                        scope = bulk::run_scope_sql("lease.job_id", "$3", "$5"),
                     ))
                     .bind(queue)
                     .bind(cursor.after_job_id)
                     .bind(cursor.before_job_id)
                     .bind(batch_size)
                     .bind(cursor.sequence_bound)
-                    .bind(cursor.started_at)
                     .fetch_all(pool)
                     .await
                     .map_err(map_sqlx_error)?;
@@ -10210,13 +10198,12 @@ impl QueueStorage {
                           AND {scope}
                         "#,
                         queues = queue_and_stripes_sql("queue", "$1"),
-                        scope = bulk::run_scope_sql("job_id", "created_at", "$3", "$4", "$5"),
+                        scope = bulk::run_scope_sql("job_id", "$3", "$4"),
                     ))
                     .bind(queue)
                     .bind(cursor.after_job_id)
                     .bind(cursor.before_job_id)
                     .bind(cursor.sequence_bound)
-                    .bind(cursor.started_at)
                     .fetch_one(tx.as_mut())
                     .await
                     .map_err(map_sqlx_error)?;
@@ -10317,14 +10304,13 @@ impl QueueStorage {
                 COALESCE(payload, '{{}}'::jsonb) AS payload
             "#,
             queues = queue_and_stripes_sql("queue", "$1"),
-            scope = bulk::run_scope_sql("job_id", "created_at", "$3", "$5", "$6"),
+            scope = bulk::run_scope_sql("job_id", "$3", "$5"),
         ))
         .bind(queue)
         .bind(after_job_id)
         .bind(scope.before_job_id)
         .bind(batch_size)
         .bind(scope.sequence_bound)
-        .bind(scope.started_at)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10390,7 +10376,7 @@ impl QueueStorage {
     fn drain_ready_target_ctes(&self, lock: bool) -> String {
         let schema = self.schema();
         let claimed = self.ready_row_claimed_sql("ready");
-        let scope = bulk::run_scope_sql("ready.job_id", "ready.created_at", "$7", "$8", "$9");
+        let scope = bulk::run_scope_sql("ready.job_id", "$7", "$8");
         let lock = if lock {
             "FOR UPDATE OF ready SKIP LOCKED"
         } else {
@@ -10491,7 +10477,6 @@ impl QueueStorage {
         .bind(1_i64)
         .bind(scope.before_job_id)
         .bind(scope.sequence_bound)
-        .bind(scope.started_at)
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
@@ -10567,7 +10552,6 @@ impl QueueStorage {
         .bind(batch_size)
         .bind(scope.before_job_id)
         .bind(scope.sequence_bound)
-        .bind(scope.started_at)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -17525,8 +17509,9 @@ impl QueueStorage {
         let schema = self.schema();
         let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self.dlq_left_above_tx(&mut tx, fence, filter).await?;
         let pick = self
             .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor)
             .await?;
@@ -17592,46 +17577,192 @@ impl QueueStorage {
         Ok(batch)
     }
 
-    /// On a run's first batch, record its bounds: the next value of the job
-    /// ID sequence, the database time, and one past the highest existing job
-    /// ID, so the run reaches a done or DLQ row whose ID is above the
-    /// sequence, such as one migrated from canonical storage, and leaves
-    /// alone jobs enqueued after it started.
+    /// On a run's first batch, fence the schema's job ID sequence (see
+    /// [`bulk`]) past the highest done or DLQ job ID, such as one migrated
+    /// from canonical storage, and record the run's bound in `cursor`.
+    /// Returns the fence on a first batch, `None` when the cursor resumes a
+    /// run.
     async fn mark_bulk_run_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         cursor: &mut BulkCursor,
-    ) -> Result<(), AwaError> {
-        if cursor.before_job_id == 0 {
-            let schema = self.schema();
-            let (before_job_id, sequence_bound, started_at): (
-                i64,
-                i64,
-                chrono::DateTime<chrono::Utc>,
-            ) = sqlx::query_as(&format!(
+    ) -> Result<Option<bulk::Fence>, AwaError> {
+        if cursor.before_job_id != 0 {
+            return Ok(None);
+        }
+        let schema = self.schema();
+        let fence = bulk::fence_sequence_tx(
+            tx,
+            &format!(
                 r#"
                 WITH sequence AS (
                     SELECT {schema}.sequence_next_value('job_id_seq') AS next
                 )
                 SELECT
+                    sequence.next,
                     GREATEST(
                         sequence.next,
                         (SELECT max(job_id) + 1 FROM {schema}.done_entries),
                         (SELECT max(job_id) + 1 FROM {schema}.dlq_entries)
-                    ),
-                    sequence.next,
-                    now()
+                    )
                 FROM sequence
                 "#
-            ))
+            ),
+            &format!("SELECT {schema}.set_sequence_next('job_id_seq', $1)"),
+        )
+        .await?;
+        bulk::apply_fence(cursor, fence);
+        Ok(Some(fence))
+    }
+
+    /// SQL counting the rows matching each `(relation, filter)` whose job
+    /// ID lies in `bound..top`, the IDs a refused fence leaves above the run.
+    fn left_above_sql(&self, passes: &[(&str, &str)], bound: &str, top: &str) -> String {
+        let schema = self.schema();
+        let counts: Vec<String> = passes
+            .iter()
+            .map(|(relation, filter)| {
+                format!(
+                    "({})",
+                    bulk::count_between_sql(
+                        &format!("{schema}.{relation}"),
+                        "job_id",
+                        filter,
+                        bound,
+                        top
+                    )
+                )
+            })
+            .collect();
+        format!("SELECT {}", counts.join(" + "))
+    }
+
+    /// Matching DLQ rows a refused `fence` leaves above the run.
+    async fn dlq_left_above_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        fence: Option<bulk::Fence>,
+        filter: &ListDlqFilter,
+    ) -> Result<u64, AwaError> {
+        let Some(bulk::Fence::Refused { bound, top }) = fence else {
+            return Ok(0);
+        };
+        let count: i64 = sqlx::query_scalar(&self.left_above_sql(
+            &[("dlq_entries", DLQ_FILTER_SQL)],
+            "$6",
+            "$7",
+        ))
+        .bind(&filter.kind)
+        .bind(&filter.queue)
+        .bind(&filter.tag)
+        .bind(filter.before_id)
+        .bind(filter.before_dlq_at)
+        .bind(bound)
+        .bind(top)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(count as u64)
+    }
+
+    /// Matching failed done rows, and with `with_dlq` the kind's DLQ rows, a
+    /// refused `fence` leaves above the run.
+    async fn failed_left_above_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        fence: Option<bulk::Fence>,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        with_dlq: bool,
+    ) -> Result<u64, AwaError> {
+        let Some(bulk::Fence::Refused { bound, top }) = fence else {
+            return Ok(0);
+        };
+        let mut passes = vec![(
+            "done_entries",
+            "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
+        )];
+        if with_dlq {
+            passes.push((
+                "dlq_entries",
+                "($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
+            ));
+        }
+        let count: i64 = sqlx::query_scalar(&self.left_above_sql(&passes, "$3", "$4"))
+            .bind(kind)
+            .bind(queue)
+            .bind(bound)
+            .bind(top)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
-            cursor.before_job_id = before_job_id;
-            cursor.sequence_bound = sequence_bound;
-            cursor.started_at = Some(started_at);
-        }
-        Ok(())
+        Ok(count as u64)
+    }
+
+    /// The queue's waiting, scheduled, retryable and unclaimed available
+    /// jobs a refused `fence` leaves above the drain run.
+    async fn drain_left_above(
+        &self,
+        pool: &PgPool,
+        fence: Option<bulk::Fence>,
+        queue: &str,
+    ) -> Result<u64, AwaError> {
+        let Some(bulk::Fence::Refused { bound, top }) = fence else {
+            return Ok(0);
+        };
+        let schema = self.schema();
+        let claimed = self.ready_row_claimed_sql("ready");
+        let deferred_and_waiting = self.left_above_sql(
+            &[
+                (
+                    "deferred_jobs",
+                    &format!(
+                        "{} AND state IN ('scheduled', 'retryable')",
+                        queue_and_stripes_sql("queue", "$1")
+                    ),
+                ),
+                (
+                    "leases",
+                    &format!(
+                        "{} AND state = 'waiting_external'",
+                        queue_and_stripes_sql("queue", "$1")
+                    ),
+                ),
+            ],
+            "$2",
+            "$3",
+        );
+        let count: i64 = sqlx::query_scalar(&format!(
+            r#"
+            {deferred_and_waiting} + (
+                SELECT count(*)
+                FROM {schema}.ready_entries AS ready
+                WHERE {queues}
+                  AND ready.job_id >= $2
+                  AND ready.job_id < $3
+                  AND NOT (
+                      EXISTS (
+                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                          WHERE tomb.ready_slot = ready.ready_slot
+                            AND tomb.ready_generation = ready.ready_generation
+                            AND tomb.queue = ready.queue
+                            AND tomb.priority = ready.priority
+                            AND tomb.enqueue_shard = ready.enqueue_shard
+                            AND tomb.lane_seq = ready.lane_seq
+                      )
+                      OR {claimed}
+                  )
+            )
+            "#,
+            queues = queue_and_stripes_sql("ready.queue", "$1"),
+        ))
+        .bind(queue)
+        .bind(bound)
+        .bind(top)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(count as u64)
     }
 
     /// Lock the next DLQ rows matching `filter` in the cursor's range.
@@ -17648,7 +17779,7 @@ impl QueueStorage {
                 "job_id",
                 DLQ_FILTER_SQL,
                 "$6",
-                ["$7", "$9", "$10"],
+                ["$7", "$9"],
                 "$8",
             ))
             .bind(&filter.kind)
@@ -17660,7 +17791,6 @@ impl QueueStorage {
             .bind(cursor.before_job_id)
             .bind(batch_size)
             .bind(cursor.sequence_bound)
-            .bind(cursor.started_at)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -17683,7 +17813,7 @@ impl QueueStorage {
                 "job_id",
                 "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
                 "$3",
-                ["$4", "$6", "$7"],
+                ["$4", "$6"],
                 "$5",
             ))
             .bind(kind)
@@ -17692,7 +17822,6 @@ impl QueueStorage {
             .bind(cursor.before_job_id)
             .bind(batch_size)
             .bind(cursor.sequence_bound)
-            .bind(cursor.started_at)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -17782,8 +17911,11 @@ impl QueueStorage {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self
+            .failed_left_above_tx(&mut tx, fence, kind, queue, false)
+            .await?;
         let pick = self
             .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor)
             .await?;
@@ -17892,8 +18024,11 @@ impl QueueStorage {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self
+            .failed_left_above_tx(&mut tx, fence, Some(kind), None, true)
+            .await?;
         if cursor.stage == 0 {
             let pick = self
                 .pick_failed_done_batch_tx(&mut tx, Some(kind), None, batch_size, cursor)
@@ -17937,8 +18072,11 @@ impl QueueStorage {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self
+            .failed_left_above_tx(&mut tx, fence, kind, queue, false)
+            .await?;
         let pick = self
             .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor)
             .await?;
@@ -17964,8 +18102,9 @@ impl QueueStorage {
         bulk::validate_batch_size(batch_size)?;
         let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
         let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self.dlq_left_above_tx(&mut tx, fence, filter).await?;
         let pick = self
             .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor)
             .await?;

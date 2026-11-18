@@ -92,7 +92,7 @@ async fn dlq_purge_runs_one_batch_or_every_batch_and_counts_are_capped() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({ "count": 3, "skipped": 0, "conflicts": [], "done": true })
+        json!({ "count": 3, "skipped": 0, "conflicts": [], "left_above_sequence": 0, "done": true })
     );
 }
 
@@ -156,17 +156,17 @@ async fn queue_drain_runs_one_batch_from_a_cursor_or_every_batch() {
             &app,
             "POST",
             &format!(
-                "/api/queues/{queue}/drain?batch_size=2&stage={}&after_job_id={}&before_job_id={}&sequence_bound={}&started_at={}",
+                "/api/queues/{queue}/drain?batch_size=2&stage={}&after_job_id={}&before_job_id={}&sequence_bound={}",
                 cursor["stage"],
                 cursor["after_job_id"],
                 cursor["before_job_id"],
                 cursor["sequence_bound"],
-                cursor["started_at"].as_str().expect("started_at")
             ),
             None,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["left_above_sequence"], 0, "{body}");
         drained += body["drained"].as_u64().expect("drained");
         cursor = body["cursor"].clone();
         if body["done"] == true {

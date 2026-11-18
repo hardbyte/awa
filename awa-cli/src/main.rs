@@ -89,6 +89,12 @@ fn print_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
             ids.join(", ")
         );
     }
+    if run.left_above_sequence > 0 {
+        eprintln!(
+            "Left {} matching job(s) with an explicit ID above the job ID sequence: the database role may not advance the sequence past them. Grant UPDATE on the sequence and rerun to include them.",
+            run.left_above_sequence
+        );
+    }
 }
 
 /// Print a bulk run's result, including any skipped jobs and whether it

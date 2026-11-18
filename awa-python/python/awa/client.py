@@ -325,8 +325,9 @@ class AsyncClient:
         empty and ``matched`` is the retried count. A job whose unique key a
         live job holds is skipped, and ``UniqueConflict`` is raised naming
         the skipped jobs after the rest are retried. Any exception a batched
-        run raises has ``count``, ``skipped`` and ``conflicts`` attributes:
-        the jobs retried before it, which stay retried. Without it, every
+        run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the jobs retried before it, which
+        stay retried. Without it, every
         matching job is retried in one transaction, so the result can list
         them.
         """
@@ -356,7 +357,10 @@ class AsyncClient:
         """Cancel all pending jobs in a queue.
 
         Jobs are cancelled ``batch_size`` per transaction (1,000 by default);
-        the run is not atomic.
+        the run is not atomic. Jobs enqueued during the run are left alone.
+        When the database role may not advance the job ID sequence past jobs
+        inserted with explicit IDs above it, those jobs are left too and a
+        ``RuntimeWarning`` names how many.
         """
         return await self._raw.drain_queue(queue, batch_size)
 
@@ -606,8 +610,9 @@ class AsyncClient:
         ``DatabaseError`` is raised. A row whose unique key a live job holds
         is skipped and stays in the DLQ; after every other row is retried,
         ``UniqueConflict`` is raised naming the skipped jobs. Any exception
-        the run raises has ``count``, ``skipped`` and ``conflicts``
-        attributes: the rows retried before it, which stay retried.
+        the run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the rows retried before it, which
+        stay retried.
         """
         return await self._raw.bulk_retry_from_dlq(
             kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
@@ -1245,8 +1250,9 @@ class Client:
         empty and ``matched`` is the retried count. A job whose unique key a
         live job holds is skipped, and ``UniqueConflict`` is raised naming
         the skipped jobs after the rest are retried. Any exception a batched
-        run raises has ``count``, ``skipped`` and ``conflicts`` attributes:
-        the jobs retried before it, which stay retried. Without it, every
+        run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the jobs retried before it, which
+        stay retried. Without it, every
         matching job is retried in one transaction, so the result can list
         them.
         """
@@ -1276,7 +1282,10 @@ class Client:
         """Cancel all pending jobs in a queue.
 
         Jobs are cancelled ``batch_size`` per transaction (1,000 by default);
-        the run is not atomic.
+        the run is not atomic. Jobs enqueued during the run are left alone.
+        When the database role may not advance the job ID sequence past jobs
+        inserted with explicit IDs above it, those jobs are left too and a
+        ``RuntimeWarning`` names how many.
         """
         return self._raw.drain_queue_sync(queue, batch_size)
 
@@ -1547,8 +1556,9 @@ class Client:
         ``DatabaseError`` is raised. A row whose unique key a live job holds
         is skipped and stays in the DLQ; after every other row is retried,
         ``UniqueConflict`` is raised naming the skipped jobs. Any exception
-        the run raises has ``count``, ``skipped`` and ``conflicts``
-        attributes: the rows retried before it, which stay retried.
+        the run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the rows retried before it, which
+        stay retried.
         """
         return self._raw.bulk_retry_from_dlq_sync(
             kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size

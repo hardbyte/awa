@@ -4908,40 +4908,68 @@ const CANONICAL_DRAIN_SQL: &str = r#"
     WHERE id = ANY($1) AND state IN ('available', 'scheduled', 'retryable', 'waiting_external')
 "#;
 
-/// On a run's first batch, record its bounds: the next value of the job ID
-/// sequence, the database time, and one past the highest existing job ID, so
-/// the run reaches a job inserted with an explicit ID above the sequence and
-/// leaves alone jobs enqueued after it started.
+/// On a run's first batch, fence `awa.jobs_id_seq` (see [`bulk`]) and record
+/// the run's bound in `cursor`. Returns the fence on a first batch, `None`
+/// when the cursor resumes a run.
 async fn mark_canonical_run_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     cursor: &mut BulkCursor,
-) -> Result<(), AwaError> {
-    if cursor.before_job_id == 0 {
-        let (before_job_id, sequence_bound, started_at): (i64, i64, chrono::DateTime<chrono::Utc>) =
-            sqlx::query_as(
-                r#"
-                WITH sequence AS (
-                    SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END AS next
-                    FROM awa.jobs_id_seq
-                )
-                SELECT
-                    GREATEST(
-                        sequence.next,
-                        (SELECT max(id) + 1 FROM awa.jobs_hot),
-                        (SELECT max(id) + 1 FROM awa.scheduled_jobs)
-                    ),
-                    sequence.next,
-                    now()
-                FROM sequence
-                "#,
-            )
-            .fetch_one(tx.as_mut())
-            .await?;
-        cursor.before_job_id = before_job_id;
-        cursor.sequence_bound = sequence_bound;
-        cursor.started_at = Some(started_at);
+) -> Result<Option<bulk::Fence>, AwaError> {
+    if cursor.before_job_id != 0 {
+        return Ok(None);
     }
-    Ok(())
+    let fence = bulk::fence_sequence_tx(
+        tx,
+        r#"
+        WITH sequence AS (
+            SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END AS next
+            FROM awa.jobs_id_seq
+        )
+        SELECT
+            sequence.next,
+            GREATEST(
+                sequence.next,
+                (SELECT max(id) + 1 FROM awa.jobs_hot),
+                (SELECT max(id) + 1 FROM awa.scheduled_jobs)
+            )
+        FROM sequence
+        "#,
+        r#"
+        SELECT setval('awa.jobs_id_seq', $1 - 1, true)
+        FROM awa.jobs_id_seq
+        WHERE CASE WHEN is_called THEN last_value + 1 ELSE last_value END < $1
+        "#,
+    )
+    .await?;
+    bulk::apply_fence(cursor, fence);
+    Ok(Some(fence))
+}
+
+/// When `fence` was refused, count the rows of each `(relation, filter)`
+/// (filters bind `$1` and `$2`) that the run leaves above its bound.
+async fn count_canonical_left_above_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    fence: Option<bulk::Fence>,
+    passes: &[(&str, &str)],
+    first: Option<&str>,
+    second: Option<&str>,
+) -> Result<u64, AwaError> {
+    let Some(bulk::Fence::Refused { bound, top }) = fence else {
+        return Ok(0);
+    };
+    let mut left = 0;
+    for (relation, filter) in passes {
+        let count: i64 =
+            sqlx::query_scalar(&bulk::count_between_sql(relation, "id", filter, "$3", "$4"))
+                .bind(first)
+                .bind(second)
+                .bind(bound)
+                .bind(top)
+                .fetch_one(tx.as_mut())
+                .await?;
+        left += count as u64;
+    }
+    Ok(left)
 }
 
 /// Lock the next canonical rows of `relation` matching `filter` (binding
@@ -4956,7 +4984,7 @@ async fn pick_canonical_batch_tx(
     cursor: BulkCursor,
 ) -> Result<bulk::Pick, AwaError> {
     let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) = sqlx::query_as(
-        &bulk::pick_sql(relation, "id", filter, "$3", ["$4", "$6", "$7"], "$5"),
+        &bulk::pick_sql(relation, "id", filter, "$3", ["$4", "$6"], "$5"),
     )
     .bind(first)
     .bind(second)
@@ -4964,7 +4992,6 @@ async fn pick_canonical_batch_tx(
     .bind(cursor.before_job_id)
     .bind(batch_size)
     .bind(cursor.sequence_bound)
-    .bind(cursor.started_at)
     .fetch_one(tx.as_mut())
     .await?;
     Ok(bulk::Pick::new(picked, first_held, more))
@@ -5045,13 +5072,18 @@ async fn canonical_retry_failed_batch(
     batch_size: i64,
     mut cursor: BulkCursor,
 ) -> Result<BulkBatch, AwaError> {
+    const FILTER: &str =
+        "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)";
     let mut tx = pool.begin().await?;
-    mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let fence = mark_canonical_run_tx(&mut tx, &mut cursor).await?;
     let mut batch = BulkBatch::new(cursor);
+    batch.left_above_sequence =
+        count_canonical_left_above_tx(&mut tx, fence, &[("awa.jobs_hot", FILTER)], kind, queue)
+            .await?;
     let pick = pick_canonical_batch_tx(
         &mut tx,
         "awa.jobs_hot",
-        "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
+        FILTER,
         kind,
         queue,
         batch_size,
@@ -5128,13 +5160,22 @@ pub async fn discard_failed_batch(
             .await;
     }
     let mut cursor = cursor;
+    const FILTER: &str = "state = 'failed' AND kind = $1 AND $2::text IS NULL";
     let mut tx = pool.begin().await?;
-    mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let fence = mark_canonical_run_tx(&mut tx, &mut cursor).await?;
     let mut batch = BulkBatch::new(cursor);
+    batch.left_above_sequence = count_canonical_left_above_tx(
+        &mut tx,
+        fence,
+        &[("awa.jobs_hot", FILTER)],
+        Some(kind),
+        None,
+    )
+    .await?;
     let pick = pick_canonical_batch_tx(
         &mut tx,
         "awa.jobs_hot",
-        "state = 'failed' AND kind = $1 AND $2::text IS NULL",
+        FILTER,
         Some(kind),
         None,
         batch_size,
@@ -5177,23 +5218,34 @@ pub async fn drain_queue_batch(
             .await;
     }
     let mut cursor = cursor;
+    const PASSES: [(&str, &str); 3] = [
+        (
+            "awa.jobs_hot",
+            "state = 'waiting_external' AND queue = $1 AND $2::text IS NULL",
+        ),
+        (
+            "awa.scheduled_jobs",
+            "state IN ('scheduled', 'retryable') AND queue = $1 AND $2::text IS NULL",
+        ),
+        (
+            "awa.jobs_hot",
+            "state = 'available' AND queue = $1 AND $2::text IS NULL",
+        ),
+    ];
     let mut tx = pool.begin().await?;
-    mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let fence = mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let left_above_sequence =
+        count_canonical_left_above_tx(&mut tx, fence, &PASSES, Some(queue), None).await?;
     loop {
-        let (relation, states, next_stage) = match cursor.stage {
-            0 => ("awa.jobs_hot", "state = 'waiting_external'", Some(1)),
-            1 => (
-                "awa.scheduled_jobs",
-                "state IN ('scheduled', 'retryable')",
-                Some(2),
-            ),
-            _ => ("awa.jobs_hot", "state = 'available'", None),
-        };
+        let stage = usize::from(cursor.stage).min(PASSES.len() - 1);
+        let (relation, filter) = PASSES[stage];
+        let next_stage = (stage + 1 < PASSES.len()).then_some(stage as u8 + 1);
         let mut batch = BulkBatch::new(cursor);
+        batch.left_above_sequence = left_above_sequence;
         let pick = pick_canonical_batch_tx(
             &mut tx,
             relation,
-            &format!("{states} AND queue = $1 AND $2::text IS NULL"),
+            filter,
             Some(queue),
             None,
             batch_size,

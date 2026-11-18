@@ -92,8 +92,9 @@ pub(crate) fn build_retry_opts(
     }
 }
 
-/// Set `count`, `skipped` and `conflicts` on `err` from `run`, so a caller
-/// that catches it knows what the run changed before it stopped.
+/// Set `count`, `skipped`, `conflicts` and `left_above_sequence` on `err`
+/// from `run`, so a caller that catches it knows what the run changed before
+/// it stopped.
 fn with_progress(err: PyErr, run: &awa_model::BulkRun) -> PyErr {
     Python::attach(|py| {
         let value = err.value(py);
@@ -101,12 +102,16 @@ fn with_progress(err: PyErr, run: &awa_model::BulkRun) -> PyErr {
         let _ = value.setattr("count", run.count);
         let _ = value.setattr("skipped", run.skipped);
         let _ = value.setattr("conflicts", run.conflicts.clone());
+        let _ = value.setattr("left_above_sequence", run.left_above_sequence);
     });
     err
 }
 
 /// Finish a bulk run for Python: the count of changed rows, or an exception
-/// carrying the run's `count`, `skipped` and `conflicts`. The exception is
+/// carrying the run's `count`, `skipped`, `conflicts` and
+/// `left_above_sequence`. A run that left matching rows with explicit IDs
+/// above the job ID sequence issues a `RuntimeWarning` naming them. The
+/// exception is
 /// `UniqueConflict` naming the skipped jobs after every other row was
 /// changed, `DatabaseError` if the run gave up on rows another transaction
 /// held, naming any jobs it skipped, or the mapped error of a batch that
@@ -150,6 +155,22 @@ pub(crate) fn finish_bulk_run(
             crate::UniqueConflict::new_err(format!("{verb} {} row(s); {text}", run.count)),
             &run,
         ));
+    }
+    if run.left_above_sequence > 0 {
+        let message = std::ffi::CString::new(format!(
+            "{verb} {} row(s); left {} matching job(s) with an explicit ID above the job ID sequence, which the database role may not advance; grant UPDATE on the sequence and rerun to include them",
+            run.count, run.left_above_sequence
+        ))
+        .expect("message has no NUL byte");
+        Python::attach(|py| {
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+                &message,
+                1,
+            )
+        })
+        .map_err(|err| with_progress(err, &run))?;
     }
     Ok(run.count)
 }
