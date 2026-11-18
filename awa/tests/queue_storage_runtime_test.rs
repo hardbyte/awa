@@ -2011,6 +2011,111 @@ async fn test_claim_crosses_rolled_back_reservations_before_spent_rows_without_r
     assert_claim_crosses_rolled_back_reservations_before_spent_rows(false).await;
 }
 
+/// Lane positions from a provisioned, empty lane: `R` an insert whose
+/// transaction rolls back, `C` a cancelled job, `M` a moved job, `L` a live
+/// job. Each case is its own lane; the claims must hand out its live job.
+async fn assert_fresh_lane_claims_past_rollbacks_and_spent_rows(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: format!("awa_qs_fresh_gap_{receipts}"),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cases = [
+        ("qs_fresh_gap_rcl", "RCL"),
+        ("qs_fresh_gap_rml", "RML"),
+        ("qs_fresh_gap_crcl", "CRCL"),
+        ("qs_fresh_gap_rcrcl", "RCRCL"),
+        ("qs_fresh_gap_crl", "CRL"),
+    ];
+    for (queue, shape) in cases {
+        sqlx::query(&format!(
+            "SELECT {}.provision_lane($1, 2::smallint, 0::smallint)",
+            store.schema()
+        ))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("provision lane");
+        let mut live = None;
+        for (position, step) in (1_i64..).zip(shape.chars()) {
+            match step {
+                'R' => {
+                    let mut tx = pool.begin().await.expect("begin");
+                    insert::insert_with(
+                        &mut *tx,
+                        &CompleteJob { id: position },
+                        InsertOpts {
+                            queue: queue.to_string(),
+                            priority: 2,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("insert inside the rolled-back transaction");
+                    tx.rollback().await.expect("roll back the insert");
+                }
+                'C' | 'M' | 'L' => {
+                    let job = enqueue_lane(&pool, &store, queue, 2, 1).await[0];
+                    assert_eq!(
+                        first_lane_seqs(&pool, &store, &[job]).await[0],
+                        position,
+                        "{shape}: lane position of step {position}"
+                    );
+                    match step {
+                        'C' => {
+                            admin::cancel(&pool, job).await.expect("cancel");
+                        }
+                        'M' => assert!(store
+                            .move_queue(&pool, job, "qs_fresh_gap_dest", None)
+                            .await
+                            .expect("move")),
+                        _ => live = Some(job),
+                    }
+                }
+                other => unreachable!("{other}"),
+            }
+        }
+        let live = live.expect("each shape ends with a live job");
+        let start = claim_cursor(&pool, &store, queue, 2).await;
+        let mut claimed = Vec::new();
+        for _ in 0..3 {
+            claimed.extend(
+                claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                    .await
+                    .into_iter()
+                    .map(|job| job.job.id),
+            );
+        }
+        assert_eq!(
+            claimed,
+            vec![live],
+            "{shape}: three claims from cursor {start} hand out the live job"
+        );
+        assert_eq!(
+            claim_cursor(&pool, &store, queue, 2).await,
+            shape.len() as i64 + 1,
+            "{shape}: the cursor ends one past the live job"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fresh_lane_claims_past_rollbacks_and_spent_rows_with_receipts() {
+    assert_fresh_lane_claims_past_rollbacks_and_spent_rows(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fresh_lane_claims_past_rollbacks_and_spent_rows_without_receipts() {
+    assert_fresh_lane_claims_past_rollbacks_and_spent_rows(false).await;
+}
+
 struct ReceiptRescueWorker {
     release: Arc<tokio::sync::Notify>,
     first_attempt_started: Arc<AtomicBool>,
