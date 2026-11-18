@@ -2007,8 +2007,8 @@ fn rescheduled_event_row(
 }
 
 /// Re-schedule a canonical attempt in its own transaction. When it is
-/// cancelled as a duplicate under a new job ID, the stored successor is
-/// read in the same transaction, so the row matches what was committed.
+/// cancelled as a duplicate, the stored row is read in the same
+/// transaction, so the event carries what was committed.
 #[allow(clippy::too_many_arguments)]
 async fn reschedule_reading_successor(
     pool: &sqlx::PgPool,
@@ -2027,33 +2027,27 @@ async fn reschedule_reading_successor(
     let successor = match &outcome {
         RescheduleOutcome::CancelledDuplicate {
             job_id: successor_id,
-        } if *successor_id != job_id => {
-            sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
-                .bind(successor_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(awa_model::map_sqlx_error)?
-                .map(Box::new)
-        }
+        } => sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
+            .bind(successor_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(awa_model::map_sqlx_error)?
+            .map(Box::new),
         _ => None,
     };
     tx.commit().await.map_err(awa_model::map_sqlx_error)?;
     Ok((outcome, successor))
 }
 
-/// The stored row of a cancelled duplicate that routing moved to a new
-/// job ID; `None` when the attempt was cancelled in place.
+/// The stored row of an attempt cancelled as a duplicate, in place or under
+/// a new job ID.
 async fn stored_duplicate_successor<'e, E>(
     executor: E,
-    job: &JobRow,
     job_id: i64,
 ) -> Result<Option<Box<JobRow>>, awa_model::AwaError>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    if job_id == job.id {
-        return Ok(None);
-    }
     let row = sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
         .bind(job_id)
         .fetch_optional(executor)
@@ -3387,7 +3381,7 @@ async fn retry_after_canonical_with_followups(
             attempt,
         } => (job_id, run_at, attempt),
         RescheduleOutcome::CancelledDuplicate { job_id } => {
-            let persisted = stored_duplicate_successor(&mut *tx, job, job_id).await?;
+            let persisted = stored_duplicate_successor(&mut *tx, job_id).await?;
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,
@@ -3564,7 +3558,7 @@ async fn retry_backoff_canonical_with_followups(
             attempt,
         } => (job_id, run_at, attempt),
         RescheduleOutcome::CancelledDuplicate { job_id } => {
-            let persisted = stored_duplicate_successor(&mut *tx, job, job_id).await?;
+            let persisted = stored_duplicate_successor(&mut *tx, job_id).await?;
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,

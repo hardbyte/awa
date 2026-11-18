@@ -1124,6 +1124,17 @@ async fn migrated_duplicate_cancellation_keeps_its_key_for_retry() {
         .expect("retry once the key is free")
         .expect("retried successor");
     assert_eq!(claim_holder(&pool, key).await, Some(successor));
+    let restored: Option<String> =
+        sqlx::query_scalar("SELECT unique_states::text FROM awa.jobs WHERE id = $1")
+            .bind(successor)
+            .fetch_one(&pool)
+            .await
+            .expect("restored mask");
+    assert_eq!(
+        restored.as_deref(),
+        Some("11000010"),
+        "the original mask exactly"
+    );
 
     // The retried job has its original mask back, so cancelling it again
     // keeps the key as the mask says.
@@ -1178,9 +1189,22 @@ async fn retry_of_a_keyless_duplicate_cancellation_is_refused() {
         RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
         other => panic!("expected CancelledDuplicate, got {other:?}"),
     };
-    // The row as 0.6.18 wrote it: no unique key or mask.
+    // The row as 0.6.18 wrote it: no unique key or mask, and a duplicate
+    // error entry without a recorded mask.
     sqlx::query(
-        "UPDATE awa.done_entries SET unique_key = NULL, unique_states = NULL WHERE job_id = $1",
+        "UPDATE awa.done_entries
+         SET unique_key = NULL,
+             unique_states = NULL,
+             payload = jsonb_set(
+                 payload,
+                 '{errors}',
+                 jsonb_build_array(jsonb_build_object(
+                     'error', 'rescheduled as duplicate: unique claim held by a newer job',
+                     'attempt', 0,
+                     'terminal', true
+                 ))
+             )
+         WHERE job_id = $1",
     )
     .bind(successor)
     .execute(&pool)

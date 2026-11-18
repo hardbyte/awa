@@ -404,6 +404,10 @@ async fn run(
         1,
         "one Cancelled event for the duplicate cancellation: {events:?}"
     );
+    assert_eq!(
+        events[0].0, job_a,
+        "the Cancelled event names the cancelled job"
+    );
     assert!(
         events[0].1.contains(duplicate_error),
         "Cancelled event reason should name the duplicate: {events:?}"

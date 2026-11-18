@@ -33,6 +33,8 @@ pub(crate) const SNOOZED_DUPLICATE_ERROR: &str =
     "snoozed as duplicate: unique claim held by a newer job";
 pub(crate) const RETRIED_DUPLICATE_ERROR: &str =
     "retried as duplicate: unique claim held by a newer job";
+pub(crate) const RESCHEDULED_DUPLICATE_ERROR: &str =
+    "rescheduled as duplicate: unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
@@ -1895,14 +1897,21 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
 
 /// The key of a duplicate-cancellation error entry that holds the job's
 /// unique mask from before `cancelled` was cleared from it.
-pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "unique_states";
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "duplicate_unique_states";
+
+/// The messages of the error entries awa writes when it cancels a job as a
+/// duplicate. A recorded mask is trusted only on an entry with one of them.
+pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 4] = [
+    SNOOZED_DUPLICATE_ERROR,
+    RETRIED_DUPLICATE_ERROR,
+    RESCUED_DUPLICATE_ERROR,
+    RESCHEDULED_DUPLICATE_ERROR,
+];
 
 /// The messages releases before 0.6.19 wrote when they cancelled a duplicate
 /// and stored it without its unique key.
-const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] = [
-    RESCUED_DUPLICATE_ERROR,
-    "rescheduled as duplicate: unique claim held by a newer job",
-];
+const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] =
+    [RESCUED_DUPLICATE_ERROR, RESCHEDULED_DUPLICATE_ERROR];
 
 /// The unique mask a revived job takes. A row cancelled as a duplicate
 /// carries its original mask under [`DUPLICATE_CANCEL_MASK_KEY`] in the
@@ -1925,6 +1934,10 @@ fn revived_unique_states(
         .map(Vec::as_slice)
         .unwrap_or_default();
     if let Some(original) = errors.iter().rev().find_map(|error| {
+        let message = error.get("error").and_then(serde_json::Value::as_str)?;
+        if !DUPLICATE_CANCEL_ERRORS.contains(&message) {
+            return None;
+        }
         error
             .get(DUPLICATE_CANCEL_MASK_KEY)
             .and_then(serde_json::Value::as_str)
@@ -20300,6 +20313,31 @@ mod revived_unique_states_tests {
                 Err(AwaError::UniqueConflict { .. })
             ));
         }
+    }
+
+    #[test]
+    fn a_mask_field_on_a_caller_error_entry_is_ignored() {
+        let forged = payload(serde_json::json!({
+            "error": "upstream failed",
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &forged).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_revive_sql_names_every_canonical_duplicate_message() {
+        let admin = include_str!("admin.rs");
+        for message in [SNOOZED_DUPLICATE_ERROR, RETRIED_DUPLICATE_ERROR] {
+            assert_eq!(
+                admin.matches(&format!("'{message}'")).count(),
+                2,
+                "{message} in both canonical revive statements"
+            );
+        }
+        assert!(admin.contains(&format!("entry->>'{DUPLICATE_CANCEL_MASK_KEY}'")));
     }
 
     #[test]

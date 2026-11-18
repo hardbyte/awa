@@ -1739,10 +1739,13 @@ pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErro
             callback_on_fail = NULL, callback_transform = NULL,
             unique_states = CASE
                 WHEN state = 'cancelled' THEN COALESCE(
-                    (SELECT (entry->>'unique_states')::bit(8)
+                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
                      FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
-                     WHERE entry->>'error' LIKE '%as duplicate: unique claim held by%'
-                       AND entry->>'unique_states' IS NOT NULL
+                     WHERE entry->>'error' IN (
+                           'snoozed as duplicate: unique claim held by a newer job',
+                           'retried as duplicate: unique claim held by a newer job'
+                       )
+                       AND entry->>'duplicate_unique_states' IS NOT NULL
                      ORDER BY n DESC
                      LIMIT 1),
                     unique_states
@@ -4835,10 +4838,13 @@ pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaEr
             callback_on_fail = NULL, callback_transform = NULL,
             unique_states = CASE
                 WHEN state = 'cancelled' THEN COALESCE(
-                    (SELECT (entry->>'unique_states')::bit(8)
+                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
                      FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
-                     WHERE entry->>'error' LIKE '%as duplicate: unique claim held by%'
-                       AND entry->>'unique_states' IS NOT NULL
+                     WHERE entry->>'error' IN (
+                           'snoozed as duplicate: unique claim held by a newer job',
+                           'retried as duplicate: unique claim held by a newer job'
+                       )
+                       AND entry->>'duplicate_unique_states' IS NOT NULL
                      ORDER BY n DESC
                      LIMIT 1),
                     unique_states

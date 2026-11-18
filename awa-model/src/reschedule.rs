@@ -315,7 +315,7 @@ async fn reschedule_canonical(
             errors = CASE WHEN $3::jsonb IS NULL THEN errors ELSE errors || $3::jsonb END
                 || jsonb_build_object(
                     'error', $4::text, 'attempt', attempt, 'at', now(),
-                    'unique_states', unique_states::text
+                    'duplicate_unique_states', unique_states::text
                 )
         WHERE id = $1 AND state = 'running' AND run_lease = $2
         RETURNING id
@@ -531,7 +531,7 @@ async fn migrate_to_queue_storage(
             tx,
             successor,
             job.unique_states,
-            "rescheduled as duplicate: unique claim held by a newer job",
+            crate::queue_storage::RESCHEDULED_DUPLICATE_ERROR,
         )
         .await?;
 
