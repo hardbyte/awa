@@ -596,3 +596,138 @@ async fn mixed_batch_claims_ready_and_scheduled_keys_in_one_order() {
         setup::clean_queue(&pool, &queue).await;
     }
 }
+
+/// Insert two unique jobs with distinct keys on `queue`'s lane and fail them
+/// with their claims released, as a failed job whose mask omits `failed`.
+async fn seed_failed_unique_pair(pool: &PgPool, queue: &str) -> [(i64, Vec<u8>); 2] {
+    let params: Vec<InsertParams> = ["claim_lane_retry_a", "claim_lane_retry_b"]
+        .into_iter()
+        .map(|kind| InsertParams {
+            kind: kind.to_string(),
+            args: serde_json::json!({}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                priority: PRIORITY,
+                unique: Some(UniqueOpts {
+                    by_queue: true,
+                    by_args: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        })
+        .collect();
+    let jobs = insert_many(pool, &params)
+        .await
+        .expect("insert unique jobs");
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    sqlx::query(
+        r#"
+        WITH moved AS (
+            DELETE FROM awa.ready_entries
+            WHERE job_id = ANY($1)
+            RETURNING ready_slot, ready_generation, job_id, kind, queue, args,
+                      priority, attempt, run_lease, max_attempts, lane_seq, run_at,
+                      attempted_at, created_at, unique_key, unique_states, payload
+        )
+        INSERT INTO awa.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, args, state,
+            priority, attempt, run_lease, max_attempts, lane_seq, run_at,
+            attempted_at, finalized_at, created_at, unique_key, unique_states, payload
+        )
+        SELECT ready_slot, ready_generation, job_id, kind, queue, args,
+               'failed'::awa.job_state, priority, 1, run_lease,
+               max_attempts, lane_seq, run_at, now(), now(),
+               created_at, unique_key, unique_states, payload
+        FROM moved
+        "#,
+    )
+    .bind(&ids)
+    .execute(pool)
+    .await
+    .expect("fail the jobs");
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE job_id = ANY($1)")
+        .bind(&ids)
+        .execute(pool)
+        .await
+        .expect("release the failed jobs' claims");
+    let mut seeded = jobs
+        .into_iter()
+        .map(|job| (job.id, job.unique_key.expect("unique key")));
+    let first = seeded.next().expect("first job");
+    let second = seeded.next().expect("second job");
+    assert!(first.0 < second.0, "jobs are retried in job ID order");
+    [first, second]
+}
+
+async fn assert_left_failed(pool: &PgPool, job_id: i64) {
+    let state: JobState = sqlx::query_scalar("SELECT state FROM awa.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("job state");
+    assert_eq!(state, JobState::Failed, "the conflicting job stays failed");
+}
+
+/// A bounded retry of failed jobs A and B on one lane, while a fresh enqueue
+/// holds B's key and then reserves the lane, claims both keys before it
+/// reserves the lane, so it loses B's key instead of deadlocking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_retry_by_queue_claims_every_key_before_reserving_the_lane() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_retry_failed");
+    provision_lane(&pool, &queue).await;
+    let [(first, _), (second, second_key)] = seed_failed_unique_pair(&pool, &queue).await;
+    let batch =
+        race_fresh_enqueue(&pool, &queue, &second_key, {
+            let pool = pool.clone();
+            let queue = queue.clone();
+            async move {
+                admin::retry_failed_by_queue_batch(&pool, &queue, 10, BulkCursor::default()).await
+            }
+        })
+        .await
+        .expect("retry_failed_batch skips the conflicting job");
+    assert_eq!(
+        (batch.count, batch.skipped, batch.conflicts.clone()),
+        (1, 1, vec![second])
+    );
+    let state: JobState = sqlx::query_scalar("SELECT state FROM awa.jobs WHERE id = $1")
+        .bind(first)
+        .fetch_one(&pool)
+        .await
+        .expect("job state");
+    assert_eq!(state, JobState::Available);
+    assert_left_failed(&pool, second).await;
+    drop_claim(&pool, &second_key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// [`bounded_retry_by_queue_claims_every_key_before_reserving_the_lane`] for
+/// a bounded retry of explicit job IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_retry_by_ids_claims_every_key_before_reserving_the_lane() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_retry_ids");
+    provision_lane(&pool, &queue).await;
+    let [(first, _), (second, second_key)] = seed_failed_unique_pair(&pool, &queue).await;
+    let outcome = race_fresh_enqueue(&pool, &queue, &second_key, {
+        let pool = pool.clone();
+        async move { admin::bulk_retry_in_batches(&pool, &[first, second], 10).await }
+    })
+    .await
+    .expect("retry_jobs_in_batches skips the conflicting job");
+    assert_eq!(
+        (
+            outcome.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+            outcome.skipped,
+            outcome.conflicts.clone()
+        ),
+        (vec![first], 1, vec![second])
+    );
+    assert_left_failed(&pool, second).await;
+    drop_claim(&pool, &second_key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
