@@ -11622,6 +11622,36 @@ async fn promote_unique_conflict_case(unique_states: u8, schema: &str) {
         unique_claim_holders(&pool, duplicate_id, &store).await,
         vec![duplicate_id]
     );
+
+    // The retry restored the original mask: cancelling the job again keeps
+    // its key exactly when that mask claims `cancelled`.
+    let key = sqlx::query_scalar::<_, Vec<u8>>(&format!(
+        "SELECT unique_key FROM {}.ready_entries WHERE job_id = $1",
+        store.schema()
+    ))
+    .bind(duplicate_id)
+    .fetch_one(&pool)
+    .await
+    .expect("retried key");
+    admin::cancel(&pool, duplicate_id)
+        .await
+        .expect("cancel the retried job")
+        .expect("cancelled row");
+    let holders: Vec<i64> =
+        sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+            .bind(&key)
+            .fetch_all(&pool)
+            .await
+            .expect("claim holders");
+    let claims_cancelled = unique_states & (1 << JobState::Cancelled.bit_position()) != 0;
+    assert_eq!(
+        holders,
+        if claims_cancelled {
+            vec![duplicate_id]
+        } else {
+            Vec::new()
+        }
+    );
 }
 
 /// A due row whose unique key another live job holds is cancelled as a

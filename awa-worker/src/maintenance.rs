@@ -3813,8 +3813,9 @@ impl MaintenanceService {
 
     /// Cancels the due `state` row `$1` as a duplicate, writing `$2` to its
     /// errors. The cancelled row keeps its unique key with `cancelled`
-    /// cleared from its mask, so it never holds the key and a later retry
-    /// still checks it.
+    /// cleared from its mask and the original mask recorded in its error
+    /// entry, so it never holds the key and a later retry restores the mask
+    /// and re-checks ownership.
     fn cancel_promoted_duplicate_sql(state: &'static str) -> String {
         format!(
             r#"
@@ -3850,7 +3851,8 @@ impl MaintenanceService {
                 errors || jsonb_build_object(
                     'error', $2::text,
                     'attempt', attempt,
-                    'at', now()
+                    'at', now(),
+                    'unique_states', unique_states::text
                 )::jsonb,
                 metadata,
                 tags,

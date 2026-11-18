@@ -1912,6 +1912,72 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+/// The key of a duplicate-cancellation error entry that holds the job's
+/// unique mask from before `cancelled` was cleared from it.
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "unique_states";
+
+/// Whether `error` records a cancellation as a duplicate.
+fn is_duplicate_cancel_error(error: &serde_json::Value) -> bool {
+    error
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|message| message.contains("as duplicate: unique claim held by"))
+}
+
+/// The unique mask a revived job takes. A row cancelled as a duplicate
+/// carries its original mask in the duplicate error entry, and gets it back.
+/// A cancelled duplicate stored without its unique key, as releases before
+/// 0.6.19 wrote it, cannot be revived: nothing would keep it from running
+/// beside the job that holds its key.
+fn revived_unique_states(
+    state: JobState,
+    unique_key: Option<&[u8]>,
+    unique_states: Option<String>,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, AwaError> {
+    if state != JobState::Cancelled {
+        return Ok(unique_states);
+    }
+    let Some(duplicate) = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| {
+            errors
+                .iter()
+                .rev()
+                .find(|error| is_duplicate_cancel_error(error))
+        })
+    else {
+        return Ok(unique_states);
+    };
+    if unique_key.is_none() && unique_states.is_none() {
+        return Err(AwaError::UniqueConflict {
+            constraint: Some("idx_awa_jobs_unique".to_string()),
+        });
+    }
+    Ok(duplicate
+        .get(DUPLICATE_CANCEL_MASK_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or(unique_states))
+}
+
+/// Clear `cancelled` from `done`'s mask and record the original mask in its
+/// last error entry, the duplicate cancellation.
+fn clear_cancelled_claim(done: &mut DoneJobRow) -> Result<(), AwaError> {
+    let Some(original) = done.unique_states.clone() else {
+        return Ok(());
+    };
+    let mut payload = RuntimePayload::from_json(done.payload.clone())?;
+    if let Some(entry) = payload.errors.last_mut() {
+        entry[DUPLICATE_CANCEL_MASK_KEY] = serde_json::Value::String(original.clone());
+    }
+    done.payload = payload.into_json();
+    done.unique_states = unique_states_without(Some(original), JobState::Cancelled);
+    Ok(())
+}
+
+/// `unique_states` with `state`'s bit cleared.
 fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
     let mut bitmask = unique_states?.into_bytes();
     if let Some(bit) = bitmask.get_mut(state.bit_position() as usize) {
@@ -8909,7 +8975,7 @@ impl QueueStorage {
         };
         let queue = ready_row.queue.clone();
         let row = Self::retried_job_row(ready_row.clone())?;
-        self.insert_existing_ready_rows_tx(tx, vec![ready_row], Some(old_state))
+        self.insert_existing_ready_rows_tx(tx, vec![ready_row], old_state)
             .await?;
         self.notify_queues_tx(tx, std::iter::once(queue)).await?;
         Ok(Some(row))
@@ -8936,11 +9002,15 @@ impl QueueStorage {
 
     /// Remove a waiting, failed or cancelled job from where it sits and
     /// return its ready row and the state it leaves, without enqueueing it.
+    /// The state is `None` when the stored row holds no claim in it: a
+    /// duplicate cancellation cleared `cancelled` from its mask, and the
+    /// revived mask restores it, so the claim sync must not take the
+    /// restored mask as proof that the row already holds its key.
     async fn take_retry_row_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
-    ) -> Result<Option<(ExistingReadyRow, JobState)>, AwaError> {
+    ) -> Result<Option<(ExistingReadyRow, Option<JobState>)>, AwaError> {
         let schema = self.schema();
         let deleted_waiting: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
@@ -8988,7 +9058,7 @@ impl QueueStorage {
                 attempted_at: None,
                 ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
             };
-            return Ok(Some((ready_row, waiting.state)));
+            return Ok(Some((ready_row, Some(waiting.state))));
         }
 
         let done_projection = done_row_projection("done", "ready");
@@ -9030,6 +9100,8 @@ impl QueueStorage {
                 &Self::done_rows_to_counter_keys(std::slice::from_ref(&terminal)),
             )
             .await?;
+            let held_state = unique_state_claims(terminal.unique_states.as_deref(), terminal.state)
+                .then_some(terminal.state);
             let ready_row = ExistingReadyRow {
                 job_id: terminal.job_id,
                 kind: terminal.kind,
@@ -9042,11 +9114,16 @@ impl QueueStorage {
                 run_at: Utc::now(),
                 attempted_at: None,
                 created_at: terminal.created_at,
+                unique_states: revived_unique_states(
+                    terminal.state,
+                    terminal.unique_key.as_deref(),
+                    terminal.unique_states,
+                    &terminal.payload,
+                )?,
                 unique_key: terminal.unique_key,
-                unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
-            return Ok(Some((ready_row, terminal.state)));
+            return Ok(Some((ready_row, held_state)));
         }
 
         Ok(None)
@@ -9080,7 +9157,7 @@ impl QueueStorage {
         let mut taken = Vec::with_capacity(unique_ids.len());
         for job_id in &unique_ids {
             if let Some((ready_row, old_state)) = self.take_retry_row_tx(&mut tx, *job_id).await? {
-                taken.push((ready_row, Some(old_state)));
+                taken.push((ready_row, old_state));
             }
         }
         let rows = taken
@@ -18353,7 +18430,9 @@ impl QueueStorage {
 
     /// Cancel due rows whose promotion lost their unique key to another job.
     /// The cancelled row keeps its unique key with `cancelled` cleared from
-    /// its mask, so it never holds the key and a later retry still checks it.
+    /// its mask and the original mask recorded in its error entry, so it
+    /// never holds the key and a later retry restores the mask and re-checks
+    /// ownership.
     async fn cancel_promoted_duplicates_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -18368,7 +18447,7 @@ impl QueueStorage {
             .map(|(row, due_run_at)| {
                 let mut payload = RuntimePayload::from_json(row.payload)?;
                 payload.push_error(lifecycle_error(PROMOTED_DUPLICATE_ERROR, row.attempt, true));
-                Ok(DoneJobRow {
+                let mut done = DoneJobRow {
                     ready_slot,
                     ready_generation,
                     job_id: row.job_id,
@@ -18386,12 +18465,15 @@ impl QueueStorage {
                     attempted_at: row.attempted_at,
                     finalized_at,
                     created_at: row.created_at,
-                    // Keep the key so a retry still checks it; clearing
-                    // `cancelled` keeps the cancelled row from claiming it.
                     unique_key: row.unique_key,
-                    unique_states: unique_states_without(row.unique_states, JobState::Cancelled),
+                    unique_states: row.unique_states,
                     payload: payload.into_json(),
-                })
+                };
+                // The row keeps its key, so a retry restores the mask and
+                // re-checks ownership; without `cancelled` in its mask the
+                // cancelled row never holds the key.
+                clear_cancelled_claim(&mut done)?;
+                Ok(done)
             })
             .collect::<Result<_, AwaError>>()?;
         self.ensure_lane(tx, &lane.queue, lane.priority, 0).await?;

@@ -301,6 +301,23 @@ async fn run_case(pool: &PgPool, states: u8, queue_storage: bool) {
     assert_eq!(job_state(pool, duplicate).await, "available");
     assert_eq!(claim_holder(pool, duplicate).await, vec![duplicate]);
 
+    // The retry restored the original mask: cancelling the job again keeps
+    // its key exactly when that mask claims `cancelled`.
+    admin::cancel(pool, duplicate)
+        .await
+        .expect("cancel the retried job")
+        .expect("cancelled row");
+    let claims_cancelled = states & (1 << JobState::Cancelled.bit_position()) != 0;
+    assert_eq!(
+        claim_holder(pool, duplicate).await,
+        if claims_cancelled {
+            vec![duplicate]
+        } else {
+            Vec::new()
+        },
+        "a cancelled job keeps its key exactly when its mask claims cancelled"
+    );
+
     clean(pool).await;
 }
 
