@@ -147,10 +147,11 @@ Run the broken correlated-hash witness with:
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models enqueue, the first enqueue to a new lane (`queue_lanes` row, provisioning lock, enqueue lock), claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings and the idle probe that gates each rotate. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models enqueue, the first enqueue to a new lane (`queue_lanes` row, provisioning lock, enqueue lock), enqueue and re-enqueue of jobs with unique keys (each key's claim before the lane, a batch's keys in key order), claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings and the idle probe that gates each rotate. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
 - [`AwaStorageLockOrderOldStripedClaimDeadlock.cfg`](./AwaStorageLockOrderOldStripedClaimDeadlock.cfg): the historical claim shape that walked several physical stripes against the enqueue order — **NoDeadlock tripped**.
 - [`AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg`](./AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg): the historical `QueueStorage` order for a new lane, provisioning lock before the `queue_lanes` row, against a SQL producer of the same lane — **NoDeadlock tripped in 5 steps** (#692).
+- [`AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg`](./AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg): the 0.6.18 re-enqueue order, lane before the job's unique claim, against a fresh enqueue of the same key into the same lane — **NoDeadlock tripped in 5 steps** (#799).
 - [`AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg`](./AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg): the 0.6.16 claim prune order, the slot's `claim_ring_slots` row before the slot's partitions, against stale receipt rescue, which takes the partitions and then the row — **NoDeadlock tripped** (#721).
 
 Run:
@@ -160,6 +161,7 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg
 ```
 
 Plan order follows PostgreSQL, not the SQL text: a statement takes every relation lock when it is planned and its row locks afterwards, so a `FOR UPDATE` written in a leading CTE is still acquired after the locks on every table the statement reads. The rescue plans listed the cursor row first until #721, which hid their cycle with claim prune.

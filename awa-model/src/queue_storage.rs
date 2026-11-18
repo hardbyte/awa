@@ -2353,6 +2353,9 @@ type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 struct CancelJobTxResult {
     row: JobRow,
     claim_cursor_advance: Option<ClaimCursorAdvance>,
+    /// Shard-0 lane of a cancelled deferred job, to be ensured after the
+    /// transaction's unique claims change.
+    lane: Option<(String, i16)>,
 }
 
 struct ReadyBatchMoveResult {
@@ -3716,22 +3719,22 @@ impl QueueStorage {
         Ok(())
     }
 
+    /// Insert enqueue-time unique claims in one statement, in unique-key
+    /// order.
     async fn sync_enqueue_unique_claims<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        claims: Vec<(Vec<u8>, i64)>,
+        mut claims: Vec<(Vec<u8>, i64)>,
     ) -> Result<(), AwaError> {
         if claims.is_empty() {
             return Ok(());
         }
 
-        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(claims.len());
-        for (key, _) in &claims {
-            if !seen.insert(key.as_slice()) {
-                return Err(AwaError::UniqueConflict {
-                    constraint: Some("idx_awa_jobs_unique".to_string()),
-                });
-            }
+        claims.sort_unstable();
+        if claims.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
         }
 
         let (keys, job_ids): (Vec<Vec<u8>>, Vec<i64>) = claims.into_iter().unzip();
@@ -5441,29 +5444,38 @@ impl QueueStorage {
         rows: Vec<ExistingReadyRow>,
         old_state: Option<JobState>,
     ) -> Result<usize, AwaError> {
+        let rows = rows.into_iter().map(|row| (row, old_state)).collect();
         let (inserted, _) = self
-            .insert_existing_ready_rows_inner_tx(tx, rows, old_state, false)
+            .insert_existing_ready_rows_inner_tx(tx, rows, false)
             .await?;
         Ok(inserted)
     }
 
-    /// Re-enqueue `rows`, reserving each lane before claiming its rows'
-    /// unique keys, the order every enqueue path takes them in. With
-    /// `skip_conflicts`, a row whose unique key a live job holds is left out
-    /// and its job ID returned, and its reserved lane position stays a gap.
+    /// Re-enqueue `rows`, each paired with the state it leaves. Every row's
+    /// unique claim is synced before any lane is reserved, the order every
+    /// enqueue path takes them in. With `skip_conflicts`, a row whose unique
+    /// key a live job holds gets no lane position and its job ID is returned.
     async fn insert_existing_ready_rows_inner_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        rows: Vec<ExistingReadyRow>,
-        old_state: Option<JobState>,
+        rows: Vec<(ExistingReadyRow, Option<JobState>)>,
         skip_conflicts: bool,
     ) -> Result<(usize, Vec<i64>), AwaError> {
         if rows.is_empty() {
             return Ok((0, Vec::new()));
         }
 
+        let conflicts = self
+            .sync_reenqueue_unique_claims(tx, &rows, skip_conflicts)
+            .await?;
+
         let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
-        for row in rows {
+        let mut skipped = Vec::with_capacity(conflicts.len());
+        for (row, _) in rows {
+            if conflicts.contains(&row.job_id) {
+                skipped.push(row.job_id);
+                continue;
+            }
             grouped
                 .entry((row.queue.clone(), row.priority))
                 .or_default()
@@ -5472,7 +5484,6 @@ impl QueueStorage {
 
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         let mut ready_rows = Vec::with_capacity(total_rows);
-        let mut skipped = Vec::new();
 
         for ((queue, priority), lane_rows) in grouped {
             // Re-enqueue paths (retry-after, age-waiting, DLQ retry,
@@ -5493,24 +5504,6 @@ impl QueueStorage {
                 .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
-                match self
-                    .sync_unique_claim(
-                        tx,
-                        row.job_id,
-                        &row.unique_key,
-                        row.unique_states.as_deref(),
-                        old_state,
-                        Some(JobState::Available),
-                    )
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(AwaError::UniqueConflict { .. }) if skip_conflicts => {
-                        skipped.push(row.job_id);
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                }
                 ready_rows.push(RuntimeReadyInsert {
                     job_id: row.job_id,
                     kind: row.kind,
@@ -5539,6 +5532,101 @@ impl QueueStorage {
         self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
         self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok((ready_rows.len(), skipped))
+    }
+
+    /// Sync the unique claims of rows moving to `available`, ordered by
+    /// unique key, releases of a key before claims of it, then job ID.
+    /// Consecutive claims go in one statement. Returns the job IDs whose key
+    /// another job holds; without `skip_conflicts` any such row is an error.
+    async fn sync_reenqueue_unique_claims<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[(ExistingReadyRow, Option<JobState>)],
+        skip_conflicts: bool,
+    ) -> Result<HashSet<i64>, AwaError> {
+        let mut changes: Vec<(&[u8], bool, i64)> = rows
+            .iter()
+            .filter_map(|(row, old_state)| {
+                let key = row.unique_key.as_deref()?;
+                let states = row.unique_states.as_deref();
+                let old_claim = old_state.is_some_and(|state| unique_state_claims(states, state));
+                let new_claim = unique_state_claims(states, JobState::Available);
+                (old_claim != new_claim).then_some((key, new_claim, row.job_id))
+            })
+            .collect();
+        let mut conflicts = HashSet::new();
+        if changes.is_empty() {
+            return Ok(conflicts);
+        }
+        changes.sort_unstable();
+
+        let mut pending: Vec<(&[u8], i64)> = Vec::new();
+        for (key, claim, job_id) in changes {
+            if claim {
+                if pending.last().is_some_and(|(last, _)| *last == key) {
+                    conflicts.insert(job_id);
+                } else {
+                    pending.push((key, job_id));
+                }
+                continue;
+            }
+            self.claim_unique_keys_tx(tx, &mut pending, &mut conflicts)
+                .await?;
+            sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1 AND job_id = $2")
+                .bind(key)
+                .bind(job_id)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        self.claim_unique_keys_tx(tx, &mut pending, &mut conflicts)
+            .await?;
+
+        if !skip_conflicts && !conflicts.is_empty() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        Ok(conflicts)
+    }
+
+    /// Claim distinct `pending` keys in the given order, adding the job IDs
+    /// whose key another job holds to `conflicts`, and clear `pending`.
+    async fn claim_unique_keys_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        pending: &mut Vec<(&[u8], i64)>,
+        conflicts: &mut HashSet<i64>,
+    ) -> Result<(), AwaError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = pending.drain(..).unzip();
+        let claimed: HashSet<i64> = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO awa.job_unique_claims (unique_key, job_id)
+            SELECT input.unique_key, input.job_id
+            FROM unnest($1::bytea[], $2::bigint[]) WITH ORDINALITY AS input(unique_key, job_id, ord)
+            ORDER BY input.ord
+            ON CONFLICT (unique_key)
+            DO UPDATE SET job_id = EXCLUDED.job_id
+            WHERE awa.job_unique_claims.job_id = EXCLUDED.job_id
+            RETURNING job_id
+            "#,
+        )
+        .bind(&keys)
+        .bind(&job_ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?
+        .into_iter()
+        .collect();
+        conflicts.extend(
+            job_ids
+                .into_iter()
+                .filter(|job_id| !claimed.contains(job_id)),
+        );
+        Ok(())
     }
 
     async fn insert_deferred_rows_tx<'a>(
@@ -8785,6 +8873,43 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
     ) -> Result<Option<JobRow>, AwaError> {
+        let Some((ready_row, old_state)) = self.take_retry_row_tx(tx, job_id).await? else {
+            return Ok(None);
+        };
+        let queue = ready_row.queue.clone();
+        let row = Self::retried_job_row(ready_row.clone())?;
+        self.insert_existing_ready_rows_tx(tx, vec![ready_row], Some(old_state))
+            .await?;
+        self.notify_queues_tx(tx, std::iter::once(queue)).await?;
+        Ok(Some(row))
+    }
+
+    fn retried_job_row(ready_row: ExistingReadyRow) -> Result<JobRow, AwaError> {
+        ReadyJobRow {
+            job_id: ready_row.job_id,
+            kind: ready_row.kind,
+            queue: ready_row.queue,
+            args: ready_row.args,
+            priority: ready_row.priority,
+            attempt: ready_row.attempt,
+            run_lease: ready_row.run_lease,
+            max_attempts: ready_row.max_attempts,
+            run_at: ready_row.run_at,
+            attempted_at: ready_row.attempted_at,
+            created_at: ready_row.created_at,
+            unique_key: ready_row.unique_key,
+            payload: ready_row.payload,
+        }
+        .into_job_row()
+    }
+
+    /// Remove a waiting, failed or cancelled job from where it sits and
+    /// return its ready row and the state it leaves, without enqueueing it.
+    async fn take_retry_row_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<(ExistingReadyRow, JobState)>, AwaError> {
         let schema = self.schema();
         let deleted_waiting: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
@@ -8832,28 +8957,7 @@ impl QueueStorage {
                 attempted_at: None,
                 ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
             };
-            self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(waiting.state))
-                .await?;
-            self.notify_queues_tx(tx, std::iter::once(waiting.queue.clone()))
-                .await?;
-            return Ok(Some(
-                ReadyJobRow {
-                    job_id: ready_row.job_id,
-                    kind: ready_row.kind,
-                    queue: ready_row.queue,
-                    args: ready_row.args,
-                    priority: ready_row.priority,
-                    attempt: ready_row.attempt,
-                    run_lease: ready_row.run_lease,
-                    max_attempts: ready_row.max_attempts,
-                    run_at: ready_row.run_at,
-                    attempted_at: ready_row.attempted_at,
-                    created_at: ready_row.created_at,
-                    unique_key: ready_row.unique_key,
-                    payload: ready_row.payload,
-                }
-                .into_job_row()?,
-            ));
+            return Ok(Some((ready_row, waiting.state)));
         }
 
         let done_projection = done_row_projection("done", "ready");
@@ -8911,28 +9015,7 @@ impl QueueStorage {
                 unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
-            self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(terminal.state))
-                .await?;
-            self.notify_queues_tx(tx, std::iter::once(terminal.queue.clone()))
-                .await?;
-            return Ok(Some(
-                ReadyJobRow {
-                    job_id: ready_row.job_id,
-                    kind: ready_row.kind,
-                    queue: ready_row.queue,
-                    args: ready_row.args,
-                    priority: ready_row.priority,
-                    attempt: ready_row.attempt,
-                    run_lease: ready_row.run_lease,
-                    max_attempts: ready_row.max_attempts,
-                    run_at: ready_row.run_at,
-                    attempted_at: ready_row.attempted_at,
-                    created_at: ready_row.created_at,
-                    unique_key: ready_row.unique_key,
-                    payload: ready_row.payload,
-                }
-                .into_job_row()?,
-            ));
+            return Ok(Some((ready_row, terminal.state)));
         }
 
         Ok(None)
@@ -8963,12 +9046,23 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut rows = Vec::with_capacity(unique_ids.len());
+        let mut taken = Vec::with_capacity(unique_ids.len());
         for job_id in &unique_ids {
-            if let Some(row) = self.retry_job_tx(&mut tx, *job_id).await? {
-                rows.push(row);
+            if let Some((ready_row, old_state)) = self.take_retry_row_tx(&mut tx, *job_id).await? {
+                taken.push((ready_row, Some(old_state)));
             }
         }
+        let rows = taken
+            .iter()
+            .map(|(ready_row, _)| Self::retried_job_row(ready_row.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let queues: BTreeSet<String> = taken
+            .iter()
+            .map(|(ready_row, _)| ready_row.queue.clone())
+            .collect();
+        self.insert_existing_ready_rows_inner_tx(&mut tx, taken, false)
+            .await?;
+        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok((rows, unique_ids.len() as u64))
     }
@@ -9462,6 +9556,7 @@ impl QueueStorage {
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
                 claim_cursor_advance: None,
+                lane: None,
             }));
         }
 
@@ -9516,6 +9611,7 @@ impl QueueStorage {
                         return Ok(Some(CancelJobTxResult {
                             row: done.into_job_row()?,
                             claim_cursor_advance: None,
+                            lane: None,
                         }));
                     }
                 }
@@ -9612,6 +9708,7 @@ impl QueueStorage {
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
                 claim_cursor_advance: Some(claim_cursor_advance),
+                lane: None,
             }));
         }
 
@@ -9651,10 +9748,9 @@ impl QueueStorage {
             // is parked on shard 0 with a synthetic negative `lane_seq`
             // that keeps the `done_entries` PK
             // `(ready_slot, queue, priority, enqueue_shard, lane_seq)`
-            // unique. `ensure_lane` registers shard 0 for the queue so
-            // the lane row exists regardless of producer activity.
-            self.ensure_lane(tx, &deferred.queue, deferred.priority, 0)
-                .await?;
+            // unique. The caller ensures shard 0 of the lane so the lane
+            // row exists regardless of producer activity.
+            let lane = (deferred.queue.clone(), deferred.priority);
             let done = DoneJobRow {
                 ready_slot,
                 ready_generation,
@@ -9682,6 +9778,7 @@ impl QueueStorage {
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
                 claim_cursor_advance: None,
+                lane: Some(lane),
             }));
         }
 
@@ -9691,6 +9788,9 @@ impl QueueStorage {
     pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let result = self.cancel_job_tx(&mut tx, job_id).await?;
+        if let Some((queue, priority)) = result.as_ref().and_then(|result| result.lane.as_ref()) {
+            self.ensure_lane(&mut tx, queue, *priority, 0).await?;
+        }
         tx.commit().await.map_err(map_sqlx_error)?;
         if let Some(result) = result {
             if let Some(advance) = result.claim_cursor_advance.as_ref() {
@@ -9713,10 +9813,13 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
     ) -> Result<Option<JobRow>, AwaError> {
-        Ok(self
-            .cancel_job_tx(tx, job_id)
-            .await?
-            .map(|result| result.row))
+        let Some(result) = self.cancel_job_tx(tx, job_id).await? else {
+            return Ok(None);
+        };
+        if let Some((queue, priority)) = &result.lane {
+            self.ensure_lane(tx, queue, *priority, 0).await?;
+        }
+        Ok(Some(result.row))
     }
 
     pub async fn cancel_jobs_by_ids(
@@ -9744,13 +9847,18 @@ impl QueueStorage {
         }
         let mut rows = Vec::with_capacity(ids.len());
         let mut claim_cursor_advances = Vec::new();
+        let mut lanes = BTreeSet::new();
         for job_id in ids {
             if let Some(result) = self.cancel_job_tx(&mut tx, *job_id).await? {
                 if let Some(advance) = result.claim_cursor_advance {
                     claim_cursor_advances.push(advance);
                 }
+                lanes.extend(result.lane);
                 rows.push(result.row);
             }
+        }
+        for (queue, priority) in &lanes {
+            self.ensure_lane(&mut tx, queue, *priority, 0).await?;
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         self.advance_claim_cursors(pool, &claim_cursor_advances)
@@ -9921,9 +10029,6 @@ impl QueueStorage {
             .iter()
             .map(|row| (row.queue.clone(), row.priority))
             .collect();
-        for (queue, priority) in &lanes {
-            self.ensure_lane(tx, queue, *priority, 0).await?;
-        }
 
         let finalized_at = Utc::now();
         let mut by_state: HashMap<JobState, Vec<DoneJobRow>> = HashMap::new();
@@ -9956,6 +10061,9 @@ impl QueueStorage {
         }
         for (old_state, rows) in by_state {
             self.insert_done_rows_tx(tx, &rows, Some(old_state)).await?;
+        }
+        for (queue, priority) in &lanes {
+            self.ensure_lane(tx, queue, *priority, 0).await?;
         }
 
         Ok((cancelled, last_job_id))
@@ -16153,8 +16261,6 @@ impl QueueStorage {
         let mut cancelled_payload = RuntimePayload::from_json(deferred.payload.clone())?;
         cancelled_payload.push_error(lifecycle_error(duplicate_error, deferred.attempt, true));
         let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
-        self.ensure_lane(tx, &deferred.queue, deferred.priority, 0)
-            .await?;
         let mut done = DoneJobRow {
             ready_slot,
             ready_generation,
@@ -16180,7 +16286,7 @@ impl QueueStorage {
             payload: cancelled_payload.into_json(),
         };
 
-        {
+        let claimed = {
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
                 .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), None)
@@ -16188,22 +16294,27 @@ impl QueueStorage {
             {
                 Ok(_) => {
                     savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return done.into_job_row();
+                    true
                 }
                 Err(AwaError::UniqueConflict { .. }) => {
                     savepoint.rollback().await.map_err(map_sqlx_error)?;
+                    false
                 }
                 Err(err) => return Err(err),
             }
-        }
+        };
 
-        // If `cancelled` itself claims uniqueness, the newer holder still
-        // wins. The cancelled evidence carries no claim to release, so strip
-        // the uniqueness fields exactly like rescue duplicate cancellation.
-        done.unique_key = None;
-        done.unique_states = None;
-        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
-            .await?;
+        if !claimed {
+            // If `cancelled` itself claims uniqueness, the newer holder still
+            // wins. The cancelled evidence carries no claim to release, so
+            // strip the uniqueness fields exactly like rescue duplicate
+            // cancellation.
+            done.unique_key = None;
+            done.unique_states = None;
+            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
+                .await?;
+        }
+        self.ensure_lane(tx, &done.queue, done.priority, 0).await?;
         done.into_job_row()
     }
 
@@ -17042,13 +17153,12 @@ impl QueueStorage {
                 ));
             }
             let picked: Vec<i64> = ready_rows.iter().map(|row| row.job_id).collect();
+            let ready_rows = ready_rows
+                .into_iter()
+                .map(|row| (row, Some(JobState::Failed)))
+                .collect();
             let (revived, skipped) = self
-                .insert_existing_ready_rows_inner_tx(
-                    &mut tx,
-                    ready_rows,
-                    Some(JobState::Failed),
-                    true,
-                )
+                .insert_existing_ready_rows_inner_tx(&mut tx, ready_rows, true)
                 .await?;
             for job_id in &skipped {
                 batch.skip(*job_id);
