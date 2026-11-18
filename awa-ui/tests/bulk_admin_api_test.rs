@@ -217,17 +217,14 @@ async fn bulk_routes_reject_a_batch_size_above_the_cap() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
-#[tokio::test]
-async fn bulk_retry_by_id_reports_skipped_conflicts() {
-    let _guard = TEST_LOCK.lock().await;
-    let pool = awa_testing::setup::setup(4).await;
-    awa_testing::setup::reset_to_canonical(&pool).await;
-    let queue = unique_name("ui_bulk_retry_ids");
+/// Fail a plain job and a unique job whose key a live job then takes, and
+/// return their IDs.
+async fn failed_jobs_one_conflicting(pool: &sqlx::PgPool, queue: &str) -> Vec<i64> {
     let unique = |key: &str| awa_model::InsertParams {
         kind: "ui_bulk_unique_job".to_string(),
         args: json!({ "key": key }),
         opts: awa_model::InsertOpts {
-            queue: queue.clone(),
+            queue: queue.to_string(),
             unique: Some(awa_model::UniqueOpts::default()),
             ..Default::default()
         },
@@ -236,11 +233,11 @@ async fn bulk_retry_by_id_reports_skipped_conflicts() {
         kind: "ui_bulk_job".to_string(),
         args: json!({ "seq": 1 }),
         opts: awa_model::InsertOpts {
-            queue: queue.clone(),
+            queue: queue.to_string(),
             ..Default::default()
         },
     };
-    let jobs = awa_model::insert_many(&pool, &[plain, unique("k")])
+    let jobs = awa_model::insert_many(pool, &[plain, unique(queue)])
         .await
         .expect("insert jobs");
     let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
@@ -248,12 +245,53 @@ async fn bulk_retry_by_id_reports_skipped_conflicts() {
         "UPDATE awa.jobs SET state = 'failed', attempt = 1, finalized_at = now() WHERE id = ANY($1)",
     )
     .bind(&ids)
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("fail jobs");
-    awa_model::insert_many(&pool, &[unique("k")])
+    awa_model::insert_many(pool, &[unique(queue)])
         .await
         .expect("a live job takes the key");
+    ids
+}
+
+#[tokio::test]
+async fn bulk_retry_by_id_reports_skipped_conflicts_when_asked() {
+    let _guard = TEST_LOCK.lock().await;
+    let pool = awa_testing::setup::setup(4).await;
+    awa_testing::setup::reset_to_canonical(&pool).await;
+    let queue = unique_name("ui_bulk_retry_ids");
+    let ids = failed_jobs_one_conflicting(&pool, &queue).await;
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/jobs/bulk-retry",
+        Some(json!({ "ids": ids, "report_skipped": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["jobs"].as_array().expect("jobs").len(), 1, "{body}");
+    assert_eq!(body["jobs"][0]["id"], ids[0]);
+    assert_eq!(
+        (body["skipped"].clone(), body["conflicts"].clone()),
+        (json!(1), json!([ids[1]]))
+    );
+    awa_testing::setup::clean_queue(&pool, &queue).await;
+}
+
+/// A client that does not ask for the report, such as a web UI loaded from
+/// the previous release during a rolling update, gets the array of retried
+/// jobs the route has always returned.
+#[tokio::test]
+async fn bulk_retry_by_id_returns_the_array_by_default() {
+    let _guard = TEST_LOCK.lock().await;
+    let pool = awa_testing::setup::setup(4).await;
+    awa_testing::setup::reset_to_canonical(&pool).await;
+    let queue = unique_name("ui_bulk_retry_array");
+    let ids = failed_jobs_one_conflicting(&pool, &queue).await;
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
@@ -266,11 +304,8 @@ async fn bulk_retry_by_id_reports_skipped_conflicts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["jobs"].as_array().expect("jobs").len(), 1, "{body}");
-    assert_eq!(body["jobs"][0]["id"], ids[0]);
-    assert_eq!(
-        (body["skipped"].clone(), body["conflicts"].clone()),
-        (json!(1), json!([ids[1]]))
-    );
+    let jobs = body.as_array().expect("an array of retried jobs");
+    assert_eq!(jobs.len(), 1, "{body}");
+    assert_eq!(jobs[0]["id"], ids[0]);
     awa_testing::setup::clean_queue(&pool, &queue).await;
 }

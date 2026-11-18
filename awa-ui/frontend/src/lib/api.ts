@@ -374,11 +374,21 @@ export interface BulkRetryResult {
   conflicts: number[];
 }
 
-export function bulkRetry(ids: number[]): Promise<BulkRetryResult> {
-  return apiFetch("/jobs/bulk-retry", {
+/**
+ * Read a bulk-retry response. A server that predates `report_skipped`
+ * returns the array of retried jobs and reports no skipped jobs.
+ */
+export function toBulkRetryResult(body: JobRow[] | BulkRetryResult): BulkRetryResult {
+  if (Array.isArray(body)) return { jobs: body, skipped: 0, conflicts: [] };
+  return body;
+}
+
+export async function bulkRetry(ids: number[]): Promise<BulkRetryResult> {
+  const body = await apiFetch<JobRow[] | BulkRetryResult>("/jobs/bulk-retry", {
     method: "POST",
-    body: JSON.stringify({ ids }),
+    body: JSON.stringify({ ids, report_skipped: true }),
   });
+  return toBulkRetryResult(body);
 }
 
 export function bulkCancel(ids: number[]): Promise<JobRow[]> {

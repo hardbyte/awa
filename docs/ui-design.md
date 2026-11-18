@@ -60,7 +60,7 @@ GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=
 GET  /api/jobs/:id
 POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
-POST /api/jobs/bulk-retry               { ids: [...] }
+POST /api/jobs/bulk-retry               { ids: [...], report_skipped? }
 POST /api/jobs/bulk-cancel              { ids: [...] }
 
 POST /api/batch-ops/preview             { op_kind, filter, spec }

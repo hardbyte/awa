@@ -193,8 +193,18 @@ fn changed_jobs(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkRetryPayload {
+    pub ids: Vec<i64>,
+    /// Return a [`BulkRetryReport`] instead of the array of retried jobs.
+    /// A server that predates the field ignores it and returns the array,
+    /// so a client that sets it accepts either shape.
+    #[serde(default)]
+    pub report_skipped: bool,
+}
+
 #[derive(Debug, Serialize)]
-pub struct BulkRetryResponse {
+pub struct BulkRetryReport {
     /// The jobs retried.
     pub jobs: Vec<JobResponse>,
     /// Jobs skipped because a live job holds their unique key.
@@ -203,19 +213,33 @@ pub struct BulkRetryResponse {
     pub conflicts: Vec<i64>,
 }
 
+/// The array of retried jobs, the response every client understands, or
+/// the report a client asked for with `report_skipped`.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum BulkRetryResponse {
+    Jobs(Vec<JobResponse>),
+    Report(BulkRetryReport),
+}
+
 pub async fn bulk_retry(
     State(state): State<AppState>,
-    Json(payload): Json<BulkIdsPayload>,
+    Json(payload): Json<BulkRetryPayload>,
 ) -> Result<Json<BulkRetryResponse>, ApiError> {
     state.require_writable()?;
     let outcome = changed_jobs(
         &state,
         admin::bulk_retry_in_batches(&state.pool, &payload.ids, bulk::DEFAULT_BATCH_SIZE).await,
     )?;
-    Ok(Json(BulkRetryResponse {
-        jobs: JobResponse::from_rows(&state.pool, outcome.jobs).await?,
-        skipped: outcome.skipped,
-        conflicts: outcome.conflicts,
+    let jobs = JobResponse::from_rows(&state.pool, outcome.jobs).await?;
+    Ok(Json(if payload.report_skipped {
+        BulkRetryResponse::Report(BulkRetryReport {
+            jobs,
+            skipped: outcome.skipped,
+            conflicts: outcome.conflicts,
+        })
+    } else {
+        BulkRetryResponse::Jobs(jobs)
     }))
 }
 
