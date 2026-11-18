@@ -132,9 +132,15 @@ impl GateProof {
     }
 
     pub async fn install(shared: &Arc<Shared>) -> Result<(), String> {
+        // The persona fleets share what is left, so the proof's pools come out of the
+        // same budget instead of the headroom kept for the oracle and chaos sessions.
+        let audit_connections = shared.budget.reserve("gate-proof-audit", 2, 1);
+        let witness_connections = shared.budget.reserve("gate-proof-witness", 16, 1);
+        // One witness connection each in the python and claim-and-abandon processes.
+        shared.budget.reserve("gate-proof-children", 2, 0);
         let mut proof = Self::connect(
             &Self::owned_url(shared),
-            2,
+            audit_connections,
             "awa_gate_proof_parent_audit",
             TIMEOUT,
         )
@@ -142,7 +148,7 @@ impl GateProof {
         proof.write_pool = Some(
             Self::connect(
                 &Self::owned_url(shared),
-                16,
+                witness_connections,
                 "awa_gate_proof_parent_witness",
                 WITNESS_WRITE_TIMEOUT,
             )
