@@ -96,7 +96,12 @@ impl CancelListener {
                 _ = self.cancel.cancelled() => return,
                 _ = tokio::time::sleep(delay) => {}
             }
-            match self.connect().await {
+            // A stalled connection or LISTEN must not hold up shutdown.
+            let connected = tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                connected = self.connect() => connected,
+            };
+            match connected {
                 Ok(listener) => {
                     info!(
                         channel = CANCEL_CHANNEL,
@@ -132,7 +137,10 @@ impl CancelListener {
                         ),
                         Err(err) => {
                             warn!(error = %err, "PG cancel listener error; will retry");
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            tokio::select! {
+                                _ = self.cancel.cancelled() => return,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
                         }
                     }
                 }
@@ -249,5 +257,47 @@ mod tests {
             .await
             .expect("the listener stops on shutdown")
             .unwrap();
+    }
+
+    /// Shutdown stops a listener whose retried connection has stalled.
+    #[tokio::test]
+    async fn shutdown_interrupts_a_stalled_reconnect() {
+        let port = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            // Longer than the shutdown bound below, so a reconnect that is not
+            // raced against shutdown fails the test.
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy(&format!(
+                "postgres://postgres:test@127.0.0.1:{port}/awa_test"
+            ))
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let handle = CancelListener::new(
+            unreachable,
+            Arc::new(InFlightRegistry::default()),
+            shutdown.clone(),
+        )
+        .spawn()
+        .await
+        .expect("a failed first connection still leaves a retrying listener");
+
+        // The port now accepts connections and never answers them.
+        let stall = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (held, _) = tokio::time::timeout(Duration::from_secs(10), stall.accept())
+            .await
+            .expect("the listener retries its connection")
+            .unwrap();
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown must not wait for a stalled reconnect")
+            .unwrap();
+        drop(held);
     }
 }
