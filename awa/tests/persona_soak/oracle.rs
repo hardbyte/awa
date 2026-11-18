@@ -38,7 +38,7 @@ fn terminal_cte(schema: &str) -> String {
 
 /// Jobs the lane cursors still consider claimable: at or after the claim cursor and
 /// not tombstoned.
-fn available_cte(schema: &str) -> String {
+pub fn available_cte(schema: &str) -> String {
     format!(
         "heads AS MATERIALIZED (
             SELECT queue, priority, enqueue_shard, {schema}.sequence_next_value(seq_name) AS claim_seq
@@ -74,6 +74,9 @@ pub struct Oracle {
     reported_duplicates: std::collections::HashSet<(i64, i64)>,
     reported_cancel: std::collections::HashSet<i64>,
     initial_stats_reset: std::sync::Mutex<Option<Option<String>>>,
+    /// Set for the final reconciliation, where a failed query always leaves the oracle
+    /// incomplete instead of skipping a sample.
+    final_phase: bool,
 }
 
 impl Oracle {
@@ -87,6 +90,22 @@ impl Oracle {
             reported_duplicates: Default::default(),
             reported_cancel: Default::default(),
             initial_stats_reset: Default::default(),
+            final_phase: false,
+        }
+    }
+
+    /// Switches to the final reconciliation's pool, whose statement timeout is longer.
+    pub fn begin_final_phase(&mut self, pool: PgPool) {
+        self.pool = pool;
+        self.final_phase = true;
+    }
+
+    fn query_failed(&self, check: &str, error: &sqlx::Error) {
+        if self.final_phase {
+            self.shared
+                .incomplete(format!("{check} query failed: {error}"), vec![]);
+        } else {
+            self.shared.oracle_query_failed(check, error);
         }
     }
 
@@ -206,9 +225,7 @@ impl Oracle {
                     );
                 }
             }
-            Err(error) => self
-                .shared
-                .incomplete(format!("terminal uniqueness query failed: {error}"), vec![]),
+            Err(error) => self.query_failed("terminal_uniqueness", &error),
         }
 
         let available = available_cte(&schema);
@@ -244,10 +261,7 @@ impl Oracle {
                 let confirmed: std::collections::HashSet<i64> = match still {
                     Ok(rows) => rows.into_iter().map(|row| row.0).collect(),
                     Err(error) => {
-                        self.shared.incomplete(
-                            format!("terminal/live confirmation failed: {error}"),
-                            vec![],
-                        );
+                        self.query_failed("terminal_live_confirm", &error);
                         Default::default()
                     }
                 };
@@ -271,9 +285,7 @@ impl Oracle {
                 }
             }
             Ok(_) => {}
-            Err(error) => self
-                .shared
-                .incomplete(format!("terminal/live query failed: {error}"), vec![]),
+            Err(error) => self.query_failed("terminal_live", &error),
         }
         self.shared.run.observe(
             "oracle_terminal_check_ms",
@@ -298,8 +310,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                self.query_failed("unexplained_cancels", &error);
                 return;
             }
         };
@@ -374,8 +385,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                self.query_failed("promotion", &error);
                 return;
             }
         };
@@ -394,8 +404,7 @@ impl Oracle {
         let still = match still {
             Ok(still) => still,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("promotion confirmation failed: {error}"), vec![]);
+                self.query_failed("promotion_confirm", &error);
                 return;
             }
         };
@@ -441,8 +450,7 @@ impl Oracle {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                self.shared
-                    .incomplete(format!("invariant query failed: {error}"), vec![]);
+                self.query_failed("stall", &error);
                 return;
             }
         };
@@ -460,6 +468,7 @@ impl Oracle {
                 .or_insert((cursor, now, false));
             if entry.0 != cursor {
                 *entry = (cursor, now, false);
+                self.shared.progress.moved(&queue_name, now);
                 continue;
             }
             let Some(queue) = self.shared.queues.get(&queue_name) else {
@@ -492,8 +501,7 @@ impl Oracle {
             let available = match exact {
                 Ok(available) => available,
                 Err(error) => {
-                    self.shared
-                        .incomplete(format!("exact claimable-row check failed: {error}"), vec![]);
+                    self.query_failed("stall_exact", &error);
                     continue;
                 }
             };
@@ -558,17 +566,25 @@ impl Oracle {
         )
         .fetch_one(&self.pool)
         .await;
-        if let Ok(connections) = connections {
-            self.shared.run.set_max("peak_connections", connections);
-            self.shared.run.observe("connections", connections);
+        match connections {
+            Ok(connections) => {
+                self.shared.samplers.ok("oracle.connections");
+                self.shared.run.set_max("peak_connections", connections);
+                self.shared.run.observe("connections", connections);
+            }
+            Err(error) => self.shared.sample_skipped("oracle.connections", &error),
         }
         let size: Result<i64, _> =
             sqlx::query_scalar("SELECT pg_database_size(current_database())")
                 .fetch_one(&self.pool)
                 .await;
-        if let Ok(size) = size {
-            self.shared.run.set_max("peak_db_mb", size / (1024 * 1024));
-            self.shared.run.observe("db_mb", size / (1024 * 1024));
+        match size {
+            Ok(size) => {
+                self.shared.samplers.ok("oracle.database_size");
+                self.shared.run.set_max("peak_db_mb", size / (1024 * 1024));
+                self.shared.run.observe("db_mb", size / (1024 * 1024));
+            }
+            Err(error) => self.shared.sample_skipped("oracle.database_size", &error),
         }
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             if let Some(kb) = status

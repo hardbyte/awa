@@ -13,8 +13,9 @@ use super::stop::Stop;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Connections kept free of persona pools: oracle, chaos sessions, admin probes.
-const HEADROOM: u32 = 14;
+/// Connections kept free of persona pools: oracle, resource sampler, final reconciliation,
+/// chaos sessions, admin probes.
+const HEADROOM: u32 = 17;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
@@ -29,9 +30,11 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         config.database_name()
     );
     db::recreate_database(&config).await?;
-    let oracle_pool = db::connect_pool(&config.database_url, "soak_oracle", 4)
-        .await
-        .map_err(|error| format!("oracle connect: {error}"))?;
+    let sampler_timeouts = config.checks.sampler_timeouts();
+    let oracle_pool =
+        db::connect_sampler_pool(&config.database_url, "soak_oracle", 4, sampler_timeouts)
+            .await
+            .map_err(|error| format!("oracle connect: {error}"))?;
     let info = db::server_info(&oracle_pool)
         .await
         .map_err(|error| format!("server info: {error}"))?;
@@ -61,6 +64,19 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         ));
     }
     let shared = Shared::new(config, info, budget);
+    let final_timeouts = shared.config.checks.final_timeouts();
+    for (pool, timeouts) in [
+        (
+            "soak_oracle (periodic checks, terminal observer)",
+            sampler_timeouts,
+        ),
+        ("soak_resources (resource sampler)", sampler_timeouts),
+        ("soak_oracle_final (final reconciliation)", final_timeouts),
+    ] {
+        shared
+            .samplers
+            .register_pool(pool, describe_timeouts(timeouts));
+    }
     if super::gate_proof::enabled_from_env()? {
         super::gate_proof::GateProof::install(&shared).await?;
     }
@@ -147,6 +163,19 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         shared.clone(),
         shared.drain_stop.clone(),
     ));
+    let resource_pool = db::connect_sampler_pool(
+        &shared.config.database_url,
+        "soak_resources",
+        1,
+        sampler_timeouts,
+    )
+    .await
+    .map_err(|error| format!("resource sampler connect: {error}"))?;
+    let resource_sampler = tokio::spawn(super::resources::sample(
+        shared.clone(),
+        resource_pool.clone(),
+        shared.drain_stop.clone(),
+    ));
     let completion_stall = tokio::spawn(super::memory::stall_completions(shared.clone()));
 
     let load_deadline = Instant::now() + shared.config.load;
@@ -193,7 +222,33 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         .store(quiesced, std::sync::atomic::Ordering::Relaxed);
     shared.note("run", format!("quiesced: {quiesced}"));
     super::terminal_proof::observe(&shared, &oracle_pool).await;
+    let final_pool = db::connect_sampler_pool(
+        &shared.config.database_url,
+        "soak_oracle_final",
+        2,
+        final_timeouts,
+    )
+    .await
+    .map_err(|error| format!("final reconciliation connect: {error}"))?;
+    oracle.begin_final_phase(final_pool.clone());
     oracle.final_check(quiesced).await;
+    final_pool.close().await;
+    let idle = shared.config.checks.idle;
+    if quiesced && !idle.is_zero() {
+        // The runtimes stay up with no work: what they still cost is the idle check's subject.
+        let from_ms = shared.now_ms();
+        shared.note(
+            "run",
+            format!(
+                "idle phase: {}s with the runtimes up and no load",
+                idle.as_secs()
+            ),
+        );
+        tokio::time::sleep(idle).await;
+        shared.resources.set_idle_window(from_ms, shared.now_ms());
+    } else if !idle.is_zero() {
+        shared.note("run", "idle phase skipped: the run did not quiesce");
+    }
     let excerpts = oracle.crash_scan();
     for excerpt in &excerpts {
         shared.violation(
@@ -220,7 +275,12 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     memory_sampler
         .await
         .map_err(|error| format!("memory sampler task: {error}"))?;
+    resource_sampler
+        .await
+        .map_err(|error| format!("resource sampler task: {error}"))?;
+    resource_pool.close().await;
     super::memory::evaluate(&shared, load_started_ms);
+    super::resources::evaluate(&shared);
     for (persona, task) in tasks {
         match tokio::time::timeout(
             crate::ci_timing::scaled_timeout(Duration::from_secs(180)),
@@ -275,18 +335,39 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
             .map_err(|error| format!("could not write the maintenance metrics: {error}")),
         None => Err("captured by the OTLP collector, not in process".to_string()),
     };
+    let maintenance_rows = maintenance_metrics.as_ref().map(|capture| capture.rows());
+    let progress = super::maintenance_checks::evaluate(
+        &shared,
+        match &maintenance_rows {
+            Some(rows) => Ok(rows.as_slice()),
+            None => {
+                Err("the maintenance metrics are captured by the OTLP collector, not in process")
+            }
+        },
+    );
+    let admin_latency = super::admin_latency::evaluate(&shared);
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
         crash_excerpts: excerpts,
         log_tail,
         maintenance,
+        progress,
+        admin_latency,
     };
     if let Err(error) = report::write(&shared, &outcome) {
         eprintln!("could not write the report: {error}");
     }
     oracle_pool.close().await;
     Ok(shared)
+}
+
+fn describe_timeouts(timeouts: db::SamplerTimeouts) -> String {
+    format!(
+        "statement_timeout {} ms, lock_timeout {} ms",
+        timeouts.statement.as_millis(),
+        timeouts.lock.as_millis()
+    )
 }
 
 fn spawn_persona(

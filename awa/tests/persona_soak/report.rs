@@ -28,6 +28,69 @@ pub struct Outcome {
     pub log_tail: Option<String>,
     /// The in-process maintenance metrics, or why there are none.
     pub maintenance: Result<super::maintenance_metrics::Summary, String>,
+    pub progress: super::maintenance_checks::ProgressVerdict,
+    pub admin_latency: Vec<super::admin_latency::LatencyRow>,
+}
+
+fn render_intents(out: &mut String, shared: &Shared) {
+    let spans = shared.intents.spans();
+    let mut by_kind: std::collections::BTreeMap<String, (usize, i64)> = Default::default();
+    for span in &spans {
+        let kind = match span.intent {
+            super::intent::Intent::OperatorOp(op) => format!("operator_op:{op}"),
+            other => format!("{other:?}").to_lowercase(),
+        };
+        let entry = by_kind.entry(kind).or_default();
+        entry.0 += 1;
+        entry.1 += span.end_ms.unwrap_or_else(|| shared.now_ms()) - span.start_ms;
+    }
+    let _ = writeln!(out, "## Declared intent");
+    if by_kind.is_empty() {
+        let _ = writeln!(out, "- none declared");
+    }
+    for (kind, (count, total_ms)) in by_kind {
+        let _ = writeln!(
+            out,
+            "- {kind}: {count} span(s), {:.0} s in total",
+            total_ms as f64 / 1000.0
+        );
+    }
+    let _ = writeln!(out);
+}
+
+fn render_samplers(out: &mut String, shared: &Shared) {
+    let _ = writeln!(out, "## Sampler hygiene");
+    for (pool, settings) in shared.samplers.pools() {
+        let _ = writeln!(out, "- pool {pool}: {settings}");
+    }
+    let stats = shared.samplers.stats();
+    let skipped: Vec<_> = stats
+        .iter()
+        .filter(|(_, stats)| !stats.skipped.is_empty())
+        .collect();
+    if skipped.is_empty() {
+        let _ = writeln!(
+            out,
+            "- skipped samples: none over {} sampler(s)",
+            stats.len()
+        );
+    }
+    for (sampler, stats) in skipped {
+        let _ = writeln!(
+            out,
+            "- {sampler}: {} ok, skipped {} (last: {})",
+            stats.ok,
+            counts(
+                &stats
+                    .skipped
+                    .iter()
+                    .map(|(reason, count)| (reason.clone(), *count))
+                    .collect()
+            ),
+            stats.last_skip.as_deref().unwrap_or("")
+        );
+    }
+    let _ = writeln!(out);
 }
 
 fn counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
@@ -237,6 +300,12 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     let _ = writeln!(out);
 
     render_maintenance(&mut out, &outcome.maintenance);
+    super::maintenance_checks::render(&mut out, &outcome.progress, shared);
+    super::resources::render(&mut out, shared.resources.verdict().as_ref(), shared);
+    super::admin_latency::render(&mut out, &outcome.admin_latency, shared);
+    super::drain_check::render(&mut out, &shared.drains.results(), shared);
+    render_intents(&mut out, shared);
+    render_samplers(&mut out, shared);
 
     let findings = shared.findings.lock().expect("findings");
     let _ = writeln!(out, "## Findings, not fatal ({})", findings.len());
@@ -325,6 +394,12 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
             Ok(summary) => json!(summary),
             Err(reason) => json!({ "not_captured": reason }),
         },
+        "maintenance_progress": outcome.progress,
+        "postgres_resources": shared.resources.verdict(),
+        "admin_latency": outcome.admin_latency,
+        "drains": shared.drains.results(),
+        "intents": shared.intents.spans(),
+        "samplers": { "pools": shared.samplers.pools(), "stats": shared.samplers.stats() },
         "violations": violations,
         "findings": shared.findings.lock().expect("findings").clone(),
         "timeline": timeline,
@@ -332,6 +407,10 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
     std::fs::write(
         dir.join("memory.csv"),
         super::memory::csv(&shared.memory.samples()),
+    )?;
+    std::fs::write(
+        dir.join("pg-backends.csv"),
+        super::resources::backends_csv(&shared.resources.backends()),
     )?;
     std::fs::write(
         dir.join("report.json"),

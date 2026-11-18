@@ -675,11 +675,24 @@ async fn monitor(shared: Arc<Shared>, queues: Vec<String>) {
         .queue_storage_schema
         .clone()
         .unwrap_or_else(|| "awa".to_string());
-    let Ok(pool) = connect_pool_with_timeout(
+    // The backlog probes read every claim slot, so they keep their longer statement bound.
+    let timeouts = super::super::db::SamplerTimeouts {
+        statement: Duration::from_secs(60),
+        lock: shared.config.checks.sampler_lock_timeout,
+    };
+    shared.samplers.register_pool(
+        "soak_abandon_monitor (claim backlog and ring probes, lock capture)",
+        format!(
+            "statement_timeout {} ms, lock_timeout {} ms",
+            timeouts.statement.as_millis(),
+            timeouts.lock.as_millis()
+        ),
+    );
+    let Ok(pool) = super::super::db::connect_sampler_pool(
         &shared.config.database_url,
         "soak_abandon_monitor",
         2,
-        Some(Duration::from_secs(60)),
+        timeouts,
     )
     .await
     else {

@@ -98,6 +98,17 @@ macro_rules! rows {
 impl Capture {
     /// Writes `maintenance-metrics.jsonl` to `dir` and returns the summary of its rows.
     pub fn write(&self, dir: &Path) -> std::io::Result<Summary> {
+        let rows = self.rows();
+        std::fs::create_dir_all(dir)?;
+        let mut file = std::fs::File::create(dir.join("maintenance-metrics.jsonl"))?;
+        for row in &rows {
+            writeln!(file, "{row}")?;
+        }
+        Ok(Summary::from_rows(&rows))
+    }
+
+    /// Every captured maintenance data point so far, one JSON object per point.
+    pub fn rows(&self) -> Vec<Value> {
         let _ = self.provider.force_flush();
         let mut rows: Vec<Value> = Vec::new();
         for resource in self.exporter.get_finished_metrics().unwrap_or_default() {
@@ -115,12 +126,7 @@ impl Capture {
                 }
             }
         }
-        std::fs::create_dir_all(dir)?;
-        let mut file = std::fs::File::create(dir.join("maintenance-metrics.jsonl"))?;
-        for row in &rows {
-            writeln!(file, "{row}")?;
-        }
-        Ok(Summary::from_rows(&rows))
+        rows
     }
 }
 
