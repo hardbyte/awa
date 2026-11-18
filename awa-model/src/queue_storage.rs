@@ -6,7 +6,7 @@ use crate::insert::prepare_row_raw;
 use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use sqlx::Acquire;
 use sqlx::{FromRow, PgPool, Postgres, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1909,6 +1909,90 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     };
     let idx = state.bit_position() as usize;
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
+}
+
+/// The key of a duplicate-cancellation error entry that holds the job's
+/// unique mask from before `cancelled` was cleared from it.
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "unique_states";
+
+/// The messages releases before 0.6.19 wrote when they cancelled a duplicate
+/// and stored it without its unique key.
+const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] = [
+    RESCUED_DUPLICATE_ERROR,
+    "rescheduled as duplicate: unique claim held by a newer job",
+];
+
+/// The unique mask a revived job takes. A row cancelled as a duplicate
+/// carries its original mask under [`DUPLICATE_CANCEL_MASK_KEY`] in the
+/// duplicate error entry, and gets it back. A cancelled duplicate that a
+/// release before 0.6.19 stored without its unique key cannot be revived:
+/// nothing would keep it from running beside the job that holds its key.
+/// Neither can a recorded duplicate whose key is gone.
+fn revived_unique_states(
+    state: JobState,
+    unique_key: Option<&[u8]>,
+    unique_states: Option<String>,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, AwaError> {
+    if state != JobState::Cancelled {
+        return Ok(unique_states);
+    }
+    let errors = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(original) = errors.iter().rev().find_map(|error| {
+        error
+            .get(DUPLICATE_CANCEL_MASK_KEY)
+            .and_then(serde_json::Value::as_str)
+    }) {
+        if unique_key.is_none() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        return Ok(Some(original.to_string()));
+    }
+    let legacy_keyless_duplicate = unique_key.is_none()
+        && unique_states.is_none()
+        && errors.last().is_some_and(|error| {
+            error.get("terminal") == Some(&serde_json::Value::Bool(true))
+                && error
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| LEGACY_KEYLESS_DUPLICATE_ERRORS.contains(&message))
+        });
+    if legacy_keyless_duplicate {
+        return Err(AwaError::UniqueConflict {
+            constraint: Some("idx_awa_jobs_unique".to_string()),
+        });
+    }
+    Ok(unique_states)
+}
+
+/// Clear `cancelled` from `done`'s mask and record the original mask in its
+/// last error entry, the duplicate cancellation.
+fn clear_cancelled_claim(done: &mut DoneJobRow) -> Result<(), AwaError> {
+    let Some(original) = done.unique_states.clone() else {
+        return Ok(());
+    };
+    let mut payload = RuntimePayload::from_json(done.payload.clone())?;
+    if let Some(entry) = payload.errors.last_mut() {
+        entry[DUPLICATE_CANCEL_MASK_KEY] = serde_json::Value::String(original.clone());
+    }
+    done.payload = payload.into_json();
+    done.unique_states = unique_states_without(Some(original), JobState::Cancelled);
+    Ok(())
+}
+
+/// `unique_states` with `state`'s bit cleared.
+fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
+    let mut bitmask = unique_states?.into_bytes();
+    if let Some(bit) = bitmask.get_mut(state.bit_position() as usize) {
+        *bit = b'0';
+    }
+    String::from_utf8(bitmask).ok()
 }
 
 /// A change to one job's row in `awa.job_unique_claims`: `(key, claim,
@@ -9195,8 +9279,13 @@ impl QueueStorage {
                 run_at: Utc::now(),
                 attempted_at: None,
                 created_at: terminal.created_at,
+                unique_states: revived_unique_states(
+                    terminal.state,
+                    terminal.unique_key.as_deref(),
+                    terminal.unique_states,
+                    &terminal.payload,
+                )?,
                 unique_key: terminal.unique_key,
-                unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
             return Ok(Some((ready_row, terminal.state)));
@@ -16530,11 +16619,8 @@ impl QueueStorage {
 
         if !claimed {
             // If `cancelled` itself claims uniqueness, the newer holder still
-            // wins. The cancelled evidence carries no claim to release, so
-            // strip the uniqueness fields exactly like rescue duplicate
-            // cancellation.
-            done.unique_key = None;
-            done.unique_states = None;
+            // wins. The row keeps its key, so a retry re-checks ownership.
+            clear_cancelled_claim(&mut done)?;
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
                 .await?;
         }
@@ -16581,7 +16667,9 @@ impl QueueStorage {
             .await?
             .into_iter();
 
-        let finalized_at = Utc::now();
+        // PostgreSQL keeps microseconds, so the rows returned match the rows
+        // committed.
+        let finalized_at = Utc::now().trunc_subsecs(6);
         let mut retries: Vec<(LeaseTransitionRow, DeferredJobRow)> = Vec::new();
         let mut failures: Vec<(LeaseTransitionRow, DoneJobRow)> = Vec::new();
         let mut dead_letters: Vec<(LeaseTransitionRow, DlqJobRow)> = Vec::new();
@@ -16643,7 +16731,7 @@ impl QueueStorage {
             .await?;
 
         let mut settled = Vec::with_capacity(retries.len() + failures.len() + dead_letters.len());
-        let mut duplicates: Vec<(LeaseTransitionRow, DoneJobRow)> = Vec::new();
+        let mut duplicates: Vec<(LeaseTransitionRow, (DoneJobRow, bool))> = Vec::new();
         let mut duplicate = |row: LeaseTransitionRow, payload: serde_json::Value| {
             let attempt = row.attempt;
             let mut payload = RuntimePayload::from_json(payload)?;
@@ -16653,12 +16741,15 @@ impl QueueStorage {
                     .into_done_row(JobState::Cancelled, finalized_at, payload.into_json());
             // The attempt held no claim, since its outcome's claim conflicted.
             // A mask that claims `cancelled` would conflict again, so the
-            // cancelled row is written with its unique key stripped.
-            if unique_state_claims(done.unique_states.as_deref(), JobState::Cancelled) {
-                done.unique_key = None;
-                done.unique_states = None;
+            // row is written with `cancelled` cleared from its mask and the
+            // original mask recorded in its error entry. It keeps its unique
+            // key, so a later retry restores the mask and re-checks
+            // ownership.
+            let cleared = unique_state_claims(done.unique_states.as_deref(), JobState::Cancelled);
+            if cleared {
+                clear_cancelled_claim(&mut done)?;
             }
-            duplicates.push((row, done));
+            duplicates.push((row, (done, cleared)));
             Ok::<_, AwaError>(())
         };
         let mut kept_retries = Vec::with_capacity(retries.len());
@@ -16709,10 +16800,20 @@ impl QueueStorage {
         for dead_letter in dead_letters {
             settled.push(dead_letter.into_job_row()?);
         }
+        // A ready-backed done row takes its unique key and mask from the
+        // retained ready row, so a duplicate whose mask was cleared is
+        // written self-contained, as a rescheduled duplicate is, and stores
+        // the mask it reports.
         for (old_state, group) in group_by_previous_state(duplicates) {
-            let done: Vec<DoneJobRow> = group.into_iter().map(|(_, done)| done).collect();
-            self.write_done_rows_tx(tx, &done, Some(old_state)).await?;
-            for done in done {
+            let (cleared, kept): (Vec<_>, Vec<_>) = group
+                .into_iter()
+                .map(|(_, done)| done)
+                .partition(|(_, cleared)| *cleared);
+            let kept: Vec<DoneJobRow> = kept.into_iter().map(|(done, _)| done).collect();
+            let cleared: Vec<DoneJobRow> = cleared.into_iter().map(|(done, _)| done).collect();
+            self.write_done_rows_tx(tx, &kept, Some(old_state)).await?;
+            self.write_done_rows_tx(tx, &cleared, None).await?;
+            for done in kept.into_iter().chain(cleared) {
                 settled.push(done.into_job_row()?);
             }
         }
@@ -20457,6 +20558,63 @@ mod writer_bind_tests {
             offenders.is_empty(),
             "queue_storage.rs builds a per-row VALUES insert at lines {offenders:?}; \
              use INSERT ... SELECT FROM unnest(...) with one array bind per column"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revived_unique_states_tests {
+    use super::*;
+
+    fn payload(error: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "errors": [error] })
+    }
+
+    #[test]
+    fn a_handler_cancel_reason_mentioning_duplicates_does_not_block_retry() {
+        let reason = payload(serde_json::json!({
+            "error": "remote job rejected as duplicate: unique claim held by another job",
+            "attempt": 1,
+            "terminal": true,
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &reason).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyless_legacy_duplicate_cancellation_is_refused() {
+        for message in LEGACY_KEYLESS_DUPLICATE_ERRORS {
+            let legacy = payload(serde_json::json!({
+                "error": message,
+                "attempt": 1,
+                "terminal": true,
+            }));
+            assert!(matches!(
+                revived_unique_states(JobState::Cancelled, None, None, &legacy),
+                Err(AwaError::UniqueConflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_recorded_mask_is_restored() {
+        let recorded = payload(serde_json::json!({
+            "error": RESCUED_DUPLICATE_ERROR,
+            "attempt": 1,
+            "terminal": true,
+            DUPLICATE_CANCEL_MASK_KEY: "11000010",
+        }));
+        assert_eq!(
+            revived_unique_states(
+                JobState::Cancelled,
+                Some(b"key"),
+                Some("11000000".to_string()),
+                &recorded
+            )
+            .unwrap(),
+            Some("11000010".to_string())
         );
     }
 }
