@@ -2,6 +2,12 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [Unreleased]
+
+### Documentation
+
+- [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) tells the fault apart from a pinned lane by the prune outcome alone. It said `awa.maintenance.prune.pinned_ready_age` stays absent or `0` during the fault, but the leader leaves the gauge unchanged when prune is `blocked`, so it can be positive while a lane also pins the slot. The storage-isolation section of the deployment guide is corrected the same way.
+
 ## [0.6.18] — 2026-11-18
 
 Recommended for everyone on 0.6.17 using queue storage, and especially if you run more than one queue stripe, publish the awa schema for logical replication, or see retry storms. Jobs inserted through the compatibility path into a striped queue were never claimed; that is fixed. An idle runtime now costs the database far less: in a comparison against 0.6.17 on PostgreSQL 18, idle transactions fell from 60 to 26 a second and idle WAL by about 60%, and with 200 idle queues from about 670 to 125 transactions a second. A retry storm no longer floods the connection pool, completing 230 to 300 jobs a second where 0.6.17 completed 90 to 150. Moving, reprioritising or cancelling the jobs of a stuck lane now lets the queue ring reclaim storage again. Saturation throughput and claim latency match or improve on 0.6.17. One new schema patch takes brief table locks when `awa migrate` applies it; see the [upgrade guide](docs/upgrade-0.6.17-to-0.6.18.md).
