@@ -3,8 +3,12 @@
 //! queries the UI issues, and rolls a client restart through another persona's fleet.
 
 use super::super::config::Persona;
-use super::super::db::{connect_pool, connect_pool_with_timeout, ClientFactory};
+use super::super::db::{
+    connect_pool, connect_pool_with_timeout, connect_sampler_pool, ClientFactory,
+};
+use super::super::drain_check::{self, WatchedJob};
 use super::super::fleet::Fleet;
+use super::super::intent::Intent;
 use super::super::ledger::{expect, flag};
 use super::super::registry::QueueInfo;
 use super::super::rng::Rng;
@@ -18,9 +22,10 @@ use awa::model::batch_operations::{
 use awa::model::dlq;
 use awa::model::{insert_many, DlqPage, JobFilter, JobPage, JobState, RetryFromDlqOpts};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, Worker};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,6 +84,9 @@ struct Context {
     diagnostics: PgPool,
     stalled_rows: std::sync::Mutex<Vec<String>>,
     rng: Rng,
+    /// The newest job id Alex's producer enqueued, for `get_job`.
+    latest_job_id: Arc<AtomicI64>,
+    batch_count: u64,
 }
 
 /// pid, application, state, wait event, seconds running, blocking pids, query.
@@ -101,6 +109,7 @@ impl Context {
         call: impl std::future::Future<Output = Result<T, E>>,
     ) -> Option<T> {
         let started = Instant::now();
+        let started_ms = self.shared.now_ms();
         let mut call = std::pin::pin!(call);
         let result = tokio::select! {
             result = &mut call => result,
@@ -118,6 +127,11 @@ impl Context {
             );
         }
         self.stats().observe(name, ms);
+        if let Some(read) = super::super::admin_latency::library_read(name) {
+            self.shared
+                .admin_latency
+                .observe(read, "library", started_ms, ms);
+        }
         if ms > 5_000 {
             self.stats().add("slow_admin_calls_over_5s", 1);
             self.shared.note("alex", format!("{name} took {ms} ms"));
@@ -210,6 +224,29 @@ impl Context {
             };
             self.timed("admin_list_jobs", admin::find_jobs(&pool, &filter, page))
                 .await;
+            self.timed(
+                "admin_queue_overview",
+                admin::queue_overview(&pool, &queue.name),
+            )
+            .await;
+        }
+        // A recent job, usually still live, or an older one, usually pruned: a lookup
+        // that misses costs the same search.
+        let latest = self.latest_job_id.load(Ordering::Relaxed);
+        if latest > 0 {
+            let job_id = if self.rng.chance(50) {
+                latest
+            } else {
+                1 + self.rng.below(latest as u64) as i64
+            };
+            self.timed("admin_get_job", async {
+                match admin::get_job(&pool, job_id).await {
+                    Ok(job) => Ok(Some(job)),
+                    Err(awa::AwaError::JobNotFound { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .await;
         }
     }
 
@@ -243,7 +280,9 @@ impl Context {
                 .or_else(|| self.queue_of(Persona::Mia)),
         };
         let Some(queue) = target else { return };
-        queue.hold();
+        let _paused = self
+            .shared
+            .declare(Some(&queue.name), Intent::Paused, "alex pause");
         let pool = self.pool.clone();
         let paused = self
             .timed(
@@ -262,7 +301,6 @@ impl Context {
         self.resume_with_retry(&queue.name).await;
         // Give the claimers a moment to pick the queue back up before stall checks resume.
         self.shared.stop_sleep(Duration::from_secs(3)).await;
-        queue.release();
     }
 
     async fn drain(&mut self) {
@@ -272,21 +310,39 @@ impl Context {
             self.queue_of(Persona::Tom)
         };
         let Some(queue) = target else { return };
+        let floor = drain_check::id_floor(&self.shared, &self.diagnostics).await;
         // Until the drain returns, any job enqueued so far may legitimately be cancelled.
         queue.drained_at_ms.store(i64::MAX / 4, Ordering::Relaxed);
+        let op = self
+            .shared
+            .declare(Some(&queue.name), Intent::OperatorOp("drain"), "alex drain");
+        let start_ms = self.shared.now_ms();
         let pool = self.pool.clone();
-        if let Some(count) = self
+        let drained = self
             .timed("drain_queue", admin::drain_queue(&pool, &queue.name))
-            .await
-        {
+            .await;
+        let end_ms = self.shared.now_ms();
+        if let Some(count) = drained {
             self.stats().add("drains", 1);
             self.shared
                 .note("alex", format!("drained {} ({count} job(s))", queue.name));
             self.stats().add("drained_jobs", count as i64);
+            op.set_detail(format!("alex drain, {count} job(s)"));
         }
-        queue
-            .drained_at_ms
-            .store(self.shared.now_ms(), Ordering::Relaxed);
+        drop(op);
+        queue.drained_at_ms.store(end_ms, Ordering::Relaxed);
+        // Let completions of jobs claimed just before the drain reach the ledger first.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drain_check::verify(
+            &self.shared,
+            &self.diagnostics,
+            &queue.name,
+            start_ms,
+            end_ms,
+            floor,
+            drained,
+        )
+        .await;
     }
 
     /// Cancels live jobs of other personas, some of them already running.
@@ -324,6 +380,11 @@ impl Context {
         self.shared.note(
             "alex",
             format!("cancelling jobs {ids:?} ({state:?}) in {}", queue.name),
+        );
+        let _op = self.shared.declare(
+            Some(&queue.name),
+            Intent::OperatorOp("cancel"),
+            format!("cancel {} {state:?} job(s)", ids.len()),
         );
         if self.rng.chance(50) {
             let started_ms = self.shared.now_ms() as u32;
@@ -454,18 +515,31 @@ impl Context {
                 QUEUE_B,
             )
         };
-        // Hold the source queue so a backlog builds for the operation to act on.
+        // Hold the source queue so a backlog builds for the operation to act on. Every
+        // third operation holds it long enough for its lane to reach the queue ring's
+        // oldest slot, so the operation acts on a lane that pins the ring.
+        self.batch_count += 1;
+        let hold = if self.batch_count.is_multiple_of(3) {
+            self.shared.config.checks.pin_hold
+        } else {
+            Duration::from_secs(6)
+        };
         let pool = self.pool.clone();
-        let held = self.shared.queues.get(source);
-        if let Some(queue) = &held {
-            queue.hold();
+        let held = self.shared.queues.get(source).map(|queue| {
+            self.shared.declare(
+                Some(&queue.name),
+                Intent::Paused,
+                format!("alex hold before {label}"),
+            )
+        });
+        if held.is_some() {
             let _ = self
                 .timed(
                     "pause_queue",
-                    admin::pause_queue(&pool, &queue.name, Some("soak")),
+                    admin::pause_queue(&pool, source, Some("soak")),
                 )
                 .await;
-            self.shared.stop_sleep(Duration::from_secs(6)).await;
+            self.shared.stop_sleep(hold).await;
         }
         let request = SubmitBatchOperation {
             spec,
@@ -473,30 +547,34 @@ impl Context {
             submitted_by: Some("soak".into()),
             allow_all: false,
         };
-        self.run_batch(request, label).await;
-        if let Some(queue) = &held {
-            self.resume_with_retry(&queue.name).await;
+        let op = self
+            .shared
+            .declare(Some(source), Intent::OperatorOp(label), label.to_string());
+        let processed = self.run_batch(request, label).await;
+        op.set_detail(format!(
+            "{label} after a {} s hold, {} row(s)",
+            hold.as_secs(),
+            processed.map_or("?".to_string(), |rows| rows.to_string())
+        ));
+        drop(op);
+        if held.is_some() {
+            self.resume_with_retry(source).await;
             self.shared.stop_sleep(Duration::from_secs(3)).await;
-            queue.release();
         }
+        drop(held);
     }
 
-    async fn run_batch(&mut self, request: SubmitBatchOperation, label: &str) {
+    /// Runs a batch operation to the end; returns the rows it processed.
+    async fn run_batch(&mut self, request: SubmitBatchOperation, label: &str) -> Option<i64> {
         let pool = self.pool.clone();
-        let Some(operation) = self
+        let operation = self
             .timed("batch_submit", submit_batch_operation(&pool, request))
-            .await
-        else {
-            return;
-        };
+            .await?;
         let started = Instant::now();
         loop {
-            let Some(current) = self
+            let current = self
                 .timed("batch_get", get_batch_operation(&pool, operation.id))
-                .await
-            else {
-                return;
-            };
+                .await?;
             match current.state {
                 BatchOperationState::Completed | BatchOperationState::Cancelled => {
                     self.stats().add(&format!("batch_{label}"), 1);
@@ -504,7 +582,7 @@ impl Context {
                         .add(&format!("batch_{label}_processed"), current.processed);
                     self.stats()
                         .observe("batch_operation_ms", started.elapsed().as_millis() as i64);
-                    return;
+                    return Some(current.processed);
                 }
                 BatchOperationState::Failed => {
                     self.shared.violation(
@@ -515,7 +593,7 @@ impl Context {
                         ),
                         vec![],
                     );
-                    return;
+                    return None;
                 }
                 _ => {}
             }
@@ -528,10 +606,10 @@ impl Context {
                         operation.id, current.state
                     ),
                 );
-                return;
+                return None;
             }
             if self.shared.stop_sleep(Duration::from_secs(1)).await {
-                return;
+                return None;
             }
         }
     }
@@ -612,13 +690,18 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
 
     // Alex's own traffic: a stream the move and reprioritise operations act on, and a
     // stream that gets drained while it is still being produced.
+    // A third of the drained stream is scheduled a few seconds ahead, so promotions run
+    // while drains do.
+    let latest_job_id = Arc::new(AtomicI64::new(0));
     let producer = {
         let shared = shared.clone();
+        let latest_job_id = latest_job_id.clone();
         tokio::spawn(async move {
             let mut rng = Rng::for_task(shared.config.seed, "alex-producer");
             let mut seq = 0u64;
             while !shared.load_stop.sleep(Duration::from_millis(200)).await {
                 let mut params = Vec::new();
+                let mut scheduled_for: Vec<Option<i64>> = Vec::new();
                 for queue in [
                     QUEUE_A,
                     QUEUE_A,
@@ -630,6 +713,9 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
                     QUEUE_DRAIN,
                 ] {
                     seq += 1;
+                    let delay_ms = (queue == QUEUE_DRAIN && rng.chance(33))
+                        .then(|| rng.range(1_000, 6_000) as i64);
+                    scheduled_for.push(delay_ms);
                     params.push(
                         awa::insert::params_with(
                             &AlexJob {
@@ -638,14 +724,33 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
                             },
                             InsertOpts {
                                 queue: queue.into(),
+                                run_at: delay_ms
+                                    .map(|ms| Utc::now() + chrono::Duration::milliseconds(ms)),
                                 ..Default::default()
                             },
                         )
                         .expect("alex params"),
                     );
                 }
+                let insert_started_ms = shared.now_ms();
                 match insert_many(&producer_pool, &params).await {
                     Ok(rows) => {
+                        let committed_ms = shared.now_ms();
+                        shared.drains.note_enqueued(
+                            rows.iter()
+                                .zip(&scheduled_for)
+                                .filter(|(row, _)| row.queue == QUEUE_DRAIN)
+                                .map(|(row, delay_ms)| WatchedJob {
+                                    job_id: row.id,
+                                    queue: row.queue.clone(),
+                                    insert_started_ms,
+                                    committed_ms,
+                                    scheduled_for_ms: delay_ms.map(|ms| insert_started_ms + ms),
+                                }),
+                        );
+                        if let Some(latest) = rows.iter().map(|row| row.id).max() {
+                            latest_job_id.fetch_max(latest, Ordering::Relaxed);
+                        }
                         shared
                             .stats(Persona::Alex)
                             .add("enqueued", rows.len() as i64);
@@ -664,19 +769,31 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
         })
     };
 
-    let diagnostics = connect_pool(
+    let timeouts = shared.config.checks.sampler_timeouts();
+    let diagnostics = connect_sampler_pool(
         &shared.config.database_url,
         "awa_alex_diagnostics",
         shared.budget.reserve("alex-diagnostics", 1, 1),
+        timeouts,
     )
     .await
     .map_err(|error| error.to_string())?;
+    shared.samplers.register_pool(
+        "awa_alex_diagnostics (operator diagnostics, drain checks)",
+        format!(
+            "statement_timeout {} ms, lock_timeout {} ms",
+            timeouts.statement.as_millis(),
+            timeouts.lock.as_millis()
+        ),
+    );
     let mut context = Context {
         shared: shared.clone(),
         pool,
         diagnostics,
         stalled_rows: Default::default(),
         rng: Rng::for_task(shared.config.seed, "alex-operator"),
+        latest_job_id,
+        batch_count: 0,
     };
     let load = shared.config.load.as_secs_f64();
     // Scale the cadence down for short runs so each action still happens a few times.

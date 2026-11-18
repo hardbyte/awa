@@ -1,6 +1,7 @@
 //! Run configuration, read from the environment.
 
 use crate::ci_timing::{scaled_staleness, scaled_timeout};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -169,6 +170,150 @@ pub struct SoakConfig {
     pub queue_rotate_interval: Option<Duration>,
     pub claim_rotate_interval: Option<Duration>,
     pub prune_lock_timeout: Option<Duration>,
+    /// Thresholds of the resource, maintenance-progress, admin-latency, drain and
+    /// sampler checks.
+    pub checks: ChecksConfig,
+}
+
+/// Admin reads with a p99 budget, in the order the report lists them.
+pub const ADMIN_READS: [&str; 4] = ["get_job", "find_jobs", "queue_overview", "counts"];
+
+#[derive(Debug, Clone)]
+pub struct ChecksConfig {
+    /// How often the Postgres resource sampler runs.
+    pub resource_sample_every: Duration,
+    /// Run time before the per-backend memory baseline is taken, and the shortest span a
+    /// backend must be observed over after it to be judged.
+    pub pg_memory_warmup: Duration,
+    pub pg_memory_min_window: Duration,
+    /// Largest accepted growth of one pooled backend's private memory (RssAnon), and of all
+    /// judged pooled backends together, after the warm-up.
+    pub pg_memory_backend_growth_mib: f64,
+    pub pg_memory_total_growth_mib: f64,
+    /// Backends a runtime may hold beyond its pool size (its detached listener connections).
+    pub connections_extra_per_runtime: u32,
+    /// Largest accepted number of named prepared statements on one runtime connection.
+    pub prepared_statements_max: i64,
+    /// Idle phase after the run quiesced: its length, the part left out while the rings
+    /// empty, and the ceilings while it lasts.
+    pub idle: Duration,
+    pub idle_warmup: Duration,
+    pub idle_xacts_per_second_max: f64,
+    pub idle_wal_bytes_per_second_max: f64,
+    /// A ring whose generation stands still this long while rotation is skipped busy.
+    pub ring_stall: Duration,
+    /// Prune `blocked` rising this many times with no `pruned` over the window.
+    pub prune_blocked_window: Duration,
+    pub prune_blocked_min: u64,
+    /// Oldest accepted age of a ready row pinning the queue ring with no declared intent
+    /// and no claim progress on its queue.
+    pub pinned_age_max: Duration,
+    /// Time allowed after a declared state ends, or an operator operation returns, for a
+    /// pin to clear and a ring to move again.
+    pub pin_release: Duration,
+    /// How long the operator holds a queue before every third batch operation, so its
+    /// lane is old enough to pin the queue ring when the operation runs.
+    pub pin_hold: Duration,
+    /// p99 budgets in milliseconds for the admin reads, through the library and over HTTP.
+    pub admin_budgets_ms: BTreeMap<String, i64>,
+    pub admin_http_budgets_ms: BTreeMap<String, i64>,
+    pub admin_warmup: Duration,
+    pub admin_min_samples: usize,
+    /// Jobs whose insert began this long after a drain started count as enqueued after it.
+    pub drain_margin: Duration,
+    /// Session timeouts of the oracle and sampler pools, and the statement timeout of the
+    /// final reconciliation.
+    pub sampler_statement_timeout: Duration,
+    pub sampler_lock_timeout: Duration,
+    pub final_statement_timeout: Duration,
+}
+
+fn budgets(name: &str, defaults: [i64; 4]) -> Result<BTreeMap<String, i64>, String> {
+    let mut budgets: BTreeMap<String, i64> = ADMIN_READS
+        .iter()
+        .zip(defaults)
+        .map(|(read, budget)| (read.to_string(), budget))
+        .collect();
+    if let Some(list) = env_string(name) {
+        for entry in list.split(',').filter(|entry| !entry.trim().is_empty()) {
+            let (read, value) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("{name}: expected read=ms, got {entry:?}"))?;
+            let read = read.trim();
+            if !ADMIN_READS.contains(&read) {
+                return Err(format!(
+                    "{name}: unknown read {read:?}; expected one of {ADMIN_READS:?}"
+                ));
+            }
+            let value = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("{name}: {read} must be milliseconds, got {value:?}"))?;
+            budgets.insert(read.to_string(), value);
+        }
+    }
+    Ok(budgets)
+}
+
+fn seconds(name: &str, default: u64) -> Duration {
+    Duration::from_secs(env_parse(name).unwrap_or(default))
+}
+
+fn millis(name: &str, default: u64) -> Duration {
+    Duration::from_millis(env_parse(name).unwrap_or(default))
+}
+
+impl ChecksConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            resource_sample_every: seconds("AWA_SOAK_RESOURCE_SAMPLE_SECONDS", 15),
+            pg_memory_warmup: seconds("AWA_SOAK_PG_MEMORY_WARMUP_SECONDS", 300),
+            pg_memory_min_window: seconds("AWA_SOAK_PG_MEMORY_MIN_WINDOW_SECONDS", 600),
+            pg_memory_backend_growth_mib: env_parse("AWA_SOAK_PG_MEMORY_GROWTH_MIB")
+                .unwrap_or(24.0),
+            pg_memory_total_growth_mib: env_parse("AWA_SOAK_PG_MEMORY_TOTAL_GROWTH_MIB")
+                .unwrap_or(160.0),
+            connections_extra_per_runtime: env_parse("AWA_SOAK_CONNECTIONS_EXTRA_PER_RUNTIME")
+                .unwrap_or(2),
+            prepared_statements_max: env_parse("AWA_SOAK_PREPARED_STATEMENTS_MAX").unwrap_or(110),
+            idle: seconds("AWA_SOAK_IDLE_SECONDS", 90),
+            idle_warmup: seconds("AWA_SOAK_IDLE_WARMUP_SECONDS", 30),
+            idle_xacts_per_second_max: env_parse("AWA_SOAK_IDLE_XACTS_PER_SECOND").unwrap_or(400.0),
+            idle_wal_bytes_per_second_max: env_parse("AWA_SOAK_IDLE_WAL_BYTES_PER_SECOND")
+                .unwrap_or(65_536.0),
+            ring_stall: scaled_timeout(seconds("AWA_SOAK_RING_STALL_SECONDS", 180)),
+            prune_blocked_window: scaled_timeout(seconds("AWA_SOAK_PRUNE_BLOCKED_SECONDS", 120)),
+            prune_blocked_min: env_parse("AWA_SOAK_PRUNE_BLOCKED_MIN").unwrap_or(10),
+            pinned_age_max: scaled_timeout(seconds("AWA_SOAK_PINNED_AGE_SECONDS", 120)),
+            pin_release: scaled_timeout(seconds("AWA_SOAK_PIN_RELEASE_SECONDS", 60)),
+            pin_hold: seconds("AWA_SOAK_PIN_HOLD_SECONDS", 50),
+            admin_budgets_ms: budgets("AWA_SOAK_ADMIN_P99_MS", [2_000, 5_000, 5_000, 5_000])?,
+            admin_http_budgets_ms: budgets(
+                "AWA_SOAK_ADMIN_HTTP_P99_MS",
+                [5_000, 15_000, 15_000, 15_000],
+            )?,
+            admin_warmup: seconds("AWA_SOAK_ADMIN_WARMUP_SECONDS", 60),
+            admin_min_samples: env_parse("AWA_SOAK_ADMIN_MIN_SAMPLES").unwrap_or(20),
+            drain_margin: millis("AWA_SOAK_DRAIN_MARGIN_MS", 250),
+            sampler_statement_timeout: millis("AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS", 10_000),
+            sampler_lock_timeout: millis("AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS", 1_000),
+            final_statement_timeout: seconds("AWA_SOAK_FINAL_STATEMENT_TIMEOUT_SECONDS", 300),
+        })
+    }
+
+    pub fn sampler_timeouts(&self) -> super::db::SamplerTimeouts {
+        super::db::SamplerTimeouts {
+            statement: self.sampler_statement_timeout,
+            lock: self.sampler_lock_timeout,
+        }
+    }
+
+    pub fn final_timeouts(&self) -> super::db::SamplerTimeouts {
+        super::db::SamplerTimeouts {
+            statement: self.final_statement_timeout,
+            lock: self.sampler_lock_timeout,
+        }
+    }
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -318,6 +463,7 @@ impl SoakConfig {
                 .map(Duration::from_millis),
             prune_lock_timeout: env_parse::<u64>("AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS")
                 .map(Duration::from_millis),
+            checks: ChecksConfig::from_env()?,
         })
     }
 

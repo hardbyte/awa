@@ -27,9 +27,58 @@ pub async fn connect_pool_with_timeout(
     max_connections: u32,
     statement_timeout: Option<Duration>,
 ) -> Result<PgPool, sqlx::Error> {
+    connect_pool_with_timeouts(
+        url,
+        application_name,
+        max_connections,
+        statement_timeout,
+        None,
+    )
+    .await
+}
+
+/// A pool for the oracle and the samplers: every session has a `statement_timeout` and a
+/// `lock_timeout`, so a measurement can neither hold a lock prune waits for beyond the
+/// statement bound nor queue behind one.
+pub async fn connect_sampler_pool(
+    url: &str,
+    application_name: &str,
+    max_connections: u32,
+    timeouts: SamplerTimeouts,
+) -> Result<PgPool, sqlx::Error> {
+    connect_pool_with_timeouts(
+        url,
+        application_name,
+        max_connections,
+        Some(timeouts.statement),
+        Some(timeouts.lock),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerTimeouts {
+    pub statement: Duration,
+    pub lock: Duration,
+}
+
+async fn connect_pool_with_timeouts(
+    url: &str,
+    application_name: &str,
+    max_connections: u32,
+    statement_timeout: Option<Duration>,
+    lock_timeout: Option<Duration>,
+) -> Result<PgPool, sqlx::Error> {
     let mut options = PgConnectOptions::from_str(url)?.application_name(application_name);
+    let mut settings = Vec::new();
     if let Some(timeout) = statement_timeout {
-        options = options.options([("statement_timeout", timeout.as_millis().to_string())]);
+        settings.push(("statement_timeout", timeout.as_millis().to_string()));
+    }
+    if let Some(timeout) = lock_timeout {
+        settings.push(("lock_timeout", timeout.as_millis().to_string()));
+    }
+    if !settings.is_empty() {
+        options = options.options(settings);
     }
     PgPoolOptions::new()
         .max_connections(max_connections)
@@ -290,6 +339,13 @@ impl ClientHost {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The host's own tokio runtime, to run work on its pool's connections.
+    pub fn handle(&self) -> Option<tokio::runtime::Handle> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
     }
 
     /// Graceful stop: stop claiming, drain in-flight jobs, then close the pool.

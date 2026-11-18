@@ -8,7 +8,7 @@
 
 use super::super::adminserver::APPLICATION_NAME;
 use super::super::config::Persona;
-use super::super::db::connect_pool;
+use super::super::db::connect_sampler_pool;
 use super::super::ledger::flag;
 use super::super::rng::{percentile, Rng};
 use super::super::shared::Shared;
@@ -146,6 +146,13 @@ impl Http {
         self.shared.ui.inflight.fetch_sub(1, Ordering::Relaxed);
         let latency = started.elapsed().as_millis() as i64;
         self.shared.ui.record(&name, at_ms, latency);
+        if matches!(outcome, Outcome::Json(_)) {
+            if let Some(read) = super::super::admin_latency::http_read(&name) {
+                self.shared
+                    .admin_latency
+                    .observe(read, "http", at_ms, latency);
+            }
+        }
         let stats = self.shared.stats(self.persona);
         stats.observe(&name, latency);
         match &outcome {
@@ -444,7 +451,11 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                 let mut candidates = shared.queues.of(Persona::Sam);
                 candidates.extend(shared.queues.of(Persona::Tom));
                 if let Some(queue) = rng.pick(&candidates).cloned() {
-                    queue.hold();
+                    let paused_intent = shared.declare(
+                        Some(&queue.name),
+                        super::super::intent::Intent::Paused,
+                        "ui pause",
+                    );
                     let paused = http
                         .post(
                             "/api/queues/{queue}/pause",
@@ -469,7 +480,7 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                     )
                     .await;
                     shared.stop_sleep_load(Duration::from_secs(3)).await;
-                    queue.release();
+                    drop(paused_intent);
                 }
             }
             1 | 2 => {
@@ -647,13 +658,22 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
 pub async fn run_impatient(shared: Arc<Shared>) -> Result<(), String> {
     let persona = Persona::Impatient;
     let http = Arc::new(Http::new(&shared, persona));
-    let sampler_pool = connect_pool(
+    let sampler_pool = connect_sampler_pool(
         &shared.config.database_url,
         "awa_ui_sampler",
         shared.budget.reserve("ui-sampler", 1, 1),
+        shared.config.checks.sampler_timeouts(),
     )
     .await
     .map_err(|error| error.to_string())?;
+    shared.samplers.register_pool(
+        "awa_ui_sampler (admin server sessions)",
+        format!(
+            "statement_timeout {} ms, lock_timeout {} ms",
+            shared.config.checks.sampler_statement_timeout.as_millis(),
+            shared.config.checks.sampler_lock_timeout.as_millis()
+        ),
+    );
     let statement_timeout = shared.config.ui_statement_timeout;
     let sole_ui_persona = [Persona::Watchers, Persona::Support, Persona::UiOps]
         .iter()
@@ -686,7 +706,11 @@ pub async fn run_impatient(shared: Arc<Shared>) -> Result<(), String> {
                 )))
                 .fetch_one(&pool)
                 .await;
+                if let Err(error) = &row {
+                    shared.sample_skipped("ui.server_sessions", error);
+                }
                 if let Ok((sessions, active, oldest)) = row {
+                    shared.samplers.ok("ui.server_sessions");
                     shared.run.set_max("ui_server_sessions_peak", sessions);
                     shared.run.set_max("ui_server_active_sessions_peak", active);
                     shared

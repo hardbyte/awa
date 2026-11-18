@@ -131,6 +131,22 @@ impl Fleet {
             .collect()
     }
 
+    /// Connections in each runtime's pool.
+    pub fn pool_size(&self) -> u32 {
+        self.pool_size
+    }
+
+    /// Each live runtime's label, its tokio runtime and its pool.
+    pub async fn host_pools(&self) -> Vec<(String, tokio::runtime::Handle, PgPool)> {
+        self.hosts
+            .lock()
+            .await
+            .iter()
+            .flatten()
+            .filter_map(|host| Some((host.label.clone(), host.handle()?, host.pool().clone())))
+            .collect()
+    }
+
     pub async fn pool_of(&self, index: usize) -> Option<PgPool> {
         self.hosts
             .lock()

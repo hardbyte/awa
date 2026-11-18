@@ -138,6 +138,19 @@ pub struct Shared {
     pub abandon: super::abandon_oracle::AbandonState,
     /// Resident memory of this process over the run, and the growth gate's verdict.
     pub memory: super::memory::MemoryLog,
+    /// States the personas put the system in on purpose, which the checks allow.
+    pub intents: super::intent::IntentLog,
+    /// Epoch milliseconds at `started`, to place exported metrics on the run's clock.
+    pub started_epoch_ms: i64,
+    /// Skipped samples and the session timeouts of each sampler pool.
+    pub samplers: super::sampling::SamplerLog,
+    /// Postgres backends, connections, prepared statements and idle rates.
+    pub resources: super::resources::ResourceLog,
+    pub admin_latency: super::admin_latency::AdminLatency,
+    pub drains: super::drain_check::DrainLog,
+    /// When each queue's claim cursor was seen moving.
+    pub progress: super::maintenance_checks::ProgressLog,
+    load_started_ms: AtomicI64,
     chaos_until_ms: AtomicI64,
 }
 
@@ -171,11 +184,68 @@ impl Shared {
             shardops: Default::default(),
             abandon: Default::default(),
             memory: Default::default(),
+            intents: Default::default(),
+            started_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as i64)
+                .unwrap_or(0),
+            samplers: Default::default(),
+            resources: Default::default(),
+            admin_latency: Default::default(),
+            drains: Default::default(),
+            progress: Default::default(),
+            load_started_ms: AtomicI64::new(0),
             chaos_until_ms: AtomicI64::new(0),
         })
     }
 
-    pub fn started_load(&self, _at: Instant) {}
+    pub fn started_load(&self, _at: Instant) {
+        self.load_started_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Run time at which the load phase began.
+    pub fn load_started_ms(&self) -> i64 {
+        self.load_started_ms.load(Ordering::Relaxed)
+    }
+
+    /// Declares an intent for `queue` (a logical or physical name), or for the whole run
+    /// with `None`, until the returned guard drops. A paused or unserved queue that is
+    /// registered also counts as held by the stall check while the guard lives.
+    pub fn declare(
+        self: &Arc<Self>,
+        queue: Option<&str>,
+        intent: super::intent::Intent,
+        detail: impl Into<String>,
+    ) -> super::intent::IntentGuard {
+        let id = self.intents.begin(queue, intent, detail, self.now_ms());
+        let held = queue
+            .filter(|_| intent.holds())
+            .and_then(|queue| self.queues.get(queue));
+        super::intent::IntentGuard::new(self.clone(), id, held)
+    }
+
+    /// Records a skipped sample of `sampler`: a query a sampler bound cut short is counted
+    /// and reported, any other failure too, with the first few noted on the timeline.
+    pub fn sample_skipped(&self, sampler: &str, error: &sqlx::Error) {
+        let reason = super::sampling::skip_reason(error).unwrap_or("error");
+        let count = self.samplers.skipped(sampler, reason, &error.to_string());
+        if count <= 3 {
+            self.note(
+                "sampler",
+                format!("{sampler} sample skipped ({reason}): {error}"),
+            );
+        }
+    }
+
+    /// An oracle query failed: a timeout the sampler pools set skips the sample, any other
+    /// failure leaves the oracle incomplete.
+    pub fn oracle_query_failed(&self, check: &str, error: &sqlx::Error) {
+        if super::sampling::skip_reason(error).is_some() {
+            self.sample_skipped(&format!("oracle.{check}"), error);
+        } else {
+            self.incomplete(format!("{check} query failed: {error}"), vec![]);
+        }
+    }
 
     pub fn now_ms(&self) -> i64 {
         self.started.elapsed().as_millis() as i64
@@ -199,8 +269,16 @@ impl Shared {
     /// Marks a disruptive window (kill, failover, connection termination) so that the
     /// time-based checks allow the system its recovery time.
     pub fn chaos_window(&self, duration: std::time::Duration) {
-        let until = self.now_ms() + duration.as_millis() as i64;
+        let now = self.now_ms();
+        let until = now + duration.as_millis() as i64;
         self.chaos_until_ms.fetch_max(until, Ordering::Relaxed);
+        self.intents.window(
+            None,
+            super::intent::Intent::Disruption,
+            "chaos window",
+            now,
+            until,
+        );
     }
 
     /// Recovery time the time-based checks allow during a disruptive window: the configured
@@ -227,6 +305,32 @@ impl Shared {
             "[{:>7.1}s] VIOLATION {}: {}",
             violation.at_ms as f64 / 1000.0,
             violation.kind,
+            violation.summary
+        );
+        self.violations.lock().expect("violations").push(violation);
+    }
+
+    /// As [`Shared::violation`], placed at `at_ms` on the run's clock: for checks judged
+    /// after the run, so the reproducer's timeline is the one around the violating samples.
+    pub fn violation_at(
+        &self,
+        kind: &str,
+        at_ms: i64,
+        summary: impl Into<String>,
+        rows: Vec<String>,
+    ) {
+        let violation = Violation {
+            kind: kind.to_string(),
+            at_ms,
+            during_chaos: false,
+            summary: summary.into(),
+            rows,
+        };
+        eprintln!(
+            "[{:>7.1}s] VIOLATION {} (at {:.1}s): {}",
+            self.now_ms() as f64 / 1000.0,
+            violation.kind,
+            at_ms as f64 / 1000.0,
             violation.summary
         );
         self.violations.lock().expect("violations").push(violation);

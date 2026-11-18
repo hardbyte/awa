@@ -145,6 +145,14 @@ pub async fn stall_completions(shared: Arc<Shared>) {
         .await?;
         *shared.memory.stall_started.lock().expect("stall start") = Some(hold);
         shared.chaos_window(hold + shared.config.chaos_slack);
+        let now = shared.now_ms();
+        shared.intents.window(
+            None,
+            super::intent::Intent::HoldsLocks,
+            "completion stall: SHARE locks on the completion tables",
+            now,
+            now + hold.as_millis() as i64,
+        );
         shared.note(
             "memory",
             format!("completions stalled for {}s", hold.as_secs()),
