@@ -4,6 +4,8 @@
 //! released 0.6 patch to the current schema while traffic remains live. The old
 //! worker is a PyPI wheel installed by the workflow, not a source checkout.
 
+mod ci_timing;
+
 use async_trait::async_trait;
 use awa::audited_sql;
 use awa::model::{
@@ -524,7 +526,7 @@ fn current_builder(
         // Both fleets heartbeat their claims every 50ms, so 500ms of silence
         // means a dead worker; a hard-killed released worker's in-flight job
         // must be rescued well inside the drain windows below.
-        .heartbeat_staleness(Duration::from_millis(500))
+        .heartbeat_staleness(ci_timing::scaled_staleness(Duration::from_millis(500)))
         .heartbeat_rescue_interval(heartbeat_rescue_interval)
         .deadline_rescue_interval(Duration::from_millis(100))
 }
@@ -571,7 +573,7 @@ fn workload_client(
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(500))
+        .heartbeat_staleness(ci_timing::scaled_staleness(Duration::from_millis(500)))
         .heartbeat_rescue_interval(Duration::from_millis(100))
         .deadline_rescue_interval(Duration::from_millis(100))
         .callback_rescue_interval(Duration::from_millis(100))
