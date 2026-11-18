@@ -7,17 +7,20 @@
 //! `RetryAfter` or a retryable error. Before the fix the queue-storage
 //! finalize failed with `unique conflict` and the attempt stayed running
 //! until stale-receipt rescue. The claim holder wins: the attempt is
-//! cancelled as a duplicate.
+//! cancelled as a duplicate, with a `Cancelled` lifecycle event and a
+//! cancelled-job count.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::{Client, JobArgs, JobError, JobResult, QueueConfig, UniqueOpts};
-use awa_model::{insert_with, migrations, InsertOpts};
+use awa::{Client, JobArgs, JobError, JobEvent, JobResult, QueueConfig, UniqueOpts};
+use awa_model::{admin, insert_with, migrations, AwaError, InsertOpts};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
@@ -60,9 +63,18 @@ struct UniqueSnoozeJob {
 
 /// `scheduled | available | retryable`: the claim is released while running.
 const PENDING_ONLY_STATES: u8 = 0b0001_0011;
-const WORKED_QUEUE: &str = "snooze_uc";
+/// `PENDING_ONLY_STATES | cancelled`: the duplicate cancellation would
+/// claim the key too.
+const CANCELLED_CLAIMING_STATES: u8 = 0b0101_0011;
+/// Each case, in each run, works its own queues, so one case's deleted rows
+/// and rolled-back retries never sit in a lane ahead of another case's job.
+fn worked_queue(n: i64) -> String {
+    format!("snooze_uc_{}_{n}", std::process::id())
+}
 /// Nothing consumes this queue, so the duplicate keeps the unique claim.
-const PARKED_QUEUE: &str = "snooze_uc_parked";
+fn parked_queue(n: i64) -> String {
+    format!("snooze_uc_parked_{}_{n}", std::process::id())
+}
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct RetriedFollowUp {
@@ -83,18 +95,13 @@ enum Outcome {
 }
 
 async fn clean(pool: &PgPool) {
-    for queue in [WORKED_QUEUE, PARKED_QUEUE] {
-        sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-            .bind(queue)
+    for kind in [UniqueSnoozeJob::kind(), RetriedFollowUp::kind()] {
+        sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
+            .bind(kind)
             .execute(pool)
             .await
-            .expect("queue cleanup");
+            .expect("job cleanup");
     }
-    sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
-        .bind(RetriedFollowUp::kind())
-        .execute(pool)
-        .await
-        .expect("follow-up cleanup");
 }
 
 async fn follow_up_count(pool: &PgPool) -> i64 {
@@ -105,7 +112,7 @@ async fn follow_up_count(pool: &PgPool) -> i64 {
         .expect("follow-up probe")
 }
 
-async fn insert_unique(pool: &PgPool, queue: &str, n: i64) -> i64 {
+async fn insert_unique(pool: &PgPool, queue: &str, n: i64, states: u8) -> i64 {
     insert_with(
         pool,
         &UniqueSnoozeJob { n },
@@ -115,7 +122,7 @@ async fn insert_unique(pool: &PgPool, queue: &str, n: i64) -> i64 {
                 by_queue: false,
                 by_args: true,
                 by_period: None,
-                states: PENDING_ONLY_STATES,
+                states,
             }),
             ..Default::default()
         },
@@ -141,6 +148,68 @@ async fn errors_text(pool: &PgPool, id: i64) -> String {
         .expect("errors probe")
 }
 
+fn cancelled_count(metrics: &[ResourceMetrics]) -> u64 {
+    let mut total = 0;
+    for resource in metrics {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "awa.job.cancelled" {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    total += sum
+                        .data_points()
+                        .filter(|point| {
+                            point.attributes().any(|kv| {
+                                kv.key.as_str() == "awa.job.kind"
+                                    && kv.value.as_str() == UniqueSnoozeJob::kind()
+                            })
+                        })
+                        .map(|point| point.value())
+                        .sum::<u64>();
+                }
+            }
+        }
+    }
+    total
+}
+
+fn is_unique_conflict(err: &AwaError) -> bool {
+    match err {
+        AwaError::UniqueConflict { .. } => true,
+        AwaError::Database(sqlx::Error::Database(db_err)) => {
+            db_err.code().as_deref() == Some("23505")
+        }
+        _ => false,
+    }
+}
+
+/// An operator retry of the cancelled duplicate must not take the key from
+/// the newer job, and must take it once that job is gone.
+async fn assert_retry_rechecks_claim(pool: &PgPool, job_a: i64, job_b: i64) {
+    let err = admin::retry(pool, job_a)
+        .await
+        .expect_err("retry must fail while the newer job holds the unique claim");
+    assert!(is_unique_conflict(&err), "unexpected retry error: {err:?}");
+    assert_eq!(
+        visible_state(pool, job_a).await.as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(claim_holder(pool, job_b).await, job_b);
+
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(job_b)
+        .execute(pool)
+        .await
+        .expect("delete the claim holder");
+    let retried = admin::retry(pool, job_a)
+        .await
+        .expect("retry once the claim is free")
+        .expect("retried row");
+    assert_eq!(retried.state.to_string(), "available");
+    assert_eq!(claim_holder(pool, job_a).await, job_a);
+}
+
 async fn claim_holder(pool: &PgPool, id: i64) -> i64 {
     sqlx::query_scalar(
         "SELECT c.job_id FROM awa.job_unique_claims c JOIN awa.jobs j ON j.unique_key = c.unique_key WHERE j.id = $1",
@@ -159,6 +228,8 @@ async fn run(
     engine: Engine,
     outcome: Outcome,
     retried_follow_ups: bool,
+    retry_after_cancel: bool,
+    states: u8,
     n: i64,
     duplicate_error: &str,
 ) {
@@ -180,12 +251,19 @@ async fn run(
     }
     clean(&pool).await;
 
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let cancelled_events: Arc<StdMutex<Vec<(i64, String)>>> = Arc::default();
     let running = Arc::new(Notify::new());
     let duplicate_inserted = Arc::new(Notify::new());
     let first_attempt = Arc::new(AtomicBool::new(true));
 
     let builder = Client::builder(pool.clone())
-        .queue(WORKED_QUEUE, QueueConfig::default())
+        .queue(worked_queue(n), QueueConfig::default())
         .register::<UniqueSnoozeJob, _, _>({
             let (running, duplicate_inserted, first_attempt) = (
                 running.clone(),
@@ -215,6 +293,20 @@ async fn run(
                 }
             }
         });
+    let builder = builder.on_event::<UniqueSnoozeJob, _, _>({
+        let cancelled_events = cancelled_events.clone();
+        move |event| {
+            let cancelled_events = cancelled_events.clone();
+            async move {
+                if let JobEvent::Cancelled { job, reason, .. } = event {
+                    cancelled_events
+                        .lock()
+                        .expect("cancelled events")
+                        .push((job.id, reason));
+                }
+            }
+        }
+    });
     let builder = if retried_follow_ups {
         builder.on_retried_enqueue::<UniqueSnoozeJob, RetriedFollowUp, _>(
             |args, _job, _error, _attempt, _next_run_at| RetriedFollowUp { n: args.n },
@@ -224,7 +316,7 @@ async fn run(
     };
     let client = builder.build().expect("client build");
 
-    let job_a = insert_unique(&pool, WORKED_QUEUE, n).await;
+    let job_a = insert_unique(&pool, &worked_queue(n), n, states).await;
     client.start().await.expect("client start");
 
     tokio::time::timeout(Duration::from_secs(15), running.notified())
@@ -232,7 +324,7 @@ async fn run(
         .expect("job A never started");
     // A is running and, under this mask, no longer holds the unique claim,
     // so an identical insert is accepted and takes it.
-    let job_b = insert_unique(&pool, PARKED_QUEUE, n).await;
+    let job_b = insert_unique(&pool, &parked_queue(n), n, states).await;
     assert_ne!(job_a, job_b);
     duplicate_inserted.notify_one();
 
@@ -249,8 +341,20 @@ async fn run(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    // The lifecycle event is dispatched after the finalize commits.
+    let event_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while cancelled_events
+        .lock()
+        .expect("cancelled events")
+        .is_empty()
+        && tokio::time::Instant::now() < event_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     client.shutdown(Duration::from_secs(5)).await;
+    meter_provider.force_flush().expect("flush metrics");
+    let metrics = exporter.get_finished_metrics().expect("read metrics");
 
     assert_eq!(
         state.as_deref(),
@@ -282,6 +386,24 @@ async fn run(
         0,
         "a duplicate cancellation is not a retry"
     );
+    let events = cancelled_events.lock().expect("cancelled events").clone();
+    assert_eq!(
+        events.len(),
+        1,
+        "one Cancelled event for the duplicate cancellation: {events:?}"
+    );
+    assert!(
+        events[0].1.contains(duplicate_error),
+        "Cancelled event reason should name the duplicate: {events:?}"
+    );
+    assert_eq!(
+        cancelled_count(&metrics),
+        1,
+        "awa.job.cancelled counts the duplicate cancellation"
+    );
+    if retry_after_cancel {
+        assert_retry_rechecks_claim(&pool, job_a, job_b).await;
+    }
 
     clean(&pool).await;
     awa_testing::setup::reset_runtime_backend(&pool).await;
@@ -293,6 +415,8 @@ async fn snooze_with_duplicate_holding_unique_claim_is_finalized() {
         Engine::QueueStorage,
         Outcome::Snooze,
         false,
+        false,
+        PENDING_ONLY_STATES,
         1,
         "snoozed as duplicate",
     )
@@ -305,6 +429,8 @@ async fn retry_after_with_duplicate_holding_unique_claim_is_finalized() {
         Engine::QueueStorage,
         Outcome::RetryAfter,
         false,
+        false,
+        PENDING_ONLY_STATES,
         2,
         "retried as duplicate",
     )
@@ -317,6 +443,8 @@ async fn retryable_error_with_duplicate_holding_unique_claim_is_finalized() {
         Engine::QueueStorage,
         Outcome::RetryableError,
         false,
+        false,
+        PENDING_ONLY_STATES,
         3,
         "retried as duplicate",
     )
@@ -329,6 +457,8 @@ async fn retry_after_with_follow_ups_and_duplicate_holding_unique_claim_is_final
         Engine::QueueStorage,
         Outcome::RetryAfter,
         true,
+        false,
+        PENDING_ONLY_STATES,
         4,
         "retried as duplicate",
     )
@@ -341,6 +471,8 @@ async fn retryable_error_with_follow_ups_and_duplicate_holding_unique_claim_is_f
         Engine::QueueStorage,
         Outcome::RetryableError,
         true,
+        false,
+        PENDING_ONLY_STATES,
         5,
         "retried as duplicate",
     )
@@ -353,6 +485,8 @@ async fn canonical_snooze_with_duplicate_holding_unique_claim_is_finalized() {
         Engine::Canonical,
         Outcome::Snooze,
         false,
+        false,
+        PENDING_ONLY_STATES,
         6,
         "snoozed as duplicate",
     )
@@ -365,6 +499,8 @@ async fn canonical_retry_after_with_duplicate_holding_unique_claim_is_finalized(
         Engine::Canonical,
         Outcome::RetryAfter,
         false,
+        false,
+        PENDING_ONLY_STATES,
         7,
         "retried as duplicate",
     )
@@ -377,6 +513,8 @@ async fn canonical_retryable_error_with_duplicate_holding_unique_claim_is_finali
         Engine::Canonical,
         Outcome::RetryableError,
         false,
+        false,
+        PENDING_ONLY_STATES,
         8,
         "retried as duplicate",
     )
@@ -389,8 +527,94 @@ async fn canonical_retry_after_with_follow_ups_and_duplicate_holding_unique_clai
         Engine::Canonical,
         Outcome::RetryAfter,
         true,
+        false,
+        PENDING_ONLY_STATES,
         9,
         "retried as duplicate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn snooze_with_cancelled_claiming_mask_is_finalized() {
+    run(
+        Engine::QueueStorage,
+        Outcome::Snooze,
+        false,
+        false,
+        CANCELLED_CLAIMING_STATES,
+        10,
+        "snoozed as duplicate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retryable_error_with_cancelled_claiming_mask_is_finalized() {
+    run(
+        Engine::QueueStorage,
+        Outcome::RetryableError,
+        false,
+        false,
+        CANCELLED_CLAIMING_STATES,
+        11,
+        "retried as duplicate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn canonical_snooze_with_cancelled_claiming_mask_is_finalized() {
+    run(
+        Engine::Canonical,
+        Outcome::Snooze,
+        false,
+        false,
+        CANCELLED_CLAIMING_STATES,
+        12,
+        "snoozed as duplicate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn canonical_retryable_error_with_cancelled_claiming_mask_is_finalized() {
+    run(
+        Engine::Canonical,
+        Outcome::RetryableError,
+        false,
+        false,
+        CANCELLED_CLAIMING_STATES,
+        13,
+        "retried as duplicate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retry_of_snooze_duplicate_cancellation_rechecks_claim() {
+    run(
+        Engine::QueueStorage,
+        Outcome::Snooze,
+        false,
+        true,
+        CANCELLED_CLAIMING_STATES,
+        14,
+        "snoozed as duplicate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn canonical_retry_of_snooze_duplicate_cancellation_rechecks_claim() {
+    run(
+        Engine::Canonical,
+        Outcome::Snooze,
+        false,
+        true,
+        CANCELLED_CLAIMING_STATES,
+        15,
+        "snoozed as duplicate",
     )
     .await;
 }

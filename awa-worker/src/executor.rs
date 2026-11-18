@@ -239,6 +239,9 @@ enum CompletionOutcome {
     },
     /// The job was already rescued/cancelled — stale completion, no event.
     IgnoredStale,
+    /// A snooze or retry was finalized as `cancelled` because a newer
+    /// duplicate holds the unique claim its successor needed.
+    CancelledDuplicate { event: Option<UntypedJobEvent> },
 }
 
 #[derive(Debug, Clone)]
@@ -599,6 +602,15 @@ impl JobExecutor {
                             }
                         }
                     }
+                    Ok(CompletionOutcome::CancelledDuplicate { .. }) => {
+                        metrics.jobs_cancelled.add(
+                            1,
+                            &[
+                                opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
+                                opentelemetry::KeyValue::new("awa.job.queue", job_queue.clone()),
+                            ],
+                        );
+                    }
                     Ok(CompletionOutcome::IgnoredStale) => {}
                     Err(FinalizeError::ShuttingDown) => {
                         warn!(
@@ -618,9 +630,12 @@ impl JobExecutor {
                 if let Some(started_event) = started_event {
                     let _ = started_event.await;
                 }
-                if let Ok(CompletionOutcome::Applied {
-                    event: Some(event), ..
-                }) = outcome
+                if let Ok(
+                    CompletionOutcome::Applied {
+                        event: Some(event), ..
+                    }
+                    | CompletionOutcome::CancelledDuplicate { event: Some(event) },
+                ) = outcome
                 {
                     dispatch_lifecycle_event(&lifecycle_handlers, &job_kind, event).await;
                 }
@@ -1345,6 +1360,9 @@ async fn complete_job_canonical(
                         );
                         Ok(CompletionOutcome::IgnoredStale)
                     }
+                    Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                        Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
+                    }
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Retried {
@@ -1364,7 +1382,7 @@ async fn complete_job_canonical(
                 };
             }
 
-            let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+            let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique(
                 pool,
                 job.id,
                 job.run_lease,
@@ -1373,14 +1391,20 @@ async fn complete_job_canonical(
                 },
                 None,
                 progress_snapshot.as_ref(),
+                job.unique_key.as_deref(),
             )
             .await?;
-            if matches!(outcome, RescheduleOutcome::CancelledDuplicate { .. }) {
-                warn!(
-                    job_id = job.id,
-                    "Unique claim held by a newer job; attempt cancelled as duplicate"
+            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                let cancelled = duplicate_cancelled_event_row(
+                    job,
+                    job_id,
+                    Reschedule::RetryAfter {
+                        delay_secs: seconds,
+                    },
+                    None,
+                    progress_snapshot.clone(),
                 );
-                return Ok(CompletionOutcome::IgnoredStale);
+                return Ok(cancelled_duplicate_outcome(job, cancelled, needs_event));
             }
             let (RescheduleOutcome::Rescheduled {
                 job_id,
@@ -1434,7 +1458,7 @@ async fn complete_job_canonical(
                 snooze_secs = seconds,
                 "Job snoozed (attempt not incremented)"
             );
-            let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+            let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique(
                 pool,
                 job.id,
                 job.run_lease,
@@ -1443,14 +1467,20 @@ async fn complete_job_canonical(
                 },
                 None,
                 progress_snapshot.as_ref(),
+                job.unique_key.as_deref(),
             )
             .await?;
-            if matches!(outcome, RescheduleOutcome::CancelledDuplicate { .. }) {
-                warn!(
-                    job_id = job.id,
-                    "Unique claim held by a newer job; attempt cancelled as duplicate"
+            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                let cancelled = duplicate_cancelled_event_row(
+                    job,
+                    job_id,
+                    Reschedule::Snooze {
+                        delay_secs: seconds,
+                    },
+                    None,
+                    progress_snapshot.clone(),
                 );
-                return Ok(CompletionOutcome::IgnoredStale);
+                return Ok(cancelled_duplicate_outcome(job, cancelled, needs_event));
             }
             if matches!(outcome, RescheduleOutcome::Stale) {
                 warn!(
@@ -1842,6 +1872,9 @@ async fn complete_job_canonical(
                             );
                             Ok(CompletionOutcome::IgnoredStale)
                         }
+                        Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                            Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
+                        }
                         Some(updated_job) => {
                             let event = if needs_event {
                                 Some(UntypedJobEvent::Retried {
@@ -1866,21 +1899,25 @@ async fn complete_job_canonical(
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
                 });
-                let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+                let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique(
                     pool,
                     job.id,
                     job.run_lease,
                     Reschedule::RetryBackoff,
                     Some(&error_entry),
                     progress_snapshot.as_ref(),
+                    job.unique_key.as_deref(),
                 )
                 .await?;
-                if matches!(outcome, RescheduleOutcome::CancelledDuplicate { .. }) {
-                    warn!(
-                        job_id = job.id,
-                        "Unique claim held by a newer job; attempt cancelled as duplicate"
+                if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                    let cancelled = duplicate_cancelled_event_row(
+                        job,
+                        job_id,
+                        Reschedule::RetryBackoff,
+                        Some(&error_entry),
+                        progress_snapshot.clone(),
                     );
-                    return Ok(CompletionOutcome::IgnoredStale);
+                    return Ok(cancelled_duplicate_outcome(job, cancelled, needs_event));
                 }
                 let (RescheduleOutcome::Rescheduled {
                     job_id,
@@ -1961,6 +1998,66 @@ fn rescheduled_event_row(
         row.finalized_at = Some(chrono::Utc::now());
     }
     row
+}
+
+/// The job as a read returns it after a canonical snooze or retry was
+/// cancelled because a newer duplicate holds its unique claim.
+fn duplicate_cancelled_event_row(
+    job: &JobRow,
+    job_id: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<serde_json::Value>,
+) -> JobRow {
+    let now = chrono::Utc::now();
+    let mut row = job.clone();
+    row.id = job_id;
+    row.state = JobState::Cancelled;
+    row.finalized_at = Some(now);
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row.progress = progress;
+    row.unique_states = row
+        .unique_states
+        .map(|states| states & !(1 << JobState::Cancelled.bit_position()));
+    let errors = row.errors.get_or_insert_with(Vec::new);
+    if let Some(error) = error {
+        errors.push(error.clone());
+    }
+    errors.push(serde_json::json!({
+        "error": reschedule.duplicate_error(),
+        "attempt": job.attempt,
+        "at": now.to_rfc3339(),
+    }));
+    row
+}
+
+/// Records a snooze or retry that was cancelled as a duplicate, with the
+/// `Cancelled` event rescue dispatches for its duplicate cancellations.
+fn cancelled_duplicate_outcome(
+    job: &JobRow,
+    cancelled: JobRow,
+    needs_event: bool,
+) -> CompletionOutcome {
+    warn!(
+        job_id = job.id,
+        "Unique claim held by a newer job; attempt cancelled as duplicate"
+    );
+    let event = needs_event.then(|| {
+        let reason = cancelled
+            .errors
+            .as_ref()
+            .and_then(|errors| errors.last())
+            .and_then(|entry| entry.get("error"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        UntypedJobEvent::Cancelled {
+            job: cancelled,
+            reason,
+        }
+    });
+    CompletionOutcome::CancelledDuplicate { event }
 }
 
 /// The job as a read returns it after this attempt completes.
@@ -2167,11 +2264,7 @@ async fn complete_job_queue_storage(
                         Ok(CompletionOutcome::IgnoredStale)
                     }
                     Some(updated_job) if updated_job.state == JobState::Cancelled => {
-                        warn!(
-                            job_id = job.id,
-                            "Unique claim held by a newer job; attempt cancelled as duplicate"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
+                        Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
                     }
                     Some(updated_job) => {
                         let event = if needs_event {
@@ -2210,11 +2303,7 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             };
             if updated_job.state == JobState::Cancelled {
-                warn!(
-                    job_id = job.id,
-                    "Unique claim held by a newer job; attempt cancelled as duplicate"
-                );
-                return Ok(CompletionOutcome::IgnoredStale);
+                return Ok(cancelled_duplicate_outcome(job, updated_job, needs_event));
             }
             if needs_event {
                 Ok(CompletionOutcome::Applied {
@@ -2259,11 +2348,7 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             };
             if updated.state == JobState::Cancelled {
-                warn!(
-                    job_id = job.id,
-                    "Unique claim held by a newer job; attempt cancelled as duplicate"
-                );
-                return Ok(CompletionOutcome::IgnoredStale);
+                return Ok(cancelled_duplicate_outcome(job, updated, needs_event));
             }
             Ok(CompletionOutcome::Applied {
                 event: None,
@@ -2624,11 +2709,7 @@ async fn complete_job_queue_storage(
                             Ok(CompletionOutcome::IgnoredStale)
                         }
                         Some(updated_job) if updated_job.state == JobState::Cancelled => {
-                            warn!(
-                                job_id = job.id,
-                                "Unique claim held by a newer job; attempt cancelled as duplicate"
-                            );
-                            Ok(CompletionOutcome::IgnoredStale)
+                            Ok(cancelled_duplicate_outcome(job, updated_job, needs_event))
                         }
                         Some(updated_job) => {
                             let event = if needs_event {
@@ -2667,11 +2748,7 @@ async fn complete_job_queue_storage(
                     return Ok(CompletionOutcome::IgnoredStale);
                 };
                 if updated_job.state == JobState::Cancelled {
-                    warn!(
-                        job_id = job.id,
-                        "Unique claim held by a newer job; attempt cancelled as duplicate"
-                    );
-                    return Ok(CompletionOutcome::IgnoredStale);
+                    return Ok(cancelled_duplicate_outcome(job, updated_job, needs_event));
                 }
                 if needs_event {
                     Ok(CompletionOutcome::Applied {
@@ -3219,7 +3296,7 @@ async fn retry_after_canonical_with_followups(
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_tx(
+    let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique_tx(
         &mut tx,
         job.id,
         job.run_lease,
@@ -3228,6 +3305,7 @@ async fn retry_after_canonical_with_followups(
         },
         None,
         progress_snapshot,
+        job.unique_key.as_deref(),
     )
     .await?;
     let (job_id, run_at, attempt) = match outcome {
@@ -3241,9 +3319,17 @@ async fn retry_after_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate { .. } => {
+        RescheduleOutcome::CancelledDuplicate { job_id } => {
             tx.commit().await?;
-            return Ok(None);
+            return Ok(Some(duplicate_cancelled_event_row(
+                job,
+                job_id,
+                Reschedule::RetryAfter {
+                    delay_secs: seconds,
+                },
+                None,
+                progress_snapshot.cloned(),
+            )));
         }
         RescheduleOutcome::Stale => {
             tx.rollback().await?;
@@ -3387,13 +3473,14 @@ async fn retry_backoff_canonical_with_followups(
         "attempt": job.attempt,
         "at": chrono::Utc::now().to_rfc3339()
     });
-    let outcome = awa_model::reschedule::reschedule_canonical_attempt_tx(
+    let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique_tx(
         &mut tx,
         job.id,
         job.run_lease,
         Reschedule::RetryBackoff,
         Some(&error_entry),
         progress_snapshot,
+        job.unique_key.as_deref(),
     )
     .await?;
     let (job_id, run_at, attempt) = match outcome {
@@ -3407,9 +3494,15 @@ async fn retry_backoff_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate { .. } => {
+        RescheduleOutcome::CancelledDuplicate { job_id } => {
             tx.commit().await?;
-            return Ok(None);
+            return Ok(Some(duplicate_cancelled_event_row(
+                job,
+                job_id,
+                Reschedule::RetryBackoff,
+                Some(&error_entry),
+                progress_snapshot.cloned(),
+            )));
         }
         RescheduleOutcome::Stale => {
             tx.rollback().await?;

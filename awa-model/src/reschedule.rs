@@ -45,7 +45,9 @@ impl Reschedule {
         }
     }
 
-    fn duplicate_error(&self) -> &'static str {
+    /// The error entry recorded when the attempt is cancelled because a
+    /// newer duplicate holds the unique claim its successor needs.
+    pub fn duplicate_error(&self) -> &'static str {
         match self {
             Reschedule::Snooze { .. } => SNOOZED_DUPLICATE_ERROR,
             Reschedule::RetryAfter { .. } | Reschedule::RetryBackoff => RETRIED_DUPLICATE_ERROR,
@@ -135,6 +137,52 @@ pub async fn reschedule_canonical_attempt(
     Ok(outcome)
 }
 
+/// [`reschedule_canonical_attempt`] for a caller that knows the running
+/// job's `unique_key`. A job without one cannot hit a unique-claim
+/// conflict, so the canonical move skips the savepoint that guards it.
+#[allow(clippy::too_many_arguments)]
+pub async fn reschedule_canonical_attempt_with_unique(
+    pool: &PgPool,
+    job_id: i64,
+    run_lease: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<&serde_json::Value>,
+    unique_key: Option<&[u8]>,
+) -> Result<RescheduleOutcome, AwaError> {
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    let outcome = reschedule_canonical_attempt_with_unique_tx(
+        &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
+    )
+    .await?;
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(outcome)
+}
+
+/// Transaction-composable form of
+/// [`reschedule_canonical_attempt_with_unique`].
+#[allow(clippy::too_many_arguments)]
+pub async fn reschedule_canonical_attempt_with_unique_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+    run_lease: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<&serde_json::Value>,
+    unique_key: Option<&[u8]>,
+) -> Result<RescheduleOutcome, AwaError> {
+    reschedule_attempt_tx(
+        tx,
+        job_id,
+        run_lease,
+        reschedule,
+        error,
+        progress,
+        unique_key.is_some(),
+    )
+    .await
+}
+
 /// Transaction-composable form of [`reschedule_canonical_attempt`] for
 /// callers that must commit follow-up work atomically with the re-schedule.
 pub async fn reschedule_canonical_attempt_tx(
@@ -144,6 +192,19 @@ pub async fn reschedule_canonical_attempt_tx(
     reschedule: Reschedule,
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
+) -> Result<RescheduleOutcome, AwaError> {
+    reschedule_attempt_tx(tx, job_id, run_lease, reschedule, error, progress, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reschedule_attempt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+    run_lease: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<&serde_json::Value>,
+    may_conflict: bool,
 ) -> Result<RescheduleOutcome, AwaError> {
     // Lock the transition singleton FOR SHARE for the rest of this
     // transaction before deciding where the attempt goes. `storage_abort`,
@@ -166,18 +227,41 @@ pub async fn reschedule_canonical_attempt_tx(
     .flatten();
 
     match active_schema {
-        None => reschedule_canonical(tx, job_id, run_lease, reschedule, error, progress).await,
+        None => {
+            reschedule_canonical(
+                tx,
+                job_id,
+                run_lease,
+                reschedule,
+                error,
+                progress,
+                may_conflict,
+            )
+            .await
+        }
         Some(schema) => {
-            migrate_to_queue_storage(tx, &schema, job_id, run_lease, reschedule, error, progress)
-                .await
+            migrate_to_queue_storage(
+                tx,
+                &schema,
+                job_id,
+                run_lease,
+                reschedule,
+                error,
+                progress,
+                may_conflict,
+            )
+            .await
         }
     }
 }
 
 /// Canonical routing: the same hot -> scheduled move the executor performed
 /// historically, or a cancellation when a newer duplicate holds the unique
-/// claim the successor needs. The jobs_hot/scheduled_jobs triggers keep
-/// unique claims and admin dirty keys in sync.
+/// claim the successor needs. The cancelled row drops `cancelled` from its
+/// unique mask, so it never contends for the claim, and keeps its key, so
+/// a later retry re-checks the claim. The jobs_hot/scheduled_jobs triggers
+/// keep unique claims and admin dirty keys in sync.
+#[allow(clippy::too_many_arguments)]
 async fn reschedule_canonical(
     tx: &mut Transaction<'_, Postgres>,
     job_id: i64,
@@ -185,7 +269,11 @@ async fn reschedule_canonical(
     reschedule: Reschedule,
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
+    may_conflict: bool,
 ) -> Result<RescheduleOutcome, AwaError> {
+    if !may_conflict {
+        return move_canonical(tx.as_mut(), job_id, run_lease, reschedule, error, progress).await;
+    }
     {
         let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
         match move_canonical(
@@ -222,6 +310,7 @@ async fn reschedule_canonical(
             callback_on_complete = NULL,
             callback_on_fail = NULL,
             callback_transform = NULL,
+            unique_states = set_bit(unique_states, 6, 0),
             progress = $5,
             errors = CASE WHEN $3::jsonb IS NULL THEN errors ELSE errors || $3::jsonb END
                 || jsonb_build_object('error', $4::text, 'attempt', attempt, 'at', now())
@@ -314,6 +403,7 @@ async fn move_canonical(
 
 /// Mixed transition / active: take the canonical row and re-insert the
 /// attempt as a queue-storage deferred job under a fresh id.
+#[allow(clippy::too_many_arguments)]
 async fn migrate_to_queue_storage(
     tx: &mut Transaction<'_, Postgres>,
     schema: &str,
@@ -322,6 +412,7 @@ async fn migrate_to_queue_storage(
     reschedule: Reschedule,
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
+    may_conflict: bool,
 ) -> Result<RescheduleOutcome, AwaError> {
     // The jobs_hot delete trigger releases the job's unique claim.
     //
@@ -357,7 +448,16 @@ async fn migrate_to_queue_storage(
         // not match. Fall through to the canonical write, which applies the
         // same guard: it re-schedules a callback-carrying job in place and
         // reports `Stale` for a genuinely lost attempt.
-        return reschedule_canonical(tx, job_id, run_lease, reschedule, error, progress).await;
+        return reschedule_canonical(
+            tx,
+            job_id,
+            run_lease,
+            reschedule,
+            error,
+            progress,
+            may_conflict,
+        )
+        .await;
     };
 
     let (delay_secs, use_backoff) = reschedule.delay_parameters();

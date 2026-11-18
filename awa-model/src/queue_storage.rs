@@ -3679,7 +3679,16 @@ impl QueueStorage {
             }
         }
 
-        if new_claim && !old_claim {
+        // A terminal row can read back claim fields it never held: a
+        // duplicate cancellation keeps the ready row's key. Leaving it
+        // re-checks ownership instead of assuming the claim.
+        let leaves_terminal = old_state.is_some_and(|state| {
+            matches!(
+                state,
+                JobState::Completed | JobState::Failed | JobState::Cancelled
+            )
+        });
+        if new_claim && (!old_claim || leaves_terminal) {
             if let Some(key) = unique_key {
                 let result = sqlx::query(
                     r#"
