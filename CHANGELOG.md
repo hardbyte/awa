@@ -90,7 +90,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Forward-ported from 0.6.18
 
-- **Per-queue DLQ settings apply to striped queues.** With `queue_stripe_count` above 1, jobs are claimed from physical stripes `q#0` … `q#N-1`, and the runtime looked up `queue_dlq_enabled` and the DLQ part of `queue_retention` by that physical name, so an override for `q` never applied: with DLQ off by default and `queue_dlq_enabled("q", true)`, exhausted jobs failed instead of moving to the DLQ, and a longer DLQ retention for `q` did not protect its rows from the global retention. A stripe now takes its logical queue's DLQ override, and DLQ retention matches a logical queue's stripes. Metrics still label jobs from a stripe with the stripe's name.
+- **Per-queue DLQ settings apply to striped queues.** With `queue_stripe_count` above 1, jobs are claimed from physical stripes `q#0` … `q#N-1`, and the runtime looked up `queue_dlq_enabled` and the DLQ part of `queue_retention` by that physical name, so an override for `q` never applied: with DLQ off by default and `queue_dlq_enabled("q", true)`, exhausted jobs failed instead of moving to the DLQ, and a longer DLQ retention for `q` did not protect its rows from the global retention. While the runtime stripes its queues (`queue_stripe_count` above 1), a stripe now takes its logical queue's DLQ override and DLQ retention unless it has an override of its own; with one stripe, a queue named `q#0` stays a queue of its own. Metrics still label jobs from a stripe with the stripe's name.
 
 ### Added
 

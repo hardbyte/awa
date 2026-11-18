@@ -1271,7 +1271,12 @@ impl ClientBuilder {
                 .map(|(name, _)| (name.clone(), Arc::new(AtomicBool::new(false))))
                 .collect(),
         );
-        let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides);
+        let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides)
+            .with_queue_stripe_count(
+                self.storage
+                    .queue_storage()
+                    .map_or(1, |runtime| runtime.store.queue_stripe_count()),
+            );
 
         let health_addr = match self.health_addr {
             Some(addr) => Some(addr),

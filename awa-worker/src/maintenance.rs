@@ -4424,6 +4424,9 @@ impl MaintenanceService {
             .map(|(queue, _)| queue.as_str())
             .collect();
         let retention_secs = i64::try_from(self.dlq_retention.as_secs()).unwrap_or(i64::MAX);
+        // Rows from a stripe `q#N` take `q`'s retention only while this
+        // runtime stripes its queues; otherwise `q#N` is a queue of its own.
+        let striped = runtime.store.queue_stripe_count() > 1;
 
         let global_result = if override_queues.is_empty() {
             sqlx::query(audited_sql(format!(
@@ -4450,7 +4453,8 @@ impl MaintenanceService {
                       AND NOT EXISTS (
                           SELECT 1 FROM unnest($3::text[]) AS overridden(queue)
                           WHERE dlq_entries.queue = overridden.queue
-                             OR (left(dlq_entries.queue, char_length(overridden.queue) + 1)
+                             OR ($4::boolean
+                                 AND left(dlq_entries.queue, char_length(overridden.queue) + 1)
                                      = overridden.queue || '#'
                                  AND substr(dlq_entries.queue, char_length(overridden.queue) + 2)
                                      ~ '^[0-9]+$')
@@ -4462,6 +4466,7 @@ impl MaintenanceService {
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(&override_queues)
+            .bind(striped)
             .execute(&self.pool)
             .await
         };
@@ -4487,8 +4492,11 @@ impl MaintenanceService {
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
                     WHERE (queue = $3
-                           OR (left(queue, char_length($3) + 1) = $3 || '#'
-                               AND substr(queue, char_length($3) + 2) ~ '^[0-9]+$'))
+                           OR ($4::boolean
+                               AND left(queue, char_length($3) + 1) = $3 || '#'
+                               AND substr(queue, char_length($3) + 2) ~ '^[0-9]+$'
+                               -- A stripe with its own override keeps it.
+                               AND queue != ALL($5::text[])))
                       AND dlq_at < now() - make_interval(secs => $1::bigint)
                     LIMIT $2
                 )
@@ -4497,6 +4505,8 @@ impl MaintenanceService {
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(queue)
+            .bind(striped)
+            .bind(&override_queues)
             .execute(&self.pool)
             .await
             {

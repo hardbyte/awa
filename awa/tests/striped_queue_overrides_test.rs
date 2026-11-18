@@ -206,3 +206,191 @@ async fn queue_dlq_retention_override_applies_to_rows_from_stripes(pool: PgPool)
         "a one-day DLQ retention override on {KEPT:?} must keep its striped DLQ rows"
     );
 }
+
+fn failing_jobs(queue: &str) -> Vec<awa::model::job::InsertParams> {
+    (0..JOBS)
+        .map(|n| awa::model::job::InsertParams {
+            kind: "failing_job".into(),
+            args: serde_json::json!({ "n": n }),
+            opts: InsertOpts {
+                queue: queue.into(),
+                max_attempts: 1,
+                ..Default::default()
+            },
+        })
+        .collect()
+}
+
+async fn wait_for_runs(runs: &AtomicI64, expected: i64) {
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(20));
+    while runs.load(Ordering::SeqCst) < expected {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {} of {expected} handlers ran",
+            runs.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Let the finalizes write the DLQ rows and several cleanup passes run.
+    let settle = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(2));
+    while tokio::time::Instant::now() < settle {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn exact_dlq_rows(pool: &PgPool, queue: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM awa.dlq_entries WHERE queue = $1")
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Without striping, `lit#0` is a queue of its own: `lit`'s DLQ setting and
+/// DLQ retention do not apply to it.
+#[sqlx::test(migrations = false)]
+async fn an_unstriped_queue_named_like_a_stripe_keeps_its_own_dlq_settings(pool: PgPool) {
+    const LOGICAL: &str = "lit";
+    const LITERAL: &str = "lit#0";
+    migrations::run(&pool).await.unwrap();
+    let config = QueueStorageConfig::default();
+    assert_eq!(config.queue_stripe_count, 1);
+    let store = QueueStorage::new(config.clone()).unwrap();
+    let runs = Arc::new(AtomicI64::new(0));
+    let handler_runs = runs.clone();
+    let client = Client::builder(pool.clone())
+        .queue_storage(
+            config,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        )
+        .queue(
+            LITERAL,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .dlq_enabled_by_default(true)
+        .queue_dlq_enabled(LOGICAL, false)
+        .dlq_retention(Duration::from_secs(86_400))
+        .cleanup_interval(Duration::from_millis(100))
+        .queue_retention(
+            LOGICAL,
+            RetentionPolicy {
+                completed: Duration::from_secs(86_400),
+                failed: Duration::from_secs(86_400),
+                dlq: Some(Duration::from_millis(1)),
+            },
+        )
+        .register::<FailingJob, _, _>(move |_args, _ctx| {
+            let runs = handler_runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err(JobError::terminal("always fails"))
+            }
+        })
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    store
+        .enqueue_params_batch(&pool, &failing_jobs(LITERAL))
+        .await
+        .unwrap();
+    wait_for_runs(&runs, JOBS).await;
+    let kept = exact_dlq_rows(&pool, LITERAL).await;
+    client.shutdown(Duration::from_secs(5)).await;
+
+    assert_eq!(
+        kept, JOBS,
+        "{LITERAL:?} must keep DLQ on and the global retention, not {LOGICAL:?}'s"
+    );
+}
+
+/// A stripe's own DLQ retention override wins over its logical queue's.
+#[sqlx::test(migrations = false)]
+async fn a_stripe_retention_override_wins_over_its_logical_queue(pool: PgPool) {
+    const QUEUE: &str = "stripe_retention_exact";
+    let kept_stripe = format!("{QUEUE}#0");
+    let purged_stripe = format!("{QUEUE}#1");
+    migrations::run(&pool).await.unwrap();
+    let config = QueueStorageConfig {
+        queue_stripe_count: 2,
+        ..Default::default()
+    };
+    let store = QueueStorage::new(config.clone()).unwrap();
+    let day = Duration::from_secs(86_400);
+    let runs = Arc::new(AtomicI64::new(0));
+    let per_stripe = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (handler_runs, handler_queues) = (runs.clone(), per_stripe.clone());
+    let client = Client::builder(pool.clone())
+        .queue_storage(
+            config,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        )
+        .queue(
+            QUEUE,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .dlq_enabled_by_default(true)
+        .dlq_retention(day)
+        .cleanup_interval(Duration::from_millis(100))
+        .queue_retention(
+            QUEUE,
+            RetentionPolicy {
+                completed: day,
+                failed: day,
+                dlq: Some(Duration::from_millis(1)),
+            },
+        )
+        .queue_retention(
+            kept_stripe.clone(),
+            RetentionPolicy {
+                completed: day,
+                failed: day,
+                dlq: Some(day),
+            },
+        )
+        .register::<FailingJob, _, _>(move |_args, ctx| {
+            let (runs, queues) = (handler_runs.clone(), handler_queues.clone());
+            let queue = ctx.job.queue.clone();
+            async move {
+                queues.lock().unwrap().push(queue);
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err(JobError::terminal("always fails"))
+            }
+        })
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    store
+        .enqueue_params_batch(&pool, &failing_jobs(QUEUE))
+        .await
+        .unwrap();
+    wait_for_runs(&runs, JOBS).await;
+    let on_kept = per_stripe
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|queue| **queue == kept_stripe)
+        .count() as i64;
+    let kept = exact_dlq_rows(&pool, &kept_stripe).await;
+    let purged = exact_dlq_rows(&pool, &purged_stripe).await;
+    client.shutdown(Duration::from_secs(5)).await;
+
+    assert!(
+        on_kept > 0 && on_kept < JOBS,
+        "both stripes must run jobs: {on_kept} of {JOBS} on {kept_stripe}"
+    );
+    assert_eq!(purged, 0, "{purged_stripe:?} takes {QUEUE:?}'s retention");
+    assert_eq!(
+        kept, on_kept,
+        "{kept_stripe:?}'s one-day override must keep its DLQ rows"
+    );
+}
