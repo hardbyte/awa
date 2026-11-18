@@ -8,7 +8,7 @@
 //! Run with: `cargo test --package awa --test dlq_retry_batch_test -- --nocapture`
 
 use awa::model::bulk::{run_batches, BulkBatch, BulkCursor, BulkRunOptions};
-use awa::model::{dlq, AwaError, ListDlqFilter};
+use awa::model::{dlq, AwaError, ListDlqFilter, RetryFromDlqOpts};
 use awa_testing::setup;
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -309,16 +309,62 @@ async fn a_unique_conflict_is_skipped_reported_and_not_retried_again() {
     setup::clean_queue(&pool, &queue).await;
 }
 
-/// A batch reserves the destination lane before it claims a unique key, as
-/// every enqueue path does, so a transaction that holds the lane and then
-/// claims the same key does not wait on the batch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_batch_reserves_the_lane_before_claiming_unique_keys() {
+async fn next_lane_seq(pool: &PgPool, queue: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT awa.sequence_next_value(seq_name) FROM awa.queue_enqueue_heads \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0",
+    )
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("next lane sequence")
+}
+
+async fn backend_pid(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("backend pid")
+}
+
+/// Wait until `count` backends wait on `pid`, directly or through another
+/// waiter.
+async fn wait_for_waiters(pool: &PgPool, pid: i32, count: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "WITH RECURSIVE waiters(pid) AS (
+                 SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+                 UNION
+                 SELECT activity.pid FROM pg_stat_activity AS activity
+                 JOIN waiters ON waiters.pid = ANY(pg_blocking_pids(activity.pid))
+             )
+             SELECT count(*) FROM waiters",
+        )
+        .bind(pid)
+        .fetch_one(pool)
+        .await
+        .expect("read lock waits");
+        if waiting >= count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{count} backends should wait on {pid}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A row whose key a live job holds is left out before the lane is reserved,
+/// so the lane advances only by the rows the batch revives.
+#[tokio::test]
+async fn a_conflicting_row_gets_no_lane_position() {
     let _guard = GUARD.lock().await;
     let pool = queue_storage_pool().await;
-    let queue = unique_name("dlq_batch_lane_first");
+    let queue = unique_name("dlq_batch_no_gap");
     let key = format!("dlq-batch-{queue}").into_bytes();
-    seed_plain(&pool, "dlq_batch_job", &queue, 30).await;
+    seed_plain(&pool, "dlq_batch_job", &queue, 40).await;
     let warmed = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
     assert_eq!(warmed.count, 1, "the first batch provisions the lane");
     let keyed = seed(
@@ -326,70 +372,204 @@ async fn a_batch_reserves_the_lane_before_claiming_unique_keys() {
         Seed {
             kind: "dlq_batch_job",
             queue: &queue,
-            dlq_age_secs: 20,
+            dlq_age_secs: 30,
+            tag: None,
+            unique_key: Some(&key),
+        },
+    )
+    .await;
+    let plain = seed_plain(&pool, "dlq_batch_job", &queue, 20).await;
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(&key)
+        .bind(i64::MAX - 3)
+        .execute(&pool)
+        .await
+        .expect("live job holds the key");
+    let before = next_lane_seq(&pool, &queue).await;
+
+    let result = batch(&pool, &by_queue(&queue), 10, warmed.cursor).await;
+    assert_eq!((result.count, result.conflicts.clone()), (1, vec![keyed]));
+    let plain_seq: i64 =
+        sqlx::query_scalar("SELECT lane_seq FROM awa.ready_entries WHERE job_id = $1")
+            .bind(plain)
+            .fetch_one(&pool)
+            .await
+            .expect("revived row");
+    assert_eq!(plain_seq, before);
+    assert_eq!(
+        next_lane_seq(&pool, &queue).await,
+        before + 1,
+        "no lane gap"
+    );
+
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("drop claim");
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// Batches claim their keys in key order whatever order their rows come in,
+/// so two batches over the same keys queue behind each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batches_over_the_same_keys_do_not_deadlock() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_name("dlq_batch_key_order");
+    let low = format!("dlq-batch-a-{queue}").into_bytes();
+    let high = format!("dlq-batch-b-{queue}").into_bytes();
+    seed_plain(&pool, "dlq_batch_job", &queue, 60).await;
+    let warmed = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
+    assert_eq!(warmed.count, 1, "the first batch provisions the lane");
+    let mut first = Vec::new();
+    for key in [&low, &high] {
+        first.push(
+            seed(
+                &pool,
+                Seed {
+                    kind: "dlq_batch_first",
+                    queue: &queue,
+                    dlq_age_secs: 50,
+                    tag: None,
+                    unique_key: Some(key),
+                },
+            )
+            .await,
+        );
+    }
+    let mut second = Vec::new();
+    for key in [&high, &low] {
+        second.push(
+            seed(
+                &pool,
+                Seed {
+                    kind: "dlq_batch_second",
+                    queue: &queue,
+                    dlq_age_secs: 40,
+                    tag: None,
+                    unique_key: Some(key),
+                },
+            )
+            .await,
+        );
+    }
+
+    let mut gate = pool.begin().await.expect("begin gate");
+    let gate_pid = backend_pid(&mut gate).await;
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(&high)
+        .bind(i64::MAX - 4)
+        .execute(&mut *gate)
+        .await
+        .expect("gate holds the high key");
+
+    let run = |kind: &'static str| {
+        let pool = pool.clone();
+        let filter = ListDlqFilter {
+            kind: Some(kind.to_string()),
+            queue: Some(queue.clone()),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, BulkCursor::default()).await
+        })
+    };
+    let first_run = run("dlq_batch_first");
+    wait_for_waiters(&pool, gate_pid, 1).await;
+    let second_run = run("dlq_batch_second");
+    wait_for_waiters(&pool, gate_pid, 2).await;
+    gate.rollback().await.expect("release gate");
+
+    let first_result = first_run.await.expect("join").expect("first batch");
+    let second_result = second_run.await.expect("join").expect("second batch");
+    assert_eq!(first_result.count, 2);
+    assert_eq!(
+        (second_result.count, second_result.conflicts.clone()),
+        (0, second.clone())
+    );
+    assert_eq!(ready(&pool, &first).await.len(), 2);
+    assert_eq!(
+        in_dlq(&pool, &second).await,
+        second.iter().copied().collect()
+    );
+
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = ANY($1)")
+        .bind(vec![low.clone(), high.clone()])
+        .execute(&pool)
+        .await
+        .expect("drop claims");
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// A batch paused on the lane holds its claim, and a single retry of the
+/// same key waits on the claim without holding the lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_and_a_single_retry_of_one_key_do_not_deadlock() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_name("dlq_batch_vs_single");
+    let key = format!("dlq-batch-{queue}").into_bytes();
+    seed_plain(&pool, "dlq_batch_job", &queue, 60).await;
+    let warmed = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
+    assert_eq!(warmed.count, 1, "the first batch provisions the lane");
+    let batched = seed(
+        &pool,
+        Seed {
+            kind: "dlq_batch_job",
+            queue: &queue,
+            dlq_age_secs: 50,
+            tag: None,
+            unique_key: Some(&key),
+        },
+    )
+    .await;
+    let single = seed(
+        &pool,
+        Seed {
+            kind: "dlq_single_job",
+            queue: &queue,
+            dlq_age_secs: 40,
             tag: None,
             unique_key: Some(&key),
         },
     )
     .await;
 
-    let mut lane_holder = pool.begin().await.expect("begin lane holder");
+    let mut gate = pool.begin().await.expect("begin gate");
+    let gate_pid = backend_pid(&mut gate).await;
     sqlx::query("SELECT awa.reserve_enqueue_seq($1, 2::smallint, 0::smallint, 1)")
         .bind(&queue)
-        .execute(&mut *lane_holder)
+        .execute(&mut *gate)
         .await
-        .expect("reserve the lane");
+        .expect("gate holds the lane");
 
-    let retry = tokio::spawn({
+    let batch_run = tokio::spawn({
         let pool = pool.clone();
-        let filter = by_queue(&queue);
-        async move {
-            dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, BulkCursor::default()).await
-        }
+        let filter = ListDlqFilter {
+            kind: Some("dlq_batch_job".to_string()),
+            queue: Some(queue.clone()),
+            ..Default::default()
+        };
+        async move { dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, warmed.cursor).await }
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM pg_stat_activity
-                 WHERE pid <> pg_backend_pid()
-                   AND datname = current_database()
-                   AND wait_event_type = 'Lock'
-                   AND wait_event = 'advisory'
-                   AND query LIKE '%reserve_enqueue_seq%'
-             )",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read waits");
-        if waiting {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the batch should wait for the lane"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    wait_for_waiters(&pool, gate_pid, 1).await;
+    let single_run = tokio::spawn({
+        let pool = pool.clone();
+        async move { dlq::retry_from_dlq(&pool, single, &RetryFromDlqOpts::default()).await }
+    });
+    wait_for_waiters(&pool, gate_pid, 2).await;
+    gate.commit().await.expect("release gate");
 
-    sqlx::query("SET LOCAL lock_timeout = '2s'")
-        .execute(&mut *lane_holder)
-        .await
-        .expect("lock timeout");
-    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
-        .bind(&key)
-        .bind(i64::MAX - 3)
-        .execute(&mut *lane_holder)
-        .await
-        .expect("the lane holder claims the key without waiting on the batch");
-    lane_holder.commit().await.expect("commit lane holder");
-
-    let result = retry.await.expect("join").expect("batch");
-    assert_eq!(
-        (result.count, result.skipped, result.conflicts.clone()),
-        (0, 1, vec![keyed])
+    let batch_result = batch_run.await.expect("join").expect("batch");
+    let single_result = single_run.await.expect("join");
+    assert_eq!(batch_result.count, 1);
+    assert!(
+        matches!(single_result, Err(AwaError::UniqueConflict { .. })),
+        "{single_result:?}"
     );
-    assert_eq!(in_dlq(&pool, &[keyed]).await, BTreeSet::from([keyed]));
+    assert_eq!(ready(&pool, &[batched]).await, vec![batched]);
+    assert_eq!(in_dlq(&pool, &[single]).await, BTreeSet::from([single]));
 
     sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
         .bind(&key)
