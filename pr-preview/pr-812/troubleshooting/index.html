@@ -3916,7 +3916,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <h2 id="ring-prune-stays-blocked-under-claim-load">Ring Prune Stays Blocked Under Claim Load<a class="headerlink" href="#ring-prune-stays-blocked-under-claim-load" title="Permanent link">&para;</a></h2>
 <p>Symptoms on queue storage under sustained claim traffic from several runtimes (<a href="https://github.com/hardbyte/awa/issues/721">#721</a>):</p>
 <ul>
-<li><code>awa.maintenance.prune.attempts</code> for the queue ring, the claim ring or both keeps rising with outcome <code>blocked</code> (reason <code>none</code>), alternating with <code>backed_off</code>, and <code>pruned</code> stops advancing</li>
+<li><code>awa.maintenance.prune.attempts</code> for the queue ring, the claim ring or both keeps rising with outcome <code>blocked</code> (reason <code>none</code>), and <code>pruned</code> stops advancing; prune retries every tick, since a <code>blocked</code> outcome does not back it off</li>
 <li><code>awa.maintenance.rotate.attempts</code> for the same ring reports <code>skipped_busy</code>, usually with several blockers at once (<code>queue.ready_rows</code>, <code>queue.ready_segments</code>, <code>queue.done_rows</code> and the other slot tables, or <code>claim.rows</code>, <code>claim.closure_rows</code> and <code>claim.closure_batch_rows</code>)</li>
 <li><code>awa.ring.generation</code> for that ring stops advancing</li>
 <li>the current slot's <code>ready_entries_*</code> and <code>ready_segments_*</code> partitions keep growing, and <code>awa.dispatch.claim_duration</code> rises as they grow</li>
@@ -3932,28 +3932,24 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <tr>
 <th>Fault</th>
 <th><code>awa.maintenance.prune.attempts</code></th>
-<th><code>awa.maintenance.prune.pinned_ready_age</code></th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Claims starve prune (this section)</td>
 <td><code>blocked</code>, reason <code>none</code></td>
-<td>absent or <code>0</code></td>
 </tr>
 <tr>
 <td><a href="#queue-ring-stops-wrapping-behind-an-unclaimed-lane">Unclaimed lane pins the slot</a></td>
 <td><code>skipped_active</code>, reason <code>queue.pending_ready</code></td>
-<td>positive for the pinning lane</td>
 </tr>
 <tr>
 <td><a href="#claim-ring-stops-rotating-after-a-runtime-is-killed">Abandoned claims after a killed runtime</a></td>
 <td><code>skipped_active</code>, reason <code>queue.unclosed_claim_refs</code> or <code>claim.open</code></td>
-<td>absent or <code>0</code></td>
 </tr>
 </tbody>
 </table>
-<p>The leader reads <code>awa.maintenance.prune.pinned_ready_age</code> only after a <code>skipped_active</code> prune, so it does not report this fault.</p>
+<p>Do not use <code>awa.maintenance.prune.pinned_ready_age</code> to rule this fault in or out. The leader updates the gauge only after a <code>skipped_active</code> prune and leaves it unchanged when prune is <code>blocked</code>, so during this fault it can keep showing a lane's age from an earlier pin, or <code>0</code>.</p>
 <div class="language-promql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">awa_ring</span><span class="p">,</span><span class="w"> </span><span class="nv">awa_ring_outcome</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">increase</span><span class="o">(</span><span class="nv">awa_maintenance_prune_attempts_total</span><span class="p">[</span><span class="s">15m</span><span class="p">]</span><span class="o">))</span>
 </span></code></pre></div>
 <p>To see what holds the slots prune wants, list the locks on the oldest sealed slot of the queue ring and of the claim ring; the query picks each slot the way prune does, from the ring cursor that <code>ring_cursor</code> resolves for either cursor authority. Replace <code>&lt;schema&gt;</code> with the active <code>schema_name</code> from <a href="#find-the-active-queue-storage-schema">Find the active queue-storage schema</a>, and run it as a role that may execute <code>&lt;schema&gt;.ring_cursor</code>, such as the migration role. The query reads catalog and lock views, the ring state rows and the rotation ledger only, and takes no lock on the partitions; run it several times, since one sample can miss a short claim. Look at the rows for the ring whose prune reports <code>blocked</code>.</p>
