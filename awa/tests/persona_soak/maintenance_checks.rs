@@ -566,7 +566,7 @@ pub fn evaluate(shared: &Shared, rows: Result<&[Value], &str>) -> ProgressVerdic
             "ring_generation_stalled",
             stall.from_ms,
             format!(
-                "the {} ring stayed at generation {} from {:.0}s to {:.0}s with rotation skipped busy {} time(s), and no declared intent, disruption or claim progress explains it",
+                "the {} ring stayed at generation {} from {:.0}s to {:.0}s with rotation skipped busy {} time(s), and no declared intent, held locks or claim progress explains it",
                 stall.ring, stall.generation, stall.from_ms as f64 / 1000.0, stall.to_ms as f64 / 1000.0, stall.rotate_skipped_busy
             ),
             vec![serde_json::to_string(stall).unwrap_or_default()],
