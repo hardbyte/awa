@@ -350,6 +350,22 @@ timeout only on `ready_segments` and takes its other partitions with `NOWAIT`.
 `backed_off` means prune was skipped for a few ticks
 after repeated `skipped_active`.
 
+Prune that stays `blocked` (reason `none`) with no pinned lane while
+`awa.ring.generation` stays flat has two known causes, neither fixed on this
+release: overlapping claims from several runtimes that always hold the oldest
+sealed slot's partitions (#721), and long readers such as monitoring counts
+over `leases`, `lease_claims` or `done_entries` through the parent table, which
+lock every partition for as long as they run. Find the holders with the lock
+queries in [ring prune stays blocked under claim load](../../docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load).
+Bound or move long readers; serve queues from fewer runtimes; raise
+`prune_lock_timeout` modestly; do not lengthen the rotation interval for it.
+
+Every queue in a database shares one queue ring, one claim ring and one
+maintenance leader, so one stuck lane or a claim-heavy workload stalls
+reclamation for all of them. The isolation boundary is a separate database,
+not a separate queue-storage schema (a database has one active schema); see
+[storage isolation](../../docs/deployment.md#storage-isolation).
+
 ## Ring Rotation Cadence
 
 For queue storage, `ClientBuilder::ring_rotation_cadence` seals a slot after a

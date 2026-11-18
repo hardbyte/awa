@@ -406,6 +406,107 @@ Moving the stuck jobs to another queue or changing their priority does not relea
 
 Pick the threshold above the longest time a healthy lane's oldest row waits to be claimed. To list the lanes from Rust, `QueueStorage::queue_ring_pin` returns the oldest sealed slot and each pinning lane with its first pending row's `lane_seq`, `run_at` and age.
 
+The ring is shared by every queue in the database. To keep queues that are expected to sit paused, unserved or starved from holding back reclamation for the rest, serve them from a separate database; see [storage isolation](deployment.md#storage-isolation). A separate queue-storage schema in the same database is not a boundary, since a database has one active queue-storage schema.
+
+## Ring Prune Stays Blocked Under Claim Load
+
+Symptoms on queue storage under sustained claim traffic from several runtimes ([#721](https://github.com/hardbyte/awa/issues/721)):
+
+- `awa.maintenance.prune.attempts` for the queue ring, the claim ring or both keeps rising with outcome `blocked` (reason `none`), alternating with `backed_off`, and `pruned` stops advancing
+- `awa.maintenance.rotate.attempts` for the same ring reports `skipped_busy`, usually with several blockers at once (`queue.ready_rows`, `queue.ready_segments`, `queue.done_rows` and the other slot tables, or `claim.rows`, `claim.closure_rows` and `claim.closure_batch_rows`)
+- `awa.ring.generation` for that ring stops advancing
+- the current slot's `ready_entries_*` and `ready_segments_*` partitions keep growing, and `awa.dispatch.claim_duration` rises as they grow
+
+No jobs are lost: a blocked prune rolls back and changes nothing. The cost is storage that is not reclaimed and claim latency that grows with the current slot.
+
+Claims lock every child of the ring tables they read, sealed slots included, so each claim holds a lock on the slot prune wants to truncate. When claims from several runtimes overlap continuously, prune's lock request never finds the slot free within its wait, the ring cannot rotate into the unpruned slot, the current slot grows, and slower claims overlap more. The loop sustains itself without any other blocker.
+
+A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue ring on one slot for about two days this way, with that slot's ready partition at about 55M rows (64 GB). Sampling `pg_locks` on the next slot's partitions every 25 ms never found them free: each sample showed four to six `AccessShareLock` holders, all short transactions running the claim function, including claims for a queue with no backlog.
+
+This branch does not fix it yet, and does not carry 0.6.17's partial change either, which keeps queue prune's checks off `ACCESS EXCLUSIVE` and retries the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms.
+
+### Confirm It
+
+Tell it apart from the other ring stalls by the prune outcome:
+
+| Fault | `awa.maintenance.prune.attempts` | `awa.maintenance.prune.pinned_ready_age` |
+| --- | --- | --- |
+| Claims starve prune (this section) | `blocked`, reason `none` | absent or `0` |
+| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` | positive for the pinning lane |
+| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` | absent or `0` |
+
+The leader reads `awa.maintenance.prune.pinned_ready_age` only after a `skipped_active` prune, so it does not report this fault.
+
+```promql
+sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
+```
+
+To see what holds the slots prune wants, list the locks on the oldest sealed slot of the queue ring and of the claim ring; the query picks each slot the way prune does, from the ring cursor that `ring_cursor` resolves for either cursor authority. Replace `<schema>` with the active `schema_name` from [Find the active queue-storage schema](#find-the-active-queue-storage-schema), and run it as a role that may execute `<schema>.ring_cursor`, such as the migration role. The query reads catalog and lock views, the ring state rows and the rotation ledger only, and takes no lock on the partitions; run it several times, since one sample can miss a short claim. Look at the rows for the ring whose prune reports `blocked`.
+
+```sql
+WITH cursors AS (
+    SELECT 'queue' AS ring, c.slot, c.generation, s.slot_count
+    FROM <schema>.ring_cursor('queue') AS c, <schema>.queue_ring_state AS s
+    WHERE s.singleton
+    UNION ALL
+    SELECT 'claim', c.slot, c.generation, s.slot_count
+    FROM <schema>.ring_cursor('claim') AS c, <schema>.claim_ring_state AS s
+    WHERE s.singleton
+), oldest AS (
+    SELECT ring,
+           ((slot - (LEAST(generation + 1, slot_count) - 1)) % slot_count + slot_count) % slot_count AS slot
+    FROM cursors
+    WHERE LEAST(generation + 1, slot_count) > 1
+), targets AS (
+    SELECT o.ring, p.prefix || o.slot AS relname
+    FROM oldest o
+    CROSS JOIN (VALUES
+        ('queue', 'ready_entries_'), ('queue', 'ready_segments_'), ('queue', 'done_entries_'),
+        ('claim', 'lease_claims_'), ('claim', 'lease_claim_batches_'),
+        ('claim', 'lease_claim_closures_'), ('claim', 'lease_claim_closure_batches_')
+    ) AS p(ring, prefix)
+    WHERE p.ring = o.ring
+)
+SELECT t.ring, c.relname, l.mode, l.granted, a.pid, a.application_name,
+       now() - a.xact_start AS xact_age, left(a.query, 80) AS query
+FROM targets t
+JOIN pg_class c ON c.relname = t.relname
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
+JOIN pg_locks l ON l.relation = c.oid
+JOIN pg_stat_activity a ON a.pid = l.pid
+ORDER BY t.ring, c.relname, l.granted, a.xact_start;
+```
+
+This fault shows as a few holders in every sample, each a different short transaction: on the queue ring, `AccessShareLock` from `claim_ready_runtime` or a `claim_ready_slot_<N>` function; on the claim ring, claims and completions that read or write the claim tables. A single long `xact_age`, or a reader that is not a claim, points instead to the slow readers described under [`prune_lock_timeout`](configuration.md#what-the-knobs-mean).
+
+Long readers of the queue-storage tables stall prune the same way, without any claim load. A query that scans `leases`, `lease_claims`, `lease_claim_closures`, `done_entries`, `ready_entries` or another ring table through its parent holds `ACCESS SHARE` on every partition of that table, sealed slots included, until its transaction ends, and prune cannot truncate the oldest slot until it finishes. Monitoring and dashboard queries are the usual source: a count over these tables can run for minutes with millions of jobs in the ring, and polls issued back to back keep prune `blocked` and the ring from rotating for as long as they run. The query above covers only the queue and claim rings' prune targets; this one lists every transaction older than five seconds that holds a lock on any table in the queue-storage schema, for every ring:
+
+```sql
+SELECT a.pid, a.application_name, now() - a.xact_start AS xact_age,
+       count(DISTINCT l.relation) AS relations, left(a.query, 80) AS query
+FROM pg_locks l
+JOIN pg_class c ON c.oid = l.relation
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE a.xact_start < now() - interval '5 seconds'
+GROUP BY a.pid, a.application_name, a.xact_start, a.query
+ORDER BY xact_age DESC;
+```
+
+Run such readers against a replica or with a short `statement_timeout`, poll them less often, or use Awa's metrics instead.
+
+### Mitigations
+
+None of these has been measured against this fault. Change one at a time and watch `pruned`, `awa.ring.generation` and `awa.dispatch.claim_duration`.
+
+- **Reduce overlapping claims.** Serve each queue from fewer runtimes, especially queues that are usually idle, since every runtime that serves a queue claims on it. A dispatcher whose fallback poll finds no ready jobs does not claim, so idle queues add fewer claims than busy ones.
+- **Raise `prune_lock_timeout` modestly**, for example to `50ms` or `100ms`. While prune's `ACCESS EXCLUSIVE` request waits, every new claim on that partition queues behind it, so a longer wait trades claim latency for reclamation. Keep it well below `deadlock_timeout` and `statement_timeout`; startup warns when it reaches either.
+- **Stop long readers of the ring tables.** If either lock query shows a monitoring, dashboard or reporting query rather than claims, bound or move that query instead; see above.
+- **Do not lengthen the rotation interval for this fault.** It does not help prune get its lock, and it makes each slot larger.
+- **Split workloads across databases.** Claims lock only their own database's ring partitions, so moving some queues and their runtimes to a [separate database](deployment.md#storage-isolation) leaves fewer overlapping claims on each ring, at the cost of a second installation to migrate and operate.
+
+Once prune gets its lock, for example when claim traffic drops, the ring rotates again and the oversized slot is reclaimed when the ring reaches it.
+
 ## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means
