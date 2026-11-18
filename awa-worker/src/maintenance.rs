@@ -46,6 +46,13 @@ enum GatedRing {
 
 const PROMOTED_DUPLICATE_ERROR: &str = "promoted as duplicate: unique claim held by another job";
 
+/// What per-row canonical promotion did with one due row.
+enum PerRowPromotion {
+    Promoted(String),
+    Cancelled(Box<JobRow>),
+    Skipped,
+}
+
 fn is_unique_violation(err: &sqlx::Error) -> bool {
     matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505"))
 }
@@ -1212,7 +1219,8 @@ impl QueueStoragePromoter {
             let mut skip = self.waiting_lanes(state);
             skip.extend(contended.iter().cloned());
             let batch_started = Instant::now();
-            let (outcome, cancelled) = self
+            let mut cancelled = Vec::new();
+            let outcome = self
                 .store
                 .promote_due_lanes_with_cancelled(
                     &self.pool,
@@ -1220,9 +1228,13 @@ impl QueueStoragePromoter {
                     PROMOTE_BATCH_SIZE,
                     Some(PROMOTE_LANE_LOCK_TIMEOUT),
                     &skip,
+                    &mut cancelled,
                 )
-                .await?;
+                .await;
+            // Lanes commit on their own, so record the rows of lanes that
+            // committed before a later lane failed.
             record_cancelled(&self.cancelled, cancelled);
+            let outcome = outcome?;
             self.metrics.record_promotion_batch(
                 state.as_str(),
                 outcome.promoted as u64,
@@ -1323,19 +1335,19 @@ async fn promote_waiting_lane(
 ) {
     for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
         let batch_started = Instant::now();
-        match store
+        let mut lane_cancelled = Vec::new();
+        let outcome = store
             .promote_due_lane_with_cancelled(
                 pool,
                 *state,
                 lane,
                 PROMOTE_BATCH_SIZE,
                 Some(PROMOTE_LANE_WAITER_LOCK_TIMEOUT),
+                &mut lane_cancelled,
             )
-            .await
-            .map(|(outcome, lane_cancelled)| {
-                record_cancelled(cancelled, lane_cancelled);
-                outcome
-            }) {
+            .await;
+        record_cancelled(cancelled, lane_cancelled);
+        match outcome {
             Ok(outcome) if !outcome.contended.is_empty() => {
                 metrics.record_promotion_lane_contention(
                     state.as_str(),
@@ -3553,6 +3565,9 @@ impl MaintenanceService {
     /// Promote scheduled jobs that are now due.
     #[tracing::instrument(skip(self, promoters), name = "maintenance.promote")]
     async fn promote_scheduled(&self, promoters: &LeaderPromoters) {
+        // Lane waiters commit cancellations between ticks, so deliver them
+        // whether or not anything is due now.
+        self.deliver_promotion_cancellations(promoters).await;
         // Skip the full pass when nothing is due. A row that becomes due or
         // visible after the probe is promoted on the next tick. A failed
         // probe runs the full pass.
@@ -3590,6 +3605,20 @@ impl MaintenanceService {
         {
             error!(error = %err, "Failed to promote retryable jobs");
         }
+        self.deliver_promotion_cancellations(promoters).await;
+    }
+
+    /// Emits the `Cancelled` event and rescue metric for every row a
+    /// queue-storage promoter, by a tick or a lane waiter, cancelled as a
+    /// duplicate since the last delivery.
+    async fn deliver_promotion_cancellations(&self, promoters: &LeaderPromoters) {
+        for promoter in [&promoters.primary, &promoters.standby]
+            .into_iter()
+            .flatten()
+        {
+            self.handle_duplicate_cancellations("promotion", &promoter.take_cancelled(), false)
+                .await;
+        }
     }
 
     async fn promote_due_state(
@@ -3624,27 +3653,13 @@ impl MaintenanceService {
                 // the flip.
                 if let Some(promoter) = &promoters.standby {
                     if self.active_standby_queue_storage().await.is_some() {
-                        let promoted = promoter.promote_due(state, &self.cancel).await;
-                        self.handle_duplicate_cancellations(
-                            "promotion",
-                            &promoter.take_cancelled(),
-                            false,
-                        )
-                        .await;
-                        promoted_total += promoted?;
+                        promoted_total += promoter.promote_due(state, &self.cancel).await?;
                     }
                 }
             }
             RuntimeStorage::QueueStorage(_) => {
                 if let Some(promoter) = &promoters.primary {
-                    let promoted = promoter.promote_due(state, &self.cancel).await;
-                    self.handle_duplicate_cancellations(
-                        "promotion",
-                        &promoter.take_cancelled(),
-                        false,
-                    )
-                    .await;
-                    promoted_total += promoted?;
+                    promoted_total += promoter.promote_due(state, &self.cancel).await?;
                 }
 
                 // #456: while a storage transition drains, due jobs can still
@@ -3796,9 +3811,10 @@ impl MaintenanceService {
         )
     }
 
-    /// Cancels the `state` row `$1` as a duplicate, writing `$2` to its
-    /// errors. The cancelled row drops its unique key when its mask claims
-    /// `cancelled`, so it never holds the key.
+    /// Cancels the due `state` row `$1` as a duplicate, writing `$2` to its
+    /// errors. The cancelled row keeps its unique key with `cancelled`
+    /// cleared from its mask, so it never holds the key and a later retry
+    /// still checks it.
     fn cancel_promoted_duplicate_sql(state: &'static str) -> String {
         format!(
             r#"
@@ -3806,6 +3822,7 @@ impl MaintenanceService {
                 DELETE FROM awa.scheduled_jobs
                 WHERE id = $1
                   AND state = '{state}'::awa.job_state
+                  AND run_at <= now()
                 RETURNING *
             )
             INSERT INTO awa.jobs_hot (
@@ -3837,14 +3854,8 @@ impl MaintenanceService {
                 )::jsonb,
                 metadata,
                 tags,
-                CASE
-                    WHEN awa.job_state_in_bitmask(unique_states, 'cancelled') THEN NULL
-                    ELSE unique_key
-                END,
-                CASE
-                    WHEN awa.job_state_in_bitmask(unique_states, 'cancelled') THEN NULL
-                    ELSE unique_states
-                END,
+                unique_key,
+                set_bit(unique_states, 6, 0),
                 NULL,
                 NULL,
                 NULL,
@@ -3880,43 +3891,17 @@ impl MaintenanceService {
         .fetch_all(&self.pool)
         .await?;
 
-        let promote_one = Self::promote_one_sql(state);
-        let cancel_one = Self::cancel_promoted_duplicate_sql(state);
         let mut promoted = 0usize;
         let mut queues = HashSet::new();
         let mut cancelled = Vec::new();
         for id in ids {
-            match sqlx::query_scalar::<_, String>(&promote_one)
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-            {
-                Ok(Some(queue)) => {
+            match self.promote_or_cancel_one(state, id).await {
+                Ok(PerRowPromotion::Promoted(queue)) => {
                     promoted += 1;
                     queues.insert(queue);
                 }
-                Ok(None) => {}
-                Err(err) if is_unique_violation(&err) => {
-                    let holder = self.unique_claim_holder_of_scheduled(id).await;
-                    warn!(
-                        job_id = id,
-                        claim_holder = ?holder,
-                        state,
-                        "Promotion conflicts with a unique claim held by another job; cancelling the duplicate"
-                    );
-                    match sqlx::query_as::<_, JobRow>(&cancel_one)
-                        .bind(id)
-                        .bind(PROMOTED_DUPLICATE_ERROR)
-                        .fetch_optional(&self.pool)
-                        .await
-                    {
-                        Ok(Some(row)) => cancelled.push(row),
-                        Ok(None) => {}
-                        Err(err) => {
-                            error!(job_id = id, error = %err, state, "Failed to cancel a duplicate due job");
-                        }
-                    }
-                }
+                Ok(PerRowPromotion::Cancelled(row)) => cancelled.push(*row),
+                Ok(PerRowPromotion::Skipped) => {}
                 Err(err) => {
                     error!(job_id = id, error = %err, state, "Per-row promotion failed");
                 }
@@ -3925,22 +3910,90 @@ impl MaintenanceService {
         Ok((promoted, queues, cancelled))
     }
 
-    /// The job id holding the unique claim for scheduled job `job_id`'s key,
-    /// for conflict logs.
-    async fn unique_claim_holder_of_scheduled(&self, job_id: i64) -> Option<i64> {
-        sqlx::query_scalar(
+    /// Promotes due `state` row `id`, or cancels it when its own unique key
+    /// is held by another job. One transaction locks the due row first and
+    /// keeps the lock until the promotion or cancellation commits, so a
+    /// concurrent change to the row (a postponed `run_at`, a cancel) either
+    /// lands before the lock, and the row is skipped, or waits and then finds
+    /// the row gone. The promotion runs in a savepoint so a conflict leaves
+    /// the lock in place for the cancellation.
+    async fn promote_or_cancel_one(
+        &self,
+        state: &'static str,
+        id: i64,
+    ) -> Result<PerRowPromotion, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let unique_key: Option<Option<Vec<u8>>> = sqlx::query_scalar(&format!(
             r#"
-            SELECT c.job_id
-            FROM awa.scheduled_jobs AS s
-            JOIN awa.job_unique_claims AS c ON c.unique_key = s.unique_key
-            WHERE s.id = $1 AND c.job_id <> s.id
-            "#,
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
+            SELECT unique_key
+            FROM awa.scheduled_jobs
+            WHERE id = $1
+              AND state = '{state}'::awa.job_state
+              AND run_at <= now()
+            FOR UPDATE SKIP LOCKED
+            "#
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(unique_key) = unique_key else {
+            return Ok(PerRowPromotion::Skipped);
+        };
+
+        let mut savepoint = sqlx::Connection::begin(&mut *tx).await?;
+        let conflict = match sqlx::query_scalar::<_, String>(&Self::promote_one_sql(state))
+            .bind(id)
+            .fetch_optional(&mut *savepoint)
+            .await
+        {
+            Ok(queue) => {
+                savepoint.commit().await?;
+                tx.commit().await?;
+                return Ok(queue.map_or(PerRowPromotion::Skipped, PerRowPromotion::Promoted));
+            }
+            Err(err) if is_unique_violation(&err) => err,
+            Err(err) => return Err(err),
+        };
+        savepoint.rollback().await?;
+        #[cfg(test)]
+        tests::per_row_conflict_hook(id).await;
+
+        // Cancel only when the conflict is this job's own unique claim: the
+        // claim index reported it and another job holds the row's key.
+        let constraint = match &conflict {
+            sqlx::Error::Database(db_err) => db_err.constraint().map(str::to_owned),
+            _ => None,
+        };
+        let holder: Option<i64> = match unique_key {
+            Some(key) if constraint.as_deref() == Some("idx_awa_jobs_unique") => {
+                sqlx::query_scalar(
+                    "SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1 AND job_id <> $2",
+                )
+                .bind(key)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            _ => None,
+        };
+        let Some(holder) = holder else {
+            return Err(conflict);
+        };
+        warn!(
+            job_id = id,
+            claim_holder = holder,
+            state,
+            "Promotion conflicts with a unique claim held by another job; cancelling the duplicate"
+        );
+        let row = sqlx::query_as::<_, JobRow>(&Self::cancel_promoted_duplicate_sql(state))
+            .bind(id)
+            .bind(PROMOTED_DUPLICATE_ERROR)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row.map_or(PerRowPromotion::Skipped, |row| {
+            PerRowPromotion::Cancelled(Box::new(row))
+        }))
     }
 
     async fn promote_due_batch(
@@ -5611,6 +5664,258 @@ mod tests {
                 (holder, "available".to_string())
             ]
         );
+    }
+
+    type ConflictHook = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    /// Pauses per-row canonical promotion of a registered job right after its
+    /// promotion fails with a unique conflict and before it is cancelled.
+    static PER_ROW_CONFLICT_HOOKS: std::sync::Mutex<Option<HashMap<i64, ConflictHook>>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) async fn per_row_conflict_hook(job_id: i64) {
+        let hook = PER_ROW_CONFLICT_HOOKS
+            .lock()
+            .expect("hook registry")
+            .as_mut()
+            .and_then(|hooks| hooks.remove(&job_id));
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
+    }
+
+    /// A due duplicate postponed between its promotion conflict and its
+    /// cancellation must not be cancelled at its new, future `run_at`. The
+    /// per-row promotion holds the due row's lock from before the conflict
+    /// until the cancellation commits, so the postponement waits on it and
+    /// then finds the row gone; it cannot land in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn canonical_per_row_promotion_does_not_cancel_a_row_postponed_after_its_conflict() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+
+        let queue = "canonical_promote_postponed";
+        let unique = Some(awa_model::UniqueOpts {
+            states: 1 << JobState::Available.bit_position(),
+            ..Default::default()
+        });
+        let job = |run_at| awa_model::InsertParams {
+            kind: "canonical_promote_postponed".to_string(),
+            args: serde_json::json!({ "n": 1 }),
+            opts: awa_model::InsertOpts {
+                queue: queue.to_string(),
+                run_at,
+                unique: unique.clone(),
+                ..Default::default()
+            },
+        };
+        let duplicate = awa_model::insert_many(
+            &pool,
+            &[job(Some(Utc::now() - chrono::Duration::seconds(60)))],
+        )
+        .await
+        .expect("insert duplicate")[0]
+            .id;
+        let holder = awa_model::insert_many(&pool, &[job(None)])
+            .await
+            .expect("insert holder")[0]
+            .id;
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        PER_ROW_CONFLICT_HOOKS
+            .lock()
+            .expect("hook registry")
+            .get_or_insert_with(HashMap::new)
+            .insert(duplicate, (reached_tx, resume_rx));
+
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::Canonical,
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        );
+        let promotion =
+            tokio::spawn(async move { service.promote_canonical_per_row("scheduled").await });
+        tokio::time::timeout(Duration::from_secs(10), reached_rx)
+            .await
+            .expect("promotion reaches the conflict")
+            .expect("hook fired");
+
+        // Postpone the row by an hour from another connection.
+        let postpone_pool = pool.clone();
+        let postpone = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE awa.scheduled_jobs SET run_at = now() + interval '1 hour' WHERE id = $1",
+            )
+            .bind(duplicate)
+            .execute(&postpone_pool)
+            .await
+            .expect("postpone")
+            .rows_affected()
+        });
+        // Wait until the postponement has committed or is waiting on a lock.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut postpone_waited = false;
+        while !postpone.is_finished() {
+            postpone_waited = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                    WHERE wait_event_type = 'Lock'
+                      AND query LIKE 'UPDATE awa.scheduled_jobs SET run_at%'
+                )
+                "#,
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("lock wait probe");
+            if postpone_waited {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "postponement neither committed nor waited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        resume_tx.send(()).expect("resume promotion");
+
+        let (promoted, _, cancelled) = promotion
+            .await
+            .expect("promotion task")
+            .expect("per-row promotion");
+        let postponed_rows = tokio::time::timeout(Duration::from_secs(10), postpone)
+            .await
+            .expect("postponement finishes once promotion commits")
+            .expect("postpone task");
+        let (state, run_at): (String, DateTime<Utc>) =
+            sqlx::query_as("SELECT state::text, run_at FROM awa.jobs WHERE id = $1")
+                .bind(duplicate)
+                .fetch_one(&pool)
+                .await
+                .expect("duplicate state");
+
+        assert!(
+            !(state == "cancelled" && postponed_rows == 1),
+            "a row postponed to {run_at} after its conflict was cancelled anyway"
+        );
+        // The lock held across the conflict makes the postponement wait, and
+        // the cancellation of the still-due row commits first.
+        assert!(postpone_waited, "the postponement waits on the row lock");
+        assert_eq!(postponed_rows, 0, "the postponement finds the row gone");
+        assert_eq!(state, "cancelled");
+        assert_eq!(promoted, 0);
+        assert_eq!(
+            cancelled.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![duplicate]
+        );
+        let holder_state: String =
+            sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
+                .bind(holder)
+                .fetch_one(&pool)
+                .await
+                .expect("holder state");
+        assert_eq!(holder_state, "available");
+    }
+
+    /// A lane waiter commits its cancellations between ticks. A later tick
+    /// that finds nothing due still delivers them: the `Cancelled` event
+    /// fires and the promoter's buffer is empty afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn promotion_tick_with_nothing_due_delivers_a_waiters_cancellations() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+        let store = Arc::new(QueueStorage::new(QueueStorageConfig::default()).expect("store"));
+        store.install(&pool).await.expect("queue storage install");
+
+        let kind = "promotion_waiter_drain";
+        let row = awa_model::insert_many(
+            &pool,
+            &[awa_model::InsertParams {
+                kind: kind.to_string(),
+                args: serde_json::json!({}),
+                opts: awa_model::InsertOpts {
+                    queue: "promotion_waiter_drain".to_string(),
+                    ..Default::default()
+                },
+            }],
+        )
+        .await
+        .expect("insert")
+        .remove(0);
+        let job_id = row.id;
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: crate::events::BoxedUntypedEventHandler = Arc::new(move |event| {
+            let events_tx = events_tx.clone();
+            Box::pin(async move {
+                if let crate::events::UntypedJobEvent::Cancelled { job, .. } = event {
+                    let _ = events_tx.send(job.id);
+                }
+            })
+        });
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::Canonical,
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::from([(kind.to_string(), vec![handler])])),
+        );
+        let promoters = LeaderPromoters {
+            primary: Some(QueueStoragePromoter::new(
+                pool.clone(),
+                store,
+                metrics_for_test(),
+            )),
+            standby: None,
+        };
+        // What a lane waiter does once its lane commits a cancellation.
+        record_cancelled(
+            &promoters.primary.as_ref().expect("primary").cancelled,
+            vec![row],
+        );
+        let due: bool = sqlx::query_scalar(&promoters.due_probe_sql())
+            .fetch_one(&pool)
+            .await
+            .expect("due probe");
+        assert!(!due, "nothing is due");
+
+        service.promote_scheduled(&promoters).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("the buffered cancellation is delivered")
+            .expect("event channel open");
+        assert_eq!(delivered, job_id);
+        assert!(promoters
+            .primary
+            .as_ref()
+            .expect("primary")
+            .take_cancelled()
+            .is_empty());
     }
 
     /// #456 mirror: a queue-storage-resolved maintenance leader must keep

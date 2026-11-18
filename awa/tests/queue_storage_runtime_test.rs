@@ -11565,22 +11565,63 @@ async fn promote_unique_conflict_case(unique_states: u8, schema: &str) {
         vec![holder_id]
     );
 
-    let duplicate_key: Option<Vec<u8>> = sqlx::query_scalar(&format!(
-        "SELECT unique_key FROM {}.done_entries WHERE job_id = $1",
-        store.schema()
-    ))
-    .bind(duplicate_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read cancelled row");
-    let claims_cancelled = unique_states & (1 << JobState::Cancelled.bit_position()) != 0;
-    assert_eq!(duplicate_key.is_none(), claims_cancelled);
+    // The cancelled row keeps its key, with `cancelled` cleared from its
+    // mask, so it holds no claim and a retry still checks the key.
+    let (duplicate_key, duplicate_states): (Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as(&format!(
+            "SELECT unique_key, unique_states::text FROM {}.done_entries WHERE job_id = $1",
+            store.schema()
+        ))
+        .bind(duplicate_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read cancelled row");
+    assert!(duplicate_key.is_some());
+    let expected_states = unique_states & !(1 << JobState::Cancelled.bit_position());
+    let expected_states: String = (0..8)
+        .map(|bit| {
+            if expected_states & (1 << bit) != 0 {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .collect();
+    assert_eq!(duplicate_states.as_deref(), Some(expected_states.as_str()));
 
     let again = store
         .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
         .await
         .expect("promote again");
     assert_eq!(again, Default::default());
+
+    // Retrying the duplicate while the holder owns the key conflicts.
+    let err = admin::retry(&pool, duplicate_id)
+        .await
+        .expect_err("retry while the holder owns the key must conflict");
+    assert!(matches!(err, AwaError::UniqueConflict { .. }), "{err:?}");
+    assert_eq!(
+        unique_claim_holders(&pool, holder_id, &store).await,
+        vec![holder_id]
+    );
+
+    // Once the holder completes and releases the key, the retry succeeds
+    // and takes the claim.
+    let completed: Vec<i64> = claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+        .await
+        .iter()
+        .map(|job| job.job.id)
+        .collect();
+    assert!(completed.contains(&holder_id), "{completed:?}");
+    let retried = admin::retry(&pool, duplicate_id)
+        .await
+        .expect("retry after the holder leaves")
+        .expect("retried row");
+    assert_eq!(retried.state, JobState::Available);
+    assert_eq!(
+        unique_claim_holders(&pool, duplicate_id, &store).await,
+        vec![duplicate_id]
+    );
 }
 
 /// A due row whose unique key another live job holds is cancelled as a
@@ -11595,8 +11636,9 @@ async fn test_queue_storage_promotion_cancels_a_unique_duplicate_and_promotes_it
     .await;
 }
 
-/// A duplicate whose mask also claims `cancelled` is cancelled without its
-/// unique key, so the cancelled row holds no claim.
+/// A duplicate whose mask also claims `cancelled` is cancelled with its key
+/// and `cancelled` cleared from its mask, so the cancelled row holds no claim
+/// and a retry of it still conflicts while the holder owns the key.
 #[tokio::test]
 async fn test_queue_storage_promotion_cancels_a_duplicate_whose_mask_claims_cancelled() {
     promote_unique_conflict_case(

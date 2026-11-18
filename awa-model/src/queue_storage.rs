@@ -1912,6 +1912,14 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
+    let mut bitmask = unique_states?.into_bytes();
+    if let Some(bit) = bitmask.get_mut(state.bit_position() as usize) {
+        *bit = b'0';
+    }
+    String::from_utf8(bitmask).ok()
+}
+
 fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
     if value.contains(',')
         || value.contains('"')
@@ -18019,13 +18027,21 @@ impl QueueStorage {
         lane_lock_timeout: Option<Duration>,
         skip: &[PromotionLane],
     ) -> Result<PromoteOutcome, AwaError> {
-        self.promote_due_lanes_with_cancelled(pool, state, batch_size, lane_lock_timeout, skip)
-            .await
-            .map(|(outcome, _)| outcome)
+        self.promote_due_lanes_with_cancelled(
+            pool,
+            state,
+            batch_size,
+            lane_lock_timeout,
+            skip,
+            &mut Vec::new(),
+        )
+        .await
     }
 
-    /// [`Self::promote_due_lanes`], also returning the rows it cancelled as
-    /// duplicates.
+    /// [`Self::promote_due_lanes`], also appending to `cancelled` the rows it
+    /// cancelled as duplicates. Each lane commits on its own, so the rows of
+    /// lanes that committed are appended even when a later lane returns an
+    /// error.
     #[doc(hidden)]
     pub async fn promote_due_lanes_with_cancelled(
         &self,
@@ -18034,7 +18050,8 @@ impl QueueStorage {
         batch_size: i64,
         lane_lock_timeout: Option<Duration>,
         skip: &[PromotionLane],
-    ) -> Result<(PromoteOutcome, Vec<JobRow>), AwaError> {
+        cancelled: &mut Vec<JobRow>,
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
             return Ok(Default::default());
         }
@@ -18084,7 +18101,6 @@ impl QueueStorage {
                 .push(job_id);
         }
         let mut promoted_queues = BTreeSet::new();
-        let mut cancelled = Vec::new();
         for (lane, job_ids) in lanes {
             let promoted = self
                 .promote_lane(
@@ -18111,7 +18127,7 @@ impl QueueStorage {
             }
         }
         self.notify_promoted_queues(pool, promoted_queues).await;
-        Ok((outcome, cancelled))
+        Ok(outcome)
     }
 
     /// Promote up to `batch_size` due `state` rows of one lane, oldest
@@ -18126,13 +18142,19 @@ impl QueueStorage {
         batch_size: i64,
         lane_lock_timeout: Option<Duration>,
     ) -> Result<PromoteOutcome, AwaError> {
-        self.promote_due_lane_with_cancelled(pool, state, lane, batch_size, lane_lock_timeout)
-            .await
-            .map(|(outcome, _)| outcome)
+        self.promote_due_lane_with_cancelled(
+            pool,
+            state,
+            lane,
+            batch_size,
+            lane_lock_timeout,
+            &mut Vec::new(),
+        )
+        .await
     }
 
-    /// [`Self::promote_due_lane`], also returning the rows it cancelled as
-    /// duplicates.
+    /// [`Self::promote_due_lane`], also appending to `cancelled` the rows it
+    /// cancelled as duplicates.
     #[doc(hidden)]
     pub async fn promote_due_lane_with_cancelled(
         &self,
@@ -18141,7 +18163,8 @@ impl QueueStorage {
         lane: &PromotionLane,
         batch_size: i64,
         lane_lock_timeout: Option<Duration>,
-    ) -> Result<(PromoteOutcome, Vec<JobRow>), AwaError> {
+        cancelled: &mut Vec<JobRow>,
+    ) -> Result<PromoteOutcome, AwaError> {
         if !matches!(state, JobState::Scheduled | JobState::Retryable) || batch_size <= 0 {
             return Ok(Default::default());
         }
@@ -18162,21 +18185,19 @@ impl QueueStorage {
                 .await;
         }
         Ok(match promoted {
-            Some(promoted) => (
+            Some(promoted) => {
+                let selected = promoted.promoted + promoted.cancelled.len();
+                cancelled.extend(promoted.cancelled);
                 PromoteOutcome {
                     promoted: promoted.promoted,
-                    selected: promoted.promoted + promoted.cancelled.len(),
+                    selected,
                     contended: Vec::new(),
-                },
-                promoted.cancelled,
-            ),
-            None => (
-                PromoteOutcome {
-                    contended: vec![lane.clone()],
-                    ..PromoteOutcome::default()
-                },
-                Vec::new(),
-            ),
+                }
+            }
+            None => PromoteOutcome {
+                contended: vec![lane.clone()],
+                ..PromoteOutcome::default()
+            },
         })
     }
 
@@ -18331,8 +18352,8 @@ impl QueueStorage {
     }
 
     /// Cancel due rows whose promotion lost their unique key to another job.
-    /// The cancelled row drops its unique key when its mask claims
-    /// `cancelled`, so it never holds the key.
+    /// The cancelled row keeps its unique key with `cancelled` cleared from
+    /// its mask, so it never holds the key and a later retry still checks it.
     async fn cancel_promoted_duplicates_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -18347,8 +18368,6 @@ impl QueueStorage {
             .map(|(row, due_run_at)| {
                 let mut payload = RuntimePayload::from_json(row.payload)?;
                 payload.push_error(lifecycle_error(PROMOTED_DUPLICATE_ERROR, row.attempt, true));
-                let claims_cancelled =
-                    unique_state_claims(row.unique_states.as_deref(), JobState::Cancelled);
                 Ok(DoneJobRow {
                     ready_slot,
                     ready_generation,
@@ -18367,16 +18386,10 @@ impl QueueStorage {
                     attempted_at: row.attempted_at,
                     finalized_at,
                     created_at: row.created_at,
-                    unique_key: if claims_cancelled {
-                        None
-                    } else {
-                        row.unique_key
-                    },
-                    unique_states: if claims_cancelled {
-                        None
-                    } else {
-                        row.unique_states
-                    },
+                    // Keep the key so a retry still checks it; clearing
+                    // `cancelled` keeps the cancelled row from claiming it.
+                    unique_key: row.unique_key,
+                    unique_states: unique_states_without(row.unique_states, JobState::Cancelled),
                     payload: payload.into_json(),
                 })
             })
