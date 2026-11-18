@@ -282,6 +282,37 @@ UniqueBatchEnqueuePlan(p) ==
        Step(LaneResource(StripeA, p), ModeExclusive),
        Step(LaneResource(StripeB, p), ModeExclusive) >>
 
+\* Key-order rule: within one transaction every change to
+\* `awa.job_unique_claims`, claim or release, happens in bytewise key order,
+\* and all of them happen before any lane lock. A claim and a release of a
+\* key both hold the key's row exclusively until commit, so the model does
+\* not tell them apart.
+\*
+\* A transaction that releases or claims several jobs' keys in one pass
+\* (`QueueStorage::apply_unique_claim_changes_tx`), then may ensure a lane:
+\*   bulk cancel (`cancel_jobs_by_ids`, `cancel_job`, `cancel_job_in_tx`:
+\*     one pass over every cancelled job's change, then `ensure_lane` for
+\*     cancelled deferred jobs)
+\*   drain chunks (`cancel_deferred_chunk_tx` then `ensure_lane`;
+\*     `cancel_available_chunk_tx`)
+\*   batch completion (`complete_claimed_batch`,
+\*     `complete_runtime_batch_slow_in_tx` across its receipt and
+\*     materialized groups, `complete_job_batch_by_id_in_tx`)
+\*   claim (`claim_runtime_batch_with_aging_physical`), rescue
+\*     (`settle_rescued_attempts_tx` across every batch, retry, failure and
+\*     DLQ outcome), `discard_failed_by_kind` across done and DLQ rows,
+\*     `bulk_move_failed_to_dlq`, and every single-row `insert_*_rows_tx`
+UniqueClaimPassPlan(q, p) ==
+    << Step(UniqueClaimResource(1), ModeExclusive),
+       Step(UniqueClaimResource(2), ModeExclusive),
+       Step(LaneResource(q, p), ModeExclusive) >>
+
+\* Through 0.6.18 those paths changed claims in row order, one pass per
+\* group of rows. Kept only as a negative regression harness.
+OldRowOrderClaimPassPlan ==
+    << Step(UniqueClaimResource(2), ModeExclusive),
+       Step(UniqueClaimResource(1), ModeExclusive) >>
+
 \* Re-enqueue through 0.6.18 reserved the lane before syncing the row's
 \* claim, the reverse of a fresh enqueue. Kept only as a negative
 \* regression harness.
@@ -774,6 +805,16 @@ StartUniqueBatchEnqueue(t, p) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartUniqueClaimPass(t, q, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = UniqueClaimPassPlan(q, p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 StartComplete(t, claimSlot, readySlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -983,6 +1024,8 @@ Next ==
     \/ \E t \in TxIds, u \in UniqueKeys, q \in Queues, p \in Priorities :
           StartUniqueEnqueue(t, u, q, p)
     \/ \E t \in TxIds, p \in Priorities : StartUniqueBatchEnqueue(t, p)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities :
+          StartUniqueClaimPass(t, q, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -1159,6 +1202,31 @@ NextOldReEnqueueUniqueDeadlockDemo ==
 
 SpecOldReEnqueueUniqueDeadlockDemo ==
     ConfigOK /\ Init /\ [][NextOldReEnqueueUniqueDeadlockDemo]_vars
+
+\* ---- Historical row-order claim-pass deadlock harness ----
+\*
+\* A 0.6.18 bulk cancel releases key 2 and waits on key 1, whose row a
+\* fresh enqueue of both keys holds; the enqueue then waits on the
+\* uncommitted release of key 2. TLC is expected to flag NoDeadlock.
+
+StartOldRowOrderClaimPass(t) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = OldRowOrderClaimPassPlan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+NextOldRowOrderClaimPassDeadlockDemo ==
+    \/ \E t \in TxIds, p \in Priorities : StartUniqueBatchEnqueue(t, p)
+    \/ \E t \in TxIds : StartOldRowOrderClaimPass(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldRowOrderClaimPassDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldRowOrderClaimPassDeadlockDemo]_vars
 
 \* ---- Historical claim-prune slot-row deadlock harness ----
 \*

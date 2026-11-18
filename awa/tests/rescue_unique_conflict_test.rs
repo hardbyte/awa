@@ -234,8 +234,8 @@ async fn test_rescue_survives_unique_claim_conflict() {
 
 /// The queue-storage engine has the same wedge shape through a different
 /// door: rescue re-inserts each rescued job as a `retryable` deferred row
-/// inside one batch transaction, and `sync_unique_claim` refuses the
-/// re-entry while a duplicate holds the claim. This test strands the jobs
+/// inside one batch transaction, and the claim upsert refuses the re-entry
+/// while a duplicate holds the claim. This test strands the jobs
 /// live (parked handlers with a heartbeat-staleness shorter than the
 /// heartbeat interval) instead of via raw SQL, so it exercises the real
 /// claim/lease plane end to end.
