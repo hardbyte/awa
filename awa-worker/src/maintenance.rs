@@ -4447,7 +4447,14 @@ impl MaintenanceService {
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
                     WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-                      AND queue != ALL($3::text[])
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest($3::text[]) AS overridden(queue)
+                          WHERE dlq_entries.queue = overridden.queue
+                             OR (left(dlq_entries.queue, char_length(overridden.queue) + 1)
+                                     = overridden.queue || '#'
+                                 AND substr(dlq_entries.queue, char_length(overridden.queue) + 2)
+                                     ~ '^[0-9]+$')
+                      )
                     LIMIT $2
                 )
                 "#
@@ -4479,7 +4486,9 @@ impl MaintenanceService {
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
-                    WHERE queue = $3
+                    WHERE (queue = $3
+                           OR (left(queue, char_length($3) + 1) = $3 || '#'
+                               AND substr(queue, char_length($3) + 2) ~ '^[0-9]+$'))
                       AND dlq_at < now() - make_interval(secs => $1::bigint)
                     LIMIT $2
                 )

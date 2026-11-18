@@ -163,12 +163,23 @@ impl DlqPolicy {
         }
     }
 
+    /// Whether `queue` routes exhausted jobs to the DLQ. A queue-storage
+    /// stripe `q#N` takes the override of its logical queue `q` unless it has
+    /// one of its own.
     pub fn enabled_for(&self, queue: &str) -> bool {
         self.overrides
             .get(queue)
+            .or_else(|| stripe_logical_queue(queue).and_then(|logical| self.overrides.get(logical)))
             .copied()
             .unwrap_or(self.enabled_default)
     }
+}
+
+/// The logical queue of a queue-storage stripe name `q#N`, if `queue` is one.
+fn stripe_logical_queue(queue: &str) -> Option<&str> {
+    let (logical, stripe) = queue.rsplit_once('#')?;
+    (!logical.is_empty() && !stripe.is_empty() && stripe.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(logical)
 }
 
 /// Wrapper to turn a Display string into a std::error::Error for retryable_msg.
@@ -5080,5 +5091,26 @@ false,
                     && *delay <= Duration::from_millis(ceiling_ms)
             }));
         }
+    }
+
+    #[test]
+    fn dlq_policy_applies_a_logical_queue_override_to_its_stripes() {
+        let policy = DlqPolicy::new(
+            false,
+            HashMap::from([
+                ("orders".to_string(), true),
+                ("orders#1".to_string(), false),
+            ]),
+        );
+        assert!(policy.enabled_for("orders"));
+        assert!(policy.enabled_for("orders#0"));
+        assert!(policy.enabled_for("orders#12"));
+        assert!(
+            !policy.enabled_for("orders#1"),
+            "a stripe's own override wins"
+        );
+        assert!(!policy.enabled_for("orders#x"));
+        assert!(!policy.enabled_for("orders#"));
+        assert!(!policy.enabled_for("other#0"));
     }
 }
