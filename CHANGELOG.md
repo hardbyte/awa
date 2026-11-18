@@ -2,6 +2,12 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **A snooze or retry no longer leaves a unique job running when a duplicate holds its unique claim (#807).** With a `UniqueOpts.states` mask that leaves out `running`, an identical job can be enqueued while the first one runs. If the first job then returned `Snooze` or `RetryAfter`, or failed with a retryable error, the worker logged `Failed to complete job` with `unique conflict` and the attempt stayed `running` until rescue, which then cancelled it or ran it again. The attempt is now finalized at once as `cancelled`, with an error entry `snoozed as duplicate` or `retried as duplicate`; the worker logs a warning, no `Retried` event or follow-up job is emitted, and the newer job keeps the claim. This applies to queue storage and canonical storage, in Rust and Python workers.
+
 ## [0.6.18] — 2026-11-18
 
 Recommended for everyone on 0.6.17 using queue storage, and especially if you run more than one queue stripe, publish the awa schema for logical replication, or see retry storms. Jobs inserted through the compatibility path into a striped queue were never claimed; that is fixed. An idle runtime now costs the database far less: in a comparison against 0.6.17 on PostgreSQL 18, idle transactions fell from 60 to 26 a second and idle WAL by about 60%, and with 200 idle queues from about 670 to 125 transactions a second. A retry storm no longer floods the connection pool, completing 230 to 300 jobs a second where 0.6.17 completed 90 to 150. Moving, reprioritising or cancelling the jobs of a stuck lane now lets the queue ring reclaim storage again. Saturation throughput and claim latency match or improve on 0.6.17. One new schema patch takes brief table locks when `awa migrate` applies it; see the [upgrade guide](docs/upgrade-0.6.17-to-0.6.18.md).

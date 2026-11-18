@@ -1375,6 +1375,13 @@ async fn complete_job_canonical(
                 progress_snapshot.as_ref(),
             )
             .await?;
+            if matches!(outcome, RescheduleOutcome::CancelledDuplicate { .. }) {
+                warn!(
+                    job_id = job.id,
+                    "Unique claim held by a newer job; attempt cancelled as duplicate"
+                );
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
             let (RescheduleOutcome::Rescheduled {
                 job_id,
                 run_at,
@@ -1438,10 +1445,14 @@ async fn complete_job_canonical(
                 progress_snapshot.as_ref(),
             )
             .await?;
-            if matches!(
-                outcome,
-                RescheduleOutcome::Stale | RescheduleOutcome::CancelledDuplicate { .. }
-            ) {
+            if matches!(outcome, RescheduleOutcome::CancelledDuplicate { .. }) {
+                warn!(
+                    job_id = job.id,
+                    "Unique claim held by a newer job; attempt cancelled as duplicate"
+                );
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
+            if matches!(outcome, RescheduleOutcome::Stale) {
                 warn!(
                     job_id = job.id,
                     "Job already rescued/cancelled, snooze ignored"
@@ -1864,6 +1875,13 @@ async fn complete_job_canonical(
                     progress_snapshot.as_ref(),
                 )
                 .await?;
+                if matches!(outcome, RescheduleOutcome::CancelledDuplicate { .. }) {
+                    warn!(
+                        job_id = job.id,
+                        "Unique claim held by a newer job; attempt cancelled as duplicate"
+                    );
+                    return Ok(CompletionOutcome::IgnoredStale);
+                }
                 let (RescheduleOutcome::Rescheduled {
                     job_id,
                     run_at,
@@ -2148,6 +2166,13 @@ async fn complete_job_queue_storage(
                         );
                         Ok(CompletionOutcome::IgnoredStale)
                     }
+                    Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                        warn!(
+                            job_id = job.id,
+                            "Unique claim held by a newer job; attempt cancelled as duplicate"
+                        );
+                        Ok(CompletionOutcome::IgnoredStale)
+                    }
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Retried {
@@ -2184,6 +2209,13 @@ async fn complete_job_queue_storage(
                 );
                 return Ok(CompletionOutcome::IgnoredStale);
             };
+            if updated_job.state == JobState::Cancelled {
+                warn!(
+                    job_id = job.id,
+                    "Unique claim held by a newer job; attempt cancelled as duplicate"
+                );
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
             if needs_event {
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Retried {
@@ -2219,10 +2251,17 @@ async fn complete_job_queue_storage(
                     progress_snapshot.clone(),
                 )
                 .await?;
-            if updated.is_none() {
+            let Some(updated) = updated else {
                 warn!(
                     job_id = job.id,
                     "Job already rescued/cancelled, snooze ignored"
+                );
+                return Ok(CompletionOutcome::IgnoredStale);
+            };
+            if updated.state == JobState::Cancelled {
+                warn!(
+                    job_id = job.id,
+                    "Unique claim held by a newer job; attempt cancelled as duplicate"
                 );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
@@ -2584,6 +2623,13 @@ async fn complete_job_queue_storage(
                             );
                             Ok(CompletionOutcome::IgnoredStale)
                         }
+                        Some(updated_job) if updated_job.state == JobState::Cancelled => {
+                            warn!(
+                                job_id = job.id,
+                                "Unique claim held by a newer job; attempt cancelled as duplicate"
+                            );
+                            Ok(CompletionOutcome::IgnoredStale)
+                        }
                         Some(updated_job) => {
                             let event = if needs_event {
                                 Some(UntypedJobEvent::Retried {
@@ -2620,6 +2666,13 @@ async fn complete_job_queue_storage(
                     );
                     return Ok(CompletionOutcome::IgnoredStale);
                 };
+                if updated_job.state == JobState::Cancelled {
+                    warn!(
+                        job_id = job.id,
+                        "Unique claim held by a newer job; attempt cancelled as duplicate"
+                    );
+                    return Ok(CompletionOutcome::IgnoredStale);
+                }
                 if needs_event {
                     Ok(CompletionOutcome::Applied {
                         event: Some(UntypedJobEvent::Retried {
@@ -2762,6 +2815,10 @@ async fn retry_after_queue_storage_with_followups(
         tx.rollback().await?;
         return Ok(None);
     };
+    if updated_job.state == JobState::Cancelled {
+        tx.commit().await?;
+        return Ok(Some(updated_job));
+    }
     // Mirror the canonical `RetryAfter` event: empty error string.
     let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
         error: String::new(),
@@ -2793,6 +2850,10 @@ async fn retry_backoff_queue_storage_with_followups(
         tx.rollback().await?;
         return Ok(None);
     };
+    if updated_job.state == JobState::Cancelled {
+        tx.commit().await?;
+        return Ok(Some(updated_job));
+    }
     let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
         error: error_msg.to_string(),
         attempt: job.attempt,

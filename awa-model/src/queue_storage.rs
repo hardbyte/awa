@@ -29,6 +29,10 @@ const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
+pub(crate) const SNOOZED_DUPLICATE_ERROR: &str =
+    "snoozed as duplicate: unique claim held by a newer job";
+pub(crate) const RETRIED_DUPLICATE_ERROR: &str =
+    "retried as duplicate: unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
@@ -16062,9 +16066,10 @@ impl QueueStorage {
             Some(now),
             payload,
         );
-        self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(moved.state))
+        let row = self
+            .insert_rescued_deferred_or_cancel_tx(tx, moved, deferred, RETRIED_DUPLICATE_ERROR)
             .await?;
-        Ok(Some(deferred.into_job_row()?))
+        Ok(Some(row))
     }
 
     pub async fn snooze(
@@ -16095,10 +16100,11 @@ impl QueueStorage {
             payload,
         );
         deferred.attempt = deferred.attempt.saturating_sub(1);
-        self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
+        let row = self
+            .insert_rescued_deferred_or_cancel_tx(&mut tx, moved, deferred, SNOOZED_DUPLICATE_ERROR)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(Some(deferred.into_job_row()?))
+        Ok(Some(row))
     }
 
     /// Insert a canonical attempt's transition-time deferred successor,
@@ -16399,12 +16405,12 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
-    /// Rescue-path fallback for unique-claim conflicts: insert the rescued
-    /// attempt's deferred successor, degrading to a cancelled terminal row
-    /// when the job's unique claim is held by a newer duplicate — the claim
-    /// holder wins, and one poisoned row must not abort the whole batched
-    /// rescue transaction. The insert attempt runs inside a savepoint so the
-    /// conflict leaves the outer transaction usable.
+    /// Insert a rescued or finalized attempt's deferred successor,
+    /// degrading to a cancelled terminal row when the job's unique claim is
+    /// held by a newer duplicate — the claim holder wins, and one poisoned
+    /// row must not abort the whole batched rescue transaction. The insert
+    /// attempt runs inside a savepoint so the conflict leaves the outer
+    /// transaction usable.
     async fn insert_rescued_deferred_or_cancel_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -16413,6 +16419,11 @@ impl QueueStorage {
         duplicate_error: &str,
     ) -> Result<JobRow, AwaError> {
         let old_state = row.state;
+        if deferred.unique_key.is_none() {
+            self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(old_state))
+                .await?;
+            return deferred.into_job_row();
+        }
         {
             let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
             match self
@@ -16495,13 +16506,14 @@ impl QueueStorage {
             .await
     }
 
-    /// Write the cancelled terminal row for a rescue that lost its unique
-    /// claim to a newer duplicate. `cancelled` normally sits outside the
-    /// claiming mask so the insert is conflict-free; a mask that claims
-    /// `cancelled` as well conflicts again, and then the row is written with
-    /// its unique key stripped — the attempt held no claim (that is what
-    /// made it conflict), so there is nothing to release, and losing the key
-    /// on this terminal row beats aborting rescue for the whole cluster.
+    /// Write the cancelled terminal row for a rescue or finalize that lost
+    /// its unique claim to a newer duplicate. `cancelled` normally sits
+    /// outside the claiming mask so the insert is conflict-free; a mask that
+    /// claims `cancelled` as well conflicts again, and then the row is
+    /// written with its unique key stripped — the attempt held no claim
+    /// (that is what made it conflict), so there is nothing to release, and
+    /// losing the key on this terminal row beats aborting rescue for the
+    /// whole cluster.
     async fn cancel_rescued_duplicate_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -17136,9 +17148,10 @@ impl QueueStorage {
             Some(Utc::now()),
             payload.into_json(),
         );
-        self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(moved.state))
+        let row = self
+            .insert_rescued_deferred_or_cancel_tx(tx, moved, deferred, RETRIED_DUPLICATE_ERROR)
             .await?;
-        Ok(Some(deferred.into_job_row()?))
+        Ok(Some(row))
     }
 
     /// Rescue attempts whose heartbeat went stale. Exhausted attempts fail
