@@ -26,6 +26,74 @@ pub struct Outcome {
     pub elapsed_seconds: f64,
     pub crash_excerpts: Vec<String>,
     pub log_tail: Option<String>,
+    /// The in-process maintenance metrics, or why there are none.
+    pub maintenance: Result<super::maintenance_metrics::Summary, String>,
+}
+
+fn counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "none recorded".into();
+    }
+    counts
+        .iter()
+        .map(|(key, count)| format!("{key} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_maintenance(
+    out: &mut String,
+    maintenance: &Result<super::maintenance_metrics::Summary, String>,
+) {
+    let _ = writeln!(out, "## Maintenance");
+    match maintenance {
+        Ok(summary) => {
+            let _ = writeln!(
+                out,
+                "- prune attempts: {} ([maintenance-metrics.jsonl](maintenance-metrics.jsonl))",
+                counts(&summary.prune_attempts)
+            );
+            let _ = writeln!(
+                out,
+                "- rotate attempts: {}",
+                counts(&summary.rotate_attempts)
+            );
+            let generations = summary
+                .ring_generation
+                .iter()
+                .map(|(ring, (first, last))| format!("{ring} {first} to {last}"))
+                .collect::<Vec<_>>();
+            let _ = writeln!(
+                out,
+                "- ring generation: {}",
+                if generations.is_empty() {
+                    "none recorded".into()
+                } else {
+                    generations.join(", ")
+                }
+            );
+            let _ = match summary.oldest_pinned_ready_age_seconds {
+                Some(age) => writeln!(
+                    out,
+                    "- queue ring pinned by a ready lane: {} lane(s), oldest {age:.0} s; {} still pinning at the last export",
+                    summary.pinning_lanes, summary.pinning_lanes_at_end
+                ),
+                None => writeln!(out, "- queue ring pinned by a ready lane: never"),
+            };
+            let _ = writeln!(
+                out,
+                "- claim cursor advances by prune: {}",
+                summary
+                    .claim_cursor_advances
+                    .as_ref()
+                    .map_or("not recorded".into(), counts)
+            );
+        }
+        Err(reason) => {
+            let _ = writeln!(out, "- not captured: {reason}");
+        }
+    }
+    let _ = writeln!(out);
 }
 
 pub fn render(shared: &Shared, outcome: &Outcome) -> String {
@@ -168,6 +236,8 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     }
     let _ = writeln!(out);
 
+    render_maintenance(&mut out, &outcome.maintenance);
+
     let findings = shared.findings.lock().expect("findings");
     let _ = writeln!(out, "## Findings, not fatal ({})", findings.len());
     for finding in findings.iter() {
@@ -251,6 +321,10 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "abandon": shared.abandon.to_json(),
         "run": { "counters": shared.run.counters(), "samples": shared.run.summaries() },
         "memory": shared.memory.verdict(),
+        "maintenance": match &outcome.maintenance {
+            Ok(summary) => json!(summary),
+            Err(reason) => json!({ "not_captured": reason }),
+        },
         "violations": violations,
         "findings": shared.findings.lock().expect("findings").clone(),
         "timeline": timeline,

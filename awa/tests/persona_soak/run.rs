@@ -269,20 +269,21 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
     }
     super::gate_metrics::reconcile(&shared);
+    let maintenance = match &maintenance_metrics {
+        Some(capture) => capture
+            .write(&shared.config.report_dir)
+            .map_err(|error| format!("could not write the maintenance metrics: {error}")),
+        None => Err("captured by the OTLP collector, not in process".to_string()),
+    };
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
         crash_excerpts: excerpts,
         log_tail,
+        maintenance,
     };
     if let Err(error) = report::write(&shared, &outcome) {
         eprintln!("could not write the report: {error}");
-    }
-    if let Some(Err(error)) = maintenance_metrics
-        .as_ref()
-        .map(|capture| capture.write(&shared.config.report_dir))
-    {
-        eprintln!("could not write the maintenance metrics: {error}");
     }
     oracle_pool.close().await;
     Ok(shared)
