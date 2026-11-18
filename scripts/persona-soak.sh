@@ -42,6 +42,14 @@
 #                             halfway through the load, hold back queue-storage completions for this
 #                             many seconds while claims continue (default 0: off); resident memory
 #                             may rise by at most the given MiB over the stall (default 128)
+#   AWA_SOAK_IDLE_SECONDS     idle phase after the run quiesced, with the runtimes up and no load
+#                             (default 90); the idle transaction and WAL ceilings apply to it, and
+#                             the per-backend memory check keeps sampling through it
+#   AWA_SOAK_PG_MEMORY_*, AWA_SOAK_ADMIN_*, AWA_SOAK_RING_*, AWA_SOAK_PIN*_SECONDS, ...
+#                             thresholds of the resource, maintenance-progress, admin-latency and
+#                             drain checks; see the persona soak section of docs/test-plan.md.
+#                             Backend memory is read inside each run's container, which this
+#                             script names in AWA_SOAK_PG_CONTAINER
 #   SOAK_RESULTS_DIR          output directory (default ./soak-results/<timestamp>)
 #   SOAK_BASE_PORT            first host port; engines use consecutive ports (default 15471)
 #   SOAK_MAX_CONNECTIONS      server max_connections (default 400)

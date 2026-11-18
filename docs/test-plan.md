@@ -371,10 +371,46 @@ The oracle checks, while the load runs and again after it stops:
 - a transaction the Python application rolled back that left a job in the store, and database sessions left stranded by the Python `migrate()` path
 - an admin-server query that outlives its statement timeout, and sessions still running a query after every UI client has stopped
 - a server crash: `pg_postmaster_start_time()` changing, or `terminated by signal`, `TRAP:`, `server process (PID` and similar lines in the Postgres log
+- Postgres resources, sampled every `AWA_SOAK_RESOURCE_SAMPLE_SECONDS` through the load and the idle phase: a pooled runtime backend whose private memory (`RssAnon`) keeps growing after the warm-up (`pg_backend_memory_growth`, `pg_backend_memory_growth_total`), a runtime fleet holding more backends than its pools plus its listener connections in two consecutive samples outside a disruption (`connection_budget_exceeded`), more named prepared statements on a runtime connection than the bound (`prepared_statements_unbounded`), and transactions or WAL per second over a ceiling while the workload is idle (`idle_transactions`, `idle_wal`)
+- maintenance progress, from the captured maintenance metrics: a ring whose generation stands still while rotation is skipped busy and nothing explains it (`ring_generation_stalled`), prune `blocked` rising with nothing `pruned` (`prune_starved`, the #721 signature), a ready lane pinning the queue ring past a bound with no declared intent and no claim progress on its queue (`unexplained_ring_pin`), and a pin that outlives an operator cancel, move, reprioritise or drain on its lane by more than a bound (`pin_not_released`)
+- admin read latency: p99 of `get_job`, `find_jobs`, `queue_overview` and the state counts, through the library (the operator persona) and over HTTP (the UI personas), above its budget (`admin_latency_budget`)
+- drain semantics, on the operator's drained queue: a job committed before a drain started that had not begun to run and is still available or deferred once it returns, including a scheduled job promoted while it ran (`drain_left_job`), and a job whose insert began after the drain started that it cancelled (`drain_cancelled_new_job`)
 
 Slow or failing admin endpoints, latency that grows with retained history or backlog, and admin queries cancelled by the statement timeout are reported as non-fatal findings in the report, next to the violations.
 
 Terminal rows are pruned by ring rotation within seconds, so the oracle keeps a client-side ledger (job ids per persona, executions per job, lifecycle events, operator actions) and reconciles it with the database. Time-based checks are widened while a chaos action is recovering.
+
+### Declared intent
+
+A persona that puts the system in a state on purpose declares it, and the checks allow it. `Shared::declare(queue, intent, detail)` returns a guard; the state holds until the guard drops, or for the rest of the run after `guard.keep()`. `queue` is a logical queue name and covers its stripes; `None` covers every queue and ring. `Shared::chaos_window` records a run-wide `Disruption` the same way.
+
+| `Intent` | Declare it when | The checks allow |
+| --- | --- | --- |
+| `Paused` | a queue is paused on purpose, or held so a backlog builds | the stall check skips the queue, a ready lane of the queue pinning the queue ring, the queue ring's generation standing still |
+| `Unserved` | no runtime serves a queue on purpose | as for `Paused` |
+| `OperatorOp("cancel" \| "move_queue" \| "set_priority" \| "drain" \| ...)` | an operator operation runs on a queue's lanes | as for `Paused` while it runs; `pin_not_released` measures from its end, or from the end of a pause overlapping it |
+| `HoldsLocks` | a session holds locks on awa's tables on purpose (the completion stall declares it) | every ring standing still, and prune `blocked` with nothing pruned |
+| `Disruption` | a kill, restart, terminated connection or completion stall (`Shared::chaos_window` records it) | a fleet over its connection budget while runtimes restart; admin latency samples taken during it are judged and counted apart. It does not excuse the maintenance-progress checks: chaos runs through most of a default soak, and a kill should not keep a ring from moving for minutes |
+
+Each allowance lasts `AWA_SOAK_PIN_RELEASE_SECONDS` past the end of the state. A queue that pins the queue ring while its claim cursor keeps moving counts as progressing, not stuck. The report's Declared intent section counts the spans by kind and `report.json` lists them.
+
+### Resource and maintenance checks: minimum run length
+
+| Check | Judged from | Minimum run |
+| --- | --- | --- |
+| private memory per pooled backend | samples taken `AWA_SOAK_PG_MEMORY_WARMUP_SECONDS` (300) after both the start of the load and the backend's first sample, so a restarted runtime's backends get their own warm-up, for backends observed over at least `AWA_SOAK_PG_MEMORY_MIN_WINDOW_SECONDS` (600); growth is the median of a backend's last three samples less the median of its first three | load plus idle phase of 900 s; shorter runs report it as not evaluated |
+| backends per fleet | every sample | none |
+| prepared statements per runtime connection | every sample | none |
+| idle transactions and WAL | the idle phase after `AWA_SOAK_IDLE_WARMUP_SECONDS` (30), leaving out intervals with an autovacuum worker running; at least 30 s must remain | `AWA_SOAK_IDLE_SECONDS` of at least 60 (default 90); skipped when the run did not quiesce |
+| ring generation | stretches of `AWA_SOAK_RING_STALL_SECONDS` (180) | 180 s |
+| prune starvation | windows of `AWA_SOAK_PRUNE_BLOCKED_SECONDS` (120) | 120 s |
+| ring pin age | exports with a pin older than `AWA_SOAK_PINNED_AGE_SECONDS` (120) | 120 s |
+| pin release after an operator operation | `AWA_SOAK_PIN_RELEASE_SECONDS` (60) after the operation and any pause around it | an operation on a pinning lane; the operator holds every third batch operation's queue for `AWA_SOAK_PIN_HOLD_SECONDS` (50) so its lane can reach the oldest slot |
+| admin latency | samples after `AWA_SOAK_ADMIN_WARMUP_SECONDS` (60), from `AWA_SOAK_ADMIN_MIN_SAMPLES` (20) per read and source | about 120 s with the operator persona |
+
+Backend memory is read from `/proc/<pid>/status` inside the container named by `AWA_SOAK_PG_CONTAINER`, which `scripts/persona-soak.sh` sets, or on this host for a server on `localhost`; otherwise it is reported as not measured, since `pg_backend_memory_contexts` only reports the calling session and `pg_log_backend_memory_contexts` only writes to the server log. `pg-backends.csv` holds every backend sample with its `application_name`, and the maintenance leader's dedicated idle-check connection (`awa-maintenance-idle-check`), where a runtime has one, is reported on its own line. Prepared statements are counted on one idle connection of each runtime's own pool per sample (`pg_prepared_statements` is per session), with a one-second acquire bound so a busy pool skips the sample. The maintenance checks read the in-process capture, so they are not evaluated when OTLP capture is on, and a pin is judged only at exports where an in-process runtime led maintenance.
+
+Every oracle and sampler pool sets `statement_timeout` and `lock_timeout` on its sessions, so a measurement cannot hold a lock that prune waits for beyond the statement bound, and the report's Sampler hygiene section lists each pool's settings. A periodic sample cut short by those bounds, or by a busy pool, is counted as skipped and reported, with the first few on the timeline; the final reconciliation runs with a longer statement bound and treats any failed query as incomplete evidence, as before.
 
 Environment:
 
@@ -402,6 +438,16 @@ Environment:
 | `AWA_SOAK_PG_LOG` / `AWA_SOAK_PG_CONTAINER` / `AWA_SOAK_PG_CONTAINER_LOG` | where to read the server log for the crash scan: a file on this host, or a Docker container (with an optional log path inside it, otherwise `docker logs`) |
 | `AWA_SOAK_REPORT_DIR` | where `report.md`, `report.json` and, for a failed run, `reproducer.md` are written; `maintenance-metrics.jsonl` holds the `awa.maintenance.*` metrics and `awa.ring.generation` of the in-process runtimes as cumulative data points exported every 10 s (prune and rotate attempts by ring and outcome, branch durations and overruns, promotion lane contention, the age of each ready lane pinning the queue ring), and the report's Maintenance section summarises the prune and rotate attempts by ring and outcome, each ring's first and last generation, how many lanes pinned the queue ring and the oldest pinned age, and prune's claim-cursor advances by outcome when a runtime records them |
 | `AWA_SOAK_STALL_SECONDS`, `AWA_SOAK_PROMOTION_OVERDUE_SECONDS`, `AWA_SOAK_CHAOS_SLACK_SECONDS` | oracle thresholds |
+| `AWA_SOAK_RESOURCE_SAMPLE_SECONDS` | how often backends, their memory, connections, prepared statements and the idle counters are sampled (default 15) |
+| `AWA_SOAK_PG_MEMORY_WARMUP_SECONDS`, `AWA_SOAK_PG_MEMORY_MIN_WINDOW_SECONDS`, `AWA_SOAK_PG_MEMORY_GROWTH_MIB`, `AWA_SOAK_PG_MEMORY_TOTAL_GROWTH_MIB` | per-backend memory check: warm-up after the load starts and after each backend is first seen (default 300), shortest observed span after it (default 600), largest growth of one pooled backend (default 24 MiB) and of all judged pooled backends together (default 160 MiB) |
+| `AWA_SOAK_CONNECTIONS_EXTRA_PER_RUNTIME` | backends a runtime may hold beyond its pool size, for its detached `LISTEN` connections (default 2) |
+| `AWA_SOAK_PREPARED_STATEMENTS_MAX` | named prepared statements allowed on one runtime connection (default 110: sqlx's 100-statement cache and some slack) |
+| `AWA_SOAK_IDLE_SECONDS`, `AWA_SOAK_IDLE_WARMUP_SECONDS`, `AWA_SOAK_IDLE_XACTS_PER_SECOND`, `AWA_SOAK_IDLE_WAL_BYTES_PER_SECOND` | the idle phase after the run quiesced, with the runtimes up and no load (default 90 s, 0 skips it), the part left out while the rings empty (default 30), and the ceilings on the soak database's transactions per second (default 400) and the server's WAL bytes per second (default 65536) during it; Tom's cron schedules keep firing in it |
+| `AWA_SOAK_RING_STALL_SECONDS`, `AWA_SOAK_PRUNE_BLOCKED_SECONDS`, `AWA_SOAK_PRUNE_BLOCKED_MIN` | ring generation standing still while rotation is skipped busy (default 180), and the window (default 120) and count (default 10) of prune `blocked` outcomes with nothing pruned |
+| `AWA_SOAK_PINNED_AGE_SECONDS`, `AWA_SOAK_PIN_RELEASE_SECONDS`, `AWA_SOAK_PIN_HOLD_SECONDS` | oldest accepted unexplained pin of the queue ring (default 120), time allowed for a pin to clear after an operator operation or a declared state ends (default 60), and how long the operator holds a queue before every third batch operation (default 50) |
+| `AWA_SOAK_ADMIN_P99_MS`, `AWA_SOAK_ADMIN_HTTP_P99_MS`, `AWA_SOAK_ADMIN_WARMUP_SECONDS`, `AWA_SOAK_ADMIN_MIN_SAMPLES` | p99 budgets as `read=ms` lists over `get_job`, `find_jobs`, `queue_overview` and `counts`, through the library (defaults 2000, 5000, 5000, 5000) and over HTTP (defaults 5000, 15000, 15000, 15000), the warm-up (default 60) and the fewest samples judged (default 20) |
+| `AWA_SOAK_DRAIN_MARGIN_MS` | a job counts as enqueued after a drain when its insert began this long after the drain call (default 250) |
+| `AWA_SOAK_SAMPLER_STATEMENT_TIMEOUT_MS`, `AWA_SOAK_SAMPLER_LOCK_TIMEOUT_MS`, `AWA_SOAK_FINAL_STATEMENT_TIMEOUT_SECONDS` | session timeouts of the oracle and sampler pools (defaults 10000 and 1000) and the statement timeout of the final reconciliation (default 300) |
 | `AWA_SOAK_GATE_PROOF` | default `0`; `1` adds logged handler-return and committed-completion witnesses that survive terminal pruning |
 | `AWA_SOAK_METRICS_ENDPOINT`, `AWA_SOAK_METRICS_DIR` | optional OTLP gRPC endpoint and absolute output directory for per-process metric receipts |
 | `AWA_PRESSURE_ROTATE_MULTIPLIER` | pressure comparison setting: `1` (default) or `4`; scales the harness's queue, lease and claim rotation intervals; keeps configured generation rates unchanged |
