@@ -101,6 +101,20 @@ impl FreshEnqueue {
         }
     }
 
+    async fn claim_and_commit(mut self, key: &[u8]) -> Result<(), sqlx::Error> {
+        sqlx::query("SET LOCAL lock_timeout = '5s'")
+            .execute(&mut *self.tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO awa.job_unique_claims (unique_key, job_id) \
+             VALUES ($1, nextval('awa.job_id_seq'))",
+        )
+        .bind(key)
+        .execute(&mut *self.tx)
+        .await?;
+        self.tx.commit().await
+    }
+
     async fn reserve_and_commit(mut self, queue: &str) -> Result<(), sqlx::Error> {
         sqlx::query("SET LOCAL lock_timeout = '5s'")
             .execute(&mut *self.tx)
@@ -497,4 +511,88 @@ async fn dlq_batch_retry_keeps_the_key_owner_among_same_key_rows() {
 
     drop_claim(&pool, &key).await;
     setup::clean_queue(&pool, &queue).await;
+}
+
+/// A batch with a ready job on key A and a scheduled job on key B, A < B,
+/// claims A before B, as every other path does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_batch_claims_ready_and_scheduled_keys_in_one_order() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    for copy in [false, true] {
+        let queue = unique_queue("claim_lane_mixed_keys");
+        let key_of =
+            |kind: &str| awa::model::unique::compute_unique_key(kind, Some(&queue), None, None);
+        let (mut ready_kind, mut scheduled_kind) = ("claim_lane_key_one", "claim_lane_key_two");
+        if key_of(ready_kind) > key_of(scheduled_kind) {
+            std::mem::swap(&mut ready_kind, &mut scheduled_kind);
+        }
+        let (first, second) = (key_of(ready_kind), key_of(scheduled_kind));
+        let unique = || {
+            Some(UniqueOpts {
+                by_queue: true,
+                by_args: false,
+                ..Default::default()
+            })
+        };
+        let jobs = vec![
+            InsertParams {
+                kind: ready_kind.to_string(),
+                args: serde_json::json!({}),
+                opts: InsertOpts {
+                    queue: queue.clone(),
+                    priority: PRIORITY,
+                    unique: unique(),
+                    ..Default::default()
+                },
+            },
+            InsertParams {
+                kind: scheduled_kind.to_string(),
+                args: serde_json::json!({}),
+                opts: InsertOpts {
+                    queue: queue.clone(),
+                    priority: PRIORITY,
+                    run_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    unique: unique(),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let holder = FreshEnqueue::claim(&pool, &first).await;
+        let batch = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let storage =
+                    QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+                if copy {
+                    storage.enqueue_params_copy(&pool, &jobs).await
+                } else {
+                    storage.enqueue_params_batch(&pool, &jobs).await
+                }
+            }
+        });
+        holder.wait_for_waiter(&pool).await;
+        holder
+            .claim_and_commit(&second)
+            .await
+            .expect("the holder claims the second key and commits");
+        let result =
+            tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(10)), batch)
+                .await
+                .expect("the batch finishes")
+                .expect("join batch");
+        assert_unique_conflict(
+            result,
+            if copy {
+                "enqueue_params_copy"
+            } else {
+                "enqueue_params_batch"
+            },
+        );
+
+        drop_claim(&pool, &first).await;
+        drop_claim(&pool, &second).await;
+        setup::clean_queue(&pool, &queue).await;
+    }
 }

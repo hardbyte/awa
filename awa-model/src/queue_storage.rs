@@ -1911,6 +1911,14 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+/// The unique claims enqueuing `rows` takes.
+fn deferred_enqueue_claims(rows: &[DeferredJobRow]) -> Vec<(Vec<u8>, i64)> {
+    rows.iter()
+        .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
+        .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)))
+        .collect()
+}
+
 fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
     if value.contains(',')
         || value.contains('"')
@@ -3774,17 +3782,22 @@ impl QueueStorage {
     // Enqueue inserts have no prior storage state, so uniqueness only needs to
     // add claims for states included in the row's unique-state bitmask. State
     // transitions still use `sync_unique_claim`, which can release old claims.
+    // `deferred_claims` are claimed in the same key-ordered statement, for a
+    // batch whose deferred rows are written after its ready rows.
     async fn sync_ready_enqueue_unique_claims<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: &[RuntimeReadyInsert],
+        mut deferred_claims: Vec<(Vec<u8>, i64)>,
     ) -> Result<(), AwaError> {
-        let claims = rows
-            .iter()
-            .filter(|row| unique_state_claims(row.unique_states.as_deref(), JobState::Available))
-            .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)))
-            .collect();
-        self.sync_enqueue_unique_claims(tx, claims).await
+        deferred_claims.extend(
+            rows.iter()
+                .filter(|row| {
+                    unique_state_claims(row.unique_states.as_deref(), JobState::Available)
+                })
+                .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id))),
+        );
+        self.sync_enqueue_unique_claims(tx, deferred_claims).await
     }
 
     async fn sync_deferred_enqueue_unique_claims<'a>(
@@ -3792,12 +3805,8 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: &[DeferredJobRow],
     ) -> Result<(), AwaError> {
-        let claims = rows
-            .iter()
-            .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
-            .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)))
-            .collect();
-        self.sync_enqueue_unique_claims(tx, claims).await
+        self.sync_enqueue_unique_claims(tx, deferred_enqueue_claims(rows))
+            .await
     }
 
     /// Idempotently install the queue-storage substrate (schema, tables,
@@ -5222,6 +5231,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<RuntimeReadyRow>,
+        deferred_claims: Vec<(Vec<u8>, i64)>,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
@@ -5270,7 +5280,7 @@ impl QueueStorage {
             ));
         }
 
-        self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
+        self.sync_ready_enqueue_unique_claims(tx, &ready_rows, deferred_claims)
             .await?;
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
@@ -5364,6 +5374,7 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<RuntimeReadyRow>,
         job_ids: Vec<i64>,
+        deferred_claims: Vec<(Vec<u8>, i64)>,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
@@ -5417,7 +5428,7 @@ impl QueueStorage {
             ));
         }
 
-        self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
+        self.sync_ready_enqueue_unique_claims(tx, &ready_rows, deferred_claims)
             .await?;
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
@@ -5690,6 +5701,18 @@ impl QueueStorage {
             }
         }
 
+        self.write_deferred_rows_tx(tx, &rows).await
+    }
+
+    /// Insert `rows` into `deferred_jobs` without touching unique claims.
+    async fn write_deferred_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DeferredJobRow],
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let schema = self.schema();
         sqlx::query(&format!(
             r#"
@@ -5735,7 +5758,18 @@ impl QueueStorage {
         }
 
         self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
+        self.write_deferred_rows_copy_tx(tx, &rows).await
+    }
 
+    /// COPY `rows` into `deferred_jobs` without touching unique claims.
+    async fn write_deferred_rows_copy_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DeferredJobRow],
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let schema = self.schema();
         let copy_sql = format!(
             "COPY {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
@@ -5748,7 +5782,7 @@ impl QueueStorage {
         // 320 bytes/row is only a rough starting point; large JSON payloads
         // are bounded by chunked COPY sends below rather than by this reserve.
         let mut csv_buf = Vec::with_capacity(rows.len().min(1024) * 320);
-        for row in &rows {
+        for row in rows {
             write_deferred_copy_row(&mut csv_buf, row);
             if csv_buf.len() >= COPY_CHUNK_TARGET_BYTES {
                 let chunk =
@@ -6369,7 +6403,9 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let total_rows = self.insert_ready_rows_tx(&mut tx, rows.clone()).await?;
+        let total_rows = self
+            .insert_ready_rows_tx(&mut tx, rows.clone(), Vec::new())
+            .await?;
 
         let queues_to_notify: Vec<String> = rows.iter().map(|row| row.queue.clone()).collect();
         self.notify_queues_tx(&mut tx, queues_to_notify).await?;
@@ -6492,23 +6528,27 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
-        // Deferred rows claim unique keys without reserving a lane, so they
-        // go first: no key is claimed after a lane is held.
-        if !deferred_rows.is_empty() {
-            let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
-            let deferred_rows: Vec<_> = deferred_rows
-                .into_iter()
-                .zip(ids)
-                .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
-                .collect();
+        let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
+        let deferred_rows: Vec<_> = deferred_rows
+            .into_iter()
+            .zip(ids)
+            .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
+            .collect();
+        // Every key of the batch is claimed in one key-ordered statement
+        // before any lane is reserved.
+        if ready_rows.is_empty() {
             total += self
                 .insert_deferred_rows_tx(&mut tx, deferred_rows, None)
                 .await?;
-        }
-        if !ready_rows.is_empty() {
+        } else {
             total += self
-                .insert_ready_rows_tx(&mut tx, ready_rows.clone())
+                .insert_ready_rows_tx(
+                    &mut tx,
+                    ready_rows.clone(),
+                    deferred_enqueue_claims(&deferred_rows),
+                )
                 .await?;
+            total += self.write_deferred_rows_tx(&mut tx, &deferred_rows).await?;
         }
 
         self.notify_queues_tx(&mut tx, queues_to_notify).await?;
@@ -6601,21 +6641,28 @@ impl QueueStorage {
             .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
             .await?;
         let (ready_job_ids, deferred_job_ids) = job_ids.split_at(ready_rows.len());
-        // As in `enqueue_params_batch`, deferred rows claim their keys
-        // before any ready row reserves a lane.
-        if !deferred_rows.is_empty() {
-            let deferred_rows: Vec<_> = deferred_rows
-                .into_iter()
-                .zip(deferred_job_ids.iter().copied())
-                .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
-                .collect();
+        let deferred_rows: Vec<_> = deferred_rows
+            .into_iter()
+            .zip(deferred_job_ids.iter().copied())
+            .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
+            .collect();
+        // As in `enqueue_params_batch`, every key is claimed in one
+        // key-ordered statement before any lane is reserved.
+        if ready_rows.is_empty() {
             total += self
                 .insert_deferred_rows_copy_tx(&mut tx, deferred_rows)
                 .await?;
-        }
-        if !ready_rows.is_empty() {
+        } else {
             total += self
-                .insert_ready_rows_copy_tx(&mut tx, ready_rows, ready_job_ids.to_vec())
+                .insert_ready_rows_copy_tx(
+                    &mut tx,
+                    ready_rows,
+                    ready_job_ids.to_vec(),
+                    deferred_enqueue_claims(&deferred_rows),
+                )
+                .await?;
+            total += self
+                .write_deferred_rows_copy_tx(&mut tx, &deferred_rows)
                 .await?;
         }
 
