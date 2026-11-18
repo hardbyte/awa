@@ -309,6 +309,96 @@ async fn a_unique_conflict_is_skipped_reported_and_not_retried_again() {
     setup::clean_queue(&pool, &queue).await;
 }
 
+/// A batch reserves the destination lane before it claims a unique key, as
+/// every enqueue path does, so a transaction that holds the lane and then
+/// claims the same key does not wait on the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_reserves_the_lane_before_claiming_unique_keys() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_name("dlq_batch_lane_first");
+    let key = format!("dlq-batch-{queue}").into_bytes();
+    seed_plain(&pool, "dlq_batch_job", &queue, 30).await;
+    let warmed = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
+    assert_eq!(warmed.count, 1, "the first batch provisions the lane");
+    let keyed = seed(
+        &pool,
+        Seed {
+            kind: "dlq_batch_job",
+            queue: &queue,
+            dlq_age_secs: 20,
+            tag: None,
+            unique_key: Some(&key),
+        },
+    )
+    .await;
+
+    let mut lane_holder = pool.begin().await.expect("begin lane holder");
+    sqlx::query("SELECT awa.reserve_enqueue_seq($1, 2::smallint, 0::smallint, 1)")
+        .bind(&queue)
+        .execute(&mut *lane_holder)
+        .await
+        .expect("reserve the lane");
+
+    let retry = tokio::spawn({
+        let pool = pool.clone();
+        let filter = by_queue(&queue);
+        async move {
+            dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, BulkCursor::default()).await
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE pid <> pg_backend_pid()
+                   AND datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND wait_event = 'advisory'
+                   AND query LIKE '%reserve_enqueue_seq%'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read waits");
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the batch should wait for the lane"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *lane_holder)
+        .await
+        .expect("lock timeout");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(&key)
+        .bind(i64::MAX - 3)
+        .execute(&mut *lane_holder)
+        .await
+        .expect("the lane holder claims the key without waiting on the batch");
+    lane_holder.commit().await.expect("commit lane holder");
+
+    let result = retry.await.expect("join").expect("batch");
+    assert_eq!(
+        (result.count, result.skipped, result.conflicts.clone()),
+        (0, 1, vec![keyed])
+    );
+    assert_eq!(in_dlq(&pool, &[keyed]).await, BTreeSet::from([keyed]));
+
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("drop claim");
+    setup::clean_queue(&pool, &queue).await;
+}
+
 #[tokio::test]
 async fn a_batch_is_busy_not_done_while_every_matching_row_is_held() {
     let _guard = GUARD.lock().await;

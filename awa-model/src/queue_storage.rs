@@ -4377,7 +4377,8 @@ impl QueueStorage {
         priority: i16,
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
-        // A lane whose head row this transaction can see needs no provisioning.
+        // A lane whose head row and lane row this transaction can see needs
+        // no provisioning. `reset` truncates `queue_lanes` and keeps the heads.
         let schema = self.schema();
         let visible: bool = sqlx::query_scalar(&format!(
             r#"
@@ -4387,6 +4388,12 @@ impl QueueStorage {
                 WHERE queue = $1
                   AND priority = $2
                   AND enqueue_shard = $3
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM {schema}.queue_lanes
+                WHERE queue = $1
+                  AND priority = $2
             )
             "#
         ))
@@ -5434,8 +5441,25 @@ impl QueueStorage {
         rows: Vec<ExistingReadyRow>,
         old_state: Option<JobState>,
     ) -> Result<usize, AwaError> {
+        let (inserted, _) = self
+            .insert_existing_ready_rows_inner_tx(tx, rows, old_state, false)
+            .await?;
+        Ok(inserted)
+    }
+
+    /// Re-enqueue `rows`, reserving each lane before claiming its rows'
+    /// unique keys, the order every enqueue path takes them in. With
+    /// `skip_conflicts`, a row whose unique key a live job holds is left out
+    /// and its job ID returned, and its reserved lane position stays a gap.
+    async fn insert_existing_ready_rows_inner_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<ExistingReadyRow>,
+        old_state: Option<JobState>,
+        skip_conflicts: bool,
+    ) -> Result<(usize, Vec<i64>), AwaError> {
         if rows.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
@@ -5448,6 +5472,7 @@ impl QueueStorage {
 
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         let mut ready_rows = Vec::with_capacity(total_rows);
+        let mut skipped = Vec::new();
 
         for ((queue, priority), lane_rows) in grouped {
             // Re-enqueue paths (retry-after, age-waiting, DLQ retry,
@@ -5468,15 +5493,24 @@ impl QueueStorage {
                 .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
-                self.sync_unique_claim(
-                    tx,
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    old_state,
-                    Some(JobState::Available),
-                )
-                .await?;
+                match self
+                    .sync_unique_claim(
+                        tx,
+                        row.job_id,
+                        &row.unique_key,
+                        row.unique_states.as_deref(),
+                        old_state,
+                        Some(JobState::Available),
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(AwaError::UniqueConflict { .. }) if skip_conflicts => {
+                        skipped.push(row.job_id);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
                 ready_rows.push(RuntimeReadyInsert {
                     job_id: row.job_id,
                     kind: row.kind,
@@ -5498,10 +5532,13 @@ impl QueueStorage {
             }
         }
 
+        if ready_rows.is_empty() {
+            return Ok((0, skipped));
+        }
         let ring = self.current_queue_ring(tx).await?;
         self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
         self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
-        Ok(total_rows)
+        Ok((ready_rows.len(), skipped))
     }
 
     async fn insert_deferred_rows_tx<'a>(
@@ -16988,54 +17025,47 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            let mut revived = Vec::with_capacity(rows.len());
+            let run_at = Utc::now();
+            let mut queues = BTreeSet::new();
+            let mut ready_rows = Vec::with_capacity(rows.len());
             for row in rows {
-                match self
-                    .sync_unique_claim(
-                        &mut tx,
-                        row.job_id,
-                        &row.unique_key,
-                        row.unique_states.as_deref(),
-                        Some(JobState::Failed),
-                        Some(JobState::Available),
-                    )
-                    .await
-                {
-                    Ok(()) => revived.push(row),
-                    Err(AwaError::UniqueConflict { .. }) => batch.skip(row.job_id),
-                    Err(err) => return Err(err),
-                }
+                let queue = row.queue.clone();
+                let priority = row.priority;
+                queues.insert(queue.clone());
+                let mut payload = RuntimePayload::from_json(row.payload.clone())?;
+                payload.set_progress(None);
+                ready_rows.push(row.into_retry_ready_row(
+                    queue,
+                    priority,
+                    run_at,
+                    payload.into_json(),
+                ));
             }
-
-            if !revived.is_empty() {
-                let ids: Vec<i64> = revived.iter().map(|row| row.job_id).collect();
+            let picked: Vec<i64> = ready_rows.iter().map(|row| row.job_id).collect();
+            let (revived, skipped) = self
+                .insert_existing_ready_rows_inner_tx(
+                    &mut tx,
+                    ready_rows,
+                    Some(JobState::Failed),
+                    true,
+                )
+                .await?;
+            for job_id in &skipped {
+                batch.skip(*job_id);
+            }
+            if revived > 0 {
+                let revived_ids: Vec<i64> = picked
+                    .into_iter()
+                    .filter(|job_id| !skipped.contains(job_id))
+                    .collect();
                 sqlx::query(&format!(
                     "DELETE FROM {schema}.dlq_entries WHERE job_id = ANY($1)"
                 ))
-                .bind(&ids)
+                .bind(&revived_ids)
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-
-                let run_at = Utc::now();
-                let mut queues = BTreeSet::new();
-                let mut ready_rows = Vec::with_capacity(revived.len());
-                for row in revived {
-                    let queue = row.queue.clone();
-                    let priority = row.priority;
-                    queues.insert(queue.clone());
-                    let mut payload = RuntimePayload::from_json(row.payload.clone())?;
-                    payload.set_progress(None);
-                    ready_rows.push(row.into_retry_ready_row(
-                        queue,
-                        priority,
-                        run_at,
-                        payload.into_json(),
-                    ));
-                }
-                batch.count = ready_rows.len() as u64;
-                self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
-                    .await?;
+                batch.count = revived as u64;
                 self.notify_queues_tx(&mut tx, queues).await?;
             }
         }
