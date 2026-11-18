@@ -11476,6 +11476,136 @@ async fn test_queue_storage_promotion_leaves_a_contended_lane_deferred_and_in_or
     assert_eq!(claimed, expected);
 }
 
+async fn unique_claim_holders(pool: &sqlx::PgPool, job_id: i64, store: &QueueStorage) -> Vec<i64> {
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT claims.job_id
+        FROM awa.job_unique_claims AS claims
+        WHERE claims.unique_key = (
+            SELECT unique_key FROM {schema}.ready_entries WHERE job_id = $1
+        )
+        ORDER BY claims.job_id
+        "#,
+        schema = store.schema()
+    ))
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .expect("read unique claim holders")
+}
+
+async fn promote_unique_conflict_case(unique_states: u8, schema: &str) {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_promote_unique_conflict";
+    let store = create_store(&pool, schema).await;
+    let due = Utc::now() - chrono::Duration::seconds(60);
+    let unique_opts = |run_at: Option<DateTime<Utc>>| InsertOpts {
+        queue: queue.to_string(),
+        run_at,
+        unique: Some(UniqueOpts {
+            states: unique_states,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let duplicate_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        unique_opts(Some(due - chrono::Duration::seconds(1))),
+    )
+    .await;
+    let holder_id = enqueue_job(&pool, &store, &CompleteJob { id: 1 }, unique_opts(None)).await;
+    let other_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            run_at: Some(due),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let outcome = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
+        .await
+        .expect("a unique conflict must not fail promotion");
+    assert_eq!(outcome.promoted, 1, "{outcome:?}");
+    assert_eq!(outcome.selected, 2, "{outcome:?}");
+    assert!(outcome.contended.is_empty(), "{outcome:?}");
+
+    let duplicate = store
+        .load_job(&pool, duplicate_id)
+        .await
+        .expect("load duplicate")
+        .expect("duplicate exists");
+    assert_eq!(duplicate.state, JobState::Cancelled);
+    let errors = serde_json::to_string(&duplicate.errors).expect("render errors");
+    assert!(
+        errors.contains("promoted as duplicate: unique claim held by another job"),
+        "{errors}"
+    );
+    let other = store
+        .load_job(&pool, other_id)
+        .await
+        .expect("load other")
+        .expect("other exists");
+    assert_eq!(other.state, JobState::Available);
+    let holder = store
+        .load_job(&pool, holder_id)
+        .await
+        .expect("load holder")
+        .expect("holder exists");
+    assert_eq!(holder.state, JobState::Available);
+    assert_eq!(
+        unique_claim_holders(&pool, holder_id, &store).await,
+        vec![holder_id]
+    );
+
+    let duplicate_key: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+        "SELECT unique_key FROM {}.done_entries WHERE job_id = $1",
+        store.schema()
+    ))
+    .bind(duplicate_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read cancelled row");
+    let claims_cancelled = unique_states & (1 << JobState::Cancelled.bit_position()) != 0;
+    assert_eq!(duplicate_key.is_none(), claims_cancelled);
+
+    let again = store
+        .promote_due_lanes(&pool, JobState::Scheduled, 100, None, &[])
+        .await
+        .expect("promote again");
+    assert_eq!(again, Default::default());
+}
+
+/// A due row whose unique key another live job holds is cancelled as a
+/// duplicate in the same pass that promotes the other due rows of its lane.
+/// The job holding the key keeps it.
+#[tokio::test]
+async fn test_queue_storage_promotion_cancels_a_unique_duplicate_and_promotes_its_lane() {
+    promote_unique_conflict_case(
+        1 << JobState::Available.bit_position(),
+        "awa_qs_promote_unique_conflict",
+    )
+    .await;
+}
+
+/// A duplicate whose mask also claims `cancelled` is cancelled without its
+/// unique key, so the cancelled row holds no claim.
+#[tokio::test]
+async fn test_queue_storage_promotion_cancels_a_duplicate_whose_mask_claims_cancelled() {
+    promote_unique_conflict_case(
+        (1 << JobState::Available.bit_position()) | (1 << JobState::Cancelled.bit_position()),
+        "awa_qs_promote_unique_conflict_cancelled",
+    )
+    .await;
+}
+
 /// Holds PostgreSQL's cluster-wide notify-queue lock for about `commits` ×
 /// 100 ms. A transaction that issued NOTIFY takes that lock at COMMIT and
 /// keeps it until its commit record is flushed, which `commit_delay` stretches.
