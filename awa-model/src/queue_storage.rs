@@ -13611,6 +13611,7 @@ impl QueueStorage {
                 )
                 "#
             ))
+            .persistent(false)
             .bind(slot)
             .bind(cutoff)
             .bind(scan_limit)
@@ -13851,6 +13852,7 @@ impl QueueStorage {
                 (SELECT rescue_cursor_run_lease FROM advance_cursor)
             "#
         ))
+        .persistent(false)
         .bind(slot)
         .bind(cutoff)
         .bind(scan_limit)
@@ -14129,6 +14131,7 @@ impl QueueStorage {
                 )
                 "#
             ))
+            .persistent(false)
             .bind(slot)
             .bind(scan_limit)
             .bind(rescue_limit)
@@ -14250,6 +14253,7 @@ impl QueueStorage {
                 (SELECT deadline_cursor_run_lease FROM advance_cursor)
             "#
         ))
+        .persistent(false)
         .bind(slot)
         .bind(scan_limit)
         .bind(rescue_limit)
@@ -18945,12 +18949,14 @@ impl QueueStorage {
     /// order the ring's prune requests `ACCESS EXCLUSIVE`.
     async fn idle_ring_cursor(
         &self,
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         ring_state: &str,
         relations: &[String],
     ) -> Result<Option<(i32, i64)>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = sqlx::Connection::begin(conn)
+            .await
+            .map_err(map_sqlx_error)?;
         let refs: Vec<&str> = relations.iter().map(String::as_str).collect();
         if Self::any_relation_has_rows_tx(&mut tx, &refs).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -18999,6 +19005,19 @@ impl QueueStorage {
         .collect()
     }
 
+    /// [`Self::idle_ring_cursor`] on a connection taken from `pool` and
+    /// returned before the caller rotates.
+    async fn idle_ring_cursor_pooled(
+        &self,
+        pool: &PgPool,
+        ring_state: &str,
+        relations: &[String],
+    ) -> Result<Option<(i32, i64)>, AwaError> {
+        let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
+        self.idle_ring_cursor(&mut conn, ring_state, relations)
+            .await
+    }
+
     /// [`Self::rotate`], skipped when every partition of the queue ring is
     /// empty.
     ///
@@ -19009,10 +19028,39 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_if_active")]
     pub async fn rotate_if_active(&self, pool: &PgPool) -> Result<GatedRotateOutcome, AwaError> {
         let relations = self.queue_ring_relations();
-        match self
-            .idle_ring_cursor(pool, "queue_ring_state", &relations)
-            .await?
-        {
+        let idle = self
+            .idle_ring_cursor_pooled(pool, "queue_ring_state", &relations)
+            .await?;
+        self.finish_gated_rotate(idle, pool).await
+    }
+
+    /// [`Self::rotate_if_active`] with the emptiness check run on `check_conn`
+    /// instead of a pooled connection. Rotation still uses `pool`.
+    ///
+    /// The check loads every ring partition's metadata into the session that
+    /// runs it, so a caller that checks on one long-lived connection keeps
+    /// that metadata out of the pool's sessions. On `Ok`, `check_conn` is not
+    /// inside a transaction; on `Err` it may be, and the caller should
+    /// discard it.
+    #[tracing::instrument(skip(self, check_conn, pool), name = "queue_storage.rotate_if_active")]
+    pub async fn rotate_if_active_on(
+        &self,
+        check_conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        let relations = self.queue_ring_relations();
+        let idle = self
+            .idle_ring_cursor(check_conn, "queue_ring_state", &relations)
+            .await?;
+        self.finish_gated_rotate(idle, pool).await
+    }
+
+    async fn finish_gated_rotate(
+        &self,
+        idle: Option<(i32, i64)>,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        match idle {
             Some((slot, generation)) => Ok(GatedRotateOutcome::SkippedIdle { slot, generation }),
             None => self.rotate(pool).await.map(GatedRotateOutcome::Attempted),
         }
@@ -19026,10 +19074,36 @@ impl QueueStorage {
         pool: &PgPool,
     ) -> Result<GatedRotateOutcome, AwaError> {
         let relations = [self.leases_table()];
-        match self
-            .idle_ring_cursor(pool, "lease_ring_state", &relations)
-            .await?
-        {
+        let idle = self
+            .idle_ring_cursor_pooled(pool, "lease_ring_state", &relations)
+            .await?;
+        self.finish_gated_rotate_leases(idle, pool).await
+    }
+
+    /// [`Self::rotate_leases_if_active`] with the emptiness check run on
+    /// `check_conn`. See [`Self::rotate_if_active_on`].
+    #[tracing::instrument(
+        skip(self, check_conn, pool),
+        name = "queue_storage.rotate_leases_if_active"
+    )]
+    pub async fn rotate_leases_if_active_on(
+        &self,
+        check_conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        let relations = [self.leases_table()];
+        let idle = self
+            .idle_ring_cursor(check_conn, "lease_ring_state", &relations)
+            .await?;
+        self.finish_gated_rotate_leases(idle, pool).await
+    }
+
+    async fn finish_gated_rotate_leases(
+        &self,
+        idle: Option<(i32, i64)>,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        match idle {
             Some((slot, generation)) => Ok(GatedRotateOutcome::SkippedIdle { slot, generation }),
             None => self
                 .rotate_leases(pool)
@@ -19046,10 +19120,36 @@ impl QueueStorage {
         pool: &PgPool,
     ) -> Result<GatedRotateOutcome, AwaError> {
         let relations = self.claim_ring_relations();
-        match self
-            .idle_ring_cursor(pool, "claim_ring_state", &relations)
-            .await?
-        {
+        let idle = self
+            .idle_ring_cursor_pooled(pool, "claim_ring_state", &relations)
+            .await?;
+        self.finish_gated_rotate_claims(idle, pool).await
+    }
+
+    /// [`Self::rotate_claims_if_active`] with the emptiness check run on
+    /// `check_conn`. See [`Self::rotate_if_active_on`].
+    #[tracing::instrument(
+        skip(self, check_conn, pool),
+        name = "queue_storage.rotate_claims_if_active"
+    )]
+    pub async fn rotate_claims_if_active_on(
+        &self,
+        check_conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        let relations = self.claim_ring_relations();
+        let idle = self
+            .idle_ring_cursor(check_conn, "claim_ring_state", &relations)
+            .await?;
+        self.finish_gated_rotate_claims(idle, pool).await
+    }
+
+    async fn finish_gated_rotate_claims(
+        &self,
+        idle: Option<(i32, i64)>,
+        pool: &PgPool,
+    ) -> Result<GatedRotateOutcome, AwaError> {
+        match idle {
             Some((slot, generation)) => Ok(GatedRotateOutcome::SkippedIdle { slot, generation }),
             None => self
                 .rotate_claims(pool)
