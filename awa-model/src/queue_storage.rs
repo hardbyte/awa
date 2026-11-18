@@ -17969,12 +17969,16 @@ impl QueueStorage {
     /// Release the unique claims of DLQ rows `deleted` removed. A DLQ row is
     /// a failed job, and a unique key whose states include `failed` stays
     /// claimed while the row exists; deleting the row without this leaves
-    /// a claim that blocks the key for a job that no longer exists.
+    /// a claim that blocks the key for a job that no longer exists. Claims
+    /// are released in bytewise key order, the order every claim path takes
+    /// keys in, whatever order the delete returned the rows in.
     async fn release_deleted_dlq_claims_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         deleted: &[DeletedDlqRow],
     ) -> Result<(), AwaError> {
+        let mut deleted: Vec<&DeletedDlqRow> = deleted.iter().collect();
+        deleted.sort_by(|a, b| (&a.unique_key, a.job_id).cmp(&(&b.unique_key, b.job_id)));
         for row in deleted {
             self.sync_unique_claim(
                 tx,

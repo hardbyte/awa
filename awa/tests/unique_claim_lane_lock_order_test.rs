@@ -731,3 +731,106 @@ async fn bounded_retry_by_ids_claims_every_key_before_reserving_the_lane() {
     drop_claim(&pool, &second_key).await;
     setup::clean_queue(&pool, &queue).await;
 }
+
+/// Seed a DLQ row in `queue` whose failed-only mask keeps `key` claimed,
+/// and its claim.
+async fn seed_dlq_key_owner(pool: &PgPool, queue: &str, key: &[u8]) -> i64 {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO awa.dlq_entries (
+             job_id, kind, queue, priority, dlq_reason, original_run_lease,
+             dlq_at, unique_key, unique_states
+         )
+         VALUES (nextval('awa.job_id_seq'), 'claim_lane_job', $1, $2, 'seeded', 1,
+                 now() - interval '1 day', $3, '00000100')
+         RETURNING job_id",
+    )
+    .bind(queue)
+    .bind(PRIORITY)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("seed dlq row");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("the dlq row owns its key");
+    id
+}
+
+/// Deleting DLQ rows releases their claims in key order, as every claim
+/// path takes keys. The owner of the higher key B is the lower job ID, so
+/// the delete returns it first. A holder locks the claim of the lower key A;
+/// the purge, observed waiting on it, must not yet hold B's claim, which the
+/// holder then takes before it commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dlq_deletes_release_claims_in_key_order() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    for purge in ["purge_dlq_batch", "purge_dlq", "cleanup_dlq"] {
+        let queue = unique_queue("claim_order_dlq_delete");
+        let low = format!("claim-order-{queue}-a").into_bytes();
+        let high = format!("claim-order-{queue}-b").into_bytes();
+        seed_dlq_key_owner(&pool, &queue, &high).await;
+        seed_dlq_key_owner(&pool, &queue, &low).await;
+
+        let mut holder = pool.begin().await.expect("begin holder");
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *holder)
+            .await
+            .expect("backend pid");
+        sqlx::query("SELECT 1 FROM awa.job_unique_claims WHERE unique_key = $1 FOR UPDATE")
+            .bind(&low)
+            .fetch_all(&mut *holder)
+            .await
+            .expect("hold the low key's claim");
+        let deletes = tokio::spawn({
+            let pool = pool.clone();
+            let queue = queue.clone();
+            async move {
+                let filter = ListDlqFilter {
+                    queue: Some(queue.clone()),
+                    ..Default::default()
+                };
+                match purge {
+                    "purge_dlq_batch" => {
+                        dlq::purge_dlq_batch(&pool, &filter, false, 10, BulkCursor::default())
+                            .await
+                            .map(|batch| batch.count)
+                    }
+                    "purge_dlq" => dlq::purge_dlq(&pool, &filter, false).await,
+                    _ => dlq::cleanup_dlq(&pool, Duration::from_secs(3600), 10, Some(&queue)).await,
+                }
+            }
+        });
+        let held = FreshEnqueue { tx: holder, pid };
+        held.wait_for_waiter(&pool).await;
+        let mut holder = held.tx;
+        sqlx::query("SET LOCAL lock_timeout = '5s'")
+            .execute(&mut *holder)
+            .await
+            .expect("lock timeout");
+        sqlx::query("UPDATE awa.job_unique_claims SET job_id = job_id WHERE unique_key = $1")
+            .bind(&high)
+            .execute(&mut *holder)
+            .await
+            .unwrap_or_else(|err| panic!("{purge}: the holder takes the high key: {err}"));
+        holder.commit().await.expect("commit holder");
+        let deleted =
+            tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(10)), deletes)
+                .await
+                .expect("the delete finishes")
+                .expect("join delete");
+        assert_eq!(deleted.expect(purge), 2, "{purge}");
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.job_unique_claims WHERE unique_key = ANY($1)",
+        )
+        .bind(vec![low.clone(), high.clone()])
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+        assert_eq!(left, 0, "{purge} releases both claims");
+        setup::clean_queue(&pool, &queue).await;
+    }
+}
