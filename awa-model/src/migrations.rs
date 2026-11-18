@@ -688,15 +688,30 @@ async fn pending_schema_patches_conn(
     conn: &mut PgConnection,
 ) -> Result<Vec<SchemaPatch>, AwaError> {
     let mut pending = Vec::new();
+    let mut installer_restored = false;
     for patch in SCHEMA_PATCHES {
         let applied: bool = sqlx::query_scalar(patch.applied_probe)
             .fetch_one(&mut *conn)
             .await?;
-        if !applied {
+        if !applied || (installer_restored && rewrites_installer(patch)) {
+            installer_restored |= embeds_installer(patch);
             pending.push(*patch);
         }
     }
     Ok(pending)
+}
+
+/// Whether applying `patch` puts the released v023 installer back.
+fn embeds_installer(patch: &SchemaPatch) -> bool {
+    patch.sql.contains(include_str!(
+        "../migrations/v023_install_queue_storage_substrate.sql"
+    ))
+}
+
+/// Whether `patch` rewrites the installer in place, so it must run again
+/// after any patch that [`embeds_installer`].
+fn rewrites_installer(patch: &SchemaPatch) -> bool {
+    patch.name == "spent_claim_prefix_gaps"
 }
 
 /// Whether one schema patch is present, and if not, where it is missing.
@@ -928,14 +943,15 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
     if current <= CURRENT_VERSION {
         let before = schema_patch_status_conn(conn).await?;
         let mut applied_this_run = Vec::new();
-        for status in &before {
-            if status.applied {
+        for patch in SCHEMA_PATCHES {
+            // Probed just before applying, since an earlier patch in this
+            // run may have undone it.
+            let applied: bool = sqlx::query_scalar(patch.applied_probe)
+                .fetch_one(&mut *conn)
+                .await?;
+            if applied {
                 continue;
             }
-            let patch = SCHEMA_PATCHES
-                .iter()
-                .find(|patch| patch.name == status.name)
-                .expect("status comes from SCHEMA_PATCHES");
             info!(
                 patch = patch.name,
                 description = patch.description,
@@ -983,10 +999,10 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
             patches.push(PatchReport {
                 name: after.name,
                 description: after.description,
-                outcome: if before.applied {
-                    PatchOutcome::AlreadyPresent
-                } else {
+                outcome: if applied_this_run.contains(&after.name) {
                     PatchOutcome::Applied
+                } else {
+                    PatchOutcome::AlreadyPresent
                 },
                 repaired,
                 still_needs_repair: after.needs_repair,
@@ -1563,8 +1579,9 @@ mod tests {
                 .expect("registered patch")
         };
         let fix = position("spent_claim_prefix_gaps");
+        assert!(rewrites_installer(&SCHEMA_PATCHES[fix]));
         for patch in SCHEMA_PATCHES {
-            if patch.sql.contains(installer) {
+            if embeds_installer(patch) {
                 assert!(
                     position(patch.name) < fix && patch.name < "spent_claim_prefix_gaps",
                     "{} restores the released installer, so it must run and sort first",
