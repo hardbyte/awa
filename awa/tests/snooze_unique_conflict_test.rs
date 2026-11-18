@@ -185,7 +185,8 @@ fn is_unique_conflict(err: &AwaError) -> bool {
 }
 
 /// An operator retry of the cancelled duplicate must not take the key from
-/// the newer job, and must take it once that job is gone.
+/// the newer job, must take it once that job is gone, and restores the
+/// job's original unique mask.
 async fn assert_retry_rechecks_claim(pool: &PgPool, job_a: i64, job_b: i64) {
     let err = admin::retry(pool, job_a)
         .await
@@ -208,6 +209,17 @@ async fn assert_retry_rechecks_claim(pool: &PgPool, job_a: i64, job_b: i64) {
         .expect("retried row");
     assert_eq!(retried.state.to_string(), "available");
     assert_eq!(claim_holder(pool, job_a).await, job_a);
+
+    // The retry restored the original mask, which claims `cancelled`.
+    admin::cancel(pool, job_a)
+        .await
+        .expect("cancel the retried job")
+        .expect("cancelled row");
+    assert_eq!(
+        claim_holder(pool, job_a).await,
+        job_a,
+        "a cancelled job whose mask claims cancelled keeps its key"
+    );
 }
 
 async fn claim_holder(pool: &PgPool, id: i64) -> i64 {

@@ -1394,11 +1394,8 @@ async fn complete_job_canonical(
                 job.unique_key.as_deref(),
             )
             .await?;
-            if let RescheduleOutcome::CancelledDuplicate {
-                job_id,
-                job: persisted,
-            } = outcome
-            {
+            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                let persisted = stored_duplicate_successor(pool, job, job_id).await?;
                 let cancelled = duplicate_cancelled_event_row(
                     job,
                     job_id,
@@ -1475,11 +1472,8 @@ async fn complete_job_canonical(
                 job.unique_key.as_deref(),
             )
             .await?;
-            if let RescheduleOutcome::CancelledDuplicate {
-                job_id,
-                job: persisted,
-            } = outcome
-            {
+            if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                let persisted = stored_duplicate_successor(pool, job, job_id).await?;
                 let cancelled = duplicate_cancelled_event_row(
                     job,
                     job_id,
@@ -1919,11 +1913,8 @@ async fn complete_job_canonical(
                     job.unique_key.as_deref(),
                 )
                 .await?;
-                if let RescheduleOutcome::CancelledDuplicate {
-                    job_id,
-                    job: persisted,
-                } = outcome
-                {
+                if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
+                    let persisted = stored_duplicate_successor(pool, job, job_id).await?;
                     let cancelled = duplicate_cancelled_event_row(
                         job,
                         job_id,
@@ -2013,6 +2004,27 @@ fn rescheduled_event_row(
         row.finalized_at = Some(chrono::Utc::now());
     }
     row
+}
+
+/// The stored row of a cancelled duplicate that routing moved to a new
+/// job ID; `None` when the attempt was cancelled in place.
+async fn stored_duplicate_successor<'e, E>(
+    executor: E,
+    job: &JobRow,
+    job_id: i64,
+) -> Result<Option<Box<JobRow>>, awa_model::AwaError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if job_id == job.id {
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_optional(executor)
+        .await
+        .map_err(awa_model::map_sqlx_error)?;
+    Ok(row.map(Box::new))
 }
 
 /// The job as a read returns it after a canonical snooze or retry was
@@ -3339,10 +3351,8 @@ async fn retry_after_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate {
-            job_id,
-            job: persisted,
-        } => {
+        RescheduleOutcome::CancelledDuplicate { job_id } => {
+            let persisted = stored_duplicate_successor(&mut *tx, job, job_id).await?;
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,
@@ -3518,10 +3528,8 @@ async fn retry_backoff_canonical_with_followups(
             run_at,
             attempt,
         } => (job_id, run_at, attempt),
-        RescheduleOutcome::CancelledDuplicate {
-            job_id,
-            job: persisted,
-        } => {
+        RescheduleOutcome::CancelledDuplicate { job_id } => {
+            let persisted = stored_duplicate_successor(&mut *tx, job, job_id).await?;
             tx.commit().await?;
             return Ok(Some(duplicate_cancelled_event_row(
                 job,

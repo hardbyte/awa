@@ -1893,6 +1893,71 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+/// The key of a duplicate-cancellation error entry that holds the job's
+/// unique mask from before `cancelled` was cleared from it.
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "unique_states";
+
+/// Whether `error` records a cancellation as a duplicate.
+fn is_duplicate_cancel_error(error: &serde_json::Value) -> bool {
+    error
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|message| message.contains("as duplicate: unique claim held by"))
+}
+
+/// The unique mask a revived job takes. A row cancelled as a duplicate
+/// carries its original mask in the duplicate error entry, and gets it back.
+/// A cancelled duplicate stored without its unique key, as releases before
+/// 0.6.19 wrote it, cannot be revived: nothing would keep it from running
+/// beside the job that holds its key.
+fn revived_unique_states(
+    state: JobState,
+    unique_key: Option<&[u8]>,
+    unique_states: Option<String>,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, AwaError> {
+    if state != JobState::Cancelled {
+        return Ok(unique_states);
+    }
+    let Some(duplicate) = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| {
+            errors
+                .iter()
+                .rev()
+                .find(|error| is_duplicate_cancel_error(error))
+        })
+    else {
+        return Ok(unique_states);
+    };
+    if unique_key.is_none() && unique_states.is_none() {
+        return Err(AwaError::UniqueConflict {
+            constraint: Some("idx_awa_jobs_unique".to_string()),
+        });
+    }
+    Ok(duplicate
+        .get(DUPLICATE_CANCEL_MASK_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or(unique_states))
+}
+
+/// Clear `cancelled` from `done`'s mask and record the original mask in its
+/// last error entry, the duplicate cancellation.
+fn clear_cancelled_claim(done: &mut DoneJobRow) -> Result<(), AwaError> {
+    let Some(original) = done.unique_states.clone() else {
+        return Ok(());
+    };
+    let mut payload = RuntimePayload::from_json(done.payload.clone())?;
+    if let Some(entry) = payload.errors.last_mut() {
+        entry[DUPLICATE_CANCEL_MASK_KEY] = serde_json::Value::String(original.clone());
+    }
+    done.payload = payload.into_json();
+    done.unique_states = unique_states_without(Some(original), JobState::Cancelled);
+    Ok(())
+}
+
 /// `unique_states` with `state`'s bit cleared.
 fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
     let mut bitmask = unique_states?.into_bytes();
@@ -8929,8 +8994,13 @@ impl QueueStorage {
                 run_at: Utc::now(),
                 attempted_at: None,
                 created_at: terminal.created_at,
+                unique_states: revived_unique_states(
+                    terminal.state,
+                    terminal.unique_key.as_deref(),
+                    terminal.unique_states,
+                    &terminal.payload,
+                )?,
                 unique_key: terminal.unique_key,
-                unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
             self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(terminal.state))
@@ -16223,7 +16293,7 @@ impl QueueStorage {
 
         // If `cancelled` itself claims uniqueness, the newer holder still
         // wins. The row keeps its key, so a retry re-checks ownership.
-        done.unique_states = unique_states_without(done.unique_states, JobState::Cancelled);
+        clear_cancelled_claim(&mut done)?;
         self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
             .await?;
         done.into_job_row()
@@ -16526,8 +16596,9 @@ impl QueueStorage {
     /// its unique claim to a newer duplicate. `cancelled` normally sits
     /// outside the claiming mask so the insert is conflict-free; a mask that
     /// claims `cancelled` as well conflicts again, and then the row is
-    /// written with `cancelled` cleared from its mask. It keeps its unique
-    /// key, so a later retry re-checks ownership of it.
+    /// written with `cancelled` cleared from its mask and the original mask
+    /// recorded in its error entry. It keeps its unique key, so a later
+    /// retry restores the mask and re-checks ownership.
     async fn cancel_rescued_duplicate_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -16558,7 +16629,7 @@ impl QueueStorage {
         }
 
         let mut stripped = done;
-        stripped.unique_states = unique_states_without(stripped.unique_states, JobState::Cancelled);
+        clear_cancelled_claim(&mut stripped)?;
         self.insert_done_rows_tx(tx, std::slice::from_ref(&stripped), Some(old_state))
             .await?;
         stripped.into_job_row()

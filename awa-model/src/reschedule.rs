@@ -89,12 +89,8 @@ pub enum RescheduleOutcome {
     /// A newer duplicate acquired the unique claim while the canonical
     /// attempt was running. The attempt was recorded as cancelled (in place
     /// while canonical, as a queue-storage terminal row once routing has
-    /// flipped) and is not executable. `job` is the stored row when routing
-    /// has flipped, and `None` for an in-place canonical cancellation.
-    CancelledDuplicate {
-        job_id: i64,
-        job: Option<Box<JobRow>>,
-    },
+    /// flipped) and is not executable.
+    CancelledDuplicate { job_id: i64 },
     /// The `state = 'running' AND run_lease = $n` guard matched nothing —
     /// the attempt was rescued or cancelled and this completion is stale.
     Stale,
@@ -317,7 +313,10 @@ async fn reschedule_canonical(
             unique_states = set_bit(unique_states, 6, 0),
             progress = $5,
             errors = CASE WHEN $3::jsonb IS NULL THEN errors ELSE errors || $3::jsonb END
-                || jsonb_build_object('error', $4::text, 'attempt', attempt, 'at', now())
+                || jsonb_build_object(
+                    'error', $4::text, 'attempt', attempt, 'at', now(),
+                    'unique_states', unique_states::text
+                )
         WHERE id = $1 AND state = 'running' AND run_lease = $2
         RETURNING id
         "#,
@@ -332,7 +331,7 @@ async fn reschedule_canonical(
     .map_err(map_sqlx_error)?;
 
     Ok(match cancelled {
-        Some(job_id) => RescheduleOutcome::CancelledDuplicate { job_id, job: None },
+        Some(job_id) => RescheduleOutcome::CancelledDuplicate { job_id },
         None => RescheduleOutcome::Stale,
     })
 }
@@ -539,7 +538,6 @@ async fn migrate_to_queue_storage(
     if inserted.state == JobState::Cancelled {
         Ok(RescheduleOutcome::CancelledDuplicate {
             job_id: inserted.id,
-            job: Some(Box::new(inserted)),
         })
     } else {
         Ok(RescheduleOutcome::Migrated {

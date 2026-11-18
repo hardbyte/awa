@@ -837,7 +837,7 @@ async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
     .await
     .expect("duplicate-claim snooze");
     let successor2 = match outcome {
-        RescheduleOutcome::CancelledDuplicate { job_id, .. } => job_id,
+        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
         other => panic!("expected CancelledDuplicate, got {other:?}"),
     };
     assert_eq!(
@@ -1066,7 +1066,7 @@ async fn callback_carrying_job_is_not_migrated_to_queue_storage() {
 
 /// A migrated snooze cancelled as a duplicate under a mask that claims
 /// `cancelled` keeps its unique key, so a retry of the successor re-checks
-/// ownership; the outcome carries the stored row.
+/// ownership, and a retry restores its original mask.
 #[tokio::test]
 async fn migrated_duplicate_cancellation_keeps_its_key_for_retry() {
     use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
@@ -1097,35 +1097,13 @@ async fn migrated_duplicate_cancellation_keeps_its_key_for_retry() {
     )
     .await
     .expect("duplicate-claim snooze");
-    let (successor, persisted) = match outcome {
-        RescheduleOutcome::CancelledDuplicate {
-            job_id,
-            job: Some(job),
-        } => (job_id, *job),
-        other => panic!("expected CancelledDuplicate with its stored row, got {other:?}"),
+    let successor = match outcome {
+        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
+        other => panic!("expected CancelledDuplicate, got {other:?}"),
     };
     let stored = admin::get_job(&pool, successor)
         .await
         .expect("stored successor");
-    assert_eq!(
-        (
-            persisted.id,
-            persisted.state,
-            persisted.attempt,
-            persisted.run_at,
-            persisted.errors.clone(),
-            persisted.unique_key.clone(),
-        ),
-        (
-            stored.id,
-            stored.state,
-            stored.attempt,
-            stored.run_at,
-            stored.errors.clone(),
-            stored.unique_key.clone(),
-        ),
-        "the outcome carries the row a read returns"
-    );
     assert_eq!(stored.state, JobState::Cancelled);
     assert_eq!(stored.unique_key.as_deref(), Some(&key[..]));
 
@@ -1147,10 +1125,80 @@ async fn migrated_duplicate_cancellation_keeps_its_key_for_retry() {
         .expect("retried successor");
     assert_eq!(claim_holder(&pool, key).await, Some(successor));
 
+    // The retried job has its original mask back, so cancelling it again
+    // keeps the key as the mask says.
+    admin::cancel(&pool, successor)
+        .await
+        .expect("cancel the retried successor")
+        .expect("cancelled successor");
+    assert_eq!(
+        claim_holder(&pool, key).await,
+        Some(successor),
+        "a cancelled job whose mask claims cancelled keeps its key"
+    );
+
     sqlx::query("SELECT awa.delete_job_compat($1)")
         .bind(successor)
         .execute(&pool)
         .await
         .expect("delete retried successor");
+    finalize_after_test(&pool).await;
+}
+
+/// A cancelled duplicate that 0.6.18 stored without its unique key cannot be
+/// retried: nothing would keep it from running beside the job holding the key.
+#[tokio::test]
+async fn retry_of_a_keyless_duplicate_cancellation_is_refused() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+    use awa_model::{admin, AwaError, JobState};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    enter_mixed_transition_for_test(&pool).await;
+
+    let key = b"reschedule-dup-legacy-keyless-key";
+    let job = seed_canonical_running_job_with_mask(&pool, key, 9, "11000010").await;
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key.to_vec())
+        .bind(987_656_i64)
+        .execute(&pool)
+        .await
+        .expect("newer duplicate takes the claim");
+    let successor = match reschedule_canonical_attempt(
+        &pool,
+        job,
+        9,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("duplicate-claim snooze")
+    {
+        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
+        other => panic!("expected CancelledDuplicate, got {other:?}"),
+    };
+    // The row as 0.6.18 wrote it: no unique key or mask.
+    sqlx::query(
+        "UPDATE awa.done_entries SET unique_key = NULL, unique_states = NULL WHERE job_id = $1",
+    )
+    .bind(successor)
+    .execute(&pool)
+    .await
+    .expect("strip the key as 0.6.18 did");
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(key.to_vec())
+        .execute(&pool)
+        .await
+        .expect("the newer job releases the key");
+
+    let retried = admin::retry(&pool, successor).await;
+    assert!(
+        matches!(retried, Err(AwaError::UniqueConflict { .. })),
+        "a keyless duplicate cancellation must not be revived, got {retried:?}"
+    );
+    let stored = admin::get_job(&pool, successor).await.expect("stored row");
+    assert_eq!(stored.state, JobState::Cancelled);
+
     finalize_after_test(&pool).await;
 }
