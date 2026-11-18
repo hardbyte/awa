@@ -311,15 +311,16 @@ To set it up:
 1. Create a database per isolation domain and run `awa migrate` against each. Every release's migrations, and any staged storage transition, must then be applied to each database.
 2. Assign each queue to exactly one database. Run its workers with a pool connected to that database: `Client::builder(pool)` in Rust, `awa.AsyncClient(database_url)` in Python. Every runtime contends for maintenance leadership, so each database's leader is one of the runtimes connected to it.
 3. Route producers by queue: insert with a pool or client connected to the database that serves the queue. A job inserted into a database whose runtimes do not serve its queue waits there; nothing moves it to another database. Follow-up jobs that a handler enqueues, including lifecycle-hook follow-ups, go to the handler's own database, so keep a workflow's queues in one database.
-4. Declare periodic jobs on the clients of the database that serves their queue, since each database's leader evaluates only its own schedules.
-5. Run `awa serve` and the other `awa` commands once per database, with `--database-url` or `DATABASE_URL` set to it; one UI shows one database.
+4. Declare each unowned periodic job on every client connected to the database that serves its queue. Any of them may lead, and a leader writes to `awa.cron_jobs` only the unowned schedules its own client declares, so a schedule that only some clients declare is not registered until one of them leads. Use [owner-scoped schedules](../configuration/index.md#owner-scoped-periodic-reconciliation) to make registration independent of which client leads.
+5. When a queue moves from one database to another, its jobs and schedules in the old database stay there: `move_queue` cannot move jobs between databases. Keep a worker for the queue connected to the old database until its jobs there finish, or drain them. Retire each unowned schedule the queue's jobs come from in the old database (`awa cron retire <name> --apply` with `--database-url` set to that database) as the queue moves, or the old database's leader keeps enqueuing them there; owned schedules follow their owner's reconciliation in each database.
+6. Run `awa serve` and the other `awa` commands once per database, with `--database-url` or `DATABASE_URL` set to it; one UI shows one database.
 
 Costs:
 
 - more partitions and maintenance work in total, since each database keeps its own rings and leader
 - a separate pool, and more server connections, in every process that serves or enqueues into more than one database
 - no transaction spans databases: a handler or a producer transaction can enqueue atomically only into its own database, unique keys deduplicate only within one database, and a job cannot be moved between databases with `move_queue`
-- Awa's metrics carry no database attribute, so tell the domains apart by the resource attributes of the processes that serve them
+- Awa's metrics carry no database attribute, so the domains can be told apart only by the resource attributes of the processes that serve them: run each database's workers in processes of their own if you need per-database metrics
 
 When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero `priority_aging_interval`, queues are not left paused or unserved with jobs waiting, and you alert on `awa.maintenance.prune.pinned_ready_age`, on prune attempts with outcome `blocked`, and on `awa.ring.generation` that stops advancing, one database is simpler and a stall is caught before it costs much storage. `pinned_ready_age` catches a lane pinning the ring; it does not report [overlapping claims that keep prune blocked](../troubleshooting/index.md#ring-prune-stays-blocked-under-claim-load), which only the `blocked` count and a flat ring generation show.
 
