@@ -199,14 +199,14 @@ pub struct Context<'a> {
 pub enum Explanation {
     Intent { kind: String, detail: String },
     Progress { last_move_s: f64 },
-    Disruption { detail: String },
+    HoldsLocks { detail: String },
 }
 
 impl Context<'_> {
-    fn disruption(&self, at_ms: i64) -> Option<Explanation> {
+    fn holds_locks(&self, at_ms: i64) -> Option<Explanation> {
         super::intent::covering(self.spans, None, at_ms, self.grace_ms)
-            .find(|span| span.intent == Intent::Disruption)
-            .map(|span| Explanation::Disruption {
+            .find(|span| span.intent == Intent::HoldsLocks)
+            .map(|span| Explanation::HoldsLocks {
                 detail: span.detail.clone(),
             })
     }
@@ -237,7 +237,7 @@ impl Context<'_> {
                 last_move_s: last as f64 / 1000.0,
             });
         }
-        self.disruption(at_ms)
+        None
     }
 }
 
@@ -276,7 +276,7 @@ pub fn ring_stalls(series: &Series, context: &Context, window_ms: i64) -> Vec<Ri
                     );
                 let pins = series.pins_at(at_ms);
                 let explained = !busy
-                    || context.disruption(at_ms).is_some()
+                    || context.holds_locks(at_ms).is_some()
                     || (ring == "queue"
                         && !pins.is_empty()
                         && pins
@@ -333,7 +333,8 @@ pub struct PruneStarvation {
 }
 
 /// Windows of `window_ms` in which prune was `blocked` at least `min_blocked` times and
-/// never `pruned` (#721), outside disruptions; consecutive windows merge into one episode.
+/// never `pruned` (#721), unless a session held locks on purpose; consecutive windows
+/// merge into one episode.
 pub fn prune_starvation(
     series: &Series,
     context: &Context,
@@ -358,12 +359,12 @@ pub fn prune_starvation(
                 - series.count(PRUNE_ATTEMPTS, &ring, "blocked", from_ms);
             let pruned = series.count(PRUNE_ATTEMPTS, &ring, "pruned", at_ms)
                 - series.count(PRUNE_ATTEMPTS, &ring, "pruned", from_ms);
-            let disrupted = context.spans.iter().any(|span| {
-                span.intent == Intent::Disruption
+            let locked = context.spans.iter().any(|span| {
+                span.intent == Intent::HoldsLocks
                     && span.queue.is_none()
                     && span.overlaps(from_ms, at_ms, context.grace_ms)
             });
-            if blocked >= min_blocked as f64 && pruned == 0.0 && !disrupted {
+            if blocked >= min_blocked as f64 && pruned == 0.0 && !locked {
                 match &mut current {
                     Some(episode) => {
                         episode.to_ms = at_ms;
@@ -852,7 +853,14 @@ mod tests {
         assert!(episodes[0].from_ms >= 100_000 && episodes[0].to_ms == 400_000);
 
         let log = IntentLog::default();
-        log.window(None, Intent::Disruption, "completion stall", 0, 400_000);
+        log.window(None, Intent::Disruption, "chaos window", 0, 400_000);
+        let spans = log.spans();
+        assert_eq!(
+            prune_starvation(&series, &context(&spans, &progress), 120_000, 10).len(),
+            1,
+            "a chaos window does not excuse a starved prune"
+        );
+        log.window(None, Intent::HoldsLocks, "completion stall", 0, 400_000);
         let spans = log.spans();
         assert!(prune_starvation(&series, &context(&spans, &progress), 120_000, 10).is_empty());
     }

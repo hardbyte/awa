@@ -19,10 +19,14 @@
 //! | `Paused` | a stalled claim cursor (with the existing hold count), a ready lane pinning the queue ring, the queue ring's generation standing still |
 //! | `Unserved` | the same, for a queue no runtime serves |
 //! | `OperatorOp(kind)` | the same while the operation runs; the bounded-release check measures from its end |
-//! | `Disruption` | everything above for every queue and ring, prune `blocked` without `pruned`, and backends over a fleet budget |
+//! | `HoldsLocks` | every ring standing still and prune `blocked` without `pruned`, while a session holds locks on awa's tables on purpose |
+//! | `Disruption` | backends over a fleet budget while runtimes restart; admin latency samples during it are counted apart |
 //!
-//! Every allowance extends `AWA_SOAK_PIN_RELEASE_SECONDS` past the end of the span, the
-//! time the system has to recover once the state is lifted.
+//! A `Disruption` (every chaos window) does not excuse the maintenance-progress checks:
+//! chaos runs through most of a default soak, and a kill or a terminated connection
+//! should not keep rings from moving for minutes. Every allowance extends
+//! `AWA_SOAK_PIN_RELEASE_SECONDS` past the end of the span, the time the system has to
+//! recover once the state is lifted.
 
 use super::registry::QueueInfo;
 use serde::Serialize;
@@ -39,6 +43,8 @@ pub enum Intent {
     /// An operator operation (`cancel`, `move`, `set_priority`, `drain`, ...) is in flight
     /// on the queue's lanes.
     OperatorOp(&'static str),
+    /// A session holds locks on awa's tables on purpose (the completion stall).
+    HoldsLocks,
     /// A disruptive window (kill, restart, terminated connections, a completion stall).
     Disruption,
 }

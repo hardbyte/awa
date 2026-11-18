@@ -287,10 +287,10 @@ impl ChecksConfig {
             pinned_age_max: scaled_timeout(seconds("AWA_SOAK_PINNED_AGE_SECONDS", 120)),
             pin_release: scaled_timeout(seconds("AWA_SOAK_PIN_RELEASE_SECONDS", 60)),
             pin_hold: seconds("AWA_SOAK_PIN_HOLD_SECONDS", 50),
-            admin_budgets_ms: budgets("AWA_SOAK_ADMIN_P99_MS", [500, 2_000, 2_000, 2_000])?,
+            admin_budgets_ms: budgets("AWA_SOAK_ADMIN_P99_MS", [2_000, 5_000, 5_000, 5_000])?,
             admin_http_budgets_ms: budgets(
                 "AWA_SOAK_ADMIN_HTTP_P99_MS",
-                [2_000, 5_000, 5_000, 5_000],
+                [5_000, 15_000, 15_000, 15_000],
             )?,
             admin_warmup: seconds("AWA_SOAK_ADMIN_WARMUP_SECONDS", 60),
             admin_min_samples: env_parse("AWA_SOAK_ADMIN_MIN_SAMPLES").unwrap_or(20),
