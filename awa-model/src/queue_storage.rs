@@ -11785,8 +11785,11 @@ impl QueueStorage {
                         cursors.*,
                         LEAST(first_visible.lane_seq + $5, cursors.to_seq) AS window_end
                     FROM cursors
-                    CROSS JOIN LATERAL (
-                        SELECT min(head.lane_seq) AS lane_seq
+                    -- A lane's segments cover disjoint position ranges, so
+                    -- the first segment in position order with a visible row
+                    -- at or after the cursor holds the lane's first one.
+                    JOIN LATERAL (
+                        SELECT head.lane_seq
                         FROM {schema}.ready_segments AS segment
                         CROSS JOIN LATERAL (
                             SELECT ready.lane_seq
@@ -11797,7 +11800,7 @@ impl QueueStorage {
                               AND ready.priority = cursors.priority
                               AND ready.enqueue_shard = cursors.enqueue_shard
                               AND ready.lane_seq >= GREATEST(segment.first_lane_seq, cursors.claim_seq)
-                              AND ready.lane_seq < segment.next_lane_seq
+                              AND ready.lane_seq < LEAST(segment.next_lane_seq, cursors.to_seq)
                             ORDER BY ready.lane_seq
                             LIMIT 1
                         ) AS head
@@ -11805,7 +11808,10 @@ impl QueueStorage {
                           AND segment.priority = cursors.priority
                           AND segment.enqueue_shard = cursors.enqueue_shard
                           AND segment.next_lane_seq > cursors.claim_seq
-                    ) AS first_visible
+                          AND segment.first_lane_seq < cursors.to_seq
+                        ORDER BY segment.next_lane_seq
+                        LIMIT 1
+                    ) AS first_visible ON TRUE
                 ),
                 scanned AS (
                     SELECT
