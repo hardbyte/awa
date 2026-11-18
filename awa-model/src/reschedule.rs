@@ -228,6 +228,8 @@ async fn reschedule_attempt_tx(
     progress: Option<&serde_json::Value>,
     may_conflict: bool,
 ) -> Result<(RescheduleOutcome, Option<JobRow>), AwaError> {
+    let error = error.map(crate::queue_storage::without_duplicate_mask);
+    let error = error.as_ref();
     // Lock the transition singleton FOR SHARE for the rest of this
     // transaction before deciding where the attempt goes. `storage_abort`,
     // `storage_enter_mixed_transition`, and `storage_finalize` all take

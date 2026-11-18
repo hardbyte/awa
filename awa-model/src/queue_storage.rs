@@ -1966,6 +1966,16 @@ fn revived_unique_states(
     Ok(unique_states)
 }
 
+/// `entry` without the duplicate cancellation mask key, which only awa
+/// records.
+pub(crate) fn without_duplicate_mask(entry: &serde_json::Value) -> serde_json::Value {
+    let mut entry = entry.clone();
+    if let Some(object) = entry.as_object_mut() {
+        object.remove(DUPLICATE_CANCEL_MASK_KEY);
+    }
+    entry
+}
+
 /// A caller-supplied error entry as stored on a failed job, with the
 /// attempt, time and terminal flag filled in when absent. The duplicate
 /// cancellation mask key is dropped: only awa records it.
@@ -20352,6 +20362,20 @@ mod revived_unique_states_tests {
         assert_eq!(
             revived_unique_states(JobState::Cancelled, None, None, &payload(entry)).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn a_reschedule_error_cannot_record_a_duplicate_mask() {
+        let entry = without_duplicate_mask(&serde_json::json!({
+            "error": RETRIED_DUPLICATE_ERROR,
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], RETRIED_DUPLICATE_ERROR);
+        assert_eq!(
+            without_duplicate_mask(&serde_json::json!("plain")),
+            serde_json::json!("plain")
         );
     }
 
