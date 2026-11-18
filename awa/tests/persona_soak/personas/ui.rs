@@ -180,6 +180,18 @@ impl Http {
     }
 }
 
+/// The id and run lease of a job row the cancel endpoints returned, when the
+/// row is a cancelled job.
+fn cancelled_row(row: &Value) -> Option<(i64, i64)> {
+    if row.get("state").and_then(Value::as_str) != Some("cancelled") {
+        return None;
+    }
+    Some((
+        row.get("id").and_then(Value::as_i64)?,
+        row.get("run_lease").and_then(Value::as_i64)?,
+    ))
+}
+
 fn ids_of(value: &Value) -> Vec<i64> {
     value
         .as_array()
@@ -500,17 +512,25 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                         .ledger
                         .get(ids[0])
                         .is_some_and(|record| record.completed_events > 0);
-                    if http
+                    let reply = http
                         .post(
                             "/api/jobs/{id}/cancel",
                             &format!("/api/jobs/{}/cancel", ids[0]),
                             json!({}),
                         )
                         .await
-                        .json()
-                        .is_some()
-                    {
-                        shared.record_operator_cancel(persona, ids[0], completed_before, now);
+                        .json();
+                    // A 2xx answer is `null` when there was nothing to cancel.
+                    if let Some((id, run_lease)) = reply.as_ref().and_then(cancelled_row) {
+                        if id == ids[0] {
+                            shared.record_operator_cancel(
+                                persona,
+                                id,
+                                run_lease,
+                                completed_before,
+                                now,
+                            );
+                        }
                     }
                 } else if let Some(cancelled) = http
                     .post(
@@ -521,8 +541,9 @@ pub async fn run_ui_operator(shared: Arc<Shared>) -> Result<(), String> {
                     .await
                     .json()
                 {
-                    for id in ids_of(&cancelled) {
-                        shared.record_operator_cancel(persona, id, false, now);
+                    let rows = cancelled.as_array().map(Vec::as_slice).unwrap_or_default();
+                    for (id, run_lease) in rows.iter().filter_map(cancelled_row) {
+                        shared.record_operator_cancel(persona, id, run_lease, false, now);
                     }
                 }
             }
