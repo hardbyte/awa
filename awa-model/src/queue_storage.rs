@@ -17638,77 +17638,61 @@ impl QueueStorage {
     }
 
     /// Retry `ids` in the open transaction, skipping any job whose retry
-    /// would violate a unique claim. The jobs are retried together; only
-    /// when one conflicts are they retried again one at a time, each in a
-    /// savepoint.
+    /// would violate a unique claim. Each pass takes the jobs and claims all
+    /// their keys, in key order, before any lane is reserved. A pass that
+    /// meets a conflict holds no lane yet; it is rolled back and the next
+    /// pass leaves the conflicting jobs where they are.
     async fn retry_jobs_skipping_conflicts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         ids: &[i64],
         skipped: &mut impl FnMut(i64),
     ) -> Result<Vec<JobRow>, AwaError> {
-        sqlx::query("SAVEPOINT awa_bulk_batch")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        let mut rows = Vec::with_capacity(ids.len());
-        let mut conflicted = false;
-        for job_id in ids {
-            match self.retry_job_tx(tx, *job_id).await {
-                Ok(Some(row)) => rows.push(row),
-                Ok(None) => {}
-                Err(AwaError::UniqueConflict { .. }) => {
-                    conflicted = true;
-                    break;
-                }
-                Err(err) => return Err(err),
+        let mut ids: Vec<i64> = ids.to_vec();
+        loop {
+            if ids.is_empty() {
+                return Ok(Vec::new());
             }
-        }
-        if !conflicted {
+            sqlx::query("SAVEPOINT awa_bulk_batch")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            let mut taken = Vec::with_capacity(ids.len());
+            for job_id in &ids {
+                if let Some((ready_row, old_state)) = self.take_retry_row_tx(tx, *job_id).await? {
+                    taken.push((ready_row, Some(old_state)));
+                }
+            }
+            let conflicts = self.sync_reenqueue_unique_claims(tx, &taken, true).await?;
+            if conflicts.is_empty() {
+                let rows = taken
+                    .iter()
+                    .map(|(ready_row, _)| Self::retried_job_row(ready_row.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let queues: BTreeSet<String> = taken
+                    .iter()
+                    .map(|(ready_row, _)| ready_row.queue.clone())
+                    .collect();
+                self.insert_existing_ready_rows_inner_tx(tx, taken, false)
+                    .await?;
+                self.notify_queues_tx(tx, queues).await?;
+                sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return Ok(rows);
+            }
+            sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_batch")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
             sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-            return Ok(rows);
+            ids.retain(|job_id| !conflicts.contains(job_id));
+            conflicts.into_iter().for_each(&mut *skipped);
         }
-
-        sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_batch")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        rows.clear();
-        for job_id in ids {
-            sqlx::query("SAVEPOINT awa_bulk_row")
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            match self.retry_job_tx(tx, *job_id).await {
-                Ok(row) => {
-                    sqlx::query("RELEASE SAVEPOINT awa_bulk_row")
-                        .execute(tx.as_mut())
-                        .await
-                        .map_err(map_sqlx_error)?;
-                    rows.extend(row);
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_row")
-                        .execute(tx.as_mut())
-                        .await
-                        .map_err(map_sqlx_error)?;
-                    sqlx::query("RELEASE SAVEPOINT awa_bulk_row")
-                        .execute(tx.as_mut())
-                        .await
-                        .map_err(map_sqlx_error)?;
-                    skipped(*job_id);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(rows)
     }
 
     /// Retry up to `batch_size` failed jobs matching `kind` and `queue` past
