@@ -1472,3 +1472,85 @@ async fn drain_reports_committed_cancellations_when_moving_claim_cursors_fails()
 
     setup::clean_queue(&pool, &queue).await;
 }
+
+/// Make taking failed done rows of `kind` out of `awa.done_entries` raise a
+/// unique violation, as reviving a job whose unique claim cannot be restored
+/// does, until [`restore_done_deletes`].
+async fn refuse_done_deletes_of(pool: &PgPool, kind: &str) {
+    sqlx::query(&format!(
+        r#"
+        CREATE FUNCTION awa.test_refuse_done_delete() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF OLD.kind = '{kind}' THEN
+                RAISE unique_violation USING MESSAGE = 'retry refused by the test';
+            END IF;
+            RETURN OLD;
+        END
+        $$
+        "#
+    ))
+    .execute(pool)
+    .await
+    .expect("create refusing function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_done_delete BEFORE DELETE ON awa.done_entries \
+         FOR EACH ROW EXECUTE FUNCTION awa.test_refuse_done_delete()",
+    )
+    .execute(pool)
+    .await
+    .expect("create refusing trigger");
+}
+
+async fn restore_done_deletes(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER IF EXISTS test_refuse_done_delete ON awa.done_entries")
+        .execute(pool)
+        .await
+        .expect("drop refusing trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS awa.test_refuse_done_delete()")
+        .execute(pool)
+        .await
+        .expect("drop refusing function");
+}
+
+/// A job whose retry is refused with a unique conflict while it is taken out
+/// of its done row, before its key is claimed, is skipped and reported, and
+/// the batch's other jobs are still retried.
+#[tokio::test]
+async fn bounded_retry_skips_a_job_refused_while_taken() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_retry_refused_take");
+    let mut ids = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+    let refused = insert_jobs(&pool, &queue, "bulk_refused_job", 1).await;
+    ids.extend(&refused);
+    fail_jobs(&pool, Engine::QueueStorage, &ids).await;
+
+    refuse_done_deletes_of(&pool, "bulk_refused_job").await;
+    let by_queue =
+        admin::retry_failed_by_queue_batch(&pool, &queue, 10, BulkCursor::default()).await;
+    let by_ids = admin::bulk_retry_in_batches(&pool, &refused, 10).await;
+    restore_done_deletes(&pool).await;
+
+    let batch = by_queue.expect("retry_failed_batch skips the refused job");
+    assert_eq!(
+        (batch.count, batch.skipped, batch.conflicts.clone()),
+        (2, 1, refused.clone())
+    );
+    let outcome = by_ids.expect("retry_jobs_in_batches skips the refused job");
+    assert_eq!(
+        (
+            outcome.jobs.len(),
+            outcome.skipped,
+            outcome.conflicts.clone()
+        ),
+        (0, 1, refused.clone())
+    );
+    let now = states(&pool, &ids).await;
+    assert_eq!(
+        (count_of(&now, "available"), count_of(&now, "failed")),
+        (2, 1),
+        "{now:?}"
+    );
+    setup::clean_queue(&pool, &queue).await;
+}

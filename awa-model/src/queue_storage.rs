@@ -17702,8 +17702,9 @@ impl QueueStorage {
     /// Retry `ids` in the open transaction, skipping any job whose retry
     /// would violate a unique claim. Each pass takes the jobs and claims all
     /// their keys, in key order, before any lane is reserved. A pass that
-    /// meets a conflict holds no lane yet; it is rolled back and the next
-    /// pass leaves the conflicting jobs where they are.
+    /// meets a conflict, whether taking a job or claiming the keys, holds no
+    /// lane yet; it is rolled back and the next pass leaves the conflicting
+    /// jobs where they are.
     async fn retry_jobs_skipping_conflicts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -17720,12 +17721,22 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             let mut taken = Vec::with_capacity(ids.len());
+            let mut take_conflict = None;
             for job_id in &ids {
-                if let Some((ready_row, old_state)) = self.take_retry_row_tx(tx, *job_id).await? {
-                    taken.push((ready_row, Some(old_state)));
+                match self.take_retry_row_tx(tx, *job_id).await {
+                    Ok(Some((ready_row, old_state))) => taken.push((ready_row, Some(old_state))),
+                    Ok(None) => {}
+                    Err(AwaError::UniqueConflict { .. }) => {
+                        take_conflict = Some(*job_id);
+                        break;
+                    }
+                    Err(err) => return Err(err),
                 }
             }
-            let conflicts = self.sync_reenqueue_unique_claims(tx, &taken, true).await?;
+            let conflicts = match take_conflict {
+                Some(job_id) => HashSet::from([job_id]),
+                None => self.sync_reenqueue_unique_claims(tx, &taken, true).await?,
+            };
             if conflicts.is_empty() {
                 let rows = taken
                     .iter()
