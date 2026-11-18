@@ -454,6 +454,15 @@ pub(crate) struct AvailableSignal {
     pub available: i64,
 }
 
+/// Where a gated rotation learns whether its ring is idle.
+#[derive(Debug, Clone, Copy)]
+enum RingIdleProbe {
+    /// Probe inside the rotation transaction.
+    InRotation,
+    /// The caller probed the ring before the rotation began.
+    Observed(bool),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotateOutcome {
     Rotated {
@@ -20306,11 +20315,18 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         relation: &str,
     ) -> Result<bool, AwaError> {
+        Self::relation_has_rows(tx.as_mut(), relation).await
+    }
+
+    async fn relation_has_rows(
+        conn: &mut sqlx::PgConnection,
+        relation: &str,
+    ) -> Result<bool, AwaError> {
         sqlx::query_scalar(audited_sql(format!(
             "SELECT EXISTS (SELECT 1 FROM {relation} LIMIT 1)"
         )))
         .persistent(false)
-        .fetch_one(tx.as_mut())
+        .fetch_one(conn)
         .await
         .map_err(map_sqlx_error)
     }
@@ -20321,16 +20337,55 @@ impl QueueStorage {
     /// single `EXISTS ... LIMIT 1` probe; when the ring really is idle all
     /// probes hit empty heaps. Same SQL shape (and lock strength —
     /// AccessShare only) as the per-table busy checks above.
-    async fn relations_all_empty_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    async fn relations_all_empty(
+        conn: &mut sqlx::PgConnection,
         relations: &[String],
     ) -> Result<bool, AwaError> {
         for relation in relations {
-            if Self::relation_has_rows_tx(tx, relation).await? {
+            if Self::relation_has_rows(conn, relation).await? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Partitioned parents of every queue-ring family, for the idle gate.
+    fn queue_ring_parents(&self) -> [String; 8] {
+        let schema = self.schema();
+        [
+            "ready_entries",
+            "ready_claim_attempt_batches",
+            "done_entries",
+            "ready_tombstones",
+            "ready_segments",
+            "receipt_completion_batches",
+            "receipt_completion_tombstones",
+            "queue_terminal_count_deltas",
+        ]
+        .map(|table| format!("{schema}.{table}"))
+    }
+
+    /// Partitioned parents of every claim-ring family, for the idle gate.
+    fn claim_ring_parents(&self) -> [String; 4] {
+        let schema = self.schema();
+        [
+            "lease_claims",
+            "lease_claim_batches",
+            "lease_claim_closures",
+            "lease_claim_closure_batches",
+        ]
+        .map(|table| format!("{schema}.{table}"))
+    }
+
+    /// Lease-ring idle gate: true when no lease partition holds reclaimable
+    /// storage.
+    async fn lease_ring_idle(&self, conn: &mut sqlx::PgConnection) -> Result<bool, AwaError> {
+        let has_reclaimable_storage: bool = sqlx::query_scalar(RECLAIMABLE_CHILD_STORAGE_SQL)
+            .bind(self.leases_table())
+            .fetch_one(conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(!has_reclaimable_storage)
     }
 
     async fn slot_still_filling_tx(
@@ -20437,6 +20492,37 @@ impl QueueStorage {
         &self,
         pool: &PgPool,
         cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
+        self.rotate_queue_ring(pool, cadence, RingIdleProbe::InRotation)
+            .await
+    }
+
+    /// [`Self::rotate_with_cadence`] with the idle gate's probe run on
+    /// `check_conn`, before the rotation transaction begins on `pool`.
+    ///
+    /// The probe scans every partition of the ring, which loads each
+    /// partition's relcache entry and index metadata into the session that
+    /// runs it; a caller that probes on one long-lived connection keeps that
+    /// metadata out of the pool's sessions. The probe's statements run
+    /// outside a transaction, so `check_conn` never holds one when this
+    /// returns. The gate decides as in [`Self::rotate_with_cadence`].
+    #[tracing::instrument(skip(self, check_conn, pool), name = "queue_storage.rotate")]
+    pub async fn rotate_with_cadence_on(
+        &self,
+        check_conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
+        let idle = Self::relations_all_empty(check_conn, &self.queue_ring_parents()).await?;
+        self.rotate_queue_ring(pool, cadence, RingIdleProbe::Observed(idle))
+            .await
+    }
+
+    async fn rotate_queue_ring(
+        &self,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+        idle_probe: RingIdleProbe,
     ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -20586,17 +20672,13 @@ impl QueueStorage {
         // the next tick observes the row and rotates. The skip never
         // loses data and never leaves a non-empty slot unsealed while
         // traffic flows.
-        let ring_parents = [
-            format!("{schema}.ready_entries"),
-            format!("{schema}.ready_claim_attempt_batches"),
-            format!("{schema}.done_entries"),
-            format!("{schema}.ready_tombstones"),
-            format!("{schema}.ready_segments"),
-            format!("{schema}.receipt_completion_batches"),
-            format!("{schema}.receipt_completion_tombstones"),
-            format!("{schema}.queue_terminal_count_deltas"),
-        ];
-        if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
+        let ring_idle = match idle_probe {
+            RingIdleProbe::InRotation => {
+                Self::relations_all_empty(tx.as_mut(), &self.queue_ring_parents()).await?
+            }
+            RingIdleProbe::Observed(idle) => idle,
+        };
+        if ring_idle {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedIdle {
                 slot: state.0,
@@ -20646,6 +20728,30 @@ impl QueueStorage {
         &self,
         pool: &PgPool,
         cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
+        self.rotate_lease_ring(pool, cadence, RingIdleProbe::InRotation)
+            .await
+    }
+
+    /// [`Self::rotate_leases_with_cadence`] with the idle gate's probe run on
+    /// `check_conn`. See [`Self::rotate_with_cadence_on`].
+    #[tracing::instrument(skip(self, check_conn, pool), name = "queue_storage.rotate_leases")]
+    pub async fn rotate_leases_with_cadence_on(
+        &self,
+        check_conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
+        let idle = self.lease_ring_idle(check_conn).await?;
+        self.rotate_lease_ring(pool, cadence, RingIdleProbe::Observed(idle))
+            .await
+    }
+
+    async fn rotate_lease_ring(
+        &self,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+        idle_probe: RingIdleProbe,
     ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -20726,12 +20832,11 @@ impl QueueStorage {
         // Completion and VACUUM can empty heaps while retaining indexes/TOAST.
         // Seal these children so prune can reclaim physical storage, while
         // genuinely idle rings with only empty-index overhead remain frozen.
-        let has_reclaimable_storage: bool = sqlx::query_scalar(RECLAIMABLE_CHILD_STORAGE_SQL)
-            .bind(format!("{schema}.leases"))
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        if !has_reclaimable_storage {
+        let ring_idle = match idle_probe {
+            RingIdleProbe::InRotation => self.lease_ring_idle(tx.as_mut()).await?,
+            RingIdleProbe::Observed(idle) => idle,
+        };
+        if ring_idle {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedIdle {
                 slot: state.0,
@@ -22217,6 +22322,30 @@ impl QueueStorage {
         pool: &PgPool,
         cadence: RingRotationCadence,
     ) -> Result<RotateOutcome, AwaError> {
+        self.rotate_claim_ring(pool, cadence, RingIdleProbe::InRotation)
+            .await
+    }
+
+    /// [`Self::rotate_claims_with_cadence`] with the idle gate's probe run on
+    /// `check_conn`. See [`Self::rotate_with_cadence_on`].
+    #[tracing::instrument(skip(self, check_conn, pool), name = "queue_storage.rotate_claims")]
+    pub async fn rotate_claims_with_cadence_on(
+        &self,
+        check_conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
+        let idle = Self::relations_all_empty(check_conn, &self.claim_ring_parents()).await?;
+        self.rotate_claim_ring(pool, cadence, RingIdleProbe::Observed(idle))
+            .await
+    }
+
+    async fn rotate_claim_ring(
+        &self,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+        idle_probe: RingIdleProbe,
+    ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -22315,13 +22444,13 @@ impl QueueStorage {
         // is load-bearing (prune never advances slot generations; freezing
         // rotation with sealed receipt evidence behind would strand it
         // until traffic resumed).
-        let ring_parents = [
-            format!("{schema}.lease_claims"),
-            format!("{schema}.lease_claim_batches"),
-            format!("{schema}.lease_claim_closures"),
-            format!("{schema}.lease_claim_closure_batches"),
-        ];
-        if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
+        let ring_idle = match idle_probe {
+            RingIdleProbe::InRotation => {
+                Self::relations_all_empty(tx.as_mut(), &self.claim_ring_parents()).await?
+            }
+            RingIdleProbe::Observed(idle) => idle,
+        };
+        if ring_idle {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedIdle {
                 slot: state.0,

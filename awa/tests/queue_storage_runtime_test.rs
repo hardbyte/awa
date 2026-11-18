@@ -29862,3 +29862,412 @@ async fn test_queue_storage_metadata_completion_validates_and_does_not_lock_comp
         assert_eq!(durable.metadata, serde_json::json!({"source": "recovery"}));
     }
 }
+
+/// `application_name` of the session the maintenance leader runs ring idle
+/// checks on.
+const IDLE_CHECK_APPLICATION_NAME: &str = "awa-maintenance-idle-check";
+const MAINTENANCE_LEADER_LOCK_KEY: i64 = 0x4157_415f_4d41_494e;
+
+/// The partitioned parents the idle gate probes, per ring.
+const IDLE_GATE_RING_TABLES: [(&str, &[&str]); 3] = [
+    (
+        "queue",
+        &[
+            "ready_entries",
+            "ready_claim_attempt_batches",
+            "done_entries",
+            "ready_tombstones",
+            "ready_segments",
+            "receipt_completion_batches",
+            "receipt_completion_tombstones",
+            "queue_terminal_count_deltas",
+        ],
+    ),
+    ("lease", &["leases"]),
+    (
+        "claim",
+        &[
+            "lease_claims",
+            "lease_claim_batches",
+            "lease_claim_closures",
+            "lease_claim_closure_batches",
+        ],
+    ),
+];
+
+fn idle_check_store_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 4,
+        lease_claim_receipts: true,
+        ..Default::default()
+    }
+}
+
+/// Per ring, every index on a leaf partition of one of its tables.
+async fn ring_partition_indexes(pool: &sqlx::PgPool, schema: &str) -> Vec<Vec<String>> {
+    let mut rings = Vec::new();
+    for (ring, tables) in IDLE_GATE_RING_TABLES {
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT ic.relname::text
+             FROM unnest($1::text[]) AS t(name)
+             CROSS JOIN LATERAL pg_partition_tree(t.name::regclass) tree
+             JOIN pg_index x ON x.indrelid = tree.relid
+             JOIN pg_class ic ON ic.oid = x.indexrelid
+             WHERE tree.isleaf
+             ORDER BY 1",
+        )
+        .bind(
+            tables
+                .iter()
+                .map(|table| format!("{schema}.{table}"))
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(pool)
+        .await
+        .expect("list ring partition indexes");
+        assert!(
+            !indexes.is_empty(),
+            "the {ring} ring's partitions have no indexes"
+        );
+        rings.push(indexes);
+    }
+    rings
+}
+
+/// Per idle pooled session: its pid, and per ring how many of that ring's
+/// partition indexes have relcache index info loaded in the session.
+async fn pooled_ring_index_footprint(
+    pool: &sqlx::PgPool,
+    rings: &[Vec<String>],
+) -> Vec<(i32, Vec<usize>)> {
+    // A released connection rejoins the idle set asynchronously.
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(5));
+    while pool.num_idle() < pool.size() as usize {
+        assert!(Instant::now() < deadline, "pooled sessions did not go idle");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut held = Vec::new();
+    while let Some(conn) = pool.try_acquire() {
+        held.push(conn);
+    }
+    assert!(!held.is_empty(), "the pool has no idle sessions to inspect");
+    let mut footprint = Vec::with_capacity(held.len());
+    for conn in &mut held {
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **conn)
+            .await
+            .expect("backend pid");
+        footprint.push((pid, session_ring_index_footprint(conn, rings).await));
+    }
+    footprint
+}
+
+/// Per ring, how many of its partition indexes have relcache index info
+/// loaded in `conn`'s session.
+async fn session_ring_index_footprint(
+    conn: &mut sqlx::PgConnection,
+    rings: &[Vec<String>],
+) -> Vec<usize> {
+    let mut loaded = Vec::with_capacity(rings.len());
+    for indexes in rings {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT ident) FROM pg_backend_memory_contexts
+             WHERE name = 'index info' AND ident = ANY($1)",
+        )
+        .bind(indexes)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read backend memory contexts");
+        loaded.push(count as usize);
+    }
+    loaded
+}
+
+/// The rings, by index into `rings`, whose every partition index is loaded in
+/// some session of `footprint`.
+fn fully_loaded_rings(footprint: &[(i32, Vec<usize>)], rings: &[Vec<String>]) -> Vec<usize> {
+    (0..rings.len())
+        .filter(|&ring| {
+            footprint
+                .iter()
+                .any(|(_, loaded)| loaded[ring] == rings[ring].len())
+        })
+        .collect()
+}
+
+async fn idle_check_sessions(pool: &sqlx::PgPool) -> Vec<(i32, String)> {
+    sqlx::query_as(
+        "SELECT pid, coalesce(state, '') FROM pg_stat_activity
+         WHERE datname = current_database() AND application_name = $1
+         ORDER BY pid",
+    )
+    .bind(IDLE_CHECK_APPLICATION_NAME)
+    .fetch_all(pool)
+    .await
+    .expect("list idle check sessions")
+}
+
+/// A pool of `size` warm sessions named `name` in `pg_stat_activity`.
+async fn named_warm_pool(pool: &sqlx::PgPool, name: &str, size: u32) -> sqlx::PgPool {
+    let options = (*pool.connect_options()).clone().application_name(name);
+    let named_pool = PgPoolOptions::new()
+        .max_connections(size)
+        .connect_with(options)
+        .await
+        .expect("connect named pool");
+    let mut warm = Vec::new();
+    for _ in 0..size {
+        warm.push(named_pool.acquire().await.expect("warm named pool"));
+    }
+    drop(warm);
+    named_pool
+}
+
+fn idle_check_client(
+    runtime_pool: sqlx::PgPool,
+    queue: &str,
+    config: QueueStorageConfig,
+) -> Client {
+    Client::builder(runtime_pool)
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(50),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(config, Duration::from_millis(25), Duration::from_millis(25))
+        .claim_rotate_interval(Duration::from_millis(25))
+        .ring_rotation_cadence(RingRotationCadence::EAGER)
+        .register::<CompleteJob, _, _>(|_, _| async { Ok(JobResult::Completed) })
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(25))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("build client")
+}
+
+/// The maintenance leader runs every ring idle check on one session, so the
+/// pool's sessions never load the ring partitions' metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_maintenance_idle_checks_run_on_one_session() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let schema = "awa_qs_idle_check_one_session";
+    let queue = "qs_idle_check_one_session";
+    let config = idle_check_store_config(schema);
+    let store = create_store_with_config(&pool, config.clone()).await;
+    let rings = ring_partition_indexes(&pool, schema).await;
+    let cursors_before = [
+        ring_cursor(&pool, schema, "queue").await,
+        ring_cursor(&pool, schema, "lease").await,
+        ring_cursor(&pool, schema, "claim").await,
+    ];
+
+    let runtime_pool = named_warm_pool(&pool, "idle-check-runtime", 6).await;
+    let client = idle_check_client(runtime_pool.clone(), queue, config);
+    client.start().await.expect("start client");
+
+    let mut check_sessions = HashSet::new();
+    let mut seen_idle = false;
+    let window = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < window {
+        for (pid, state) in idle_check_sessions(&pool).await {
+            seen_idle |= state == "idle";
+            check_sessions.insert(pid);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let longest_transaction: Option<f64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM max(now() - xact_start))::float8 FROM pg_stat_activity
+         WHERE datname = current_database() AND application_name = $1",
+    )
+    .bind(IDLE_CHECK_APPLICATION_NAME)
+    .fetch_one(&pool)
+    .await
+    .expect("idle check transaction age");
+    assert_eq!(
+        [
+            ring_cursor(&pool, schema, "queue").await,
+            ring_cursor(&pool, schema, "lease").await,
+            ring_cursor(&pool, schema, "claim").await,
+        ],
+        cursors_before,
+        "every ring is empty, so the gate must skip every rotation"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(5));
+    while !idle_check_sessions(&pool).await.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the idle check session must close when leadership ends"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let ring_sizes: Vec<usize> = rings.iter().map(Vec::len).collect();
+    let footprint = pooled_ring_index_footprint(&runtime_pool, &rings).await;
+    assert!(
+        fully_loaded_rings(&footprint, &rings).is_empty(),
+        "a pooled session loaded every partition index of a ring: {footprint:?} (ring sizes {ring_sizes:?})"
+    );
+
+    assert_eq!(
+        check_sessions.len(),
+        1,
+        "the leader must run its idle checks on one session for the whole term; saw {check_sessions:?}"
+    );
+    assert!(
+        seen_idle && longest_transaction.unwrap_or(0.0) < 1.0,
+        "the idle check session must not stay in a transaction; open for {longest_transaction:?}s"
+    );
+
+    // The detector sees a session that ran the checks. A shared-invalidation
+    // reset from concurrent DDL elsewhere empties a session's relcache, so a
+    // pass that a reset interrupted is run again.
+    let mut control = runtime_pool.acquire().await.expect("control session");
+    let mut loaded = Vec::new();
+    for _ in 0..5 {
+        store
+            .rotate_with_cadence_on(&mut control, &runtime_pool, RingRotationCadence::EAGER)
+            .await
+            .expect("queue check");
+        store
+            .rotate_leases_with_cadence_on(&mut control, &runtime_pool, RingRotationCadence::EAGER)
+            .await
+            .expect("lease check");
+        store
+            .rotate_claims_with_cadence_on(&mut control, &runtime_pool, RingRotationCadence::EAGER)
+            .await
+            .expect("claim check");
+        loaded = session_ring_index_footprint(&mut control, &rings).await;
+        if loaded == ring_sizes {
+            break;
+        }
+    }
+    assert_eq!(
+        loaded, ring_sizes,
+        "a session that ran the idle checks must hold every partition index of its rings"
+    );
+    drop(control);
+    runtime_pool.close().await;
+}
+
+/// When a leader term ends, its idle check session closes and the next
+/// term's checks gate rotation on a session of their own. Either runtime may
+/// win the next term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_idle_check_session_follows_leadership() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let schema = "awa_qs_idle_check_follows_leader";
+    let queue = "qs_idle_check_follows_leader";
+    let config = idle_check_store_config(schema);
+    let store = create_store_with_config(&pool, config.clone()).await;
+
+    let pool_a = named_warm_pool(&pool, "idle-check-a", 5).await;
+    let client_a = idle_check_client(pool_a.clone(), queue, config.clone());
+    client_a.start().await.expect("start client a");
+
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(10));
+    let check_a = loop {
+        let sessions = idle_check_sessions(&pool).await;
+        if let [(pid, _)] = sessions[..] {
+            if client_a.health_check().await.leader {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "client a did not lead with one idle check session; sessions {sessions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let pool_b = named_warm_pool(&pool, "idle-check-b", 5).await;
+    let client_b = idle_check_client(pool_b.clone(), queue, config.clone());
+    client_b.start().await.expect("start client b");
+
+    // End client a's leadership by closing the session that holds the lock.
+    let terminated: Vec<bool> = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(l.pid)
+         FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+         WHERE l.locktype = 'advisory' AND l.granted
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND ((l.classid::bigint << 32) | l.objid::bigint) = $1
+           AND a.application_name = 'idle-check-a'",
+    )
+    .bind(MAINTENANCE_LEADER_LOCK_KEY)
+    .fetch_all(&pool)
+    .await
+    .expect("terminate client a's leader session");
+    assert_eq!(terminated, vec![true]);
+
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(15));
+    let check_next = loop {
+        let sessions = idle_check_sessions(&pool).await;
+        let a_leads = client_a.health_check().await.leader;
+        let b_leads = client_b.health_check().await.leader;
+        if let [(pid, _)] = sessions[..] {
+            if pid != check_a && a_leads != b_leads {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a new term should start with a new idle check session; a leads {a_leads}, b leads {b_leads}, sessions {sessions:?}, old session {check_a}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let old_session_open: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(check_a)
+            .fetch_one(&pool)
+            .await
+            .expect("look up old idle check session");
+    assert!(
+        !old_session_open,
+        "client a must close its idle check session when its term ends"
+    );
+
+    // The next term's gate holds an idle ring, then rotates once a job lands.
+    let idle_cursor = ring_cursor(&pool, schema, "queue").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, idle_cursor);
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 798 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(15));
+    while ring_cursor(&pool, schema, "queue").await.1 <= idle_cursor.1 {
+        assert!(
+            Instant::now() < deadline,
+            "the next term's leader should rotate the queue ring once job {job_id} lands"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        idle_check_sessions(&pool)
+            .await
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect::<Vec<_>>(),
+        vec![check_next],
+        "the next term's leader keeps one idle check session"
+    );
+
+    client_b.shutdown(Duration::from_secs(5)).await;
+    client_a.shutdown(Duration::from_secs(5)).await;
+    pool_a.close().await;
+    pool_b.close().await;
+}
