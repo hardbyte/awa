@@ -1382,7 +1382,7 @@ async fn complete_job_canonical(
                 };
             }
 
-            let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique(
+            let (outcome, successor) = reschedule_reading_successor(
                 pool,
                 job.id,
                 job.run_lease,
@@ -1395,7 +1395,7 @@ async fn complete_job_canonical(
             )
             .await?;
             if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
-                let persisted = stored_duplicate_successor(pool, job, job_id).await?;
+                let persisted = successor;
                 let cancelled = duplicate_cancelled_event_row(
                     job,
                     job_id,
@@ -1460,7 +1460,7 @@ async fn complete_job_canonical(
                 snooze_secs = seconds,
                 "Job snoozed (attempt not incremented)"
             );
-            let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique(
+            let (outcome, successor) = reschedule_reading_successor(
                 pool,
                 job.id,
                 job.run_lease,
@@ -1473,7 +1473,7 @@ async fn complete_job_canonical(
             )
             .await?;
             if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
-                let persisted = stored_duplicate_successor(pool, job, job_id).await?;
+                let persisted = successor;
                 let cancelled = duplicate_cancelled_event_row(
                     job,
                     job_id,
@@ -1903,7 +1903,7 @@ async fn complete_job_canonical(
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
                 });
-                let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique(
+                let (outcome, successor) = reschedule_reading_successor(
                     pool,
                     job.id,
                     job.run_lease,
@@ -1914,7 +1914,7 @@ async fn complete_job_canonical(
                 )
                 .await?;
                 if let RescheduleOutcome::CancelledDuplicate { job_id } = outcome {
-                    let persisted = stored_duplicate_successor(pool, job, job_id).await?;
+                    let persisted = successor;
                     let cancelled = duplicate_cancelled_event_row(
                         job,
                         job_id,
@@ -2004,6 +2004,41 @@ fn rescheduled_event_row(
         row.finalized_at = Some(chrono::Utc::now());
     }
     row
+}
+
+/// Re-schedule a canonical attempt in its own transaction. When it is
+/// cancelled as a duplicate under a new job ID, the stored successor is
+/// read in the same transaction, so the row matches what was committed.
+#[allow(clippy::too_many_arguments)]
+async fn reschedule_reading_successor(
+    pool: &sqlx::PgPool,
+    job_id: i64,
+    run_lease: i64,
+    reschedule: Reschedule,
+    error: Option<&serde_json::Value>,
+    progress: Option<&serde_json::Value>,
+    unique_key: Option<&[u8]>,
+) -> Result<(RescheduleOutcome, Option<Box<JobRow>>), awa_model::AwaError> {
+    let mut tx = pool.begin().await.map_err(awa_model::map_sqlx_error)?;
+    let outcome = awa_model::reschedule::reschedule_canonical_attempt_with_unique_tx(
+        &mut tx, job_id, run_lease, reschedule, error, progress, unique_key,
+    )
+    .await?;
+    let successor = match &outcome {
+        RescheduleOutcome::CancelledDuplicate {
+            job_id: successor_id,
+        } if *successor_id != job_id => {
+            sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
+                .bind(successor_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(awa_model::map_sqlx_error)?
+                .map(Box::new)
+        }
+        _ => None,
+    };
+    tx.commit().await.map_err(awa_model::map_sqlx_error)?;
+    Ok((outcome, successor))
 }
 
 /// The stored row of a cancelled duplicate that routing moved to a new
