@@ -394,3 +394,117 @@ async fn a_stripe_retention_override_wins_over_its_logical_queue(pool: PgPool) {
         "{kept_stripe:?}'s one-day override must keep its DLQ rows"
     );
 }
+
+/// Insert a dead-lettered row for `queue`, dead-lettered `age_days` ago.
+async fn backdated_dlq_row(pool: &PgPool, job_id: i64, queue: &str, age_days: i64) {
+    sqlx::query(
+        "INSERT INTO awa.dlq_entries
+             (job_id, kind, queue, priority, dlq_reason, original_run_lease, dlq_at)
+         VALUES ($1, 'failing_job', $2, 2, 'test', 1, now() - make_interval(days => $3::int))",
+    )
+    .bind(job_id)
+    .bind(queue)
+    .bind(age_days as i32)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// While striping is on, DLQ retention treats `q#N` as a stripe of `q`
+/// exactly when the runtime does: `N` parses as `usize`. Stripes left over
+/// from a larger former stripe count still take `q`'s retention, and a
+/// suffix too large for `usize` names an independent queue that takes the
+/// global retention.
+#[sqlx::test(migrations = false)]
+async fn dlq_retention_uses_the_runtime_stripe_identity(pool: PgPool) {
+    // `short` has a 1-day override, `long` a 60-day one; the global
+    // retention is 30 days.
+    const SHORT: &str = "dlq_ident_short";
+    const LONG: &str = "dlq_ident_long";
+    let too_big = "999999999999999999999999999999";
+    let usize_max = usize::MAX.to_string();
+    let past_usize_max = (u128::try_from(usize::MAX).unwrap() + 1).to_string();
+    // The runtime's rule, which the rows below rely on.
+    assert_eq!("+1".parse::<usize>(), Ok(1));
+    assert!(past_usize_max.parse::<usize>().is_err());
+    // (queue, age in days, kept)
+    let rows: Vec<(String, i64, bool)> = vec![
+        // Current and retained stripes take the logical queue's override.
+        (format!("{SHORT}#0"), 2, false),
+        (format!("{SHORT}#5"), 2, false),
+        (format!("{SHORT}#+1"), 2, false),
+        (format!("{SHORT}#{usize_max}"), 2, false),
+        (format!("{LONG}#5"), 40, true),
+        // Independent queues take the global retention.
+        (format!("{SHORT}#{too_big}"), 2, true),
+        (format!("{SHORT}#{past_usize_max}"), 2, true),
+        (format!("{SHORT}#x1"), 2, true),
+        (format!("{LONG}#{too_big}"), 40, false),
+    ];
+    migrations::run(&pool).await.unwrap();
+    for (n, (queue, age, _)) in rows.iter().enumerate() {
+        backdated_dlq_row(&pool, 9_000_000 + n as i64, queue, *age).await;
+    }
+    let config = QueueStorageConfig {
+        queue_stripe_count: 2,
+        ..Default::default()
+    };
+    let day = Duration::from_secs(86_400);
+    let client = Client::builder(pool.clone())
+        .queue_storage(
+            config,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        )
+        .queue(SHORT, QueueConfig::default())
+        .dlq_retention(30 * day)
+        .cleanup_interval(Duration::from_millis(100))
+        .queue_retention(
+            SHORT,
+            RetentionPolicy {
+                completed: day,
+                failed: day,
+                dlq: Some(day),
+            },
+        )
+        .queue_retention(
+            LONG,
+            RetentionPolicy {
+                completed: day,
+                failed: day,
+                dlq: Some(60 * day),
+            },
+        )
+        .register::<FailingJob, _, _>(|_args, _ctx| async move {
+            Err(JobError::terminal("always fails"))
+        })
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+
+    let expected_kept = rows.iter().filter(|(_, _, kept)| *kept).count() as i64;
+    let deadline = tokio::time::Instant::now() + scaled_timeout(Duration::from_secs(20));
+    loop {
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.dlq_entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if remaining <= expected_kept || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // One more cleanup pass, so a row wrongly purged late is caught too.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut wrong = Vec::new();
+    for (queue, age, kept) in &rows {
+        let present = exact_dlq_rows(&pool, queue).await == 1;
+        if present != *kept {
+            wrong.push(format!(
+                "{queue:?} ({age}d): kept={present}, expected {kept}"
+            ));
+        }
+    }
+    client.shutdown(Duration::from_secs(5)).await;
+    assert!(wrong.is_empty(), "wrong DLQ retention: {wrong:#?}");
+}
