@@ -476,6 +476,7 @@ FROM targets t
 JOIN pg_class c ON c.relname = t.relname
 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
 JOIN pg_locks l ON l.relation = c.oid
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
 JOIN pg_stat_activity a ON a.pid = l.pid
 ORDER BY t.ring, c.relname, l.granted, a.xact_start;
 ```
@@ -489,6 +490,7 @@ SELECT a.pid, a.application_name, now() - a.xact_start AS xact_age,
        count(DISTINCT l.relation) AS relations, left(a.query, 80) AS query
 FROM pg_locks l
 JOIN pg_class c ON c.oid = l.relation
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = '<schema>'
 JOIN pg_stat_activity a ON a.pid = l.pid
 WHERE a.xact_start < now() - interval '5 seconds'
