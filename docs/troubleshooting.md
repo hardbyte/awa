@@ -186,7 +186,7 @@ Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates u
 Failed to rescue deadline-expired jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
 ```
 
-Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. A worker finalizing its own snooze, `RetryAfter` or retryable failure reports it as `snoozed as duplicate` or `retried as duplicate` ([#807](https://github.com/hardbyte/awa/issues/807)); before that fix the worker logged `Failed to complete job` with `unique conflict` and the attempt stayed running until rescue. In every fixed path the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue degrades row-at-a-time; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
+Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. A worker finalizing its own snooze, `RetryAfter` or retryable failure reports it as `snoozed as duplicate` or `retried as duplicate` ([#807](https://github.com/hardbyte/awa/issues/807)); before that fix the worker logged `Failed to complete job` with `unique conflict` and the attempt stayed running until rescue. In every fixed path the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue no longer aborts on the conflict: the canonical engine retries row at a time, and queue storage cancels the conflicted attempt in the same pass that rescues the others; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
 
 ```sql
 SELECT j.id AS stuck_job, j.kind, j.queue, j.unique_key,
@@ -454,13 +454,13 @@ A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue r
 
 Tell it apart from the other ring stalls by the prune outcome:
 
-| Fault | `awa.maintenance.prune.attempts` | `awa.maintenance.prune.pinned_ready_age` |
-| --- | --- | --- |
-| Claims starve prune (this section) | `blocked`, reason `none` | absent or `0` |
-| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` | positive for the pinning lane |
-| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` | absent or `0` |
+| Fault | `awa.maintenance.prune.attempts` |
+| --- | --- |
+| Claims starve prune (this section) | `blocked`, reason `none` |
+| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` |
+| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` |
 
-The leader reads `awa.maintenance.prune.pinned_ready_age` only after a `skipped_active` prune, so it does not report this fault.
+Do not use `awa.maintenance.prune.pinned_ready_age` to rule this fault in or out. The leader reads the gauge only after a `skipped_active` prune and on backed-off ticks while a lane already pins the slot, and leaves it unchanged when prune is `blocked`, so it does not report this fault and can be positive during it when a lane also pins the slot.
 
 ```promql
 sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
@@ -652,6 +652,7 @@ Useful actions:
 ```bash
 awa --database-url "$DATABASE_URL" dlq retry <job-id>
 awa --database-url "$DATABASE_URL" dlq retry-bulk --queue email
+awa --database-url "$DATABASE_URL" dlq retry-bulk --queue email --batch-size 1000
 awa --database-url "$DATABASE_URL" dlq purge --queue email
 awa --database-url "$DATABASE_URL" dlq move --queue email --reason backfill
 ```
@@ -662,6 +663,8 @@ If DLQ depth is growing quickly:
 - sample `awa job dump <id>` for the full error/progress chain
 - pause the upstream queue or producer if one failure mode is dominating
 - tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too long for the incident volume
+
+To drain a large DLQ, use `retry-bulk --batch-size` rather than a loop of single-job `retry` calls; see [draining a large DLQ](dead-letter-queue.md#draining-a-large-dlq). A script that does call the API once per job should hold one `QueueStorage` and call its methods.
 
 ## Common Error Cases
 
@@ -685,6 +688,7 @@ Cause:
 - `insert_many`, `insert_many_copy`, `insert_many_skip_unique_conflicts` and the `QueueStorage` batch enqueues register and lock their lanes one at a time in one canonical order, `(queue, priority, shard)` ascending with queue names compared bytewise, so two batch calls cannot hold each other's lanes in opposite orders
 - a 0.6.15 or earlier `QueueStorage` process (batch enqueue, or a worker promoting scheduled or retried jobs) creates a new `(queue, priority)` lane by taking its provisioning lock before writing its `queue_lanes` row; every other producer, and `QueueStorage` from 0.6.16, writes the row first, so one of each that are both the first to use the lane can deadlock. Upgrade those processes, or create a queue's lanes before traffic reaches it with `awa storage prepare-queue`
 - with the `insert_jobs_compat_batch` schema patch, `insert_many_copy` and `insert_many_skip_unique_conflicts` take all of a batch's unique claims before any lane lock, while per-row inserts (generic `insert_many`, single-job inserts, 0.6.14 and earlier binaries) take each job's claim and lane together. For 2 s the function waits at most 500 ms (or half of its session's `deadlock_timeout`, if lower) while it holds claims or lanes, then releases them and retries, so it gives way to a per-row transaction that holds a lane the batch needs and waits for one of its keys, provided that transaction's `deadlock_timeout` is above 500 ms (the default is 1 s) and the batch inserts its unique claims within 500 ms (10,000 to 20,000 keys on a fast server, fewer under load; split larger batches). Its last attempt waits as any statement does, so a per-row transaction that holds the lane for longer than the retries (about 2.5 s) before it inserts the key still deadlocks with it, and a cycle that retrying cannot break, for example through a lock the batch's own transaction took in an earlier statement, still ends in `40P01`, after 3 to 4 s and usually by aborting the batch's transaction. The 0.6.15 body of the function waited instead, and the two deadlocked; `awa migrate` replaces it (`awa migrate --sql --pending` prints `R__insert_jobs_compat_batch` while the old body is installed)
+- a 0.6.18 or earlier process re-enqueues a job by reserving its lane before claiming its unique key, while every insert claims the key first, so retrying a failed, cancelled or dead-lettered job, or promoting or resuming one whose `unique_states` leave out the state it is in, can deadlock with a producer inserting a job with the same unique key into the same lane. From 0.6.19 every re-enqueue claims its keys first, in key order; upgrade the workers, admin tools and services that retry jobs
 - unique keys and the application's own locks can form other cycles
 - a transaction that enqueues with several separate statements (`insert` per job, handler-staged follow-ups, `Transaction.insert` in a loop) takes locks in statement order and can deadlock against a generic `insert_many`, a `QueueStorage` batch enqueue or another such transaction that touches the same lanes in a different order; a batch through `awa.insert_jobs_compat_batch` normally gives way to it instead
 

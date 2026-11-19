@@ -1532,8 +1532,10 @@ impl PyClient {
     /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
     ///
     /// Requires at least one of `kind`, `queue`, or `tag` unless
-    /// `allow_all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    /// `allow_all=True`. Retries every matching row, in job ID order,
+    /// `batch_size` rows per transaction (1,000 when unset); `batch_size` is
+    /// the per-transaction bound, not a total.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false, batch_size=None))]
     fn bulk_retry_from_dlq<'py>(
         &self,
         py: Python<'py>,
@@ -1541,19 +1543,17 @@ impl PyClient {
         queue: Option<String>,
         tag: Option<String>,
         allow_all: bool,
+        batch_size: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
-            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
-                .await
-                .map_err(map_awa_error)?;
-            if count > 0 {
-                metrics.record_dlq_retried(queue_attr.as_deref(), count);
-            }
-            Ok(count)
+            crate::dlq::bulk_retry(&pool, &filter, allow_all, batch_size, |count| {
+                metrics.record_dlq_retried(queue_attr.as_deref(), count)
+            })
+            .await
         })
     }
 
@@ -3107,7 +3107,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false, batch_size=None))]
     fn bulk_retry_from_dlq_sync(
         &self,
         py: Python<'_>,
@@ -3115,6 +3115,7 @@ impl PyClient {
         queue: Option<String>,
         tag: Option<String>,
         allow_all: bool,
+        batch_size: Option<i64>,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
@@ -3122,13 +3123,10 @@ impl PyClient {
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
-                    .await
-                    .map_err(map_awa_error)?;
-                if count > 0 {
-                    metrics.record_dlq_retried(queue_attr.as_deref(), count);
-                }
-                Ok(count)
+                crate::dlq::bulk_retry(&pool, &filter, allow_all, batch_size, |count| {
+                    metrics.record_dlq_retried(queue_attr.as_deref(), count)
+                })
+                .await
             })
         })
     }

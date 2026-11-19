@@ -242,8 +242,8 @@ async fn test_rescue_survives_unique_claim_conflict() {
 
 /// The queue-storage engine has the same wedge shape through a different
 /// door: rescue re-inserts each rescued job as a `retryable` deferred row
-/// inside one batch transaction, and `sync_unique_claim` refuses the
-/// re-entry while a duplicate holds the claim. This test strands the jobs
+/// inside one batch transaction, and the claim upsert refuses the re-entry
+/// while a duplicate holds the claim. This test strands the jobs
 /// live (parked handlers with a heartbeat-staleness shorter than the
 /// heartbeat interval) instead of via raw SQL, so it exercises the real
 /// claim/lease plane end to end.
@@ -411,5 +411,176 @@ async fn rescue_survives_unique_claim_conflict_queue_storage(
 
     client.shutdown(Duration::from_secs(5)).await;
     clean_queues(&pool, &[consumed, parked]).await;
+    awa_testing::setup::reset_runtime_backend(&pool).await;
+}
+
+/// A rescued attempt whose mask claims `cancelled` as well as `retryable`,
+/// but not `running`, loses its key to a newer duplicate while it runs. The
+/// rescue cancels it as a duplicate; writing it `cancelled` with its full
+/// mask would conflict again. The committed row keeps its unique key, has
+/// `cancelled` cleared from its mask, and records the original mask in the
+/// duplicate error entry, and the row rescue returns is the committed row.
+/// An admin retry restores the mask and re-checks ownership: refused while
+/// the duplicate holds the key, granted once it lets go.
+#[tokio::test]
+async fn test_rescued_duplicate_with_a_cancelled_mask_keeps_its_key_queue_storage() {
+    use awa::model::admin;
+    use awa::{insert_many, AwaError, InsertParams, QueueStorage, QueueStorageConfig};
+
+    let _guard = acquire_rescue_guard().await;
+    let pool = awa_testing::setup::setup(10).await;
+    awa_testing::setup::activate_queue_storage(&pool).await;
+    let queue = format!(
+        "uc_rescue_cancelled_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let storage = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+    let insert = |pool: PgPool, queue: String| async move {
+        insert_many(
+            &pool,
+            &[InsertParams {
+                kind: "uc_rescue_cancelled".to_string(),
+                args: serde_json::json!({}),
+                opts: InsertOpts {
+                    queue,
+                    unique: Some(UniqueOpts {
+                        by_queue: true,
+                        by_args: false,
+                        // available | retryable | cancelled, not running
+                        states: 0b0101_0010,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            }],
+        )
+        .await
+        .expect("insert unique job")
+        .pop()
+        .expect("inserted job")
+    };
+    let mask = |pool: PgPool, id: i64| async move {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT unique_states::text FROM awa.jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read mask")
+    };
+    let holder = |pool: PgPool, key: Vec<u8>| async move {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT (SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1)",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .expect("read claim")
+    };
+
+    let old = insert(pool.clone(), queue.clone()).await;
+    let key = old.unique_key.clone().expect("unique key");
+    let original = mask(pool.clone(), old.id).await.expect("mask");
+    let mut cleared = original.clone().into_bytes();
+    cleared[JobState::Cancelled.bit_position() as usize] = b'0';
+    let cleared = String::from_utf8(cleared).expect("mask text");
+    assert_ne!(original, cleared, "the mask claims cancelled");
+
+    // Claiming releases the key, since the mask leaves out `running`; a
+    // newer duplicate then takes it.
+    let claimed = storage
+        .claim_runtime_batch(&pool, &queue, 10, Duration::from_millis(1))
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(holder(pool.clone(), key.clone()).await, None);
+    let newer = insert(pool.clone(), queue.clone()).await;
+    assert_eq!(holder(pool.clone(), key.clone()).await, Some(newer.id));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let rescued = storage
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue");
+    let returned = rescued
+        .into_iter()
+        .find(|row| row.id == old.id)
+        .expect("rescue returns the attempt");
+    assert_eq!(returned.state, JobState::Cancelled);
+
+    let committed = admin::get_job(&pool, old.id).await.expect("committed row");
+    assert_eq!(
+        serde_json::to_value(&returned).expect("returned row"),
+        serde_json::to_value(&committed).expect("committed row"),
+        "rescue returns the row it committed"
+    );
+    assert_eq!(committed.unique_key.as_deref(), Some(key.as_slice()));
+    assert_eq!(mask(pool.clone(), old.id).await, Some(cleared.clone()));
+    let stored: (Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as("SELECT unique_key, unique_states FROM awa.done_entries WHERE job_id = $1")
+            .bind(old.id)
+            .fetch_one(&pool)
+            .await
+            .expect("stored done row");
+    assert_eq!(
+        stored,
+        (Some(key.clone()), Some(cleared)),
+        "the done row stores its key and mask"
+    );
+    let last_error = committed
+        .errors
+        .as_ref()
+        .and_then(|errors| errors.last())
+        .expect("duplicate error entry");
+    assert_eq!(
+        last_error["error"],
+        "rescued as duplicate: unique claim held by a newer job"
+    );
+    assert_eq!(last_error["duplicate_unique_states"], original.as_str());
+    assert_eq!(holder(pool.clone(), key.clone()).await, Some(newer.id));
+
+    // Retry while the duplicate holds the key: refused, nothing changes.
+    assert!(
+        matches!(
+            admin::retry(&pool, old.id).await,
+            Err(AwaError::UniqueConflict { .. })
+        ),
+        "retry while the duplicate holds the key"
+    );
+    let unchanged = admin::get_job(&pool, old.id).await.expect("row");
+    assert_eq!(unchanged.state, JobState::Cancelled);
+    assert_eq!(holder(pool.clone(), key.clone()).await, Some(newer.id));
+
+    // The duplicate lets go when it is claimed; the retry then takes the
+    // key with the original mask.
+    let claimed = storage
+        .claim_runtime_batch(&pool, &queue, 10, Duration::from_secs(300))
+        .await
+        .expect("claim the duplicate");
+    assert_eq!(
+        claimed.iter().map(|job| job.job.id).collect::<Vec<_>>(),
+        [newer.id]
+    );
+    assert_eq!(holder(pool.clone(), key.clone()).await, None);
+    let revived = admin::retry(&pool, old.id)
+        .await
+        .expect("retry once the key is free")
+        .expect("revived row");
+    assert_eq!(revived.state, JobState::Available);
+    assert_eq!(mask(pool.clone(), old.id).await, Some(original));
+    assert_eq!(holder(pool.clone(), key.clone()).await, Some(old.id));
+
+    // Close the duplicate's open receipt claim before the queue is cleaned,
+    // so no later rescue meets a claim without its ready row.
+    storage
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete the duplicate");
+    awa_testing::setup::clean_queue(&pool, &queue).await;
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("drop claim");
     awa_testing::setup::reset_runtime_backend(&pool).await;
 }

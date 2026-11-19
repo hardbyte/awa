@@ -108,6 +108,7 @@ const RELEASED: &[Released] = &[
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
             "replica_identity",
+            "spent_claim_prefix_gaps",
         ],
         observes_runtime_controls: false,
     },
@@ -120,6 +121,7 @@ const RELEASED: &[Released] = &[
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
             "replica_identity",
+            "spent_claim_prefix_gaps",
         ],
         observes_runtime_controls: false,
     },
@@ -129,12 +131,13 @@ const RELEASED: &[Released] = &[
             "runtime_maintenance_eligibility",
             "correlated_claim_tombstones",
             "replica_identity",
+            "spent_claim_prefix_gaps",
         ],
         observes_runtime_controls: true,
     },
     Released {
         version: "0.6.17",
-        pending_patches: &["replica_identity"],
+        pending_patches: &["replica_identity", "spent_claim_prefix_gaps"],
         observes_runtime_controls: true,
     },
 ];
@@ -1150,7 +1153,9 @@ async fn released_patch_upgrade_and_rollback() {
     let mut expected_lines = vec!["Schema: v40 (unchanged)".to_string()];
     for patch in migrations::SCHEMA_PATCHES {
         let outcome = if expected_pending.contains(&patch.name)
-            && (migrate_attempts == 1 || patch.name == "replica_identity")
+            && (migrate_attempts == 1
+                || patch.name == "replica_identity"
+                || patch.name == "spent_claim_prefix_gaps")
         {
             "applied"
         } else {

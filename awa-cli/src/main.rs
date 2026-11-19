@@ -8,6 +8,94 @@ use sqlx::postgres::PgPoolOptions;
 
 mod storage_wait;
 
+/// Per-transaction bound and total cap shared by the bulk commands.
+#[derive(Args, Clone, Copy, Debug)]
+struct BulkArgs {
+    /// Change at most this many rows per transaction, in job ID order, until
+    /// none match. Rows another transaction holds are waited for, for up to
+    /// 60 seconds without progress.
+    #[arg(long, default_value_t = awa_model::bulk::DEFAULT_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..))]
+    batch_size: i64,
+    /// Stop after changing this many rows in total.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    limit: Option<u64>,
+    /// Give up after this many seconds without progress while every
+    /// remaining matching row is held by another transaction.
+    #[arg(long, hide = true, default_value_t = awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs())]
+    busy_timeout_secs: u64,
+}
+
+/// Run a batched admin operation, printing each batch to stderr.
+/// `on_changed` sees the row count of each batch that changed rows, as the
+/// batch commits, so a run that fails later still accounts for them.
+async fn run_bulk<F, Fut>(
+    bulk: &BulkArgs,
+    verb: &str,
+    noun: &str,
+    batch: F,
+    mut on_changed: impl FnMut(u64),
+) -> Result<awa_model::BulkRun, awa_model::AwaError>
+where
+    F: FnMut(i64, awa_model::BulkCursor) -> Fut,
+    Fut: std::future::Future<Output = Result<awa_model::BulkBatch, awa_model::AwaError>>,
+{
+    awa_model::bulk::run_batches(
+        awa_model::BulkRunOptions::default()
+            .batch_size(bulk.batch_size)
+            .limit(bulk.limit)
+            .busy_timeout(Duration::from_secs(bulk.busy_timeout_secs)),
+        batch,
+        |batch, run| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+            if batch.count > 0 || batch.skipped > 0 {
+                eprintln!(
+                    "{verb} {} {noun} ({} so far){}.",
+                    batch.count,
+                    run.count,
+                    if batch.skipped > 0 {
+                        format!("; skipped {}", batch.skipped)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        },
+    )
+    .await
+}
+
+/// Print a bulk run's result, including any skipped jobs and whether it
+/// gave up on held rows. Exits 1 when the run gave up on rows another
+/// transaction held, otherwise 2 when it skipped rows over a unique
+/// conflict.
+fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
+    println!("{verb} {} {noun}.", run.count);
+    if run.skipped > 0 {
+        let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
+        eprintln!(
+            "Skipped {} job(s) whose unique key a live job holds{}: {}",
+            run.skipped,
+            if run.skipped as usize > run.conflicts.len() {
+                ", including"
+            } else {
+                ""
+            },
+            ids.join(", ")
+        );
+    }
+    if run.busy_timed_out {
+        eprintln!(
+            "Every remaining matching row stayed held by another transaction past the busy timeout; stopping. Rerun once it finishes."
+        );
+        std::process::exit(1);
+    }
+    if run.skipped > 0 {
+        std::process::exit(2);
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "awa",
@@ -312,6 +400,8 @@ enum DlqCommands {
         /// accidentally reviving the entire DLQ.
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        bulk: BulkArgs,
     },
     /// Move existing failed terminal rows into the DLQ
     Move {
@@ -1028,6 +1118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             queue,
                             tag,
                             all,
+                            bulk,
                         } => {
                             let filter = awa_model::dlq::ListDlqFilter {
                                 kind,
@@ -1035,12 +1126,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tag,
                                 ..Default::default()
                             };
-                            let count =
-                                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
-                            if count > 0 {
-                                metrics.record_dlq_retried(queue.as_deref(), count);
-                            }
-                            println!("Retried {count} DLQ rows.");
+                            let run = run_bulk(
+                                &bulk,
+                                "Retried",
+                                "DLQ rows",
+                                |size, cursor| {
+                                    awa_model::dlq::bulk_retry_from_dlq_batch(
+                                        &pool, &filter, all, size, cursor,
+                                    )
+                                },
+                                |count| metrics.record_dlq_retried(queue.as_deref(), count),
+                            )
+                            .await?;
+                            finish_bulk(&run, "Retried", "DLQ rows");
                         }
                         DlqCommands::Move {
                             kind,
