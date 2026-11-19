@@ -188,7 +188,14 @@ fn changed_jobs(
         state.invalidate_dashboard_caches();
     }
     match error {
-        Some(error) => Err(ApiError::after_partial(error, outcome.jobs.len() as u64)),
+        Some(error) => Err(ApiError::after_partial(
+            error,
+            crate::error::bulk::Committed {
+                changed: outcome.jobs.len() as u64,
+                skipped: outcome.skipped,
+                conflicts: outcome.conflicts,
+            },
+        )),
         None => Ok(outcome),
     }
 }

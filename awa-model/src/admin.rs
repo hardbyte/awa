@@ -1745,7 +1745,10 @@ pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErro
                      WHERE entry->>'error' IN (
                            'snoozed as duplicate: unique claim held by a newer job',
                            'retried as duplicate: unique claim held by a newer job',
-                           'promoted as duplicate: unique claim held by another job'
+                           'promoted as duplicate: unique claim held by another job',
+                           'rescued as duplicate: heartbeat stale and unique claim held by a newer job',
+                           'rescued as duplicate: deadline expired and unique claim held by a newer job',
+                           'rescued as duplicate: callback timed out and unique claim held by a newer job'
                        )
                        AND entry->>'duplicate_unique_states' IS NOT NULL
                      ORDER BY n DESC
@@ -4908,7 +4911,10 @@ const CANONICAL_RETRY_IDS_SQL: &str = r#"
                  WHERE entry->>'error' IN (
                        'snoozed as duplicate: unique claim held by a newer job',
                        'retried as duplicate: unique claim held by a newer job',
-                       'promoted as duplicate: unique claim held by another job'
+                       'promoted as duplicate: unique claim held by another job',
+                       'rescued as duplicate: heartbeat stale and unique claim held by a newer job',
+                       'rescued as duplicate: deadline expired and unique claim held by a newer job',
+                       'rescued as duplicate: callback timed out and unique claim held by a newer job'
                    )
                    AND entry->>'duplicate_unique_states' IS NOT NULL
                  ORDER BY n DESC

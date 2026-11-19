@@ -2,6 +2,16 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+/// What a bulk call's committed batches did before an error stopped it.
+pub mod bulk {
+    #[derive(Debug, Default)]
+    pub struct Committed {
+        pub changed: u64,
+        pub skipped: u64,
+        pub conflicts: Vec<i64>,
+    }
+}
+
 /// API error wrapper around AwaError, mapping to HTTP status codes.
 #[derive(Debug)]
 pub enum ApiError {
@@ -15,11 +25,12 @@ pub enum ApiError {
         message: String,
         detail: serde_json::Map<String, serde_json::Value>,
     },
-    /// `error` stopped a bulk call after earlier batches committed `changed`
-    /// rows. The response keeps `error`'s status and adds `changed`.
+    /// `error` stopped a bulk call after earlier batches committed. The
+    /// response keeps `error`'s status and adds what those batches did:
+    /// `changed`, `skipped` and `conflicts`.
     Partial {
         error: Box<ApiError>,
-        changed: u64,
+        done: bulk::Committed,
     },
 }
 
@@ -74,12 +85,17 @@ impl ApiError {
             detail.insert("error".into(), message.into());
             return (StatusCode::CONFLICT, detail);
         }
-        if let ApiError::Partial { error, changed } = self {
+        if let ApiError::Partial { error, done } = self {
             let (status, mut detail) = error.status_and_body();
             if let Some(serde_json::Value::String(message)) = detail.get_mut("error") {
-                message.push_str(&format!("; changed {changed} row(s) before the error"));
+                message.push_str(&format!(
+                    "; changed {} row(s) before the error",
+                    done.changed
+                ));
             }
-            detail.insert("changed".into(), changed.into());
+            detail.insert("changed".into(), done.changed.into());
+            detail.insert("skipped".into(), done.skipped.into());
+            detail.insert("conflicts".into(), done.conflicts.into());
             return (status, detail);
         }
         let (status, message) = match self {
@@ -126,16 +142,16 @@ impl ApiError {
         (status, body)
     }
 
-    /// `error` after a bulk call committed `changed` rows, or `error` alone
-    /// when it changed none.
-    pub fn after_partial(error: impl Into<ApiError>, changed: u64) -> Self {
+    /// `error` after a bulk call's earlier batches committed `done`, or
+    /// `error` alone when they changed and skipped nothing.
+    pub fn after_partial(error: impl Into<ApiError>, done: bulk::Committed) -> Self {
         let error = error.into();
-        if changed == 0 {
+        if done.changed == 0 && done.skipped == 0 {
             error
         } else {
             ApiError::Partial {
                 error: Box::new(error),
-                changed,
+                done,
             }
         }
     }
@@ -165,10 +181,19 @@ mod partial_tests {
 
     #[test]
     fn a_partial_failure_keeps_the_status_and_reports_what_changed() {
-        let error = ApiError::after_partial(awa_model::AwaError::Validation("bad batch".into()), 3);
+        let error = ApiError::after_partial(
+            awa_model::AwaError::Validation("bad batch".into()),
+            bulk::Committed {
+                changed: 3,
+                skipped: 1,
+                conflicts: vec![42],
+            },
+        );
         let (status, body) = error.status_and_body();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["changed"], 3);
+        assert_eq!(body["skipped"], 1);
+        assert_eq!(body["conflicts"], serde_json::json!([42]));
         assert_eq!(
             body["error"],
             "validation error: bad batch; changed 3 row(s) before the error"
@@ -177,7 +202,10 @@ mod partial_tests {
 
     #[test]
     fn a_failure_that_changed_nothing_is_the_plain_error() {
-        let error = ApiError::after_partial(awa_model::AwaError::Validation("bad batch".into()), 0);
+        let error = ApiError::after_partial(
+            awa_model::AwaError::Validation("bad batch".into()),
+            bulk::Committed::default(),
+        );
         let (status, body) = error.status_and_body();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.get("changed").is_none());
