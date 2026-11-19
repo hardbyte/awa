@@ -12,6 +12,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - **A rolled-back insert followed by a cancelled or deleted job no longer stops a queue-storage queue from claiming (#813).** When a lane's next position belonged to an insert that rolled back and the job after it had been cancelled, deleted, moved or reprioritised before anything claimed it, every claim on that queue returned no jobs, on every priority and enqueue shard. On 0.6.18 the maintenance leader released the queue after about 15 s with default settings (`queue_slot_count` × `queue_rotate_interval`), and not at all while `maintenance.prune` was halted; on earlier 0.6 releases the queue stayed stuck until something else moved the lane's cursor. Claims now step over the rolled-back positions once the schema patch is applied. Canonical storage was not affected.
 
+- `PeriodicJob::latest_fire_time` no longer panics on a schedule whose cron expression or timezone does not parse. `PeriodicJob::builder(...).build()` validates both, but a `PeriodicJob` built from its public fields or deserialized skipped that check and panicked when evaluated; it now logs a warning naming the schedule and returns `None`, so the schedule does not fire.
+
 ### Documentation
 
 - [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) tells the fault apart from a pinned lane by the prune outcome alone. It said `awa.maintenance.prune.pinned_ready_age` stays absent or `0` during the fault, but the leader leaves the gauge unchanged when prune is `blocked`, so it can be positive while a lane also pins the slot. The storage-isolation section of the deployment guide is corrected the same way.
