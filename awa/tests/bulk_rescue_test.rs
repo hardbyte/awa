@@ -799,7 +799,10 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     // three staleness windows, so a rescue that ignored their heartbeats
     // would take them. Until then they finish at once, so their claims do
     // not hold up the claim ring while the doomed runtime fills it.
-    let staleness = scaled_staleness(Duration::from_secs(6));
+    // The doomed runtime heartbeats all of its claims in each pass, so the
+    // staleness must exceed one pass over `ABANDONED` claims (about 12 s on
+    // an idle 4-core host) with room to spare; see #833.
+    let staleness = scaled_staleness(Duration::from_secs(20));
     let heartbeat_interval = staleness / 8;
     let live_job_duration = staleness * 3;
 
