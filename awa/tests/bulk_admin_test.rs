@@ -1391,6 +1391,45 @@ async fn drain_leaves_new_jobs_beside_an_explicit_id_queue_storage() {
     drain_leaves_new_jobs_beside_an_explicit_id(Engine::QueueStorage).await;
 }
 
+/// A job revived from the DLQ keeps its ID, so one migrated from canonical
+/// storage can be live above the job ID sequence. A drain that starts after
+/// it was revived still reaches it.
+#[tokio::test]
+async fn drain_reaches_a_live_job_above_the_sequence_queue_storage() {
+    let _guard = GUARD.lock().await;
+    let pool = pool_for(Engine::QueueStorage).await;
+    let queue = unique_name("bulk_drain_live_explicit");
+    let ids = insert_jobs(&pool, &queue, "bulk_job", 2).await;
+    let explicit = insert_explicit_id_row(&pool, Engine::QueueStorage, &queue).await;
+    dlq::retry_from_dlq(&pool, explicit, &dlq::RetryFromDlqOpts::default())
+        .await
+        .expect("retry the explicit-ID DLQ row")
+        .expect("retried job");
+    assert_eq!(
+        count_of(&states(&pool, &[explicit]).await, "available"),
+        1,
+        "the explicit-ID job is live"
+    );
+
+    let mut cursor = BulkCursor::default();
+    for _ in 0..20 {
+        let batch = admin::drain_queue_batch(&pool, &queue, 1, cursor)
+            .await
+            .expect("drain batch");
+        cursor = batch.cursor;
+        if batch.done {
+            break;
+        }
+    }
+    assert_eq!(count_of(&states(&pool, &ids).await, "cancelled"), 2);
+    assert_eq!(
+        count_of(&states(&pool, &[explicit]).await, "cancelled"),
+        1,
+        "the live explicit-ID job existed when the drain started"
+    );
+    setup::clean_queue(&pool, &queue).await;
+}
+
 /// The engine's job ID sequence.
 fn job_id_sequence(engine: Engine) -> &'static str {
     match engine {

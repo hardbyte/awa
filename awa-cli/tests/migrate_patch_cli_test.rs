@@ -447,7 +447,11 @@ async fn lock_timeout_in_a_later_patch_keeps_earlier_patches_and_a_rerun_resumes
         .collect();
     assert_eq!(
         pending,
-        ["runtime_maintenance_eligibility", "replica_identity"]
+        [
+            "runtime_maintenance_eligibility",
+            "replica_identity",
+            "spent_claim_prefix_gaps"
+        ]
     );
 
     let mut holder = PgConnection::connect(&db.url).await.unwrap();
@@ -492,7 +496,11 @@ async fn lock_timeout_in_a_later_patch_keeps_earlier_patches_and_a_rerun_resumes
         .iter()
         .map(|patch| patch.name)
         .collect();
-    assert_eq!(pending, ["replica_identity"], "the earlier patch committed");
+    assert_eq!(
+        pending,
+        ["replica_identity", "spent_claim_prefix_gaps"],
+        "the earlier patch committed"
+    );
 
     let output = awa(&db.url, &["migrate"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -509,6 +517,14 @@ async fn lock_timeout_in_a_later_patch_keeps_earlier_patches_and_a_rerun_resumes
         stdout.contains("Schema patch replica_identity: applied"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("Schema patch spent_claim_prefix_gaps: applied"),
+        "{stdout}"
+    );
+    assert!(migrations::pending_schema_patches(&pool)
+        .await
+        .unwrap()
+        .is_empty());
     pool.close().await;
     db.drop().await;
 }

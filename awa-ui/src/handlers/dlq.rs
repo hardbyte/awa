@@ -253,7 +253,7 @@ where
                 }
             })
             .await
-            .map_err(|err| ApiError::from(err.error))?,
+            .map_err(|err| ApiError::after_partial(err.error, err.partial.count))?,
         ),
     }
 }

@@ -188,7 +188,7 @@ fn changed_jobs(
         state.invalidate_dashboard_caches();
     }
     match error {
-        Some(error) => Err(error.into()),
+        Some(error) => Err(ApiError::after_partial(error, outcome.jobs.len() as u64)),
         None => Ok(outcome),
     }
 }
