@@ -42,8 +42,11 @@ EXTENDS Naturals, FiniteSets, TLC
 \* AllowCursorLoss  a crash or failover loses committed cursor movement and
 \*                  the cursor comes back lower; claims then pass the spent
 \*                  rows on their evidence.
+\* RepairCrossesGaps a claim whose head row is spent crosses rolled-back
+\*                  reservations before it (production: TRUE); FALSE moves
+\*                  the cursor only from a spent row at the cursor (#813).
 CONSTANTS N, WindowSize, CheckCap, MaintLocksHead, SkipInvisible,
-          InOrderEnqueue, AllowCursorLoss
+          InOrderEnqueue, AllowCursorLoss, RepairCrossesGaps
 
 Positions == 1..N
 Spent == {"claimed", "tomb"}
@@ -101,14 +104,15 @@ EnqueueAbort(p) ==
 
 \* ---- claim ---------------------------------------------------------------
 
-\* claim_ready_runtime locks the head with SKIP LOCKED and claims the first
-\* visible untombstoned row at or after the cursor.
+\* claim_ready_runtime locks the head with SKIP LOCKED and reads the first
+\* visible row at or after the cursor: it claims the row when it is live and
+\* repairs the cursor when it is spent.
 ClaimHead ==
     {p \in Positions :
         /\ p >= cursor
-        /\ state[p] \in {"live", "claimed"}
+        /\ state[p] \in Visible
         /\ \A q \in Positions : (q >= cursor /\ q < p) =>
-                state[q] \notin {"live", "claimed"}}
+                state[q] \notin Visible}
 
 ClaimBegin ==
     /\ headLock = "none"
@@ -139,12 +143,14 @@ ClaimAbort ==
                    maintTarget, claimCount, maintPassedTomb>>
 
 \* When the head row is already spent, the claim function moves the cursor
-\* over the contiguous spent prefix and returns without claiming.
+\* over it, and the rolled-back reservations before it, and returns without
+\* claiming. One step per spent row stands for the leading spent run.
 ClaimRepair ==
     /\ headLock = "none"
-    /\ cursor <= N
-    /\ state[cursor] \in Spent
-    /\ cursor' = cursor + 1
+    /\ \E p \in ClaimHead :
+        /\ state[p] \in Spent
+        /\ RepairCrossesGaps \/ p = cursor
+        /\ cursor' = p + 1
     /\ UNCHANGED <<state, append, headLock, claiming, tombing, tombAdvance,
                    pendingClaimAdvance, pendingCancelAdvance, maintPhase,
                    maintTarget, claimCount, maintPassedTomb>>
@@ -297,6 +303,13 @@ NoSkippedLive ==
 
 \* A row is claimed at most once.
 NoDoubleClaim == \A p \in Positions : claimCount[p] <= 1
+
+\* A lane with a live row at or after the cursor is never stuck: unless
+\* another transaction holds its head, a claim either claims the head row or
+\* moves the cursor.
+ClaimNeverStalls ==
+    (headLock = "none" /\ \E p \in Positions : p >= cursor /\ state[p] = "live")
+        => ENABLED (ClaimBegin \/ ClaimRepair)
 
 \* The cursor never passes the enqueue head.
 CursorBounded == cursor <= append

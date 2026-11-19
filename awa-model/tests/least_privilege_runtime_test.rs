@@ -365,7 +365,11 @@ async fn exercise_stale_custom_schema(options: PgConnectOptions, migrator: &str)
     let pending = migrations::pending_schema_patches(&pool).await?;
     assert_eq!(
         pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-        vec!["prepared_lane_sequences", "definer_lane_provisioning"]
+        vec![
+            "prepared_lane_sequences",
+            "definer_lane_provisioning",
+            "spent_claim_prefix_gaps"
+        ]
     );
     let status = lane_patch_status(&pool).await?;
     assert!(!status.applied);

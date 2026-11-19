@@ -27,6 +27,7 @@ AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceCursorLoss.cfg ;; 
 AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceSkipInvisible.cfg ;; NoSkippedLive is violated ;; advance over an uncommitted enqueue witness
 AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceOutOfOrderEnqueue.cfg ;; NoSkippedLive is violated ;; enqueues committing out of lane order witness
 AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceProgress.cfg ;; MaintNeverPassesTombstone is violated ;; maintenance passes a tombstone witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceRepairStopsAtGap.cfg ;; ClaimNeverStalls is violated ;; claim repair stopping at a rolled-back reservation witness (#813)
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRacesSafe.cfg        ;; pass ;; safe commit
@@ -44,6 +45,8 @@ AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoD
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldStripedClaimDeadlock.cfg ;; NoDeadlock is violated ;; old striped-claim order witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldLaneProvisioningDeadlock.cfg ;; NoDeadlock is violated ;; old QueueStorage lane-provisioning order witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldReEnqueueUniqueDeadlock.cfg ;; NoDeadlock is violated ;; old lane-first re-enqueue against a fresh unique enqueue witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldRowOrderClaimPassDeadlock.cfg ;; NoDeadlock is violated ;; old row-order claim pass against a fresh unique enqueue witness
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderCompletionFollowUpDeadlock.cfg ;; NoDeadlock is violated ;; completion follow-up claiming a key across two passes (known gap)
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg ;; NoDeadlock is violated ;; old claim-prune slot-row order against rescue witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + #456 reschedule drain
@@ -56,7 +59,8 @@ AwaStorageTransition.tla       ;; AwaStorageTransitionCurrentGate.cfg     ;; Mix
 AwaStorageTransition.tla       ;; AwaStorageTransitionRescheduleStaysCanonical.cfg ;; MixedTransitionCanReduceCanonicalBacklog is violated ;; pre-#456 canonical re-schedule wedge witness
 AwaMigratedRescheduleUnique.tla ;; -                                      ;; pass ;; migrated re-schedule duplicate cancellation
 AwaMigratedRescheduleUnique.tla ;; AwaMigratedRescheduleUniqueBroken.cfg  ;; NoUnclaimedExecutable is violated ;; old lost-claim successor witness
-AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
+AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; canonical per-row rescue fallback converges
+AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueQueueStorage.cfg ;; pass ;; queue-storage single settle pass converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
 '
 
