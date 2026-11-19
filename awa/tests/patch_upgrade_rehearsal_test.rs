@@ -840,6 +840,43 @@ async fn wait_for_drain(log: &EventLog, timeout: Duration) {
     }
 }
 
+/// Wait until the database records every logged job as completed. A worker
+/// logs a completion before writing it, so a worker killed straight after
+/// `wait_for_drain` can leave its last jobs running.
+async fn wait_for_durable_completions(admin: &PgPool, log: &EventLog, timeout: Duration) {
+    let mut pending: Vec<i64> = log
+        .snapshot()
+        .iter()
+        .filter(|e| e.kind == EventKind::Enqueued)
+        .map(|e| e.job_id)
+        .collect();
+    pending.sort_unstable();
+    pending.dedup();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut running = Vec::new();
+        for job_id in pending {
+            let row = admin::get_job(admin, job_id)
+                .await
+                .unwrap_or_else(|error| panic!("job {job_id}: {error}"));
+            if row.state != JobState::Completed {
+                running.push(job_id);
+            }
+        }
+        pending = running;
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} completions never became durable, e.g. {:?}",
+            pending.len(),
+            &pending[..pending.len().min(10)]
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "release gate: needs matching AWA_RELEASED_CLI and AWA_RELEASED_PYTHON artifacts"]
 async fn released_patch_upgrade_and_rollback() {
@@ -1526,6 +1563,12 @@ async fn released_patch_upgrade_and_rollback() {
         "the new lane's sequences belong to the schema owner: {new_lane_owners:?}"
     );
     wait_for_drain(&log, ci_timing::scaled_timeout(Duration::from_secs(120))).await;
+    wait_for_durable_completions(
+        &fixture.admin,
+        &log,
+        ci_timing::scaled_timeout(Duration::from_secs(120)),
+    )
+    .await;
     let stats = cli_ok(&released_cli, &fixture.runtime_url, &["queue", "stats"]).await;
     assert!(stats.contains(PROVISIONED), "{stats}");
     for worker in [worker_e, worker_f] {
