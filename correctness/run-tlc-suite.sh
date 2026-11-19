@@ -27,6 +27,7 @@ AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceCursorLoss.cfg ;; 
 AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceSkipInvisible.cfg ;; NoSkippedLive is violated ;; advance over an uncommitted enqueue witness
 AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceOutOfOrderEnqueue.cfg ;; NoSkippedLive is violated ;; enqueues committing out of lane order witness
 AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceProgress.cfg ;; MaintNeverPassesTombstone is violated ;; maintenance passes a tombstone witness
+AwaMaintenanceCursorAdvance.tla ;; AwaMaintenanceCursorAdvanceRepairStopsAtGap.cfg ;; ClaimNeverStalls is violated ;; claim repair stopping at a rolled-back reservation witness (#813)
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRacesSafe.cfg        ;; pass ;; safe commit
