@@ -240,6 +240,104 @@ async fn test_rescue_survives_unique_claim_conflict() {
     clean(&pool).await;
 }
 
+/// The canonical rescue cancels a duplicate whose mask also claims
+/// `cancelled`: the cancelled row keeps its key with `cancelled` cleared
+/// from its mask, records the original mask, and an admin retry restores it
+/// once the key is free.
+#[tokio::test]
+async fn test_canonical_rescue_duplicate_with_cancelled_claiming_mask_keeps_its_key() {
+    if awa_testing::setup::skip_unless_canonical(
+        "test_canonical_rescue_duplicate_with_cancelled_claiming_mask_keeps_its_key",
+    ) {
+        return;
+    }
+    let _guard = acquire_rescue_guard().await;
+    let pool = setup().await;
+    clean(&pool).await;
+    let states = PENDING_ONLY_STATES | 0b0100_0000;
+
+    let job_a = insert_unique_with(&pool, CONSUMED_QUEUE, 21, states).await;
+    let original: String =
+        sqlx::query_scalar("SELECT unique_states::text FROM awa.jobs WHERE id = $1")
+            .bind(job_a)
+            .fetch_one(&pool)
+            .await
+            .expect("original mask");
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'running', attempt = 1, \
+         heartbeat_at = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(job_a)
+    .execute(&pool)
+    .await
+    .expect("stranding update");
+    let job_b = insert_unique_with(&pool, PARKED_QUEUE, 21, states).await;
+
+    let client = Client::builder(pool.clone())
+        .queue(CONSUMED_QUEUE, QueueConfig::default())
+        .register::<UcRescueJob, _, _>(|_args: UcRescueJob, _ctx| async move {
+            Ok(JobResult::Completed)
+        })
+        .heartbeat_rescue_interval(Duration::from_millis(500))
+        .heartbeat_staleness(Duration::from_secs(2))
+        .build()
+        .expect("client should build");
+    client.start().await.expect("client should start");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let a = job_state(&pool, job_a).await;
+        if a == "cancelled" {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("rescue did not cancel the duplicate: A={a}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    client.shutdown(Duration::from_secs(10)).await;
+
+    let (stored, recorded): (String, Option<String>) = sqlx::query_as(
+        "SELECT unique_states::text, errors[array_length(errors, 1)]->>'duplicate_unique_states' \
+         FROM awa.jobs WHERE id = $1",
+    )
+    .bind(job_a)
+    .fetch_one(&pool)
+    .await
+    .expect("cancelled row");
+    assert_eq!(recorded.as_deref(), Some(original.as_str()));
+    assert_eq!(&stored[6..7], "0", "cancelled is cleared from {stored}");
+    let holder: i64 = sqlx::query_scalar(
+        "SELECT c.job_id FROM awa.job_unique_claims c JOIN awa.jobs j ON j.unique_key = c.unique_key WHERE j.id = $1",
+    )
+    .bind(job_b)
+    .fetch_one(&pool)
+    .await
+    .expect("claim probe");
+    assert_eq!(holder, job_b, "the newer job keeps the key");
+
+    assert!(
+        awa_model::admin::retry(&pool, job_a).await.is_err(),
+        "a retry is refused while the newer job holds the key"
+    );
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(job_b)
+        .execute(&pool)
+        .await
+        .expect("remove the holder");
+    awa_model::admin::retry(&pool, job_a)
+        .await
+        .expect("retry once the key is free");
+    let revived: String =
+        sqlx::query_scalar("SELECT unique_states::text FROM awa.jobs WHERE id = $1")
+            .bind(job_a)
+            .fetch_one(&pool)
+            .await
+            .expect("revived mask");
+    assert_eq!(revived, original, "the retry restores the recorded mask");
+    clean(&pool).await;
+}
+
 /// The queue-storage engine has the same wedge shape through a different
 /// door: rescue re-inserts each rescued job as a `retryable` deferred row
 /// inside one batch transaction, and the claim upsert refuses the re-entry
