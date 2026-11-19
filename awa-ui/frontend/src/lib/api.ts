@@ -434,6 +434,8 @@ export interface DlqDepthResponse {
   by_queue: Array<{ queue: string; count: number }>;
 }
 
+import type { BulkBatchResult, BulkCursor } from "@/lib/bulk-run";
+
 export interface DlqBulkResult {
   count: number;
 }
@@ -473,7 +475,9 @@ export function bulkRetryDlq(filter: {
   kind?: string;
   queue?: string;
   tag?: string;
-}): Promise<DlqBulkResult> {
+  batch_size?: number;
+  cursor?: BulkCursor;
+}): Promise<BulkBatchResult> {
   return apiFetch("/dlq/bulk-retry", {
     method: "POST",
     body: JSON.stringify(filter),

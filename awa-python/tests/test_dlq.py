@@ -429,6 +429,65 @@ def test_retry_from_dlq_surfaces_unique_conflict(sync_client):
     assert dlq_entry.reason == "py_unique"
 
 
+def _dead_letter(client: awa.Client, queue: str, value: str, **insert_kwargs) -> int:
+    job = client.insert(DlqPyJob(value=value), queue=queue, **insert_kwargs)
+    _move_ready_to_failed_done(client, job.id)
+    client.move_failed_to_dlq(job.id, "py_batch")
+    return job.id
+
+
+def test_bulk_retry_from_dlq_drains_in_batches(sync_client):
+    queue = "pydlq_batches"
+    for i in range(5):
+        _dead_letter(sync_client, queue, f"batch{i}")
+
+    assert sync_client.bulk_retry_from_dlq(queue=queue, batch_size=2) == 5
+    assert sync_client.dlq_depth(queue=queue) == 0
+    assert sync_client.bulk_retry_from_dlq(queue=queue) == 0
+
+
+def test_bulk_retry_from_dlq_skips_a_unique_conflict_and_names_it(sync_client):
+    queue = "pydlq_batch_unique"
+    unique_opts = {"by_queue": True, "by_args": True}
+    plain_id = _dead_letter(sync_client, queue, "plain")
+    keyed_id = _dead_letter(sync_client, queue, "same", unique_opts=unique_opts)
+    tx = sync_client.transaction()
+    tx.execute("DELETE FROM awa.job_unique_claims WHERE job_id = $1", keyed_id)
+    tx.commit()
+    sync_client.insert(DlqPyJob(value="same"), queue=queue, unique_opts=unique_opts)
+
+    with pytest.raises(awa.UniqueConflict, match=f"Retried 1 row.*skipped 1 job.*{keyed_id}"):
+        sync_client.bulk_retry_from_dlq(queue=queue, batch_size=1)
+
+    assert sync_client.get_dlq_job(plain_id) is None
+    assert sync_client.get_dlq_job(keyed_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_async_bulk_retry_from_dlq_batch_size():
+    client = awa.AsyncClient(DATABASE_URL)
+    await client.migrate()
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.commit()
+    await client.install_queue_storage(schema=SCHEMA, reset=True)
+    queue = "pydlq_async_batches"
+    try:
+        for i in range(3):
+            job = await client.insert(DlqPyJob(value=f"async{i}"), queue=queue)
+            await _move_ready_to_failed_done_async(client, job.id)
+            await client.move_failed_to_dlq(job.id, "py_async_batch")
+
+        assert await client.bulk_retry_from_dlq(queue=queue, batch_size=2) == 3
+        assert await client.dlq_depth(queue=queue) == 0
+    finally:
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+        await tx.commit()
+        await client.close()
+
+
 @pytest.mark.asyncio
 async def test_async_dlq_flow():
     client = awa.AsyncClient(DATABASE_URL)

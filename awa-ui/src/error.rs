@@ -9,6 +9,12 @@ pub enum ApiError {
     ReadOnly,
     NotFound(String),
     Unauthorized(String),
+    Conflict(String),
+    /// A 409 whose JSON body carries `detail`'s fields beside `error`.
+    ConflictDetail {
+        message: String,
+        detail: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 impl From<awa_model::AwaError> for ApiError {
@@ -45,6 +51,14 @@ impl From<std::sync::Arc<crate::cache::CacheError>> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::ConflictDetail {
+            message,
+            mut detail,
+        } = self
+        {
+            detail.insert("error".into(), message.into());
+            return (StatusCode::CONFLICT, axum::Json(detail)).into_response();
+        }
         let (status, message) = match self {
             ApiError::ReadOnly => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -53,6 +67,8 @@ impl IntoResponse for ApiError {
             ),
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ApiError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
+            ApiError::Conflict(message) => (StatusCode::CONFLICT, message),
+            ApiError::ConflictDetail { .. } => unreachable!("answered above"),
             ApiError::Awa(err) => match &err {
                 awa_model::AwaError::JobNotFound { .. } => (StatusCode::NOT_FOUND, err.to_string()),
                 awa_model::AwaError::CallbackNotFound { .. } => {
@@ -95,5 +111,9 @@ impl ApiError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         ApiError::NotFound(message.into())
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        ApiError::Conflict(message.into())
     }
 }

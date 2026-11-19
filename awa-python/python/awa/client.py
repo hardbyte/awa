@@ -570,10 +570,19 @@ class AsyncClient:
         queue: str | None = None,
         tag: str | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-retry DLQ rows matching the filter. Returns revived count."""
+        """Bulk-retry DLQ rows matching the filter. Returns the revived count.
+
+        Rows are retried in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised. A row whose unique key a live job holds
+        is skipped and stays in the DLQ; after every other row is retried,
+        ``UniqueConflict`` is raised naming the skipped jobs.
+        """
         return await self._raw.bulk_retry_from_dlq(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
         )
 
     async def move_failed_to_dlq(
@@ -1455,10 +1464,19 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-retry DLQ rows matching the filter."""
+        """Bulk-retry DLQ rows matching the filter. Returns the revived count.
+
+        Rows are retried in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised. A row whose unique key a live job holds
+        is skipped and stays in the DLQ; after every other row is retried,
+        ``UniqueConflict`` is raised naming the skipped jobs.
+        """
         return self._raw.bulk_retry_from_dlq_sync(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
         )
 
     def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None:

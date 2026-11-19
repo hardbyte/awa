@@ -2,6 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use awa_model::bulk::{self, BulkBatch, BulkCursor, BulkRun, BulkRunOptions};
 use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 
 use crate::error::ApiError;
@@ -120,15 +121,97 @@ pub struct BulkFilterPayload {
     pub all: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkRetryPayload {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub queue: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+    /// Run one batch of up to this many rows, resuming at `cursor`, and
+    /// return its cursor. Without it, the server runs batches of
+    /// `bulk::DEFAULT_BATCH_SIZE` until no matching row remains.
+    #[serde(default)]
+    pub batch_size: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<BulkCursor>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CountResponse {
     pub count: u64,
 }
 
+/// The result of a bulk route: one batch when the request set `batch_size`,
+/// otherwise the whole run.
+#[derive(Debug, Serialize)]
+pub struct BulkResponse {
+    pub count: u64,
+    /// Rows skipped because the change would violate a unique claim.
+    pub skipped: u64,
+    /// IDs of skipped jobs, at most `bulk::MAX_REPORTED_CONFLICTS`.
+    pub conflicts: Vec<i64>,
+    /// One batch: every remaining matching row is held by another
+    /// transaction; nothing changed and the caller should try again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub busy: bool,
+    /// No matching row remains.
+    pub done: bool,
+    /// One batch: pass this back to resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<BulkCursor>,
+}
+
+impl BulkResponse {
+    pub fn from_batch(batch: BulkBatch) -> Self {
+        Self {
+            count: batch.count,
+            skipped: batch.skipped,
+            conflicts: batch.conflicts,
+            busy: batch.busy,
+            done: batch.done,
+            cursor: Some(batch.cursor),
+        }
+    }
+
+    pub fn from_run(run: BulkRun) -> Result<Self, ApiError> {
+        if run.busy_timed_out {
+            let mut message = format!(
+                "every remaining matching row has been held by another transaction for {}s; changed {} row(s) before stopping",
+                bulk::DEFAULT_BUSY_TIMEOUT.as_secs(),
+                run.count
+            );
+            if run.skipped > 0 {
+                message.push_str(&format!(
+                    "; skipped {} job(s) whose unique key a live job holds",
+                    run.skipped
+                ));
+            }
+            let mut detail = serde_json::Map::new();
+            detail.insert("count".into(), run.count.into());
+            detail.insert("skipped".into(), run.skipped.into());
+            detail.insert("conflicts".into(), run.conflicts.into());
+            detail.insert("done".into(), false.into());
+            return Err(ApiError::ConflictDetail { message, detail });
+        }
+        Ok(Self {
+            count: run.count,
+            skipped: run.skipped,
+            conflicts: run.conflicts,
+            busy: false,
+            done: run.complete,
+            cursor: None,
+        })
+    }
+}
+
 pub async fn bulk_retry_dlq(
     State(state): State<AppState>,
-    Json(payload): Json<BulkFilterPayload>,
-) -> Result<Json<CountResponse>, ApiError> {
+    Json(payload): Json<BulkRetryPayload>,
+) -> Result<Json<BulkResponse>, ApiError> {
     state.require_writable()?;
     let queue_attr = payload.queue.clone();
     let filter = ListDlqFilter {
@@ -137,14 +220,43 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
-    if count > 0 {
-        state
-            .metrics
-            .record_dlq_retried(queue_attr.as_deref(), count);
-        state.invalidate_dashboard_caches();
-    }
-    Ok(Json(CountResponse { count }))
+    let record = |count: u64| {
+        if count > 0 {
+            state
+                .metrics
+                .record_dlq_retried(queue_attr.as_deref(), count);
+            state.invalidate_dashboard_caches();
+        }
+    };
+    let response = match payload.batch_size {
+        Some(batch_size) => {
+            let response = BulkResponse::from_batch(
+                dlq::bulk_retry_from_dlq_batch(
+                    &state.pool,
+                    &filter,
+                    payload.all,
+                    batch_size,
+                    payload.cursor.unwrap_or_default(),
+                )
+                .await?,
+            );
+            record(response.count);
+            response
+        }
+        // Record each batch as it commits, so a run that stops on a later
+        // batch's error or busy timeout still counts the rows it changed.
+        None => BulkResponse::from_run(
+            bulk::run_batches(
+                BulkRunOptions::default(),
+                |size, cursor| {
+                    dlq::bulk_retry_from_dlq_batch(&state.pool, &filter, payload.all, size, cursor)
+                },
+                |batch, _| record(batch.count),
+            )
+            .await?,
+        )?,
+    };
+    Ok(Json(response))
 }
 
 pub async fn purge_dlq_job(
@@ -231,4 +343,48 @@ pub async fn bulk_move_failed(
         state.invalidate_dashboard_caches();
     }
     Ok(Json(CountResponse { count }))
+}
+
+#[cfg(test)]
+mod from_run_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn a_busy_timeout_reports_skipped_conflicts() {
+        let mut run = BulkRun::default();
+        run.count = 3;
+        run.skipped = 1;
+        run.conflicts = vec![42];
+        run.busy_timed_out = true;
+        let response = BulkResponse::from_run(run)
+            .expect_err("busy timeout")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            (
+                &body["count"],
+                &body["skipped"],
+                &body["conflicts"],
+                &body["done"]
+            ),
+            (
+                &serde_json::json!(3),
+                &serde_json::json!(1),
+                &serde_json::json!([42]),
+                &serde_json::json!(false)
+            )
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("skipped 1 job(s)"),
+            "{body}"
+        );
+    }
 }
