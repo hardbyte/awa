@@ -91,3 +91,62 @@ pub(crate) fn build_retry_opts(
         queue,
     }
 }
+
+/// Finish a bulk run for Python: the count of changed rows, or
+/// `UniqueConflict` naming the skipped jobs after every other row was
+/// changed, or `DatabaseError` if the run gave up on rows another transaction
+/// held.
+pub(crate) fn finish_bulk_run(run: awa_model::BulkRun, verb: &str) -> PyResult<u64> {
+    let skipped = (run.skipped > 0).then(|| {
+        let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
+        format!(
+            "skipped {} job(s) whose unique key a live job holds: {}",
+            run.skipped,
+            ids.join(", ")
+        )
+    });
+    if run.busy_timed_out {
+        return Err(crate::DatabaseError::new_err(format!(
+            "{verb} {} row(s), then stopped: every remaining matching row has been held by another transaction for {}s{}",
+            run.count,
+            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs(),
+            skipped.map(|text| format!("; {text}")).unwrap_or_default()
+        )));
+    }
+    if let Some(text) = skipped {
+        return Err(crate::UniqueConflict::new_err(format!(
+            "{verb} {} row(s); {text}",
+            run.count
+        )));
+    }
+    Ok(run.count)
+}
+
+/// Retry every matching DLQ row, `batch_size` rows per transaction
+/// (`bulk::DEFAULT_BATCH_SIZE` when unset). `on_changed` sees the row count
+/// of each batch that retried rows, as the batch commits.
+pub(crate) async fn bulk_retry(
+    pool: &sqlx::PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: Option<i64>,
+    mut on_changed: impl FnMut(u64),
+) -> PyResult<u64> {
+    use crate::errors::map_awa_error;
+    let options = awa_model::BulkRunOptions::default()
+        .batch_size(batch_size.unwrap_or(awa_model::bulk::DEFAULT_BATCH_SIZE));
+    let run = awa_model::bulk::run_batches(
+        options,
+        |size, cursor| {
+            awa_model::dlq::bulk_retry_from_dlq_batch(pool, filter, allow_all, size, cursor)
+        },
+        |batch, _| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+        },
+    )
+    .await
+    .map_err(map_awa_error)?;
+    finish_bulk_run(run, "Retried")
+}

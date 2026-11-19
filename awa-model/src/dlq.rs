@@ -4,6 +4,7 @@
 //! active queue_storage schema from `awa.runtime_storage_backends` and operates
 //! against that backend.
 
+use crate::bulk::{BulkBatch, BulkCursor};
 use crate::error::AwaError;
 use crate::job::JobRow;
 use crate::queue_storage::QueueStorage;
@@ -356,8 +357,11 @@ pub async fn retry_from_dlq(
 /// `true`. This guard prevents an empty payload from reviving the entire DLQ
 /// by accident.
 ///
-/// Like single-row retry, unique-claim conflicts abort the transaction and
-/// leave the affected DLQ rows untouched.
+/// Every matching row is retried in one transaction. Like single-row retry,
+/// a unique-claim conflict aborts the transaction and leaves every matching
+/// row in the DLQ. For a large DLQ use [`bulk_retry_from_dlq_batch`], which
+/// works in bounded transactions; in 0.7 this function runs in batches too.
+/// It ignores `filter.limit`.
 pub async fn bulk_retry_from_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
@@ -372,6 +376,38 @@ pub async fn bulk_retry_from_dlq(
 
     let store = active_queue_storage(pool).await?;
     store.bulk_retry_from_dlq(pool, filter).await
+}
+
+/// Retry up to `batch_size` DLQ rows matching the filter in one transaction.
+///
+/// Rows are taken in job ID order past `cursor`; start from
+/// `BulkCursor::default()` and pass each batch's cursor to the next call, or
+/// drive the whole run with [`crate::bulk::run_batches`]. Rows another
+/// transaction holds are never skipped: the cursor stops before them, and a
+/// batch that can take no row reports `busy`. A row whose unique key a live
+/// job holds is skipped, stays in the DLQ, and is reported in `conflicts`.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`. Like every bulk DLQ call, it ignores `filter.limit`, which is the
+/// page size of [`list_dlq`]; cap a run with `BulkRunOptions::limit`.
+pub async fn bulk_retry_from_dlq_batch(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    if !allow_all && filter_requires_scope(filter) {
+        return Err(AwaError::Validation(
+            "bulk_retry_from_dlq_batch requires at least one of kind, queue, or tag (or allow_all=true)"
+                .into(),
+        ));
+    }
+
+    let store = active_queue_storage(pool).await?;
+    store
+        .bulk_retry_from_dlq_batch(pool, filter, batch_size, cursor)
+        .await
 }
 
 /// Purge DLQ rows matching the filter.

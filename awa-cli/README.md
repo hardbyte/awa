@@ -64,7 +64,7 @@ awa --database-url $DATABASE_URL serve
 | `dlq depth [--queue Q]` | Total DLQ rows, optionally split by queue |
 | `dlq list` | List DLQ entries with `--kind` / `--queue` / `--tag` / `--before-*` filters |
 | `dlq retry <id>` | Retry a single DLQ row |
-| `dlq retry-bulk` | Retry every DLQ row matching the filter (`--all` required if no filter is given) |
+| `dlq retry-bulk` | Retry every DLQ row matching the filter (`--all` required if no filter is given), in transactions of `--batch-size` rows (default 1,000); `--limit` caps the total, and jobs skipped over a unique conflict exit 2 |
 | `dlq move` | Move existing failed terminal rows into the DLQ |
 | `dlq purge` | Delete DLQ rows matching the filter (`--all` required if no filter is given) |
 | `storage status` | Current storage-transition state |
