@@ -17046,11 +17046,13 @@ impl QueueStorage {
             return deferred.into_job_row();
         }
         let old_state = row.state;
-        // The caller stamps the successor from the database clock; the
-        // cancelled row takes the same time.
+        // The cancelled row takes the time the caller stamped the successor
+        // with, truncated to what PostgreSQL stores so the returned row
+        // matches the committed one.
         let finalized_at = deferred
             .finalized_at
-            .unwrap_or_else(|| Utc::now().trunc_subsecs(6));
+            .unwrap_or_else(Utc::now)
+            .trunc_subsecs(6);
         let (done, cleared) =
             duplicate_cancelled_row(row, deferred.payload, duplicate_error, finalized_at)?;
         // As in rescue: a row whose mask was cleared is written
