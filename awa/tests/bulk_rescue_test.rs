@@ -619,16 +619,17 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
     let claim_slots = store.claim_slot_count() as i64;
 
-    // Once the doomed runtime has claimed its backlog, live jobs run for
-    // three staleness windows, so a rescue that ignored their heartbeats
-    // would take them. Until then they finish at once, so their claims do
+    // Once the doomed runtime has claimed its backlog, live jobs run for one
+    // and a half staleness windows, so a rescue that ignored their
+    // heartbeats would take them, while 1,000 workers still finish them
+    // faster than the producer adds them. Until then they finish at once, so their claims do
     // not hold up the claim ring while the doomed runtime fills it.
     // The doomed runtime heartbeats all of its claims in each pass, so the
     // staleness must exceed one pass over `ABANDONED` claims (about 12 s on
     // an idle 4-core host) with room to spare; see #833.
     let staleness = scaled_staleness(Duration::from_secs(20));
     let heartbeat_interval = staleness / 8;
-    let live_job_duration = staleness * 3;
+    let live_job_duration = staleness * 3 / 2;
 
     let live_pool = PgPoolOptions::new()
         .max_connections(30)
@@ -735,7 +736,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
                     .expect("enqueue live jobs");
                 n += 5;
                 produced += params.len();
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
             produced
         })
