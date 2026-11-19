@@ -16492,6 +16492,104 @@ async fn test_queue_storage_claimer_cache_rechecks_reduced_target_after_lease_lo
     );
 }
 
+/// Claim once on a fresh gate, so the claimer target is recomputed.
+async fn claim_once_for_target(store: &QueueStorage, pool: &sqlx::PgPool, queue: &str) {
+    let ttl = Duration::from_secs(300);
+    store
+        .claim_runtime_batch_with_aging_for_instance(
+            pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            ttl,
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("claim should succeed");
+}
+
+async fn claimer_state_row(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+) -> (i16, String, DateTime<Utc>) {
+    sqlx::query_as(&format!(
+        "SELECT target_claimers, xmin::text, updated_at
+         FROM {schema}.queue_claimer_state WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("claimer state row")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_target_refresh_writes_only_a_change() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_target_writes";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_target_writes";
+    // A stale row whose target an empty queue keeps at 1.
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 1, now() - interval '1 hour')"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = claimer_state_row(&pool, schema, queue).await;
+    claim_once_for_target(&store, &pool, queue).await;
+    assert_eq!(
+        claimer_state_row(&pool, schema, queue).await,
+        before,
+        "an unchanged target leaves the row as it was"
+    );
+
+    // A backlog raises the target, and that change is written.
+    store.enqueue_batch(&pool, queue, 1, 100).await.unwrap();
+    claim_once_for_target(&store, &pool, queue).await;
+    let (target, xmin, updated_at) = claimer_state_row(&pool, schema, queue).await;
+    assert_eq!(target, 4);
+    assert_ne!(xmin, before.1);
+    assert!(updated_at > before.2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_target_refresh_does_not_wait_on_a_locked_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_target_lock";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_target_lock";
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 1, now() - interval '1 hour')"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Another instance holds the row, as one mid-refresh would.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(&format!(
+        "SELECT 1 FROM {schema}.queue_claimer_state WHERE queue = $1 FOR UPDATE"
+    ))
+    .bind(queue)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        claim_once_for_target(&store, &pool, queue),
+    )
+    .await
+    .expect("a refresh that leaves the target unchanged must not wait on the row lock");
+    holder.rollback().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
     let (_db_guard, pool) = setup_pool(10).await;
