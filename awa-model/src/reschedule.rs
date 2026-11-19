@@ -137,6 +137,8 @@ pub async fn reschedule_canonical_attempt_tx(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
 ) -> Result<RescheduleOutcome, AwaError> {
+    let error = error.map(crate::queue_storage::without_duplicate_mask);
+    let error = error.as_ref();
     // Lock the transition singleton FOR SHARE for the rest of this
     // transaction before deciding where the attempt goes. `storage_abort`,
     // `storage_enter_mixed_transition`, and `storage_finalize` all take
@@ -356,7 +358,7 @@ async fn migrate_to_queue_storage(
             tx,
             successor,
             job.unique_states,
-            "rescheduled as duplicate: unique claim held by a newer job",
+            crate::queue_storage::RESCHEDULED_DUPLICATE_ERROR,
         )
         .await?;
 

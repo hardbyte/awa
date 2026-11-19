@@ -473,7 +473,7 @@ async fn test_rescued_duplicate_with_a_cancelled_mask_keeps_its_key_queue_storag
         last_error["error"],
         "rescued as duplicate: unique claim held by a newer job"
     );
-    assert_eq!(last_error["unique_states"], original.as_str());
+    assert_eq!(last_error["duplicate_unique_states"], original.as_str());
     assert_eq!(holder(pool.clone(), key.clone()).await, Some(newer.id));
 
     // Retry while the duplicate holds the key: refused, nothing changes.

@@ -30,6 +30,8 @@ const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
+pub(crate) const RESCHEDULED_DUPLICATE_ERROR: &str =
+    "rescheduled as duplicate: unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = crate::bulk::DEFAULT_BATCH_SIZE;
 
 /// Columns of a `DlqJobRow` read from `dlq_entries`.
@@ -1913,14 +1915,17 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
 
 /// The key of a duplicate-cancellation error entry that holds the job's
 /// unique mask from before `cancelled` was cleared from it.
-pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "unique_states";
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "duplicate_unique_states";
+
+/// The messages of the error entries awa writes when it cancels a job as a
+/// duplicate. A recorded mask is trusted only on an entry with one of them.
+pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 2] =
+    [RESCUED_DUPLICATE_ERROR, RESCHEDULED_DUPLICATE_ERROR];
 
 /// The messages releases before 0.6.19 wrote when they cancelled a duplicate
 /// and stored it without its unique key.
-const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] = [
-    RESCUED_DUPLICATE_ERROR,
-    "rescheduled as duplicate: unique claim held by a newer job",
-];
+const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] =
+    [RESCUED_DUPLICATE_ERROR, RESCHEDULED_DUPLICATE_ERROR];
 
 /// The unique mask a revived job takes. A row cancelled as a duplicate
 /// carries its original mask under [`DUPLICATE_CANCEL_MASK_KEY`] in the
@@ -1943,6 +1948,10 @@ fn revived_unique_states(
         .map(Vec::as_slice)
         .unwrap_or_default();
     if let Some(original) = errors.iter().rev().find_map(|error| {
+        let message = error.get("error").and_then(serde_json::Value::as_str)?;
+        if !DUPLICATE_CANCEL_ERRORS.contains(&message) {
+            return None;
+        }
         error
             .get(DUPLICATE_CANCEL_MASK_KEY)
             .and_then(serde_json::Value::as_str)
@@ -1969,6 +1978,41 @@ fn revived_unique_states(
         });
     }
     Ok(unique_states)
+}
+
+/// `entry` without the duplicate cancellation mask key, which only awa
+/// records.
+pub(crate) fn without_duplicate_mask(entry: &serde_json::Value) -> serde_json::Value {
+    let mut entry = entry.clone();
+    if let Some(object) = entry.as_object_mut() {
+        object.remove(DUPLICATE_CANCEL_MASK_KEY);
+    }
+    entry
+}
+
+/// A caller-supplied error entry as stored on a failed job, with the
+/// attempt, time and terminal flag filled in when absent. The duplicate
+/// cancellation mask key is dropped: only awa records it.
+fn caller_error_entry(error_entry: serde_json::Value, attempt: i16) -> serde_json::Value {
+    let mut error_obj = match error_entry {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("error".to_string(), other);
+            map
+        }
+    };
+    error_obj.remove(DUPLICATE_CANCEL_MASK_KEY);
+    error_obj
+        .entry("attempt".to_string())
+        .or_insert_with(|| serde_json::Value::from(i64::from(attempt)));
+    error_obj
+        .entry("at".to_string())
+        .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
+    error_obj
+        .entry("terminal".to_string())
+        .or_insert(serde_json::Value::Bool(true));
+    serde_json::Value::Object(error_obj)
 }
 
 /// Clear `cancelled` from `done`'s mask and record the original mask in its
@@ -15962,23 +16006,7 @@ impl QueueStorage {
             moved.payload.clone(),
             moved.progress.clone(),
         )?)?;
-        let mut error_entry = match error_entry {
-            serde_json::Value::Object(map) => serde_json::Value::Object(map),
-            other => serde_json::json!({ "error": other }),
-        };
-        let error_obj = error_entry
-            .as_object_mut()
-            .ok_or_else(|| AwaError::Validation("callback error entry must be an object".into()))?;
-        error_obj
-            .entry("attempt".to_string())
-            .or_insert_with(|| serde_json::Value::from(i64::from(moved.attempt)));
-        error_obj
-            .entry("at".to_string())
-            .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
-        error_obj
-            .entry("terminal".to_string())
-            .or_insert(serde_json::Value::Bool(true));
-        payload.push_error(error_entry);
+        payload.push_error(caller_error_entry(error_entry, moved.attempt));
         let done_row =
             moved
                 .clone()
@@ -20596,6 +20624,57 @@ mod revived_unique_states_tests {
                 Err(AwaError::UniqueConflict { .. })
             ));
         }
+    }
+
+    #[test]
+    fn a_mask_field_on_a_caller_error_entry_is_ignored() {
+        let forged = payload(serde_json::json!({
+            "error": "upstream failed",
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &forged).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_caller_error_entry_cannot_record_a_duplicate_mask() {
+        let entry = caller_error_entry(
+            serde_json::json!({
+                "error": RESCUED_DUPLICATE_ERROR,
+                DUPLICATE_CANCEL_MASK_KEY: "11111111",
+            }),
+            2,
+        );
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], RESCUED_DUPLICATE_ERROR);
+        assert_eq!(entry["attempt"], 2);
+        assert_eq!(entry["terminal"], true);
+        assert_eq!(
+            revived_unique_states(
+                JobState::Cancelled,
+                Some(b"key"),
+                Some("11000000".to_string()),
+                &payload(entry)
+            )
+            .unwrap(),
+            Some("11000000".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reschedule_error_cannot_record_a_duplicate_mask() {
+        let entry = without_duplicate_mask(&serde_json::json!({
+            "error": RESCHEDULED_DUPLICATE_ERROR,
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], RESCHEDULED_DUPLICATE_ERROR);
+        assert_eq!(
+            without_duplicate_mask(&serde_json::json!("plain")),
+            serde_json::json!("plain")
+        );
     }
 
     #[test]
