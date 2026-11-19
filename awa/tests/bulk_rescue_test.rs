@@ -554,21 +554,27 @@ impl HeartbeatLagSampler {
                             );
                         }
                         let conn = conn.as_mut().expect("sampler connection");
+                        let sampled_at = started.elapsed();
                         let query_started = Instant::now();
                         let (open_claims, max_age_ms) = heartbeat_lag(conn, queue).await?;
-                        Ok::<_, sqlx::Error>((open_claims, max_age_ms, query_started.elapsed()))
+                        Ok::<_, sqlx::Error>((
+                            sampled_at,
+                            open_claims,
+                            max_age_ms,
+                            query_started.elapsed(),
+                        ))
                     };
                     let outcome = tokio::select! {
                         _ = &mut stopped => break,
                         outcome = read => outcome,
                     };
                     match outcome {
-                        Ok((open_claims, max_age_ms, query_time)) => {
+                        Ok((sampled_at, open_claims, max_age_ms, query_time)) => {
                             samples
                                 .lock()
                                 .expect("lag samples")
                                 .push(HeartbeatLagSample {
-                                    elapsed: started.elapsed(),
+                                    elapsed: sampled_at,
                                     open_claims,
                                     max_age: max_age_ms
                                         .map(|ms| Duration::from_secs_f64(ms.max(0.0) / 1_000.0)),
