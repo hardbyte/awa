@@ -81,7 +81,11 @@ const CONSUMED_QUEUE: &str = "uc_rescue";
 const PARKED_QUEUE: &str = "uc_rescue_parked";
 
 async fn clean(pool: &PgPool) {
-    for queue in [CONSUMED_QUEUE, PARKED_QUEUE] {
+    clean_queues(pool, &[CONSUMED_QUEUE, PARKED_QUEUE]).await;
+}
+
+async fn clean_queues(pool: &PgPool, queues: &[&str]) {
+    for queue in queues {
         sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
             .bind(queue)
             .execute(pool)
@@ -91,6 +95,10 @@ async fn clean(pool: &PgPool) {
 }
 
 async fn insert_unique(pool: &PgPool, queue: &str, n: i64) -> i64 {
+    insert_unique_with(pool, queue, n, PENDING_ONLY_STATES).await
+}
+
+async fn insert_unique_with(pool: &PgPool, queue: &str, n: i64, states: u8) -> i64 {
     let row = insert_with(
         pool,
         &UcRescueJob { n },
@@ -100,7 +108,7 @@ async fn insert_unique(pool: &PgPool, queue: &str, n: i64) -> i64 {
                 by_queue: false,
                 by_args: true,
                 by_period: None,
-                states: PENDING_ONLY_STATES,
+                states,
             }),
             ..Default::default()
         },
@@ -241,6 +249,32 @@ async fn test_rescue_survives_unique_claim_conflict() {
 /// claim/lease plane end to end.
 #[tokio::test]
 async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
+    rescue_survives_unique_claim_conflict_queue_storage(
+        PENDING_ONLY_STATES,
+        CONSUMED_QUEUE,
+        PARKED_QUEUE,
+    )
+    .await;
+}
+
+/// The mask also claims `cancelled`, so the cancelled duplicate is written
+/// with `cancelled` cleared from its mask. It keeps its unique key, and a
+/// retry conflicts while the duplicate holds it.
+#[tokio::test]
+async fn test_rescue_duplicate_with_cancelled_claiming_mask_keeps_its_key() {
+    rescue_survives_unique_claim_conflict_queue_storage(
+        PENDING_ONLY_STATES | 0b0100_0000,
+        "uc_rescue_cancelled_mask",
+        "uc_rescue_cancelled_mask_parked",
+    )
+    .await;
+}
+
+async fn rescue_survives_unique_claim_conflict_queue_storage(
+    states: u8,
+    consumed: &str,
+    parked: &str,
+) {
     let _guard = acquire_rescue_guard().await;
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -250,16 +284,16 @@ async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
         .expect("Failed to connect — is Postgres running?");
     migrations::run(&pool).await.expect("Failed to migrate");
     awa_testing::setup::activate_queue_storage(&pool).await;
-    clean(&pool).await;
+    clean_queues(&pool, &[consumed, parked]).await;
 
     // Job A: unique, pending-only mask — the claim is released the moment
     // it is claimed. Job C: no uniqueness, the innocent stuck job.
-    let job_a = insert_unique(&pool, CONSUMED_QUEUE, 11).await;
+    let job_a = insert_unique_with(&pool, consumed, 11, states).await;
     let job_c = insert_with(
         &pool,
         &UcRescueJob { n: 12 },
         InsertOpts {
-            queue: CONSUMED_QUEUE.into(),
+            queue: consumed.into(),
             ..Default::default()
         },
     )
@@ -273,7 +307,7 @@ async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
     // crashed worker.
     let client = Client::builder(pool.clone())
         .queue(
-            CONSUMED_QUEUE,
+            consumed,
             QueueConfig {
                 max_workers: 4,
                 ..QueueConfig::default()
@@ -300,11 +334,14 @@ async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
             _ => {}
         }
         if tokio::time::Instant::now() > deadline {
-            panic!("job A was never claimed");
+            panic!(
+                "job A was never claimed: {:?}",
+                job_state_opt(&pool, job_a).await
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let job_b = insert_unique(&pool, PARKED_QUEUE, 11).await;
+    let job_b = insert_unique_with(&pool, parked, 11, states).await;
 
     // Old behavior: the whole rescue batch aborts on A's conflict and C is
     // never rescued. Fixed behavior: A is cancelled (claim holder wins) and
@@ -346,8 +383,34 @@ async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
     );
     assert_eq!(job_state(&pool, job_b).await, "available");
 
+    let key: Option<Vec<u8>> = sqlx::query_scalar("SELECT unique_key FROM awa.jobs WHERE id = $1")
+        .bind(job_a)
+        .fetch_one(&pool)
+        .await
+        .expect("unique key probe");
+    assert!(
+        key.is_some(),
+        "the cancelled duplicate keeps its unique key"
+    );
+    let retried = awa::model::admin::retry(&pool, job_a).await;
+    assert!(
+        matches!(retried, Err(awa::AwaError::UniqueConflict { .. })),
+        "retry while the duplicate holds the key must conflict, got {retried:?}"
+    );
+    assert_eq!(job_state(&pool, job_b).await, "available");
+    sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+        .bind(job_b)
+        .execute(&pool)
+        .await
+        .expect("delete the duplicate");
+    let retried = awa::model::admin::retry(&pool, job_a).await;
+    assert!(
+        matches!(retried, Ok(Some(_))),
+        "retry once the key is free must succeed, got {retried:?}"
+    );
+
     client.shutdown(Duration::from_secs(5)).await;
-    clean(&pool).await;
+    clean_queues(&pool, &[consumed, parked]).await;
     awa_testing::setup::reset_runtime_backend(&pool).await;
 }
 
