@@ -423,6 +423,32 @@ macro_rules! correlated_claim_tombstones_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `spent_claim_prefix_gaps` patch: the
+/// installer, and each claim function of an installed queue-storage substrate
+/// (found as for `correlated_claim_tombstones`) whose spent prefix still has to
+/// start at the claim cursor.
+macro_rules! spent_claim_prefix_gaps_pending_sql {
+    () => {
+        "SELECT 'awa.install_queue_storage_substrate'::text AS target \
+         WHERE EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'install_queue_storage_substrate' \
+               AND p.prosrc ~ 'prefix_group[[:space:]]+=[[:space:]]+v_lane_claim_seq') \
+         UNION ALL \
+         SELECT format('claim function %s.%s', n.nspname, p.proname) \
+         FROM pg_proc AS p \
+         JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+         WHERE p.prokind = 'f' \
+           AND (p.proname = 'claim_ready_runtime' OR p.proname ~ '^claim_ready_slot_[0-9]+$') \
+           AND p.prosrc ~ 'prefix_group[[:space:]]+=[[:space:]]+v_lane_claim_seq' \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid \
+                         AND c.relname = 'ready_tombstones' \
+                         AND c.relkind = 'p')"
+    };
+}
+
 /// Rows naming what still lacks the `replica_identity` patch: the installer,
 /// the awa tables without a primary key, and each `queue_terminal_count_deltas`
 /// table or partition of an installed queue-storage substrate (found as for
@@ -481,6 +507,10 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
         }
         "correlated_claim_tombstones" => Some(concat!(
             correlated_claim_tombstones_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        "spent_claim_prefix_gaps" => Some(concat!(
+            spent_claim_prefix_gaps_pending_sql!(),
             " ORDER BY 1"
         )),
         "replica_identity" => Some(concat!(replica_identity_pending_sql!(), " ORDER BY 1")),
@@ -612,13 +642,27 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         description: "Replica identity for every awa table (awa 0.7 migration v047)",
         // The v023 definitions first, so the installer sets the identity in
         // schemas prepared later; the patch then sets it on existing tables.
-        // Keep last: it holds table locks until its transaction commits.
+        // Keep last but for `spent_claim_prefix_gaps`: it holds table locks
+        // until its transaction commits.
         sql: concat!(
             include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
             "\n",
             include_str!("../migrations/patches/replica_identity.sql"),
         ),
         applied_probe: concat!("SELECT NOT EXISTS (", replica_identity_pending_sql!(), ")"),
+    },
+    SchemaPatch {
+        name: "spent_claim_prefix_gaps",
+        description: "Let a claim cross rolled-back reservations ahead of spent ready rows",
+        // Rewrites the installed installer and claim functions in place; the
+        // versioned v023 file stays as released. Keep after every patch that
+        // embeds the v023 installer, which would restore the released claim.
+        sql: include_str!("../migrations/patches/spent_claim_prefix_gaps.sql"),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            spent_claim_prefix_gaps_pending_sql!(),
+            ")"
+        ),
     },
 ];
 
@@ -644,15 +688,30 @@ async fn pending_schema_patches_conn(
     conn: &mut PgConnection,
 ) -> Result<Vec<SchemaPatch>, AwaError> {
     let mut pending = Vec::new();
+    let mut installer_restored = false;
     for patch in SCHEMA_PATCHES {
         let applied: bool = sqlx::query_scalar(patch.applied_probe)
             .fetch_one(&mut *conn)
             .await?;
-        if !applied {
+        if !applied || (installer_restored && rewrites_installer(patch)) {
+            installer_restored |= embeds_installer(patch);
             pending.push(*patch);
         }
     }
     Ok(pending)
+}
+
+/// Whether applying `patch` puts the released v023 installer back.
+fn embeds_installer(patch: &SchemaPatch) -> bool {
+    patch.sql.contains(include_str!(
+        "../migrations/v023_install_queue_storage_substrate.sql"
+    ))
+}
+
+/// Whether `patch` rewrites the installer in place, so it must run again
+/// after any patch that [`embeds_installer`].
+fn rewrites_installer(patch: &SchemaPatch) -> bool {
+    patch.name == "spent_claim_prefix_gaps"
 }
 
 /// Whether one schema patch is present, and if not, where it is missing.
@@ -884,14 +943,12 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
     if current <= CURRENT_VERSION {
         let before = schema_patch_status_conn(conn).await?;
         let mut applied_this_run = Vec::new();
-        for status in &before {
-            if status.applied {
+        let mut installer_restored = false;
+        for (status, patch) in before.iter().zip(SCHEMA_PATCHES) {
+            if status.applied && !(installer_restored && rewrites_installer(patch)) {
                 continue;
             }
-            let patch = SCHEMA_PATCHES
-                .iter()
-                .find(|patch| patch.name == status.name)
-                .expect("status comes from SCHEMA_PATCHES");
+            installer_restored |= embeds_installer(patch);
             info!(
                 patch = patch.name,
                 description = patch.description,
@@ -939,10 +996,10 @@ async fn run_inner(conn: &mut PgConnection) -> Result<MigrationReport, AwaError>
             patches.push(PatchReport {
                 name: after.name,
                 description: after.description,
-                outcome: if before.applied {
-                    PatchOutcome::AlreadyPresent
-                } else {
+                outcome: if applied_this_run.contains(&after.name) {
                     PatchOutcome::Applied
+                } else {
+                    PatchOutcome::AlreadyPresent
                 },
                 repaired,
                 still_needs_repair: after.needs_repair,
@@ -1320,6 +1377,216 @@ mod tests {
         assert!(subset.iter().all(|(v, _, _)| *v > 2));
         let expected = MIGRATIONS.iter().filter(|&&(v, _, _)| v > 2).count();
         assert_eq!(subset.len(), expected);
+    }
+
+    fn versioned_export_digests() -> Vec<(i32, String)> {
+        migration_sql()
+            .into_iter()
+            .map(|(version, description, sql)| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(description.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(sql.as_bytes());
+                (version, hasher.finalize().to_hex().to_string())
+            })
+            .collect()
+    }
+
+    /// blake3 of each versioned export's description, a NUL byte and its
+    /// SQL, as released in 0.6.18.
+    const VERSIONED_EXPORTS_0_6_18: &[(i32, &str)] = &[
+        (
+            1,
+            "1bb73b9f44d17601b4b9e8f941381e09b0141106bb14b6dda5e98751da295c90",
+        ),
+        (
+            2,
+            "ce4ee2e10f353678e4c6d7100a74be16eb4d2951a6309d9899aefab60b5a3028",
+        ),
+        (
+            3,
+            "b1f8d910a5f097651bb664c3a7183daa635a6da7613cc67dd1e30f2d3d0ec3d4",
+        ),
+        (
+            4,
+            "e30f95f4a8697ad407dc4a3d746dcb48b0ef3ccbd026b7812afc2c23e6e1ef32",
+        ),
+        (
+            5,
+            "fd6ec5e693f3bb8cd6db52d806b313451b192c138605adbe2ec5dab87a5b4c8c",
+        ),
+        (
+            6,
+            "13026488c3ec82edcc4e582e4349d5c0f77bcc96b31992281e34f797bc7e5766",
+        ),
+        (
+            7,
+            "1385ca0e0c09d2687a6789b4aef6fb8b37d0aa6dfa763b905b1316e794ea28b4",
+        ),
+        (
+            9,
+            "bc02951e90eda38f7a9a5a12bef3385fc20a364f5eac7670c50ddc0349612465",
+        ),
+        (
+            10,
+            "f1a311704e0af5fd25ed4b1c97b770e343f146934a3a4b650f71e284f360f448",
+        ),
+        (
+            11,
+            "e99386451f1e35f36bda2b34db8c3eabf27f5bd795ee49800b2a1ee43781d864",
+        ),
+        (
+            12,
+            "f5bea8c5c5d1849c79cb744da483083b4841db94b9b77b039d997794f552d168",
+        ),
+        (
+            13,
+            "ec049d32cb23190edb18c857df050a4368522ea07ccfeeca45a7a904e95960d1",
+        ),
+        (
+            14,
+            "e6fd621f2da3b2b8d13868b0a7d2c0031b2068a0ead1b5497ccf2f80840ab150",
+        ),
+        (
+            15,
+            "f80b488edcff4b51deea62c0b396a2f5cd80863402f9580130ab8930cba0d8e2",
+        ),
+        (
+            16,
+            "ac1c724fedda91dffb029a5c7c708e0ec489eb2287aa72b4b77ce6d8b5e4a783",
+        ),
+        (
+            17,
+            "7e062841121382bb1e4b9124bcc3e284619a7abb83c8b41676afda16769904fa",
+        ),
+        (
+            18,
+            "b95bfcb15d0b34110b8e38c4f77c4f831af24be054e2c0286aaf320ab063e783",
+        ),
+        (
+            19,
+            "89f419bc35602176a5c1032b2eb31dff741238b418dfb19eb4f67aed6a0afb64",
+        ),
+        (
+            20,
+            "f16297626d203d5b046870205886a22b5657264f41e2290fe61863f952815a33",
+        ),
+        (
+            21,
+            "309f77d63762aa81dbba4a87bf8b87d731bb9dd1dbbd1bd8d89ab5e4996631b5",
+        ),
+        (
+            22,
+            "6cf926ba024166db9ff988d08ede2aa1c4e102168b23c648169a2d4e743f84f7",
+        ),
+        (
+            23,
+            "09f053b920d84761b01e68c06274cbdd806d7a419266798c5a35fe125f97c4c4",
+        ),
+        (
+            24,
+            "0f3178d4bd3a7a9528184317a79298e020cea5767390c55235a6523540f5c814",
+        ),
+        (
+            25,
+            "2b818187213cd9f4c1191733a01c1122dd4a34a8615f7b02671b92691b7c1815",
+        ),
+        (
+            26,
+            "0c0b3f9e80f5f34bc122d6d8745dcef5590644eeee2999da8101454f25eabb5c",
+        ),
+        (
+            27,
+            "022662031b01d4b8bc5e71eb8d197b65e961ec6ae0adee6bbf259b41de71b40c",
+        ),
+        (
+            28,
+            "ee088a81296f301a2608c2bdc4dfd64803522a65b8af4a342793ea70b836d939",
+        ),
+        (
+            29,
+            "c48f17454e132affe202ec9643ae0c60e323385e0ad874c892ffdc05efcf443e",
+        ),
+        (
+            30,
+            "1af71144fe42a53b973af5ec490609535cdcbfd05da1b39f4be765ca60ce303e",
+        ),
+        (
+            31,
+            "c4febae04b95a78fc93f72d2d4ed7caa37494f2330a7549c9ebc0ce60d0cd30c",
+        ),
+        (
+            32,
+            "51555423865c88c6bdaedb8ac1305850e3b812301321ec1033fed3a74b3d14f0",
+        ),
+        (
+            33,
+            "d02e3aca39357130c782c78173af4108690f6f4120b6850fb7930d5a80647572",
+        ),
+        (
+            34,
+            "2465d331a0b69854616eaa2bbf50a4ae27475701ad5bee80338493b14b2d1d6e",
+        ),
+        (
+            35,
+            "750d4bed4f585fb565de3b535dcb47a789bcccc65ca4f9a4d2c6abb07f1076bc",
+        ),
+        (
+            36,
+            "103eeb0b8c9d9868b07f77ad01d70636eb11e682c2f471747299ba204fd96848",
+        ),
+        (
+            37,
+            "f134e8bb15bcd572e0ae0e5e004d642a8f30e0be8d0f4156b3407bf01bc4a7d6",
+        ),
+        (
+            38,
+            "6e67b61234d2c88433caff38e767497a905d3799a29577235c64d3bf2450a15b",
+        ),
+        (
+            39,
+            "cd815a6b2857238f2c9666d3ddfadfc7779ebbeefc5ae6d5e15dad0ff25b2de8",
+        ),
+        (
+            40,
+            "99356db46cc43cfb489dac726194d819af9dad196840f3c99786ae9e788b303b",
+        ),
+    ];
+
+    #[test]
+    fn versioned_exports_match_0_6_18() {
+        // Checksum-validating runners reject an applied file whose bytes
+        // change; fixes after 0.6.18 ship as schema patches.
+        assert_eq!(
+            versioned_export_digests(),
+            VERSIONED_EXPORTS_0_6_18
+                .iter()
+                .map(|&(version, digest)| (version, digest.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn spent_claim_prefix_gaps_runs_after_every_installer_patch() {
+        let installer = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+        let position = |name: &str| {
+            SCHEMA_PATCHES
+                .iter()
+                .position(|patch| patch.name == name)
+                .expect("registered patch")
+        };
+        let fix = position("spent_claim_prefix_gaps");
+        assert!(rewrites_installer(&SCHEMA_PATCHES[fix]));
+        for patch in SCHEMA_PATCHES {
+            if embeds_installer(patch) {
+                assert!(
+                    position(patch.name) < fix && patch.name < "spent_claim_prefix_gaps",
+                    "{} restores the released installer, so it must run and sort first",
+                    patch.name
+                );
+            }
+        }
+        assert!(!SCHEMA_PATCHES[fix].sql.contains(installer));
     }
 
     #[test]

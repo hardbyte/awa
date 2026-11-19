@@ -4,7 +4,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- `awa migrate` applies one new repeatable patch, `spent_claim_prefix_gaps`, which replaces `awa.install_queue_storage_substrate` and `claim_ready_runtime` in every queue-storage schema and takes no table lock. Versioned migration files are byte-for-byte those of 0.6.18. External migration runners apply `R__spent_claim_prefix_gaps.sql` after `V40` and after every other `R__` script (its name sorts last but for `R__wait_free_dirty_marks.sql`, which it does not depend on), as the owner of the installer and claim functions. A runner that re-runs only changed repeatables, such as Flyway, must re-run it whenever it re-runs a patch that embeds the installer; with Flyway, also install it as an `afterMigrate` callback. 0.6.18 binaries run unchanged on the patched schema.
+
 ### Fixed
+
+- **A rolled-back insert followed by a cancelled or deleted job no longer stops a queue-storage queue from claiming (#813).** When a lane's next position belonged to an insert that rolled back and the job after it had been cancelled, deleted, moved or reprioritised before anything claimed it, every claim on that queue returned no jobs, on every priority and enqueue shard. On 0.6.18 the maintenance leader released the queue after about 15 s with default settings (`queue_slot_count` × `queue_rotate_interval`), and not at all while `maintenance.prune` was halted; on earlier 0.6 releases the queue stayed stuck until something else moved the lane's cursor. Claims now step over the rolled-back positions once the schema patch is applied. Canonical storage was not affected.
 
 - `PeriodicJob::latest_fire_time` no longer panics on a schedule whose cron expression or timezone does not parse. `PeriodicJob::builder(...).build()` validates both, but a `PeriodicJob` built from its public fields or deserialized skipped that check and panicked when evaluated; it now logs a warning naming the schedule and returns `None`, so the schedule does not fire.
 

@@ -549,7 +549,11 @@ async fn schema_patch_is_applied_once_by_migrate() {
     // The recreated mark tables need their replica identity again.
     assert_eq!(
         pending.iter().map(|patch| patch.name).collect::<Vec<_>>(),
-        ["wait_free_dirty_marks", "replica_identity"]
+        [
+            "wait_free_dirty_marks",
+            "replica_identity",
+            "spent_claim_prefix_gaps"
+        ]
     );
 
     awa_model::migrations::run(&pool).await.unwrap();
