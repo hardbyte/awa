@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- `PeriodicJob::latest_fire_time` no longer panics on a schedule whose cron expression or timezone does not parse. `PeriodicJob::builder(...).build()` validates both, but a `PeriodicJob` built from its public fields or deserialized skipped that check and panicked when evaluated; it now logs a warning naming the schedule and returns `None`, so the schedule does not fire.
+
 ### Documentation
 
 - [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) tells the fault apart from a pinned lane by the prune outcome alone. It said `awa.maintenance.prune.pinned_ready_age` stays absent or `0` during the fault, but the leader leaves the gauge unchanged when prune is `blocked`, so it can be positive while a lane also pins the slot. The storage-isolation section of the deployment guide is corrected the same way.
