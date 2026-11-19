@@ -508,6 +508,206 @@ fn assert_completed_exactly(
     ids
 }
 
+/// One database-side reading of how far behind a runtime's heartbeats are.
+#[derive(Clone, Copy, Debug)]
+struct HeartbeatLagSample {
+    elapsed: Duration,
+    open_claims: i64,
+    /// The longest any open claim had gone without a heartbeat (or, never
+    /// heartbeated, since it was claimed); `None` with no open claims.
+    max_age: Option<Duration>,
+    /// How long the sampling statement took.
+    query_time: Duration,
+}
+
+/// Samples, about once a second on a connection of its own, the heartbeat
+/// lag across a queue's open compact claims. Read errors are logged and
+/// skipped, so the sampler cannot fail or stall the test that runs it.
+struct HeartbeatLagSampler {
+    samples: Arc<Mutex<Vec<HeartbeatLagSample>>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HeartbeatLagSampler {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn start(url: String, queue: &'static str) -> Self {
+        let samples: Arc<Mutex<Vec<HeartbeatLagSample>>> = Arc::default();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = {
+            let samples = samples.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let mut conn: Option<sqlx::PgConnection> = None;
+                let mut ticks = tokio::time::interval(Self::INTERVAL);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        _ = ticks.tick() => {}
+                    }
+                    let read = async {
+                        if conn.is_none() {
+                            conn = Some(
+                                <sqlx::PgConnection as sqlx::Connection>::connect(&url).await?,
+                            );
+                        }
+                        let conn = conn.as_mut().expect("sampler connection");
+                        let query_started = Instant::now();
+                        let (open_claims, max_age_ms) = heartbeat_lag(conn, queue).await?;
+                        Ok::<_, sqlx::Error>((open_claims, max_age_ms, query_started.elapsed()))
+                    };
+                    let outcome = tokio::select! {
+                        _ = &mut stopped => break,
+                        outcome = read => outcome,
+                    };
+                    match outcome {
+                        Ok((open_claims, max_age_ms, query_time)) => {
+                            samples
+                                .lock()
+                                .expect("lag samples")
+                                .push(HeartbeatLagSample {
+                                    elapsed: started.elapsed(),
+                                    open_claims,
+                                    max_age: max_age_ms
+                                        .map(|ms| Duration::from_secs_f64(ms.max(0.0) / 1_000.0)),
+                                    query_time,
+                                });
+                        }
+                        Err(err) => {
+                            eprintln!("heartbeat lag sample failed: {err}");
+                            conn = None;
+                        }
+                    }
+                }
+            })
+        };
+        Self {
+            samples,
+            stop: Some(stop),
+            task: Some(task),
+        }
+    }
+
+    fn samples(&self) -> Vec<HeartbeatLagSample> {
+        self.samples.lock().expect("lag samples").clone()
+    }
+
+    async fn stop(mut self) -> Vec<HeartbeatLagSample> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            if let Err(err) = task.await {
+                eprintln!("heartbeat lag sampler ended abnormally: {err}");
+            }
+        }
+        self.samples()
+    }
+}
+
+/// Open compact claims in `queue` and the longest any has gone without a
+/// heartbeat, in milliseconds, aged the way `record_compact_rescue_heartbeats`
+/// ages a claim it sees rescued. A claim is open until a closure batch covers
+/// its receipt or a closure row names its attempt.
+///
+/// Heartbeats keep `attempt_state` full of dead tuples, so it is read once
+/// into a hash rather than probed per claim, and each claim batch gathers only
+/// the closure batches that overlap it.
+async fn heartbeat_lag(
+    conn: &mut sqlx::PgConnection,
+    queue: &str,
+) -> Result<(i64, Option<f64>), sqlx::Error> {
+    sqlx::query_as(
+        "WITH attempt AS MATERIALIZED (
+             SELECT job_id, run_lease, heartbeat_at FROM awa.attempt_state
+         )
+         SELECT count(*),
+                EXTRACT(EPOCH FROM max(now() - COALESCE(attempt.heartbeat_at, batches.claimed_at)))::float8
+                    * 1000
+         FROM awa.lease_claim_batches AS batches
+         LEFT JOIN LATERAL (
+             SELECT range_agg(closed.receipt_ranges) AS receipt_ranges
+               FROM awa.lease_claim_closure_batches AS closed
+              WHERE closed.claim_slot = batches.claim_slot
+                AND closed.receipt_ranges && batches.receipt_ranges
+         ) AS closed ON true
+         CROSS JOIN LATERAL unnest(batches.receipt_ids, batches.job_ids, batches.run_leases)
+             AS items(receipt_id, job_id, run_lease)
+         LEFT JOIN attempt
+           ON attempt.job_id = items.job_id AND attempt.run_lease = items.run_lease
+         WHERE batches.queue = $1
+           AND (closed.receipt_ranges IS NULL OR NOT closed.receipt_ranges @> items.receipt_id)
+           AND NOT EXISTS (
+               SELECT 1 FROM awa.lease_claim_closures AS closures
+                WHERE closures.claim_slot = batches.claim_slot
+                  AND closures.job_id = items.job_id
+                  AND closures.run_lease = items.run_lease
+           )",
+    )
+    .bind(queue)
+    .fetch_one(conn)
+    .await
+}
+
+fn secs(duration: Duration) -> String {
+    format!("{:.2}s", duration.as_secs_f64())
+}
+
+/// One line on the heartbeat lag samples: the worst, the 95th percentile, and
+/// how close the worst came to `staleness`.
+fn heartbeat_lag_summary(samples: &[HeartbeatLagSample], staleness: Duration) -> String {
+    let mut ages: Vec<Duration> = samples.iter().filter_map(|s| s.max_age).collect();
+    ages.sort();
+    let worst = samples
+        .iter()
+        .filter(|s| s.max_age.is_some())
+        .max_by_key(|s| s.max_age);
+    let slowest_query = samples.iter().map(|s| s.query_time).max();
+    let Some(worst) = worst else {
+        return format!(
+            "heartbeat lag: {} samples, none with open claims; staleness {}",
+            samples.len(),
+            secs(staleness)
+        );
+    };
+    let max_age = worst.max_age.expect("worst sample has an age");
+    let p95 = ages[(ages.len() * 95).div_ceil(100).max(1) - 1];
+    let headroom = staleness.as_secs_f64() - max_age.as_secs_f64();
+    format!(
+        "heartbeat lag: {} samples; max {} at {} open claims ({} in); p95 {}; staleness {}; \
+         headroom {headroom:.2}s; slowest sample query {}",
+        samples.len(),
+        secs(max_age),
+        worst.open_claims,
+        secs(worst.elapsed),
+        secs(p95),
+        secs(staleness),
+        slowest_query.map(secs).unwrap_or_default(),
+    )
+}
+
+/// The summary plus the last ten samples, for a failure message.
+fn heartbeat_lag_report(samples: &[HeartbeatLagSample], staleness: Duration) -> String {
+    let recent: Vec<String> = samples[samples.len().saturating_sub(10)..]
+        .iter()
+        .map(|s| {
+            format!(
+                "{} open={} max_age={}",
+                secs(s.elapsed),
+                s.open_claims,
+                s.max_age.map(secs).unwrap_or_else(|| "n/a".into())
+            )
+        })
+        .collect();
+    format!(
+        "{}; last samples: [{}]",
+        heartbeat_lag_summary(samples, staleness),
+        recent.join(", ")
+    )
+}
+
 /// A client on its own Tokio runtime, so it can be killed the way SIGKILL
 /// would: every task is dropped mid-flight, no shutdown runs, and its
 /// connections close with their transactions rolled back.
@@ -725,6 +925,7 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     let generation_before = claim_ring_generation(&pool).await;
     record_compact_rescue_heartbeats(&pool).await;
     let doomed = DoomedClient::start(db.url(), staleness, heartbeat_interval);
+    let heartbeat_lag = HeartbeatLagSampler::start(db.url(), ABANDONED_QUEUE);
     let claim_started = Instant::now();
     for chunk_start in (0..ABANDONED).step_by(ABANDONED_CHUNK as usize) {
         let chunk_end = (chunk_start + ABANDONED_CHUNK).min(ABANDONED);
@@ -764,18 +965,27 @@ async fn rescue_drains_an_abandoned_backlog_without_rescuing_live_claims() {
     let claimed_in = claim_started.elapsed();
     let (fresh, rescued, freshest) = rescued_heartbeat_ages(&pool, staleness).await;
     assert_eq!(
-        fresh, 0,
-        "rescue closed {fresh} claims last heartbeated within the {staleness:?} staleness window"
+        fresh,
+        0,
+        "rescue closed {fresh} claims last heartbeated within the {staleness:?} staleness \
+         window; {}",
+        heartbeat_lag_report(&heartbeat_lag.samples(), staleness)
     );
     assert_eq!(
         rescued_rows(&pool, ABANDONED_QUEUE).await,
         0,
         "rescue took a claim while its runtime was alive: {rescued} claims had gone {freshest} \
          or longer without a heartbeat, beyond the {staleness:?} staleness, so the live \
-         runtime's heartbeat passes fell behind"
+         runtime's heartbeat passes fell behind; {}",
+        heartbeat_lag_report(&heartbeat_lag.samples(), staleness)
     );
     let generation_at_kill = claim_ring_generation(&pool).await;
     live_hold_ms.store(live_job_duration.as_millis() as u64, Ordering::SeqCst);
+    let lag_samples = heartbeat_lag.stop().await;
+    eprintln!(
+        "while claiming: {}",
+        heartbeat_lag_summary(&lag_samples, staleness)
+    );
     doomed.kill();
     let slots = abandoned_claim_slots(&pool).await;
     assert!(
