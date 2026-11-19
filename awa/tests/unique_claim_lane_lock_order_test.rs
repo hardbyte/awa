@@ -414,15 +414,16 @@ async fn promotion_and_fresh_enqueue_of_one_key_do_not_deadlock() {
                 .await
         }
     })
-    .await;
-    assert_unique_conflict(result, "promotion");
-    let still_scheduled: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM awa.deferred_jobs WHERE job_id = $1)")
-            .bind(scheduled)
-            .fetch_one(&pool)
-            .await
-            .expect("deferred row");
-    assert!(still_scheduled, "the job stays scheduled");
+    .await
+    .expect("promotion cancels the duplicate instead of failing");
+    assert_eq!(result.promoted, 0, "{result:?}");
+    assert_eq!(result.selected, 1, "{result:?}");
+    let state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
+        .bind(scheduled)
+        .fetch_one(&pool)
+        .await
+        .expect("job state");
+    assert_eq!(state, "cancelled", "the job loses the key and is cancelled");
 
     drop_claim(&pool, &key).await;
     setup::clean_queue(&pool, &queue).await;
