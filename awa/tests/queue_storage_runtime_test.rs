@@ -1925,6 +1925,197 @@ async fn test_queue_storage_ready_tombstone_non_head_does_not_skip_live_prefix()
     assert_eq!(lease_count(&pool, &store).await, 1);
 }
 
+/// A lane whose claim cursor sits on a rolled-back reservation followed by
+/// cancelled, deleted or moved jobs, with further rolled-back reservations
+/// between them, still hands out its next live job, and the queue's other
+/// lanes keep being claimed.
+async fn assert_claim_crosses_rolled_back_reservations_before_spent_rows(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_gap_spent_head";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: format!("awa_qs_gap_spent_head_{receipts}"),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = enqueue_lane(&pool, &store, queue, 2, 1).await;
+    let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+    assert_eq!(claimed[0].job.id, first[0]);
+
+    for spend in ["cancel", "delete", "move"] {
+        let mut spent = Vec::new();
+        for _ in 0..2 {
+            reserve_and_roll_back(&pool, &store, queue, 2, 1).await;
+            let job = enqueue_lane(&pool, &store, queue, 2, 1).await[0];
+            match spend {
+                "cancel" => {
+                    admin::cancel(&pool, job)
+                        .await
+                        .expect("cancel available job");
+                }
+                "delete" => {
+                    let deleted = sqlx::query("DELETE FROM awa.jobs WHERE id = $1")
+                        .bind(job)
+                        .execute(&pool)
+                        .await
+                        .expect("delete available job")
+                        .rows_affected();
+                    assert_eq!(deleted, 1);
+                }
+                _ => assert!(store
+                    .move_queue(&pool, job, "qs_gap_spent_head_dest", None)
+                    .await
+                    .expect("move available job")),
+            }
+            spent.push(job);
+        }
+        let live = enqueue_lane(&pool, &store, queue, 2, 1).await[0];
+        let other_lane = enqueue_lane(&pool, &store, queue, 3, 1).await[0];
+        let live_seq = first_lane_seqs(&pool, &store, &[live]).await[0];
+
+        let mut claimed = Vec::new();
+        for _ in 0..4 {
+            claimed.extend(
+                claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                    .await
+                    .into_iter()
+                    .map(|job| job.job.id),
+            );
+        }
+        claimed.sort_unstable();
+        assert_eq!(
+            claimed,
+            vec![live, other_lane],
+            "{spend}: the lane's live job and the other lane's job are claimed past {spent:?}"
+        );
+        assert_eq!(
+            claim_cursor(&pool, &store, queue, 2).await,
+            live_seq + 1,
+            "{spend}: the cursor crosses the gaps and spent rows to the live job"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_crosses_rolled_back_reservations_before_spent_rows_with_receipts() {
+    assert_claim_crosses_rolled_back_reservations_before_spent_rows(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_crosses_rolled_back_reservations_before_spent_rows_without_receipts() {
+    assert_claim_crosses_rolled_back_reservations_before_spent_rows(false).await;
+}
+
+/// Lane positions from a provisioned, empty lane: `R` an insert whose
+/// transaction rolls back, `C` a cancelled job, `M` a moved job, `L` a live
+/// job. Each case is its own lane; the claims must hand out its live job.
+async fn assert_fresh_lane_claims_past_rollbacks_and_spent_rows(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: format!("awa_qs_fresh_gap_{receipts}"),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cases = [
+        ("qs_fresh_gap_rcl", "RCL"),
+        ("qs_fresh_gap_rml", "RML"),
+        ("qs_fresh_gap_crcl", "CRCL"),
+        ("qs_fresh_gap_rcrcl", "RCRCL"),
+        ("qs_fresh_gap_crl", "CRL"),
+    ];
+    for (queue, shape) in cases {
+        sqlx::query(&format!(
+            "SELECT {}.provision_lane($1, 2::smallint, 0::smallint)",
+            store.schema()
+        ))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("provision lane");
+        let mut live = None;
+        for (position, step) in (1_i64..).zip(shape.chars()) {
+            match step {
+                'R' => {
+                    let mut tx = pool.begin().await.expect("begin");
+                    insert::insert_with(
+                        &mut *tx,
+                        &CompleteJob { id: position },
+                        InsertOpts {
+                            queue: queue.to_string(),
+                            priority: 2,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("insert inside the rolled-back transaction");
+                    tx.rollback().await.expect("roll back the insert");
+                }
+                'C' | 'M' | 'L' => {
+                    let job = enqueue_lane(&pool, &store, queue, 2, 1).await[0];
+                    assert_eq!(
+                        first_lane_seqs(&pool, &store, &[job]).await[0],
+                        position,
+                        "{shape}: lane position of step {position}"
+                    );
+                    match step {
+                        'C' => {
+                            admin::cancel(&pool, job).await.expect("cancel");
+                        }
+                        'M' => assert!(store
+                            .move_queue(&pool, job, "qs_fresh_gap_dest", None)
+                            .await
+                            .expect("move")),
+                        _ => live = Some(job),
+                    }
+                }
+                other => unreachable!("{other}"),
+            }
+        }
+        let live = live.expect("each shape ends with a live job");
+        let start = claim_cursor(&pool, &store, queue, 2).await;
+        let mut claimed = Vec::new();
+        for _ in 0..3 {
+            claimed.extend(
+                claim_and_complete(&store, &pool, queue, 10, Duration::ZERO)
+                    .await
+                    .into_iter()
+                    .map(|job| job.job.id),
+            );
+        }
+        assert_eq!(
+            claimed,
+            vec![live],
+            "{shape}: three claims from cursor {start} hand out the live job"
+        );
+        assert_eq!(
+            claim_cursor(&pool, &store, queue, 2).await,
+            shape.len() as i64 + 1,
+            "{shape}: the cursor ends one past the live job"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fresh_lane_claims_past_rollbacks_and_spent_rows_with_receipts() {
+    assert_fresh_lane_claims_past_rollbacks_and_spent_rows(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fresh_lane_claims_past_rollbacks_and_spent_rows_without_receipts() {
+    assert_fresh_lane_claims_past_rollbacks_and_spent_rows(false).await;
+}
+
 struct ReceiptRescueWorker {
     release: Arc<tokio::sync::Notify>,
     first_attempt_started: Arc<AtomicBool>,
@@ -25234,7 +25425,7 @@ async fn test_claim_batch_job_index_patch_leaves_indexing_to_claim_prune() {
             .iter()
             .map(|patch| patch.name)
             .collect::<Vec<_>>(),
-        vec!["claim_batch_job_index"]
+        vec!["claim_batch_job_index", "spent_claim_prefix_gaps"]
     );
 
     let schema_versions = || async {

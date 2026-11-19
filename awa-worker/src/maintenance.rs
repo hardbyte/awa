@@ -44,7 +44,7 @@ enum GatedRing {
     Claim,
 }
 
-const PROMOTED_DUPLICATE_ERROR: &str = "promoted as duplicate: unique claim held by another job";
+use awa_model::queue_storage::PROMOTED_DUPLICATE_ERROR;
 
 /// What per-row canonical promotion did with one due row.
 enum PerRowPromotion {
@@ -3852,7 +3852,7 @@ impl MaintenanceService {
                     'error', $2::text,
                     'attempt', attempt,
                     'at', now(),
-                    'unique_states', unique_states::text
+                    'duplicate_unique_states', unique_states::text
                 )::jsonb,
                 metadata,
                 tags,

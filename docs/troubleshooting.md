@@ -186,7 +186,7 @@ Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates u
 Failed to rescue deadline-expired jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
 ```
 
-Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. In both fixed paths the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue degrades row-at-a-time; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
+Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. A worker finalizing its own snooze, `RetryAfter` or retryable failure reports it as `snoozed as duplicate` or `retried as duplicate` ([#807](https://github.com/hardbyte/awa/issues/807)); before that fix the worker logged `Failed to complete job` with `unique conflict` and the attempt stayed running until rescue. In every fixed path the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue no longer aborts on the conflict: the canonical engine retries row at a time, and queue storage cancels the conflicted attempt in the same pass that rescues the others; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
 
 ```sql
 SELECT j.id AS stuck_job, j.kind, j.queue, j.unique_key,
@@ -456,13 +456,13 @@ A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue r
 
 Tell it apart from the other ring stalls by the prune outcome:
 
-| Fault | `awa.maintenance.prune.attempts` | `awa.maintenance.prune.pinned_ready_age` |
-| --- | --- | --- |
-| Claims starve prune (this section) | `blocked`, reason `none` | absent or `0` |
-| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` | positive for the pinning lane |
-| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` | absent or `0` |
+| Fault | `awa.maintenance.prune.attempts` |
+| --- | --- |
+| Claims starve prune (this section) | `blocked`, reason `none` |
+| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` |
+| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` |
 
-The leader reads `awa.maintenance.prune.pinned_ready_age` only after a `skipped_active` prune, so it does not report this fault.
+Do not use `awa.maintenance.prune.pinned_ready_age` to rule this fault in or out. The leader reads the gauge only after a `skipped_active` prune and on backed-off ticks while a lane already pins the slot, and leaves it unchanged when prune is `blocked`, so it does not report this fault and can be positive during it when a lane also pins the slot.
 
 ```promql
 sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
