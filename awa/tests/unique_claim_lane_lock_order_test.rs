@@ -1484,3 +1484,241 @@ async fn row_by_row_copy_skips_a_held_key_without_waiting_for_it() {
         setup::clean_queue(&pool, lane).await;
     }
 }
+
+/// Insert two unique jobs with distinct keys on `queue`'s lane and fail them
+/// with their claims released, as a failed job whose mask omits `failed`.
+async fn seed_failed_unique_pair(pool: &PgPool, queue: &str) -> [(i64, Vec<u8>); 2] {
+    let params: Vec<InsertParams> = ["claim_lane_retry_a", "claim_lane_retry_b"]
+        .into_iter()
+        .map(|kind| InsertParams {
+            kind: kind.to_string(),
+            args: serde_json::json!({}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                priority: PRIORITY,
+                unique: Some(UniqueOpts {
+                    by_queue: true,
+                    by_args: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        })
+        .collect();
+    let jobs = insert_many(pool, &params)
+        .await
+        .expect("insert unique jobs");
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    sqlx::query(
+        r#"
+        WITH moved AS (
+            DELETE FROM awa.ready_entries
+            WHERE job_id = ANY($1)
+            RETURNING ready_slot, ready_generation, job_id, kind, queue, args,
+                      priority, attempt, run_lease, max_attempts, lane_seq, run_at,
+                      attempted_at, created_at, unique_key, unique_states, payload
+        )
+        INSERT INTO awa.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, args, state,
+            priority, attempt, run_lease, max_attempts, lane_seq, run_at,
+            attempted_at, finalized_at, created_at, unique_key, unique_states, payload
+        )
+        SELECT ready_slot, ready_generation, job_id, kind, queue, args,
+               'failed'::awa.job_state, priority, 1, run_lease,
+               max_attempts, lane_seq, run_at, now(), now(),
+               created_at, unique_key, unique_states, payload
+        FROM moved
+        "#,
+    )
+    .bind(&ids)
+    .execute(pool)
+    .await
+    .expect("fail the jobs");
+    sqlx::query("DELETE FROM awa.job_unique_claims WHERE job_id = ANY($1)")
+        .bind(&ids)
+        .execute(pool)
+        .await
+        .expect("release the failed jobs' claims");
+    let mut seeded = jobs
+        .into_iter()
+        .map(|job| (job.id, job.unique_key.expect("unique key")));
+    let first = seeded.next().expect("first job");
+    let second = seeded.next().expect("second job");
+    assert!(first.0 < second.0, "jobs are retried in job ID order");
+    [first, second]
+}
+
+async fn assert_left_failed(pool: &PgPool, job_id: i64) {
+    let state: JobState = sqlx::query_scalar("SELECT state FROM awa.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("job state");
+    assert_eq!(state, JobState::Failed, "the conflicting job stays failed");
+}
+
+/// A bounded retry of failed jobs A and B on one lane, while a fresh enqueue
+/// holds B's key and then reserves the lane, claims both keys before it
+/// reserves the lane, so it loses B's key instead of deadlocking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_retry_by_queue_claims_every_key_before_reserving_the_lane() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_retry_failed");
+    provision_lane(&pool, &queue).await;
+    let [(first, _), (second, second_key)] = seed_failed_unique_pair(&pool, &queue).await;
+    let batch =
+        race_fresh_enqueue(&pool, &queue, &second_key, {
+            let pool = pool.clone();
+            let queue = queue.clone();
+            async move {
+                admin::retry_failed_by_queue_batch(&pool, &queue, 10, BulkCursor::default()).await
+            }
+        })
+        .await
+        .expect("retry_failed_batch skips the conflicting job");
+    assert_eq!(
+        (batch.count, batch.skipped, batch.conflicts.clone()),
+        (1, 1, vec![second])
+    );
+    let state: JobState = sqlx::query_scalar("SELECT state FROM awa.jobs WHERE id = $1")
+        .bind(first)
+        .fetch_one(&pool)
+        .await
+        .expect("job state");
+    assert_eq!(state, JobState::Available);
+    assert_left_failed(&pool, second).await;
+    drop_claim(&pool, &second_key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// [`bounded_retry_by_queue_claims_every_key_before_reserving_the_lane`] for
+/// a bounded retry of explicit job IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_retry_by_ids_claims_every_key_before_reserving_the_lane() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("claim_lane_retry_ids");
+    provision_lane(&pool, &queue).await;
+    let [(first, _), (second, second_key)] = seed_failed_unique_pair(&pool, &queue).await;
+    let outcome = race_fresh_enqueue(&pool, &queue, &second_key, {
+        let pool = pool.clone();
+        async move { admin::bulk_retry_in_batches(&pool, &[first, second], 10).await }
+    })
+    .await
+    .expect("retry_jobs_in_batches skips the conflicting job");
+    assert_eq!(
+        (
+            outcome.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+            outcome.skipped,
+            outcome.conflicts.clone()
+        ),
+        (vec![first], 1, vec![second])
+    );
+    assert_left_failed(&pool, second).await;
+    drop_claim(&pool, &second_key).await;
+    setup::clean_queue(&pool, &queue).await;
+}
+
+/// Seed a DLQ row in `queue` whose failed-only mask keeps `key` claimed,
+/// and its claim.
+async fn seed_dlq_key_owner(pool: &PgPool, queue: &str, key: &[u8]) -> i64 {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO awa.dlq_entries (
+             job_id, kind, queue, priority, dlq_reason, original_run_lease,
+             dlq_at, unique_key, unique_states
+         )
+         VALUES (nextval('awa.job_id_seq'), 'claim_lane_job', $1, $2, 'seeded', 1,
+                 now() - interval '1 day', $3, '00000100')
+         RETURNING job_id",
+    )
+    .bind(queue)
+    .bind(PRIORITY)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("seed dlq row");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(key)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("the dlq row owns its key");
+    id
+}
+
+/// Deleting DLQ rows releases their claims in key order, as every claim
+/// path takes keys. The owner of the higher key B is the lower job ID, so
+/// the delete returns it first. A holder locks the claim of the lower key A;
+/// the purge, observed waiting on it, must not yet hold B's claim, which the
+/// holder then takes before it commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dlq_deletes_release_claims_in_key_order() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    for purge in ["purge_dlq_batch", "purge_dlq", "cleanup_dlq"] {
+        let queue = unique_queue("claim_order_dlq_delete");
+        let low = format!("claim-order-{queue}-a").into_bytes();
+        let high = format!("claim-order-{queue}-b").into_bytes();
+        seed_dlq_key_owner(&pool, &queue, &high).await;
+        seed_dlq_key_owner(&pool, &queue, &low).await;
+
+        let mut holder = pool.begin().await.expect("begin holder");
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *holder)
+            .await
+            .expect("backend pid");
+        sqlx::query("SELECT 1 FROM awa.job_unique_claims WHERE unique_key = $1 FOR UPDATE")
+            .bind(&low)
+            .fetch_all(&mut *holder)
+            .await
+            .expect("hold the low key's claim");
+        let deletes = tokio::spawn({
+            let pool = pool.clone();
+            let queue = queue.clone();
+            async move {
+                let filter = ListDlqFilter {
+                    queue: Some(queue.clone()),
+                    ..Default::default()
+                };
+                match purge {
+                    "purge_dlq_batch" => {
+                        dlq::purge_dlq_batch(&pool, &filter, false, 10, BulkCursor::default())
+                            .await
+                            .map(|batch| batch.count)
+                    }
+                    "purge_dlq" => dlq::purge_dlq(&pool, &filter, false).await,
+                    _ => dlq::cleanup_dlq(&pool, Duration::from_secs(3600), 10, Some(&queue)).await,
+                }
+            }
+        });
+        let held = FreshEnqueue { tx: holder, pid };
+        held.wait_for_waiter(&pool).await;
+        let mut holder = held.tx;
+        sqlx::query("SET LOCAL lock_timeout = '5s'")
+            .execute(&mut *holder)
+            .await
+            .expect("lock timeout");
+        sqlx::query("UPDATE awa.job_unique_claims SET job_id = job_id WHERE unique_key = $1")
+            .bind(&high)
+            .execute(&mut *holder)
+            .await
+            .unwrap_or_else(|err| panic!("{purge}: the holder takes the high key: {err}"));
+        holder.commit().await.expect("commit holder");
+        let deleted =
+            tokio::time::timeout(ci_timing::scaled_timeout(Duration::from_secs(10)), deletes)
+                .await
+                .expect("the delete finishes")
+                .expect("join delete");
+        assert_eq!(deleted.expect(purge), 2, "{purge}");
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.job_unique_claims WHERE unique_key = ANY($1)",
+        )
+        .bind(vec![low.clone(), high.clone()])
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+        assert_eq!(left, 0, "{purge} releases both claims");
+        setup::clean_queue(&pool, &queue).await;
+    }
+}

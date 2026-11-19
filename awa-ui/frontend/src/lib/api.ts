@@ -365,11 +365,30 @@ export function cancelJob(id: number): Promise<JobRow> {
   return apiFetch(`/jobs/${id}/cancel`, { method: "POST" });
 }
 
-export function bulkRetry(ids: number[]): Promise<JobRow[]> {
-  return apiFetch("/jobs/bulk-retry", {
+export interface BulkRetryResult {
+  /** The jobs retried. */
+  jobs: JobRow[];
+  /** Jobs skipped because a live job holds their unique key. */
+  skipped: number;
+  /** IDs of skipped jobs, at most 10. */
+  conflicts: number[];
+}
+
+/**
+ * Read a bulk-retry response. A server that predates `report_skipped`
+ * returns the array of retried jobs and reports no skipped jobs.
+ */
+export function toBulkRetryResult(body: JobRow[] | BulkRetryResult): BulkRetryResult {
+  if (Array.isArray(body)) return { jobs: body, skipped: 0, conflicts: [] };
+  return body;
+}
+
+export async function bulkRetry(ids: number[]): Promise<BulkRetryResult> {
+  const body = await apiFetch<JobRow[] | BulkRetryResult>("/jobs/bulk-retry", {
     method: "POST",
-    body: JSON.stringify({ ids }),
+    body: JSON.stringify({ ids, report_skipped: true }),
   });
+  return toBulkRetryResult(body);
 }
 
 export function bulkCancel(ids: number[]): Promise<JobRow[]> {
@@ -488,7 +507,9 @@ export function bulkPurgeDlq(filter: {
   kind?: string;
   queue?: string;
   tag?: string;
-}): Promise<DlqBulkResult> {
+  batch_size?: number;
+  cursor?: BulkCursor;
+}): Promise<BulkBatchResult> {
   return apiFetch("/dlq/bulk-purge", {
     method: "POST",
     body: JSON.stringify(filter),
@@ -499,7 +520,9 @@ export function bulkMoveFailedToDlq(body: {
   kind?: string;
   queue?: string;
   reason?: string;
-}): Promise<DlqBulkResult> {
+  batch_size?: number;
+  cursor?: BulkCursor;
+}): Promise<BulkBatchResult> {
   return apiFetch("/dlq/bulk-move", {
     method: "POST",
     body: JSON.stringify(body),
@@ -539,10 +562,43 @@ export function resumeQueue(queue: string): Promise<{ ok: boolean }> {
   });
 }
 
-export function drainQueue(queue: string): Promise<{ drained: number }> {
-  return apiFetch(`/queues/${encodeURIComponent(queue)}/drain`, {
+export function drainQueue(
+  queue: string,
+  batch?: { batch_size: number; cursor?: BulkCursor }
+): Promise<BulkBatchResult & { drained: number }> {
+  const qs = new URLSearchParams();
+  if (batch) {
+    qs.set("batch_size", String(batch.batch_size));
+    if (batch.cursor) {
+      qs.set("stage", String(batch.cursor.stage));
+      qs.set("after_job_id", String(batch.cursor.after_job_id));
+      if (batch.cursor.before_job_id) {
+        qs.set("before_job_id", String(batch.cursor.before_job_id));
+      }
+      if (batch.cursor.sequence_bound) {
+        qs.set("sequence_bound", String(batch.cursor.sequence_bound));
+      }
+      if (batch.cursor.started_at) {
+        qs.set("started_at", batch.cursor.started_at);
+      }
+    }
+  }
+  const query = qs.toString();
+  return apiFetch(`/queues/${encodeURIComponent(queue)}/drain${query ? `?${query}` : ""}`, {
     method: "POST",
   });
+}
+
+export function fetchDlqCount(filter: {
+  kind?: string;
+  queue?: string;
+  tag?: string;
+}): Promise<{ count: number; capped: boolean }> {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(filter)) {
+    if (v) qs.set(k, v);
+  }
+  return apiFetch(`/dlq/count?${qs.toString()}`);
 }
 
 // Cron

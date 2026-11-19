@@ -387,7 +387,7 @@ async fn a_conflicting_row_gets_no_lane_position() {
         .expect("live job holds the key");
     let before = next_lane_seq(&pool, &queue).await;
 
-    let result = batch(&pool, &by_queue(&queue), 10, warmed.cursor).await;
+    let result = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
     assert_eq!((result.count, result.conflicts.clone()), (1, vec![keyed]));
     let plain_seq: i64 =
         sqlx::query_scalar("SELECT lane_seq FROM awa.ready_entries WHERE job_id = $1")
@@ -551,7 +551,9 @@ async fn a_batch_and_a_single_retry_of_one_key_do_not_deadlock() {
             queue: Some(queue.clone()),
             ..Default::default()
         };
-        async move { dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, warmed.cursor).await }
+        async move {
+            dlq::bulk_retry_from_dlq_batch(&pool, &filter, false, 10, BulkCursor::default()).await
+        }
     });
     wait_for_waiters(&pool, gate_pid, 1).await;
     let single_run = tokio::spawn({
@@ -592,7 +594,7 @@ async fn a_batch_is_busy_not_done_while_every_matching_row_is_held() {
     let holder = hold(&pool, &ids).await;
     let held = batch(&pool, &by_queue(&queue), 10, BulkCursor::default()).await;
     assert_eq!((held.count, held.busy, held.done), (0, true, false));
-    assert_eq!(held.cursor, BulkCursor::default());
+    assert_eq!((held.cursor.stage, held.cursor.after_job_id), (0, 0));
     holder.rollback().await.expect("release rows");
 
     let released = batch(&pool, &by_queue(&queue), 10, held.cursor).await;

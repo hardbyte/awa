@@ -5,6 +5,7 @@ Requires Postgres running at localhost:15432 (see docker command in test plan).
 
 import asyncio
 import os
+import uuid
 from dataclasses import dataclass
 
 import pytest
@@ -578,6 +579,47 @@ async def test_admin_drain(client):
 
     count = await client.drain_queue("drain_py_test")
     assert count == 3
+
+
+@pytest.mark.asyncio
+async def test_admin_drain_warns_about_explicit_ids_it_cannot_reach(client):
+    """A role that may not advance the job ID sequence drains below it and
+    warns about the jobs with explicit IDs above it."""
+    queue = "drain_py_unfenced"
+    for i in range(2):
+        await client.insert(
+            SendEmail(to=f"unfenced{i}@example.com", subject="Drain"), queue=queue
+        )
+    role = f"awa_py_no_seq_update_{uuid.uuid4().hex[:8]}"
+    tx = await client.transaction()
+    await tx.execute(
+        "INSERT INTO awa.jobs (id, kind, queue, args) "
+        "VALUES (nextval('awa.jobs_id_seq') + 1000000000, 'send_email', $1, '{}')",
+        queue,
+    )
+    await tx.execute(f"CREATE ROLE {role} NOLOGIN")
+    await tx.execute(f"GRANT USAGE ON SCHEMA awa TO {role}")
+    await tx.execute(
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA awa TO {role}"
+    )
+    await tx.execute(f"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO {role}")
+    await tx.execute(f"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {role}")
+    await tx.execute(f"REVOKE UPDATE ON SEQUENCE awa.jobs_id_seq FROM {role}")
+    await tx.commit()
+
+    separator = "&" if "?" in DATABASE_URL else "?"
+    restricted = awa.AsyncClient(f"{DATABASE_URL}{separator}options=-c%20role%3D{role}")
+    try:
+        with pytest.warns(RuntimeWarning, match="left 1 matching job"):
+            count = await restricted.drain_queue(queue)
+        assert count == 2
+    finally:
+        await restricted.close()
+        tx = await client.transaction()
+        await tx.execute(f"DROP OWNED BY {role}")
+        await tx.execute(f"DROP ROLE {role}")
+        await tx.execute("DELETE FROM awa.jobs WHERE queue = $1", queue)
+        await tx.commit()
 
 
 @pytest.mark.asyncio

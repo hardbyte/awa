@@ -13,6 +13,7 @@ import {
   drainQueue,
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
+import { useBulkRun, BulkRunProgress } from "@/hooks/use-bulk-run";
 import { toast } from "@/components/ui/toast";
 import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
@@ -77,17 +78,18 @@ export function QueuesPage() {
     },
   });
 
-  const drainMutation = useMutation({
-    mutationFn: (queue: string) => drainQueue(queue),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["queues"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue drained`);
-    },
-    onError: () => {
-      toast.error("Failed to drain queue");
-    },
-  });
+  const bulk = useBulkRun();
+  const startDrain = (queue: string) =>
+    void bulk.start({
+      label: `Draining queue "${queue}"`,
+      verb: "Drained",
+      noun: `job(s) from "${queue}"`,
+      runBatch: (batchSize, cursor) => drainQueue(queue, { batch_size: batchSize, cursor }),
+      onFinish: () => {
+        void queryClient.invalidateQueries({ queryKey: ["queues"] });
+        void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      },
+    });
 
   const queues = queuesQuery.data ?? [];
   const runtimeByQueue = new Map<string, QueueRuntimeSummary>(
@@ -260,6 +262,8 @@ export function QueuesPage() {
           })}
         </div>
       )}
+
+      <BulkRunProgress state={bulk.state} onStop={bulk.requestStop} />
 
       {/* Desktop table layout */}
       <Table aria-label="Queues" className="hidden sm:table">
@@ -454,13 +458,14 @@ export function QueuesPage() {
           if (!open) setDrainTarget(null);
         }}
         title={`Drain queue "${drainTarget}"`}
-        description="This will cancel all available, scheduled, retryable, and waiting_external jobs in this queue. Running jobs will not be affected."
+        description="This will cancel all available, scheduled, retryable, and waiting_external jobs in this queue, in batches of up to 1,000. You can stop between batches. Running jobs will not be affected."
         confirmLabel="Drain queue"
         confirmIntent="danger"
         onConfirm={() => {
-          if (drainTarget) drainMutation.mutate(drainTarget);
+          if (drainTarget) startDrain(drainTarget);
+          setDrainTarget(null);
         }}
-        isPending={drainMutation.isPending}
+        isPending={bulk.state !== null}
       />
     </div>
   );

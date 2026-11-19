@@ -192,6 +192,9 @@ pub async fn move_failed_to_dlq(
 ///
 /// Preserves the source row's progress snapshot and error history so manual
 /// operator moves do not discard the last known execution state.
+///
+/// Every matching row moves in one transaction. Operator tooling should use
+/// [`bulk_move_failed_to_dlq_batch`]; in 0.7 this function runs in batches.
 pub async fn bulk_move_failed_to_dlq(
     pool: &PgPool,
     kind: Option<&str>,
@@ -410,11 +413,112 @@ pub async fn bulk_retry_from_dlq_batch(
         .await
 }
 
+/// Move up to `batch_size` failed rows matching `kind` and `queue` past
+/// `cursor` into the DLQ, in job ID order, in one transaction.
+///
+/// Start from `BulkCursor::default()` and pass each batch's cursor to the
+/// next call, or drive the run with [`crate::bulk::run_batches`]. A row
+/// another transaction holds is never skipped: the batch reports `busy`.
+/// Requires at least one of `kind` or `queue` unless `allow_all` is `true`.
+pub async fn bulk_move_failed_to_dlq_batch(
+    pool: &PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    reason: &str,
+    allow_all: bool,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    if !allow_all && kind.is_none() && queue.is_none() {
+        return Err(AwaError::Validation(
+            "bulk_move_failed_to_dlq_batch requires at least one of kind or queue (or allow_all=true)"
+                .into(),
+        ));
+    }
+    let store = active_queue_storage(pool).await?;
+    store
+        .bulk_move_failed_to_dlq_batch(pool, kind, queue, reason, batch_size, cursor)
+        .await
+}
+
+/// Delete up to `batch_size` DLQ rows matching the filter past `cursor`, in
+/// job ID order, in one transaction.
+///
+/// See [`bulk_move_failed_to_dlq_batch`] for the cursor and `busy`. Requires
+/// at least one of `kind`, `queue`, or `tag` unless `allow_all` is `true`.
+/// Ignores `filter.limit`.
+pub async fn purge_dlq_batch(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    if !allow_all && filter_requires_scope(filter) {
+        return Err(AwaError::Validation(
+            "purge_dlq_batch requires at least one of kind, queue, or tag (or allow_all=true)"
+                .into(),
+        ));
+    }
+    let store = active_queue_storage(pool).await?;
+    store
+        .purge_dlq_batch(pool, filter, batch_size, cursor)
+        .await
+}
+
+/// How many DLQ rows match `filter`, counting at most `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DlqCount {
+    pub count: i64,
+    /// More than `count` rows match; counting stopped at the cap.
+    pub capped: bool,
+}
+
+/// Count DLQ rows matching `filter`, including its `before_id` and
+/// `before_dlq_at` cursor, stopping at `cap` so the count stays cheap on a
+/// large DLQ. Ignores `filter.limit`.
+pub async fn count_dlq(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    cap: i64,
+) -> Result<DlqCount, AwaError> {
+    let store = active_queue_storage(pool).await?;
+    let counted: i64 = sqlx::query_scalar(&format!(
+        r#"
+        SELECT count(*)::bigint FROM (
+            SELECT 1
+            FROM {}.dlq_entries
+            WHERE {}
+            LIMIT $6
+        ) AS matching
+        "#,
+        store.schema(),
+        crate::queue_storage::DLQ_FILTER_SQL,
+    ))
+    .bind(&filter.kind)
+    .bind(&filter.queue)
+    .bind(&filter.tag)
+    .bind(filter.before_id)
+    .bind(filter.before_dlq_at)
+    .bind(cap.max(0) + 1)
+    .fetch_one(pool)
+    .await?;
+    Ok(DlqCount {
+        count: counted.min(cap.max(0)),
+        capped: counted > cap.max(0),
+    })
+}
+
 /// Purge DLQ rows matching the filter.
 ///
 /// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
 /// `true`, which is the explicit "yes, purge the whole DLQ" escape hatch for
 /// operator tooling.
+///
+/// Every matching row is deleted in one transaction. Operator tooling should
+/// use [`purge_dlq_batch`]; in 0.7 this function runs in batches. Ignores
+/// `filter.limit`.
 pub async fn purge_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
@@ -427,45 +531,13 @@ pub async fn purge_dlq(
     }
 
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(&format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE ($1::text IS NULL OR kind = $1)
-          AND ($2::text IS NULL OR queue = $2)
-          AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-          AND (
-              ($4::bigint IS NULL AND $5::timestamptz IS NULL)
-              OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
-              OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
-              OR (
-                  $4::bigint IS NOT NULL
-                  AND $5::timestamptz IS NOT NULL
-                  AND (dlq_at, job_id) < ($5, $4)
-              )
-          )
-        "#,
-        store.schema()
-    ))
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.before_id)
-    .bind(filter.before_dlq_at)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    store.purge_dlq(pool, filter).await
 }
 
+/// Delete one DLQ row, releasing its unique claim.
 pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(&format!(
-        "DELETE FROM {}.dlq_entries WHERE job_id = $1",
-        store.schema()
-    ))
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    store.purge_dlq_job(pool, job_id).await
 }
 
 /// Purge DLQ rows older than the configured retention horizon.
@@ -480,26 +552,7 @@ pub async fn cleanup_dlq(
     queue: Option<&str>,
 ) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let retention_secs = retention.as_secs().min(i64::MAX as u64) as i64;
-    let result = sqlx::query(&format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE job_id IN (
-            SELECT job_id
-            FROM {}.dlq_entries
-            WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-              AND ($3::text IS NULL OR queue = $3)
-            ORDER BY dlq_at ASC, job_id ASC
-            LIMIT $2
-        )
-        "#,
-        store.schema(),
-        store.schema()
-    ))
-    .bind(retention_secs)
-    .bind(batch_size)
-    .bind(queue)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    store
+        .delete_expired_dlq_rows(pool, retention, batch_size, queue, &[], true)
+        .await
 }

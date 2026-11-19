@@ -3,9 +3,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
-use awa_model::admin;
 use awa_model::dlq::DlqMetadata;
 use awa_model::job::{JobRow, JobState};
+use awa_model::{admin, bulk};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -173,16 +173,74 @@ pub struct BulkIdsPayload {
     pub ids: Vec<i64>,
 }
 
-pub async fn bulk_retry(
-    State(state): State<AppState>,
-    Json(payload): Json<BulkIdsPayload>,
-) -> Result<Json<Vec<JobResponse>>, ApiError> {
-    state.require_writable()?;
-    let jobs = admin::bulk_retry(&state.pool, &payload.ids).await?;
-    if !jobs.is_empty() {
+/// The jobs a chunked bulk call changed. When a later chunk failed, the
+/// earlier chunks stay committed: invalidate the caches for them, then
+/// return the error.
+fn changed_jobs(
+    state: &AppState,
+    result: Result<awa_model::BulkIds, awa_model::BulkError<awa_model::BulkIds>>,
+) -> Result<awa_model::BulkIds, ApiError> {
+    let (outcome, error) = match result {
+        Ok(outcome) => (outcome, None),
+        Err(err) => (err.partial, Some(err.error)),
+    };
+    if !outcome.jobs.is_empty() {
         state.invalidate_dashboard_caches();
     }
-    Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
+    match error {
+        Some(error) => Err(ApiError::after_partial(error, outcome.jobs.len() as u64)),
+        None => Ok(outcome),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkRetryPayload {
+    pub ids: Vec<i64>,
+    /// Return a [`BulkRetryReport`] instead of the array of retried jobs.
+    /// A server that predates the field ignores it and returns the array,
+    /// so a client that sets it accepts either shape.
+    #[serde(default)]
+    pub report_skipped: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkRetryReport {
+    /// The jobs retried.
+    pub jobs: Vec<JobResponse>,
+    /// Jobs skipped because a live job holds their unique key.
+    pub skipped: u64,
+    /// IDs of skipped jobs, at most `bulk::MAX_REPORTED_CONFLICTS`.
+    pub conflicts: Vec<i64>,
+}
+
+/// The array of retried jobs, the response every client understands, or
+/// the report a client asked for with `report_skipped`.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum BulkRetryResponse {
+    Jobs(Vec<JobResponse>),
+    Report(BulkRetryReport),
+}
+
+pub async fn bulk_retry(
+    State(state): State<AppState>,
+    Json(payload): Json<BulkRetryPayload>,
+) -> Result<Json<BulkRetryResponse>, ApiError> {
+    state.require_writable()?;
+    let outcome = changed_jobs(
+        &state,
+        admin::bulk_retry_in_batches(&state.pool, &payload.ids, bulk::DEFAULT_BATCH_SIZE).await,
+    )?;
+    let jobs = JobResponse::from_rows(&state.pool, outcome.jobs).await?;
+    Ok(Json(if payload.report_skipped {
+        BulkRetryResponse::Report(BulkRetryReport {
+            jobs,
+            skipped: outcome.skipped,
+            conflicts: outcome.conflicts,
+        })
+    } else {
+        BulkRetryResponse::Jobs(jobs)
+    }))
 }
 
 pub async fn bulk_cancel(
@@ -190,9 +248,10 @@ pub async fn bulk_cancel(
     Json(payload): Json<BulkIdsPayload>,
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
-    let jobs = admin::bulk_cancel(&state.pool, &payload.ids).await?;
-    if !jobs.is_empty() {
-        state.invalidate_dashboard_caches();
-    }
+    let jobs = changed_jobs(
+        &state,
+        admin::bulk_cancel_in_batches(&state.pool, &payload.ids, bulk::DEFAULT_BATCH_SIZE).await,
+    )?
+    .jobs;
     Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
 }

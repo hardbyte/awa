@@ -470,6 +470,79 @@ test.describe("Queue context banner", () => {
     await expect(dialog).not.toBeVisible();
   });
 
+  test("Drain runs in batches until the queue is drained", async ({ page }) => {
+    const drainRequests: string[] = [];
+    const responses = [
+      { drained: 2, count: 2, skipped: 0, conflicts: [], done: false, cursor: { stage: 2, after_job_id: 12, before_job_id: 40, sequence_bound: 30, started_at: "2026-11-18T09:00:00.123456Z" } },
+      { drained: 1, count: 1, skipped: 0, conflicts: [], done: true, cursor: { stage: 1, after_job_id: 0 } },
+    ];
+    await page.route("**/api/queues/e2e_test/drain**", async (route) => {
+      const url = new URL(route.request().url());
+      drainRequests.push(url.search);
+      await route.fulfill({ json: responses.shift() });
+    });
+    await Promise.all([
+      page.waitForResponse(isQueuesListResponse),
+      page.goto("/jobs?q=queue%3Ae2e_test"),
+    ]);
+
+    const banner = page.locator(".rounded-lg.border.bg-muted\\/30");
+    await banner.getByRole("button", { name: "Drain" }).click();
+    await page
+      .getByRole("alertdialog")
+      .getByRole("button", { name: "Drain queue" })
+      .click();
+
+    await expect(page.getByText('Drained 3 job(s) from "e2e_test"')).toBeVisible();
+    expect(drainRequests).toEqual([
+      "?batch_size=1000",
+      "?batch_size=1000&stage=2&after_job_id=12&before_job_id=40&sequence_bound=30&started_at=2026-11-18T09%3A00%3A00.123456Z",
+    ]);
+  });
+
+  for (const shape of ["report", "array"] as const) {
+    test(`bulk retry reads the ${shape} a server returns`, async ({ page }) => {
+      // Show the first listed job as failed, so it can be retried.
+      let retryable: { id: number } | undefined;
+      await page.route("**/api/jobs?**", async (route) => {
+        const response = await route.fetch();
+        const body = await response.json();
+        const rows = Array.isArray(body) ? body : body.jobs;
+        if (rows?.length) {
+          rows[0].state = "failed";
+          retryable = rows[0];
+        }
+        await route.fulfill({ response, json: body });
+      });
+      const requests: unknown[] = [];
+      await page.route("**/api/jobs/bulk-retry", async (route) => {
+        requests.push(route.request().postDataJSON());
+        // A server from before `report_skipped` ignores it and returns the
+        // array of retried jobs.
+        await route.fulfill({
+          json:
+            shape === "report"
+              ? { jobs: [retryable], skipped: 0, conflicts: [] }
+              : [retryable],
+        });
+      });
+      await Promise.all([
+        page.waitForResponse(
+          (r) => r.url().includes("/api/jobs") && r.url().includes("queue=e2e_test") && r.ok()
+        ),
+        page.goto("/jobs?q=queue%3Ae2e_test"),
+      ]);
+
+      const jobTable = page.getByRole("grid", { name: "Jobs" });
+      await jobTable.getByRole("checkbox").nth(1).click({ force: true });
+      await page.getByRole("button", { name: "Retry (1)" }).click();
+
+      await expect(page.getByText("Retried 1 job(s)", { exact: true })).toBeVisible();
+      expect(requests).toEqual([{ ids: [retryable!.id], report_skipped: true }]);
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+    });
+  }
+
   test("banner does not appear without queue filter", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),

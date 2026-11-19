@@ -1,3 +1,4 @@
+use crate::bulk::{self, BulkBatch, BulkCursor, BulkError, BulkIds};
 use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
@@ -2376,7 +2377,11 @@ pub struct RetryFailedOutcome {
     pub pruned_failed_count: Option<u64>,
 }
 
-/// Retry all failed jobs of a given kind.
+/// Retry all failed jobs of a given kind, in one transaction.
+///
+/// A unique conflict aborts the whole retry. Operator tooling should use
+/// [`retry_failed_by_kind_batch`], which works in bounded transactions; in
+/// 0.7 this function runs in batches too.
 pub async fn retry_failed_by_kind(
     pool: &PgPool,
     kind: &str,
@@ -2421,7 +2426,11 @@ pub async fn retry_failed_by_kind(
     })
 }
 
-/// Retry all failed jobs in a given queue.
+/// Retry all failed jobs in a given queue, in one transaction.
+///
+/// A unique conflict aborts the whole retry. Operator tooling should use
+/// [`retry_failed_by_queue_batch`], which works in bounded transactions; in
+/// 0.7 this function runs in batches too.
 pub async fn retry_failed_by_queue(
     pool: &PgPool,
     queue: &str,
@@ -2467,7 +2476,10 @@ pub async fn retry_failed_by_queue(
     })
 }
 
-/// Discard (delete) all failed jobs of a given kind.
+/// Discard (delete) all failed jobs of a given kind, in one transaction.
+///
+/// Operator tooling should use [`discard_failed_batch`], which works in
+/// bounded transactions; in 0.7 this function runs in batches too.
 pub async fn discard_failed(pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         return store.discard_failed_by_kind(pool, kind).await;
@@ -2522,6 +2534,10 @@ where
 ///
 /// On queue storage this also drains the queue's stripes: queues named
 /// `<queue>#<digits>`. Jobs enqueued after the drain starts are left alone.
+/// Queue storage drains in transactions of [`bulk::DEFAULT_BATCH_SIZE`]
+/// jobs; canonical storage drains in one transaction. Operator tooling
+/// should use [`drain_queue_batch`]; in 0.7 this function runs in batches on
+/// both engines.
 pub async fn drain_queue(pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         return store.drain_queue(pool, queue).await;
@@ -4823,48 +4839,28 @@ pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
 }
 
 /// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.
+///
+/// Every ID is retried in one transaction, and a unique conflict aborts it.
+/// Operator tooling should use [`bulk_retry_in_batches`]; in 0.7 this
+/// function chunks the IDs too.
 pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         let (rows, _attempted) = store.retry_jobs_by_ids(pool, ids).await?;
         return Ok(rows);
     }
 
-    let rows = sqlx::query_as::<_, JobRow>(
-        r#"
-        UPDATE awa.jobs
-        SET state = 'available', attempt = 0, run_at = now(),
-            finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
-            callback_id = NULL, callback_timeout_at = NULL,
-            callback_filter = NULL, callback_on_complete = NULL,
-            callback_on_fail = NULL, callback_transform = NULL,
-            unique_states = CASE
-                WHEN state = 'cancelled' THEN COALESCE(
-                    (SELECT (entry->>'duplicate_unique_states')::bit(8)
-                     FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
-                     WHERE entry->>'error' IN (
-                           'snoozed as duplicate: unique claim held by a newer job',
-                           'retried as duplicate: unique claim held by a newer job',
-                           'promoted as duplicate: unique claim held by another job'
-                       )
-                       AND entry->>'duplicate_unique_states' IS NOT NULL
-                     ORDER BY n DESC
-                     LIMIT 1),
-                    unique_states
-                )
-                ELSE unique_states
-            END
-        WHERE id = ANY($1) AND state IN ('failed', 'cancelled', 'waiting_external')
-        RETURNING *
-        "#,
-    )
-    .bind(ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query_as::<_, JobRow>(CANONICAL_RETRY_IDS_SQL)
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows)
 }
 
 /// Cancel multiple jobs by ID. Only cancels non-terminal jobs.
+///
+/// Every ID is cancelled in one transaction. Operator tooling should use
+/// [`bulk_cancel_in_batches`]; in 0.7 this function chunks the IDs too.
 pub async fn bulk_cancel(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         return store.cancel_jobs_by_ids(pool, ids).await;
@@ -4886,6 +4882,504 @@ pub async fn bulk_cancel(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaE
     .await?;
 
     Ok(rows)
+}
+
+const CANONICAL_RETRY_FAILED_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = 'available', attempt = 0, run_at = now(),
+        finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL
+    WHERE id = ANY($1) AND state = 'failed'
+    RETURNING *
+"#;
+
+/// Revive failed, cancelled and waiting jobs by ID: the one statement
+/// behind [`bulk_retry`] and [`bulk_retry_in_batches`] on canonical storage.
+const CANONICAL_RETRY_IDS_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = 'available', attempt = 0, run_at = now(),
+        finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
+        callback_id = NULL, callback_timeout_at = NULL,
+        callback_filter = NULL, callback_on_complete = NULL,
+        callback_on_fail = NULL, callback_transform = NULL,
+        unique_states = CASE
+            WHEN state = 'cancelled' THEN COALESCE(
+                (SELECT (entry->>'duplicate_unique_states')::bit(8)
+                 FROM unnest(errors) WITH ORDINALITY AS e(entry, n)
+                 WHERE entry->>'error' IN (
+                       'snoozed as duplicate: unique claim held by a newer job',
+                       'retried as duplicate: unique claim held by a newer job',
+                       'promoted as duplicate: unique claim held by another job'
+                   )
+                   AND entry->>'duplicate_unique_states' IS NOT NULL
+                 ORDER BY n DESC
+                 LIMIT 1),
+                unique_states
+            )
+            ELSE unique_states
+        END
+    WHERE id = ANY($1) AND state IN ('failed', 'cancelled', 'waiting_external')
+    RETURNING *
+"#;
+
+const CANONICAL_CANCEL_IDS_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = 'cancelled', finalized_at = now(),
+        callback_id = NULL, callback_timeout_at = NULL,
+        callback_filter = NULL, callback_on_complete = NULL,
+        callback_on_fail = NULL, callback_transform = NULL
+    WHERE id = ANY($1) AND state NOT IN ('completed', 'failed', 'cancelled')
+    RETURNING *
+"#;
+
+const CANONICAL_DRAIN_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = 'cancelled', finalized_at = now(),
+        callback_id = NULL, callback_timeout_at = NULL,
+        callback_filter = NULL, callback_on_complete = NULL,
+        callback_on_fail = NULL, callback_transform = NULL
+    WHERE id = ANY($1) AND state IN ('available', 'scheduled', 'retryable', 'waiting_external')
+"#;
+
+/// On a run's first batch, fence `awa.jobs_id_seq` (see [`bulk`]) and record
+/// the run's bound in `cursor`. Returns the fence on a first batch, `None`
+/// when the cursor resumes a run.
+async fn mark_canonical_run_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    cursor: &mut BulkCursor,
+) -> Result<Option<bulk::Fence>, AwaError> {
+    if cursor.before_job_id != 0 {
+        return Ok(None);
+    }
+    let fence = bulk::fence_sequence_tx(
+        tx,
+        r#"
+        WITH sequence AS (
+            SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END AS next
+            FROM awa.jobs_id_seq
+        )
+        SELECT
+            sequence.next,
+            GREATEST(
+                sequence.next,
+                (SELECT max(id) + 1 FROM awa.jobs_hot),
+                (SELECT max(id) + 1 FROM awa.scheduled_jobs)
+            )
+        FROM sequence
+        "#,
+        r#"
+        SELECT setval('awa.jobs_id_seq', $1 - 1, true)
+        FROM awa.jobs_id_seq
+        WHERE CASE WHEN is_called THEN last_value + 1 ELSE last_value END < $1
+        "#,
+    )
+    .await?;
+    bulk::apply_fence(cursor, fence);
+    Ok(Some(fence))
+}
+
+/// When `fence` was refused, count the rows of each `(relation, filter)`
+/// (filters bind `$1` and `$2`) that the run leaves above its bound.
+async fn count_canonical_left_above_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    fence: Option<bulk::Fence>,
+    passes: &[(&str, &str)],
+    first: Option<&str>,
+    second: Option<&str>,
+) -> Result<u64, AwaError> {
+    let Some(bulk::Fence::Refused { bound, top }) = fence else {
+        return Ok(0);
+    };
+    let mut left = 0;
+    for (relation, filter) in passes {
+        let count: i64 =
+            sqlx::query_scalar(&bulk::count_between_sql(relation, "id", filter, "$3", "$4"))
+                .bind(first)
+                .bind(second)
+                .bind(bound)
+                .bind(top)
+                .fetch_one(tx.as_mut())
+                .await?;
+        left += count as u64;
+    }
+    Ok(left)
+}
+
+/// Lock the next canonical rows of `relation` matching `filter` (binding
+/// `$1` and `$2`) in the cursor's range.
+async fn pick_canonical_batch_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    relation: &str,
+    filter: &str,
+    first: Option<&str>,
+    second: Option<&str>,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<bulk::Pick, AwaError> {
+    let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) = sqlx::query_as(
+        &bulk::pick_sql(relation, "id", filter, "$3", ["$4", "$6"], "$5"),
+    )
+    .bind(first)
+    .bind(second)
+    .bind(cursor.after_job_id)
+    .bind(cursor.before_job_id)
+    .bind(batch_size)
+    .bind(cursor.sequence_bound)
+    .fetch_one(tx.as_mut())
+    .await?;
+    Ok(bulk::Pick::new(picked, first_held, more))
+}
+
+/// Run `sql` (an `UPDATE ... WHERE id = ANY($1) ... RETURNING *`) over
+/// `ids`. When the statement hits a unique conflict, run it again one ID at
+/// a time, each in a savepoint, and report the IDs that conflict.
+async fn update_canonical_skipping_conflicts_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    sql: &str,
+    ids: &[i64],
+    skipped: &mut impl FnMut(i64),
+) -> Result<Vec<JobRow>, AwaError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query("SAVEPOINT awa_bulk_batch")
+        .execute(tx.as_mut())
+        .await?;
+    match sqlx::query_as::<_, JobRow>(sql)
+        .bind(ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(crate::error::map_sqlx_error)
+    {
+        Ok(rows) => {
+            sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
+                .execute(tx.as_mut())
+                .await?;
+            return Ok(rows);
+        }
+        Err(AwaError::UniqueConflict { .. }) => {}
+        Err(err) => return Err(err),
+    }
+    sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_batch")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
+        .execute(tx.as_mut())
+        .await?;
+    let mut rows = Vec::with_capacity(ids.len());
+    for job_id in ids {
+        sqlx::query("SAVEPOINT awa_bulk_row")
+            .execute(tx.as_mut())
+            .await?;
+        match sqlx::query_as::<_, JobRow>(sql)
+            .bind([*job_id].as_slice())
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(crate::error::map_sqlx_error)
+        {
+            Ok(row) => {
+                sqlx::query("RELEASE SAVEPOINT awa_bulk_row")
+                    .execute(tx.as_mut())
+                    .await?;
+                rows.extend(row);
+            }
+            Err(AwaError::UniqueConflict { .. }) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_row")
+                    .execute(tx.as_mut())
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT awa_bulk_row")
+                    .execute(tx.as_mut())
+                    .await?;
+                skipped(*job_id);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(rows)
+}
+
+async fn canonical_retry_failed_batch(
+    pool: &PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    batch_size: i64,
+    mut cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    const FILTER: &str =
+        "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)";
+    let mut tx = pool.begin().await?;
+    let fence = mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let mut batch = BulkBatch::new(cursor);
+    batch.left_above_sequence =
+        count_canonical_left_above_tx(&mut tx, fence, &[("awa.jobs_hot", FILTER)], kind, queue)
+            .await?;
+    let pick = pick_canonical_batch_tx(
+        &mut tx,
+        "awa.jobs_hot",
+        FILTER,
+        kind,
+        queue,
+        batch_size,
+        cursor,
+    )
+    .await?;
+    let mut skipped = Vec::new();
+    let rows = update_canonical_skipping_conflicts_tx(
+        &mut tx,
+        CANONICAL_RETRY_FAILED_SQL,
+        &pick.ids,
+        &mut |job_id| skipped.push(job_id),
+    )
+    .await?;
+    tx.commit().await?;
+    batch.count = rows.len() as u64;
+    skipped.into_iter().for_each(|job_id| batch.skip(job_id));
+    pick.settle(&mut batch, None);
+    Ok(batch)
+}
+
+/// Retry up to `batch_size` failed jobs of `kind` past `cursor`, in job ID
+/// order, in one transaction.
+///
+/// Start from `BulkCursor::default()` and pass each batch's cursor to the
+/// next call, or drive the run with [`bulk::run_batches`]. A job whose retry
+/// would violate a unique claim is skipped and reported, and a job another
+/// transaction holds is never skipped: the batch reports `busy` instead.
+pub async fn retry_failed_by_kind_batch(
+    pool: &PgPool,
+    kind: &str,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    bulk::validate_batch_size(batch_size)?;
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .retry_failed_batch(pool, Some(kind), None, batch_size, cursor)
+            .await;
+    }
+    canonical_retry_failed_batch(pool, Some(kind), None, batch_size, cursor).await
+}
+
+/// Retry up to `batch_size` failed jobs in `queue` past `cursor`, in job ID
+/// order, in one transaction. See [`retry_failed_by_kind_batch`].
+pub async fn retry_failed_by_queue_batch(
+    pool: &PgPool,
+    queue: &str,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    bulk::validate_batch_size(batch_size)?;
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .retry_failed_batch(pool, None, Some(queue), batch_size, cursor)
+            .await;
+    }
+    canonical_retry_failed_batch(pool, None, Some(queue), batch_size, cursor).await
+}
+
+/// Discard up to `batch_size` failed jobs of `kind` past `cursor`, in job ID
+/// order, in one transaction. On queue storage the run covers failed jobs,
+/// then the kind's DLQ rows. See [`retry_failed_by_kind_batch`].
+pub async fn discard_failed_batch(
+    pool: &PgPool,
+    kind: &str,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    bulk::validate_batch_size(batch_size)?;
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .discard_failed_batch(pool, kind, batch_size, cursor)
+            .await;
+    }
+    let mut cursor = cursor;
+    const FILTER: &str = "state = 'failed' AND kind = $1 AND $2::text IS NULL";
+    let mut tx = pool.begin().await?;
+    let fence = mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let mut batch = BulkBatch::new(cursor);
+    batch.left_above_sequence = count_canonical_left_above_tx(
+        &mut tx,
+        fence,
+        &[("awa.jobs_hot", FILTER)],
+        Some(kind),
+        None,
+    )
+    .await?;
+    let pick = pick_canonical_batch_tx(
+        &mut tx,
+        "awa.jobs_hot",
+        FILTER,
+        Some(kind),
+        None,
+        batch_size,
+        cursor,
+    )
+    .await?;
+    if !pick.ids.is_empty() {
+        batch.count = sqlx::query("DELETE FROM awa.jobs WHERE id = ANY($1) AND state = 'failed'")
+            .bind(&pick.ids)
+            .execute(tx.as_mut())
+            .await?
+            .rows_affected();
+    }
+    tx.commit().await?;
+    pick.settle(&mut batch, None);
+    Ok(batch)
+}
+
+/// Cancel up to `batch_size` of the queue's waiting, scheduled, retryable
+/// and available jobs past `cursor`, in one step of a drain run. Jobs
+/// enqueued after the run started are left alone.
+///
+/// The run takes waiting jobs first, then scheduled and retryable ones,
+/// then available ones: the order jobs move between them (a waiting job
+/// whose callback times out becomes retryable, and a scheduled or retryable
+/// job is promoted to available), so a job that moves during the run is
+/// still drained. A job another transaction holds is never passed: when
+/// every remaining job of a pass is held, the batch reports `busy`. On queue
+/// storage the queue's stripes (`queue#N`) are drained with it.
+pub async fn drain_queue_batch(
+    pool: &PgPool,
+    queue: &str,
+    batch_size: i64,
+    cursor: BulkCursor,
+) -> Result<BulkBatch, AwaError> {
+    bulk::validate_batch_size(batch_size)?;
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .drain_queue_batch(pool, queue, batch_size, cursor)
+            .await;
+    }
+    let mut cursor = cursor;
+    const PASSES: [(&str, &str); 3] = [
+        (
+            "awa.jobs_hot",
+            "state = 'waiting_external' AND queue = $1 AND $2::text IS NULL",
+        ),
+        (
+            "awa.scheduled_jobs",
+            "state IN ('scheduled', 'retryable') AND queue = $1 AND $2::text IS NULL",
+        ),
+        (
+            "awa.jobs_hot",
+            "state = 'available' AND queue = $1 AND $2::text IS NULL",
+        ),
+    ];
+    let mut tx = pool.begin().await?;
+    let fence = mark_canonical_run_tx(&mut tx, &mut cursor).await?;
+    let left_above_sequence =
+        count_canonical_left_above_tx(&mut tx, fence, &PASSES, Some(queue), None).await?;
+    loop {
+        let stage = usize::from(cursor.stage).min(PASSES.len() - 1);
+        let (relation, filter) = PASSES[stage];
+        let next_stage = (stage + 1 < PASSES.len()).then_some(stage as u8 + 1);
+        let mut batch = BulkBatch::new(cursor);
+        batch.left_above_sequence = left_above_sequence;
+        let pick = pick_canonical_batch_tx(
+            &mut tx,
+            relation,
+            filter,
+            Some(queue),
+            None,
+            batch_size,
+            cursor,
+        )
+        .await?;
+        pick.settle(&mut batch, next_stage);
+        if pick.ids.is_empty() && !batch.busy && !batch.done {
+            // This pass is finished; start the next in the same batch.
+            cursor = batch.cursor;
+            continue;
+        }
+        if !pick.ids.is_empty() {
+            batch.count = sqlx::query(CANONICAL_DRAIN_SQL)
+                .bind(&pick.ids)
+                .execute(tx.as_mut())
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+        return Ok(batch);
+    }
+}
+
+/// Retry jobs by ID in transactions of at most `batch_size` jobs. Only
+/// retries failed, cancelled, or waiting_external jobs. A job whose retry
+/// would violate a unique claim is skipped and reported. When a chunk fails,
+/// the error carries the jobs earlier chunks committed.
+pub async fn bulk_retry_in_batches(
+    pool: &PgPool,
+    ids: &[i64],
+    batch_size: i64,
+) -> Result<BulkIds, BulkError<BulkIds>> {
+    let started = async {
+        bulk::validate_batch_size(batch_size)?;
+        active_queue_storage(pool).await
+    };
+    let store = match started.await {
+        Ok(store) => store,
+        Err(error) => return Err(bulk::BulkError::new(BulkIds::default(), error)),
+    };
+    if let Some(store) = store {
+        return store.retry_jobs_in_batches(pool, ids, batch_size).await;
+    }
+    let mut outcome = BulkIds::default();
+    for chunk in ids.chunks(batch_size as usize) {
+        let mut skipped = Vec::new();
+        let chunk_result = async {
+            let mut tx = pool.begin().await?;
+            let rows = update_canonical_skipping_conflicts_tx(
+                &mut tx,
+                CANONICAL_RETRY_IDS_SQL,
+                chunk,
+                &mut |job_id| skipped.push(job_id),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok::<_, AwaError>(rows)
+        }
+        .await;
+        match chunk_result {
+            Ok(rows) => {
+                outcome.jobs.extend(rows);
+                skipped.into_iter().for_each(|job_id| outcome.skip(job_id));
+            }
+            Err(error) => return Err(bulk::BulkError::new(outcome, error)),
+        }
+    }
+    Ok(outcome)
+}
+
+/// Cancel jobs by ID in transactions of at most `batch_size` jobs. Only
+/// cancels non-terminal jobs. When a chunk fails, the error carries the jobs
+/// earlier chunks committed.
+pub async fn bulk_cancel_in_batches(
+    pool: &PgPool,
+    ids: &[i64],
+    batch_size: i64,
+) -> Result<BulkIds, BulkError<BulkIds>> {
+    let started = async {
+        bulk::validate_batch_size(batch_size)?;
+        active_queue_storage(pool).await
+    };
+    let store = match started.await {
+        Ok(store) => store,
+        Err(error) => return Err(bulk::BulkError::new(BulkIds::default(), error)),
+    };
+    if let Some(store) = store {
+        return store.cancel_jobs_in_batches(pool, ids, batch_size).await;
+    }
+    let mut outcome = BulkIds::default();
+    for chunk in ids.chunks(batch_size as usize) {
+        match sqlx::query_as::<_, JobRow>(CANONICAL_CANCEL_IDS_SQL)
+            .bind(chunk)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => outcome.jobs.extend(rows),
+            Err(error) => return Err(bulk::BulkError::new(outcome, error.into())),
+        }
+    }
+    Ok(outcome)
 }
 
 /// A bucketed count of jobs by state over time.

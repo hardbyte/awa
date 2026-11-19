@@ -262,6 +262,16 @@ pub struct PyRetryFailedResult {
     pub pruned_failed_count: Option<u64>,
 }
 
+impl PyRetryFailedResult {
+    fn batched(retried: u64) -> Self {
+        Self {
+            jobs: Vec::new(),
+            matched: retried,
+            pruned_failed_count: None,
+        }
+    }
+}
+
 #[pymethods]
 impl PyRetryFailedResult {
     #[getter]
@@ -968,12 +978,13 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None))]
+    #[pyo3(signature = (*, kind=None, queue=None, batch_size=None))]
     fn retry_failed<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
+        batch_size: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         match (&kind, &queue) {
             (Some(_), None) | (None, Some(_)) => {}
@@ -985,6 +996,12 @@ impl PyClient {
         }
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
+            if let Some(batch_size) = batch_size {
+                let retried =
+                    crate::dlq::retry_failed(&pool, kind.as_deref(), queue.as_deref(), batch_size)
+                        .await?;
+                return Ok(PyRetryFailedResult::batched(retried));
+            }
             let outcome = match (kind, queue) {
                 (Some(kind), None) => awa_model::admin::retry_failed_by_kind(&pool, &kind).await,
                 (None, Some(queue)) => awa_model::admin::retry_failed_by_queue(&pool, &queue).await,
@@ -996,12 +1013,16 @@ impl PyClient {
         })
     }
 
-    fn discard_failed<'py>(&self, py: Python<'py>, kind: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (kind, batch_size=None))]
+    fn discard_failed<'py>(
+        &self,
+        py: Python<'py>,
+        kind: String,
+        batch_size: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let count = awa_model::admin::discard_failed(&pool, &kind)
-                .await
-                .map_err(map_awa_error)?;
+            let count = crate::dlq::discard_failed(&pool, &kind, batch_size).await?;
             Ok(count)
         })
     }
@@ -1032,12 +1053,16 @@ impl PyClient {
         })
     }
 
-    fn drain_queue<'py>(&self, py: Python<'py>, queue: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (queue, batch_size=None))]
+    fn drain_queue<'py>(
+        &self,
+        py: Python<'py>,
+        queue: String,
+        batch_size: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let count = awa_model::admin::drain_queue(&pool, &queue)
-                .await
-                .map_err(map_awa_error)?;
+            let count = crate::dlq::drain_queue(&pool, &queue, batch_size).await?;
             Ok(count)
         })
     }
@@ -1589,7 +1614,7 @@ impl PyClient {
     /// Bulk-move failed jobs into the DLQ.
     ///
     /// Requires at least one of `kind` or `queue` unless `allow_all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false, batch_size=None))]
     fn bulk_move_failed_to_dlq<'py>(
         &self,
         py: Python<'py>,
@@ -1597,30 +1622,30 @@ impl PyClient {
         queue: Option<String>,
         reason: String,
         allow_all: bool,
+        batch_size: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
             let kind_attr = kind.clone();
             let queue_attr = queue.clone();
-            let count = awa_model::dlq::bulk_move_failed_to_dlq(
+            crate::dlq::bulk_move(
                 &pool,
                 kind.as_deref(),
                 queue.as_deref(),
                 &reason,
                 allow_all,
+                batch_size,
+                |count| {
+                    metrics.record_dlq_moved_bulk(
+                        kind_attr.as_deref(),
+                        queue_attr.as_deref(),
+                        &reason,
+                        count,
+                    )
+                },
             )
             .await
-            .map_err(map_awa_error)?;
-            if count > 0 {
-                metrics.record_dlq_moved_bulk(
-                    kind_attr.as_deref(),
-                    queue_attr.as_deref(),
-                    &reason,
-                    count,
-                );
-            }
-            Ok(count)
         })
     }
 
@@ -1647,7 +1672,7 @@ impl PyClient {
     ///
     /// Requires at least one of `kind`, `queue`, or `tag` unless
     /// `allow_all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false, batch_size=None))]
     #[allow(clippy::too_many_arguments)]
     fn purge_dlq<'py>(
         &self,
@@ -1658,19 +1683,17 @@ impl PyClient {
         before_id: Option<i64>,
         before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
+        batch_size: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
-            let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
-                .await
-                .map_err(map_awa_error)?;
-            if count > 0 {
-                metrics.record_dlq_purged(queue_attr.as_deref(), count);
-            }
-            Ok(count)
+            crate::dlq::purge(&pool, &filter, allow_all, batch_size, |count| {
+                metrics.record_dlq_purged(queue_attr.as_deref(), count)
+            })
+            .await
         })
     }
 
@@ -2727,12 +2750,13 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None))]
+    #[pyo3(signature = (*, kind=None, queue=None, batch_size=None))]
     fn retry_failed_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
+        batch_size: Option<i64>,
     ) -> PyResult<PyRetryFailedResult> {
         match (&kind, &queue) {
             (Some(_), None) | (None, Some(_)) => {}
@@ -2745,6 +2769,16 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                if let Some(batch_size) = batch_size {
+                    let retried = crate::dlq::retry_failed(
+                        &pool,
+                        kind.as_deref(),
+                        queue.as_deref(),
+                        batch_size,
+                    )
+                    .await?;
+                    return Ok(PyRetryFailedResult::batched(retried));
+                }
                 let outcome = match (kind, queue) {
                     (Some(kind), None) => {
                         awa_model::admin::retry_failed_by_kind(&pool, &kind).await
@@ -2760,13 +2794,17 @@ impl PyClient {
         })
     }
 
-    fn discard_failed_sync(&self, py: Python<'_>, kind: String) -> PyResult<u64> {
+    #[pyo3(signature = (kind, batch_size=None))]
+    fn discard_failed_sync(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        batch_size: Option<i64>,
+    ) -> PyResult<u64> {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::admin::discard_failed(&pool, &kind)
-                    .await
-                    .map_err(map_awa_error)?;
+                let count = crate::dlq::discard_failed(&pool, &kind, batch_size).await?;
                 Ok(count)
             })
         })
@@ -2802,13 +2840,17 @@ impl PyClient {
         })
     }
 
-    fn drain_queue_sync(&self, py: Python<'_>, queue: String) -> PyResult<u64> {
+    #[pyo3(signature = (queue, batch_size=None))]
+    fn drain_queue_sync(
+        &self,
+        py: Python<'_>,
+        queue: String,
+        batch_size: Option<i64>,
+    ) -> PyResult<u64> {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::admin::drain_queue(&pool, &queue)
-                    .await
-                    .map_err(map_awa_error)?;
+                let count = crate::dlq::drain_queue(&pool, &queue, batch_size).await?;
                 Ok(count)
             })
         })
@@ -3152,7 +3194,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false, batch_size=None))]
     fn bulk_move_failed_to_dlq_sync(
         &self,
         py: Python<'_>,
@@ -3160,6 +3202,7 @@ impl PyClient {
         queue: Option<String>,
         reason: String,
         allow_all: bool,
+        batch_size: Option<i64>,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
@@ -3167,24 +3210,23 @@ impl PyClient {
         let queue_attr = queue.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                crate::dlq::bulk_move(
                     &pool,
                     kind.as_deref(),
                     queue.as_deref(),
                     &reason,
                     allow_all,
+                    batch_size,
+                    |count| {
+                        metrics.record_dlq_moved_bulk(
+                            kind_attr.as_deref(),
+                            queue_attr.as_deref(),
+                            &reason,
+                            count,
+                        )
+                    },
                 )
                 .await
-                .map_err(map_awa_error)?;
-                if count > 0 {
-                    metrics.record_dlq_moved_bulk(
-                        kind_attr.as_deref(),
-                        queue_attr.as_deref(),
-                        &reason,
-                        count,
-                    );
-                }
-                Ok(count)
             })
         })
     }
@@ -3209,7 +3251,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false, batch_size=None))]
     #[allow(clippy::too_many_arguments)]
     fn purge_dlq_sync(
         &self,
@@ -3220,6 +3262,7 @@ impl PyClient {
         before_id: Option<i64>,
         before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
+        batch_size: Option<i64>,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
@@ -3227,13 +3270,10 @@ impl PyClient {
         let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
-                    .await
-                    .map_err(map_awa_error)?;
-                if count > 0 {
-                    metrics.record_dlq_purged(queue_attr.as_deref(), count);
-                }
-                Ok(count)
+                crate::dlq::purge(&pool, &filter, allow_all, batch_size, |count| {
+                    metrics.record_dlq_purged(queue_attr.as_deref(), count)
+                })
+                .await
             })
         })
     }

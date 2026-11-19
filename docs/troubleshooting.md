@@ -450,6 +450,8 @@ Claims lock every child of the ring tables they read, sealed slots included, so 
 
 A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue ring on one slot for about two days this way, with that slot's ready partition at about 55M rows (64 GB). Sampling `pg_locks` on the next slot's partitions every 25 ms never found them free: each sample showed four to six `AccessShareLock` holders, all short transactions running `claim_ready_runtime`, including claims for a queue with no backlog.
 
+A bulk admin run on queue storage (a large retry, drain, purge or cancel by ID) holds the same locks for each batch. Since 0.6.19 it pauses 100 ms between batches so prune gets a gap; see [pause between batches](bulk-admin.md#pause-between-batches-on-queue-storage).
+
 0.6.17 shortened what prune holds once it gets its locks (it no longer runs its checks under `ACCESS EXCLUSIVE`) and retries the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms. It does not stop claims from locking sealed slots, so the starvation remains in 0.6.17 and 0.6.18.
 
 ### Confirm It
@@ -666,7 +668,7 @@ If DLQ depth is growing quickly:
 - pause the upstream queue or producer if one failure mode is dominating
 - tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too long for the incident volume
 
-To drain a large DLQ, use `retry-bulk --batch-size` rather than a loop of single-job `retry` calls; see [draining a large DLQ](dead-letter-queue.md#draining-a-large-dlq). A script that does call the API once per job should hold one `QueueStorage` and call its methods.
+Bulk retry, move and purge run in bounded batches; see [bulk admin operations](bulk-admin.md). To drain a large DLQ, use `retry-bulk` rather than a loop of single-job `retry` calls; see [draining a large DLQ](dead-letter-queue.md#draining-a-large-dlq). A script that does call the API once per job should hold one `QueueStorage` and call its methods.
 
 ## Common Error Cases
 
