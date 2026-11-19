@@ -525,6 +525,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   from more than four minutes). Available jobs and completions are still read
   in full when the state allows them. JIT is off for the read.
 
+### Project
+
+- CI runs the sharded Rust suite and the queue-storage leg on PostgreSQL 19 as
+  well as 17 and 18. On PostgreSQL 19, `max_locks_per_transaction` holds about
+  half as many locks per unit as before, so a value carried over from 18 must
+  be doubled (see the [upgrade guide](docs/upgrade-0.6-to-0.7.md)).
+
 ## [0.7.0-alpha.1] — 2026-10-29
 
 ### Upgrading
