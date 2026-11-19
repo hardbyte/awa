@@ -4687,52 +4687,29 @@ impl MaintenanceService {
             return;
         };
 
-        let schema = runtime.store.schema();
         let override_queues: Vec<&str> = self
             .queue_retention_overrides
             .iter()
             .filter(|(_, policy)| policy.dlq.is_some())
             .map(|(queue, _)| queue.as_str())
             .collect();
-        let retention_secs = i64::try_from(self.dlq_retention.as_secs()).unwrap_or(i64::MAX);
 
-        let global_result = if override_queues.is_empty() {
-            sqlx::query(&format!(
-                r#"
-                DELETE FROM {schema}.dlq_entries
-                WHERE job_id IN (
-                    SELECT job_id FROM {schema}.dlq_entries
-                    WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-                    LIMIT $2
-                )
-                "#
-            ))
-            .bind(retention_secs)
-            .bind(self.dlq_cleanup_batch_size)
-            .execute(&self.pool)
-            .await
-        } else {
-            sqlx::query(&format!(
-                r#"
-                DELETE FROM {schema}.dlq_entries
-                WHERE job_id IN (
-                    SELECT job_id FROM {schema}.dlq_entries
-                    WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-                      AND queue != ALL($3::text[])
-                    LIMIT $2
-                )
-                "#
-            ))
-            .bind(retention_secs)
-            .bind(self.dlq_cleanup_batch_size)
-            .bind(&override_queues)
-            .execute(&self.pool)
-            .await
-        };
+        // Deleting through the store releases each row's unique claim.
+        let global_result = runtime
+            .store
+            .delete_expired_dlq_rows(
+                &self.pool,
+                self.dlq_retention,
+                self.dlq_cleanup_batch_size,
+                None,
+                &override_queues,
+                false,
+            )
+            .await;
 
         match global_result {
-            Ok(result) if result.rows_affected() > 0 => {
-                self.metrics.record_dlq_purged(None, result.rows_affected());
+            Ok(deleted) if deleted > 0 => {
+                self.metrics.record_dlq_purged(None, deleted);
             }
             Err(err) => {
                 self.control.record_reclamation_error(&err);
@@ -4745,27 +4722,20 @@ impl MaintenanceService {
             let Some(retention) = policy.dlq else {
                 continue;
             };
-            let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
-            match sqlx::query(&format!(
-                r#"
-                DELETE FROM {schema}.dlq_entries
-                WHERE job_id IN (
-                    SELECT job_id FROM {schema}.dlq_entries
-                    WHERE queue = $3
-                      AND dlq_at < now() - make_interval(secs => $1::bigint)
-                    LIMIT $2
+            match runtime
+                .store
+                .delete_expired_dlq_rows(
+                    &self.pool,
+                    retention,
+                    self.dlq_cleanup_batch_size,
+                    Some(queue),
+                    &[],
+                    false,
                 )
-                "#
-            ))
-            .bind(retention_secs)
-            .bind(self.dlq_cleanup_batch_size)
-            .bind(queue)
-            .execute(&self.pool)
-            .await
+                .await
             {
-                Ok(result) if result.rows_affected() > 0 => {
-                    self.metrics
-                        .record_dlq_purged(Some(queue), result.rows_affected());
+                Ok(deleted) if deleted > 0 => {
+                    self.metrics.record_dlq_purged(Some(queue), deleted);
                 }
                 Err(err) => {
                     self.control.record_reclamation_error(&err);

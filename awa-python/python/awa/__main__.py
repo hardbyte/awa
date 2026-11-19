@@ -20,6 +20,21 @@ from pathlib import Path
 import awa
 
 
+# Matches awa_model::bulk::MAX_BATCH_SIZE.
+MAX_BATCH_SIZE = 10_000
+
+
+def _batch_size(value: str) -> int:
+    """Parse ``--batch-size``: an integer from 1 to ``MAX_BATCH_SIZE``."""
+    try:
+        size = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if not 1 <= size <= MAX_BATCH_SIZE:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_BATCH_SIZE}")
+    return size
+
+
 def _add_database_url(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--database-url",
@@ -84,6 +99,12 @@ def main() -> None:
     p_retry_failed = sj.add_parser("retry-failed", help="Retry all failed jobs by kind or queue")
     p_retry_failed.add_argument("--kind")
     p_retry_failed.add_argument("--queue")
+    p_retry_failed.add_argument(
+        "--batch-size",
+        type=_batch_size,
+        default=1000,
+        help="Retry at most this many jobs per transaction (default 1000).",
+    )
     p_discard = sj.add_parser("discard", help="Discard failed jobs by kind")
     p_discard.add_argument("--kind", required=True)
     p_list = sj.add_parser("list", help="List jobs")
@@ -346,18 +367,18 @@ async def _dispatch_job(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         await client.cancel(args.id)
         print(f"Cancelled job {args.id}")
     elif jc == "retry-failed":
-        outcome = await client.retry_failed(kind=args.kind, queue=args.queue)
-        retried = len(outcome.jobs)
-        message = f"Retried {retried} failed jobs"
-        if outcome.matched != retried:
-            dropped = max(0, outcome.matched - retried)
-            message += f" (matched {outcome.matched}; {dropped} raced or pruned)"
-        if outcome.pruned_failed_count is not None and outcome.pruned_failed_count > 0:
-            message += (
-                f"; {outcome.pruned_failed_count} failed rows have been pruned "
-                "past retention and are no longer retryable"
+        try:
+            outcome = await client.retry_failed(
+                kind=args.kind, queue=args.queue, batch_size=args.batch_size
             )
-        print(message)
+        except awa.AwaError as err:
+            # A batched run that stops keeps the jobs it already retried.
+            retried = getattr(err, "count", None)
+            if retried is not None:
+                print(f"Retried {retried} failed jobs")
+            print(f"error: {err}", file=sys.stderr)
+            sys.exit(2 if isinstance(err, awa.UniqueConflict) else 1)
+        print(f"Retried {outcome.matched} failed jobs")
     elif jc == "discard":
         count = await client.discard_failed(args.kind)
         print(f"Discarded {count} failed jobs of kind '{args.kind}'")

@@ -306,7 +306,11 @@ class AsyncClient:
         )
 
     async def retry_failed(
-        self, *, kind: str | None = None, queue: str | None = None
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        batch_size: int | None = None,
     ) -> RetryFailedResult:
         """Retry all failed jobs matching the filter.
 
@@ -315,12 +319,31 @@ class AsyncClient:
         ``matched - len(jobs)`` raced or were pruned past retention), and
         ``pruned_failed_count`` (cumulative failed rows pruned past retention
         for the queue, or ``None`` when filtering by kind).
-        """
-        return await self._raw.retry_failed(kind=kind, queue=queue)
 
-    async def discard_failed(self, kind: str) -> int:
-        """Delete all failed jobs of a given kind."""
-        return await self._raw.discard_failed(kind)
+        With ``batch_size``, failed jobs are retried in job ID order,
+        ``batch_size`` per transaction, until none match, and ``jobs`` is
+        empty and ``matched`` is the retried count. A job whose unique key a
+        live job holds is skipped, and ``UniqueConflict`` is raised naming
+        the skipped jobs after the rest are retried. Any exception a batched
+        run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the jobs retried before it, which
+        stay retried. Without it, every
+        matching job is retried in one transaction, so the result can list
+        them.
+        """
+        return await self._raw.retry_failed(
+            kind=kind, queue=queue, batch_size=batch_size
+        )
+
+    async def discard_failed(self, kind: str, batch_size: int | None = None) -> int:
+        """Delete all failed jobs of a given kind.
+
+        Rows are changed in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised.
+        """
+        return await self._raw.discard_failed(kind, batch_size)
 
     async def pause_queue(self, queue: str, paused_by: str | None = None) -> None:
         """Pause a queue."""
@@ -330,9 +353,16 @@ class AsyncClient:
         """Resume a paused queue."""
         return await self._raw.resume_queue(queue)
 
-    async def drain_queue(self, queue: str) -> int:
-        """Cancel all pending jobs in a queue."""
-        return await self._raw.drain_queue(queue)
+    async def drain_queue(self, queue: str, batch_size: int | None = None) -> int:
+        """Cancel all pending jobs in a queue.
+
+        Jobs are cancelled ``batch_size`` per transaction (1,000 by default);
+        the run is not atomic. Jobs enqueued during the run are left alone.
+        When the database role may not advance the job ID sequence past jobs
+        inserted with explicit IDs above it, those jobs are left too and a
+        ``RuntimeWarning`` names how many.
+        """
+        return await self._raw.drain_queue(queue, batch_size)
 
     async def flush_admin_metadata(self) -> None:
         """Drain dirty keys and recompute cached admin counters.
@@ -579,7 +609,10 @@ class AsyncClient:
         another transaction holds are waited for, for up to 60 seconds, then
         ``DatabaseError`` is raised. A row whose unique key a live job holds
         is skipped and stays in the DLQ; after every other row is retried,
-        ``UniqueConflict`` is raised naming the skipped jobs.
+        ``UniqueConflict`` is raised naming the skipped jobs. Any exception
+        the run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the rows retried before it, which
+        stay retried.
         """
         return await self._raw.bulk_retry_from_dlq(
             kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
@@ -598,10 +631,21 @@ class AsyncClient:
         queue: str | None = None,
         reason: str = "manual",
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-move failed jobs into the DLQ."""
+        """Bulk-move failed jobs into the DLQ.
+
+        Rows are changed in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised.
+        """
         return await self._raw.bulk_move_failed_to_dlq(
-            kind=kind, queue=queue, reason=reason, allow_all=allow_all
+            kind=kind,
+            queue=queue,
+            reason=reason,
+            allow_all=allow_all,
+            batch_size=batch_size,
         )
 
     async def purge_dlq_job(self, job_id: int) -> bool:
@@ -617,8 +661,15 @@ class AsyncClient:
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-delete DLQ rows matching the filter."""
+        """Bulk-delete DLQ rows matching the filter.
+
+        Rows are changed in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised.
+        """
         return await self._raw.purge_dlq(
             kind=kind,
             queue=queue,
@@ -626,6 +677,7 @@ class AsyncClient:
             before_id=before_id,
             before_dlq_at=before_dlq_at,
             allow_all=allow_all,
+            batch_size=batch_size,
         )
 
     async def health_check(self) -> HealthCheck:
@@ -1179,7 +1231,11 @@ class Client:
         )
 
     def retry_failed(
-        self, *, kind: str | None = None, queue: str | None = None
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        batch_size: int | None = None,
     ) -> RetryFailedResult:
         """Retry all failed jobs matching the filter.
 
@@ -1188,12 +1244,31 @@ class Client:
         ``matched - len(jobs)`` raced or were pruned past retention), and
         ``pruned_failed_count`` (cumulative failed rows pruned past retention
         for the queue, or ``None`` when filtering by kind).
-        """
-        return self._raw.retry_failed_sync(kind=kind, queue=queue)
 
-    def discard_failed(self, kind: str) -> int:
-        """Delete all failed jobs of a given kind."""
-        return self._raw.discard_failed_sync(kind)
+        With ``batch_size``, failed jobs are retried in job ID order,
+        ``batch_size`` per transaction, until none match, and ``jobs`` is
+        empty and ``matched`` is the retried count. A job whose unique key a
+        live job holds is skipped, and ``UniqueConflict`` is raised naming
+        the skipped jobs after the rest are retried. Any exception a batched
+        run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the jobs retried before it, which
+        stay retried. Without it, every
+        matching job is retried in one transaction, so the result can list
+        them.
+        """
+        return self._raw.retry_failed_sync(
+            kind=kind, queue=queue, batch_size=batch_size
+        )
+
+    def discard_failed(self, kind: str, batch_size: int | None = None) -> int:
+        """Delete all failed jobs of a given kind.
+
+        Rows are changed in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised.
+        """
+        return self._raw.discard_failed_sync(kind, batch_size)
 
     def pause_queue(self, queue: str, paused_by: str | None = None) -> None:
         """Pause a queue."""
@@ -1203,9 +1278,16 @@ class Client:
         """Resume a paused queue."""
         return self._raw.resume_queue_sync(queue)
 
-    def drain_queue(self, queue: str) -> int:
-        """Cancel all pending jobs in a queue."""
-        return self._raw.drain_queue_sync(queue)
+    def drain_queue(self, queue: str, batch_size: int | None = None) -> int:
+        """Cancel all pending jobs in a queue.
+
+        Jobs are cancelled ``batch_size`` per transaction (1,000 by default);
+        the run is not atomic. Jobs enqueued during the run are left alone.
+        When the database role may not advance the job ID sequence past jobs
+        inserted with explicit IDs above it, those jobs are left too and a
+        ``RuntimeWarning`` names how many.
+        """
+        return self._raw.drain_queue_sync(queue, batch_size)
 
     def flush_admin_metadata(self) -> None:
         """Drain dirty keys and recompute cached admin counters."""
@@ -1473,7 +1555,10 @@ class Client:
         another transaction holds are waited for, for up to 60 seconds, then
         ``DatabaseError`` is raised. A row whose unique key a live job holds
         is skipped and stays in the DLQ; after every other row is retried,
-        ``UniqueConflict`` is raised naming the skipped jobs.
+        ``UniqueConflict`` is raised naming the skipped jobs. Any exception
+        the run raises has ``count``, ``skipped``, ``conflicts`` and
+        ``left_above_sequence`` attributes: the rows retried before it, which
+        stay retried.
         """
         return self._raw.bulk_retry_from_dlq_sync(
             kind=kind, queue=queue, tag=tag, allow_all=allow_all, batch_size=batch_size
@@ -1490,10 +1575,21 @@ class Client:
         queue: str | None = None,
         reason: str = "manual",
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-move failed jobs into the DLQ."""
+        """Bulk-move failed jobs into the DLQ.
+
+        Rows are changed in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised.
+        """
         return self._raw.bulk_move_failed_to_dlq_sync(
-            kind=kind, queue=queue, reason=reason, allow_all=allow_all
+            kind=kind,
+            queue=queue,
+            reason=reason,
+            allow_all=allow_all,
+            batch_size=batch_size,
         )
 
     def purge_dlq_job(self, job_id: int) -> bool:
@@ -1509,8 +1605,15 @@ class Client:
         before_id: int | None = None,
         before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
+        batch_size: int | None = None,
     ) -> int:
-        """Bulk-delete DLQ rows matching the filter."""
+        """Bulk-delete DLQ rows matching the filter.
+
+        Rows are changed in job ID order, ``batch_size`` rows per transaction
+        (1,000 by default), until none match; the run is not atomic. Rows
+        another transaction holds are waited for, for up to 60 seconds, then
+        ``DatabaseError`` is raised.
+        """
         return self._raw.purge_dlq_sync(
             kind=kind,
             queue=queue,
@@ -1518,4 +1621,5 @@ class Client:
             before_id=before_id,
             before_dlq_at=before_dlq_at,
             allow_all=allow_all,
+            batch_size=batch_size,
         )

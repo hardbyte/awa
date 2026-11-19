@@ -1,5 +1,5 @@
 use crate::admin::{CallbackConfig, CallbackPollResult};
-use crate::bulk::{self, BulkBatch, BulkCursor};
+use crate::bulk::{self, BulkBatch, BulkCursor, BulkError, BulkIds};
 use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
@@ -42,6 +42,13 @@ pub const PROMOTED_DUPLICATE_ERROR: &str =
     "promoted as duplicate: unique claim held by another job";
 const DRAIN_BATCH_SIZE: i64 = crate::bulk::DEFAULT_BATCH_SIZE;
 
+/// Most jobs [`QueueStorage::cancel_jobs_in_batches`] cancels per
+/// transaction. Cancelling by ID costs several milliseconds a job, most of
+/// it planning the job's statements against the partitioned ring tables,
+/// and the transaction holds the lanes' claim heads, so 1,000 jobs held them
+/// for seconds; 250 keeps a chunk around two seconds.
+pub const CANCEL_BY_ID_CHUNK: i64 = 250;
+
 /// Columns of a `DlqJobRow` read from `dlq_entries`.
 const DLQ_ROW_COLUMNS: &str = "job_id, kind, queue, args, state, priority, attempt, run_lease, \
      max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, \
@@ -49,7 +56,7 @@ const DLQ_ROW_COLUMNS: &str = "job_id, kind, queue, args, state, priority, attem
 
 /// The `ListDlqFilter` predicate over `dlq_entries`, binding kind, queue,
 /// tag, before_id and before_dlq_at as `$1` to `$5`.
-const DLQ_FILTER_SQL: &str = r#"($1::text IS NULL OR kind = $1)
+pub(crate) const DLQ_FILTER_SQL: &str = r#"($1::text IS NULL OR kind = $1)
     AND ($2::text IS NULL OR queue = $2)
     AND ($3::text IS NULL OR payload -> 'tags' ? $3)
     AND (
@@ -3054,6 +3061,17 @@ impl DoneJobRow {
         }
     }
 }
+
+/// The unique-claim fields of a deleted DLQ row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DeletedDlqRow {
+    job_id: i64,
+    state: JobState,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+}
+
+const DELETED_DLQ_COLUMNS: &str = "job_id, state, unique_key, unique_states";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DlqJobRow {
@@ -10280,12 +10298,24 @@ impl QueueStorage {
     /// `queue` and its stripes (`queue#N`), returning how many were cancelled.
     ///
     /// Jobs enqueued after the drain starts are left alone, and so are running
-    /// jobs. Scheduled, retryable and available jobs are cancelled a chunk at
-    /// a time, each chunk in its own transaction, so a large backlog costs a
+    /// jobs. Waiting jobs go through [`Self::cancel_jobs_by_ids`], then
+    /// scheduled, retryable and available jobs are cancelled a chunk at a
+    /// time, each chunk in its own transaction, so a large backlog costs a
     /// few statements per chunk rather than per job and holds row locks for
     /// one chunk at a time. Rows another transaction has locked are skipped.
-    /// Waiting jobs go through [`Self::cancel_jobs_by_ids`].
     pub(crate) async fn drain_queue(&self, pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
+        self.drain_queue_in_batches(pool, queue, DRAIN_BATCH_SIZE)
+            .await
+    }
+
+    /// [`Self::drain_queue`] with at most `batch_size` jobs per transaction.
+    pub(crate) async fn drain_queue_in_batches(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        batch_size: i64,
+    ) -> Result<u64, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
         let schema = self.schema();
         let job_id_bound: i64 = sqlx::query_scalar(&format!(
             "SELECT {schema}.sequence_next_value('job_id_seq')"
@@ -10294,7 +10324,35 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        let scope = BulkCursor {
+            before_job_id: job_id_bound,
+            ..BulkCursor::default()
+        };
         let mut drained = 0u64;
+        // Waiting jobs first, then deferred, then ready: the order jobs move
+        // between them. A waiting job whose callback times out becomes
+        // retryable, and a deferred job is promoted to ready, so a job that
+        // moves while the drain runs is still drained.
+        let waiting: Vec<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT job_id
+            FROM {schema}.leases
+            WHERE {queues}
+              AND state = 'waiting_external'
+              AND job_id < $2
+            ORDER BY job_id
+            "#,
+            queues = queue_and_stripes_sql("queue", "$1"),
+        ))
+        .bind(queue)
+        .bind(job_id_bound)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        for chunk in waiting.chunks(batch_size as usize) {
+            drained += self.cancel_jobs_by_ids(pool, chunk).await?.len() as u64;
+        }
+
         let mut after_job_id = i64::MIN;
         loop {
             let mut tx = pool
@@ -10302,11 +10360,11 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             let (cancelled, last_job_id) = self
-                .cancel_deferred_chunk_tx(&mut tx, queue, after_job_id, job_id_bound)
+                .cancel_deferred_chunk_tx(&mut tx, queue, after_job_id, scope, batch_size)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             drained += cancelled as u64;
-            if (cancelled as i64) < DRAIN_BATCH_SIZE {
+            if (cancelled as i64) < batch_size {
                 break;
             }
             after_job_id = last_job_id;
@@ -10314,6 +10372,37 @@ impl QueueStorage {
 
         // Read after the deferred pass, so jobs promoted while it ran are
         // drained from the ready lanes.
+        let mut lanes = self.drain_lanes(pool, queue).await?;
+
+        let drained_lanes = lanes.clone();
+        while !lanes.is_empty() {
+            let mut tx = pool
+                .begin_with(DRAIN_TRANSACTION_BEGIN)
+                .await
+                .map_err(map_sqlx_error)?;
+            self.lock_claim_heads_tx(&mut tx, &lanes).await?;
+            let cancelled = self
+                .cancel_available_chunk_tx(&mut tx, &mut lanes, scope, batch_size)
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            drained += cancelled as u64;
+            self.skip_spent_claim_prefixes_after_commit(pool, &lanes)
+                .await;
+            if (cancelled as i64) < batch_size {
+                break;
+            }
+            lanes.retain(|lane| lane.from_seq < lane.to_seq);
+        }
+        self.skip_spent_claim_prefixes_after_commit(pool, &drained_lanes)
+            .await;
+
+        Ok(drained)
+    }
+
+    /// The lanes of `queue` and its stripes that hold ready rows past their
+    /// claim cursor, from the claim cursor to the enqueue head.
+    async fn drain_lanes(&self, pool: &PgPool, queue: &str) -> Result<Vec<DrainLane>, AwaError> {
+        let schema = self.schema();
         let mut lanes: Vec<DrainLane> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -10336,55 +10425,174 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         lanes.retain(|lane| lane.from_seq < lane.to_seq);
-
-        let drained_lanes = lanes.clone();
-        while !lanes.is_empty() {
-            let mut tx = pool
-                .begin_with(DRAIN_TRANSACTION_BEGIN)
-                .await
-                .map_err(map_sqlx_error)?;
-            self.lock_claim_heads_tx(&mut tx, &lanes).await?;
-            let cancelled = self.cancel_available_chunk_tx(&mut tx, &mut lanes).await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
-            self.skip_spent_claim_prefixes(pool, &lanes).await?;
-            drained += cancelled as u64;
-            if (cancelled as i64) < DRAIN_BATCH_SIZE {
-                break;
-            }
-            lanes.retain(|lane| lane.from_seq < lane.to_seq);
-        }
-        self.skip_spent_claim_prefixes(pool, &drained_lanes).await?;
-
-        let waiting: Vec<i64> = sqlx::query_scalar(&format!(
-            r#"
-            SELECT job_id
-            FROM {schema}.leases
-            WHERE {queues}
-              AND state = 'waiting_external'
-              AND job_id < $2
-            ORDER BY job_id
-            "#,
-            queues = queue_and_stripes_sql("queue", "$1"),
-        ))
-        .bind(queue)
-        .bind(job_id_bound)
-        .fetch_all(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-        drained += self.cancel_jobs_by_ids(pool, &waiting).await?.len() as u64;
-
-        Ok(drained)
+        Ok(lanes)
     }
 
-    /// Cancel up to [`DRAIN_BATCH_SIZE`] scheduled and retryable jobs of
-    /// `queue` with ids in `(after_job_id, job_id_bound)`, returning how many
-    /// were cancelled and the largest cancelled id.
+    /// Cancel up to `batch_size` of the waiting, scheduled, retryable and
+    /// available jobs of `queue` and its stripes (`queue#N`), resuming at
+    /// `cursor`, as one step of a drain run.
+    ///
+    /// The run takes waiting jobs, then scheduled and retryable jobs, then
+    /// available jobs: the order jobs move between them (a waiting job whose
+    /// callback times out becomes retryable, and a deferred job is promoted
+    /// to ready), so a job that moves during the run is still drained. Jobs
+    /// enqueued after the run started are left alone. The run never passes
+    /// a scheduled, retryable or available job another transaction holds:
+    /// when every remaining one is held, the batch reports `busy`.
+    pub async fn drain_queue_batch(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        batch_size: i64,
+        cursor: BulkCursor,
+    ) -> Result<BulkBatch, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
+        let schema = self.schema();
+        let mut cursor = cursor;
+        let mut fence = None;
+        if cursor.before_job_id == 0 {
+            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+        }
+        let left_above_sequence = self.drain_left_above(pool, fence, queue).await?;
+        let next_pass = |cursor: BulkCursor, stage: u8| cursor.next_pass(stage);
+        loop {
+            let mut batch = BulkBatch::queue_storage(cursor);
+            batch.left_above_sequence = left_above_sequence;
+            match cursor.stage {
+                0 => {
+                    let waiting: Vec<i64> = sqlx::query_scalar(&format!(
+                        r#"
+                        SELECT lease.job_id
+                        FROM {schema}.leases AS lease
+                        WHERE {queues}
+                          AND lease.state = 'waiting_external'
+                          AND lease.job_id > $2
+                          AND {scope}
+                        ORDER BY lease.job_id
+                        LIMIT $4
+                        "#,
+                        queues = queue_and_stripes_sql("lease.queue", "$1"),
+                        scope = bulk::run_scope_sql("lease.job_id", "$3", "$5"),
+                    ))
+                    .bind(queue)
+                    .bind(cursor.after_job_id)
+                    .bind(cursor.before_job_id)
+                    .bind(batch_size)
+                    .bind(cursor.sequence_bound)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    let Some(last) = waiting.last().copied() else {
+                        cursor = next_pass(cursor, 1);
+                        continue;
+                    };
+                    batch.count = self.cancel_jobs_by_ids(pool, &waiting).await?.len() as u64;
+                    batch.cursor.after_job_id = last;
+                    if (waiting.len() as i64) < batch_size {
+                        batch.cursor = next_pass(cursor, 1);
+                    }
+                    return Ok(batch);
+                }
+                1 => {
+                    let mut tx = pool
+                        .begin_with(DRAIN_TRANSACTION_BEGIN)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                    let (cancelled, last) = self
+                        .cancel_deferred_chunk_tx(
+                            &mut tx,
+                            queue,
+                            cursor.after_job_id,
+                            cursor,
+                            batch_size,
+                        )
+                        .await?;
+                    // The lowest matching job left in the range after the
+                    // chunk: one this chunk skipped because another
+                    // transaction holds it, or one past the chunk's limit.
+                    let first_left: Option<i64> = sqlx::query_scalar(&format!(
+                        r#"
+                        SELECT min(job_id)
+                        FROM {schema}.deferred_jobs
+                        WHERE {queues}
+                          AND state IN ('scheduled', 'retryable')
+                          AND job_id > $2
+                          AND {scope}
+                        "#,
+                        queues = queue_and_stripes_sql("queue", "$1"),
+                        scope = bulk::run_scope_sql("job_id", "$3", "$4"),
+                    ))
+                    .bind(queue)
+                    .bind(cursor.after_job_id)
+                    .bind(cursor.before_job_id)
+                    .bind(cursor.sequence_bound)
+                    .fetch_one(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    tx.commit().await.map_err(map_sqlx_error)?;
+                    batch.count = cancelled as u64;
+                    let Some(first_left) = first_left else {
+                        if cancelled == 0 {
+                            cursor = next_pass(cursor, 2);
+                            continue;
+                        }
+                        batch.cursor = next_pass(cursor, 2);
+                        return Ok(batch);
+                    };
+                    // Never move past a held row.
+                    let handled = if cancelled > 0 {
+                        last
+                    } else {
+                        cursor.after_job_id
+                    };
+                    batch.cursor.after_job_id = handled.min(first_left - 1);
+                    batch.busy = cancelled == 0;
+                    return Ok(batch);
+                }
+                _ => {
+                    let lanes = self.drain_lanes(pool, queue).await?;
+                    if lanes.is_empty() {
+                        batch.done = true;
+                        return Ok(batch);
+                    }
+                    let mut tx = pool
+                        .begin_with(DRAIN_TRANSACTION_BEGIN)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                    self.lock_claim_heads_tx(&mut tx, &lanes).await?;
+                    let mut chunk_lanes = lanes.clone();
+                    let cancelled = self
+                        .cancel_available_chunk_tx(&mut tx, &mut chunk_lanes, cursor, batch_size)
+                        .await?;
+                    let remaining = (cancelled as i64) >= batch_size
+                        || self
+                            .drain_ready_remaining_tx(&mut tx, &lanes, cursor)
+                            .await?;
+                    tx.commit().await.map_err(map_sqlx_error)?;
+                    batch.count = cancelled as u64;
+                    self.skip_spent_claim_prefixes_after_commit(pool, &lanes)
+                        .await;
+                    batch.done = !remaining;
+                    batch.busy = remaining && cancelled == 0;
+                    return Ok(batch);
+                }
+            }
+        }
+    }
+
+    /// Cancel up to `batch_size` scheduled and retryable jobs of
+    /// `queue` with ids after `after_job_id` that belong to the run `scope`
+    /// bounds, returning how many were cancelled and the largest cancelled
+    /// id.
     async fn cancel_deferred_chunk_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queue: &str,
         after_job_id: i64,
-        job_id_bound: i64,
+        scope: BulkCursor,
+        batch_size: i64,
     ) -> Result<(usize, i64), AwaError> {
         let schema = self.schema();
         let deferred: Vec<DeferredJobRow> = sqlx::query_as(&format!(
@@ -10396,7 +10604,7 @@ impl QueueStorage {
                 WHERE {queues}
                   AND state IN ('scheduled', 'retryable')
                   AND job_id > $2
-                  AND job_id < $3
+                  AND {scope}
                 ORDER BY job_id
                 LIMIT $4
                 FOR UPDATE SKIP LOCKED
@@ -10420,11 +10628,13 @@ impl QueueStorage {
                 COALESCE(payload, '{{}}'::jsonb) AS payload
             "#,
             queues = queue_and_stripes_sql("queue", "$1"),
+            scope = bulk::run_scope_sql("job_id", "$3", "$5"),
         ))
         .bind(queue)
         .bind(after_job_id)
-        .bind(job_id_bound)
-        .bind(DRAIN_BATCH_SIZE)
+        .bind(scope.before_job_id)
+        .bind(batch_size)
+        .bind(scope.sequence_bound)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10485,31 +10695,26 @@ impl QueueStorage {
         Ok((cancelled, last_job_id))
     }
 
-    /// Cancel up to [`DRAIN_BATCH_SIZE`] available jobs from `lanes`,
+    /// Cancel up to `batch_size` available jobs from `lanes`,
     /// returning how many were cancelled and the claim-cursor advances that
     /// skip them.
-    async fn cancel_available_chunk_tx<'a>(
-        &self,
-        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        lanes: &mut [DrainLane],
-    ) -> Result<usize, AwaError> {
+    /// The `heads` and `target` CTEs that find a drain's unclaimed ready rows
+    /// in `lanes` (bound as `$1` to `$5`), at most `$6` of them, with job IDs
+    /// below `$7`. With `lock`, the rows are locked, skipping rows another
+    /// transaction holds; without it, held rows are included, so a check
+    /// that runs after a locking chunk finds the rows that chunk skipped.
+    fn drain_ready_target_ctes(&self, lock: bool) -> String {
         let schema = self.schema();
         let claimed = self.ready_row_claimed_sql("ready");
-        // Unclaimed rows are found the way a claim finds them: from each
-        // lane's claim cursor through its segments, then along the ready key
-        // within each segment's ring slot. The ready key leads with the ring
-        // slot, so a lane range without it scans every retained ready row.
-        // Rows are locked before the limit applies, so a row another
-        // transaction holds does not shorten the chunk. The tombstone check
-        // shares one NOT with the claim check: on its own, NOT EXISTS is
-        // planned as an anti join that reads the lane's tombstones again for
-        // every segment, and a lane enqueued one job at a time has a segment
-        // per row. Only rows whose
-        // tombstone this statement inserts are cancelled, so a concurrent
-        // cancel of the same row cannot produce a second done row.
-        let ready: Vec<ReadyTransitionRow> = sqlx::query_as(&format!(
+        let scope = bulk::run_scope_sql("ready.job_id", "$7", "$8");
+        let lock = if lock {
+            "FOR UPDATE OF ready SKIP LOCKED"
+        } else {
+            ""
+        };
+        format!(
             r#"
-            WITH heads AS (
+            heads AS (
                 SELECT
                     lanes.queue,
                     lanes.priority,
@@ -10550,6 +10755,7 @@ impl QueueStorage {
                       AND ready.enqueue_shard = heads.enqueue_shard
                       AND ready.lane_seq >= segment.from_seq
                       AND ready.lane_seq < segment.to_seq
+                      AND {scope}
                       AND NOT (
                           EXISTS (
                               SELECT 1 FROM {schema}.ready_tombstones AS tomb
@@ -10563,10 +10769,72 @@ impl QueueStorage {
                           OR {claimed}
                       )
                     ORDER BY ready.lane_seq
-                    FOR UPDATE OF ready SKIP LOCKED
+                    {lock}
                 ) AS ready
                 LIMIT $6
-            ),
+            )
+            "#
+        )
+    }
+
+    /// Whether any unclaimed ready row of `lanes` that belongs to the run
+    /// `scope` bounds remains, counting rows another transaction holds.
+    async fn drain_ready_remaining_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        lanes: &[DrainLane],
+        scope: BulkCursor,
+    ) -> Result<bool, AwaError> {
+        sqlx::query_scalar(&format!(
+            "WITH {} SELECT EXISTS (SELECT 1 FROM target)",
+            self.drain_ready_target_ctes(false)
+        ))
+        .bind(
+            lanes
+                .iter()
+                .map(|lane| lane.queue.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
+        .bind(
+            lanes
+                .iter()
+                .map(|lane| lane.enqueue_shard)
+                .collect::<Vec<_>>(),
+        )
+        .bind(lanes.iter().map(|lane| lane.from_seq).collect::<Vec<_>>())
+        .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
+        .bind(1_i64)
+        .bind(scope.before_job_id)
+        .bind(scope.sequence_bound)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
+    async fn cancel_available_chunk_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        lanes: &mut [DrainLane],
+        scope: BulkCursor,
+        batch_size: i64,
+    ) -> Result<usize, AwaError> {
+        let schema = self.schema();
+        // Unclaimed rows are found the way a claim finds them: from each
+        // lane's claim cursor through its segments, then along the ready key
+        // within each segment's ring slot. The ready key leads with the ring
+        // slot, so a lane range without it scans every retained ready row.
+        // Rows are locked before the limit applies, so a row another
+        // transaction holds does not shorten the chunk. The tombstone check
+        // shares one NOT with the claim check: on its own, NOT EXISTS is
+        // planned as an anti join that reads the lane's tombstones again for
+        // every segment, and a lane enqueued one job at a time has a segment
+        // per row. Only rows whose
+        // tombstone this statement inserts are cancelled, so a concurrent
+        // cancel of the same row cannot produce a second done row.
+        let ready: Vec<ReadyTransitionRow> = sqlx::query_as(&format!(
+            r#"
+            WITH {ctes},
             tombstone AS (
                 INSERT INTO {schema}.ready_tombstones (
                     ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
@@ -10603,14 +10871,17 @@ impl QueueStorage {
              AND tombstone.priority = target.priority
              AND tombstone.enqueue_shard = target.enqueue_shard
              AND tombstone.lane_seq = target.lane_seq
-            "#
+            "#,
+            ctes = self.drain_ready_target_ctes(true),
         ))
         .bind(lanes.iter().map(|lane| lane.queue.as_str()).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.priority).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.enqueue_shard).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.from_seq).collect::<Vec<_>>())
         .bind(lanes.iter().map(|lane| lane.to_seq).collect::<Vec<_>>())
-        .bind(DRAIN_BATCH_SIZE)
+        .bind(batch_size)
+        .bind(scope.before_job_id)
+        .bind(scope.sequence_bound)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -10757,6 +11028,22 @@ impl QueueStorage {
             });
         }
         Ok(())
+    }
+
+    /// [`Self::skip_spent_claim_prefixes`] after the cancellations of
+    /// `lanes` have committed. Moving the cursors only saves claims from
+    /// crossing rows that are already spent, so a failure is logged, not
+    /// returned: the caller must still see the committed count. The next
+    /// drain batch moves the cursors over the same rows again, and a claim
+    /// crosses them in any case.
+    async fn skip_spent_claim_prefixes_after_commit(&self, pool: &PgPool, lanes: &[DrainLane]) {
+        if let Err(err) = self.skip_spent_claim_prefixes(pool, lanes).await {
+            tracing::warn!(
+                error = ?err,
+                lanes = lanes.len(),
+                "failed to move queue-storage claim cursors over drained rows after the drain committed"
+            );
+        }
     }
 
     /// The statement behind [`Self::skip_spent_claim_prefixes`] and
@@ -17183,8 +17470,25 @@ impl QueueStorage {
         queue: Option<&str>,
         dlq_reason: &str,
     ) -> Result<u64, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let moved = self
+            .move_failed_rows_to_dlq_tx(&mut tx, kind, queue, dlq_reason, None)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(moved)
+    }
+
+    /// Move failed done rows matching `kind` and `queue` into the DLQ,
+    /// limited to `ids` when set.
+    async fn move_failed_rows_to_dlq_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        dlq_reason: &str,
+        ids: Option<&[i64]>,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
         let moved: Vec<HydratedTerminalRow> = sqlx::query_as(&format!(
@@ -17194,6 +17498,7 @@ impl QueueStorage {
                 WHERE state = 'failed'
                   AND ($1::text IS NULL OR kind = $1)
                   AND ($2::text IS NULL OR queue = $2)
+                  AND ($3::bigint[] IS NULL OR job_id = ANY($3))
                 RETURNING *
             )
             SELECT {done_projection}, COALESCE(ready.priority, done.priority) AS body_priority
@@ -17203,12 +17508,12 @@ impl QueueStorage {
         ))
         .bind(kind)
         .bind(queue)
+        .bind(ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
         if moved.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(0);
         }
 
@@ -17216,11 +17521,11 @@ impl QueueStorage {
             .into_iter()
             .map(|row| (row.terminal, row.body_priority))
             .unzip();
-        self.ensure_terminal_removed_receipt_closures_tx(&mut tx, &moved)
+        self.ensure_terminal_removed_receipt_closures_tx(tx, &moved)
             .await?;
         // Bulk DLQ move deletes from done_entries. Append negative deltas by
         // the per-group magnitudes of the moved rows.
-        self.decrement_live_terminal_counters_tx(&mut tx, &Self::done_rows_to_counter_keys(&moved))
+        self.decrement_live_terminal_counters_tx(tx, &Self::done_rows_to_counter_keys(&moved))
             .await?;
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
@@ -17231,9 +17536,8 @@ impl QueueStorage {
                 row.into_dlq_row(dlq_reason.to_string(), dlq_at)
             })
             .collect();
-        self.insert_dlq_rows_tx(&mut tx, &rows, Some(JobState::Failed))
+        self.insert_dlq_rows_tx(tx, &rows, Some(JobState::Failed))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rows.len() as u64)
     }
 
@@ -17431,10 +17735,13 @@ impl QueueStorage {
     ) -> Result<BulkBatch, AwaError> {
         bulk::validate_batch_size(batch_size)?;
         let schema = self.schema();
-        let mut batch = BulkBatch::new(cursor);
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self.dlq_left_above_tx(&mut tx, fence, filter).await?;
         let pick = self
-            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor.after_job_id)
+            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor)
             .await?;
         if !pick.ids.is_empty() {
             let rows: Vec<DlqJobRow> = sqlx::query_as(&format!(
@@ -17498,13 +17805,206 @@ impl QueueStorage {
         Ok(batch)
     }
 
-    /// Lock the next DLQ rows matching `filter` past `after_job_id`.
+    /// On a run's first batch, fence the schema's job ID sequence (see
+    /// [`bulk`]) past the highest job ID in any of the schema's job tables,
+    /// such as one migrated from canonical storage and kept by a retry, and
+    /// record the run's bound in `cursor`.
+    /// Returns the fence on a first batch, `None` when the cursor resumes a
+    /// run.
+    async fn mark_bulk_run_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        cursor: &mut BulkCursor,
+    ) -> Result<Option<bulk::Fence>, AwaError> {
+        if cursor.before_job_id != 0 {
+            return Ok(None);
+        }
+        let schema = self.schema();
+        let fence = bulk::fence_sequence_tx(
+            tx,
+            &format!(
+                r#"
+                WITH sequence AS (
+                    SELECT {schema}.sequence_next_value('job_id_seq') AS next
+                )
+                SELECT
+                    sequence.next,
+                    GREATEST(
+                        sequence.next,
+                        (SELECT max(job_id) + 1 FROM {schema}.ready_entries),
+                        (SELECT max(job_id) + 1 FROM {schema}.deferred_jobs),
+                        (SELECT max(job_id) + 1 FROM {schema}.leases),
+                        (SELECT max(job_id) + 1 FROM {schema}.lease_claims),
+                        (SELECT max(job_id) + 1 FROM {schema}.done_entries),
+                        (SELECT max(job_id) + 1 FROM {schema}.dlq_entries)
+                    )
+                FROM sequence
+                "#
+            ),
+            &format!("SELECT {schema}.set_sequence_next('job_id_seq', $1)"),
+        )
+        .await?;
+        bulk::apply_fence(cursor, fence);
+        Ok(Some(fence))
+    }
+
+    /// SQL counting the rows matching each `(relation, filter)` whose job
+    /// ID lies in `bound..top`, the IDs a refused fence leaves above the run.
+    fn left_above_sql(&self, passes: &[(&str, &str)], bound: &str, top: &str) -> String {
+        let schema = self.schema();
+        let counts: Vec<String> = passes
+            .iter()
+            .map(|(relation, filter)| {
+                format!(
+                    "({})",
+                    bulk::count_between_sql(
+                        &format!("{schema}.{relation}"),
+                        "job_id",
+                        filter,
+                        bound,
+                        top
+                    )
+                )
+            })
+            .collect();
+        format!("SELECT {}", counts.join(" + "))
+    }
+
+    /// Matching DLQ rows a refused `fence` leaves above the run.
+    async fn dlq_left_above_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        fence: Option<bulk::Fence>,
+        filter: &ListDlqFilter,
+    ) -> Result<u64, AwaError> {
+        let Some(bulk::Fence::Refused { bound, top }) = fence else {
+            return Ok(0);
+        };
+        let count: i64 = sqlx::query_scalar(&self.left_above_sql(
+            &[("dlq_entries", DLQ_FILTER_SQL)],
+            "$6",
+            "$7",
+        ))
+        .bind(&filter.kind)
+        .bind(&filter.queue)
+        .bind(&filter.tag)
+        .bind(filter.before_id)
+        .bind(filter.before_dlq_at)
+        .bind(bound)
+        .bind(top)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(count as u64)
+    }
+
+    /// Matching failed done rows, and with `with_dlq` the kind's DLQ rows, a
+    /// refused `fence` leaves above the run.
+    async fn failed_left_above_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        fence: Option<bulk::Fence>,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        with_dlq: bool,
+    ) -> Result<u64, AwaError> {
+        let Some(bulk::Fence::Refused { bound, top }) = fence else {
+            return Ok(0);
+        };
+        let mut passes = vec![(
+            "done_entries",
+            "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
+        )];
+        if with_dlq {
+            passes.push((
+                "dlq_entries",
+                "($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
+            ));
+        }
+        let count: i64 = sqlx::query_scalar(&self.left_above_sql(&passes, "$3", "$4"))
+            .bind(kind)
+            .bind(queue)
+            .bind(bound)
+            .bind(top)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(count as u64)
+    }
+
+    /// The queue's waiting, scheduled, retryable and unclaimed available
+    /// jobs a refused `fence` leaves above the drain run.
+    async fn drain_left_above(
+        &self,
+        pool: &PgPool,
+        fence: Option<bulk::Fence>,
+        queue: &str,
+    ) -> Result<u64, AwaError> {
+        let Some(bulk::Fence::Refused { bound, top }) = fence else {
+            return Ok(0);
+        };
+        let schema = self.schema();
+        let claimed = self.ready_row_claimed_sql("ready");
+        let deferred_and_waiting = self.left_above_sql(
+            &[
+                (
+                    "deferred_jobs",
+                    &format!(
+                        "{} AND state IN ('scheduled', 'retryable')",
+                        queue_and_stripes_sql("queue", "$1")
+                    ),
+                ),
+                (
+                    "leases",
+                    &format!(
+                        "{} AND state = 'waiting_external'",
+                        queue_and_stripes_sql("queue", "$1")
+                    ),
+                ),
+            ],
+            "$2",
+            "$3",
+        );
+        let count: i64 = sqlx::query_scalar(&format!(
+            r#"
+            {deferred_and_waiting} + (
+                SELECT count(*)
+                FROM {schema}.ready_entries AS ready
+                WHERE {queues}
+                  AND ready.job_id >= $2
+                  AND ready.job_id < $3
+                  AND NOT (
+                      EXISTS (
+                          SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                          WHERE tomb.ready_slot = ready.ready_slot
+                            AND tomb.ready_generation = ready.ready_generation
+                            AND tomb.queue = ready.queue
+                            AND tomb.priority = ready.priority
+                            AND tomb.enqueue_shard = ready.enqueue_shard
+                            AND tomb.lane_seq = ready.lane_seq
+                      )
+                      OR {claimed}
+                  )
+            )
+            "#,
+            queues = queue_and_stripes_sql("ready.queue", "$1"),
+        ))
+        .bind(queue)
+        .bind(bound)
+        .bind(top)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(count as u64)
+    }
+
+    /// Lock the next DLQ rows matching `filter` in the cursor's range.
     async fn pick_dlq_batch_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         filter: &ListDlqFilter,
         batch_size: i64,
-        after_job_id: i64,
+        cursor: BulkCursor,
     ) -> Result<bulk::Pick, AwaError> {
         let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
             sqlx::query_as(&bulk::pick_sql(
@@ -17512,24 +18012,487 @@ impl QueueStorage {
                 "job_id",
                 DLQ_FILTER_SQL,
                 "$6",
-                "$7",
+                ["$7", "$9"],
+                "$8",
             ))
             .bind(&filter.kind)
             .bind(&filter.queue)
             .bind(&filter.tag)
             .bind(filter.before_id)
             .bind(filter.before_dlq_at)
-            .bind(after_job_id)
+            .bind(cursor.after_job_id)
+            .bind(cursor.before_job_id)
             .bind(batch_size)
+            .bind(cursor.sequence_bound)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
         Ok(bulk::Pick::new(picked, first_held, more))
     }
 
-    pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
-        let schema = self.schema();
+    /// Lock the next failed done rows matching `kind` and `queue` in the
+    /// cursor's range.
+    async fn pick_failed_done_batch_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        batch_size: i64,
+        cursor: BulkCursor,
+    ) -> Result<bulk::Pick, AwaError> {
+        let (picked, first_held, more): (Vec<i64>, Option<i64>, bool) =
+            sqlx::query_as(&bulk::pick_sql(
+                &format!("{}.done_entries", self.schema()),
+                "job_id",
+                "state = 'failed' AND ($1::text IS NULL OR kind = $1) AND ($2::text IS NULL OR queue = $2)",
+                "$3",
+                ["$4", "$6"],
+                "$5",
+            ))
+            .bind(kind)
+            .bind(queue)
+            .bind(cursor.after_job_id)
+            .bind(cursor.before_job_id)
+            .bind(batch_size)
+            .bind(cursor.sequence_bound)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(bulk::Pick::new(picked, first_held, more))
+    }
+
+    /// Retry `ids` in the open transaction, skipping any job whose retry
+    /// would violate a unique claim. Each pass takes the jobs and claims all
+    /// their keys, in key order, before any lane is reserved. A pass that
+    /// meets a conflict, whether taking a job or claiming the keys, holds no
+    /// lane yet; it is rolled back and the next pass leaves the conflicting
+    /// jobs where they are.
+    async fn retry_jobs_skipping_conflicts_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ids: &[i64],
+        skipped: &mut impl FnMut(i64),
+    ) -> Result<Vec<JobRow>, AwaError> {
+        let mut ids: Vec<i64> = ids.to_vec();
+        loop {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            sqlx::query("SAVEPOINT awa_bulk_batch")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            let mut taken = Vec::with_capacity(ids.len());
+            let mut take_conflict = None;
+            for job_id in &ids {
+                match self.take_retry_row_tx(tx, *job_id).await {
+                    Ok(Some((ready_row, old_state))) => taken.push((ready_row, Some(old_state))),
+                    Ok(None) => {}
+                    Err(AwaError::UniqueConflict { .. }) => {
+                        take_conflict = Some(*job_id);
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            let conflicts = match take_conflict {
+                Some(job_id) => HashSet::from([job_id]),
+                None => self.sync_reenqueue_unique_claims(tx, &taken, true).await?,
+            };
+            if conflicts.is_empty() {
+                let rows = taken
+                    .iter()
+                    .map(|(ready_row, _)| Self::retried_job_row(ready_row.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let queues: BTreeSet<String> = taken
+                    .iter()
+                    .map(|(ready_row, _)| ready_row.queue.clone())
+                    .collect();
+                self.insert_existing_ready_rows_inner_tx(tx, taken, false)
+                    .await?;
+                self.notify_queues_tx(tx, queues).await?;
+                sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                return Ok(rows);
+            }
+            sqlx::query("ROLLBACK TO SAVEPOINT awa_bulk_batch")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            sqlx::query("RELEASE SAVEPOINT awa_bulk_batch")
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            ids.retain(|job_id| !conflicts.contains(job_id));
+            conflicts.into_iter().for_each(&mut *skipped);
+        }
+    }
+
+    /// Retry up to `batch_size` failed jobs matching `kind` and `queue` past
+    /// `cursor`, in job ID order, in one transaction. A job whose retry would
+    /// violate a unique claim is skipped and reported.
+    pub async fn retry_failed_batch(
+        &self,
+        pool: &PgPool,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        batch_size: i64,
+        cursor: BulkCursor,
+    ) -> Result<BulkBatch, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
+        let mut cursor = cursor;
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self
+            .failed_left_above_tx(&mut tx, fence, kind, queue, false)
+            .await?;
+        let pick = self
+            .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor)
+            .await?;
+        let mut skipped = Vec::new();
+        let rows = self
+            .retry_jobs_skipping_conflicts_tx(&mut tx, &pick.ids, &mut |job_id| {
+                skipped.push(job_id)
+            })
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        batch.count = rows.len() as u64;
+        skipped.into_iter().for_each(|job_id| batch.skip(job_id));
+        pick.settle(&mut batch, None);
+        Ok(batch)
+    }
+
+    /// Retry `ids` in transactions of at most `batch_size` jobs, skipping and
+    /// reporting jobs whose retry would violate a unique claim. When a chunk
+    /// fails, the error carries the jobs earlier chunks committed.
+    pub async fn retry_jobs_in_batches(
+        &self,
+        pool: &PgPool,
+        ids: &[i64],
+        batch_size: i64,
+    ) -> Result<BulkIds, BulkError<BulkIds>> {
+        let mut outcome = BulkIds::default();
+        if let Err(error) = bulk::validate_batch_size(batch_size) {
+            return Err(BulkError::new(outcome, error));
+        }
+        let unique_ids: Vec<i64> = ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for (index, chunk) in unique_ids.chunks(batch_size as usize).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(bulk::DEFAULT_QUEUE_STORAGE_PAUSE).await;
+            }
+            let mut skipped = Vec::new();
+            let chunk_result = async {
+                let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+                let rows = self
+                    .retry_jobs_skipping_conflicts_tx(&mut tx, chunk, &mut |job_id| {
+                        skipped.push(job_id)
+                    })
+                    .await?;
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok::<_, AwaError>(rows)
+            }
+            .await;
+            match chunk_result {
+                Ok(rows) => {
+                    outcome.jobs.extend(rows);
+                    skipped.into_iter().for_each(|job_id| outcome.skip(job_id));
+                }
+                Err(error) => return Err(BulkError::new(outcome, error)),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Cancel `ids` in transactions of at most `batch_size` jobs, and at most
+    /// [`CANCEL_BY_ID_CHUNK`] jobs, in job ID order. When a chunk fails, the
+    /// error carries the jobs earlier chunks committed.
+    pub async fn cancel_jobs_in_batches(
+        &self,
+        pool: &PgPool,
+        ids: &[i64],
+        batch_size: i64,
+    ) -> Result<BulkIds, BulkError<BulkIds>> {
+        let mut outcome = BulkIds::default();
+        if let Err(error) = bulk::validate_batch_size(batch_size) {
+            return Err(BulkError::new(outcome, error));
+        }
+        // Sorted and deduplicated, so concurrent calls lock claim heads and
+        // rows in the same order.
+        let unique_ids: Vec<i64> = ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let chunk_size = batch_size.min(CANCEL_BY_ID_CHUNK) as usize;
+        for (index, chunk) in unique_ids.chunks(chunk_size).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(bulk::DEFAULT_QUEUE_STORAGE_PAUSE).await;
+            }
+            match self.cancel_jobs_by_ids(pool, chunk).await {
+                Ok(rows) => outcome.jobs.extend(rows),
+                Err(error) => return Err(BulkError::new(outcome, error)),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Discard up to `batch_size` failed jobs of `kind` past `cursor`, in
+    /// one transaction: failed done rows first, then DLQ rows.
+    pub async fn discard_failed_batch(
+        &self,
+        pool: &PgPool,
+        kind: &str,
+        batch_size: i64,
+        cursor: BulkCursor,
+    ) -> Result<BulkBatch, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
+        let mut cursor = cursor;
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self
+            .failed_left_above_tx(&mut tx, fence, Some(kind), None, true)
+            .await?;
+        if cursor.stage == 0 {
+            let pick = self
+                .pick_failed_done_batch_tx(&mut tx, Some(kind), None, batch_size, cursor)
+                .await?;
+            if !pick.ids.is_empty() {
+                batch.count = self
+                    .discard_failed_rows_tx(&mut tx, kind, Some(&pick.ids), Some(&[]))
+                    .await?;
+            }
+            pick.settle(&mut batch, Some(1));
+        } else {
+            let filter = ListDlqFilter {
+                kind: Some(kind.to_string()),
+                ..Default::default()
+            };
+            let pick = self
+                .pick_dlq_batch_tx(&mut tx, &filter, batch_size, cursor)
+                .await?;
+            if !pick.ids.is_empty() {
+                batch.count = self
+                    .discard_failed_rows_tx(&mut tx, kind, Some(&[]), Some(&pick.ids))
+                    .await?;
+            }
+            pick.settle(&mut batch, None);
+        }
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(batch)
+    }
+
+    /// Move up to `batch_size` failed jobs matching `kind` and `queue` past
+    /// `cursor` into the DLQ, in one transaction.
+    pub async fn bulk_move_failed_to_dlq_batch(
+        &self,
+        pool: &PgPool,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        dlq_reason: &str,
+        batch_size: i64,
+        cursor: BulkCursor,
+    ) -> Result<BulkBatch, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
+        let mut cursor = cursor;
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self
+            .failed_left_above_tx(&mut tx, fence, kind, queue, false)
+            .await?;
+        let pick = self
+            .pick_failed_done_batch_tx(&mut tx, kind, queue, batch_size, cursor)
+            .await?;
+        if !pick.ids.is_empty() {
+            batch.count = self
+                .move_failed_rows_to_dlq_tx(&mut tx, kind, queue, dlq_reason, Some(&pick.ids))
+                .await?;
+        }
+        pick.settle(&mut batch, None);
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(batch)
+    }
+
+    /// Delete up to `batch_size` DLQ rows matching `filter` past `cursor`, in
+    /// one transaction. `filter.limit` is ignored.
+    pub async fn purge_dlq_batch(
+        &self,
+        pool: &PgPool,
+        filter: &ListDlqFilter,
+        batch_size: i64,
+        cursor: BulkCursor,
+    ) -> Result<BulkBatch, AwaError> {
+        bulk::validate_batch_size(batch_size)?;
+        let mut cursor = cursor;
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let fence = self.mark_bulk_run_tx(&mut tx, &mut cursor).await?;
+        let mut batch = BulkBatch::queue_storage(cursor);
+        batch.left_above_sequence = self.dlq_left_above_tx(&mut tx, fence, filter).await?;
+        let pick = self
+            .pick_dlq_batch_tx(&mut tx, filter, batch_size, cursor)
+            .await?;
+        if !pick.ids.is_empty() {
+            batch.count = self.delete_dlq_rows_by_id_tx(&mut tx, &pick.ids).await?;
+        }
+        pick.settle(&mut batch, None);
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(batch)
+    }
+
+    /// Release the unique claims of DLQ rows `deleted` removed. A DLQ row is
+    /// a failed job, and a unique key whose states include `failed` stays
+    /// claimed while the row exists; deleting the row without this leaves
+    /// a claim that blocks the key for a job that no longer exists. Claims
+    /// are released in one pass in key order, whatever order the delete
+    /// returned the rows in.
+    async fn release_deleted_dlq_claims_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: &[DeletedDlqRow],
+    ) -> Result<(), AwaError> {
+        let changes = deleted
+            .iter()
+            .filter_map(|row| {
+                unique_claim_change(
+                    row.job_id,
+                    row.unique_key.as_deref(),
+                    row.unique_states.as_deref(),
+                    Some(row.state),
+                    None,
+                )
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete the DLQ rows `job_ids` in the open transaction, releasing their
+    /// unique claims, and return how many were deleted.
+    pub(crate) async fn delete_dlq_rows_by_id_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_ids: &[i64],
+    ) -> Result<u64, AwaError> {
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(&format!(
+            "DELETE FROM {}.dlq_entries WHERE job_id = ANY($1) RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema()
+        ))
+        .bind(job_ids)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(tx, &deleted).await?;
+        Ok(deleted.len() as u64)
+    }
+
+    /// Delete every DLQ row matching `filter`, its cursor included, in one
+    /// transaction, releasing their unique claims. Ignores `filter.limit`.
+    pub async fn purge_dlq(&self, pool: &PgPool, filter: &ListDlqFilter) -> Result<u64, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(&format!(
+            "DELETE FROM {}.dlq_entries WHERE {DLQ_FILTER_SQL} RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema()
+        ))
+        .bind(&filter.kind)
+        .bind(&filter.queue)
+        .bind(&filter.tag)
+        .bind(filter.before_id)
+        .bind(filter.before_dlq_at)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
+    }
+
+    /// Delete one DLQ row, releasing its unique claim.
+    pub async fn purge_dlq_job(&self, pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted = self.delete_dlq_rows_by_id_tx(&mut tx, &[job_id]).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete up to `limit` DLQ rows older than `retention`, releasing their
+    /// unique claims, and return how many were deleted. `queue` keeps the
+    /// delete to one queue; `exclude_queues` leaves those queues alone.
+    /// With `oldest_first`, rows go in `(dlq_at, job_id)` order.
+    pub async fn delete_expired_dlq_rows(
+        &self,
+        pool: &PgPool,
+        retention: std::time::Duration,
+        limit: i64,
+        queue: Option<&str>,
+        exclude_queues: &[&str],
+        oldest_first: bool,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
+        let order = if oldest_first {
+            "ORDER BY dlq_at ASC, job_id ASC"
+        } else {
+            ""
+        };
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE job_id IN (
+                SELECT job_id FROM {schema}.dlq_entries
+                WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+                  AND ($3::text IS NULL OR queue = $3)
+                  AND queue <> ALL($4::text[])
+                {order}
+                LIMIT $2
+            )
+            RETURNING {DELETED_DLQ_COLUMNS}
+            "#
+        ))
+        .bind(retention_secs)
+        .bind(limit)
+        .bind(queue)
+        .bind(exclude_queues)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
+    }
+
+    pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let discarded = self
+            .discard_failed_rows_tx(&mut tx, kind, None, None)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(discarded)
+    }
+
+    /// Discard failed done rows and DLQ rows of `kind`, limited to the given
+    /// job IDs when they are set.
+    async fn discard_failed_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        kind: &str,
+        done_ids: Option<&[i64]>,
+        dlq_ids: Option<&[i64]>,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
 
         let done_projection = done_row_projection("done", "ready");
         let ready_join = done_ready_join(schema, "done", "ready");
@@ -17539,6 +18502,7 @@ impl QueueStorage {
                 DELETE FROM {schema}.done_entries
                 WHERE kind = $1
                   AND state = 'failed'
+                  AND ($2::bigint[] IS NULL OR job_id = ANY($2))
                 RETURNING *
             )
             SELECT {done_projection}
@@ -17547,6 +18511,7 @@ impl QueueStorage {
             "#
         ))
         .bind(kind)
+        .bind(done_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -17555,6 +18520,7 @@ impl QueueStorage {
             r#"
             DELETE FROM {schema}.dlq_entries
             WHERE kind = $1
+              AND ($2::bigint[] IS NULL OR job_id = ANY($2))
             RETURNING
                 job_id,
                 kind,
@@ -17578,6 +18544,7 @@ impl QueueStorage {
             "#
         ))
         .bind(kind)
+        .bind(dlq_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -17586,10 +18553,10 @@ impl QueueStorage {
         // `failed` DLQ rows from dlq_entries — exact terminal counts are keyed
         // on done_entries only). Append negative deltas by the per-group
         // magnitudes of `deleted_done`.
-        self.ensure_terminal_removed_receipt_closures_tx(&mut tx, &deleted_done)
+        self.ensure_terminal_removed_receipt_closures_tx(tx, &deleted_done)
             .await?;
         self.decrement_live_terminal_counters_tx(
-            &mut tx,
+            tx,
             &Self::done_rows_to_counter_keys(&deleted_done),
         )
         .await?;
@@ -17606,10 +18573,9 @@ impl QueueStorage {
                 unique_claim_change(job_id, key.as_deref(), states.as_deref(), Some(state), None)
             })
             .collect();
-        self.apply_unique_claim_changes_tx(&mut tx, changes, false)
+        self.apply_unique_claim_changes_tx(tx, changes, false)
             .await?;
 
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok((deleted_done.len() + deleted_dlq.len()) as u64)
     }
 

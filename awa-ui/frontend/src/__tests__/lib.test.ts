@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { timeAgo } from "@/lib/time";
 import { parseSearch } from "@/components/SearchBar";
+import { toBulkRetryResult } from "@/lib/api";
+import type { JobRow } from "@/lib/api";
 
 describe("timeAgo", () => {
   it("shows seconds for recent times", () => {
@@ -69,5 +71,21 @@ describe("parseSearch", () => {
     expect(parseSearch("kind:first kind:second")).toEqual({
       kind: "second",
     });
+  });
+});
+
+describe("toBulkRetryResult", () => {
+  const job = { id: 7 } as JobRow;
+
+  it("reads the report a current server returns", () => {
+    expect(toBulkRetryResult({ jobs: [job], skipped: 1, conflicts: [8] })).toEqual({
+      jobs: [job],
+      skipped: 1,
+      conflicts: [8],
+    });
+  });
+
+  it("reads the array a server from before report_skipped returns", () => {
+    expect(toBulkRetryResult([job])).toEqual({ jobs: [job], skipped: 0, conflicts: [] });
   });
 });

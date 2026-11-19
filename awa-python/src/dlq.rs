@@ -92,11 +92,43 @@ pub(crate) fn build_retry_opts(
     }
 }
 
-/// Finish a bulk run for Python: the count of changed rows, or
+/// Set `count`, `skipped`, `conflicts` and `left_above_sequence` on `err`
+/// from `run`, so a caller that catches it knows what the run changed before
+/// it stopped.
+fn with_progress(err: PyErr, run: &awa_model::BulkRun) -> PyErr {
+    Python::attach(|py| {
+        let value = err.value(py);
+        // Setting attributes on an exception instance does not fail.
+        let _ = value.setattr("count", run.count);
+        let _ = value.setattr("skipped", run.skipped);
+        let _ = value.setattr("conflicts", run.conflicts.clone());
+        let _ = value.setattr("left_above_sequence", run.left_above_sequence);
+    });
+    err
+}
+
+/// Finish a bulk run for Python: the count of changed rows, or an exception
+/// carrying the run's `count`, `skipped`, `conflicts` and
+/// `left_above_sequence`. A run that left matching rows with explicit IDs
+/// above the job ID sequence issues a `RuntimeWarning` naming them. The
+/// exception is
 /// `UniqueConflict` naming the skipped jobs after every other row was
-/// changed, or `DatabaseError` if the run gave up on rows another transaction
-/// held.
-pub(crate) fn finish_bulk_run(run: awa_model::BulkRun, verb: &str) -> PyResult<u64> {
+/// changed, `DatabaseError` if the run gave up on rows another transaction
+/// held, naming any jobs it skipped, or the mapped error of a batch that
+/// failed.
+pub(crate) fn finish_bulk_run(
+    result: Result<awa_model::BulkRun, awa_model::BulkError<awa_model::BulkRun>>,
+    verb: &str,
+) -> PyResult<u64> {
+    let run = match result {
+        Ok(run) => run,
+        Err(err) => {
+            return Err(with_progress(
+                crate::errors::map_awa_error(err.error),
+                &err.partial,
+            ))
+        }
+    };
     let skipped = (run.skipped > 0).then(|| {
         let ids: Vec<String> = run.conflicts.iter().map(i64::to_string).collect();
         format!(
@@ -106,18 +138,39 @@ pub(crate) fn finish_bulk_run(run: awa_model::BulkRun, verb: &str) -> PyResult<u
         )
     });
     if run.busy_timed_out {
-        return Err(crate::DatabaseError::new_err(format!(
-            "{verb} {} row(s), then stopped: every remaining matching row has been held by another transaction for {}s{}",
-            run.count,
-            awa_model::bulk::DEFAULT_BUSY_TIMEOUT.as_secs(),
-            skipped.map(|text| format!("; {text}")).unwrap_or_default()
-        )));
+        return Err(with_progress(
+            crate::DatabaseError::new_err(format!(
+                "{verb} {} row(s), then stopped: every remaining matching row stayed held by another transaction{}",
+                run.count,
+                skipped
+                    .as_ref()
+                    .map(|text| format!("; {text}"))
+                    .unwrap_or_default()
+            )),
+            &run,
+        ));
     }
     if let Some(text) = skipped {
-        return Err(crate::UniqueConflict::new_err(format!(
-            "{verb} {} row(s); {text}",
-            run.count
-        )));
+        return Err(with_progress(
+            crate::UniqueConflict::new_err(format!("{verb} {} row(s); {text}", run.count)),
+            &run,
+        ));
+    }
+    if run.left_above_sequence > 0 {
+        let message = std::ffi::CString::new(format!(
+            "{verb} {} row(s); left {} matching job(s) with an explicit ID above the job ID sequence, which the database role may not advance; grant UPDATE on the sequence and rerun to include them",
+            run.count, run.left_above_sequence
+        ))
+        .expect("message has no NUL byte");
+        Python::attach(|py| {
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+                &message,
+                1,
+            )
+        })
+        .map_err(|err| with_progress(err, &run))?;
     }
     Ok(run.count)
 }
@@ -132,7 +185,6 @@ pub(crate) async fn bulk_retry(
     batch_size: Option<i64>,
     mut on_changed: impl FnMut(u64),
 ) -> PyResult<u64> {
-    use crate::errors::map_awa_error;
     let options = awa_model::BulkRunOptions::default()
         .batch_size(batch_size.unwrap_or(awa_model::bulk::DEFAULT_BATCH_SIZE));
     let run = awa_model::bulk::run_batches(
@@ -146,7 +198,125 @@ pub(crate) async fn bulk_retry(
             }
         },
     )
-    .await
-    .map_err(map_awa_error)?;
+    .await;
+    finish_bulk_run(run, "Retried")
+}
+
+fn batch_options(batch_size: Option<i64>) -> awa_model::BulkRunOptions {
+    awa_model::BulkRunOptions::default()
+        .batch_size(batch_size.unwrap_or(awa_model::bulk::DEFAULT_BATCH_SIZE))
+}
+
+/// Discard every failed job of `kind` in batches.
+pub(crate) async fn discard_failed(
+    pool: &sqlx::PgPool,
+    kind: &str,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| awa_model::admin::discard_failed_batch(pool, kind, size, cursor),
+        |_, _| {},
+    )
+    .await;
+    finish_bulk_run(run, "Discarded")
+}
+
+/// Drain `queue` in batches.
+pub(crate) async fn drain_queue(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    batch_size: Option<i64>,
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| awa_model::admin::drain_queue_batch(pool, queue, size, cursor),
+        |_, _| {},
+    )
+    .await;
+    finish_bulk_run(run, "Drained")
+}
+
+/// Move failed jobs into the DLQ in batches. `on_changed` sees the row
+/// count of each batch that moved rows, as the batch commits.
+pub(crate) async fn bulk_move(
+    pool: &sqlx::PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    reason: &str,
+    allow_all: bool,
+    batch_size: Option<i64>,
+    mut on_changed: impl FnMut(u64),
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| {
+            awa_model::dlq::bulk_move_failed_to_dlq_batch(
+                pool, kind, queue, reason, allow_all, size, cursor,
+            )
+        },
+        |batch, _| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+        },
+    )
+    .await;
+    finish_bulk_run(run, "Moved")
+}
+
+/// Purge matching DLQ rows in batches. `on_changed` sees the row count of
+/// each batch that purged rows, as the batch commits.
+pub(crate) async fn purge(
+    pool: &sqlx::PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+    batch_size: Option<i64>,
+    mut on_changed: impl FnMut(u64),
+) -> PyResult<u64> {
+    let run = awa_model::bulk::run_batches(
+        batch_options(batch_size),
+        |size, cursor| awa_model::dlq::purge_dlq_batch(pool, filter, allow_all, size, cursor),
+        |batch, _| {
+            if batch.count > 0 {
+                on_changed(batch.count);
+            }
+        },
+    )
+    .await;
+    finish_bulk_run(run, "Purged")
+}
+
+/// Retry every failed job of `kind` or in `queue` in batches.
+pub(crate) async fn retry_failed(
+    pool: &sqlx::PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    batch_size: i64,
+) -> PyResult<u64> {
+    let options = batch_options(Some(batch_size));
+    let run = match (kind, queue) {
+        (Some(kind), None) => {
+            awa_model::bulk::run_batches(
+                options,
+                |size, cursor| {
+                    awa_model::admin::retry_failed_by_kind_batch(pool, kind, size, cursor)
+                },
+                |_, _| {},
+            )
+            .await
+        }
+        (None, Some(queue)) => {
+            awa_model::bulk::run_batches(
+                options,
+                |size, cursor| {
+                    awa_model::admin::retry_failed_by_queue_batch(pool, queue, size, cursor)
+                },
+                |_, _| {},
+            )
+            .await
+        }
+        _ => unreachable!("validated by the caller"),
+    };
     finish_bulk_run(run, "Retried")
 }

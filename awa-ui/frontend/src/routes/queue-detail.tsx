@@ -13,6 +13,7 @@ import {
   resumeQueue,
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
+import { useBulkRun, BulkRunProgress } from "@/hooks/use-bulk-run";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
@@ -75,17 +76,19 @@ export function QueueDetailPage() {
     onError: () => toast.error("Failed to resume queue"),
   });
 
-  const drainMutation = useMutation({
-    mutationFn: () => drainQueue(queueName),
-    onSuccess: () => {
-      setShowDrainConfirm(false);
-      void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
-      void queryClient.invalidateQueries({ queryKey: ["queues"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      toast.success(`Queue "${queueName}" drained`);
-    },
-    onError: () => toast.error("Failed to drain queue"),
-  });
+  const bulk = useBulkRun();
+  const startDrain = () =>
+    void bulk.start({
+      label: `Draining queue "${queueName}"`,
+      verb: "Drained",
+      noun: `job(s) from "${queueName}"`,
+      runBatch: (batchSize, cursor) => drainQueue(queueName, { batch_size: batchSize, cursor }),
+      onFinish: () => {
+        void queryClient.invalidateQueries({ queryKey: ["queue", queueName] });
+        void queryClient.invalidateQueries({ queryKey: ["queues"] });
+        void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      },
+    });
 
   if (!queueName) {
     return <p className="text-sm text-muted-fg">Queue not found.</p>;
@@ -186,11 +189,13 @@ export function QueueDetailPage() {
           size="sm"
           className="text-danger"
           onPress={() => setShowDrainConfirm(true)}
-          isDisabled={readOnly || drainMutation.isPending}
+          isDisabled={readOnly || bulk.state !== null}
         >
           Drain
         </Button>
       </div>
+
+      <BulkRunProgress state={bulk.state} onStop={bulk.requestStop} />
 
       <Card>
         <CardHeader title="Descriptor" />
@@ -360,11 +365,14 @@ export function QueueDetailPage() {
       <ConfirmDialog
         isOpen={showDrainConfirm}
         onOpenChange={setShowDrainConfirm}
-        onConfirm={() => drainMutation.mutate()}
+        onConfirm={() => {
+          setShowDrainConfirm(false);
+          startDrain();
+        }}
         title="Drain queue?"
-        description={`Cancel all available, scheduled, retryable, and waiting jobs in "${queue.queue}". Running jobs are not affected.`}
+        description={`Cancel all available, scheduled, retryable, and waiting jobs in "${queue.queue}", in batches of up to 1,000. You can stop between batches. Running jobs are not affected.`}
         confirmLabel="Drain queue"
-        isPending={drainMutation.isPending}
+        isPending={bulk.state !== null}
       />
     </div>
   );

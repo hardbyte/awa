@@ -15,6 +15,12 @@ pub enum ApiError {
         message: String,
         detail: serde_json::Map<String, serde_json::Value>,
     },
+    /// `error` stopped a bulk call after earlier batches committed `changed`
+    /// rows. The response keeps `error`'s status and adds `changed`.
+    Partial {
+        error: Box<ApiError>,
+        changed: u64,
+    },
 }
 
 impl From<awa_model::AwaError> for ApiError {
@@ -51,13 +57,30 @@ impl From<std::sync::Arc<crate::cache::CacheError>> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let (status, detail) = self.status_and_body();
+        (status, axum::Json(detail)).into_response()
+    }
+}
+
+impl ApiError {
+    /// The response status and JSON body, whose `error` field holds the
+    /// message.
+    fn status_and_body(self) -> (StatusCode, serde_json::Map<String, serde_json::Value>) {
         if let ApiError::ConflictDetail {
             message,
             mut detail,
         } = self
         {
             detail.insert("error".into(), message.into());
-            return (StatusCode::CONFLICT, axum::Json(detail)).into_response();
+            return (StatusCode::CONFLICT, detail);
+        }
+        if let ApiError::Partial { error, changed } = self {
+            let (status, mut detail) = error.status_and_body();
+            if let Some(serde_json::Value::String(message)) = detail.get_mut("error") {
+                message.push_str(&format!("; changed {changed} row(s) before the error"));
+            }
+            detail.insert("changed".into(), changed.into());
+            return (status, detail);
         }
         let (status, message) = match self {
             ApiError::ReadOnly => (
@@ -68,7 +91,9 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ApiError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
             ApiError::Conflict(message) => (StatusCode::CONFLICT, message),
-            ApiError::ConflictDetail { .. } => unreachable!("answered above"),
+            ApiError::ConflictDetail { .. } | ApiError::Partial { .. } => {
+                unreachable!("answered above")
+            }
             ApiError::Awa(err) => match &err {
                 awa_model::AwaError::JobNotFound { .. } => (StatusCode::NOT_FOUND, err.to_string()),
                 awa_model::AwaError::CallbackNotFound { .. } => {
@@ -95,8 +120,24 @@ impl IntoResponse for ApiError {
             },
         };
 
-        let body = axum::Json(json!({ "error": message }));
-        (status, body).into_response()
+        let serde_json::Value::Object(body) = json!({ "error": message }) else {
+            unreachable!("a JSON object literal")
+        };
+        (status, body)
+    }
+
+    /// `error` after a bulk call committed `changed` rows, or `error` alone
+    /// when it changed none.
+    pub fn after_partial(error: impl Into<ApiError>, changed: u64) -> Self {
+        let error = error.into();
+        if changed == 0 {
+            error
+        } else {
+            ApiError::Partial {
+                error: Box::new(error),
+                changed,
+            }
+        }
     }
 }
 
@@ -115,5 +156,30 @@ impl ApiError {
 
     pub fn conflict(message: impl Into<String>) -> Self {
         ApiError::Conflict(message.into())
+    }
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_failure_keeps_the_status_and_reports_what_changed() {
+        let error = ApiError::after_partial(awa_model::AwaError::Validation("bad batch".into()), 3);
+        let (status, body) = error.status_and_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["changed"], 3);
+        assert_eq!(
+            body["error"],
+            "validation error: bad batch; changed 3 row(s) before the error"
+        );
+    }
+
+    #[test]
+    fn a_failure_that_changed_nothing_is_the_plain_error() {
+        let error = ApiError::after_partial(awa_model::AwaError::Validation("bad batch".into()), 0);
+        let (status, body) = error.status_and_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.get("changed").is_none());
     }
 }

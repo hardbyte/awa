@@ -123,6 +123,7 @@ pub async fn router_with(
         // DLQ
         .route("/dlq", get(handlers::dlq::list_dlq))
         .route("/dlq/depth", get(handlers::dlq::dlq_depth))
+        .route("/dlq/count", get(handlers::dlq::dlq_count))
         .route("/dlq/{id}", get(handlers::dlq::get_dlq_job))
         .route("/dlq/{id}", delete(handlers::dlq::purge_dlq_job))
         .route("/dlq/{id}/retry", post(handlers::dlq::retry_dlq_job))

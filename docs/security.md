@@ -106,7 +106,9 @@ END$$;
 GRANT USAGE ON SCHEMA awa TO awa_runtime;
 
 -- Sequences: canonical `jobs_id_seq`, and queue-storage `job_id_seq`
--- once prepare_schema has materialized it.
+-- once prepare_schema has materialized it. Bulk admin operations need
+-- UPDATE on the job ID sequence to advance it past jobs inserted with
+-- explicit IDs above it; without it they leave those jobs and report them.
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
 
 -- All tables: the runtime needs full DML because triggers run as the
