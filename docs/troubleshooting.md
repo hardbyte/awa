@@ -454,13 +454,13 @@ A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue r
 
 Tell it apart from the other ring stalls by the prune outcome:
 
-| Fault | `awa.maintenance.prune.attempts` | `awa.maintenance.prune.pinned_ready_age` |
-| --- | --- | --- |
-| Claims starve prune (this section) | `blocked`, reason `none` | absent or `0` |
-| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` | positive for the pinning lane |
-| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` | absent or `0` |
+| Fault | `awa.maintenance.prune.attempts` |
+| --- | --- |
+| Claims starve prune (this section) | `blocked`, reason `none` |
+| [Unclaimed lane pins the slot](#queue-ring-stops-wrapping-behind-an-unclaimed-lane) | `skipped_active`, reason `queue.pending_ready` |
+| [Abandoned claims after a killed runtime](#claim-ring-stops-rotating-after-a-runtime-is-killed) | `skipped_active`, reason `queue.unclosed_claim_refs` or `claim.open` |
 
-The leader reads `awa.maintenance.prune.pinned_ready_age` only after a `skipped_active` prune, so it does not report this fault.
+Do not use `awa.maintenance.prune.pinned_ready_age` to rule this fault in or out. The leader reads the gauge only after a `skipped_active` prune and on backed-off ticks while a lane already pins the slot, and leaves it unchanged when prune is `blocked`, so it does not report this fault and can be positive during it when a lane also pins the slot.
 
 ```promql
 sum by (awa_ring, awa_ring_outcome) (increase(awa_maintenance_prune_attempts_total[15m]))
