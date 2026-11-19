@@ -248,7 +248,7 @@ Costs:
 - no transaction spans databases: a handler or a producer transaction can enqueue atomically only into its own database, unique keys deduplicate only within one database, and a job cannot be moved between databases with `move_queue`
 - Awa's metrics carry no database attribute, so tell the domains apart by the resource attributes of the processes that serve them
 
-When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero `priority_aging_interval`, queues are not left paused or unserved with jobs waiting, and you alert on `awa.maintenance.prune.pinned_ready_age`, on prune attempts with outcome `blocked`, and on `awa.ring.generation` that stops advancing, one database is simpler and a stall is caught before it costs much storage. `pinned_ready_age` catches a lane pinning the ring; it stays at zero when [overlapping claims keep prune blocked](troubleshooting.md#ring-prune-stays-blocked-under-claim-load), which only the `blocked` count and a flat ring generation show.
+When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero `priority_aging_interval`, queues are not left paused or unserved with jobs waiting, and you alert on `awa.maintenance.prune.pinned_ready_age`, on prune attempts with outcome `blocked`, and on `awa.ring.generation` that stops advancing, one database is simpler and a stall is caught before it costs much storage. `pinned_ready_age` catches a lane pinning the ring; it does not report [overlapping claims that keep prune blocked](troubleshooting.md#ring-prune-stays-blocked-under-claim-load), which only the `blocked` count and a flat ring generation show.
 
 ## Web UI Deployment
 
