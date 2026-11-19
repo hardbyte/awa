@@ -6,7 +6,7 @@ use crate::insert::prepare_row_raw;
 use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use sqlx::Acquire;
 use sqlx::{FromRow, PgPool, Postgres, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -30,6 +30,8 @@ const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
+pub(crate) const RESCHEDULED_DUPLICATE_ERROR: &str =
+    "rescheduled as duplicate: unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = crate::bulk::DEFAULT_BATCH_SIZE;
 
 /// Columns of a `DlqJobRow` read from `dlq_entries`.
@@ -1911,6 +1913,218 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
 }
 
+/// The key of a duplicate-cancellation error entry that holds the job's
+/// unique mask from before `cancelled` was cleared from it.
+pub(crate) const DUPLICATE_CANCEL_MASK_KEY: &str = "duplicate_unique_states";
+
+/// The messages of the error entries awa writes when it cancels a job as a
+/// duplicate. A recorded mask is trusted only on an entry with one of them.
+pub(crate) const DUPLICATE_CANCEL_ERRORS: [&str; 2] =
+    [RESCUED_DUPLICATE_ERROR, RESCHEDULED_DUPLICATE_ERROR];
+
+/// The messages releases before 0.6.19 wrote when they cancelled a duplicate
+/// and stored it without its unique key.
+const LEGACY_KEYLESS_DUPLICATE_ERRORS: [&str; 2] =
+    [RESCUED_DUPLICATE_ERROR, RESCHEDULED_DUPLICATE_ERROR];
+
+/// The unique mask a revived job takes. A row cancelled as a duplicate
+/// carries its original mask under [`DUPLICATE_CANCEL_MASK_KEY`] in the
+/// duplicate error entry, and gets it back. A cancelled duplicate that a
+/// release before 0.6.19 stored without its unique key cannot be revived:
+/// nothing would keep it from running beside the job that holds its key.
+/// Neither can a recorded duplicate whose key is gone.
+fn revived_unique_states(
+    state: JobState,
+    unique_key: Option<&[u8]>,
+    unique_states: Option<String>,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, AwaError> {
+    if state != JobState::Cancelled {
+        return Ok(unique_states);
+    }
+    let errors = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(original) = errors.iter().rev().find_map(|error| {
+        let message = error.get("error").and_then(serde_json::Value::as_str)?;
+        if !DUPLICATE_CANCEL_ERRORS.contains(&message) {
+            return None;
+        }
+        error
+            .get(DUPLICATE_CANCEL_MASK_KEY)
+            .and_then(serde_json::Value::as_str)
+    }) {
+        if unique_key.is_none() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        return Ok(Some(original.to_string()));
+    }
+    let legacy_keyless_duplicate = unique_key.is_none()
+        && unique_states.is_none()
+        && errors.last().is_some_and(|error| {
+            error.get("terminal") == Some(&serde_json::Value::Bool(true))
+                && error
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| LEGACY_KEYLESS_DUPLICATE_ERRORS.contains(&message))
+        });
+    if legacy_keyless_duplicate {
+        return Err(AwaError::UniqueConflict {
+            constraint: Some("idx_awa_jobs_unique".to_string()),
+        });
+    }
+    Ok(unique_states)
+}
+
+/// `entry` without the duplicate cancellation mask key, which only awa
+/// records.
+pub(crate) fn without_duplicate_mask(entry: &serde_json::Value) -> serde_json::Value {
+    let mut entry = entry.clone();
+    if let Some(object) = entry.as_object_mut() {
+        object.remove(DUPLICATE_CANCEL_MASK_KEY);
+    }
+    entry
+}
+
+/// A caller-supplied error entry as stored on a failed job, with the
+/// attempt, time and terminal flag filled in when absent. The duplicate
+/// cancellation mask key is dropped: only awa records it.
+fn caller_error_entry(error_entry: serde_json::Value, attempt: i16) -> serde_json::Value {
+    let mut error_obj = match error_entry {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("error".to_string(), other);
+            map
+        }
+    };
+    error_obj.remove(DUPLICATE_CANCEL_MASK_KEY);
+    error_obj
+        .entry("attempt".to_string())
+        .or_insert_with(|| serde_json::Value::from(i64::from(attempt)));
+    error_obj
+        .entry("at".to_string())
+        .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
+    error_obj
+        .entry("terminal".to_string())
+        .or_insert(serde_json::Value::Bool(true));
+    serde_json::Value::Object(error_obj)
+}
+
+/// Clear `cancelled` from `done`'s mask and record the original mask in its
+/// last error entry, the duplicate cancellation.
+fn clear_cancelled_claim(done: &mut DoneJobRow) -> Result<(), AwaError> {
+    let Some(original) = done.unique_states.clone() else {
+        return Ok(());
+    };
+    let mut payload = RuntimePayload::from_json(done.payload.clone())?;
+    if let Some(entry) = payload.errors.last_mut() {
+        entry[DUPLICATE_CANCEL_MASK_KEY] = serde_json::Value::String(original.clone());
+    }
+    done.payload = payload.into_json();
+    done.unique_states = unique_states_without(Some(original), JobState::Cancelled);
+    Ok(())
+}
+
+/// `unique_states` with `state`'s bit cleared.
+fn unique_states_without(unique_states: Option<String>, state: JobState) -> Option<String> {
+    let mut bitmask = unique_states?.into_bytes();
+    if let Some(bit) = bitmask.get_mut(state.bit_position() as usize) {
+        *bit = b'0';
+    }
+    String::from_utf8(bitmask).ok()
+}
+
+/// A change to one job's row in `awa.job_unique_claims`: `(key, claim,
+/// job_id)`, where `claim` takes the key for the job and otherwise releases
+/// it. The tuple order is the order every transaction applies changes in:
+/// unique key bytewise, a key's releases before its claims, then job ID.
+type UniqueClaimChange<'k> = (&'k [u8], bool, i64);
+
+/// The claim change a job moving from `old_state` to `new_state` makes, if
+/// any. `None` is a state outside job storage.
+fn unique_claim_change<'k>(
+    job_id: i64,
+    unique_key: Option<&'k [u8]>,
+    unique_states: Option<&str>,
+    old_state: Option<JobState>,
+    new_state: Option<JobState>,
+) -> Option<UniqueClaimChange<'k>> {
+    let key = unique_key?;
+    let old_claim = old_state.is_some_and(|state| unique_state_claims(unique_states, state));
+    let new_claim = new_state.is_some_and(|state| unique_state_claims(unique_states, state));
+    // A terminal row's mask can name its state while another job holds the
+    // key, as for a cancelled duplicate, so reviving it re-checks ownership
+    // through the claim upsert.
+    let recheck = new_claim
+        && old_state.is_some_and(|state| state.is_terminal())
+        && !new_state.is_some_and(|state| state.is_terminal());
+    (old_claim != new_claim || recheck).then_some((key, new_claim, job_id))
+}
+
+/// The claim changes writing `rows` as done rows makes.
+fn done_claim_changes(
+    rows: &[DoneJobRow],
+    old_state: Option<JobState>,
+) -> impl Iterator<Item = UniqueClaimChange<'_>> {
+    rows.iter().filter_map(move |row| {
+        unique_claim_change(
+            row.job_id,
+            row.unique_key.as_deref(),
+            row.unique_states.as_deref(),
+            old_state,
+            Some(row.state),
+        )
+    })
+}
+
+/// The claim change writing `row` as a done row makes, owning its key.
+fn owned_done_claim_change(
+    row: &DoneJobRow,
+    old_state: Option<JobState>,
+) -> Option<(Vec<u8>, bool, i64)> {
+    done_claim_changes(std::slice::from_ref(row), old_state)
+        .next()
+        .map(|(key, claim, job_id)| (key.to_vec(), claim, job_id))
+}
+
+/// The claim changes writing `rows` as DLQ rows makes. A DLQ row holds its
+/// claim as `failed`.
+fn dlq_claim_changes(
+    rows: &[DlqJobRow],
+    old_state: Option<JobState>,
+) -> impl Iterator<Item = UniqueClaimChange<'_>> {
+    rows.iter().filter_map(move |row| {
+        unique_claim_change(
+            row.job_id,
+            row.unique_key.as_deref(),
+            row.unique_states.as_deref(),
+            old_state,
+            Some(JobState::Failed),
+        )
+    })
+}
+
+/// The claim changes writing `rows` as deferred rows makes.
+fn deferred_claim_changes(
+    rows: &[DeferredJobRow],
+    old_state: Option<JobState>,
+) -> impl Iterator<Item = UniqueClaimChange<'_>> {
+    rows.iter().filter_map(move |row| {
+        unique_claim_change(
+            row.job_id,
+            row.unique_key.as_deref(),
+            row.unique_states.as_deref(),
+            old_state,
+            Some(row.state),
+        )
+    })
+}
+
 /// The unique claims enqueuing `rows` takes.
 fn deferred_enqueue_claims(rows: &[DeferredJobRow]) -> Vec<(Vec<u8>, i64)> {
     rows.iter()
@@ -2360,6 +2574,9 @@ type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
 struct CancelJobTxResult {
     row: JobRow,
+    /// The cancellation's claim change, for the caller to apply with the
+    /// rest of its transaction's.
+    claim_change: Option<(Vec<u8>, bool, i64)>,
     claim_cursor_advance: Option<ClaimCursorAdvance>,
     /// Shard-0 lane of a cancelled deferred job, to be ensured after the
     /// transaction's unique claims change.
@@ -3674,20 +3891,94 @@ impl QueueStorage {
         .into_json())
     }
 
-    async fn sync_unique_claim<'a>(
+    /// Apply `changes` to `awa.job_unique_claims` in one pass, in
+    /// [`UniqueClaimChange`] order. A run of consecutive releases goes in one
+    /// statement, and so does a run of consecutive claims. Each transaction
+    /// changes its claims in a single such pass, before it reserves any lane.
+    /// Returns the job IDs whose key another job holds; without
+    /// `skip_conflicts` any such job is an error.
+    async fn apply_unique_claim_changes_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        job_id: i64,
-        unique_key: &Option<Vec<u8>>,
-        unique_states: Option<&str>,
-        old_state: Option<JobState>,
-        new_state: Option<JobState>,
-    ) -> Result<(), AwaError> {
-        let old_claim = old_state.is_some_and(|state| unique_state_claims(unique_states, state));
-        let new_claim = new_state.is_some_and(|state| unique_state_claims(unique_states, state));
+        mut changes: Vec<UniqueClaimChange<'_>>,
+        skip_conflicts: bool,
+    ) -> Result<HashSet<i64>, AwaError> {
+        let mut conflicts = HashSet::new();
+        if changes.is_empty() {
+            return Ok(conflicts);
+        }
+        changes.sort_unstable();
+        changes.dedup();
 
-        if old_claim && !new_claim {
-            if let Some(key) = unique_key {
+        let contested: Vec<&[u8]> = changes
+            .windows(2)
+            .filter(|pair| pair[0].1 && pair[1].1 && pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+            .collect();
+        let owners: HashMap<Vec<u8>, i64> = if contested.is_empty() {
+            HashMap::new()
+        } else {
+            sqlx::query_as::<_, (Vec<u8>, i64)>(
+                "SELECT unique_key, job_id FROM awa.job_unique_claims WHERE unique_key = ANY($1)",
+            )
+            .bind(&contested)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .collect()
+        };
+        // Among jobs claiming the same key, the one that owns it wins;
+        // otherwise the lowest job ID does.
+        let mut winners: HashMap<&[u8], i64> = HashMap::new();
+        for (key, claim, job_id) in &changes {
+            if !*claim {
+                continue;
+            }
+            let winner = winners.entry(*key).or_insert(*job_id);
+            if owners.get(*key) == Some(job_id) {
+                *winner = *job_id;
+            }
+        }
+
+        let mut claiming: Vec<(&[u8], i64)> = Vec::new();
+        let mut releasing: Vec<(&[u8], i64)> = Vec::new();
+        for (key, claim, job_id) in changes {
+            if claim {
+                if winners.get(key) == Some(&job_id) {
+                    self.release_unique_keys_tx(tx, &mut releasing).await?;
+                    claiming.push((key, job_id));
+                } else {
+                    conflicts.insert(job_id);
+                }
+            } else {
+                self.claim_unique_keys_tx(tx, &mut claiming, &mut conflicts)
+                    .await?;
+                releasing.push((key, job_id));
+            }
+        }
+        self.claim_unique_keys_tx(tx, &mut claiming, &mut conflicts)
+            .await?;
+        self.release_unique_keys_tx(tx, &mut releasing).await?;
+
+        if !skip_conflicts && !conflicts.is_empty() {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+        Ok(conflicts)
+    }
+
+    /// Release the `pending` claims each job holds, locking them in the given
+    /// order, and clear `pending`.
+    async fn release_unique_keys_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        pending: &mut Vec<(&[u8], i64)>,
+    ) -> Result<(), AwaError> {
+        match pending.as_slice() {
+            [] => return Ok(()),
+            [(key, job_id)] => {
                 sqlx::query(
                     "DELETE FROM awa.job_unique_claims WHERE unique_key = $1 AND job_id = $2",
                 )
@@ -3697,33 +3988,35 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
             }
-        }
-
-        if new_claim && !old_claim {
-            if let Some(key) = unique_key {
-                let result = sqlx::query(
+            _ => {
+                let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = pending.iter().copied().unzip();
+                // The locking clause applies after ORDER BY, so the CTE locks
+                // the rows in key order; the DELETE only reaches rows the CTE
+                // has already locked.
+                sqlx::query(
                     r#"
-                    INSERT INTO awa.job_unique_claims (unique_key, job_id)
-                    VALUES ($1, $2)
-                    ON CONFLICT (unique_key)
-                    DO UPDATE SET job_id = EXCLUDED.job_id
-                    WHERE awa.job_unique_claims.job_id = EXCLUDED.job_id
+                    WITH released AS MATERIALIZED (
+                        SELECT claims.unique_key
+                        FROM unnest($1::bytea[], $2::bigint[]) AS input(unique_key, job_id)
+                        JOIN awa.job_unique_claims AS claims
+                          ON claims.unique_key = input.unique_key
+                         AND claims.job_id = input.job_id
+                        ORDER BY claims.unique_key
+                        FOR UPDATE OF claims
+                    )
+                    DELETE FROM awa.job_unique_claims AS claims
+                    USING released
+                    WHERE claims.unique_key = released.unique_key
                     "#,
                 )
-                .bind(key)
-                .bind(job_id)
+                .bind(&keys)
+                .bind(&job_ids)
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-
-                if result.rows_affected() == 0 {
-                    return Err(AwaError::UniqueConflict {
-                        constraint: Some("idx_awa_jobs_unique".to_string()),
-                    });
-                }
             }
         }
-
+        pending.clear();
         Ok(())
     }
 
@@ -3781,7 +4074,8 @@ impl QueueStorage {
 
     // Enqueue inserts have no prior storage state, so uniqueness only needs to
     // add claims for states included in the row's unique-state bitmask. State
-    // transitions still use `sync_unique_claim`, which can release old claims.
+    // transitions use `apply_unique_claim_changes_tx`, which can release old
+    // claims.
     // `deferred_claims` are claimed in the same key-ordered statement, for a
     // batch whose deferred rows are written after its ready rows.
     async fn sync_ready_enqueue_unique_claims<'a>(
@@ -5545,95 +5839,28 @@ impl QueueStorage {
         Ok((ready_rows.len(), skipped))
     }
 
-    /// Sync the unique claims of rows moving to `available`, ordered by
-    /// unique key, releases of a key before claims of it, then job ID.
-    /// Consecutive claims go in one statement. Returns the job IDs whose key
-    /// another job holds; without `skip_conflicts` any such row is an error.
+    /// Sync the unique claims of rows moving to `available` through
+    /// [`Self::apply_unique_claim_changes_tx`].
     async fn sync_reenqueue_unique_claims<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: &[(ExistingReadyRow, Option<JobState>)],
         skip_conflicts: bool,
     ) -> Result<HashSet<i64>, AwaError> {
-        let mut changes: Vec<(&[u8], bool, i64)> = rows
+        let changes = rows
             .iter()
             .filter_map(|(row, old_state)| {
-                let key = row.unique_key.as_deref()?;
-                let states = row.unique_states.as_deref();
-                let old_claim = old_state.is_some_and(|state| unique_state_claims(states, state));
-                let new_claim = unique_state_claims(states, JobState::Available);
-                // A terminal row's mask can name its state while another job
-                // holds the key, as for a cancelled duplicate, so reviving it
-                // re-checks ownership through the claim upsert.
-                let recheck = new_claim && old_state.is_some_and(|state| state.is_terminal());
-                (old_claim != new_claim || recheck).then_some((key, new_claim, row.job_id))
+                unique_claim_change(
+                    row.job_id,
+                    row.unique_key.as_deref(),
+                    row.unique_states.as_deref(),
+                    *old_state,
+                    Some(JobState::Available),
+                )
             })
             .collect();
-        let mut conflicts = HashSet::new();
-        if changes.is_empty() {
-            return Ok(conflicts);
-        }
-        changes.sort_unstable();
-
-        let contested: Vec<&[u8]> = changes
-            .windows(2)
-            .filter(|pair| pair[0].1 && pair[1].1 && pair[0].0 == pair[1].0)
-            .map(|pair| pair[0].0)
-            .collect();
-        let owners: HashMap<Vec<u8>, i64> = if contested.is_empty() {
-            HashMap::new()
-        } else {
-            sqlx::query_as::<_, (Vec<u8>, i64)>(
-                "SELECT unique_key, job_id FROM awa.job_unique_claims WHERE unique_key = ANY($1)",
-            )
-            .bind(&contested)
-            .fetch_all(tx.as_mut())
+        self.apply_unique_claim_changes_tx(tx, changes, skip_conflicts)
             .await
-            .map_err(map_sqlx_error)?
-            .into_iter()
-            .collect()
-        };
-        // Among rows claiming the same key, the one that owns it wins;
-        // otherwise the lowest job ID does.
-        let mut winners: HashMap<&[u8], i64> = HashMap::new();
-        for (key, claim, job_id) in &changes {
-            if !*claim {
-                continue;
-            }
-            let winner = winners.entry(*key).or_insert(*job_id);
-            if owners.get(*key) == Some(job_id) {
-                *winner = *job_id;
-            }
-        }
-
-        let mut pending: Vec<(&[u8], i64)> = Vec::new();
-        for (key, claim, job_id) in changes {
-            if claim {
-                if winners.get(key) == Some(&job_id) {
-                    pending.push((key, job_id));
-                } else {
-                    conflicts.insert(job_id);
-                }
-                continue;
-            }
-            self.claim_unique_keys_tx(tx, &mut pending, &mut conflicts)
-                .await?;
-            sqlx::query("DELETE FROM awa.job_unique_claims WHERE unique_key = $1 AND job_id = $2")
-                .bind(key)
-                .bind(job_id)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-        }
-        self.claim_unique_keys_tx(tx, &mut pending, &mut conflicts)
-            .await?;
-
-        if !skip_conflicts && !conflicts.is_empty() {
-            return Err(AwaError::UniqueConflict {
-                constraint: Some("idx_awa_jobs_unique".to_string()),
-            });
-        }
-        Ok(conflicts)
     }
 
     /// Claim distinct `pending` keys in the given order, adding the job IDs
@@ -5688,17 +5915,9 @@ impl QueueStorage {
         if old_state.is_none() {
             self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
         } else {
-            for row in &rows {
-                self.sync_unique_claim(
-                    tx,
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    old_state,
-                    Some(row.state),
-                )
+            let changes = deferred_claim_changes(&rows, old_state).collect();
+            self.apply_unique_claim_changes_tx(tx, changes, false)
                 .await?;
-            }
         }
 
         self.write_deferred_rows_tx(tx, &rows).await
@@ -5807,17 +6026,21 @@ impl QueueStorage {
         if rows.is_empty() {
             return Ok(0);
         }
-
-        for row in rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                old_state,
-                Some(row.state),
-            )
+        let changes = done_claim_changes(rows, old_state).collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
             .await?;
+        self.write_done_rows_tx(tx, rows, old_state).await
+    }
+
+    /// Write `rows` into `done_entries` without touching unique claims.
+    async fn write_done_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DoneJobRow],
+        old_state: Option<JobState>,
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
         }
 
         let schema = self.schema();
@@ -6262,17 +6485,20 @@ impl QueueStorage {
         if rows.is_empty() {
             return Ok(0);
         }
-
-        for row in rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                old_state,
-                Some(JobState::Failed),
-            )
+        let changes = dlq_claim_changes(rows, old_state).collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
             .await?;
+        self.write_dlq_rows_tx(tx, rows).await
+    }
+
+    /// Write `rows` into `dlq_entries` without touching unique claims.
+    async fn write_dlq_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DlqJobRow],
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
         }
 
         let schema = self.schema();
@@ -6819,17 +7045,20 @@ impl QueueStorage {
                 .await?,
         );
 
-        for row in &claimed {
-            self.sync_unique_claim(
-                &mut tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                Some(JobState::Available),
-                Some(JobState::Running),
-            )
+        let changes = claimed
+            .iter()
+            .filter_map(|row| {
+                unique_claim_change(
+                    row.job_id,
+                    row.unique_key.as_deref(),
+                    row.unique_states.as_deref(),
+                    Some(JobState::Available),
+                    Some(JobState::Running),
+                )
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(&mut tx, changes, false)
             .await?;
-        }
 
         let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
         if !use_lease_claim_receipts && deadline_duration.is_zero() {
@@ -7973,6 +8202,9 @@ impl QueueStorage {
                 .cloned()
                 .partition(|entry| entry.claim.lease_claim_receipt);
             let mut updated_all = Vec::new();
+            // Both groups' done rows are written together, so their unique
+            // claims change in one key-ordered pass.
+            let mut done_rows = Vec::new();
 
             if !receipt_claimed.is_empty() {
                 let receipt_pairs: Vec<(i64, i64)> = receipt_claimed
@@ -8197,16 +8429,12 @@ impl QueueStorage {
 
                 if !updated.is_empty() {
                     let finalized_at = Utc::now();
-                    let mut done_rows = Vec::with_capacity(updated.len());
                     for (job_id, run_lease) in &updated {
                         if let Some(runtime_job) = claimed_map.get(&(*job_id, *run_lease)).cloned()
                         {
                             done_rows.push(runtime_job.into_done_row(finalized_at)?);
                         }
                     }
-
-                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
-                        .await?;
                     updated_all.extend(updated);
                 }
 
@@ -8341,7 +8569,6 @@ impl QueueStorage {
                         .await?;
 
                     let finalized_at = Utc::now();
-                    let mut done_rows = Vec::with_capacity(deleted.len());
                     for deleted_row in deleted {
                         if let Some(runtime_job) = claimed_map
                             .get(&(deleted_row.job_id, deleted_row.run_lease))
@@ -8351,12 +8578,11 @@ impl QueueStorage {
                             updated_all.push((deleted_row.job_id, deleted_row.run_lease));
                         }
                     }
-
-                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
-                        .await?;
                 }
             }
 
+            self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
+                .await?;
             return Ok(updated_all);
         }
 
@@ -9097,8 +9323,13 @@ impl QueueStorage {
                 run_at: Utc::now(),
                 attempted_at: None,
                 created_at: terminal.created_at,
+                unique_states: revived_unique_states(
+                    terminal.state,
+                    terminal.unique_key.as_deref(),
+                    terminal.unique_states,
+                    &terminal.payload,
+                )?,
                 unique_key: terminal.unique_key,
-                unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
             return Ok(Some((ready_row, terminal.state)));
@@ -9629,7 +9860,8 @@ impl QueueStorage {
             let done = lease
                 .clone()
                 .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
-            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
+            let claim_change = owned_done_claim_change(&done, Some(lease.state));
+            self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
                 .await?;
             // Receipt-plane consistency: close any matching open
             // receipt so the ADR-023 anti-join no longer considers this
@@ -9641,6 +9873,7 @@ impl QueueStorage {
                 .await?;
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
+                claim_change,
                 claim_cursor_advance: None,
                 lane: None,
             }));
@@ -9649,6 +9882,8 @@ impl QueueStorage {
         Ok(None)
     }
 
+    /// Cancel `job_id`, leaving its unique-claim change in the result for the
+    /// caller to apply.
     async fn cancel_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -9679,7 +9914,8 @@ impl QueueStorage {
                         )?;
                         let done =
                             lease.into_done_row(JobState::Cancelled, Utc::now(), done_payload);
-                        self.insert_done_rows_tx(
+                        let claim_change = owned_done_claim_change(&done, Some(JobState::Running));
+                        self.write_done_rows_tx(
                             tx,
                             std::slice::from_ref(&done),
                             Some(JobState::Running),
@@ -9696,6 +9932,7 @@ impl QueueStorage {
                         self.notify_cancellation_tx(tx, job_id, run_lease).await?;
                         return Ok(Some(CancelJobTxResult {
                             row: done.into_job_row()?,
+                            claim_change,
                             claim_cursor_advance: None,
                             lane: None,
                         }));
@@ -9773,7 +10010,8 @@ impl QueueStorage {
                 ready
                     .clone()
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
-            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
+            let claim_change = owned_done_claim_change(&done, Some(JobState::Available));
+            self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
             // If the cancelled lane was *exactly* at the claim head,
             // advance the head past it so the derived cursor-difference count
@@ -9793,6 +10031,7 @@ impl QueueStorage {
             };
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
+                claim_change,
                 claim_cursor_advance: Some(claim_cursor_advance),
                 lane: None,
             }));
@@ -9859,10 +10098,12 @@ impl QueueStorage {
                 unique_states: deferred.unique_states,
                 payload: deferred.payload,
             };
-            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
+            let claim_change = owned_done_claim_change(&done, Some(deferred.state));
+            self.write_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
                 .await?;
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,
+                claim_change,
                 claim_cursor_advance: None,
                 lane: Some(lane),
             }));
@@ -9874,6 +10115,8 @@ impl QueueStorage {
     pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let result = self.cancel_job_tx(&mut tx, job_id).await?;
+        self.apply_cancel_claim_changes_tx(&mut tx, result.as_slice())
+            .await?;
         if let Some((queue, priority)) = result.as_ref().and_then(|result| result.lane.as_ref()) {
             self.ensure_lane(&mut tx, queue, *priority, 0).await?;
         }
@@ -9889,6 +10132,22 @@ impl QueueStorage {
         }
     }
 
+    /// Apply the claim changes of `results` in one key-ordered pass.
+    async fn apply_cancel_claim_changes_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        results: &[CancelJobTxResult],
+    ) -> Result<(), AwaError> {
+        let changes = results
+            .iter()
+            .filter_map(|result| result.claim_change.as_ref())
+            .map(|(key, claim, job_id)| (key.as_slice(), *claim, *job_id))
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        Ok(())
+    }
+
     /// Transaction-scoped cancel used by [`crate::admin::cancel_tx`]. Runs the
     /// full cancellation on the caller's transaction and returns the cancelled
     /// row. Unlike [`Self::cancel_job`] this does NOT perform the post-commit
@@ -9902,6 +10161,8 @@ impl QueueStorage {
         let Some(result) = self.cancel_job_tx(tx, job_id).await? else {
             return Ok(None);
         };
+        self.apply_cancel_claim_changes_tx(tx, std::slice::from_ref(&result))
+            .await?;
         if let Some((queue, priority)) = &result.lane {
             self.ensure_lane(tx, queue, *priority, 0).await?;
         }
@@ -9931,17 +10192,21 @@ impl QueueStorage {
             self.lock_receipt_attempt_keys_tx(&mut tx, &attempts)
                 .await?;
         }
-        let mut rows = Vec::with_capacity(ids.len());
+        let mut results = Vec::with_capacity(ids.len());
+        for job_id in ids {
+            results.extend(self.cancel_job_tx(&mut tx, *job_id).await?);
+        }
+        self.apply_cancel_claim_changes_tx(&mut tx, &results)
+            .await?;
+        let mut rows = Vec::with_capacity(results.len());
         let mut claim_cursor_advances = Vec::new();
         let mut lanes = BTreeSet::new();
-        for job_id in ids {
-            if let Some(result) = self.cancel_job_tx(&mut tx, *job_id).await? {
-                if let Some(advance) = result.claim_cursor_advance {
-                    claim_cursor_advances.push(advance);
-                }
-                lanes.extend(result.lane);
-                rows.push(result.row);
+        for result in results {
+            if let Some(advance) = result.claim_cursor_advance {
+                claim_cursor_advances.push(advance);
             }
+            lanes.extend(result.lane);
+            rows.push(result.row);
         }
         for (queue, priority) in &lanes {
             self.ensure_lane(&mut tx, queue, *priority, 0).await?;
@@ -10145,8 +10410,14 @@ impl QueueStorage {
             };
             by_state.entry(deferred.state).or_default().push(done);
         }
-        for (old_state, rows) in by_state {
-            self.insert_done_rows_tx(tx, &rows, Some(old_state)).await?;
+        let changes = by_state
+            .iter()
+            .flat_map(|(old_state, rows)| done_claim_changes(rows, Some(*old_state)))
+            .collect();
+        self.apply_unique_claim_changes_tx(tx, changes, false)
+            .await?;
+        for (old_state, rows) in &by_state {
+            self.write_done_rows_tx(tx, rows, Some(*old_state)).await?;
         }
         for (queue, priority) in &lanes {
             self.ensure_lane(tx, queue, *priority, 0).await?;
@@ -15735,23 +16006,7 @@ impl QueueStorage {
             moved.payload.clone(),
             moved.progress.clone(),
         )?)?;
-        let mut error_entry = match error_entry {
-            serde_json::Value::Object(map) => serde_json::Value::Object(map),
-            other => serde_json::json!({ "error": other }),
-        };
-        let error_obj = error_entry
-            .as_object_mut()
-            .ok_or_else(|| AwaError::Validation("callback error entry must be an object".into()))?;
-        error_obj
-            .entry("attempt".to_string())
-            .or_insert_with(|| serde_json::Value::from(i64::from(moved.attempt)));
-        error_obj
-            .entry("at".to_string())
-            .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
-        error_obj
-            .entry("terminal".to_string())
-            .or_insert(serde_json::Value::Bool(true));
-        payload.push_error(error_entry);
+        payload.push_error(caller_error_entry(error_entry, moved.attempt));
         let done_row =
             moved
                 .clone()
@@ -16392,11 +16647,8 @@ impl QueueStorage {
 
         if !claimed {
             // If `cancelled` itself claims uniqueness, the newer holder still
-            // wins. The cancelled evidence carries no claim to release, so
-            // strip the uniqueness fields exactly like rescue duplicate
-            // cancellation.
-            done.unique_key = None;
-            done.unique_states = None;
+            // wins. The row keeps its key, so a retry re-checks ownership.
+            clear_cancelled_claim(&mut done)?;
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
                 .await?;
         }
@@ -16408,41 +16660,48 @@ impl QueueStorage {
     /// deadline or callback timeout): back to `retryable` with backoff while
     /// attempts remain, `failed` once the rescued attempt was the last. A job
     /// that kills or hangs its worker every time therefore stops after
-    /// `max_attempts`, like one whose handler returns an error.
+    /// `max_attempts`, like one whose handler returns an error. Each batch
+    /// pairs rescued attempts with the error recorded on them.
     ///
     /// An exhausted attempt on a queue whose DLQ is enabled goes straight to
     /// `dlq_entries` in this transaction, as `fail_to_dlq` does for a handler
     /// error, so there is no window in which it sits `failed` outside the DLQ.
     ///
-    /// Each outcome is written in one statement per previous state. If that
-    /// statement hits a unique-claim conflict, the group is retried row by
-    /// row so only the conflicting attempts become cancellations.
+    /// Every batch's unique claims change in one key-ordered pass. An attempt
+    /// whose outcome claims a key a newer duplicate holds is cancelled
+    /// instead: the claim holder wins, and one poisoned row must not abort
+    /// the whole rescue transaction.
     async fn settle_rescued_attempts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        rows: Vec<LeaseTransitionRow>,
-        error: &str,
+        batches: Vec<(Vec<LeaseTransitionRow>, &str)>,
         dlq: RescueDlq<'_>,
     ) -> Result<Vec<JobRow>, AwaError> {
+        let rows: Vec<(LeaseTransitionRow, &str)> = batches
+            .into_iter()
+            .flat_map(|(rows, error)| rows.into_iter().map(move |row| (row, error)))
+            .collect();
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
         let (retry_attempts, retry_max_attempts): (Vec<i16>, Vec<i16>) = rows
             .iter()
-            .filter(|row| row.attempt < row.max_attempts)
-            .map(|row| (row.attempt, row.max_attempts))
+            .filter(|(row, _)| row.attempt < row.max_attempts)
+            .map(|(row, _)| (row.attempt, row.max_attempts))
             .unzip();
         let mut retry_run_ats = self
             .backoffs_at_tx(tx, &retry_attempts, &retry_max_attempts)
             .await?
             .into_iter();
 
-        let finalized_at = Utc::now();
+        // PostgreSQL keeps microseconds, so the rows returned match the rows
+        // committed.
+        let finalized_at = Utc::now().trunc_subsecs(6);
         let mut retries: Vec<(LeaseTransitionRow, DeferredJobRow)> = Vec::new();
         let mut failures: Vec<(LeaseTransitionRow, DoneJobRow)> = Vec::new();
         let mut dead_letters: Vec<(LeaseTransitionRow, DlqJobRow)> = Vec::new();
-        for row in rows {
+        for (row, error) in rows {
             let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
                 row.payload.clone(),
                 row.progress.clone(),
@@ -16476,95 +16735,114 @@ impl QueueStorage {
             }
         }
 
+        let mut changes = Vec::new();
+        for (row, deferred) in &retries {
+            changes.extend(deferred_claim_changes(
+                std::slice::from_ref(deferred),
+                Some(row.state),
+            ));
+        }
+        for (row, done) in &failures {
+            changes.extend(done_claim_changes(
+                std::slice::from_ref(done),
+                Some(row.state),
+            ));
+        }
+        for (row, dead_letter) in &dead_letters {
+            changes.extend(dlq_claim_changes(
+                std::slice::from_ref(dead_letter),
+                Some(row.state),
+            ));
+        }
+        let conflicts = self
+            .apply_unique_claim_changes_tx(tx, changes, true)
+            .await?;
+
         let mut settled = Vec::with_capacity(retries.len() + failures.len() + dead_letters.len());
-        for (old_state, group) in group_by_previous_state(retries) {
-            let deferred: Vec<DeferredJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_deferred_rows_tx(&mut savepoint, deferred, Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    for (_, deferred) in group {
-                        settled.push(deferred.into_job_row()?);
-                    }
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                    for (row, deferred) in group {
-                        settled.push(
-                            self.insert_rescued_deferred_or_cancel_tx(
-                                tx,
-                                row,
-                                deferred,
-                                RESCUED_DUPLICATE_ERROR,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-                Err(err) => return Err(err),
+        let mut duplicates: Vec<(LeaseTransitionRow, (DoneJobRow, bool))> = Vec::new();
+        let mut duplicate = |row: LeaseTransitionRow, payload: serde_json::Value| {
+            let attempt = row.attempt;
+            let mut payload = RuntimePayload::from_json(payload)?;
+            payload.push_error(lifecycle_error(RESCUED_DUPLICATE_ERROR, attempt, true));
+            let mut done =
+                row.clone()
+                    .into_done_row(JobState::Cancelled, finalized_at, payload.into_json());
+            // The attempt held no claim, since its outcome's claim conflicted.
+            // A mask that claims `cancelled` would conflict again, so the
+            // row is written with `cancelled` cleared from its mask and the
+            // original mask recorded in its error entry. It keeps its unique
+            // key, so a later retry restores the mask and re-checks
+            // ownership.
+            let cleared = unique_state_claims(done.unique_states.as_deref(), JobState::Cancelled);
+            if cleared {
+                clear_cancelled_claim(&mut done)?;
+            }
+            duplicates.push((row, (done, cleared)));
+            Ok::<_, AwaError>(())
+        };
+        let mut kept_retries = Vec::with_capacity(retries.len());
+        for (row, deferred) in retries {
+            if conflicts.contains(&row.job_id) {
+                duplicate(row, deferred.payload)?;
+            } else {
+                kept_retries.push((row, deferred));
             }
         }
-        for (old_state, group) in group_by_previous_state(failures) {
-            let done: Vec<DoneJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_done_rows_tx(&mut savepoint, &done, Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    for done in done {
-                        settled.push(done.into_job_row()?);
-                    }
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                    for (row, done) in group {
-                        settled.push(
-                            self.insert_rescued_done_or_cancel_tx(
-                                tx,
-                                row,
-                                done,
-                                RESCUED_DUPLICATE_ERROR,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-                Err(err) => return Err(err),
+        let mut kept_failures = Vec::with_capacity(failures.len());
+        for (row, done) in failures {
+            if conflicts.contains(&row.job_id) {
+                duplicate(row, done.payload)?;
+            } else {
+                kept_failures.push((row, done));
             }
         }
-        for (old_state, group) in group_by_previous_state(dead_letters) {
-            let dead_letters: Vec<DlqJobRow> = group.iter().map(|(_, row)| row.clone()).collect();
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_dlq_rows_tx(&mut savepoint, &dead_letters, Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    for dead_letter in dead_letters {
-                        settled.push(dead_letter.into_job_row()?);
-                    }
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                    for (row, dead_letter) in group {
-                        settled.push(
-                            self.insert_rescued_dlq_or_cancel_tx(
-                                tx,
-                                row,
-                                dead_letter,
-                                RESCUED_DUPLICATE_ERROR,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-                Err(err) => return Err(err),
+        let mut kept_dead_letters = Vec::with_capacity(dead_letters.len());
+        for (row, dead_letter) in dead_letters {
+            if conflicts.contains(&row.job_id) {
+                duplicate(row, dead_letter.payload)?;
+            } else {
+                kept_dead_letters.push((row, dead_letter));
+            }
+        }
+
+        let deferred: Vec<DeferredJobRow> = kept_retries
+            .into_iter()
+            .map(|(_, deferred)| deferred)
+            .collect();
+        self.write_deferred_rows_tx(tx, &deferred).await?;
+        for deferred in deferred {
+            settled.push(deferred.into_job_row()?);
+        }
+        for (old_state, group) in group_by_previous_state(kept_failures) {
+            let done: Vec<DoneJobRow> = group.into_iter().map(|(_, done)| done).collect();
+            self.write_done_rows_tx(tx, &done, Some(old_state)).await?;
+            for done in done {
+                settled.push(done.into_job_row()?);
+            }
+        }
+        let dead_letters: Vec<DlqJobRow> = kept_dead_letters
+            .into_iter()
+            .map(|(_, dead_letter)| dead_letter)
+            .collect();
+        self.write_dlq_rows_tx(tx, &dead_letters).await?;
+        for dead_letter in dead_letters {
+            settled.push(dead_letter.into_job_row()?);
+        }
+        // A ready-backed done row takes its unique key and mask from the
+        // retained ready row, so a duplicate whose mask was cleared is
+        // written self-contained, as a rescheduled duplicate is, and stores
+        // the mask it reports.
+        for (old_state, group) in group_by_previous_state(duplicates) {
+            let (cleared, kept): (Vec<_>, Vec<_>) = group
+                .into_iter()
+                .map(|(_, done)| done)
+                .partition(|(_, cleared)| *cleared);
+            let kept: Vec<DoneJobRow> = kept.into_iter().map(|(done, _)| done).collect();
+            let cleared: Vec<DoneJobRow> = cleared.into_iter().map(|(done, _)| done).collect();
+            self.write_done_rows_tx(tx, &kept, Some(old_state)).await?;
+            self.write_done_rows_tx(tx, &cleared, None).await?;
+            for done in kept.into_iter().chain(cleared) {
+                settled.push(done.into_job_row()?);
             }
         }
         Ok(settled)
@@ -16594,146 +16872,6 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
-    }
-
-    /// Rescue-path fallback for unique-claim conflicts: insert the rescued
-    /// attempt's deferred successor, degrading to a cancelled terminal row
-    /// when the job's unique claim is held by a newer duplicate — the claim
-    /// holder wins, and one poisoned row must not abort the whole batched
-    /// rescue transaction. The insert attempt runs inside a savepoint so the
-    /// conflict leaves the outer transaction usable.
-    async fn insert_rescued_deferred_or_cancel_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        deferred: DeferredJobRow,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_deferred_rows_tx(&mut savepoint, vec![deferred.clone()], Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return deferred.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        self.cancel_rescued_duplicate_tx(tx, row, deferred.payload, duplicate_error)
-            .await
-    }
-
-    /// Same fallback for rescue arms that write a terminal row directly
-    /// (callback timeout at max attempts): a `failed` insert that conflicts
-    /// with a newer duplicate's claim becomes a cancellation instead.
-    async fn insert_rescued_done_or_cancel_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        done: DoneJobRow,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return done.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        self.cancel_rescued_duplicate_tx(tx, row, done.payload, duplicate_error)
-            .await
-    }
-
-    /// The DLQ counterpart of [`Self::insert_rescued_done_or_cancel_tx`]: a
-    /// DLQ row holds its unique claim as `failed`, so it conflicts with a
-    /// newer duplicate exactly when the `failed` terminal row would.
-    async fn insert_rescued_dlq_or_cancel_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        dlq: DlqJobRow,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_dlq_rows_tx(&mut savepoint, std::slice::from_ref(&dlq), Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return dlq.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        self.cancel_rescued_duplicate_tx(tx, row, dlq.payload, duplicate_error)
-            .await
-    }
-
-    /// Write the cancelled terminal row for a rescue that lost its unique
-    /// claim to a newer duplicate. `cancelled` normally sits outside the
-    /// claiming mask so the insert is conflict-free; a mask that claims
-    /// `cancelled` as well conflicts again, and then the row is written with
-    /// its unique key stripped — the attempt held no claim (that is what
-    /// made it conflict), so there is nothing to release, and losing the key
-    /// on this terminal row beats aborting rescue for the whole cluster.
-    async fn cancel_rescued_duplicate_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        row: LeaseTransitionRow,
-        base_payload: serde_json::Value,
-        duplicate_error: &str,
-    ) -> Result<JobRow, AwaError> {
-        let old_state = row.state;
-        let mut payload = RuntimePayload::from_json(base_payload)?;
-        payload.push_error(lifecycle_error(duplicate_error, row.attempt, true));
-        let done = row.into_done_row(JobState::Cancelled, Utc::now(), payload.into_json());
-
-        {
-            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
-            match self
-                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), Some(old_state))
-                .await
-            {
-                Ok(_) => {
-                    savepoint.commit().await.map_err(map_sqlx_error)?;
-                    return done.into_job_row();
-                }
-                Err(AwaError::UniqueConflict { .. }) => {
-                    savepoint.rollback().await.map_err(map_sqlx_error)?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let mut stripped = done;
-        stripped.unique_key = None;
-        stripped.unique_states = None;
-        self.insert_done_rows_tx(tx, std::slice::from_ref(&stripped), Some(old_state))
-            .await?;
-        stripped.into_job_row()
     }
 
     pub async fn cancel_running(
@@ -17366,29 +17504,20 @@ impl QueueStorage {
         )
         .await?;
 
-        for row in &deleted_done {
-            self.sync_unique_claim(
-                &mut tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                Some(row.state),
-                None,
+        let changes = deleted_done
+            .iter()
+            .map(|row| (row.job_id, &row.unique_key, &row.unique_states, row.state))
+            .chain(
+                deleted_dlq
+                    .iter()
+                    .map(|row| (row.job_id, &row.unique_key, &row.unique_states, row.state)),
             )
+            .filter_map(|(job_id, key, states, state)| {
+                unique_claim_change(job_id, key.as_deref(), states.as_deref(), Some(state), None)
+            })
+            .collect();
+        self.apply_unique_claim_changes_tx(&mut tx, changes, false)
             .await?;
-        }
-
-        for row in &deleted_dlq {
-            self.sync_unique_claim(
-                &mut tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                Some(row.state),
-                None,
-            )
-            .await?;
-        }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok((deleted_done.len() + deleted_dlq.len()) as u64)
@@ -17664,29 +17793,19 @@ impl QueueStorage {
                 }
             };
 
-            let mut rescued = self
+            let rescued = self
                 .settle_rescued_attempts_tx(
                     &mut attempt,
-                    moved_leases,
-                    "heartbeat stale: worker presumed dead",
+                    vec![
+                        (moved_leases, "heartbeat stale: worker presumed dead"),
+                        (moved_receipts, "receipt claim stale: worker presumed dead"),
+                    ],
                     RescueDlq {
                         reason: "heartbeat_stale",
                         enabled: dlq_enabled,
                     },
                 )
                 .await?;
-            rescued.extend(
-                self.settle_rescued_attempts_tx(
-                    &mut attempt,
-                    moved_receipts,
-                    "receipt claim stale: worker presumed dead",
-                    RescueDlq {
-                        reason: "heartbeat_stale",
-                        enabled: dlq_enabled,
-                    },
-                )
-                .await?,
-            );
             attempt.commit().await.map_err(map_sqlx_error)?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RescueBatch {
@@ -17872,8 +17991,7 @@ impl QueueStorage {
             let rescued = self
                 .settle_rescued_attempts_tx(
                     &mut attempt,
-                    moved,
-                    "hard deadline exceeded",
+                    vec![(moved, "hard deadline exceeded")],
                     RescueDlq {
                         reason: "deadline_exceeded",
                         enabled: dlq_enabled,
@@ -18020,8 +18138,7 @@ impl QueueStorage {
             let rescued = self
                 .settle_rescued_attempts_tx(
                     &mut attempt,
-                    moved,
-                    "callback timed out",
+                    vec![(moved, "callback timed out")],
                     RescueDlq {
                         reason: "callback_timeout",
                         enabled: dlq_enabled,
@@ -20469,6 +20586,114 @@ mod writer_bind_tests {
             offenders.is_empty(),
             "queue_storage.rs builds a per-row VALUES insert at lines {offenders:?}; \
              use INSERT ... SELECT FROM unnest(...) with one array bind per column"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revived_unique_states_tests {
+    use super::*;
+
+    fn payload(error: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "errors": [error] })
+    }
+
+    #[test]
+    fn a_handler_cancel_reason_mentioning_duplicates_does_not_block_retry() {
+        let reason = payload(serde_json::json!({
+            "error": "remote job rejected as duplicate: unique claim held by another job",
+            "attempt": 1,
+            "terminal": true,
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &reason).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyless_legacy_duplicate_cancellation_is_refused() {
+        for message in LEGACY_KEYLESS_DUPLICATE_ERRORS {
+            let legacy = payload(serde_json::json!({
+                "error": message,
+                "attempt": 1,
+                "terminal": true,
+            }));
+            assert!(matches!(
+                revived_unique_states(JobState::Cancelled, None, None, &legacy),
+                Err(AwaError::UniqueConflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_mask_field_on_a_caller_error_entry_is_ignored() {
+        let forged = payload(serde_json::json!({
+            "error": "upstream failed",
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert_eq!(
+            revived_unique_states(JobState::Cancelled, None, None, &forged).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_caller_error_entry_cannot_record_a_duplicate_mask() {
+        let entry = caller_error_entry(
+            serde_json::json!({
+                "error": RESCUED_DUPLICATE_ERROR,
+                DUPLICATE_CANCEL_MASK_KEY: "11111111",
+            }),
+            2,
+        );
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], RESCUED_DUPLICATE_ERROR);
+        assert_eq!(entry["attempt"], 2);
+        assert_eq!(entry["terminal"], true);
+        assert_eq!(
+            revived_unique_states(
+                JobState::Cancelled,
+                Some(b"key"),
+                Some("11000000".to_string()),
+                &payload(entry)
+            )
+            .unwrap(),
+            Some("11000000".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reschedule_error_cannot_record_a_duplicate_mask() {
+        let entry = without_duplicate_mask(&serde_json::json!({
+            "error": RESCHEDULED_DUPLICATE_ERROR,
+            DUPLICATE_CANCEL_MASK_KEY: "11111111",
+        }));
+        assert!(entry.get(DUPLICATE_CANCEL_MASK_KEY).is_none());
+        assert_eq!(entry["error"], RESCHEDULED_DUPLICATE_ERROR);
+        assert_eq!(
+            without_duplicate_mask(&serde_json::json!("plain")),
+            serde_json::json!("plain")
+        );
+    }
+
+    #[test]
+    fn a_recorded_mask_is_restored() {
+        let recorded = payload(serde_json::json!({
+            "error": RESCUED_DUPLICATE_ERROR,
+            "attempt": 1,
+            "terminal": true,
+            DUPLICATE_CANCEL_MASK_KEY: "11000010",
+        }));
+        assert_eq!(
+            revived_unique_states(
+                JobState::Cancelled,
+                Some(b"key"),
+                Some("11000000".to_string()),
+                &recorded
+            )
+            .unwrap(),
+            Some("11000010".to_string())
         );
     }
 }
