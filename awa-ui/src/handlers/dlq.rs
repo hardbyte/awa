@@ -253,7 +253,16 @@ where
                 }
             })
             .await
-            .map_err(|err| ApiError::after_partial(err.error, err.partial.count))?,
+            .map_err(|err| {
+                ApiError::after_partial(
+                    err.error,
+                    crate::error::bulk::Committed {
+                        changed: err.partial.count,
+                        skipped: err.partial.skipped,
+                        conflicts: err.partial.conflicts,
+                    },
+                )
+            })?,
         ),
     }
 }
