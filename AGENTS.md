@@ -31,8 +31,8 @@ exit code from a piped or backgrounded command.
 
 ### Version matrix
 
-CI runs the sharded Rust suite and the queue-storage leg against **Postgres 17
-and 18** — both majors run the whole suite, because the schema, its
+CI runs the sharded Rust suite and the queue-storage leg against **Postgres 17,
+18 and 19** — every major runs the whole suite, because the schema, its
 partitioning, and the planner behaviour the claim path depends on are all
 version-sensitive.
 

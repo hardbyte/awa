@@ -268,7 +268,7 @@ jobs:
         # planner behaviour the claim path depends on are all version-
         # sensitive, so the whole sharded suite runs on each major rather
         # than a smoke subset.
-        postgres: ["17", "18"]
+        postgres: ["17", "18", "19"]
         shard:
           - migrations-1
           - migrations-2
@@ -279,7 +279,9 @@ jobs:
           - workspace
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}-alpine
+        # 19rc2 differs from 19.0 only in its version stamp; Docker Hub has
+        # not published 19-alpine yet.
+        image: postgres:${{ matrix.postgres == '19' && '19rc2' || matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
@@ -320,10 +322,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["17", "18"]
+        postgres: ["17", "18", "19"]
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}-alpine
+        # 19rc2 differs from 19.0 only in its version stamp; Docker Hub has
+        # not published 19-alpine yet.
+        image: postgres:${{ matrix.postgres == '19' && '19rc2' || matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
