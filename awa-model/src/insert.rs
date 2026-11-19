@@ -5,6 +5,7 @@ use crate::unique::compute_unique_key;
 use crate::JobArgs;
 use sqlx::postgres::PgConnection;
 use sqlx::{PgExecutor, PgPool};
+use std::collections::HashSet;
 
 // ── Lane lock order ─────────────────────────────────────────────────────
 //
@@ -35,6 +36,19 @@ use sqlx::{PgExecutor, PgPool};
 // same key, stably, before they reach `awa.insert_job_compat`, and returned in
 // input order. Both paths take the same lane lock, so producers on either, and
 // older binaries, share a lane without reordering it.
+//
+// `awa.insert_job_compat` claims a row's unique key and then reserves its
+// lane. A multi-row per-row insert takes every key its rows claim before the
+// first row, in key order, like the batch function and the `QueueStorage`
+// enqueue paths: it inserts a placeholder claim for each key and deletes it in
+// the same statement, which keeps the key locked against other claimants
+// until the transaction ends. A key another job holds fails that insert with
+// the `idx_awa_jobs_unique` conflict its row would raise, before any lane is
+// reserved, so the statement never waits for a key while it holds a lane: a
+// holder that released the key later could otherwise let a fresh enqueue take
+// it and wait for the batch's lane. The `insert_many_copy` fallback, which
+// skips conflicting rows, skips the rows whose key was held at that point
+// instead of trying them.
 //
 // The shard is derived as `insert_job_compat` derives it: rows with an
 // ordering key use `ordering_key_hash64 % enqueue_shards`, other rows
@@ -231,11 +245,36 @@ impl PreparedJobInsert {
 /// statement can place keyed rows on the shard `insert_job_compat` will pick.
 ///
 /// One `awa.insert_job_compat` call per row, rows inserted in canonical lane
-/// order (see "Lane lock order" above) and returned in input order. It works
-/// with and without the `insert_jobs_compat_batch` schema patch, including when
-/// one process writes to databases that differ in whether they have it.
+/// order (see "Lane lock order" above) and returned in input order. With more
+/// than one row, the unique keys the rows claim are taken first, in key order,
+/// by `held` and `released`; a key another job holds fails the statement
+/// there, before any lane. It works with and without the
+/// `insert_jobs_compat_batch` schema patch, including when one process writes
+/// to databases that differ in whether they have it.
 const INSERT_MANY_ROW_FUNCTION_SQL: &str = r#"
-    WITH input AS MATERIALIZED (
+    WITH claim_keys AS (
+        SELECT DISTINCT claim.unique_key
+        FROM unnest($4::text[], $10::bytea[], $11::text[]) AS claim(state, unique_key, unique_states)
+        WHERE cardinality($1::text[]) > 1
+          AND claim.unique_key IS NOT NULL
+          AND claim.unique_states IS NOT NULL
+          AND awa.job_state_in_bitmask(claim.unique_states::bit(8), claim.state::awa.job_state)
+    ),
+    held AS MATERIALIZED (
+        INSERT INTO awa.job_unique_claims (unique_key, job_id)
+        SELECT claim_keys.unique_key, 0
+        FROM claim_keys
+        ORDER BY claim_keys.unique_key
+        RETURNING unique_key, job_id
+    ),
+    released AS MATERIALIZED (
+        SELECT awa.release_queue_storage_unique_claim(held.job_id, held.unique_key, '11111111', 'available')
+        FROM held
+    ),
+    claims_taken AS (
+        SELECT count(*) AS released FROM released
+    ),
+    input AS MATERIALIZED (
         SELECT
             raw.*,
             MOD(
@@ -266,6 +305,7 @@ const INSERT_MANY_ROW_FUNCTION_SQL: &str = r#"
             kind, queue, args, state, priority, max_attempts, run_at,
             metadata, tags, unique_key, unique_states, ordering_key, ordering_hash, ord
         )
+        CROSS JOIN claims_taken
         ORDER BY raw.queue COLLATE "C", raw.priority, lane_shard, raw.ord
     )
     SELECT inserted.*
@@ -842,6 +882,7 @@ async fn insert_staged_rows_per_row(
                 Option<Vec<u8>>,
                 Option<String>,
                 Option<Vec<u8>>,
+                bool,
             ),
         >(concat!(
             "WITH",
@@ -860,13 +901,58 @@ async fn insert_staged_rows_per_row(
                 tags,
                 unique_key,
                 unique_states::text,
-                ordering_key
+                ordering_key,
+                COALESCE(
+                    unique_key IS NOT NULL
+                        AND unique_states IS NOT NULL
+                        AND awa.job_state_in_bitmask(unique_states, state),
+                    FALSE
+                )
             FROM staged_in_lane_order
             ORDER BY queue COLLATE "C", priority, lane_shard, ord
             "#
         ))
         .fetch_all(&mut *conn)
         .await?;
+
+        // Take every free key the rows claim, in key order, before the first
+        // row reserves a lane. A key another job holds stays with it: its
+        // rows are skipped below without being tried, since trying one later
+        // could wait for the key while holding a lane.
+        let held_elsewhere: HashSet<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            WITH claim_keys AS (
+                SELECT DISTINCT staged.unique_key
+                FROM pg_temp.awa_copy_staging AS staged
+                WHERE staged.unique_key IS NOT NULL
+                  AND staged.unique_states IS NOT NULL
+                  AND awa.job_state_in_bitmask(staged.unique_states, staged.state)
+            ),
+            held AS MATERIALIZED (
+                INSERT INTO awa.job_unique_claims (unique_key, job_id)
+                SELECT claim_keys.unique_key, 0
+                FROM claim_keys
+                ORDER BY claim_keys.unique_key
+                ON CONFLICT (unique_key) DO NOTHING
+                RETURNING unique_key, job_id
+            ),
+            released AS MATERIALIZED (
+                SELECT
+                    held.unique_key,
+                    awa.release_queue_storage_unique_claim(held.job_id, held.unique_key, '11111111', 'available')
+                FROM held
+            )
+            SELECT claim_keys.unique_key
+            FROM claim_keys
+            WHERE NOT EXISTS (
+                SELECT 1 FROM released WHERE released.unique_key = claim_keys.unique_key
+            )
+            "#,
+        )
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect();
 
         let mut inserted = Vec::with_capacity(staged_rows.len());
         for (
@@ -883,8 +969,16 @@ async fn insert_staged_rows_per_row(
             unique_key,
             unique_states,
             ordering_key,
+            claims,
         ) in staged_rows
         {
+            if claims
+                && unique_key
+                    .as_ref()
+                    .is_some_and(|key| held_elsewhere.contains(key))
+            {
+                continue;
+            }
             sqlx::query("SAVEPOINT awa_copy_unique_row")
                 .execute(&mut *conn)
                 .await?;
