@@ -18362,6 +18362,104 @@ async fn test_queue_storage_claimer_cache_rechecks_reduced_target_after_lease_lo
     );
 }
 
+/// Claim once on a fresh gate, so the claimer target is recomputed.
+async fn claim_once_for_target(store: &QueueStorage, pool: &sqlx::PgPool, queue: &str) {
+    let ttl = Duration::from_secs(300);
+    store
+        .claim_runtime_batch_with_aging_for_instance(
+            pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            ttl,
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("claim should succeed");
+}
+
+async fn claimer_state_row(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+) -> (i16, String, DateTime<Utc>) {
+    sqlx::query_as(audited_sql(format!(
+        "SELECT target_claimers, xmin::text, updated_at
+         FROM {schema}.queue_claimer_state WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("claimer state row")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_target_refresh_writes_only_a_change() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_target_writes";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_target_writes";
+    // A stale row whose target an empty queue keeps at 1.
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 1, now() - interval '1 hour')"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = claimer_state_row(&pool, schema, queue).await;
+    claim_once_for_target(&store, &pool, queue).await;
+    assert_eq!(
+        claimer_state_row(&pool, schema, queue).await,
+        before,
+        "an unchanged target leaves the row as it was"
+    );
+
+    // A backlog raises the target, and that change is written.
+    store.enqueue_batch(&pool, queue, 1, 100).await.unwrap();
+    claim_once_for_target(&store, &pool, queue).await;
+    let (target, xmin, updated_at) = claimer_state_row(&pool, schema, queue).await;
+    assert_eq!(target, 4);
+    assert_ne!(xmin, before.1);
+    assert!(updated_at > before.2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_target_refresh_does_not_wait_on_a_locked_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_target_lock";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_target_lock";
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 1, now() - interval '1 hour')"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Another instance holds the row, as one mid-refresh would.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_claimer_state WHERE queue = $1 FOR UPDATE"
+    )))
+    .bind(queue)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        claim_once_for_target(&store, &pool, queue),
+    )
+    .await
+    .expect("a refresh that leaves the target unchanged must not wait on the row lock");
+    holder.rollback().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
     let (_db_guard, pool) = setup_pool(10).await;
@@ -29843,4 +29941,79 @@ async fn test_receipt_rescue_walks_are_not_prepared() {
         "receipt rescue walks must not be prepared: {walks:#?}"
     );
     session.close().await;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_coalesced_wakeups";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_coalesced_wakeups";
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // Each enqueue commits its own transaction. Notifying inside each one
+    // would deliver one notification per enqueue; coalesced wake-ups send
+    // at most one per channel per window, the last after the final commit.
+    const ENQUEUES: usize = 20;
+    let started = Instant::now();
+    for _ in 0..ENQUEUES {
+        store.enqueue_batch(&pool, queue, 1, 1).await.unwrap();
+    }
+    let burst = started.elapsed();
+
+    let mut received = 0;
+    while let Ok(notification) =
+        tokio::time::timeout(Duration::from_millis(300), listener.recv()).await
+    {
+        notification.expect("listener stays connected");
+        received += 1;
+    }
+    assert!(received >= 1, "a burst of enqueues wakes its claimers");
+    // One at the start of each 50 ms window, plus the trailing one.
+    let bound = burst.as_millis() as usize / 50 + 2;
+    assert!(
+        received <= bound,
+        "{ENQUEUES} enqueues in {burst:?} sent {received} notifications, more than one per window"
+    );
+}
+
+#[tokio::test]
+async fn test_queue_storage_flush_wakeups_sends_before_the_pool_closes() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_flush_wakeups";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_flush_wakeups";
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // A short-lived producer enqueues on its own pool and closes it at once.
+    // Closing the pool fails a wake-up still waiting to be sent, so the
+    // producer flushes first.
+    let producer = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("connect producer pool");
+    store.enqueue_batch(&producer, queue, 1, 1).await.unwrap();
+    assert!(
+        awa::flush_wakeups(&producer, Duration::from_secs(5)).await,
+        "the flush finished before its timeout"
+    );
+    producer.close().await;
+
+    let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("the flushed wake-up was delivered")
+        .expect("listener stays connected");
+    assert_eq!(notification.channel(), format!("awa:{queue}"));
 }

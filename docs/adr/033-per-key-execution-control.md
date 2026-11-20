@@ -238,7 +238,9 @@ Every completion, retry/snooze, cancellation, DLQ, callback resolution, caller-o
 and rescue transaction that closes one or more keyed grants therefore emits the ordinary
 transactional queue notification for each distinct affected logical queue. PostgreSQL delivers the
 notification only after commit, so a woken claimer sees the closure. Batched closure paths dedupe
-queues before calling `pg_notify`.
+queues before calling `pg_notify`. [ADR-053](053-coordination-off-the-commit-path.md) amends this: a
+closure awa commits hands its queues to the post-commit coalescer instead of notifying inside the
+transaction.
 
 `key_gated` is its own dispatcher wait class. It is busy for idle-prune/health purposes but does not
 hot-spin: the dispatcher waits for a queue notification plus a bounded safety poll for lost
