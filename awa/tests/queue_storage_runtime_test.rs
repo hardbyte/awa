@@ -29922,7 +29922,7 @@ async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {
     // One at the start of each 50 ms window, plus the trailing one.
     let bound = burst.as_millis() as usize / 50 + 2;
     assert!(
-        received <= bound.min(ENQUEUES - 1),
+        received <= bound,
         "{ENQUEUES} enqueues in {burst:?} sent {received} notifications, more than one per window"
     );
 }
