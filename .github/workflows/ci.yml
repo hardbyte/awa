@@ -279,9 +279,7 @@ jobs:
           - workspace
     services:
       postgres:
-        # 19rc2 differs from 19.0 only in its version stamp; Docker Hub has
-        # not published 19-alpine yet.
-        image: postgres:${{ matrix.postgres == '19' && '19rc2' || matrix.postgres }}-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
@@ -325,9 +323,7 @@ jobs:
         postgres: ["17", "18", "19"]
     services:
       postgres:
-        # 19rc2 differs from 19.0 only in its version stamp; Docker Hub has
-        # not published 19-alpine yet.
-        image: postgres:${{ matrix.postgres == '19' && '19rc2' || matrix.postgres }}-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
