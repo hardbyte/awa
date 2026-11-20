@@ -21227,6 +21227,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(generation)
             .fetch_one(pool)
             .await
