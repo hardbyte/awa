@@ -118,6 +118,10 @@ SELECT EXISTS (
 /// indefinitely with no query in flight to bound it).
 const MVCC_HORIZON_PIN_MIN_AGE: Duration = Duration::from_secs(5);
 
+/// How long the job output column probe's catalog query may run once it has
+/// a connection.
+const JOB_OUTPUT_PROBE_QUERY_BUDGET: Duration = Duration::from_secs(10);
+
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
 /// This is intentionally simple enough to implement byte-for-byte in
@@ -3389,6 +3393,105 @@ mod ready_segment_tests {
         );
     }
 
+    /// A probe whose catalog query stalls on an open connection gives up
+    /// after its budget instead of holding the single-flight lock while every
+    /// other pool caller waits behind it.
+    #[sqlx::test(migrations = false)]
+    async fn a_stalled_probe_query_releases_the_single_flight_lock(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::migrations::run(&pool).await.unwrap();
+        let options = (*pool.connect_options()).clone();
+        let (db_host, db_port) = (options.get_host().to_string(), options.get_port());
+
+        // A relay to the database that stops forwarding once `stall` is set,
+        // leaving the pool's connection open but unanswered.
+        let stall = std::sync::Arc::new(AtomicBool::new(false));
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        {
+            let stall = stall.clone();
+            tokio::spawn(async move {
+                while let Ok((client, _)) = relay.accept().await {
+                    let server = tokio::net::TcpStream::connect((db_host.as_str(), db_port))
+                        .await
+                        .unwrap();
+                    let (client_rx, client_tx) = client.into_split();
+                    let (server_rx, server_tx) = server.into_split();
+                    for (mut from, mut to) in [
+                        (
+                            Box::new(client_rx) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                            Box::new(server_tx) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                        ),
+                        (Box::new(server_rx) as _, Box::new(client_tx) as _),
+                    ] {
+                        let stall = stall.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                let read = match from.read(&mut buf).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(read) => read,
+                                };
+                                while stall.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                if to.write_all(&buf[..read]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        let relayed = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(300))
+            .test_before_acquire(false)
+            .connect_with(options.host("127.0.0.1").port(relay_port))
+            .await
+            .unwrap();
+        sqlx::query("SELECT 1").execute(&relayed).await.unwrap();
+        // Let the connection finish returning to the pool before stalling.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(relayed.num_idle(), 1);
+        stall.store(true, Ordering::SeqCst);
+
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let started = Instant::now();
+        let first = {
+            let (store, relayed) = (store.clone(), relayed.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&relayed).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waiter = {
+            let (store, relayed) = (store.clone(), relayed.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&relayed).await })
+        };
+        let limit = Duration::from_millis(300) + super::JOB_OUTPUT_PROBE_QUERY_BUDGET;
+        let first = tokio::time::timeout(limit + Duration::from_secs(5), first)
+            .await
+            .expect("a stalled probe must give up within its budget")
+            .unwrap();
+        assert!(first.is_err(), "{first:?}");
+        let waiter = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a caller waiting on the stalled probe must not wait again")
+            .unwrap();
+        assert!(waiter.is_err(), "{waiter:?}");
+        assert!(
+            started.elapsed() < limit + Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(store.job_output_probe_count(), 1);
+    }
+
     /// A pool probe holding the single-flight lock while it waits for the
     /// only connection must not block a transaction holding that connection
     /// from probing on it.
@@ -4287,6 +4390,9 @@ impl QueueStorage {
     /// connection they hold is always released. A caller that waited while
     /// the probe failed gets a retryable error at once rather than probing
     /// again, so an outage costs one probe's wait rather than one per caller.
+    /// The probe gets the pool's acquire timeout plus
+    /// `JOB_OUTPUT_PROBE_QUERY_BUDGET`; a probe whose query stalls on an open
+    /// connection fails then, so it cannot hold the lock indefinitely.
     pub async fn supports_job_output_from_pool(&self, pool: &PgPool) -> Result<bool, AwaError> {
         if let Some(supported) = self.cached_job_output_columns() {
             return Ok(supported);
@@ -4306,7 +4412,14 @@ impl QueueStorage {
                 "the job output column probe failed while this call waited for it".into(),
             )));
         }
-        let probed = self.probe_job_output_columns(pool).await;
+        let deadline = pool.options().get_acquire_timeout() + JOB_OUTPUT_PROBE_QUERY_BUDGET;
+        let probed = match tokio::time::timeout(deadline, self.probe_job_output_columns(pool)).await
+        {
+            Ok(probed) => probed,
+            Err(_) => Err(AwaError::Database(sqlx::Error::Protocol(format!(
+                "the job output column probe did not finish within {deadline:?}"
+            )))),
+        };
         if probed.is_err() {
             *self
                 .job_output_probe_failed_at
