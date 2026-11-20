@@ -4424,6 +4424,11 @@ impl MaintenanceService {
             .map(|(queue, _)| queue.as_str())
             .collect();
         let retention_secs = i64::try_from(self.dlq_retention.as_secs()).unwrap_or(i64::MAX);
+        // Rows from a stripe `q#N` take `q`'s retention only while this
+        // runtime stripes its queues; otherwise `q#N` is a queue of its own.
+        let striped = runtime.store.queue_stripe_count() > 1;
+        let global_stripe_of = stripe_of_sql("dlq_entries.queue", "overridden.queue", "$5");
+        let override_stripe_of = stripe_of_sql("queue", "$3", "$6");
 
         let global_result = if override_queues.is_empty() {
             sqlx::query(audited_sql(format!(
@@ -4447,7 +4452,11 @@ impl MaintenanceService {
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
                     WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-                      AND queue != ALL($3::text[])
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest($3::text[]) AS overridden(queue)
+                          WHERE dlq_entries.queue = overridden.queue
+                             OR ($4::boolean AND {global_stripe_of})
+                      )
                     LIMIT $2
                 )
                 "#
@@ -4455,6 +4464,8 @@ impl MaintenanceService {
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(&override_queues)
+            .bind(striped)
+            .bind(usize::MAX.to_string())
             .execute(&self.pool)
             .await
         };
@@ -4479,7 +4490,11 @@ impl MaintenanceService {
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
-                    WHERE queue = $3
+                    WHERE (queue = $3
+                           OR ($4::boolean
+                               AND {override_stripe_of}
+                               -- A stripe with its own override keeps it.
+                               AND queue != ALL($5::text[])))
                       AND dlq_at < now() - make_interval(secs => $1::bigint)
                     LIMIT $2
                 )
@@ -4488,6 +4503,9 @@ impl MaintenanceService {
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(queue)
+            .bind(striped)
+            .bind(&override_queues)
+            .bind(usize::MAX.to_string())
             .execute(&self.pool)
             .await
             {
@@ -4502,6 +4520,22 @@ impl MaintenanceService {
             }
         }
     }
+}
+
+/// SQL that is true when `queue` is a stripe name of `logical`, by the rule
+/// `QueueStorage` routes with: `logical`, the stripe delimiter `#`, then a
+/// suffix that parses as `usize` (ASCII digits, an optional leading `+`, a
+/// value no greater than `usize_max`). The stripe count does not bound the
+/// suffix, so stripes left over from a larger former stripe count stay
+/// stripes, and a suffix too large for `usize` names an independent queue.
+fn stripe_of_sql(queue: &str, logical: &str, usize_max: &str) -> String {
+    let suffix = format!("substr({queue}, char_length({logical}) + 2)");
+    format!(
+        "(left({queue}, char_length({logical}) + 1) = {logical} || '#' \
+         AND CASE WHEN {suffix} ~ '^\\+?[0-9]+$' \
+                  THEN ltrim({suffix}, '+')::numeric <= {usize_max}::numeric \
+                  ELSE false END)"
+    )
 }
 
 struct MaintenanceAliveGuard(Arc<AtomicBool>);
