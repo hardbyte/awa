@@ -300,8 +300,8 @@ impl Shared {
             .collect()
     }
 
-    /// Records the start of a handler. Hold the returned guard for the duration of
-    /// `perform`; dropping it, including when the runtime is killed, ends the execution.
+    /// Records that a handler returned `Completed`, in the ledger and, with the gate proof
+    /// on, as a durable handler-return witness. A return is not a commit.
     pub async fn record_completed_return(&self, persona: Persona, job: &JobRow) {
         if let Some(proof) = self.gate_proof.get() {
             let started = Instant::now();
@@ -317,6 +317,8 @@ impl Shared {
         self.ledger.mark(job.id, flag::RETURNED_COMPLETED);
     }
 
+    /// Records the start of a handler. Hold the returned guard for the duration of
+    /// `perform`; dropping it, including when the runtime is killed, ends the execution.
     pub fn begin_execution(
         self: &Arc<Self>,
         persona: Persona,
