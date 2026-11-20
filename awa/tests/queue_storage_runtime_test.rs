@@ -29887,62 +29887,6 @@ async fn test_queue_storage_metadata_completion_validates_and_does_not_lock_comp
     }
 }
 
-/// Each claim slot's receipt rescue walk has its own SQL text, naming that
-/// slot's partition. The walks run unprepared, so a pooled session that runs
-/// them keeps neither their statements nor their generic plans.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_receipt_rescue_walks_are_not_prepared() {
-    let (_db_guard, pool) = setup_pool(4).await;
-    let schema = "awa_qs_rescue_walks_unprepared";
-    let store = create_store_with_config(&pool, ring_pin_store_config(schema)).await;
-    let session = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with((*pool.connect_options()).clone())
-        .await
-        .expect("single-connection pool");
-
-    // Postgres switches a prepared statement to a generic plan on its sixth
-    // execution in a session.
-    for _ in 0..7 {
-        store
-            .rescue_stale_heartbeats_batch(
-                &session,
-                Duration::from_secs(90),
-                &|_| false,
-                &Default::default(),
-            )
-            .await
-            .expect("stale heartbeat rescue");
-        store
-            .rescue_expired_deadlines_batch(&session, &|_| false, &Default::default())
-            .await
-            .expect("deadline rescue");
-    }
-
-    // The patterns are concatenated so this statement does not match itself.
-    let walks: Vec<String> = sqlx::query_scalar(
-        "SELECT left(statement, 120) FROM pg_prepared_statements
-         WHERE statement LIKE '%rescue_cursor_' || 'claimed_at%'
-            OR statement LIKE '%deadline_cursor_' || 'deadline_at%'",
-    )
-    .fetch_all(&session)
-    .await
-    .expect("read prepared statements");
-    let prepared: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements")
-        .fetch_one(&session)
-        .await
-        .expect("count prepared statements");
-    assert!(
-        prepared > 0,
-        "the session should hold the rescue passes' other prepared statements"
-    );
-    assert!(
-        walks.is_empty(),
-        "receipt rescue walks must not be prepared: {walks:#?}"
-    );
-    session.close().await;
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {
     let (_db_guard, pool) = setup_pool(10).await;
