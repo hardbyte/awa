@@ -174,7 +174,9 @@ acquisition times out (SQLSTATE `55P03`, typically behind a long-running read
 of `awa.jobs` or a backup) the error names the partition, the whole migration
 rolls back, and it can simply be re-run. Locks taken are held until commit,
 about 60 per 16-slot schema, so a database with hundreds of queue-storage
-schemas may need a larger `max_locks_per_transaction` for this step.
+schemas may need a larger `max_locks_per_transaction` for this step. PostgreSQL 19
+holds about half as many locks per unit of the setting as earlier releases,
+so a value carried over from PostgreSQL 18 must be doubled.
 `queue_counts_exact`, which filters ready rows by queue across every slot,
 seq-scans the ready partitions on PostgreSQL 17 without the index; at
 200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
