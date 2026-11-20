@@ -50,7 +50,7 @@ const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
-// Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
+// Physical bytes above empty-index overhead on PostgreSQL 17 to 19. Installed
 // btree/GiST main forks retain one page; GIN (tag and claim-batch job indexes) retains its
 // metapage and root; BRIN retains three main
 // and three FSM pages (four below 4 KiB block size) when empty. Unknown
@@ -7566,10 +7566,8 @@ impl QueueStorage {
             .insert_ready_rows_tx(&mut tx, rows.clone(), false)
             .await?;
 
-        let queues_to_notify: Vec<String> = rows.iter().map(|row| row.queue.clone()).collect();
-        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, rows.into_iter().map(|row| row.queue));
         Ok(total_rows)
     }
 
@@ -7716,9 +7714,8 @@ impl QueueStorage {
                 .await?;
         }
 
-        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues_to_notify);
         Ok(total)
     }
 
@@ -7830,9 +7827,8 @@ impl QueueStorage {
                 .await?;
         }
 
-        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues_to_notify);
         Ok(total)
     }
 
@@ -8285,6 +8281,17 @@ impl QueueStorage {
         }
     }
 
+    /// The queue's shared claimer target, recomputed from the claimer signal
+    /// once the stored value is older than `control_interval`.
+    ///
+    /// A recomputed target is written only when it differs from the stored
+    /// one, and with a plain `UPDATE` whose `WHERE` excludes the stored value.
+    /// Such an `UPDATE` takes no row lock on a row it skips, so steady-state
+    /// refreshes from every instance neither write nor wait on each other.
+    /// (`INSERT ... ON CONFLICT DO UPDATE ... WHERE` would lock the existing
+    /// row even when its `WHERE` is false.) `updated_at` therefore records
+    /// the last change, and a change stands for `control_interval` before
+    /// anyone recomputes it.
     async fn queue_claimer_target(
         &self,
         pool: &PgPool,
@@ -8298,64 +8305,69 @@ impl QueueStorage {
             - TimeDelta::from_std(control_interval).map_err(|err| {
                 AwaError::Validation(format!("invalid claimer control interval: {err}"))
             })?;
+        let clamp = |target: i16| target.clamp(1, max_claimers.max(1));
 
-        if let Some(target) = sqlx::query_scalar::<_, i16>(audited_sql(format!(
+        let stored: Option<(i16, bool)> = sqlx::query_as(audited_sql(format!(
             r#"
-            SELECT target_claimers
+            SELECT target_claimers, updated_at > $2
             FROM {schema}.queue_claimer_state
             WHERE queue = $1
-              AND updated_at > $2
             "#
         )))
         .bind(queue)
         .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(target.clamp(1, max_claimers.max(1)));
-        }
-
-        let current_target = sqlx::query_scalar::<_, i16>(audited_sql(format!(
-            r#"
-            SELECT target_claimers
-            FROM {schema}.queue_claimer_state
-            WHERE queue = $1
-            "#
-        )))
-        .bind(queue)
         .fetch_optional(pool)
         .await
         .map_err(map_sqlx_error)?;
+        if let Some((target, true)) = stored {
+            return Ok(clamp(target));
+        }
+        let current_target = stored.map(|(target, _)| target);
 
         let signal = self.queue_claimer_signal(pool, queue).await?;
         let desired = self.desired_queue_claimer_target(current_target, &signal, max_claimers);
-
-        if let Some(updated) = sqlx::query_scalar::<_, i16>(audited_sql(format!(
-            r#"
-            INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (queue) DO UPDATE
-            SET target_claimers = EXCLUDED.target_claimers,
-                updated_at = EXCLUDED.updated_at
-            WHERE {schema}.queue_claimer_state.updated_at <= $4
-            RETURNING target_claimers
-            "#
-        )))
-        .bind(queue)
-        .bind(desired)
-        .bind(now)
-        .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(updated.clamp(1, max_claimers.max(1)));
+        if current_target == Some(desired) {
+            return Ok(clamp(desired));
         }
 
-        Ok(current_target
-            .unwrap_or(desired)
-            .clamp(1, max_claimers.max(1)))
+        let written = match current_target {
+            None => sqlx::query_scalar::<_, i16>(audited_sql(format!(
+                r#"
+                INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (queue) DO NOTHING
+                RETURNING target_claimers
+                "#
+            )))
+            .bind(queue)
+            .bind(desired)
+            .bind(now)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?,
+            Some(_) => sqlx::query_scalar::<_, i16>(audited_sql(format!(
+                r#"
+                UPDATE {schema}.queue_claimer_state
+                SET target_claimers = $2,
+                    updated_at = $3
+                WHERE queue = $1
+                  AND target_claimers IS DISTINCT FROM $2
+                  AND updated_at <= $4
+                RETURNING target_claimers
+                "#
+            )))
+            .bind(queue)
+            .bind(desired)
+            .bind(now)
+            .bind(stale_cutoff)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?,
+        };
+
+        // Another instance changed or created the row first; its target
+        // stands until the next recompute.
+        Ok(clamp(written.or(current_target).unwrap_or(desired)))
     }
 
     /// Whether a claim of `queue` could find a ready row, from the same
@@ -10199,8 +10211,6 @@ impl QueueStorage {
             };
             self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(waiting.state))
                 .await?;
-            self.notify_queues_tx(tx, std::iter::once(waiting.queue.clone()))
-                .await?;
             return Ok(Some(
                 ReadyJobRow {
                     job_id: ready_row.job_id,
@@ -10278,8 +10288,6 @@ impl QueueStorage {
             };
             self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(terminal.state))
                 .await?;
-            self.notify_queues_tx(tx, std::iter::once(terminal.queue.clone()))
-                .await?;
             return Ok(Some(
                 ReadyJobRow {
                     job_id: ready_row.job_id,
@@ -10307,6 +10315,9 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let row = self.retry_job_tx(&mut tx, job_id).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        if let Some(row) = &row {
+            self.wake_queues_after_commit(pool, [row.queue.clone()]);
+        }
         Ok(row)
     }
 
@@ -10335,6 +10346,7 @@ impl QueueStorage {
             }
         }
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, rows.iter().map(|row| row.queue.clone()));
         Ok((rows, unique_ids.len() as u64))
     }
 
@@ -12411,8 +12423,8 @@ impl QueueStorage {
         // The drift is bounded by aging rate × poll interval.
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues);
         Ok(ids)
     }
 
@@ -12509,6 +12521,19 @@ impl QueueStorage {
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)
+    }
+
+    /// Wake the claimers of `queues` once the caller's transaction has
+    /// committed, coalesced per pool (see [`crate::wakeup`]). Paths that
+    /// commit their own transaction use this; the public `*_tx` methods,
+    /// whose caller commits, notify inside the transaction instead.
+    fn wake_queues_after_commit(&self, pool: &PgPool, queues: impl IntoIterator<Item = String>) {
+        crate::wakeup::wake_after_commit(
+            pool,
+            queues
+                .into_iter()
+                .map(|queue| format!("awa:{}", self.logical_queue_name(&queue))),
+        );
     }
 
     async fn notify_queues_tx<'a>(
@@ -18988,9 +19013,8 @@ impl QueueStorage {
         let ready = moved.into_retry_ready_row(queue.clone(), priority, Utc::now(), payload);
         self.insert_existing_ready_rows_tx(&mut tx, vec![ready.clone()], Some(JobState::Failed))
             .await?;
-        self.notify_queues_tx(&mut tx, std::iter::once(queue))
-            .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, [queue]);
         Ok(Some(
             ReadyJobRow {
                 job_id: ready.job_id,
@@ -19101,8 +19125,8 @@ impl QueueStorage {
         let revived = ready_rows.len() as u64;
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Failed))
             .await?;
-        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.wake_queues_after_commit(pool, queues);
         Ok(revived)
     }
 
@@ -20087,12 +20111,12 @@ impl QueueStorage {
                 }
                 Ok(None) => outcome.contended.push(lane),
                 Err(err) => {
-                    self.notify_promoted_queues(pool, promoted_queues).await;
+                    self.notify_promoted_queues(pool, promoted_queues);
                     return Err(err);
                 }
             }
         }
-        self.notify_promoted_queues(pool, promoted_queues).await;
+        self.notify_promoted_queues(pool, promoted_queues);
         Ok(outcome)
     }
 
@@ -20121,8 +20145,7 @@ impl QueueStorage {
             )
             .await?;
         if promoted.is_some_and(|promoted| promoted > 0) {
-            self.notify_promoted_queues(pool, [lane.queue.clone()])
-                .await;
+            self.notify_promoted_queues(pool, [lane.queue.clone()]);
         }
         Ok(match promoted {
             Some(promoted) => PromoteOutcome {
@@ -20264,34 +20287,9 @@ impl QueueStorage {
     /// A notifying transaction takes PostgreSQL's notify-queue lock at
     /// `COMMIT`, which every notifying transaction in the cluster waits its
     /// turn for, and a lane transaction would hold its lane's locks, and run
-    /// under its lock timeout, while it waited. The wakeup is a hint that
-    /// claimers also poll for, so a failure is logged and not returned.
-    async fn notify_promoted_queues(
-        &self,
-        pool: &PgPool,
-        queues: impl IntoIterator<Item = String>,
-    ) {
-        let channels: Vec<String> = queues
-            .into_iter()
-            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect();
-        if channels.is_empty() {
-            return;
-        }
-        if let Err(err) =
-            sqlx::query("SELECT pg_notify(channel, '') FROM unnest($1::text[]) AS channel")
-                .bind(&channels)
-                .execute(pool)
-                .await
-        {
-            tracing::warn!(
-                error = %err,
-                channels = channels.len(),
-                "Failed to wake claimers after promotion; they pick the rows up on their next poll"
-            );
-        }
+    /// under its lock timeout, while it waited.
+    fn notify_promoted_queues(&self, pool: &PgPool, queues: impl IntoIterator<Item = String>) {
+        self.wake_queues_after_commit(pool, queues);
     }
 
     // Statements whose text names one ring child (probes, prune locks and
