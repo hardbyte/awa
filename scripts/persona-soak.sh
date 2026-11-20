@@ -53,12 +53,21 @@
 #   SOAK_KEEP_SERVER_LOG      set to 1 to write server.log for a run that passed too
 #   AWA_SOAK_QUEUE_ROTATE_MS, AWA_SOAK_CLAIM_ROTATE_MS, AWA_SOAK_PRUNE_LOCK_TIMEOUT_MS
 #                             queue and claim ring rotation intervals and the prune lock timeout
-#                             of every in-process runtime (default: the library's 1000, 1000 and 10)
+#                             of every in-process runtime (default: the pressure base interval for
+#                             the rings, 1000 ms or 4000 ms, and the library's 10 ms)
+#   AWA_PRESSURE_ROTATE_MULTIPLIER
+#                             1 (default) or 4: the base rotation interval of the queue, lease and
+#                             claim rings of every runtime, including the python and
+#                             claim-and-abandon processes, as 1000 ms or 4000 ms
 #   SOAK_CASSERT_IMAGE        image for pg18-cassert (default awa-pg18-cassert:18.6-O0; the
 #                             -epqlog5 build, which logs every partition-pruning setup with its
 #                             query text, is opt-in for diagnosing pruning crashes)
 #   SOAK_SKIP_PREPARE         set to 1 to skip building the awa binary and the Python bindings
 #                             (neither is needed without the UI and python personas)
+#   AWA_SOAK_GATE_PROOF       1 adds the durable handler-return and completion witnesses; with the
+#                             python persona, preparation also installs asyncpg into
+#                             awa-python/.venv, and the run refuses to start when AWA_SOAK_PYTHON
+#                             cannot import it
 #   SOAK_TEST_BIN             a prebuilt harness binary to run instead of `cargo test`
 #   CARGO_TARGET_DIR          cargo target directory, as for any cargo build
 #
@@ -86,6 +95,17 @@ fi
 
 mkdir -p "$RESULTS_DIR"
 
+# The python persona writes its gate-proof witnesses with asyncpg, which is only a dev
+# dependency of awa-python.
+GATE_PROOF_PYTHON_DEPS="asyncpg>=0.31.0"
+python_gate_proof() {
+  [ "${AWA_SOAK_GATE_PROOF:-0}" = 1 ] || return 1
+  case ",${AWA_SOAK_PERSONAS:-python}," in
+    *,python,*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 prepare() {
   echo "== building the awa binary and the Python bindings"
   cargo build --release -p awa-cli || return 1
@@ -93,12 +113,20 @@ prepare() {
     uv venv --quiet awa-python/.venv || return 1
     uv pip install --quiet --python awa-python/.venv maturin || return 1
   fi
+  if python_gate_proof && [ -z "${AWA_SOAK_PYTHON:-}" ]; then
+    uv pip install --quiet --python awa-python/.venv "$GATE_PROOF_PYTHON_DEPS" || return 1
+  fi
   (cd awa-python && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" maturin develop --release) || return 1
 }
 if [ "${SOAK_SKIP_PREPARE:-0}" != 1 ]; then
   prepare >"$RESULTS_DIR/prepare.log" 2>&1 || { echo "prepare failed; see $RESULTS_DIR/prepare.log" >&2; exit 2; }
 fi
 export AWA_SOAK_PYTHON="${AWA_SOAK_PYTHON:-$PWD/awa-python/.venv/bin/python}"
+if python_gate_proof && ! "$AWA_SOAK_PYTHON" -c 'import asyncpg' >/dev/null 2>&1; then
+  echo "AWA_SOAK_GATE_PROOF=1 needs asyncpg in $AWA_SOAK_PYTHON for the python persona; install it with:" >&2
+  echo "  uv pip install --python '$AWA_SOAK_PYTHON' '$GATE_PROOF_PYTHON_DEPS'" >&2
+  exit 2
+fi
 export AWA_SOAK_AWA_BIN="${AWA_SOAK_AWA_BIN:-${CARGO_TARGET_DIR:-$PWD/target}/release/awa}"
 CONTAINERS=()
 STATS_PID=""

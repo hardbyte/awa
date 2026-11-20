@@ -331,7 +331,8 @@ def init_gate_metrics():
         return
     service = f"awa-soak-python-{ROLE}-{os.getpid()}-{time.time_ns()}"
     try:
-        if not awa.init_telemetry(endpoint, service, export_interval_ms=5000):
+        # The bundled collector has a metrics pipeline only.
+        if not awa.init_telemetry(endpoint, service, export_interval_ms=5000, traces=False):
             raise RuntimeError("telemetry provider already installed")
     except Exception:
         print("AWA_SOAK_METRICS_INCOMPLETE", file=sys.stderr, flush=True)
