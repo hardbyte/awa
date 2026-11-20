@@ -8285,6 +8285,17 @@ impl QueueStorage {
         }
     }
 
+    /// The queue's shared claimer target, recomputed from the claimer signal
+    /// once the stored value is older than `control_interval`.
+    ///
+    /// A recomputed target is written only when it differs from the stored
+    /// one, and with a plain `UPDATE` whose `WHERE` excludes the stored value.
+    /// Such an `UPDATE` takes no row lock on a row it skips, so steady-state
+    /// refreshes from every instance neither write nor wait on each other.
+    /// (`INSERT ... ON CONFLICT DO UPDATE ... WHERE` would lock the existing
+    /// row even when its `WHERE` is false.) `updated_at` therefore records
+    /// the last change, and a change stands for `control_interval` before
+    /// anyone recomputes it.
     async fn queue_claimer_target(
         &self,
         pool: &PgPool,
@@ -8298,64 +8309,69 @@ impl QueueStorage {
             - TimeDelta::from_std(control_interval).map_err(|err| {
                 AwaError::Validation(format!("invalid claimer control interval: {err}"))
             })?;
+        let clamp = |target: i16| target.clamp(1, max_claimers.max(1));
 
-        if let Some(target) = sqlx::query_scalar::<_, i16>(audited_sql(format!(
+        let stored: Option<(i16, bool)> = sqlx::query_as(audited_sql(format!(
             r#"
-            SELECT target_claimers
+            SELECT target_claimers, updated_at > $2
             FROM {schema}.queue_claimer_state
             WHERE queue = $1
-              AND updated_at > $2
             "#
         )))
         .bind(queue)
         .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(target.clamp(1, max_claimers.max(1)));
-        }
-
-        let current_target = sqlx::query_scalar::<_, i16>(audited_sql(format!(
-            r#"
-            SELECT target_claimers
-            FROM {schema}.queue_claimer_state
-            WHERE queue = $1
-            "#
-        )))
-        .bind(queue)
         .fetch_optional(pool)
         .await
         .map_err(map_sqlx_error)?;
+        if let Some((target, true)) = stored {
+            return Ok(clamp(target));
+        }
+        let current_target = stored.map(|(target, _)| target);
 
         let signal = self.queue_claimer_signal(pool, queue).await?;
         let desired = self.desired_queue_claimer_target(current_target, &signal, max_claimers);
-
-        if let Some(updated) = sqlx::query_scalar::<_, i16>(audited_sql(format!(
-            r#"
-            INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (queue) DO UPDATE
-            SET target_claimers = EXCLUDED.target_claimers,
-                updated_at = EXCLUDED.updated_at
-            WHERE {schema}.queue_claimer_state.updated_at <= $4
-            RETURNING target_claimers
-            "#
-        )))
-        .bind(queue)
-        .bind(desired)
-        .bind(now)
-        .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(updated.clamp(1, max_claimers.max(1)));
+        if current_target == Some(desired) {
+            return Ok(clamp(desired));
         }
 
-        Ok(current_target
-            .unwrap_or(desired)
-            .clamp(1, max_claimers.max(1)))
+        let written = match current_target {
+            None => sqlx::query_scalar::<_, i16>(audited_sql(format!(
+                r#"
+                INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (queue) DO NOTHING
+                RETURNING target_claimers
+                "#
+            )))
+            .bind(queue)
+            .bind(desired)
+            .bind(now)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?,
+            Some(_) => sqlx::query_scalar::<_, i16>(audited_sql(format!(
+                r#"
+                UPDATE {schema}.queue_claimer_state
+                SET target_claimers = $2,
+                    updated_at = $3
+                WHERE queue = $1
+                  AND target_claimers IS DISTINCT FROM $2
+                  AND updated_at <= $4
+                RETURNING target_claimers
+                "#
+            )))
+            .bind(queue)
+            .bind(desired)
+            .bind(now)
+            .bind(stale_cutoff)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?,
+        };
+
+        // Another instance changed or created the row first; its target
+        // stands until the next recompute.
+        Ok(clamp(written.or(current_target).unwrap_or(desired)))
     }
 
     /// Whether a claim of `queue` could find a ready row, from the same
