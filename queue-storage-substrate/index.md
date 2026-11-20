@@ -42,6 +42,8 @@ awa storage prepare-queue-storage-schema \
 
 The command invokes the idempotent `awa.install_queue_storage_substrate(...)` helper under a per-schema advisory transaction lock. The helper is activation-neutral: preparing a schema does not route work to it. Activation is a separate staged transition described in [Upgrading from 0.5 to 0.6](../upgrade-0.5-to-0.6/index.md).
 
+A database has one active queue-storage schema. Producers write to it, and a runtime configured for any other schema refuses to start, so a custom schema replaces the default rather than running beside it. To isolate workloads from each other's ring stalls, use separate databases; see [storage isolation](../deployment/index.md#storage-isolation).
+
 The installer is `SECURITY INVOKER`; its caller needs DDL privileges on the target schema. Workers need runtime DML, sequence `USAGE`/`SELECT`/`UPDATE`, and `TRUNCATE` for guarded ring reclamation. They do not need schema CREATE: lanes are created through the schema owner's provisioning functions. See [Database roles](../security/database-roles/index.md).
 
 ## Operator rules
