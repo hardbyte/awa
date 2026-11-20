@@ -2829,7 +2829,7 @@
 <tr>
 <td style="text-align: right;">053</td>
 <td><a href="053-coordination-off-the-commit-path/">Coordination stays off the commit path</a></td>
-<td>A job transition never waits on another transaction's coordination work, and coordination that changes nothing writes and locks nothing: hot-path triggers write only append-only marks, wake-ups are coalesced and sent after commit, and coordination state is written only on change. Supersedes 045. Wake-ups from caller-owned transactions and adaptive backoff are proposed.</td>
+<td>A job transition never waits on another transaction's coordination work, and coordination that changes nothing writes and locks nothing: hot-path triggers write only append-only marks, wake-ups are coalesced and sent after commit, and coordination state is written only on change. Supersedes 045. Amends 033's grant-close wake-up. Wake-ups from caller-owned transactions (with #342, 0.8) and adaptive backoff are proposed.</td>
 <td></td>
 </tr>
 </tbody>
