@@ -29886,3 +29886,43 @@ async fn test_queue_storage_metadata_completion_validates_and_does_not_lock_comp
         assert_eq!(durable.metadata, serde_json::json!({"source": "recovery"}));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_coalesced_wakeups";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_coalesced_wakeups";
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // Each enqueue commits its own transaction. Notifying inside each one
+    // would deliver one notification per enqueue; coalesced wake-ups send
+    // at most one per channel per window, the last after the final commit.
+    const ENQUEUES: usize = 20;
+    let started = Instant::now();
+    for _ in 0..ENQUEUES {
+        store.enqueue_batch(&pool, queue, 1, 1).await.unwrap();
+    }
+    let burst = started.elapsed();
+
+    let mut received = 0;
+    while let Ok(notification) =
+        tokio::time::timeout(Duration::from_millis(300), listener.recv()).await
+    {
+        notification.expect("listener stays connected");
+        received += 1;
+    }
+    assert!(received >= 1, "a burst of enqueues wakes its claimers");
+    // One at the start of each 50 ms window, plus the trailing one.
+    let bound = burst.as_millis() as usize / 50 + 2;
+    assert!(
+        received <= bound,
+        "{ENQUEUES} enqueues in {burst:?} sent {received} notifications, more than one per window"
+    );
+}

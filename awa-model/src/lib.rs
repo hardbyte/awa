@@ -24,6 +24,7 @@ mod storage_footprint_sql;
 pub mod tag_index;
 pub mod trace;
 pub mod unique;
+mod wakeup;
 
 // Re-exports for ergonomics
 pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
