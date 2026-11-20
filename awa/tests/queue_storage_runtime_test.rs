@@ -10315,6 +10315,80 @@ async fn test_rescue_deadline_batch_scan_examines_a_bounded_number_of_members() 
     assert_eq!(retryable, BATCHES * BATCH_MEMBERS);
 }
 
+/// The receipt rescue walks and the terminal-count rollup probe visit every
+/// claim or sealed queue slot on each maintenance pass, with one SQL text per
+/// slot. They run unprepared, so a pooled session that runs them keeps
+/// neither their statements nor their generic plans.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_per_slot_maintenance_statements_are_not_prepared() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_per_slot_unprepared";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Seal queue slots 0 and 1 as two rotations would, so the rollup probes
+    // them.
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) VALUES (1, 1), (2, 2)"
+    )))
+    .execute(&pool)
+    .await
+    .expect("advance the queue ring cursor");
+    let session = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("single-connection pool");
+
+    // Postgres switches a prepared statement to a generic plan on its sixth
+    // execution in a session.
+    for _ in 0..7 {
+        store
+            .rescue_stale_heartbeats_batch(
+                &session,
+                Duration::from_secs(90),
+                &|_| false,
+                &Default::default(),
+            )
+            .await
+            .expect("stale heartbeat rescue");
+        store
+            .rescue_expired_deadlines_batch(&session, &|_| false, &Default::default())
+            .await
+            .expect("deadline rescue");
+        store
+            .rollup_terminal_count_deltas(&session, 1)
+            .await
+            .expect("terminal count rollup");
+    }
+
+    let per_slot: Vec<String> = sqlx::query_scalar(
+        "SELECT left(statement, 160) FROM pg_prepared_statements WHERE statement ~ $1",
+    )
+    .bind(format!(r"\m{schema}\.[a-z_]+_[0-9]+\M"))
+    .fetch_all(&session)
+    .await
+    .expect("read prepared statements");
+    let prepared: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements")
+        .fetch_one(&session)
+        .await
+        .expect("count prepared statements");
+    assert!(
+        prepared > 0,
+        "the session should hold the passes' other prepared statements"
+    );
+    assert!(
+        per_slot.is_empty(),
+        "statements naming one ring slot must not be prepared: {per_slot:#?}"
+    );
+    session.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_rescue_batch_continues_past_closed_scan_windows() {
     for (deadline, fresh_history) in [(false, false), (true, false), (false, true)] {
@@ -21013,7 +21087,17 @@ async fn test_queue_storage_dlq_deletes_release_unique_claims() {
 
     // The maintenance leader's retention pass.
     let expired = store
-        .delete_expired_dlq_rows(&pool, Duration::ZERO, 1, None, &[], false)
+        .delete_expired_dlq_rows(
+            &pool,
+            &awa::model::queue_storage::DlqExpiry {
+                retention: Duration::ZERO,
+                limit: 1,
+                queue: None,
+                overridden_queues: &[],
+                stripe_families: true,
+                oldest_first: false,
+            },
+        )
         .await
         .expect("delete_expired_dlq_rows");
     assert_eq!(expired, 1);
@@ -29990,6 +30074,71 @@ async fn test_queue_storage_metadata_completion_validates_and_does_not_lock_comp
         assert_eq!(durable.tags, vec!["retained".to_string()]);
         assert_eq!(durable.metadata, serde_json::json!({"source": "recovery"}));
     }
+}
+
+/// Leave `count` rolled-back reservations on the lane: positions an enqueue
+/// reserved and never committed.
+async fn reserve_and_roll_back(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    count: i64,
+) {
+    let schema = store.schema();
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, 0::smallint, $3)"
+    )))
+    .bind(queue)
+    .bind(priority)
+    .bind(count)
+    .execute(&mut *tx)
+    .await
+    .expect("reserve lane positions");
+    tx.rollback().await.expect("roll back the reservation");
+}
+
+/// #779: a drain moves its lane's claim cursor across a run of rolled-back
+/// reservations longer than one window, so the drained lane stops pinning
+/// the queue ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_drain_moves_the_claim_cursor_across_rolled_back_reservations() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_ring_pin_store(&pool, "awa_qs_drain_gap").await;
+    let queue = "qs_drain_gap";
+
+    let first = enqueue_lane(&pool, &store, queue, 2, 1).await;
+    let claimed = claim_and_complete(&store, &pool, queue, 1, Duration::ZERO).await;
+    assert_eq!(claimed[0].job.id, first[0]);
+    reserve_and_roll_back(&pool, &store, queue, 2, 2_500).await;
+    let jobs = enqueue_lane(&pool, &store, queue, 2, 3).await;
+    let schema = store.schema();
+    let mut seqs = Vec::with_capacity(jobs.len());
+    for job_id in &jobs {
+        seqs.push(
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT lane_seq FROM {schema}.ready_entries
+                 WHERE job_id = $1 ORDER BY run_lease LIMIT 1"
+            )))
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read lane position"),
+        );
+    }
+    let start = claim_cursor_for(&pool, &store, queue, 2, 0).await;
+    assert!(seqs[0] - start >= 2_500, "the gap is wider than one window");
+
+    assert_eq!(
+        admin::drain_queue(&pool, queue).await.expect("drain queue"),
+        3
+    );
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, 2, 0).await,
+        seqs[2] + 1,
+        "a drain moves its lane's cursor across the gap and its cancelled rows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

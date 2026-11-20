@@ -584,6 +584,16 @@ pub async fn cleanup_dlq(
 ) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
     store
-        .delete_expired_dlq_rows(pool, retention, batch_size, queue, &[], true)
+        .delete_expired_dlq_rows(
+            pool,
+            &crate::queue_storage::DlqExpiry {
+                retention,
+                limit: batch_size,
+                queue,
+                overridden_queues: &[],
+                stripe_families: false,
+                oldest_first: true,
+            },
+        )
         .await
 }

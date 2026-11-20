@@ -6,6 +6,7 @@ use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
+use awa_model::queue_storage::DlqExpiry;
 use awa_model::{
     AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
     RescueBatch, RescueBatchOptions, RescueScanProgress, RescueSlotOrder, RotateOutcome,
@@ -4423,16 +4424,20 @@ impl MaintenanceService {
             .map(|(queue, _)| queue.as_str())
             .collect();
 
-        // Deleting through the store releases each row's unique claim.
+        // Deleting through the store releases each row's unique claim. A
+        // queue's stripes `q#N` follow `q`'s retention while it stripes.
         let global_result = runtime
             .store
             .delete_expired_dlq_rows(
                 &self.pool,
-                self.dlq_retention,
-                self.dlq_cleanup_batch_size,
-                None,
-                &override_queues,
-                false,
+                &DlqExpiry {
+                    retention: self.dlq_retention,
+                    limit: self.dlq_cleanup_batch_size,
+                    queue: None,
+                    overridden_queues: &override_queues,
+                    stripe_families: true,
+                    oldest_first: false,
+                },
             )
             .await;
 
@@ -4454,11 +4459,14 @@ impl MaintenanceService {
                 .store
                 .delete_expired_dlq_rows(
                     &self.pool,
-                    retention,
-                    self.dlq_cleanup_batch_size,
-                    Some(queue),
-                    &[],
-                    false,
+                    &DlqExpiry {
+                        retention,
+                        limit: self.dlq_cleanup_batch_size,
+                        queue: Some(queue),
+                        overridden_queues: &override_queues,
+                        stripe_families: true,
+                        oldest_first: false,
+                    },
                 )
                 .await
             {

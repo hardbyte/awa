@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use sqlx::Acquire;
 use sqlx::{FromRow, PgPool, Postgres, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -117,6 +117,10 @@ SELECT EXISTS (
 /// always treated as pinning regardless of age (they hold their snapshot
 /// indefinitely with no query in flight to bound it).
 const MVCC_HORIZON_PIN_MIN_AGE: Duration = Duration::from_secs(5);
+
+/// How long the job output column probe's catalog query may run once it has
+/// a connection.
+const JOB_OUTPUT_PROBE_QUERY_BUDGET: Duration = Duration::from_secs(10);
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -3339,6 +3343,189 @@ mod ready_segment_tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn concurrent_job_output_probes_share_one_catalog_read(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let probes = (0..16).map(|_| {
+            let (store, pool) = (store.clone(), pool.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&pool).await })
+        });
+        for probe in probes.collect::<Vec<_>>() {
+            assert!(probe.await.unwrap().unwrap());
+        }
+        assert_eq!(store.job_output_probe_count(), 1);
+    }
+
+    /// Callers waiting on a probe that fails do not each probe again, so an
+    /// unreachable database costs about one acquire timeout, not one per
+    /// waiting caller.
+    #[tokio::test]
+    async fn callers_waiting_on_a_failed_probe_fail_without_probing_again() {
+        use super::QueueStorageConfig;
+        use std::time::{Duration, Instant};
+
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(300))
+            .connect_lazy("postgres://awa@127.0.0.1:1/awa")
+            .unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let started = Instant::now();
+        let probes: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, pool) = (store.clone(), unreachable.clone());
+                tokio::spawn(async move { store.supports_job_output_from_pool(&pool).await })
+            })
+            .collect();
+        for probe in probes {
+            assert!(probe.await.unwrap().is_err());
+        }
+        assert!(
+            store.job_output_probe_count() < 8,
+            "waiting callers probed again: {} probes",
+            store.job_output_probe_count()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "eight callers took {:?}, about one acquire timeout each",
+            started.elapsed()
+        );
+    }
+
+    /// A probe whose catalog query stalls on an open connection gives up
+    /// after its budget instead of holding the single-flight lock while every
+    /// other pool caller waits behind it.
+    #[sqlx::test(migrations = false)]
+    async fn a_stalled_probe_query_releases_the_single_flight_lock(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::migrations::run(&pool).await.unwrap();
+        let options = (*pool.connect_options()).clone();
+        let (db_host, db_port) = (options.get_host().to_string(), options.get_port());
+
+        // A relay to the database that stops forwarding once `stall` is set,
+        // leaving the pool's connection open but unanswered.
+        let stall = std::sync::Arc::new(AtomicBool::new(false));
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        {
+            let stall = stall.clone();
+            tokio::spawn(async move {
+                while let Ok((client, _)) = relay.accept().await {
+                    let server = tokio::net::TcpStream::connect((db_host.as_str(), db_port))
+                        .await
+                        .unwrap();
+                    let (client_rx, client_tx) = client.into_split();
+                    let (server_rx, server_tx) = server.into_split();
+                    for (mut from, mut to) in [
+                        (
+                            Box::new(client_rx) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                            Box::new(server_tx) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                        ),
+                        (Box::new(server_rx) as _, Box::new(client_tx) as _),
+                    ] {
+                        let stall = stall.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                let read = match from.read(&mut buf).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(read) => read,
+                                };
+                                while stall.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                if to.write_all(&buf[..read]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        let relayed = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(300))
+            .test_before_acquire(false)
+            .connect_with(options.host("127.0.0.1").port(relay_port))
+            .await
+            .unwrap();
+        sqlx::query("SELECT 1").execute(&relayed).await.unwrap();
+        // Let the connection finish returning to the pool before stalling.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(relayed.num_idle(), 1);
+        stall.store(true, Ordering::SeqCst);
+
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let started = Instant::now();
+        let first = {
+            let (store, relayed) = (store.clone(), relayed.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&relayed).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waiter = {
+            let (store, relayed) = (store.clone(), relayed.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&relayed).await })
+        };
+        let limit = Duration::from_millis(300) + super::JOB_OUTPUT_PROBE_QUERY_BUDGET;
+        let first = tokio::time::timeout(limit + Duration::from_secs(5), first)
+            .await
+            .expect("a stalled probe must give up within its budget")
+            .unwrap();
+        assert!(first.is_err(), "{first:?}");
+        let waiter = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a caller waiting on the stalled probe must not wait again")
+            .unwrap();
+        assert!(waiter.is_err(), "{waiter:?}");
+        assert!(
+            started.elapsed() < limit + Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(store.job_output_probe_count(), 1);
+    }
+
+    /// A pool probe holding the single-flight lock while it waits for the
+    /// only connection must not block a transaction holding that connection
+    /// from probing on it.
+    #[sqlx::test(migrations = false)]
+    async fn a_transaction_probe_does_not_wait_for_a_pool_probe(pool: sqlx::PgPool) {
+        use super::QueueStorageConfig;
+        use std::time::Duration;
+
+        crate::migrations::run(&pool).await.unwrap();
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let mut tx = single.begin().await.unwrap();
+        let pool_probe = {
+            let (store, single) = (store.clone(), single.clone());
+            tokio::spawn(async move { store.supports_job_output_from_pool(&single).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let in_tx = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.supports_job_output(tx.as_mut()),
+        )
+        .await
+        .expect("the transaction's probe waited for the pool probe");
+        assert!(in_tx.unwrap());
+        tx.commit().await.unwrap();
+        assert!(pool_probe.await.unwrap().unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn enqueue_batch_writes_more_segments_than_the_old_bind_limit(pool: sqlx::PgPool) {
         use super::{QueueStorageConfig, RuntimeReadyRow};
         use crate::audited_sql;
@@ -3525,6 +3712,43 @@ impl DoneJobRow {
             original_run_lease: self.run_lease,
         }
     }
+}
+
+/// One pass of DLQ retention for [`QueueStorage::delete_expired_dlq_rows`].
+#[derive(Debug, Clone, Copy)]
+pub struct DlqExpiry<'a> {
+    /// Rows older than this are deleted.
+    pub retention: std::time::Duration,
+    /// At most this many rows are deleted.
+    pub limit: i64,
+    /// With a queue, the pass covers that queue; without one, every queue
+    /// except `overridden_queues`.
+    pub queue: Option<&'a str>,
+    /// Queues with a retention of their own. A pass without a queue leaves
+    /// them alone; a pass for a queue leaves its stripes that are listed here
+    /// alone.
+    pub overridden_queues: &'a [&'a str],
+    /// Treat a queue's stripes `q#N` as part of `q`, by the rule the store
+    /// routes with, while the store stripes its queues.
+    pub stripe_families: bool,
+    /// Delete in `(dlq_at, job_id)` order.
+    pub oldest_first: bool,
+}
+
+/// SQL that is true when `queue` is a stripe name of `logical`, by the rule
+/// `QueueStorage` routes with: `logical`, the stripe delimiter `#`, then a
+/// suffix that parses as `usize` (ASCII digits, an optional leading `+`, a
+/// value no greater than `usize_max`). The stripe count does not bound the
+/// suffix, so stripes left over from a larger former stripe count stay
+/// stripes, and a suffix too large for `usize` names an independent queue.
+fn stripe_of_sql(queue: &str, logical: &str, usize_max: &str) -> String {
+    let suffix = format!("substr({queue}, char_length({logical}) + 2)");
+    format!(
+        "(left({queue}, char_length({logical}) + 1) = {logical} || '#' \
+         AND CASE WHEN {suffix} ~ '^\\+?[0-9]+$' \
+                  THEN ltrim({suffix}, '+')::numeric <= {usize_max}::numeric \
+                  ELSE false END)"
+    )
 }
 
 /// The unique-claim fields of a deleted DLQ row.
@@ -4089,6 +4313,13 @@ pub struct QueueStorage {
     /// Whether this schema has migration v052's output columns (ADR-048),
     /// and when that was last checked.
     job_output_columns: Mutex<Option<(bool, std::time::Instant)>>,
+    /// Held while one caller probes for the output columns, so concurrent
+    /// cache misses wait for its answer instead of probing on their own.
+    job_output_probe: tokio::sync::Mutex<()>,
+    /// When a pool probe last failed, so callers that waited on it fail at
+    /// once instead of each probing again during an outage.
+    job_output_probe_failed_at: Mutex<Option<std::time::Instant>>,
+    job_output_probes: AtomicU64,
 }
 
 /// How long a negative answer about the output columns is trusted before
@@ -4145,6 +4376,9 @@ impl QueueStorage {
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
             cancel_phase_hook: CancelPhaseHookSlot(None),
             job_output_columns: Mutex::new(None),
+            job_output_probe: tokio::sync::Mutex::new(()),
+            job_output_probe_failed_at: Mutex::new(None),
+            job_output_probes: AtomicU64::new(0),
         })
     }
 
@@ -4165,19 +4399,90 @@ impl QueueStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// How many catalog probes [`Self::supports_job_output`] has run.
+    #[doc(hidden)]
+    pub fn job_output_probe_count(&self) -> u64 {
+        self.job_output_probes.load(Ordering::Relaxed)
+    }
+
+    fn cached_job_output_columns(&self) -> Option<bool> {
+        let cached = *self
+            .job_output_columns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached.and_then(|(supported, checked_at)| {
+            (supported || checked_at.elapsed() < JOB_OUTPUT_PROBE_INTERVAL).then_some(supported)
+        })
+    }
+
+    /// Whether this schema has migration v052's job output columns.
+    ///
+    /// This probes on `executor` whenever the cache misses, without waiting
+    /// for a concurrent probe: a caller inside a transaction must not wait on
+    /// a pool probe that may need its connection. Pool callers should use
+    /// [`Self::supports_job_output_from_pool`].
     pub async fn supports_job_output<'e, E>(&self, executor: E) -> Result<bool, AwaError>
     where
         E: sqlx::PgExecutor<'e>,
     {
-        if let Some((supported, checked_at)) = *self
-            .job_output_columns
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        self.probe_job_output_columns(executor).await
+    }
+
+    /// [`Self::supports_job_output`] for a pool caller: concurrent cache
+    /// misses wait for one probe instead of each taking a connection for
+    /// their own. The probe holds the single-flight lock while it waits for a
+    /// connection; transaction callers never wait on that lock, so the
+    /// connection they hold is always released. A caller that waited while
+    /// the probe failed gets a retryable error at once rather than probing
+    /// again, so an outage costs one probe's wait rather than one per caller.
+    /// The probe gets the pool's acquire timeout plus
+    /// `JOB_OUTPUT_PROBE_QUERY_BUDGET`; a probe whose query stalls on an open
+    /// connection fails then, so it cannot hold the lock indefinitely.
+    pub async fn supports_job_output_from_pool(&self, pool: &PgPool) -> Result<bool, AwaError> {
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        let waiting_since = std::time::Instant::now();
+        let _probe = self.job_output_probe.lock().await;
+        if let Some(supported) = self.cached_job_output_columns() {
+            return Ok(supported);
+        }
+        let failed_while_waiting = self
+            .job_output_probe_failed_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            if supported || checked_at.elapsed() < JOB_OUTPUT_PROBE_INTERVAL {
-                return Ok(supported);
-            }
+            .is_some_and(|failed_at| failed_at >= waiting_since);
+        if failed_while_waiting {
+            return Err(AwaError::Database(sqlx::Error::Protocol(
+                "the job output column probe failed while this call waited for it".into(),
+            )));
         }
+        let deadline = pool.options().get_acquire_timeout() + JOB_OUTPUT_PROBE_QUERY_BUDGET;
+        let probed = match tokio::time::timeout(deadline, self.probe_job_output_columns(pool)).await
+        {
+            Ok(probed) => probed,
+            Err(_) => Err(AwaError::Database(sqlx::Error::Protocol(format!(
+                "the job output column probe did not finish within {deadline:?}"
+            )))),
+        };
+        if probed.is_err() {
+            *self
+                .job_output_probe_failed_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::time::Instant::now());
+        }
+        probed
+    }
+
+    async fn probe_job_output_columns<'e, E>(&self, executor: E) -> Result<bool, AwaError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        self.job_output_probes.fetch_add(1, Ordering::Relaxed);
         let supported: bool = sqlx::query_scalar(
             r#"
             SELECT count(*) = 2
@@ -8484,24 +8789,39 @@ impl QueueStorage {
 
         let now = Utc::now();
         if !claimed.is_empty() && lease.needs_refresh(now, lease_ttl, idle_threshold) {
-            let still_owned = self
+            // The claim has committed, so a failed refresh leaves the claimed
+            // jobs with this runtime; the cached lease is dropped instead.
+            let refreshed = match self
                 .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
-                .await?;
-            if still_owned {
-                let refreshed = QueueClaimerLeaseRow {
-                    last_claimed_at: now,
-                    expires_at: now
-                        + TimeDelta::from_std(lease_ttl).map_err(|err| {
-                            AwaError::Validation(format!("invalid claimer lease ttl: {err}"))
-                        })?,
-                    ..lease
-                };
-                self.cache_claimer_gate(gate_key, refreshed);
-            } else {
-                self.claimer_gates
-                    .lock()
-                    .expect("claimer gate cache poisoned")
-                    .remove(&gate_key);
+                .await
+            {
+                Ok(true) => TimeDelta::from_std(lease_ttl)
+                    .ok()
+                    .map(|ttl| QueueClaimerLeaseRow {
+                        last_claimed_at: now,
+                        expires_at: now + ttl,
+                        ..lease
+                    }),
+                Ok(false) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        queue,
+                        claimed = claimed.len(),
+                        "failed to refresh the queue claimer lease after a committed claim; \
+                         dispatching the claimed jobs"
+                    );
+                    None
+                }
+            };
+            match refreshed {
+                Some(refreshed) => self.cache_claimer_gate(gate_key, refreshed),
+                None => {
+                    self.claimer_gates
+                        .lock()
+                        .expect("claimer gate cache poisoned")
+                        .remove(&gate_key);
+                }
             }
         }
 
@@ -11783,17 +12103,18 @@ impl QueueStorage {
             // column behind OFFSET 0, so it is not pushed down as a NOT EXISTS,
             // for the reason given in `cancel_available_chunk_tx`. A gap before a visible row
             // is an enqueue that rolled back: enqueues on a lane commit in
-            // position order.
+            // position order. So each window starts at the lane's first
+            // visible row at or after the cursor, however many rolled-back
+            // positions lie before it.
             let unfinished: Vec<(String, i16, i16)> = sqlx::query_as(audited_sql(format!(
                 r#"
-                WITH windows AS (
+                WITH cursors AS (
                     SELECT
                         lanes.queue,
                         lanes.priority,
                         lanes.enqueue_shard,
                         claims.seq_name,
                         {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                        LEAST({schema}.sequence_next_value(claims.seq_name) + $5, lanes.to_seq) AS window_end,
                         lanes.to_seq
                     FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[])
                         AS lanes(queue, priority, enqueue_shard, to_seq)
@@ -11801,6 +12122,39 @@ impl QueueStorage {
                       ON claims.queue = lanes.queue
                      AND claims.priority = lanes.priority
                      AND claims.enqueue_shard = lanes.enqueue_shard
+                ),
+                windows AS (
+                    SELECT
+                        cursors.*,
+                        LEAST(first_visible.lane_seq + $5, cursors.to_seq) AS window_end
+                    FROM cursors
+                    -- A lane's segments cover disjoint position ranges, so
+                    -- the first segment in position order with a visible row
+                    -- at or after the cursor holds the lane's first one.
+                    JOIN LATERAL (
+                        SELECT head.lane_seq
+                        FROM {schema}.ready_segments AS segment
+                        CROSS JOIN LATERAL (
+                            SELECT ready.lane_seq
+                            FROM {schema}.ready_entries AS ready
+                            WHERE ready.ready_slot = segment.ready_slot
+                              AND ready.ready_generation = segment.ready_generation
+                              AND ready.queue = cursors.queue
+                              AND ready.priority = cursors.priority
+                              AND ready.enqueue_shard = cursors.enqueue_shard
+                              AND ready.lane_seq >= GREATEST(segment.first_lane_seq, cursors.claim_seq)
+                              AND ready.lane_seq < LEAST(segment.next_lane_seq, cursors.to_seq)
+                            ORDER BY ready.lane_seq
+                            LIMIT 1
+                        ) AS head
+                        WHERE segment.queue = cursors.queue
+                          AND segment.priority = cursors.priority
+                          AND segment.enqueue_shard = cursors.enqueue_shard
+                          AND segment.next_lane_seq > cursors.claim_seq
+                          AND segment.first_lane_seq < cursors.to_seq
+                        ORDER BY segment.next_lane_seq
+                        LIMIT 1
+                    ) AS first_visible ON TRUE
                 ),
                 scanned AS (
                     SELECT
@@ -14795,6 +15149,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(slot)
             .bind(cutoff)
             .bind(scan_limit)
@@ -15035,6 +15390,7 @@ impl QueueStorage {
                 (SELECT rescue_cursor_run_lease FROM advance_cursor)
             "#
         )))
+        .persistent(false)
         .bind(slot)
         .bind(cutoff)
         .bind(scan_limit)
@@ -15339,6 +15695,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(slot)
             .bind(scan_limit)
             .bind(rescue_limit)
@@ -15460,6 +15817,7 @@ impl QueueStorage {
                 (SELECT deadline_cursor_run_lease FROM advance_cursor)
             "#
         )))
+        .persistent(false)
         .bind(slot)
         .bind(scan_limit)
         .bind(rescue_limit)
@@ -15728,6 +16086,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(slot)
             .bind(scan_limit)
             .bind(rescue_limit)
@@ -15891,6 +16250,7 @@ impl QueueStorage {
                 (SELECT 0::bigint FROM advance_cursor)
             "#
         )))
+        .persistent(false)
         .bind(slot)
         .bind(scan_limit)
         .bind(rescue_limit)
@@ -16061,7 +16421,7 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
         let schema = self.schema();
-        let output_column = if include_output && self.supports_job_output(pool).await? {
+        let output_column = if include_output && self.supports_job_output_from_pool(pool).await? {
             ",\n                output"
         } else {
             ""
@@ -19050,26 +19410,26 @@ impl QueueStorage {
         Ok(!deleted.is_empty())
     }
 
-    /// Delete up to `limit` DLQ rows older than `retention`, releasing their
-    /// unique claims, and return how many were deleted. `queue` keeps the
-    /// delete to one queue; `exclude_queues` leaves those queues alone.
-    /// With `oldest_first`, rows go in `(dlq_at, job_id)` order.
+    /// Delete up to `expiry.limit` DLQ rows older than `expiry.retention`,
+    /// releasing their unique claims, and return how many were deleted. See
+    /// [`DlqExpiry`] for which rows a pass covers.
     pub async fn delete_expired_dlq_rows(
         &self,
         pool: &PgPool,
-        retention: std::time::Duration,
-        limit: i64,
-        queue: Option<&str>,
-        exclude_queues: &[&str],
-        oldest_first: bool,
+        expiry: &DlqExpiry<'_>,
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
-        let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
-        let order = if oldest_first {
+        let retention_secs = i64::try_from(expiry.retention.as_secs()).unwrap_or(i64::MAX);
+        let order = if expiry.oldest_first {
             "ORDER BY dlq_at ASC, job_id ASC"
         } else {
             ""
         };
+        // A stripe `q#N` belongs to `q`'s family only while this store
+        // stripes its queues; otherwise `q#N` is a queue of its own.
+        let stripes = expiry.stripe_families && self.queue_stripe_count() > 1;
+        let stripe_of_queue = stripe_of_sql("queue", "$3", "$6");
+        let stripe_of_overridden = stripe_of_sql("dlq_entries.queue", "overridden.queue", "$6");
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -19077,8 +19437,20 @@ impl QueueStorage {
             WHERE job_id IN (
                 SELECT job_id FROM {schema}.dlq_entries
                 WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-                  AND ($3::text IS NULL OR queue = $3)
-                  AND queue <> ALL($4::text[])
+                  AND (
+                      $3::text IS NULL
+                      OR queue = $3
+                      -- A stripe with an override of its own keeps it.
+                      OR ($5::boolean AND {stripe_of_queue} AND queue <> ALL($4::text[]))
+                  )
+                  AND (
+                      $3::text IS NOT NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM unnest($4::text[]) AS overridden(queue)
+                          WHERE dlq_entries.queue = overridden.queue
+                             OR ($5::boolean AND {stripe_of_overridden})
+                      )
+                  )
                 {order}
                 LIMIT $2
             )
@@ -19086,9 +19458,11 @@ impl QueueStorage {
             "#
         )))
         .bind(retention_secs)
-        .bind(limit)
-        .bind(queue)
-        .bind(exclude_queues)
+        .bind(expiry.limit)
+        .bind(expiry.queue)
+        .bind(expiry.overridden_queues)
+        .bind(stripes)
+        .bind(usize::MAX.to_string())
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -21212,6 +21586,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(generation)
             .fetch_one(pool)
             .await

@@ -136,42 +136,72 @@ impl Drop for InFlightGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::QueueRegistry;
-    use crate::persona_soak::config::Persona;
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use super::*;
+    use crate::ci_timing::scaled_timeout;
+    use std::sync::{mpsc, Barrier};
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn lookups_and_registrations_do_not_deadlock() {
+    fn concurrent_registration_and_striped_lookup_complete() {
         let registry = Arc::new(QueueRegistry::default());
-        registry.register("awa_soak_registry_0", Persona::Mia, false);
-        let (done_tx, done_rx) = mpsc::channel();
-        let registering = {
+        let seed = registry.register("seed", Persona::Mia, true);
+        assert!(Arc::ptr_eq(&seed, &registry.get("seed#7").unwrap()));
+        assert!(registry.get("seed#bad").is_none());
+        assert!(registry.get("missing").is_none());
+        let duplicate = registry.register("seed", Persona::Tom, false);
+        assert!(Arc::ptr_eq(&seed, &duplicate));
+        assert!(duplicate.persona == Persona::Mia && duplicate.rate_limited);
+        let barrier = Arc::new(Barrier::new(9));
+        let (done, completed) = mpsc::channel();
+        let mut threads = Vec::new();
+        for worker in 0..8 {
             let registry = registry.clone();
-            let done_tx = done_tx.clone();
-            std::thread::spawn(move || {
-                for index in 1..20_000 {
-                    registry.register(&format!("awa_soak_registry_{index}"), Persona::Mia, false);
+            let seed = seed.clone();
+            let barrier = barrier.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                if worker < 4 {
+                    for number in 0..2_000 {
+                        let name = format!("queue-{worker}-{number}");
+                        let queue = registry.register(&name, Persona::Tom, false);
+                        assert!(Arc::ptr_eq(&queue, &registry.get(&name).unwrap()));
+                        assert!(Arc::ptr_eq(
+                            &queue,
+                            &registry.get(&format!("{name}#2")).unwrap()
+                        ));
+                        assert!(Arc::ptr_eq(
+                            &queue,
+                            &registry.by_index(queue.index).unwrap()
+                        ));
+                    }
+                } else {
+                    for number in 0..20_000 {
+                        assert!(Arc::ptr_eq(&seed, &registry.get("seed#3").unwrap()));
+                        let name = format!("queue-{}-{}", number % 4, number % 2_000);
+                        if let Some(queue) = registry.get(&name) {
+                            assert_eq!(queue.name, name);
+                            assert!(Arc::ptr_eq(
+                                &queue,
+                                &registry.by_index(queue.index).unwrap()
+                            ));
+                        }
+                    }
                 }
-                let _ = done_tx.send(());
-            })
-        };
-        let looking_up = {
-            let registry = registry.clone();
-            std::thread::spawn(move || {
-                for _ in 0..200_000 {
-                    assert!(registry.get("awa_soak_registry_0#1").is_some());
-                }
-                let _ = done_tx.send(());
-            })
-        };
-        for _ in 0..2 {
-            done_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("register and get finish without deadlocking");
+                done.send(()).unwrap();
+            }));
         }
-        registering.join().unwrap();
-        looking_up.join().unwrap();
+        drop(done);
+        barrier.wait();
+        let deadline = Instant::now() + scaled_timeout(Duration::from_secs(30));
+        for _ in 0..8 {
+            completed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("concurrent register/get must complete before the deadline");
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(registry.all().len(), 8_001);
     }
 }

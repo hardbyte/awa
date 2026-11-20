@@ -74,8 +74,8 @@ impl Worker for SharedQueueWorker {
             return Err(JobError::retryable_msg("interrupted"));
         }
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Python, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }
@@ -130,6 +130,19 @@ fn spawn_process(
                 .to_string(),
         )
         .env("SOAK_ROLE", role)
+        .env("SOAK_PG_APPLICATION_NAME", application_name)
+        .env(
+            super::super::gate_proof::ENV_ENABLED,
+            if shared.gate_proof.get().is_some() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            super::super::gate_proof::ENV_URL,
+            super::super::gate_proof::GateProof::owned_url(shared),
+        )
         .env(
             "SOAK_DRAIN",
             if shared.load_stop.is_stopped() {
@@ -176,9 +189,27 @@ fn spawn_process(
         let shared = shared.clone();
         let probe_phase = probe_phase.clone();
         let application_name = application_name.to_string();
+        let instrumented_output = shared.gate_proof.get().is_some()
+            || std::env::var_os(super::super::gate_metrics::ENV_ENDPOINT).is_some();
+        let output_guard =
+            instrumented_output.then(super::super::worker_errors::child_output_guard);
         tokio::spawn(async move {
+            let _output_guard = output_guard;
             let mut lines = BufReader::new(stream).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => {
+                        if instrumented_output {
+                            shared.incomplete(
+                                format!("Python instrumentation output read failed: {error}"),
+                                vec![],
+                            );
+                        }
+                        break;
+                    }
+                };
                 if let (Some(phase), Some(marker)) = (&probe_phase, Phase::marker(&line)) {
                     // A close marker alone does not prove migrate-and-query
                     // reached readiness. IDLE also follows that completed call.
@@ -196,6 +227,12 @@ fn spawn_process(
 
 /// Turns the interesting stdout lines of the Python process into report counters.
 fn absorb_output(shared: &Shared, line: &str) {
+    if super::super::gate_proof::absorb_error(shared, line) {
+        return;
+    }
+    if super::super::gate_metrics::absorb_output(shared, line) {
+        return;
+    }
     let stats = shared.stats(Persona::Python);
     let field = |name: &str| {
         line.split_whitespace()
@@ -501,7 +538,7 @@ async fn migrate_probe(shared: &Arc<Shared>, python: &PathBuf, ledger_path: &Pat
     };
     let pool = match super::super::db::connect_pool(
         &shared.config.database_url,
-        "soak_python_probe_watch",
+        "awa_python_probe_watch",
         1,
     )
     .await
@@ -639,7 +676,7 @@ pub async fn run(shared: Arc<Shared>) -> Result<(), String> {
     shared.note("python", format!("{} started; queues {QUEUE_WORK}, {QUEUE_DEADLINE}, {QUEUE_SHARED} (shared with a Rust runtime)", python.display()));
 
     let tail_pool =
-        super::super::db::connect_pool(&shared.config.database_url, "soak_python_tail", 1)
+        super::super::db::connect_pool(&shared.config.database_url, "awa_python_tail", 1)
             .await
             .map_err(|error| error.to_string())?;
     let mut tail_tick = 0u64;
@@ -798,7 +835,7 @@ async fn check_rolled_back(shared: &Arc<Shared>, ids: &HashSet<i64>) -> Result<(
         .queue_storage_schema
         .clone()
         .unwrap_or_else(|| "awa".into());
-    let pool = super::super::db::connect_pool(&shared.config.database_url, "soak_python_check", 1)
+    let pool = super::super::db::connect_pool(&shared.config.database_url, "awa_python_check", 1)
         .await
         .map_err(|error| error.to_string())?;
     let ids: Vec<i64> = ids.iter().copied().collect();

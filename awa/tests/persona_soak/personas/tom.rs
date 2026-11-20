@@ -5,7 +5,7 @@
 use super::super::config::Persona;
 use super::super::db::{connect_pool, ClientFactory};
 use super::super::fleet::Fleet;
-use super::super::ledger::{expect, flag, JobRecord};
+use super::super::ledger::{expect, JobRecord};
 use super::super::rng::Rng;
 use super::super::shared::Shared;
 use super::{attach_events, backoff, register_rows, tune};
@@ -48,8 +48,8 @@ impl Worker for TomWorker {
             return Err(JobError::retryable_msg("interrupted"));
         }
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::Tom, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }

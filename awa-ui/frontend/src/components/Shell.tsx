@@ -1,7 +1,8 @@
 import { refreshAll, getReadStatus, subscribeReadStatus, observationPolicy } from "@/lib/observation/coordinator";
 import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { Outlet, useRouterState, useNavigate } from "@tanstack/react-router";
+import { Outlet, useRouter, useRouterState, useNavigate } from "@tanstack/react-router";
+import { isExternalHref } from "@/lib/base-path";
 import {
   Link as AriaLink,
   RouterProvider as AriaRouterProvider,
@@ -351,6 +352,7 @@ const NAV_ITEMS = [
 ] as const;
 
 export function Shell() {
+  const router = useRouter();
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;
   const navigate = useNavigate();
@@ -410,7 +412,10 @@ export function Shell() {
   const [sidebarOpen, setSidebarOpen] = useSidebarOpenState();
 
   return (
-    <AriaRouterProvider navigate={ariaNavigate}>
+    <AriaRouterProvider
+      navigate={ariaNavigate}
+      useHref={(to) => isExternalHref(to) ? to : router.buildLocation({ to }).href}
+    >
     <SidebarProvider
       isOpen={sidebarOpen}
       onOpenChange={setSidebarOpen}
