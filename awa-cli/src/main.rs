@@ -101,18 +101,27 @@ fn print_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
 /// gave up on held rows. Exits 1 when the run gave up on rows another
 /// transaction held, otherwise 2 when it skipped rows over a unique
 /// conflict.
-fn finish_bulk(run: &awa_model::BulkRun, verb: &str, noun: &str) {
+async fn finish_bulk(pool: &sqlx::PgPool, run: &awa_model::BulkRun, verb: &str, noun: &str) {
     print_bulk(run, verb, noun);
-    if run.busy_timed_out {
+    let code = if run.busy_timed_out {
         eprintln!(
             "Every remaining matching row stayed held by another transaction past the busy timeout; stopping. Rerun once it finishes."
         );
-        std::process::exit(1);
-    }
-    if run.skipped > 0 {
-        std::process::exit(2);
-    }
+        1
+    } else if run.skipped > 0 {
+        2
+    } else {
+        return;
+    };
+    // The batches that did commit woke their queues; send those wake-ups
+    // before exiting.
+    awa_model::flush_wakeups(pool, CLI_WAKEUP_FLUSH_TIMEOUT).await;
+    std::process::exit(code);
 }
+
+/// How long a CLI command waits for its pending queue wake-ups to be sent
+/// before the process exits.
+const CLI_WAKEUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(
@@ -963,6 +972,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .connect(&db_url)
                 .await?;
 
+            // Run the command in a block so its queue wake-ups are sent
+            // whether it succeeds or fails after earlier batches committed.
+            let outcome: Result<(), Box<dyn std::error::Error>> = async {
             match command {
                 Commands::Migrate { .. } | Commands::Serve { .. } | Commands::Callbacks { .. } => {
                     unreachable!()
@@ -1024,7 +1036,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             unreachable!("clap requires exactly one retry-failed filter")
                         };
-                        finish_bulk(&run, "Retried", "failed jobs");
+                        finish_bulk(&pool, &run, "Retried", "failed jobs").await;
                     }
 
                     JobCommands::Discard { kind, bulk } => {
@@ -1039,7 +1051,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             |_| {},
                         )
                         .await?;
-                        finish_bulk(&run, "Discarded", &noun);
+                        finish_bulk(&pool, &run, "Discarded", &noun).await;
                     }
 
                     JobCommands::List {
@@ -1194,7 +1206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 |count| metrics.record_dlq_retried(queue.as_deref(), count),
                             )
                             .await?;
-                            finish_bulk(&run, "Retried", "DLQ rows");
+                            finish_bulk(&pool, &run, "Retried", "DLQ rows").await;
                         }
                         DlqCommands::Move {
                             kind,
@@ -1232,7 +1244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                             )
                             .await?;
-                            finish_bulk(&run, "Moved", "failed jobs into the DLQ");
+                            finish_bulk(&pool, &run, "Moved", "failed jobs into the DLQ").await;
                         }
                         DlqCommands::Purge {
                             kind,
@@ -1259,7 +1271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 |count| metrics.record_dlq_purged(queue.as_deref(), count),
                             )
                             .await?;
-                            finish_bulk(&run, "Purged", "DLQ rows");
+                            finish_bulk(&pool, &run, "Purged", "DLQ rows").await;
                         }
                     }
                 }
@@ -1637,7 +1649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             |_| {},
                         )
                         .await?;
-                        finish_bulk(&run, "Drained", &noun);
+                        finish_bulk(&pool, &run, "Drained", &noun).await;
                     }
                     QueueCommands::Stats => {
                         let stats = awa_model::admin::queue_overviews(&pool).await?;
@@ -1676,11 +1688,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
             }
+            Ok(())
+            }
+            .await;
 
             // Retries and other commands commit and leave their queues'
             // wake-ups to be sent in the background; send them before the
             // process exits so running workers claim the jobs now.
-            awa_model::flush_wakeups(&pool, Duration::from_secs(1)).await;
+            awa_model::flush_wakeups(&pool, CLI_WAKEUP_FLUSH_TIMEOUT).await;
+            outcome?;
         }
     }
 
