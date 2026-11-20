@@ -2782,7 +2782,7 @@
 <td style="text-align: right;">045</td>
 <td><a href="045-hot-path-trigger-lock-contract/">Hot-path triggers never wait on another transaction</a></td>
 <td>Triggers on the canonical hot tables may write only append-only, unconstrained mark tables or the job's own unique claim; the maintenance path never truncates; the contract is an executable test and a TLA+ witness (v046, 0.6 patch).</td>
-<td></td>
+<td><span class="awa-status awa-status--superseded">Superseded by 053</span></td>
 </tr>
 <tr>
 <td style="text-align: right;">046</td>
@@ -2825,6 +2825,12 @@
 <td><a href="052-runtime-halt/">Scoped runtime controls</a></td>
 <td>Permanent reclamation cap and an independently reviewable prune gate; full scoped controls remain proposed.</td>
 <td><span class="awa-status awa-status--proposed">Proposed</span></td>
+</tr>
+<tr>
+<td style="text-align: right;">053</td>
+<td><a href="053-coordination-off-the-commit-path/">Coordination stays off the commit path</a></td>
+<td>A job transition never waits on another transaction's coordination work, and coordination that changes nothing writes nothing and, in steady state, locks nothing: hot-path triggers write only append-only marks, wake-ups are coalesced and sent after commit, and coordination state is written only on change. Supersedes 045. Amends 033's grant-close wake-up. Wake-ups from caller-owned transactions (with #342, 0.8) and adaptive backoff are proposed.</td>
+<td></td>
 </tr>
 </tbody>
 </table>
