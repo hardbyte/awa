@@ -1570,6 +1570,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_completions_of_one_job_under_distinct_leases_are_fatal() {
+        let run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete");
+        // A stale attempt and its replacement both commit: one job, two run leases, each
+        // completed once.
+        sqlx::query("INSERT INTO public.awa_soak_completed_inserts(job_id,run_lease,attempt,queue,writer_shape)
+                     SELECT job_id,run_lease+1,attempt+1,queue,writer_shape FROM public.awa_soak_completed_inserts")
+            .execute(&run.pool).await.expect("inject a second attempt's completion");
+        super::super::gate_proof::reconcile(&run.shared).await;
+        assert_eq!(run.shared.run.get("gate_completed_insert_rows"), 2);
+        assert_eq!(run.shared.run.get("gate_completed_unique_pairs"), 2);
+        assert_eq!(run.shared.run.get("gate_completed_unique_jobs"), 1);
+        let violations = run.shared.violations.lock().expect("violations").clone();
+        let duplicate = violations
+            .iter()
+            .find(|row| row.kind == "duplicate_completed_jobs")
+            .expect("a job completed under two run leases is fatal");
+        let row: serde_json::Value =
+            serde_json::from_str(&duplicate.rows[0]).expect("violation row is JSON");
+        assert_eq!(duplicate.rows.len(), 1);
+        assert_eq!(row["job_id"], run.claim.job.id);
+        assert_eq!(
+            row["run_leases"],
+            serde_json::json!([run.claim.job.run_lease, run.claim.job.run_lease + 1])
+        );
+        assert!(!violations
+            .iter()
+            .any(|row| row.kind == "duplicate_completed_inserts"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
     async fn completion_stall_gives_up_on_a_held_lock_instead_of_hanging() {
         let run = TestRun::create_configured(true, true, |config| {
             config.load = Duration::ZERO;

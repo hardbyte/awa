@@ -12,10 +12,18 @@ use tokio::runtime::Handle;
 pub const ENV_ENABLED: &str = "AWA_SOAK_GATE_PROOF";
 pub const ENV_URL: &str = "AWA_SOAK_GATE_PROOF_URL";
 pub const ERROR_MARKER: &str = "AWA_SOAK_GATE_PROOF_INCOMPLETE";
-const TIMEOUT: Duration = Duration::from_secs(2);
-const WITNESS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 100_000;
 const MAX_ROWS: i64 = 100_001;
+
+/// Budget of one proof query or pool connection; loosened on CI like the soak's other waits.
+fn query_timeout() -> Duration {
+    crate::ci_timing::scaled_timeout(Duration::from_secs(2))
+}
+
+/// Budget of one witness write, from dispatch to commit.
+fn witness_write_timeout() -> Duration {
+    crate::ci_timing::scaled_timeout(Duration::from_secs(5))
+}
 
 type WitnessStats = Arc<Mutex<HashMap<&'static str, i64>>>;
 
@@ -103,7 +111,7 @@ impl GateProof {
         statement_timeout: Duration,
     ) -> Result<Self, String> {
         let pool = tokio::time::timeout(
-            TIMEOUT,
+            query_timeout(),
             super::db::connect_pool_with_timeout(
                 url,
                 application,
@@ -142,7 +150,7 @@ impl GateProof {
             &Self::owned_url(shared),
             audit_connections,
             "awa_gate_proof_parent_audit",
-            TIMEOUT,
+            query_timeout(),
         )
         .await?;
         proof.write_pool = Some(
@@ -150,7 +158,7 @@ impl GateProof {
                 &Self::owned_url(shared),
                 witness_connections,
                 "awa_gate_proof_parent_witness",
-                WITNESS_WRITE_TIMEOUT,
+                witness_write_timeout(),
             )
             .await?
             .pool,
@@ -183,7 +191,7 @@ impl GateProof {
             ),
         ] {
             let coverage: (i64, i64) = tokio::time::timeout(
-                TIMEOUT,
+                query_timeout(),
                 sqlx::query_as(
                     "SELECT count(*),count(*) FILTER(WHERE EXISTS(
                    SELECT 1 FROM pg_trigger AS installed
@@ -202,7 +210,7 @@ impl GateProof {
                 return Err(format!("proof trigger coverage incomplete: {coverage:?}"));
             }
         }
-        let persistent: i64=tokio::time::timeout(TIMEOUT,sqlx::query_scalar(
+        let persistent: i64=tokio::time::timeout(query_timeout(),sqlx::query_scalar(
             "SELECT count(*) FROM pg_class
              WHERE oid IN ('public.awa_soak_handler_returns'::regclass,'public.awa_soak_completed_inserts'::regclass)
                AND relpersistence='p'"
@@ -212,7 +220,7 @@ impl GateProof {
             return Err("proof tables are not both logged".into());
         }
         let quiet: i64 = tokio::time::timeout(
-            TIMEOUT,
+            query_timeout(),
             sqlx::query_scalar(
                 "SELECT count(*) FROM pg_class AS proof
                  JOIN pg_class AS toast ON toast.oid=proof.reltoastrelid
@@ -233,7 +241,7 @@ impl GateProof {
             return Err("proof heaps and TOAST tables must explicitly disable autovacuum".into());
         }
         let trusted: i64 = tokio::time::timeout(
-            TIMEOUT,
+            query_timeout(),
             sqlx::query_scalar(
                 "SELECT count(*) FROM pg_proc
              WHERE oid IN ('public.awa_soak_audit_done_insert()'::regprocedure,
@@ -270,7 +278,7 @@ impl GateProof {
         }
         let url = std::env::var(ENV_URL)
             .map_err(|_| "owned proof URL not passed to child".to_string())?;
-        Self::connect(&url, 1, "awa_gate_proof_child", WITNESS_WRITE_TIMEOUT)
+        Self::connect(&url, 1, "awa_gate_proof_child", witness_write_timeout())
             .await
             .map(Some)
     }
@@ -278,7 +286,7 @@ impl GateProof {
     pub async fn returned_completed(&self, job: &JobRow, persona: &str) -> Result<(), String> {
         let pool = self.write_pool.as_ref().unwrap_or(&self.pool).clone();
         let started = Instant::now();
-        let deadline_at = tokio::time::Instant::now() + WITNESS_WRITE_TIMEOUT;
+        let deadline_at = tokio::time::Instant::now() + witness_write_timeout();
         let pool_size = pool.size();
         let pool_idle = pool.num_idle();
         let job_id = job.id;
@@ -336,7 +344,7 @@ impl GateProof {
     }
 
     pub async fn close(&self) -> Result<(), String> {
-        tokio::time::timeout(TIMEOUT, async {
+        tokio::time::timeout(query_timeout(), async {
             tokio::join!(self.pool.close(), async {
                 if let Some(pool) = &self.write_pool {
                     pool.close().await;
@@ -390,7 +398,7 @@ pub async fn observe(shared: &Shared) {
     let schema = shared.info.queue_storage_schema.as_deref().unwrap_or("awa");
     let started = Instant::now();
     shared.run.add("gate_proof_observer_queries", 1);
-    let rows=tokio::time::timeout(TIMEOUT,sqlx::query_as::<_,(i64,i64,String)>(awa::audited_sql(format!(
+    let rows=tokio::time::timeout(query_timeout(),sqlx::query_as::<_,(i64,i64,String)>(awa::audited_sql(format!(
         "WITH pending AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::boolean[]) AS refs(job_id,run_lease,no_events))
          SELECT DISTINCT audit.job_id,audit.run_lease,'completed'::text
          FROM public.awa_soak_completed_inserts AS audit JOIN pending ON audit.job_id=pending.job_id
@@ -436,7 +444,7 @@ pub async fn check_lease_duplicates(shared: &Shared) {
     let started = Instant::now();
     shared.run.add("gate_proof_lease_snapshot_queries", 1);
     let result = tokio::time::timeout(
-        TIMEOUT,
+        query_timeout(),
         sqlx::query_as::<_, (i64, i64, i64)>(awa::audited_sql(format!(
             "SELECT job_id,run_lease,count(*) FROM {schema}.leases
          GROUP BY job_id,run_lease HAVING count(*)>1 ORDER BY job_id,run_lease LIMIT 25"
@@ -476,66 +484,101 @@ pub async fn check_lease_duplicates(shared: &Shared) {
     }
 }
 
+/// Up to 25 rows of committed-completion evidence that breaks an invariant, as JSON text.
+/// A failed read leaves the violation without rows and marks the proof incomplete.
+async fn duplicate_details(
+    shared: &Shared,
+    pool: &PgPool,
+    deadline: tokio::time::Instant,
+    sql: &'static str,
+) -> Vec<String> {
+    match tokio::time::timeout_at(
+        deadline,
+        sqlx::query_scalar::<_, String>(sql).fetch_all(pool),
+    )
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        failure => {
+            let message =
+                format!("full completion proof duplicate details incomplete: {failure:?}");
+            shared.note("gate_proof", message.clone());
+            shared.incomplete(message, vec![]);
+            vec![]
+        }
+    }
+}
+
+/// Final reconciliation of the witnesses. A job commits a completion at most once: one
+/// insert per attempt pair, and one attempt pair per job, since a completed job never
+/// runs again. Two completed pairs for a job mean a stale attempt and its replacement
+/// both committed.
 pub async fn reconcile(shared: &Shared) {
     let Some(proof) = shared.gate_proof.get() else {
         return;
     };
     proof.publish_write_stats(shared);
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline =
+        tokio::time::Instant::now() + crate::ci_timing::scaled_timeout(Duration::from_secs(5));
     let counts = tokio::time::timeout_at(
         deadline,
-        sqlx::query_as::<_, (i64, i64, i64, i64)>(
-            "SELECT handler.rows,handler.pairs,completed.rows,completed.pairs
+        sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            "SELECT handler.rows,handler.pairs,completed.rows,completed.pairs,completed.jobs
              FROM (SELECT coalesce(sum(n),0)::bigint AS rows,count(*) AS pairs
                    FROM (SELECT count(*) AS n FROM public.awa_soak_handler_returns
                          GROUP BY job_id,run_lease) AS pairs) AS handler
-             CROSS JOIN (SELECT coalesce(sum(n),0)::bigint AS rows,count(*) AS pairs
-                   FROM (SELECT count(*) AS n FROM public.awa_soak_completed_inserts
+             CROSS JOIN (SELECT coalesce(sum(n),0)::bigint AS rows,count(*) AS pairs,
+                                count(DISTINCT job_id) AS jobs
+                   FROM (SELECT job_id,count(*) AS n FROM public.awa_soak_completed_inserts
                          GROUP BY job_id,run_lease) AS pairs) AS completed",
         )
         .fetch_one(&proof.pool),
     )
     .await;
     match counts {
-        Ok(Ok((returns, return_pairs, inserts, completed_pairs))) => {
+        Ok(Ok((returns, return_pairs, inserts, completed_pairs, completed_jobs))) => {
             for (name, value) in [
                 ("gate_handler_return_rows", returns),
                 ("gate_handler_return_unique_pairs", return_pairs),
                 ("gate_completed_insert_rows", inserts),
                 ("gate_completed_unique_pairs", completed_pairs),
+                ("gate_completed_unique_jobs", completed_jobs),
             ] {
                 shared.run.add(name, value);
             }
-            shared.note("gate_proof",format!("final counts in {:?}; handler rows={returns},handler pairs={return_pairs},committed completed insert rows={inserts},unique completed pairs={completed_pairs}; handler returns are not commits; stale returned pairs need not complete",started.elapsed()));
+            shared.note("gate_proof",format!("final counts in {:?}; handler rows={returns},handler pairs={return_pairs},committed completed insert rows={inserts},unique completed pairs={completed_pairs},completed jobs={completed_jobs}; handler returns are not commits; stale returned pairs need not complete",started.elapsed()));
             if inserts > completed_pairs {
-                let details = tokio::time::timeout_at(
+                let rows = duplicate_details(
+                    shared,
+                    &proof.pool,
                     deadline,
-                    sqlx::query_as::<_, (i64, i64, i64)>(
-                        "SELECT job_id,run_lease,count(*) FROM public.awa_soak_completed_inserts
-                         GROUP BY job_id,run_lease HAVING count(*)>1 ORDER BY job_id,run_lease LIMIT 25",
-                    )
-                    .fetch_all(&proof.pool),
+                    "SELECT jsonb_build_object('job_id',job_id,'run_lease',run_lease,'count',count(*))::text
+                     FROM public.awa_soak_completed_inserts
+                     GROUP BY job_id,run_lease HAVING count(*)>1 ORDER BY job_id,run_lease LIMIT 25",
                 )
                 .await;
-                let rows = match details {
-                    Ok(Ok(duplicates)) => duplicates
-                        .into_iter()
-                        .map(|(id, lease, count)| {
-                            serde_json::json!({"job_id":id,"run_lease":lease,"count":count})
-                                .to_string()
-                        })
-                        .collect(),
-                    failure => {
-                        let message = format!(
-                            "full completion proof duplicate details incomplete: {failure:?}"
-                        );
-                        shared.note("gate_proof", message.clone());
-                        shared.incomplete(message, vec![]);
-                        vec![]
-                    }
-                };
                 shared.violation("duplicate_completed_inserts",format!("{inserts} completed insert facts for {completed_pairs} distinct attempt pairs"),rows);
+            }
+            if completed_pairs > completed_jobs {
+                let rows = duplicate_details(
+                    shared,
+                    &proof.pool,
+                    deadline,
+                    "SELECT jsonb_build_object('job_id',job_id,
+                                'run_leases',array_agg(DISTINCT run_lease ORDER BY run_lease))::text
+                     FROM public.awa_soak_completed_inserts
+                     GROUP BY job_id HAVING count(DISTINCT run_lease)>1 ORDER BY job_id LIMIT 25",
+                )
+                .await;
+                shared.violation(
+                    "duplicate_completed_jobs",
+                    format!(
+                        "{completed_pairs} attempt pairs committed a completion for {completed_jobs} \
+                         distinct jobs; a job completed under more than one run lease"
+                    ),
+                    rows,
+                );
             }
         }
         failure => {
