@@ -3729,7 +3729,7 @@
 <tr>
 <td><code>poll_interval</code></td>
 <td><code>200ms</code></td>
-<td>How often a claimer polls when no <code>NOTIFY</code> reaches it; with LISTEN available, empty polls back off to 2 s (see below). Wake-ups are coalesced to at most one per queue per 50 ms from each pool (<a href="../adr/053-coordination-off-the-commit-path/">ADR-053</a>).</td>
+<td>How often a claimer polls when no <code>NOTIFY</code> reaches it; with LISTEN available, empty polls back off to 2 s (see below). Wake-ups from the enqueue and retry paths awa commits itself are coalesced to at most one per queue per 50 ms from each pool; SQL-function inserts and the public <code>*_tx</code> methods still notify once per transaction (<a href="../adr/053-coordination-off-the-commit-path/">ADR-053</a>).</td>
 </tr>
 <tr>
 <td><code>min_workers</code> / <code>weight</code></td>
