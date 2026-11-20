@@ -50,7 +50,7 @@ const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
-// Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
+// Physical bytes above empty-index overhead on PostgreSQL 17 to 19. Installed
 // btree/GiST main forks retain one page; GIN (tag and claim-batch job indexes) retains its
 // metapage and root; BRIN retains three main
 // and three FSM pages (four below 4 KiB block size) when empty. Unknown
