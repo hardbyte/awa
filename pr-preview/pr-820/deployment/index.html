@@ -1701,6 +1701,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Queue Isolation Patterns">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#storage-isolation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage Isolation
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2773,6 +2790,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Queue Isolation Patterns">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#storage-isolation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage Isolation
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -3042,6 +3076,34 @@ producers and migrations.</p>
 <li>Rust: <code>ClientBuilder::queue("name", QueueConfig { ... })</code></li>
 <li>Python: <code>client.start([("name", 10)])</code> or dict configs in weighted mode</li>
 </ul>
+<p>Separate deployments isolate worker capacity and handler failures, but not storage reclamation: every queue in the database still shares one queue ring, one claim ring and one maintenance leader. To isolate those, see <a href="#storage-isolation">Storage isolation</a>.</p>
+<h3 id="storage-isolation">Storage Isolation<a class="headerlink" href="#storage-isolation" title="Permanent link">&para;</a></h3>
+<p>On queue storage, all queues in a database share one set of rings. A queue that stops being claimed while it holds ready jobs, such as a paused queue, a queue with no running workers, or a lower priority starved under strict priority, stops <a href="../troubleshooting/#queue-ring-stops-wrapping-behind-an-unclaimed-lane">queue-ring reclamation for every queue</a> in that database until it is claimed again. <a href="../troubleshooting/#ring-prune-stays-blocked-under-claim-load">Claims that starve ring prune</a> are also per ring: every runtime that claims from the database adds to the overlap that keeps prune from its lock. To keep workloads with different risk profiles from stalling each other's reclamation, for example long-paused, batch or strictly prioritised queues apart from latency-sensitive ones, give each its own database.</p>
+<p>The boundary is the database, not the queue-storage schema. A database holds one Awa installation: the <code>awa</code> control schema records a single active queue-storage schema, every producer path (Rust and Python inserts, <code>awa.insert_job</code> and the other SQL compatibility functions, cron, follow-up enqueues, retries, the DLQ and admin operations) writes to that schema, and a runtime configured with a <code>queue_storage_schema</code> other than the active one refuses to start. A <a href="../queue-storage-substrate/#default-and-custom-schemas">custom queue-storage schema</a> replaces the default as the one active substrate; it does not run beside it.</p>
+<p>Each database has its own:</p>
+<ul>
+<li>queue, lease and claim rings, so a lane pinned in one database does not hold back reclamation in another, and claims in one database do not lock another's partitions</li>
+<li>maintenance leader, elected by an advisory lock that Postgres scopes to the database, so a long rescue pass or a stalled prune in one database does not delay rotation, promotion or rescue in another</li>
+<li>cron schedules, unique-key claims, DLQ, queue controls and admin view</li>
+</ul>
+<p>The databases can share one Postgres server. Isolation then stops at the server: CPU, I/O, WAL, <code>max_connections</code> and autovacuum workers are shared, and a replication slot whose <code>xmin</code> is set (in <code>pg_replication_slots</code>), or a standby with <code>hot_standby_feedback</code>, holds back vacuum of table rows in every database on it. A slot that only retains WAL, or a logical slot with only <code>catalog_xmin</code> set, does not hold back vacuum of Awa's table rows. Within one database, a stalled lane still pins that database's ring; the fixes in <a href="../troubleshooting/#queue-ring-stops-wrapping-behind-an-unclaimed-lane">the troubleshooting guide</a> still apply there.</p>
+<p>To set it up:</p>
+<ol>
+<li>Create a database per isolation domain and run <code>awa migrate</code> against each. Every release's migrations, and any staged storage transition, must then be applied to each database.</li>
+<li>Assign each queue to exactly one database. Run its workers with a pool connected to that database: <code>Client::builder(pool)</code> in Rust, <code>awa.AsyncClient(database_url)</code> in Python. Every runtime contends for maintenance leadership, so each database's leader is one of the runtimes connected to it.</li>
+<li>Route producers by queue: insert with a pool or client connected to the database that serves the queue. A job inserted into a database whose runtimes do not serve its queue waits there; nothing moves it to another database. Follow-up jobs that a handler enqueues, including lifecycle-hook follow-ups, go to the handler's own database, so keep a workflow's queues in one database.</li>
+<li>Declare each unowned periodic job on every client connected to the database that serves its queue. Any of them may lead, and a leader writes to <code>awa.cron_jobs</code> only the unowned schedules its own client declares, so a schedule that only some clients declare is not registered until one of them leads. Use <a href="../configuration/#owner-scoped-periodic-reconciliation">owner-scoped schedules</a> to make registration independent of which client leads.</li>
+<li>When a queue moves from one database to another, its jobs and schedules in the old database stay there: <code>move_queue</code> cannot move jobs between databases. Keep a worker for the queue connected to the old database until its jobs there finish, or drain them. Retire each unowned schedule the queue's jobs come from in the old database (<code>awa cron retire &lt;name&gt; --apply</code> with <code>--database-url</code> set to that database) as the queue moves, or the old database's leader keeps enqueuing them there; owned schedules follow their owner's reconciliation in each database.</li>
+<li>Run <code>awa serve</code> and the other <code>awa</code> commands once per database, with <code>--database-url</code> or <code>DATABASE_URL</code> set to it; one UI shows one database.</li>
+</ol>
+<p>Costs:</p>
+<ul>
+<li>more partitions and maintenance work in total, since each database keeps its own rings and leader</li>
+<li>a separate pool, and more server connections, in every process that serves or enqueues into more than one database</li>
+<li>no transaction spans databases: a handler or a producer transaction can enqueue atomically only into its own database, unique keys deduplicate only within one database, and a job cannot be moved between databases with <code>move_queue</code></li>
+<li>Awa's metrics carry no database attribute, so the domains can be told apart only by the resource attributes of the processes that serve them: run each database's workers in processes of their own if you need per-database metrics</li>
+</ul>
+<p>When not to bother: if every queue is claimed continuously, queues that mix priorities under a sustained backlog have a non-zero <code>priority_aging_interval</code>, queues are not left paused or unserved with jobs waiting, and you alert on <code>awa.maintenance.prune.pinned_ready_age</code>, on prune attempts with outcome <code>blocked</code>, and on <code>awa.ring.generation</code> that stops advancing, one database is simpler and a stall is caught before it costs much storage. <code>pinned_ready_age</code> catches a lane pinning the ring; it does not report <a href="../troubleshooting/#ring-prune-stays-blocked-under-claim-load">overlapping claims that keep prune blocked</a>, which only the <code>blocked</code> count and a flat ring generation show.</p>
 <h2 id="web-ui-deployment">Web UI Deployment<a class="headerlink" href="#web-ui-deployment" title="Permanent link">&para;</a></h2>
 <p><code>awa serve</code> binds to <code>127.0.0.1:3000</code> by default. In containers, set:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>serve<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">3000</span>

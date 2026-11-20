@@ -189,7 +189,7 @@ index; the rest use `REPLICA IDENTITY FULL`:
 
 | Table | Why FULL | Cost |
 | --- | --- | --- |
-| `awa.admin_dirty_queue_marks`, `awa.admin_dirty_kind_marks` | ADR-045 forbids any index or constraint on them | A ~40-byte old-row image per mark the drain deletes |
+| `awa.admin_dirty_queue_marks`, `awa.admin_dirty_kind_marks` | ADR-053 forbids any index or constraint on them | A ~40-byte old-row image per mark the drain deletes |
 | `{schema}.queue_terminal_count_deltas` and its partitions | Append-only; reclaimed by `TRUNCATE`, never updated or deleted | None — identity only affects UPDATE/DELETE WAL |
 | `{schema}.queue_terminal_rollup_deltas` | Append-only; folded by a periodic `DELETE ... RETURNING` of a handful of rows | Negligible |
 

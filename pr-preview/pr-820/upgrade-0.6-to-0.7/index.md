@@ -174,7 +174,9 @@ acquisition times out (SQLSTATE `55P03`, typically behind a long-running read
 of `awa.jobs` or a backup) the error names the partition, the whole migration
 rolls back, and it can simply be re-run. Locks taken are held until commit,
 about 60 per 16-slot schema, so a database with hundreds of queue-storage
-schemas may need a larger `max_locks_per_transaction` for this step.
+schemas may need a larger `max_locks_per_transaction` for this step. PostgreSQL 19
+holds about half as many locks per unit of the setting as earlier releases,
+so a value carried over from PostgreSQL 18 must be doubled.
 `queue_counts_exact`, which filters ready rows by queue across every slot,
 seq-scans the ready partitions on PostgreSQL 17 without the index; at
 200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
@@ -568,7 +570,7 @@ maintenance leader on each tick. `awa.job_unique_claims` identifies rows by its
 existing uniqueness index; `awa.admin_dirty_queue_marks`,
 `awa.admin_dirty_kind_marks`, `queue_terminal_rollup_deltas` and
 `queue_terminal_count_deltas` with its partitions use `REPLICA IDENTITY FULL`
-(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+(ADR-053 forbids an index on the mark tables; the delta tables are append-only,
 so FULL costs nothing on their hot path).
 
 0.7.x runtimes retain the same query behavior after migration; replica identity
