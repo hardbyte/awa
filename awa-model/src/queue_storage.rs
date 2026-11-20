@@ -14818,6 +14818,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(slot)
             .bind(cutoff)
             .bind(scan_limit)
@@ -15058,6 +15059,7 @@ impl QueueStorage {
                 (SELECT rescue_cursor_run_lease FROM advance_cursor)
             "#
         )))
+        .persistent(false)
         .bind(slot)
         .bind(cutoff)
         .bind(scan_limit)
@@ -15362,6 +15364,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(slot)
             .bind(scan_limit)
             .bind(rescue_limit)
@@ -15483,6 +15486,7 @@ impl QueueStorage {
                 (SELECT deadline_cursor_run_lease FROM advance_cursor)
             "#
         )))
+        .persistent(false)
         .bind(slot)
         .bind(scan_limit)
         .bind(rescue_limit)
@@ -15751,6 +15755,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(slot)
             .bind(scan_limit)
             .bind(rescue_limit)
@@ -15914,6 +15919,7 @@ impl QueueStorage {
                 (SELECT 0::bigint FROM advance_cursor)
             "#
         )))
+        .persistent(false)
         .bind(slot)
         .bind(scan_limit)
         .bind(rescue_limit)
@@ -21100,6 +21106,7 @@ impl QueueStorage {
                 )
                 "#
             )))
+            .persistent(false)
             .bind(generation)
             .fetch_one(pool)
             .await
