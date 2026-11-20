@@ -523,8 +523,8 @@ fn current_builder(
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
-        // Both fleets heartbeat their claims every 50ms, so 500ms of silence
-        // means a dead worker; a hard-killed released worker's in-flight job
+        // Both fleets heartbeat their claims every 50ms, so silence past the
+        // scaled staleness (500ms unscaled) means a dead worker; a hard-killed released worker's in-flight job
         // must be rescued well inside the drain windows below.
         .heartbeat_staleness(ci_timing::scaled_staleness(Duration::from_millis(500)))
         .heartbeat_rescue_interval(heartbeat_rescue_interval)
