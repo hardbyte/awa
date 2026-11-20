@@ -553,6 +553,29 @@ impl Dispatcher {
         permits
     }
 
+    /// Waits for a slot in this runtime's claim gate. Returns `None`, with the
+    /// batch's rate tokens refunded, when dispatch is cancelled or the gate is
+    /// closed first.
+    async fn acquire_claim_slot(
+        &self,
+        batch_size: usize,
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                self.refund_rate_limit(batch_size);
+                None
+            }
+            permit = self.claim_gate.acquire() => match permit {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.refund_rate_limit(batch_size);
+                    None
+                }
+            }
+        }
+    }
+
     /// In weighted mode, clear this queue's overflow demand.
     fn clear_overflow_demand(&self) {
         if let ConcurrencyMode::Weighted {
@@ -770,57 +793,66 @@ impl Dispatcher {
         let claim_start = Instant::now();
 
         let jobs: Vec<DispatchedJob> = match &self.storage {
-            RuntimeStorage::Canonical => match sqlx::query_as::<_, JobRow>(
-                r#"
-                WITH claimed AS (
-                    SELECT id
-                    FROM awa.jobs_hot
-                    WHERE state = 'available'
-                      AND queue = $1
-                      AND run_at <= now()
-                      AND NOT EXISTS (
-                          SELECT 1 FROM awa.queue_meta
-                          WHERE queue = $1 AND paused = TRUE
-                      )
-                    ORDER BY priority ASC, run_at ASC, id ASC
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE awa.jobs_hot
-                SET state = 'running',
-                    attempt = attempt + 1,
-                    run_lease = run_lease + 1,
-                    attempted_at = now(),
-                    heartbeat_at = now(),
-                    deadline_at = now() + make_interval(secs => $3)
-                FROM claimed
-                WHERE awa.jobs_hot.id = claimed.id
-                  AND awa.jobs_hot.state = 'available'
-                RETURNING awa.jobs_hot.*
-                "#,
-            )
-            .bind(&self.queue)
-            .bind(batch_size as i32)
-            .bind(deadline_secs)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(jobs) => jobs
-                    .into_iter()
-                    .map(|job| DispatchedJob {
-                        job,
-                        queue_storage_claim: None,
-                        queue_storage_unique_states: None,
-                        abandon_after,
-                    })
-                    .collect(),
-                Err(err) => {
-                    warn!(queue = %self.queue, messaging.destination.name = %self.queue, error = %err, "Failed to claim jobs");
-                    self.refund_rate_limit(batch_size);
+            RuntimeStorage::Canonical => {
+                let Some(claim_slot) = self.acquire_claim_slot(batch_size).await else {
                     return false;
+                };
+                let claimed = sqlx::query_as::<_, JobRow>(
+                    r#"
+                    WITH claimed AS (
+                        SELECT id
+                        FROM awa.jobs_hot
+                        WHERE state = 'available'
+                          AND queue = $1
+                          AND run_at <= now()
+                          AND NOT EXISTS (
+                              SELECT 1 FROM awa.queue_meta
+                              WHERE queue = $1 AND paused = TRUE
+                          )
+                        ORDER BY priority ASC, run_at ASC, id ASC
+                        LIMIT $2
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE awa.jobs_hot
+                    SET state = 'running',
+                        attempt = attempt + 1,
+                        run_lease = run_lease + 1,
+                        attempted_at = now(),
+                        heartbeat_at = now(),
+                        deadline_at = now() + make_interval(secs => $3)
+                    FROM claimed
+                    WHERE awa.jobs_hot.id = claimed.id
+                      AND awa.jobs_hot.state = 'available'
+                    RETURNING awa.jobs_hot.*
+                    "#,
+                )
+                .bind(&self.queue)
+                .bind(batch_size as i32)
+                .bind(deadline_secs)
+                .fetch_all(&self.pool)
+                .await;
+                drop(claim_slot);
+                match claimed {
+                    Ok(jobs) => jobs
+                        .into_iter()
+                        .map(|job| DispatchedJob {
+                            job,
+                            queue_storage_claim: None,
+                            queue_storage_unique_states: None,
+                            abandon_after,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        warn!(queue = %self.queue, messaging.destination.name = %self.queue, error = %err, "Failed to claim jobs");
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
                 }
-            },
+            }
             RuntimeStorage::QueueStorage(runtime) => {
+                let Some(claim_slot) = self.acquire_claim_slot(batch_size).await else {
+                    return false;
+                };
                 if check_ready_signal {
                     match runtime
                         .store
@@ -828,6 +860,7 @@ impl Dispatcher {
                         .await
                     {
                         Ok(false) => {
+                            drop(claim_slot);
                             self.refund_rate_limit(batch_size);
                             self.clear_overflow_demand();
                             return false;
@@ -842,21 +875,13 @@ impl Dispatcher {
                             );
                         }
                     }
-                }
-                let claim_slot = tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => {
+                    // Shutdown may have begun while the read waited.
+                    if self.cancel.is_cancelled() {
+                        drop(claim_slot);
                         self.refund_rate_limit(batch_size);
                         return false;
                     }
-                    permit = self.claim_gate.acquire() => match permit {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            self.refund_rate_limit(batch_size);
-                            return false;
-                        }
-                    }
-                };
+                }
                 let claimed = runtime
                     .store
                     .claim_runtime_batch_with_aging_for_instance(
@@ -1015,11 +1040,12 @@ mod tests {
     use super::*;
 
     fn blocked_dispatcher() -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:test@localhost/awa_test")
-            .unwrap();
-        let metrics =
-            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
+        blocked_dispatcher_on("postgres://postgres:test@localhost/awa_test")
+    }
+
+    fn blocked_dispatcher_on(
+        database_url: &str,
+    ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
         let storage = RuntimeStorage::QueueStorage(
             crate::storage::QueueStorageRuntime::new(
                 awa_model::QueueStorageConfig::default(),
@@ -1028,6 +1054,18 @@ mod tests {
             )
             .unwrap(),
         );
+        blocked_dispatcher_with(database_url, storage)
+    }
+
+    fn blocked_dispatcher_with(
+        database_url: &str,
+        storage: RuntimeStorage,
+    ) -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(database_url)
+            .unwrap();
+        let metrics =
+            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
         let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
         let (_, completion) = crate::completion::CompletionBatcher::new(
             pool.clone(),
@@ -1051,6 +1089,7 @@ mod tests {
             tokio_util::task::TaskTracker::new(),
             CancellationToken::new(),
             1,
+            4,
         ));
         let config = QueueConfig {
             max_workers: 1,
@@ -1124,6 +1163,155 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(dispatcher.claim_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn ready_signal_read_waits_for_the_claim_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut dispatcher, _capacity, cancel) = blocked_dispatcher_on(&format!(
+            "postgres://postgres:test@127.0.0.1:{port}/awa_test"
+        ));
+        dispatcher.check_ready_signal = true;
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block the ready signal read"),
+                accepted = listener.accept() => {
+                    panic!("ready signal read opened a connection past a saturated gate: {accepted:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(dispatcher.claim_gate.available_permits(), 0);
+    }
+
+    /// Cancelling the dispatcher while its ready-signal read waits must not
+    /// let a claim start once the read returns.
+    #[tokio::test]
+    async fn cancellation_during_the_ready_signal_read_starts_no_claim() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .unwrap();
+        awa_model::migrations::run(&pool).await.unwrap();
+        let config = awa_model::QueueStorageConfig {
+            schema: "awa_dispatch_cancel_signal".into(),
+            ..Default::default()
+        };
+        let store = awa_model::QueueStorage::new(config.clone()).unwrap();
+        store.install(&pool).await.unwrap();
+        store.reset(&pool).await.unwrap();
+        store
+            .enqueue_params_batch(
+                &pool,
+                &[awa_model::job::InsertParams {
+                    kind: "signal_job".into(),
+                    args: serde_json::json!({}),
+                    opts: awa_model::InsertOpts {
+                        queue: "blocked".into(),
+                        ..Default::default()
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let storage = RuntimeStorage::QueueStorage(
+            crate::storage::QueueStorageRuntime::new(
+                config,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher_with(&url, storage);
+        dispatcher.check_ready_signal = true;
+        dispatcher.claim_gate.add_permits(1);
+
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query(
+            "LOCK TABLE awa_dispatch_cancel_signal.queue_enqueue_heads IN ACCESS EXCLUSIVE MODE",
+        )
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("the ready signal read must wait for the lock"),
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            lock.commit().await.unwrap();
+            assert!(!tokio::time::timeout(Duration::from_secs(10), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        let claimed = store
+            .claim_runtime_batch(&pool, "blocked", 10, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "a claim started after cancellation");
+    }
+
+    #[tokio::test]
+    async fn canonical_claim_waits_for_the_claim_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher_with(
+            &format!("postgres://postgres:test@127.0.0.1:{port}/awa_test"),
+            RuntimeStorage::Canonical,
+        );
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block the canonical claim"),
+                accepted = listener.accept() => {
+                    panic!("canonical claim opened a connection past a saturated gate: {accepted:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        assert_eq!(dispatcher.claim_gate.available_permits(), 0);
     }
 
     #[tokio::test]
@@ -1319,6 +1507,7 @@ mod tests {
             tokio_util::task::TaskTracker::new(),
             CancellationToken::new(),
             jobs as u32,
+            4,
         ));
         let config = QueueConfig {
             max_workers: jobs as u32,

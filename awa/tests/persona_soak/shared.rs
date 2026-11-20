@@ -11,7 +11,7 @@ use awa::{JobRow, UntypedJobEvent};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +110,7 @@ pub struct Shared {
     pub info: ServerInfo,
     pub started: Instant,
     pub ledger: Ledger,
+    pub gate_proof: OnceLock<super::gate_proof::GateProof>,
     pub queues: QueueRegistry,
     pub budget: Budget,
     pub load_stop: Stop,
@@ -135,6 +136,8 @@ pub struct Shared {
     pub shardops: super::shard_oracle::ShardOpsState,
     /// State of the claim-and-abandon persona and the checks that go with it.
     pub abandon: super::abandon_oracle::AbandonState,
+    /// Resident memory of this process over the run, and the growth gate's verdict.
+    pub memory: super::memory::MemoryLog,
     chaos_until_ms: AtomicI64,
 }
 
@@ -149,6 +152,7 @@ impl Shared {
             info,
             started: Instant::now(),
             ledger: Ledger::new(),
+            gate_proof: OnceLock::new(),
             queues: QueueRegistry::default(),
             budget,
             load_stop: Stop::new(),
@@ -166,6 +170,7 @@ impl Shared {
             fleets: Mutex::new(HashMap::new()),
             shardops: Default::default(),
             abandon: Default::default(),
+            memory: Default::default(),
             chaos_until_ms: AtomicI64::new(0),
         })
     }
@@ -196,6 +201,14 @@ impl Shared {
     pub fn chaos_window(&self, duration: std::time::Duration) {
         let until = self.now_ms() + duration.as_millis() as i64;
         self.chaos_until_ms.fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// Recovery time the time-based checks allow during a disruptive window: the configured
+    /// slack, plus the completion stall while one has been run, since claiming and promotion
+    /// wait on the stalled tables for its whole length.
+    pub fn chaos_slack(&self) -> std::time::Duration {
+        let stalled = self.memory.stalled_for();
+        self.config.chaos_slack + stalled
     }
 
     pub fn chaos_active(&self) -> bool {
@@ -287,6 +300,23 @@ impl Shared {
             .filter(|fleet| fleet.persona == persona)
             .cloned()
             .collect()
+    }
+
+    /// Records that a handler returned `Completed`, in the ledger and, with the gate proof
+    /// on, as a durable handler-return witness. A return is not a commit.
+    pub async fn record_completed_return(&self, persona: Persona, job: &JobRow) {
+        if let Some(proof) = self.gate_proof.get() {
+            let started = Instant::now();
+            if let Err(error) = proof.returned_completed(job, persona.name()).await {
+                self.incomplete(error, vec![]);
+                self.run.add("gate_handler_return_write_failures", 1);
+            }
+            self.run.add(
+                "gate_handler_return_write_us",
+                started.elapsed().as_micros().min(i64::MAX as u128) as i64,
+            );
+        }
+        self.ledger.mark(job.id, flag::RETURNED_COMPLETED);
     }
 
     /// Records the start of a handler. Hold the returned guard for the duration of
