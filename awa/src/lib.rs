@@ -21,6 +21,8 @@ pub use awa_model::{
     ResolveOutcome, RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
 };
 
+pub use awa_model::flush_wakeups;
+
 // Re-export worker runtime
 pub use awa_worker::{
     self as worker, context::ProgressState, BuildError, CallbackGuard, CallbackToken, Client,

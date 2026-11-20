@@ -28081,3 +28081,39 @@ async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {
         "{ENQUEUES} enqueues in {burst:?} sent {received} notifications, more than one per window"
     );
 }
+
+#[tokio::test]
+async fn test_queue_storage_flush_wakeups_sends_before_the_pool_closes() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_flush_wakeups";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_flush_wakeups";
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // A short-lived producer enqueues on its own pool and closes it at once.
+    // Closing the pool fails a wake-up still waiting to be sent, so the
+    // producer flushes first.
+    let producer = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("connect producer pool");
+    store.enqueue_batch(&producer, queue, 1, 1).await.unwrap();
+    assert!(
+        awa::flush_wakeups(&producer, Duration::from_secs(5)).await,
+        "the flush finished before its timeout"
+    );
+    producer.close().await;
+
+    let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("the flushed wake-up was delivered")
+        .expect("listener stays connected");
+    assert_eq!(notification.channel(), format!("awa:{queue}"));
+}
