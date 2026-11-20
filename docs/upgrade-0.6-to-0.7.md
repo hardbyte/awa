@@ -355,6 +355,14 @@ v060 rewrites `<schema>.claim_ready_runtime` and each `<schema>.claim_ready_slot
 
 Binaries before v060 call the same functions with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete `awa migrate --sql --from 59 --to 60` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
 
+## v061: claims cross rolled-back reservations
+
+When the first ready row at or after a lane's claim cursor is spent (cancelled, deleted, moved, reprioritised or already claimed), the claim moves the cursor over the spent rows and returns no jobs. It stopped at the first lane position left by an enqueue that rolled back, so a lane whose head held spent rows separated by such gaps cost one empty claim per gap, and while the lane had the oldest head every claim on the queue picked it. The claim now crosses the rolled-back positions between the leading spent rows. Every enqueue reserves its positions through `reserve_enqueue_seq`, which holds the lane's reservation lock until the enqueue ends, so a committed row follows only ended reservations.
+
+v061 rewrites `<schema>.claim_ready_runtime` in the default and every discovered custom queue-storage schema from its own definition, so its signature, owner, privileges and settings are unchanged; the per-slot claim functions carry no spent prefix and are not touched. A function that already carries the change is left alone, so a replay, a fresh install and a database coming from 0.6.19 (whose `claim_spent_prefix_gaps` schema patch made the same change) are no-ops. It reinstalls no table or trigger and takes no lock on any `awa` or queue-storage table; a claim in flight finishes on the old body.
+
+Binaries before v061 call the same function with the same arguments and results, so they can run before or after the migration. External migration runners apply the complete `awa migrate --sql --from 60 --to 61` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
+
 ## Tag indexes (ADR-049)
 
 Tags become the indexed way to find jobs on queue storage. There is no
