@@ -17,9 +17,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
 
 /// Shortest gap between two wake-ups of one channel from one pool.
@@ -27,8 +28,10 @@ pub(crate) const WINDOW: Duration = Duration::from_millis(50);
 
 /// Wake-up state of one pool. It holds no pool clone: the sender task owns
 /// one, so a pool is never kept alive here.
-#[derive(Default)]
 struct PoolWakeups {
+    /// Keeps the address used as this state's key from being reused by
+    /// another pool, even if this pool's connect options are replaced.
+    _options: Arc<PgConnectOptions>,
     pending: BTreeSet<String>,
     last_sent: HashMap<String, Instant>,
     /// Generation of the live sender task, if one is running.
@@ -43,10 +46,17 @@ fn pools() -> &'static Mutex<HashMap<usize, PoolWakeups>> {
     POOLS.get_or_init(Default::default)
 }
 
+// Every update leaves the state consistent, so a panic elsewhere while the
+// lock was held does not make it unusable.
+fn lock_pools() -> MutexGuard<'static, HashMap<usize, PoolWakeups>> {
+    pools().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 // Clones of a pool share its connect options, so their address identifies
-// the pool for as long as it has wake-up state here.
-fn pool_key(pool: &PgPool) -> usize {
-    Arc::as_ptr(&pool.connect_options()) as usize
+// the pool. The state holds the options, so the address is not reused while
+// the state exists.
+fn pool_key(options: &Arc<PgConnectOptions>) -> usize {
+    Arc::as_ptr(options) as usize
 }
 
 /// Wake the claimers listening on `channels` after the caller's commit.
@@ -55,21 +65,35 @@ fn pool_key(pool: &PgPool) -> usize {
 /// Outside a Tokio runtime nothing is sent, and claimers find the rows when
 /// they next poll.
 pub(crate) fn wake_after_commit(pool: &PgPool, channels: impl IntoIterator<Item = String>) {
-    let mut channels = channels.into_iter().peekable();
-    if channels.peek().is_none() {
+    let channels: BTreeSet<String> = channels.into_iter().collect();
+    if channels.is_empty() {
         return;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
     static GENERATIONS: AtomicU64 = AtomicU64::new(0);
-    let key = pool_key(pool);
+    let options = pool.connect_options();
+    let key = pool_key(&options);
     let spawn = {
-        let mut pools = pools().lock().expect("wake-up state poisoned");
-        let wakeups = pools.entry(key).or_default();
+        let mut pools = lock_pools();
+        let wakeups = pools.entry(key).or_insert_with(|| PoolWakeups {
+            _options: options,
+            pending: BTreeSet::new(),
+            last_sent: HashMap::new(),
+            sender: None,
+            arrived: Arc::default(),
+        });
+        // Only a channel outside its window can be sent before the sender's
+        // current wait ends.
+        let due_now = channels
+            .iter()
+            .any(|channel| !wakeups.last_sent.contains_key(channel));
         wakeups.pending.extend(channels);
         if wakeups.sender.is_some() {
-            wakeups.arrived.notify_one();
+            if due_now {
+                wakeups.arrived.notify_one();
+            }
             None
         } else {
             let generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
@@ -94,9 +118,7 @@ struct SenderGuard {
 
 impl Drop for SenderGuard {
     fn drop(&mut self) {
-        let Ok(mut pools) = pools().lock() else {
-            return;
-        };
+        let mut pools = lock_pools();
         if pools
             .get(&self.key)
             .is_some_and(|wakeups| wakeups.sender == Some(self.generation))
@@ -109,7 +131,7 @@ impl Drop for SenderGuard {
 async fn send_wakeups(guard: SenderGuard, pool: PgPool) {
     loop {
         let (due, wait, arrived) = {
-            let mut pools = pools().lock().expect("wake-up state poisoned");
+            let mut pools = lock_pools();
             let Some(wakeups) = pools.get_mut(&guard.key) else {
                 return;
             };
@@ -148,7 +170,7 @@ async fn send_wakeups(guard: SenderGuard, pool: PgPool) {
         } else {
             send(&pool, &due).await;
             // Start the window when the send completes.
-            let mut pools = pools().lock().expect("wake-up state poisoned");
+            let mut pools = lock_pools();
             if let Some(wakeups) = pools.get_mut(&guard.key) {
                 let sent = Instant::now();
                 for channel in due {
@@ -180,7 +202,7 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     fn has_state(key: usize) -> bool {
-        pools().lock().unwrap().contains_key(&key)
+        lock_pools().contains_key(&key)
     }
 
     #[test]
@@ -194,7 +216,7 @@ mod tests {
                 .connect_lazy("postgres://awa@127.0.0.1:1/awa")
                 .unwrap();
             wake_after_commit(&pool, ["awa:q".to_string()]);
-            let key = pool_key(&pool);
+            let key = pool_key(&pool.connect_options());
             assert!(has_state(key));
             key
         });
@@ -221,7 +243,7 @@ mod tests {
             // window.
             tokio::time::sleep(Duration::from_millis(10)).await;
             wake_after_commit(&pool, ["awa:q".to_string()]);
-            pool_key(&pool)
+            pool_key(&pool.connect_options())
         });
         drop(runtime);
         assert!(
