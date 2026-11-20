@@ -105,7 +105,7 @@ The key `QueueConfig` fields:
 | `max_workers` | `50` | Always — this is your concurrency cap per queue |
 | `rate_limit` | `None` | External API rate limits, backpressure |
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims. |
-| `poll_interval` | `200ms` | The longest a claimer waits for work when no `NOTIFY` reaches it. Wake-ups are coalesced to at most one per queue per 50 ms from each pool, so lower this only if a lost wake-up's delay matters. |
+| `poll_interval` | `200ms` | How often a claimer polls when no `NOTIFY` reaches it; with LISTEN available, empty polls back off to 2 s (see below). Wake-ups are coalesced to at most one per queue per 50 ms from each pool. |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |

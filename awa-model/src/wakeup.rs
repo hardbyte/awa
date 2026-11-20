@@ -9,7 +9,8 @@
 //! statement at a time, so a burst of commits costs a few notifications and
 //! at most one connection. The first wake-up of a channel that has not been
 //! woken within the window goes out at once; later ones go out when the
-//! window ends.
+//! window ends. The window is measured from when a send completes, so a slow
+//! database does not shorten it.
 //!
 //! A wake-up is a hint: claimers also poll, so a wake-up lost to an error or
 //! to the process exiting delays a claim until the claimer's next poll.
@@ -32,6 +33,9 @@ struct PoolWakeups {
     last_sent: HashMap<String, Instant>,
     /// Generation of the live sender task, if one is running.
     sender: Option<u64>,
+    /// Interrupts the sender's wait for a window to end, so a channel that
+    /// has no window running is sent at once.
+    arrived: Arc<tokio::sync::Notify>,
 }
 
 fn pools() -> &'static Mutex<HashMap<usize, PoolWakeups>> {
@@ -65,6 +69,7 @@ pub(crate) fn wake_after_commit(pool: &PgPool, channels: impl IntoIterator<Item 
         let wakeups = pools.entry(key).or_default();
         wakeups.pending.extend(channels);
         if wakeups.sender.is_some() {
+            wakeups.arrived.notify_one();
             None
         } else {
             let generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
@@ -103,7 +108,7 @@ impl Drop for SenderGuard {
 
 async fn send_wakeups(guard: SenderGuard, pool: PgPool) {
     loop {
-        let (due, wait) = {
+        let (due, wait, arrived) = {
             let mut pools = pools().lock().expect("wake-up state poisoned");
             let Some(wakeups) = pools.get_mut(&guard.key) else {
                 return;
@@ -133,12 +138,23 @@ async fn send_wakeups(guard: SenderGuard, pool: PgPool) {
                 .map(|sent| WINDOW.saturating_sub(now.duration_since(*sent)))
                 .min()
                 .unwrap_or(WINDOW);
-            (due, wait)
+            (due, wait, wakeups.arrived.clone())
         };
         if due.is_empty() {
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = arrived.notified() => {}
+            }
         } else {
             send(&pool, &due).await;
+            // Start the window when the send completes.
+            let mut pools = pools().lock().expect("wake-up state poisoned");
+            if let Some(wakeups) = pools.get_mut(&guard.key) {
+                let sent = Instant::now();
+                for channel in due {
+                    wakeups.last_sent.insert(channel, sent);
+                }
+            }
         }
     }
 }
