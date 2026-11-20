@@ -39,6 +39,10 @@ struct PoolWakeups {
     /// Interrupts the sender's wait for a window to end, so a channel that
     /// has no window running is sent at once.
     arrived: Arc<tokio::sync::Notify>,
+    /// Sends completed, so tests can tell when the sender is waiting out a
+    /// window.
+    #[cfg(test)]
+    sends_completed: u32,
 }
 
 fn pools() -> &'static Mutex<HashMap<usize, PoolWakeups>> {
@@ -83,6 +87,8 @@ pub(crate) fn wake_after_commit(pool: &PgPool, channels: impl IntoIterator<Item 
             last_sent: HashMap::new(),
             sender: None,
             arrived: Arc::default(),
+            #[cfg(test)]
+            sends_completed: 0,
         });
         // Only a channel outside its window can be sent before the sender's
         // current wait ends.
@@ -176,6 +182,10 @@ async fn send_wakeups(guard: SenderGuard, pool: PgPool) {
                 for channel in due {
                     wakeups.last_sent.insert(channel, sent);
                 }
+                #[cfg(test)]
+                {
+                    wakeups.sends_completed += 1;
+                }
             }
         }
     }
@@ -205,6 +215,12 @@ mod tests {
         lock_pools().contains_key(&key)
     }
 
+    fn sends_completed(key: usize) -> Option<u32> {
+        lock_pools()
+            .get(&key)
+            .map(|wakeups| wakeups.sends_completed)
+    }
+
     #[test]
     fn a_runtime_dropped_before_the_sender_runs_leaves_no_state() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -228,6 +244,31 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_dropped_during_a_send_leaves_no_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key = runtime.block_on(async {
+            let pool = PgPoolOptions::new()
+                .acquire_timeout(Duration::from_millis(500))
+                .connect_lazy("postgres://awa@127.0.0.1:1/awa")
+                .unwrap();
+            wake_after_commit(&pool, ["awa:q".to_string()]);
+            // The sender is still trying to acquire a connection.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let key = pool_key(&pool.connect_options());
+            assert_eq!(sends_completed(key), Some(0));
+            key
+        });
+        drop(runtime);
+        assert!(
+            !has_state(key),
+            "the cancelled sender cleared its pool's state"
+        );
+    }
+
+    #[test]
     fn a_runtime_dropped_inside_the_window_leaves_no_state() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -235,15 +276,20 @@ mod tests {
             .unwrap();
         let key = runtime.block_on(async {
             let pool = PgPoolOptions::new()
-                .acquire_timeout(Duration::from_millis(50))
+                .acquire_timeout(Duration::from_millis(1))
                 .connect_lazy("postgres://awa@127.0.0.1:1/awa")
                 .unwrap();
             wake_after_commit(&pool, ["awa:q".to_string()]);
-            // Let the sender try its first send and start waiting out the
-            // window.
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let key = pool_key(&pool.connect_options());
+            // Once the first send has completed, the sender waits out the
+            // channel's window; the runtime is single-threaded, so it is
+            // parked there whenever this task runs.
+            while sends_completed(key) != Some(1) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             wake_after_commit(&pool, ["awa:q".to_string()]);
-            pool_key(&pool.connect_options())
+            assert_eq!(sends_completed(key), Some(1));
+            key
         });
         drop(runtime);
         assert!(
