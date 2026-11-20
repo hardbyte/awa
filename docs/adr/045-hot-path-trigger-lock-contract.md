@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Tracked in [#492](https://github.com/hardbyte/awa/issues/492). Implemented by migration v046 (`awa-model/migrations/v046_wait_free_dirty_marks.sql`), the 0.6 schema patch `wait_free_dirty_marks`, the `hot_path_triggers_cannot_wait_on_other_transactions` test in `awa/tests/dirty_marks_wait_free_test.rs`, and the `AwaCanonicalDirtyMarks` TLA+ model.
+Superseded by [ADR-053](053-coordination-off-the-commit-path.md), which keeps this trigger contract as its rule 1 and extends it to wake-ups and coordination writes. Previously accepted. Tracked in [#492](https://github.com/hardbyte/awa/issues/492). Implemented by migration v046 (`awa-model/migrations/v046_wait_free_dirty_marks.sql`), the 0.6 schema patch `wait_free_dirty_marks`, the `hot_path_triggers_cannot_wait_on_other_transactions` test in `awa/tests/dirty_marks_wait_free_test.rs`, and the `AwaCanonicalDirtyMarks` TLA+ model.
 
 ## Context
 

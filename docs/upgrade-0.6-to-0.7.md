@@ -566,7 +566,7 @@ maintenance leader on each tick. `awa.job_unique_claims` identifies rows by its
 existing uniqueness index; `awa.admin_dirty_queue_marks`,
 `awa.admin_dirty_kind_marks`, `queue_terminal_rollup_deltas` and
 `queue_terminal_count_deltas` with its partitions use `REPLICA IDENTITY FULL`
-(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+(ADR-053 forbids an index on the mark tables; the delta tables are append-only,
 so FULL costs nothing on their hot path).
 
 0.7.x runtimes retain the same query behavior after migration; replica identity

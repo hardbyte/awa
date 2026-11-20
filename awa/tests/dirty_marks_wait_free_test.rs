@@ -116,7 +116,7 @@ async fn enqueues_in_application_transactions_do_not_deadlock_through_dirty_mark
         .unwrap();
 }
 
-/// Lock contract for every trigger on the canonical hot tables (ADR-045).
+/// Lock contract for every trigger on the canonical hot tables (ADR-053 rule 1).
 ///
 /// A trigger runs inside every job transition, so anything it does that can
 /// wait on another transaction is a deadlock edge joining transactions that
@@ -194,7 +194,7 @@ async fn hot_path_triggers_cannot_wait_on_other_transactions() {
         for target in write_targets(body) {
             assert!(
                 allowed_writes.contains(&target.as_str()),
-                "trigger {function} on {table} writes {target}, outside the ADR-045 allowlist {allowed_writes:?}"
+                "trigger {function} on {table} writes {target}, outside the ADR-053 allowlist {allowed_writes:?}"
             );
         }
         for forbidden in [
