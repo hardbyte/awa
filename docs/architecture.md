@@ -42,7 +42,7 @@ While a storage transition is unfinalized, the leader promotes the deferred back
 
 - Awa assumes one shared Postgres database and any number of Rust or Python worker processes.
 - Each process registers the queues and job kinds it can execute.
-- Queue work is awakened by `LISTEN/NOTIFY` with polling as the fallback.
+- Queue work is awakened by `LISTEN/NOTIFY` with polling as the fallback. A transaction that calls `NOTIFY` takes PostgreSQL's cluster-wide notify lock at `COMMIT` and holds it until its commit is flushed, so paths that commit their own transaction (batch and COPY enqueue, retries, DLQ retries, priority aging, promotion) send their wake-ups after `COMMIT` instead: at most one `NOTIFY` per queue per 50 ms from each pool, the first at once and later ones at the end of the window. Inserts through the SQL functions (`insert`, `insert_with`, `insert_many`, cron) and the public `*_tx` methods notify inside the caller's transaction, so the wake-up is delivered only if that transaction commits. A wake-up is a hint: a lost one delays a claim by at most `poll_interval`.
 - The maintenance leader is elected inside the same worker fleet; no `pg_cron` or external scheduler is required.
 - Long analytical reads should run on replicas or with disciplined timeouts, because long-lived primary transactions can delay best-effort partition prune.
 
