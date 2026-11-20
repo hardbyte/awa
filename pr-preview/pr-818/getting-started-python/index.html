@@ -2904,6 +2904,7 @@
 <ul>
 <li><code>await client.migrate()</code> runs migrations from Python instead of the CLI.</li>
 <li><code>awa.Client</code> provides a synchronous API for worker/admin/direct-producer code — all methods are plain (e.g., <code>client.insert(...)</code>, <code>client.migrate()</code>).</li>
+<li>A script that enqueues and exits should close its client (<code>client.close()</code>, or <code>with awa.Client(...) as client:</code>): closing sends the queue wake-ups still pending, so workers pick the jobs up at once rather than at their next poll.</li>
 <li><code>client.start()</code> accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See <a href="../configuration/">Configuration reference</a>.</li>
 <li><code>awa.PartitionedQueue</code> helps one hot logical queue use several physical queues while keeping routing deterministic. See <a href="../configuration/#partitioned-queues">Partitioned queues</a>.</li>
 </ul>
