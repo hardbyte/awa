@@ -251,6 +251,7 @@ impl Shared {
         &self,
         persona: Persona,
         job_id: i64,
+        run_lease: i64,
         completed_before: bool,
         call_started_ms: u32,
     ) {
@@ -262,6 +263,7 @@ impl Shared {
             |record| {
                 record.flags |= flag::OPERATOR_REMOVED | flag::OPERATOR_CANCEL_OK;
                 record.operator_cancel_ms = now;
+                record.operator_cancel_run_lease = Some(run_lease);
             },
         );
         if completed_before {
@@ -321,10 +323,16 @@ impl Shared {
                     record.first_start_ms = now.max(1);
                 }
                 record.last_start_ms = now;
-                (
-                    record.operator_cancel_ms != 0 && now > record.operator_cancel_ms,
-                    overlapped,
-                )
+                // Cancelling a running handler is cooperative: the attempt
+                // the cancel closed was claimed before it and may still reach
+                // its handler afterwards. The completion check below and the
+                // final verdict make sure that attempt never counts as done.
+                // Any other attempt starting after the cancel was claimed
+                // after it.
+                let ran_after_cancel = record.operator_cancel_ms != 0
+                    && now > record.operator_cancel_ms
+                    && record.operator_cancel_run_lease != Some(job.run_lease);
+                (ran_after_cancel, overlapped)
             },
         );
         if ran_after_cancel {
@@ -390,6 +398,7 @@ impl Shared {
             .get(&job.queue)
             .map_or(Persona::Chaos, |queue| queue.persona);
         let mut double_complete = false;
+        let mut cancelled_attempt_completed = false;
         self.ledger.with(
             job.id,
             || JobRecord::new(persona, queue_index, now, expect::ANY_TERMINAL, 0),
@@ -400,6 +409,8 @@ impl Shared {
                     record.completed_event_ms = now;
                     record.flags |= flag::COMPLETED_EVENT;
                     double_complete = record.completed_events > 1 && !record.has(flag::DLQ_RETRIED);
+                    cancelled_attempt_completed =
+                        record.operator_cancel_run_lease == Some(job.run_lease);
                 }
                 UntypedJobEvent::Exhausted { .. } => {
                     record.note_terminal(job.run_lease);
@@ -437,6 +448,19 @@ impl Shared {
             UntypedJobEvent::Cancelled { .. } => self.stats(persona).add("handler_cancelled", 1),
             UntypedJobEvent::Retried { .. } => self.stats(persona).add("retried", 1),
             _ => {}
+        }
+        if cancelled_attempt_completed {
+            self.violation(
+                "cancelled_attempt_completed",
+                format!(
+                    "job {} attempt {} was reported completed after an operator cancel of that attempt succeeded",
+                    job.id, job.run_lease
+                ),
+                vec![format!(
+                    "{{\"job_id\":{},\"queue\":\"{}\",\"run_lease\":{}}}",
+                    job.id, job.queue, job.run_lease
+                )],
+            );
         }
         if double_complete {
             self.violation(
