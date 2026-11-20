@@ -29941,6 +29941,7 @@ async fn test_receipt_rescue_walks_are_not_prepared() {
         "receipt rescue walks must not be prepared: {walks:#?}"
     );
     session.close().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_enqueue_wakes_after_commit_coalesced() {

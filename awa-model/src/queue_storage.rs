@@ -3354,6 +3354,41 @@ mod ready_segment_tests {
         assert_eq!(store.job_output_probe_count(), 1);
     }
 
+    /// Callers waiting on a probe that fails do not each probe again, so an
+    /// unreachable database costs about one acquire timeout, not one per
+    /// waiting caller.
+    #[tokio::test]
+    async fn callers_waiting_on_a_failed_probe_fail_without_probing_again() {
+        use super::QueueStorageConfig;
+        use std::time::{Duration, Instant};
+
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(300))
+            .connect_lazy("postgres://awa@127.0.0.1:1/awa")
+            .unwrap();
+        let store = std::sync::Arc::new(QueueStorage::new(QueueStorageConfig::default()).unwrap());
+        let started = Instant::now();
+        let probes: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, pool) = (store.clone(), unreachable.clone());
+                tokio::spawn(async move { store.supports_job_output_from_pool(&pool).await })
+            })
+            .collect();
+        for probe in probes {
+            assert!(probe.await.unwrap().is_err());
+        }
+        assert!(
+            store.job_output_probe_count() < 8,
+            "waiting callers probed again: {} probes",
+            store.job_output_probe_count()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "eight callers took {:?}, about one acquire timeout each",
+            started.elapsed()
+        );
+    }
+
     /// A pool probe holding the single-flight lock while it waits for the
     /// only connection must not block a transaction holding that connection
     /// from probing on it.
@@ -4130,6 +4165,9 @@ pub struct QueueStorage {
     /// Held while one caller probes for the output columns, so concurrent
     /// cache misses wait for its answer instead of probing on their own.
     job_output_probe: tokio::sync::Mutex<()>,
+    /// When a pool probe last failed, so callers that waited on it fail at
+    /// once instead of each probing again during an outage.
+    job_output_probe_failed_at: Mutex<Option<std::time::Instant>>,
     job_output_probes: AtomicU64,
 }
 
@@ -4188,6 +4226,7 @@ impl QueueStorage {
             cancel_phase_hook: CancelPhaseHookSlot(None),
             job_output_columns: Mutex::new(None),
             job_output_probe: tokio::sync::Mutex::new(()),
+            job_output_probe_failed_at: Mutex::new(None),
             job_output_probes: AtomicU64::new(0),
         })
     }
@@ -4225,6 +4264,7 @@ impl QueueStorage {
         })
     }
 
+    /// Whether this schema has migration v052's job output columns.
     ///
     /// This probes on `executor` whenever the cache misses, without waiting
     /// for a concurrent probe: a caller inside a transaction must not wait on
@@ -4244,16 +4284,37 @@ impl QueueStorage {
     /// misses wait for one probe instead of each taking a connection for
     /// their own. The probe holds the single-flight lock while it waits for a
     /// connection; transaction callers never wait on that lock, so the
-    /// connection they hold is always released.
+    /// connection they hold is always released. A caller that waited while
+    /// the probe failed gets a retryable error at once rather than probing
+    /// again, so an outage costs one probe's wait rather than one per caller.
     pub async fn supports_job_output_from_pool(&self, pool: &PgPool) -> Result<bool, AwaError> {
         if let Some(supported) = self.cached_job_output_columns() {
             return Ok(supported);
         }
+        let waiting_since = std::time::Instant::now();
         let _probe = self.job_output_probe.lock().await;
         if let Some(supported) = self.cached_job_output_columns() {
             return Ok(supported);
         }
-        self.probe_job_output_columns(pool).await
+        let failed_while_waiting = self
+            .job_output_probe_failed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|failed_at| failed_at >= waiting_since);
+        if failed_while_waiting {
+            return Err(AwaError::Database(sqlx::Error::Protocol(
+                "the job output column probe failed while this call waited for it".into(),
+            )));
+        }
+        let probed = self.probe_job_output_columns(pool).await;
+        if probed.is_err() {
+            *self
+                .job_output_probe_failed_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::time::Instant::now());
+        }
+        probed
     }
 
     async fn probe_job_output_columns<'e, E>(&self, executor: E) -> Result<bool, AwaError>
