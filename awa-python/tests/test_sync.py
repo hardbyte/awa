@@ -364,6 +364,35 @@ def test_enqueue_many_copy_sync_queue_storage(client):
     assert counts["available_count"] == 3
 
 
+def test_close_sends_pending_wakeups():
+    import psycopg
+
+    schema = "awa_py_sync_close_flush"
+    queue = "sync_close_flush"
+    c = awa.Client(DATABASE_URL)
+    c.migrate()
+    reset_storage_transition_state(c)
+    c.install_queue_storage(schema=schema, reset=True)
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as listener:
+            listener.execute(f'LISTEN "awa:{queue}"')
+            # A script that enqueues and closes at once: the enqueue's
+            # wake-up is sent after its commit, and close() sends it before
+            # closing the pool.
+            c.enqueue_many_copy([SyncEmail(to="flush@example.com", subject="Flush")], queue=queue)
+            c.close()
+            channels = [n.channel for n in listener.notifies(timeout=2.0, stop_after=1)]
+        assert channels == [f"awa:{queue}"]
+    finally:
+        cleanup = awa.Client(DATABASE_URL)
+        tx = cleanup.transaction()
+        tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        tx.commit()
+        reset_storage_transition_state(cleanup)
+        cleanup.close()
+
+
 def test_ordering_key_routes_all_sync_python_insert_paths(client):
     schema = "awa_py_sync_ordering_key"
     queue = "sync_ordering_key"

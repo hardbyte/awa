@@ -190,3 +190,32 @@ async fn retry_bulk_reports_skipped_jobs_when_it_gives_up_on_a_held_row() {
         .expect("drop claim");
     awa_testing::setup::clean_queue(&pool, &queue).await;
 }
+
+#[tokio::test]
+async fn retry_bulk_wakes_claimers_before_the_process_exits() {
+    let _guard = GUARD.lock().await;
+    let pool = queue_storage_pool().await;
+    let queue = unique_queue("cli_dlq_wake");
+    seed_dlq(&pool, &queue, 1).await;
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect listener");
+    listener
+        .listen(&format!("awa:{queue}"))
+        .await
+        .expect("listen");
+
+    // The retry commits, then hands its queue's wake-up to a background
+    // sender; the process exits right after, so the CLI must flush it first.
+    run_cli(&["dlq", "retry-bulk", "--queue", &queue])
+        .assert()
+        .success();
+
+    let notification = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
+        .await
+        .expect("the retry woke the queue before the CLI exited")
+        .expect("listener stays connected");
+    assert_eq!(notification.channel(), format!("awa:{queue}"));
+
+    awa_testing::setup::clean_queue(&pool, &queue).await;
+}

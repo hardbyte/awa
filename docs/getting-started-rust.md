@@ -152,6 +152,7 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `Client::start()` spawns background tasks and returns immediately. Your service should usually stay alive until it receives a shutdown signal.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.
+- A short-lived producer that enqueues or retries through `QueueStorage` (for example `enqueue_params_copy`) and then exits or closes its pool calls `awa_model::flush_wakeups(&pool, Duration::from_secs(1)).await` first, so workers are woken now rather than at their next poll. `Client::shutdown` does this itself.
 
 When enqueueing from a request or service method that already writes app data, use your existing `sqlx` transaction and pass it to Awa:
 

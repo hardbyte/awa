@@ -125,6 +125,7 @@ python -m awa --database-url "$DATABASE_URL" serve
 
 - `await client.migrate()` runs migrations from Python instead of the CLI.
 - `awa.Client` provides a synchronous API for worker/admin/direct-producer code — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`).
+- A script that enqueues and exits should close its client (`client.close()`, or `with awa.Client(...) as client:`): closing sends the queue wake-ups still pending, so workers pick the jobs up at once rather than at their next poll.
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
 - `awa.PartitionedQueue` helps one hot logical queue use several physical queues while keeping routing deterministic. See [Partitioned queues](configuration.md#partitioned-queues).
 

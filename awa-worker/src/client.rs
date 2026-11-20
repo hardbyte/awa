@@ -32,6 +32,9 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// How long [`Client::shutdown`] waits for pending queue wake-ups to be sent.
+const SHUTDOWN_WAKEUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Errors returned when building a worker client.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BuildError {
@@ -2012,6 +2015,8 @@ impl Client {
     /// 4. Drain in-flight jobs and their finalization (heartbeat,
     ///    maintenance and the completion batcher still alive!)
     /// 5. Stop heartbeat, maintenance and the completion batcher
+    /// 6. Send pending queue wake-ups, for at most one second beyond
+    ///    `timeout`
     pub async fn shutdown(&self, timeout: Duration) {
         info!("Initiating graceful shutdown");
 
@@ -2086,6 +2091,11 @@ impl Client {
         for handle in service_handles {
             let _ = handle.await;
         }
+
+        // Phase 6: Send the wake-ups that retries and enqueues during the
+        // drain left pending, so other runtimes claim those jobs now rather
+        // than at their next poll.
+        awa_model::flush_wakeups(&self.pool, SHUTDOWN_WAKEUP_FLUSH_TIMEOUT).await;
 
         info!("Awa worker runtime stopped");
     }
