@@ -419,11 +419,11 @@ Symptoms on queue storage under sustained claim traffic from several runtimes ([
 
 No jobs are lost: a blocked prune rolls back and changes nothing. The cost is storage that is not reclaimed and claim latency that grows with the current slot.
 
-Claims lock every child of the ring tables they read, sealed slots included, so each claim holds a lock on the slot prune wants to truncate. When claims from several runtimes overlap continuously, prune's lock request never finds the slot free within its wait, the ring cannot rotate into the unpruned slot, the current slot grows, and slower claims overlap more. The loop sustains itself without any other blocker.
+Claims hold `AccessShareLock` on the ring partitions they read, which can include the slot prune wants to truncate. When claims from several runtimes overlap continuously, prune's lock request never finds the slot free within its wait, the ring cannot rotate into the unpruned slot, the current slot grows, and slower claims overlap more. The loop sustains itself without any other blocker.
 
 A deployment with 14 runtimes serving about 13 queues on 0.6.16 kept its queue ring on one slot for about two days this way, with that slot's ready partition at about 55M rows (64 GB). Sampling `pg_locks` on the next slot's partitions every 25 ms never found them free: each sample showed four to six `AccessShareLock` holders, all short transactions running the claim function, including claims for a queue with no backlog.
 
-This branch does not fix it. Queue prune already runs its skip checks before it requests `ACCESS EXCLUSIVE` (and checks them again once it holds it), but it makes one request per attempt: it does not have 0.6.17's retry of the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms.
+0.7 does not fix it yet. Queue prune already runs its skip checks before it requests `ACCESS EXCLUSIVE` (and checks them again once it holds it), but it makes one request per attempt: it does not have 0.6.17's retry of the `ACCESS EXCLUSIVE` request with doubling waits up to 320 ms.
 
 ### Confirm It
 
@@ -505,7 +505,7 @@ Run such readers against a replica or with a short `statement_timeout`, poll the
 None of these has been measured against this fault. Change one at a time and watch `pruned`, `awa.ring.generation` and `awa.dispatch.claim_duration`.
 
 - **Reduce overlapping claims.** Serve each queue from fewer runtimes, especially queues that are usually idle, since every runtime that serves a queue claims on it. A dispatcher whose fallback poll finds no ready jobs does not claim, so idle queues add fewer claims than busy ones.
-- **Raise `prune_lock_timeout` modestly**, for example to `50ms` or `100ms`. While prune's `ACCESS EXCLUSIVE` request waits, every new claim on that partition queues behind it, so a longer wait trades claim latency for reclamation. Keep it well below `deadlock_timeout` and `statement_timeout`; startup warns when it reaches either.
+- **Raise `prune_lock_timeout` modestly**, for example to `50ms` or `100ms`. Only the `ready_segments` partition waits for this timeout; the other queue partitions are locked `NOWAIT`. While prune's `ACCESS EXCLUSIVE` request waits, every new claim on that partition queues behind it, so a longer wait trades claim latency for reclamation. Keep it well below `deadlock_timeout` and `statement_timeout`; startup warns when it reaches either.
 - **Stop long readers of the ring tables.** If either lock query shows a monitoring, dashboard or reporting query rather than claims, bound or move that query instead; see above.
 - **Do not lengthen the rotation interval for this fault.** It does not help prune get its lock, and it makes each slot larger.
 - **Split workloads across databases.** Claims lock only their own database's ring partitions, so moving some queues and their runtimes to a [separate database](deployment.md#storage-isolation) leaves fewer overlapping claims on each ring, at the cost of a second installation to migrate and operate.

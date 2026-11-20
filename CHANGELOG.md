@@ -90,7 +90,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Forward-ported from 0.6.18
 
-- [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) covers queue and claim ring prunes that overlapping claims keep `blocked` (#721): symptoms, how to tell it from a lane pinning the queue ring or abandoned claims, a lock query for both rings that works under either ring cursor authority, and mitigations. This branch does not fix it. The section also covers long readers of the queue-storage tables, such as monitoring queries, which stall prune for as long as they run, with a query that lists them for every ring.
+- [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) covers queue and claim ring prunes that overlapping claims keep `blocked` (#721): symptoms, how to tell it from a lane pinning the queue ring or abandoned claims, a lock query for both rings that works under either ring cursor authority, and mitigations. 0.7 does not fix it yet. The section also covers long readers of the queue-storage tables, such as monitoring queries, which stall prune for as long as they run, with a query that lists them for every ring.
 - [Storage isolation](docs/deployment.md#storage-isolation) recommends a separate database for queues likely to sit paused, unserved or starved under strict priority, since every queue in a database shares one queue ring, one claim ring and one maintenance leader (#779, #721). It covers what the boundary contains, setup for producers and runtimes, costs, and why a separate queue-storage schema in the same database is not a boundary.
 
 ### Added
