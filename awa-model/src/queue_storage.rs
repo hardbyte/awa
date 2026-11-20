@@ -3527,6 +3527,17 @@ impl DoneJobRow {
     }
 }
 
+/// The unique-claim fields of a deleted DLQ row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DeletedDlqRow {
+    job_id: i64,
+    state: JobState,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+}
+
+const DELETED_DLQ_COLUMNS: &str = "job_id, state, unique_key, unique_states";
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DlqJobRow {
     job_id: i64,
@@ -18950,6 +18961,141 @@ impl QueueStorage {
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rows.len() as u64)
+    }
+
+    /// Release the unique claims of the DLQ rows `deleted` removed. A DLQ
+    /// row is a failed job, and a unique key whose states include `failed`
+    /// stays claimed while the row exists; deleting the row without this
+    /// leaves a claim that refuses the key to new jobs. The claims are
+    /// locked in key order, the order every other claim change takes.
+    async fn release_deleted_dlq_claims_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: &[DeletedDlqRow],
+    ) -> Result<(), AwaError> {
+        let mut released: Vec<(&[u8], i64)> = deleted
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
+            .filter_map(|row| Some((row.unique_key.as_deref()?, row.job_id)))
+            .collect();
+        if released.is_empty() {
+            return Ok(());
+        }
+        released.sort_unstable();
+        let (keys, job_ids): (Vec<&[u8]>, Vec<i64>) = released.into_iter().unzip();
+        // The locking clause applies after ORDER BY, so the CTE locks the
+        // claims in key order; the DELETE only reaches rows it has locked.
+        sqlx::query(
+            r#"
+            WITH released AS MATERIALIZED (
+                SELECT claims.unique_key
+                FROM unnest($1::bytea[], $2::bigint[]) AS input(unique_key, job_id)
+                JOIN awa.job_unique_claims AS claims
+                  ON claims.unique_key = input.unique_key
+                 AND claims.job_id = input.job_id
+                ORDER BY claims.unique_key
+                FOR UPDATE OF claims
+            )
+            DELETE FROM awa.job_unique_claims AS claims
+            USING released
+            WHERE claims.unique_key = released.unique_key
+            "#,
+        )
+        .bind(&keys)
+        .bind(&job_ids)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Delete the DLQ rows `predicate` selects in one transaction, releasing
+    /// their unique claims, and return how many were deleted.
+    pub(crate) async fn purge_dlq_where(
+        &self,
+        pool: &PgPool,
+        predicate: &crate::job_query::Predicate,
+    ) -> Result<u64, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let sql = format!(
+            "DELETE FROM {}.dlq_entries {} RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema(),
+            predicate.where_clause()
+        );
+        let deleted: Vec<DeletedDlqRow> = predicate
+            .bind_query_as(sqlx::query_as(audited_sql(sql)))
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
+    }
+
+    /// Delete one DLQ row, releasing its unique claim.
+    pub async fn purge_dlq_job(&self, pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            "DELETE FROM {}.dlq_entries WHERE job_id = $1 RETURNING {DELETED_DLQ_COLUMNS}",
+            self.schema()
+        )))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(!deleted.is_empty())
+    }
+
+    /// Delete up to `limit` DLQ rows older than `retention`, releasing their
+    /// unique claims, and return how many were deleted. `queue` keeps the
+    /// delete to one queue; `exclude_queues` leaves those queues alone.
+    /// With `oldest_first`, rows go in `(dlq_at, job_id)` order.
+    pub async fn delete_expired_dlq_rows(
+        &self,
+        pool: &PgPool,
+        retention: std::time::Duration,
+        limit: i64,
+        queue: Option<&str>,
+        exclude_queues: &[&str],
+        oldest_first: bool,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
+        let order = if oldest_first {
+            "ORDER BY dlq_at ASC, job_id ASC"
+        } else {
+            ""
+        };
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedDlqRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE job_id IN (
+                SELECT job_id FROM {schema}.dlq_entries
+                WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+                  AND ($3::text IS NULL OR queue = $3)
+                  AND queue <> ALL($4::text[])
+                {order}
+                LIMIT $2
+            )
+            RETURNING {DELETED_DLQ_COLUMNS}
+            "#
+        )))
+        .bind(retention_secs)
+        .bind(limit)
+        .bind(queue)
+        .bind(exclude_queues)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.release_deleted_dlq_claims_tx(&mut tx, &deleted)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(deleted.len() as u64)
     }
 
     pub async fn retry_from_dlq(

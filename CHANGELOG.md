@@ -93,6 +93,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) covers queue and claim ring prunes that overlapping claims keep `blocked` (#721): symptoms, how to tell it from a lane pinning the queue ring or abandoned claims, a lock query for both rings that works under either ring cursor authority, and mitigations. 0.7 does not fix it yet. The section also covers long readers of the queue-storage tables, such as monitoring queries, which stall prune for as long as they run, with a query that lists them for every ring.
 - [Storage isolation](docs/deployment.md#storage-isolation) recommends a separate database for queues likely to sit paused, unserved or starved under strict priority, since every queue in a database shares one queue ring, one claim ring and one maintenance leader (#779, #721). It covers what the boundary contains, setup for producers and runtimes, costs, and why a separate queue-storage schema in the same database is not a boundary.
 
+### Forward-ported from 0.6.19
+
+- `PeriodicJob::latest_fire_time` no longer panics on a schedule whose cron expression or timezone does not parse. It logs a warning and returns `None`.
+- Deleting a DLQ row now releases its unique claim. A unique key whose states include `failed` stays claimed while its job is in the DLQ, and `purge_dlq_matching`, `purge_dlq`, `purge_dlq_job`, `cleanup_dlq` and the maintenance leader's DLQ retention deleted the row but left the claim, so a new job with that key was refused as a duplicate of a job that no longer existed. Each now releases the claims in the same transaction, locking them in key order.
+
 ### Added
 
 - **`awa::flush_wakeups(&pool, timeout)`** sends a pool's pending wake-ups without waiting for the 50 ms window and waits until they have been sent, for at most `timeout`. A Rust producer that enqueues or retries and then exits or closes its pool calls it first; it returns `false` if the timeout ran out, leaving the jobs to polling. `Client::shutdown` (after the drain, for at most one more second), the Python client's `close()` and the CLI call it. Closing a pool fails any wake-up still waiting to be sent, so before this a Python script that enqueued and then called `close()` never woke its claimers.

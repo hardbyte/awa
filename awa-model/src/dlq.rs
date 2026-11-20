@@ -563,28 +563,12 @@ pub async fn purge_dlq(
 
 async fn purge_where(pool: &PgPool, predicate: &Predicate) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let sql = format!(
-        "DELETE FROM {}.dlq_entries {}",
-        store.schema(),
-        predicate.where_clause()
-    );
-    let result = predicate
-        .bind_query(sqlx::query(audited_sql(sql)))
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    store.purge_dlq_where(pool, predicate).await
 }
 
 pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(audited_sql(format!(
-        "DELETE FROM {}.dlq_entries WHERE job_id = $1",
-        store.schema()
-    )))
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    store.purge_dlq_job(pool, job_id).await
 }
 
 /// Purge DLQ rows older than the configured retention horizon.
@@ -599,26 +583,7 @@ pub async fn cleanup_dlq(
     queue: Option<&str>,
 ) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let retention_secs = retention.as_secs().min(i64::MAX as u64) as i64;
-    let result = sqlx::query(audited_sql(format!(
-        r#"
-        DELETE FROM {}.dlq_entries
-        WHERE job_id IN (
-            SELECT job_id
-            FROM {}.dlq_entries
-            WHERE dlq_at < now() - make_interval(secs => $1::bigint)
-              AND ($3::text IS NULL OR queue = $3)
-            ORDER BY dlq_at ASC, job_id ASC
-            LIMIT $2
-        )
-        "#,
-        store.schema(),
-        store.schema()
-    )))
-    .bind(retention_secs)
-    .bind(batch_size)
-    .bind(queue)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    store
+        .delete_expired_dlq_rows(pool, retention, batch_size, queue, &[], true)
+        .await
 }
