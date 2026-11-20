@@ -324,10 +324,10 @@ mod tests {
         while sends_completed(key) != Some(1) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        // Woken again inside its window: without a flush this waits for the
-        // window to end.
+        // Woken again inside its window: without the flush's bypass this
+        // waits for the window to end, so it must finish well before that.
         wake_after_commit(&pool, ["awa:q".to_string()]);
-        assert!(flush_wakeups(&pool, Duration::from_secs(5)).await);
+        assert!(flush_wakeups(&pool, WINDOW / 2).await);
         assert_eq!(
             sends_completed(key),
             Some(2),
