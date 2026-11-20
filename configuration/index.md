@@ -107,7 +107,7 @@ The key `QueueConfig` fields:
 | `max_workers` | `50` | Always — this is your concurrency cap per queue in each worker process |
 | `rate_limit` | `None` | External API rate limits, backpressure. The token bucket is per worker process |
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on the claim batch's shared `lease_claim_batches.deadline_at` and the maintenance rescue path force-closes expired claims. |
-| `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
+| `poll_interval` | `200ms` | How often a claimer polls when no `NOTIFY` reaches it; with LISTEN available, empty polls back off to 2 s (see below). Wake-ups from the enqueue and retry paths awa commits itself are coalesced to at most one per queue per 50 ms from each pool; SQL-function inserts and the public `*_tx` methods still notify once per transaction ([ADR-053](../adr/053-coordination-off-the-commit-path/index.md)). |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |

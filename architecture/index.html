@@ -2870,7 +2870,7 @@
 <ul>
 <li>Awa assumes one shared Postgres database and any number of Rust or Python worker processes.</li>
 <li>Each process registers the queues and job kinds it can execute.</li>
-<li>Queue work is awakened by <code>LISTEN/NOTIFY</code> with polling as the fallback.</li>
+<li>Queue work is awakened by <code>LISTEN/NOTIFY</code> with polling as the fallback. A transaction that calls <code>NOTIFY</code> takes PostgreSQL's cluster-wide notify lock at <code>COMMIT</code> and holds it until its commit is flushed, so paths that commit their own transaction (batch and COPY enqueue, retries, DLQ retries, priority aging, promotion) send their wake-ups after <code>COMMIT</code> instead: at most one <code>NOTIFY</code> per queue per 50 ms from each pool, the first at once and later ones at the end of the window. Inserts through the SQL functions (<code>insert</code>, <code>insert_with</code>, <code>insert_many</code>, cron) and the public <code>*_tx</code> methods notify inside the caller's transaction, so the wake-up is delivered only if that transaction commits. A wake-up is a hint: a lost one delays a claim until the claimer's next poll, at most the idle poll backoff (2 s, or <code>poll_interval</code> when larger). See <a href="../adr/053-coordination-off-the-commit-path/">ADR-053</a>.</li>
 <li>The maintenance leader is elected inside the same worker fleet; no <code>pg_cron</code> or external scheduler is required.</li>
 <li>Long analytical reads should run on replicas or with disciplined timeouts, because long-lived primary transactions can delay best-effort partition prune.</li>
 </ul>
