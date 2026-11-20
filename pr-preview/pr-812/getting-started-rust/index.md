@@ -205,6 +205,7 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `Client::start()` spawns background tasks and returns immediately. Your service should usually stay alive until it receives a shutdown signal.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.
+- A short-lived producer that enqueues or retries through `QueueStorage` (for example `enqueue_params_copy`) and then exits or closes its pool calls `awa_model::flush_wakeups(&pool, Duration::from_secs(1)).await` first, so workers are woken now rather than at their next poll. `Client::shutdown` does this itself.
 - If your service runs a `tracing-opentelemetry` layer, distributed tracing is automatic: enqueues capture the current span's context and the worker's `job.execute` span continues that trace (retries link back instead — see [Distributed tracing](../configuration/index.md#distributed-tracing) and [ADR-039](../adr/039-trace-propagation/index.md)). To propagate onward from a handler (outgoing HTTP headers), use the ambient context — `awa_model::trace::current_traceparent()` — so the downstream span is a child of the execution span; `ctx.traceparent()` returns the stored *enqueue-site* context for inspection.
 
 When enqueueing from a request or service method that already writes app data, use your existing `sqlx` transaction and pass it to Awa:
