@@ -21,8 +21,10 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     super::gate_metrics::install("parent")?;
     // OTLP capture, when on, owns the global meter provider, and its collector also
     // receives the maintenance metrics, so the in-memory capture is only for runs without it.
-    let maintenance_metrics =
-        (!super::gate_metrics::active()).then(super::maintenance_metrics::install);
+    let maintenance_metrics = (!super::gate_metrics::active()).then(|| {
+        super::maintenance_metrics::install(&config.report_dir)
+            .map_err(|error| format!("could not create the maintenance metrics file: {error}"))
+    });
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -269,11 +271,26 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         }
     }
     super::gate_metrics::reconcile(&shared);
-    let maintenance = match &maintenance_metrics {
-        Some(capture) => capture
-            .write(&shared.config.report_dir)
-            .map_err(|error| format!("could not write the maintenance metrics: {error}")),
+    let maintenance = match maintenance_metrics {
+        Some(Ok(capture)) => capture.finish(),
+        Some(Err(error)) => Err(error),
         None => Err("captured by the OTLP collector, not in process".to_string()),
+    };
+    // The runtimes have stopped, and a leader zeroes the pinned-age gauge as it steps
+    // down, so the final pin state comes from storage rather than the last export.
+    let maintenance = match maintenance {
+        Ok(mut summary) => {
+            let schema = shared.info.queue_storage_schema.as_deref().unwrap_or("awa");
+            match super::maintenance_metrics::pinning_lanes_now(&oracle_pool, schema).await {
+                Ok(lanes) => summary.pinning_lanes_at_end = Some(lanes),
+                Err(error) => shared.note(
+                    "run",
+                    format!("could not read the final queue ring pin: {error}"),
+                ),
+            }
+            Ok(summary)
+        }
+        Err(reason) => Err(reason),
     };
     let outcome = Outcome {
         quiesced,

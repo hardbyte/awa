@@ -1648,6 +1648,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_queue_ring_pin_is_read_from_storage() {
+        let run = TestRun::create().await;
+        let pinned =
+            super::super::maintenance_metrics::pinning_lanes_now(&run.pool, &schema(&run.shared))
+                .await
+                .expect("read the pin before any rotation");
+        assert_eq!(pinned, 0);
+        run.store
+            .enqueue_batch(&run.pool, "oracle_pinned", 2, 3)
+            .await
+            .expect("enqueue an unclaimed lane");
+        run.store
+            .rotate(&run.pool)
+            .await
+            .expect("rotate queue ring");
+        let pinned =
+            super::super::maintenance_metrics::pinning_lanes_now(&run.pool, &schema(&run.shared))
+                .await
+                .expect("read the pin after the lane's slot sealed");
+        assert_eq!(pinned, 1);
+        run.drop().await;
+    }
+
+    #[tokio::test]
     async fn gate_materialized_lease_duplicate_is_visible_without_counting_receipts() {
         let run = TestRun::create().await;
         super::super::gate_proof::GateProof::install(&run.shared)

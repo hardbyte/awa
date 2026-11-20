@@ -75,11 +75,18 @@ fn render_maintenance(
             let _ = match summary.oldest_pinned_ready_age_seconds {
                 Some(age) => writeln!(
                     out,
-                    "- queue ring pinned by a ready lane: {} lane(s), oldest {age:.0} s; {} still pinning at the last export",
-                    summary.pinning_lanes, summary.pinning_lanes_at_end
+                    "- queue ring pinned by a ready lane: {} lane(s), oldest {age:.0} s",
+                    summary.pinning_lanes
                 ),
                 None => writeln!(out, "- queue ring pinned by a ready lane: never"),
             };
+            let _ = writeln!(
+                out,
+                "- lanes pinning the queue ring after the runtimes stopped: {}",
+                summary
+                    .pinning_lanes_at_end
+                    .map_or("not read".into(), |lanes| lanes.to_string())
+            );
             let _ = writeln!(
                 out,
                 "- claim cursor advances by prune: {}",

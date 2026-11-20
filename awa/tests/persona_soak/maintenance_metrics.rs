@@ -3,14 +3,22 @@
 //! cumulative data point per line. Runtimes in their own process (the python and
 //! claim-and-abandon personas) are not covered; when one of those leads, its maintenance
 //! activity is missing from the file.
+//!
+//! This process is also the one whose resident memory the soak gates, so the exporter
+//! keeps no history: each export's selected data points are appended to the file as they
+//! arrive, and only the latest point of each series is held for the summary.
 
-use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+use awa::model::{QueueStorage, QueueStorageConfig};
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PREFIX: &str = "awa.maintenance.";
@@ -20,21 +28,84 @@ const ROTATE_ATTEMPTS: &str = "awa.maintenance.rotate.attempts";
 const PINNED_READY_AGE: &str = "awa.maintenance.prune.pinned_ready_age";
 const CLAIM_CURSOR_ADVANCES: &str = "awa.maintenance.prune.claim_cursor_advances";
 const EXPORT_EVERY: Duration = Duration::from_secs(10);
+const FILE_NAME: &str = "maintenance-metrics.jsonl";
+
+struct Sink {
+    file: BufWriter<std::fs::File>,
+    /// The first write error; later exports are dropped once the file is incomplete.
+    error: Option<String>,
+    summary: Accumulator,
+}
+
+/// Appends each export's selected data points to the file and folds them into the
+/// summary, then drops them.
+#[derive(Clone)]
+struct StreamingExporter(Arc<Mutex<Sink>>);
+
+impl PushMetricExporter for StreamingExporter {
+    async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+        let rows = selected_rows(metrics);
+        let mut sink = self
+            .0
+            .lock()
+            .map_err(|_| OTelSdkError::InternalFailure("metrics sink poisoned".into()))?;
+        if sink.error.is_some() {
+            return Ok(());
+        }
+        for row in &rows {
+            if let Err(error) = writeln!(sink.file, "{row}") {
+                sink.error = Some(error.to_string());
+                return Ok(());
+            }
+            sink.summary.add(row);
+        }
+        Ok(())
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        let mut sink = self
+            .0
+            .lock()
+            .map_err(|_| OTelSdkError::InternalFailure("metrics sink poisoned".into()))?;
+        sink.file
+            .flush()
+            .map_err(|error| OTelSdkError::InternalFailure(error.to_string()))
+    }
+
+    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+        self.force_flush()
+    }
+
+    fn temporality(&self) -> Temporality {
+        Temporality::Cumulative
+    }
+}
 
 pub struct Capture {
-    exporter: InMemoryMetricExporter,
+    sink: Arc<Mutex<Sink>>,
     provider: SdkMeterProvider,
 }
 
-/// Installs the global meter provider. Call before any runtime is built.
-pub fn install() -> Capture {
-    let exporter = InMemoryMetricExporter::default();
-    let reader = PeriodicReader::builder(exporter.clone())
+/// Creates `maintenance-metrics.jsonl` in `dir` and installs the global meter provider
+/// that streams into it. Call before any runtime is built.
+pub fn install(dir: &Path) -> std::io::Result<Capture> {
+    let capture = capture(dir)?;
+    opentelemetry::global::set_meter_provider(capture.provider.clone());
+    Ok(capture)
+}
+
+fn capture(dir: &Path) -> std::io::Result<Capture> {
+    std::fs::create_dir_all(dir)?;
+    let sink = Arc::new(Mutex::new(Sink {
+        file: BufWriter::new(std::fs::File::create(dir.join(FILE_NAME))?),
+        error: None,
+        summary: Accumulator::default(),
+    }));
+    let reader = PeriodicReader::builder(StreamingExporter(sink.clone()))
         .with_interval(EXPORT_EVERY)
         .build();
     let provider = SdkMeterProvider::builder().with_reader(reader).build();
-    opentelemetry::global::set_meter_provider(provider.clone());
-    Capture { exporter, provider }
+    Ok(Capture { sink, provider })
 }
 
 fn epoch_ms(time: SystemTime) -> u64 {
@@ -95,33 +166,55 @@ macro_rules! rows {
     };
 }
 
-impl Capture {
-    /// Writes `maintenance-metrics.jsonl` to `dir` and returns the summary of its rows.
-    pub fn write(&self, dir: &Path) -> std::io::Result<Summary> {
-        let _ = self.provider.force_flush();
-        let mut rows: Vec<Value> = Vec::new();
-        for resource in self.exporter.get_finished_metrics().unwrap_or_default() {
-            for scope in resource.scope_metrics() {
-                for metric in scope.metrics() {
-                    let name = metric.name();
-                    if !name.starts_with(PREFIX) && name != RING_GENERATION {
-                        continue;
-                    }
-                    match metric.data() {
-                        AggregatedMetrics::F64(data) => rows!(name, data, rows),
-                        AggregatedMetrics::U64(data) => rows!(name, data, rows),
-                        AggregatedMetrics::I64(data) => rows!(name, data, rows),
-                    }
-                }
+/// The selected data points of one export, one JSON row each.
+fn selected_rows(metrics: &ResourceMetrics) -> Vec<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for scope in metrics.scope_metrics() {
+        for metric in scope.metrics() {
+            let name = metric.name();
+            if !name.starts_with(PREFIX) && name != RING_GENERATION {
+                continue;
+            }
+            match metric.data() {
+                AggregatedMetrics::F64(data) => rows!(name, data, rows),
+                AggregatedMetrics::U64(data) => rows!(name, data, rows),
+                AggregatedMetrics::I64(data) => rows!(name, data, rows),
             }
         }
-        std::fs::create_dir_all(dir)?;
-        let mut file = std::fs::File::create(dir.join("maintenance-metrics.jsonl"))?;
-        for row in &rows {
-            writeln!(file, "{row}")?;
-        }
-        Ok(Summary::from_rows(&rows))
     }
+    rows
+}
+
+impl Capture {
+    /// Exports once more, completes `maintenance-metrics.jsonl` and returns the summary of
+    /// its rows. `pinning_lanes_at_end` is left for the caller to read from storage.
+    pub fn finish(&self) -> Result<Summary, String> {
+        let _ = self.provider.force_flush();
+        let mut sink = self.sink.lock().map_err(|_| "metrics sink poisoned")?;
+        if let Err(error) = sink.file.flush() {
+            sink.error.get_or_insert(error.to_string());
+        }
+        match &sink.error {
+            Some(error) => Err(format!("could not write {FILE_NAME}: {error}")),
+            None => Ok(sink.summary.summary()),
+        }
+    }
+}
+
+/// Lanes holding ready rows at or past their claim cursor in the oldest sealed queue ring
+/// slot, read from storage. The pinned-age gauge cannot answer this at the end of a run:
+/// a leader zeroes it when it gives up leadership, pinned or not.
+pub async fn pinning_lanes_now(pool: &sqlx::PgPool, schema: &str) -> Result<usize, String> {
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.to_string(),
+        ..QueueStorageConfig::default()
+    })
+    .map_err(|error| error.to_string())?;
+    let pin = store
+        .queue_ring_pin(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(pin.map_or(0, |pin| pin.lanes.len()))
 }
 
 /// The ring metrics of a run, read from the captured cumulative data points.
@@ -138,9 +231,11 @@ pub struct Summary {
     /// lanes; `None` when no runtime recorded it.
     pub claim_cursor_advances: Option<BTreeMap<String, u64>>,
     /// Lanes `awa.maintenance.prune.pinned_ready_age` reported pinning the queue ring at
-    /// any export, and those still pinning it at the last one.
+    /// any export.
     pub pinning_lanes: usize,
-    pub pinning_lanes_at_end: usize,
+    /// Lanes pinning the queue ring once the runtimes had stopped, read from storage;
+    /// `None` when that read failed.
+    pub pinning_lanes_at_end: Option<usize>,
     /// The largest `awa.maintenance.prune.pinned_ready_age` recorded, in seconds.
     pub oldest_pinned_ready_age_seconds: Option<f64>,
 }
@@ -157,72 +252,87 @@ fn ring_and_outcome(row: &Value) -> String {
     )
 }
 
-impl Summary {
-    pub fn from_rows(rows: &[Value]) -> Self {
-        let mut summary = Summary::default();
-        let mut pinning_lanes: BTreeSet<String> = BTreeSet::new();
-        // Each export repeats every series cumulatively, in export order, so the last
-        // point of a series is its value for the whole run.
-        let mut last: BTreeMap<(String, String), &Value> = BTreeMap::new();
-        for row in rows {
-            let name = row["name"].as_str().unwrap_or_default();
-            let series = row["attributes"].to_string();
-            match name {
-                RING_GENERATION => {
-                    let generation = row["value"].as_i64().unwrap_or_default();
-                    summary
-                        .ring_generation
-                        .entry(attribute(row, "awa.ring").to_string())
-                        .and_modify(|(_, latest)| *latest = generation)
-                        .or_insert((generation, generation));
-                }
-                PINNED_READY_AGE => {
-                    let age_seconds = row["value"].as_f64().unwrap_or_default();
-                    if age_seconds > 0.0 {
-                        pinning_lanes.insert(series.clone());
-                        summary.oldest_pinned_ready_age_seconds = Some(
-                            summary
-                                .oldest_pinned_ready_age_seconds
-                                .unwrap_or_default()
-                                .max(age_seconds),
-                        );
-                    }
-                }
-                _ => {}
+/// Folds rows into a [`Summary`] one at a time. It holds the latest row of each series,
+/// so its size follows the number of series, not the length of the run.
+#[derive(Default)]
+struct Accumulator {
+    ring_generation: BTreeMap<String, (i64, i64)>,
+    pinning_lanes: BTreeSet<String>,
+    oldest_pinned_ready_age_seconds: Option<f64>,
+    // Each export repeats every series cumulatively, in export order, so the last point
+    // of a series is its value for the whole run.
+    last: BTreeMap<(String, String), Value>,
+}
+
+impl Accumulator {
+    fn add(&mut self, row: &Value) {
+        let name = row["name"].as_str().unwrap_or_default();
+        let series = row["attributes"].to_string();
+        match name {
+            RING_GENERATION => {
+                let generation = row["value"].as_i64().unwrap_or_default();
+                self.ring_generation
+                    .entry(attribute(row, "awa.ring").to_string())
+                    .and_modify(|(_, latest)| *latest = generation)
+                    .or_insert((generation, generation));
             }
-            last.insert((name.to_string(), series), row);
+            PINNED_READY_AGE => {
+                let age_seconds = row["value"].as_f64().unwrap_or_default();
+                if age_seconds > 0.0 {
+                    self.pinning_lanes.insert(series.clone());
+                    self.oldest_pinned_ready_age_seconds = Some(
+                        self.oldest_pinned_ready_age_seconds
+                            .unwrap_or_default()
+                            .max(age_seconds),
+                    );
+                }
+            }
+            _ => {}
         }
-        summary.pinning_lanes = pinning_lanes.len();
-        for ((name, _), row) in last {
+        if matches!(
+            name,
+            PRUNE_ATTEMPTS | ROTATE_ATTEMPTS | CLAIM_CURSOR_ADVANCES
+        ) {
+            self.last.insert((name.to_string(), series), row.clone());
+        }
+    }
+
+    fn summary(&self) -> Summary {
+        let mut summary = Summary {
+            ring_generation: self.ring_generation.clone(),
+            pinning_lanes: self.pinning_lanes.len(),
+            oldest_pinned_ready_age_seconds: self.oldest_pinned_ready_age_seconds,
+            ..Summary::default()
+        };
+        for ((name, _), row) in &self.last {
             let total = row["value"].as_u64().unwrap_or_default();
-            match name.as_str() {
-                PRUNE_ATTEMPTS => {
-                    *summary
-                        .prune_attempts
-                        .entry(ring_and_outcome(row))
-                        .or_default() += total;
-                }
-                ROTATE_ATTEMPTS => {
-                    *summary
-                        .rotate_attempts
-                        .entry(ring_and_outcome(row))
-                        .or_default() += total;
-                }
+            let counts = match name.as_str() {
+                PRUNE_ATTEMPTS => &mut summary.prune_attempts,
+                ROTATE_ATTEMPTS => &mut summary.rotate_attempts,
                 CLAIM_CURSOR_ADVANCES => {
                     *summary
                         .claim_cursor_advances
                         .get_or_insert_with(BTreeMap::new)
                         .entry(attribute(row, "awa.ring.outcome").to_string())
                         .or_default() += total;
+                    continue;
                 }
-                PINNED_READY_AGE => {
-                    summary.pinning_lanes_at_end +=
-                        usize::from(row["value"].as_f64().unwrap_or_default() > 0.0);
-                }
-                _ => {}
-            }
+                _ => continue,
+            };
+            *counts.entry(ring_and_outcome(row)).or_default() += total;
         }
         summary
+    }
+}
+
+impl Summary {
+    #[cfg(test)]
+    fn from_rows(rows: &[Value]) -> Self {
+        let mut accumulator = Accumulator::default();
+        for row in rows {
+            accumulator.add(row);
+        }
+        accumulator.summary()
     }
 }
 
@@ -265,8 +375,52 @@ mod tests {
             BTreeMap::from([("queue".to_string(), (7, 19))])
         );
         assert_eq!(summary.pinning_lanes, 2);
-        assert_eq!(summary.pinning_lanes_at_end, 1);
+        assert_eq!(summary.pinning_lanes_at_end, None);
         assert_eq!(summary.oldest_pinned_ready_age_seconds, Some(40.0));
         assert_eq!(summary.claim_cursor_advances, None);
+    }
+
+    #[test]
+    fn capture_streams_only_the_selected_metrics_to_the_file() {
+        use opentelemetry::metrics::MeterProvider;
+        let dir = std::env::temp_dir().join(format!(
+            "awa-soak-maintenance-metrics-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let capture = capture(&dir).expect("create the capture");
+        let meter = capture.provider.meter("soak-test");
+        let attempts = meter.u64_counter(PRUNE_ATTEMPTS).build();
+        let other = meter.u64_counter("awa.job.completed").build();
+        let pruned = [
+            opentelemetry::KeyValue::new("awa.ring", "queue"),
+            opentelemetry::KeyValue::new("awa.ring.outcome", "pruned"),
+        ];
+        for _ in 0..3 {
+            attempts.add(2, &pruned);
+            other.add(1, &[]);
+            capture.provider.force_flush().expect("export");
+        }
+        let summary = capture.finish().expect("finish the capture");
+        assert_eq!(
+            summary.prune_attempts,
+            BTreeMap::from([("queue/pruned".to_string(), 6)])
+        );
+        let file = std::fs::read_to_string(dir.join(FILE_NAME)).expect("read the file");
+        let rows: Vec<Value> = file
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON row"))
+            .collect();
+        assert!(rows.len() >= 3, "one row per export: {rows:?}");
+        assert!(rows.iter().all(|row| row["name"] == PRUNE_ATTEMPTS));
+        assert_eq!(rows.last().expect("a row")["value"], 6);
+        let sink = capture.sink.lock().expect("sink");
+        assert_eq!(
+            sink.summary.last.len(),
+            1,
+            "one series, however many exports"
+        );
+        drop(sink);
+        let _ = capture.provider.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
