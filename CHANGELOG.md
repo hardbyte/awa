@@ -90,6 +90,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Forward-ported from 0.6.18
 
+- [Ring prune stays blocked under claim load](docs/troubleshooting.md#ring-prune-stays-blocked-under-claim-load) covers queue and claim ring prunes that overlapping claims keep `blocked` (#721): symptoms, how to tell it from a lane pinning the queue ring or abandoned claims, a lock query for both rings that works under either ring cursor authority, and mitigations. 0.7 does not fix it yet. The section also covers long readers of the queue-storage tables, such as monitoring queries, which stall prune for as long as they run, with a query that lists them for every ring.
+- [Storage isolation](docs/deployment.md#storage-isolation) recommends a separate database for queues likely to sit paused, unserved or starved under strict priority, since every queue in a database shares one queue ring, one claim ring and one maintenance leader (#779, #721). It covers what the boundary contains, setup for producers and runtimes, costs, and why a separate queue-storage schema in the same database is not a boundary.
 - **`drain_queue` no longer leaves a drained lane pinning the queue ring** when 1,000 or more rolled-back inserts preceded its jobs. Drain steps each lane's claim cursor past rows it has cancelled, but its window started at the cursor, so a run of rolled-back enqueue reservations wider than one window left the window empty and the cursor behind the gap, and the lane kept its ready rows in the oldest sealed slot until something claimed from it. Each window now starts at the lane's first committed row at or after the cursor.
 
 ### Added
