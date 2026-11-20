@@ -234,34 +234,36 @@ async fn send_wakeups(guard: SenderGuard, pool: PgPool) {
 /// rows up when they next poll.
 pub async fn flush_wakeups(pool: &PgPool, timeout: Duration) -> bool {
     let key = pool_key(&pool.connect_options());
-    let settled = {
+    // Asks the pool's current sender to send everything pending and returns
+    // the signal it raises when a send finishes or it stops, or `None` once
+    // nothing is pending or being sent. A sender that stops is replaced by
+    // a new one with its own signal on the next hand-off, so the signal is
+    // read again on every pass rather than kept from the first.
+    let flush = || -> Option<Arc<tokio::sync::Notify>> {
         let mut pools = lock_pools();
-        let Some(wakeups) = pools.get_mut(&key) else {
-            return true;
-        };
+        let wakeups = pools.get_mut(&key)?;
         if wakeups.pending.is_empty() && !wakeups.sending {
-            return true;
+            return None;
         }
-        wakeups.flush = true;
-        wakeups.arrived.notify_one();
-        wakeups.settled.clone()
-    };
-    let is_settled = || {
-        lock_pools()
-            .get(&key)
-            .is_none_or(|wakeups| wakeups.pending.is_empty() && !wakeups.sending)
+        if !wakeups.flush {
+            wakeups.flush = true;
+            wakeups.arrived.notify_one();
+        }
+        Some(wakeups.settled.clone())
     };
     let flushed = tokio::time::timeout(timeout, async {
-        loop {
+        while let Some(settled) = flush() {
             let notified = settled.notified();
             tokio::pin!(notified);
-            // Registered before the check, so a signal between the two is
-            // not missed.
             notified.as_mut().enable();
-            if is_settled() {
-                return;
+            // The sender raises the signal while holding the state lock, so
+            // checking again under the lock after registering cannot miss
+            // it.
+            match flush() {
+                None => return,
+                Some(current) if Arc::ptr_eq(&current, &settled) => notified.await,
+                Some(_) => {}
             }
-            notified.await;
         }
     })
     .await
