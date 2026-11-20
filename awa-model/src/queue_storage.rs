@@ -12055,17 +12055,18 @@ impl QueueStorage {
             // column behind OFFSET 0, so it is not pushed down as a NOT EXISTS,
             // for the reason given in `cancel_available_chunk_tx`. A gap before a visible row
             // is an enqueue that rolled back: enqueues on a lane commit in
-            // position order.
+            // position order. So each window starts at the lane's first
+            // visible row at or after the cursor, however many rolled-back
+            // positions lie before it.
             let unfinished: Vec<(String, i16, i16)> = sqlx::query_as(audited_sql(format!(
                 r#"
-                WITH windows AS (
+                WITH cursors AS (
                     SELECT
                         lanes.queue,
                         lanes.priority,
                         lanes.enqueue_shard,
                         claims.seq_name,
                         {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
-                        LEAST({schema}.sequence_next_value(claims.seq_name) + $5, lanes.to_seq) AS window_end,
                         lanes.to_seq
                     FROM unnest($1::text[], $2::smallint[], $3::smallint[], $4::bigint[])
                         AS lanes(queue, priority, enqueue_shard, to_seq)
@@ -12073,6 +12074,39 @@ impl QueueStorage {
                       ON claims.queue = lanes.queue
                      AND claims.priority = lanes.priority
                      AND claims.enqueue_shard = lanes.enqueue_shard
+                ),
+                windows AS (
+                    SELECT
+                        cursors.*,
+                        LEAST(first_visible.lane_seq + $5, cursors.to_seq) AS window_end
+                    FROM cursors
+                    -- A lane's segments cover disjoint position ranges, so
+                    -- the first segment in position order with a visible row
+                    -- at or after the cursor holds the lane's first one.
+                    JOIN LATERAL (
+                        SELECT head.lane_seq
+                        FROM {schema}.ready_segments AS segment
+                        CROSS JOIN LATERAL (
+                            SELECT ready.lane_seq
+                            FROM {schema}.ready_entries AS ready
+                            WHERE ready.ready_slot = segment.ready_slot
+                              AND ready.ready_generation = segment.ready_generation
+                              AND ready.queue = cursors.queue
+                              AND ready.priority = cursors.priority
+                              AND ready.enqueue_shard = cursors.enqueue_shard
+                              AND ready.lane_seq >= GREATEST(segment.first_lane_seq, cursors.claim_seq)
+                              AND ready.lane_seq < LEAST(segment.next_lane_seq, cursors.to_seq)
+                            ORDER BY ready.lane_seq
+                            LIMIT 1
+                        ) AS head
+                        WHERE segment.queue = cursors.queue
+                          AND segment.priority = cursors.priority
+                          AND segment.enqueue_shard = cursors.enqueue_shard
+                          AND segment.next_lane_seq > cursors.claim_seq
+                          AND segment.first_lane_seq < cursors.to_seq
+                        ORDER BY segment.next_lane_seq
+                        LIMIT 1
+                    ) AS first_visible ON TRUE
                 ),
                 scanned AS (
                     SELECT
