@@ -1676,6 +1676,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
             }
+
+            // Retries and other commands commit and leave their queues'
+            // wake-ups to be sent in the background; send them before the
+            // process exits so running workers claim the jobs now.
+            awa_model::flush_wakeups(&pool, Duration::from_secs(1)).await;
         }
     }
 

@@ -27,6 +27,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// How long `close()` waits for pending queue wake-ups to be sent before
+/// closing the pool.
+const CLOSE_WAKEUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Run the migrations on the shared bridge runtime.
 ///
 /// `migrations::run` is `!Send` (it holds a pooled connection across awaits),
@@ -622,6 +626,7 @@ impl PyClient {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
+            awa_model::flush_wakeups(&pool, CLOSE_WAKEUP_FLUSH_TIMEOUT).await;
             pool.close().await;
             Ok(())
         })
@@ -2612,6 +2617,7 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::flush_wakeups(&pool, CLOSE_WAKEUP_FLUSH_TIMEOUT).await;
                 pool.close().await;
                 Ok(())
             })
