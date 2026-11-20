@@ -4767,7 +4767,20 @@ BEGIN
                         OVER (ORDER BY selected_with_spent.lane_seq) AS unspent_through
                 FROM selected_with_spent
             )
-            SELECT max(spent_prefix.lane_seq) + 1
+            SELECT LEAST(
+                max(spent_prefix.lane_seq) + 1,
+                (
+                    SELECT min(other.first_lane_seq)
+                    FROM %1$I.ready_segments AS other
+                    WHERE other.queue = p_queue
+                      AND other.priority = v_lane_priority
+                      AND other.enqueue_shard = v_lane_shard
+                      AND other.next_lane_seq > v_lane_claim_seq
+                      AND other.next_lane_seq <= max(spent_prefix.lane_seq)
+                      AND (other.ready_slot, other.ready_generation)
+                          IS DISTINCT FROM (v_target_slot, v_target_generation)
+                )
+            )
             INTO v_spent_next_seq
             FROM spent_prefix
             WHERE unspent_through = 0;
@@ -4781,7 +4794,14 @@ BEGIN
                     -- reservation lock until the enqueue ends, so a committed
                     -- row follows only ended reservations. A path that
                     -- writes ready rows from any other allocation (such as
-                    -- the enqueue-head trigger) would break this. Later
+                    -- the enqueue-head trigger) would break this. A position
+                    -- outside this generation's window can still hold a
+                    -- committed row of another generation (a producer whose
+                    -- snapshot predates a ring rotation), so the prefix stops
+                    -- at the first segment of another generation that ends
+                    -- inside it; segments are contiguous per enqueue and
+                    -- never span a position of this generation. The next
+                    -- claim targets that segment. Later
                     -- spent/tombstoned lanes cannot move the
                     -- cursor past an earlier live row, because the surrounding
                     -- claim transaction could still abort.
