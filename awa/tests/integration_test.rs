@@ -2056,8 +2056,10 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
     use chrono::{TimeDelta, Utc};
     use uuid::Uuid;
 
-    let _guard = test_lock().lock().await;
-    let client = setup().await;
+    // `setup()` in other tests deletes every runtime snapshot without this
+    // test's mutex; run in a database they cannot reset.
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool();
 
     let fresh_id = Uuid::new_v4();
     let stale_id = Uuid::new_v4();
@@ -2084,7 +2086,7 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         queue_descriptor_hashes: std::collections::HashMap::new(),
         job_kind_descriptor_hashes: std::collections::HashMap::new(),
     };
-    admin::upsert_runtime_snapshot(client.pool(), &fresh_snapshot)
+    admin::upsert_runtime_snapshot(pool, &fresh_snapshot)
         .await
         .unwrap();
 
@@ -2103,22 +2105,21 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         "#,
     )
     .bind(stale_id)
-    .execute(client.pool())
+    .execute(pool)
     .await
     .unwrap();
 
     // Run cleanup with 24h threshold — should delete stale but keep fresh
-    let deleted =
-        admin::cleanup_runtime_snapshots(client.pool(), TimeDelta::try_hours(24).unwrap())
-            .await
-            .unwrap();
+    let deleted = admin::cleanup_runtime_snapshots(pool, TimeDelta::try_hours(24).unwrap())
+        .await
+        .unwrap();
     assert!(
         deleted >= 1,
         "expected at least the stale snapshot to be deleted"
     );
 
     // Verify fresh snapshot still exists
-    let instances = admin::list_runtime_instances(client.pool()).await.unwrap();
+    let instances = admin::list_runtime_instances(pool).await.unwrap();
     assert!(
         instances.iter().any(|i| i.instance_id == fresh_id),
         "fresh snapshot should not be deleted"
@@ -2134,13 +2135,6 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         !instances.iter().any(|i| i.instance_id == stale_id),
         "stale snapshot should be deleted"
     );
-
-    // Cleanup: remove our test data
-    sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id = $1")
-        .bind(fresh_id)
-        .execute(client.pool())
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
