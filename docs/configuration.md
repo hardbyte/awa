@@ -114,7 +114,9 @@ Each worker process applies its `QueueConfig` on its own: `max_workers` is a sem
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
-A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
+A runtime with many queues or claimers also bounds how many claim round-trips it runs at once, on queue and canonical storage alike: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
+
+On queue storage a runtime also bounds how many direct finalize transactions it runs at once: `ClientBuilder::max_concurrent_finalizes` (default: a quarter of the pool, clamped to `4..=64`). A finalize is direct when the job is retried, snoozed, cancelled, parked for a callback, failed or sent to the DLQ, when it completes with follow-up enqueues (registered or staged by the handler), or when its completion batch fails and it is written on its own. Completions written by the completion batcher do not count against the gate. A finalize waits for a slot before it acquires a connection and holds the slot for one attempt; it keeps its heartbeat while it waits, and the wait does not count toward the finalize's two-minute retry budget. Claims and finalizes have separate gates, so neither can take the other's slots. The gate also caps how fast direct finalizes run, so raise it when most outcomes are retries, snoozes or callback waits and the pool has connections to spare. Canonical storage does not use the finalize gate.
 
 With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_interval` when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain `poll_interval`. The cap is internal, preserving existing `QueueConfig` struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.
 
@@ -485,6 +487,8 @@ Receipts mode (the 0.6 default storage) supports both shapes: the deadline lands
 ### Callback timeout — bounding `wait_for_callback` { #callback-timeout }
 
 If you suspend a handler with `wait_for_callback()` and the external system never resumes, a callback-timeout rescue brings the job back to ready (or DLQ if attempts are exhausted).
+
+While it waits, the handler checks the callback's state after 200 ms, then at doubling intervals up to 5 seconds, so a resolved callback can take up to 5 seconds to be noticed. A cancel of the waiting job is still noticed within 200 ms.
 
 | Knob | Default | What it does |
 | --- | --- | --- |

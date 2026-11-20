@@ -91,7 +91,7 @@ own fixed `max_workers`. **Weighted** shares one pool: call `.global_max_workers
 (Rust) or pass `global_max_workers=N` with dict-form queues (Python), then use
 `min_workers` as a floor and `weight` to split overflow. Per-queue rate limiting
 is a token bucket (`RateLimit { max_rate, burst }` / `rate_limit=(rate, burst)`).
-A runtime shares one LISTEN connection across queues. Empty notification-backed queues poll with backoff up to 2s; poll-only runtimes retain `poll_interval`. `ClientBuilder::max_concurrent_claims` bounds concurrent queue-storage claim round trips across queues (default pool size / 4, clamped to 4..=64). This controls database pressure separately from worker capacity; increase it only with measured pool headroom. Extra `claimers` share each queue's worker permits.
+A runtime shares one LISTEN connection across queues. Empty notification-backed queues poll with backoff up to 2s; poll-only runtimes retain `poll_interval`. `ClientBuilder::max_concurrent_claims` bounds concurrent claim round trips across queues, on queue and canonical storage (default pool size / 4, clamped to 4..=64). `ClientBuilder::max_concurrent_finalizes` bounds concurrent direct finalize transactions on queue storage (retries, snoozes, cancels, failures, DLQ moves, completions with follow-ups; same default), so a retry storm cannot take the pool. This controls database pressure separately from worker capacity; increase it only with measured pool headroom. Extra `claimers` share each queue's worker permits.
 
 Enabling a rate limit live is not supported — you can only retune a queue that
 was built with one.
@@ -253,7 +253,9 @@ handler when it arrives.
 - For a long wait, return `JobResult::WaitForCallback(guard)` /
   `awa.WaitForCallback(token)` — this releases the worker permit while parked.
 - `ctx.wait_for_callback(guard).await` suspends the handler in place but **holds
-  the worker permit** while polling; use it only for short waits.
+  the worker permit** while polling (from 200 ms, doubling to 5 s between
+  checks, so a resolution can take up to 5 s to be seen); use it only for
+  short waits.
 - Resolve from a process holding the worker client so hooks fire:
   `resolve_callback(id, payload, default_action)`, or `complete_external` /
   `fail_external` / `retry_external` / `resume_external`. Resolving through the

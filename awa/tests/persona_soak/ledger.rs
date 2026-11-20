@@ -75,6 +75,10 @@ pub struct JobRecord {
     pub completed_event_ms: u32,
     /// When an operator cancel on this job committed, 0 if none.
     pub operator_cancel_ms: u32,
+    /// The run lease of the row that operator cancel returned: the attempt it
+    /// cancelled, or for a job that was not running, the attempt a later
+    /// claim would have superseded.
+    pub operator_cancel_run_lease: Option<i64>,
 }
 
 impl JobRecord {
@@ -98,6 +102,7 @@ impl JobRecord {
             cancel_events: 0,
             completed_event_ms: 0,
             operator_cancel_ms: 0,
+            operator_cancel_run_lease: None,
         }
     }
 

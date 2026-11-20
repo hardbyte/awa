@@ -1,6 +1,7 @@
 import { hashKey, type QueryKey } from "@tanstack/react-query";
 import { queryClient } from "../query";
 import { fetchCapabilities } from "../api";
+import { apiPath } from "../base-path.ts";
 import { RefreshScheduler } from "./scheduler.ts";
 import { onHttpFailure, readWithFence, withReadSignal } from "./read-control.ts";
 import { ObservationDriver } from "./driver.ts";
@@ -9,7 +10,7 @@ import { bindPageLifecycle } from "./lifecycle.ts";
 export const refreshScheduler = new RefreshScheduler();
 export const observationPolicy = refreshScheduler.policy;
 export function managedQueryId(key: QueryKey) {
-  const backend = typeof window === "undefined" ? "/api" : `${window.location.origin}/api`;
+  const backend = typeof window === "undefined" ? "/api" : `${window.location.origin}${apiPath("")}`;
   return hashKey([backend, "trusted-admin", ...key]);
 }
 export function getReadStatus() { return refreshScheduler.readStatus(); }

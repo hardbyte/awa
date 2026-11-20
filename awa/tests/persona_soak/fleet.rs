@@ -99,6 +99,7 @@ impl Fleet {
         let host = ClientHost::spawn(
             self.url.clone(),
             format!("{}_{index}", self.name),
+            self.persona,
             self.pool_size,
             self.worker_threads,
             self.factory.clone(),

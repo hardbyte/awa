@@ -171,6 +171,7 @@ impl Oracle {
     }
 
     async fn check_terminal_uniqueness(&mut self) {
+        super::gate_proof::check_lease_duplicates(&self.shared).await;
         let schema = schema(&self.shared);
         let terminal = terminal_cte(&schema);
         let started = std::time::Instant::now();
@@ -359,7 +360,7 @@ impl Oracle {
         let schema = schema(&self.shared);
         let mut threshold = self.shared.config.promotion_overdue;
         if self.shared.chaos_active() {
-            threshold += self.shared.config.chaos_slack;
+            threshold += self.shared.chaos_slack();
         }
         let rows: Result<Vec<(i64, String, f64)>, _> = sqlx::query_as(awa::audited_sql(format!(
             "SELECT job_id, queue, extract(epoch FROM now() - run_at)::float8
@@ -448,7 +449,7 @@ impl Oracle {
         let now = self.shared.now_ms();
         let mut window = self.shared.config.stall_window;
         if self.shared.chaos_active() {
-            window += self.shared.config.chaos_slack;
+            window += self.shared.chaos_slack();
         }
         let mut candidates = Vec::new();
         for (queue_name, backlog, cursor) in rows {
@@ -700,7 +701,20 @@ impl Oracle {
         let mut sampled = 0i64;
         let mut confirmed = 0i64;
         let mut excluded = 0i64;
+        let mut cancelled_completed: Vec<String> = Vec::new();
         self.shared.ledger.for_each(|id, record| {
+            // The lifecycle check in `on_event` misses jobs without events;
+            // their terminal rows read from the store cover the same rule.
+            if record.operator_cancel_run_lease.is_some()
+                && record.operator_cancel_run_lease == record.terminal_run_lease
+                && record.has(flag::DB_SEEN_COMPLETED)
+                && cancelled_completed.len() < MAX_ROWS
+            {
+                cancelled_completed.push(format!(
+                    "{{\"job_id\":{id},\"run_lease\":{}}}",
+                    record.terminal_run_lease.unwrap_or_default()
+                ));
+            }
             if record.has(flag::OPERATOR_REMOVED) || record.has(flag::DLQ_PURGED) {
                 return;
             }
@@ -747,6 +761,16 @@ impl Oracle {
                 unresolved.push(id);
             }
         });
+        if !cancelled_completed.is_empty() {
+            self.shared.violation(
+                "cancelled_attempt_completed",
+                format!(
+                    "{} job(s) stored a completion for the attempt an operator cancel had closed",
+                    cancelled_completed.len()
+                ),
+                cancelled_completed,
+            );
+        }
         if !unexpected.is_empty() {
             self.shared.violation(
                 "unexpected_outcome",
@@ -763,14 +787,25 @@ impl Oracle {
         let mut lost = Vec::new();
         let mut lost_after_run = Vec::new();
         let mut terminal_in_db = 0usize;
+        let gate_proof = self.shared.gate_proof.get().is_some();
+        let completed = if gate_proof {
+            "SELECT job_id, 'audit_completed', run_lease FROM public.awa_soak_completed_inserts WHERE job_id = ANY($1)".to_string()
+        } else {
+            format!("SELECT b.job_id, 'receipt_completed', b.run_lease
+                      FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids, c.run_leases) AS b(job_id, run_lease)
+                      WHERE c.job_ids && $1 AND b.job_id = ANY($1)")
+        };
+        let done_filter = if gate_proof {
+            "AND state <> 'completed'"
+        } else {
+            ""
+        };
         for chunk in unresolved.chunks(5000) {
             let found: Result<Vec<(i64, String, Option<i64>)>, _> = sqlx::query_as(awa::audited_sql(format!(
                 "SELECT job_id, string_agg(place, ','), max(terminal_run_lease) FROM (
-                    SELECT job_id, 'done:' || state::text AS place, run_lease AS terminal_run_lease FROM {schema}.done_entries WHERE job_id = ANY($1)
+                    SELECT job_id, 'done:' || state::text AS place, run_lease AS terminal_run_lease FROM {schema}.done_entries WHERE job_id = ANY($1) {done_filter}
                     UNION ALL SELECT job_id, 'dlq', run_lease FROM {schema}.dlq_entries WHERE job_id = ANY($1)
-                    UNION ALL SELECT b.job_id, 'receipt_completed', b.run_lease
-                      FROM {schema}.receipt_completion_batches c, LATERAL unnest(c.job_ids, c.run_leases) AS b(job_id, run_lease)
-                      WHERE c.job_ids && $1 AND b.job_id = ANY($1)
+                    UNION ALL {completed}
                     UNION ALL SELECT job_id, 'deferred:' || state::text, NULL::bigint FROM {schema}.deferred_jobs WHERE job_id = ANY($1)
                     UNION ALL SELECT job_id, 'ready', NULL::bigint FROM {schema}.ready_entries WHERE job_id = ANY($1)
                     UNION ALL SELECT job_id, 'leased:' || state::text, NULL::bigint FROM {schema}.leases WHERE job_id = ANY($1)
@@ -1090,6 +1125,70 @@ mod tests {
         }
     }
 
+    fn cancel_fixture() -> Arc<Shared> {
+        let config = SoakConfig::for_test(
+            "postgres://postgres:test@localhost/awa_soak_cancel_lease".to_string(),
+        );
+        let info = db::ServerInfo::default();
+        let budget = Budget::new(&info, 0);
+        Shared::new(config, info, budget)
+    }
+
+    fn attempt(job_id: i64, run_lease: i64) -> awa::JobRow {
+        let now = chrono::Utc::now();
+        serde_json::from_value(serde_json::json!({
+            "id": job_id, "kind": "cancel_lease", "queue": "cancel_lease", "args": {},
+            "state": "running", "priority": 2, "attempt": run_lease, "run_lease": run_lease,
+            "max_attempts": 5, "run_at": now, "attempted_at": now,
+            "created_at": now, "metadata": {}, "tags": [],
+        }))
+        .expect("job row")
+    }
+
+    fn violations_of(shared: &Shared, kind: &str) -> usize {
+        shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .filter(|violation| violation.kind == kind)
+            .count()
+    }
+
+    /// Cancellation of a running handler is cooperative, so the attempt the
+    /// operator cancelled may still start after the cancel committed: its
+    /// claim committed first and it was on its way to the handler. Only a
+    /// newer attempt, which a claim after the cancel would produce, shows
+    /// the cancel did not stop the job.
+    #[test]
+    fn handler_start_after_cancel_is_judged_by_run_lease() {
+        let shared = cancel_fixture();
+        // The ledger reads a cancel at 0 ms as none.
+        std::thread::sleep(Duration::from_millis(5));
+        shared.record_operator_cancel(Persona::Alex, 42, 3, false, 0);
+        std::thread::sleep(Duration::from_millis(5));
+
+        drop(shared.begin_execution(Persona::Tom, &attempt(42, 3), false));
+        assert_eq!(violations_of(&shared, "ran_after_cancel"), 0);
+
+        drop(shared.begin_execution(Persona::Tom, &attempt(42, 4), false));
+        assert_eq!(violations_of(&shared, "ran_after_cancel"), 1);
+    }
+
+    /// The cancelled attempt may start, but it must never be reported
+    /// completed: the cancel already ended it.
+    #[test]
+    fn completion_of_the_cancelled_attempt_is_a_violation() {
+        let shared = cancel_fixture();
+        shared.record_operator_cancel(Persona::Alex, 42, 3, false, 0);
+        drop(shared.begin_execution(Persona::Tom, &attempt(42, 3), false));
+        shared.on_event(&awa::UntypedJobEvent::Completed {
+            job: attempt(42, 3),
+            duration: Duration::ZERO,
+        });
+        assert_eq!(violations_of(&shared, "cancelled_attempt_completed"), 1);
+    }
+
     struct TestRun {
         shared: Arc<Shared>,
         pool: PgPool,
@@ -1104,11 +1203,20 @@ mod tests {
         }
 
         async fn create_with(no_events: bool, sampled: bool) -> Self {
+            Self::create_configured(no_events, sampled, |_| {}).await
+        }
+
+        async fn create_configured(
+            no_events: bool,
+            sampled: bool,
+            configure: impl FnOnce(&mut SoakConfig),
+        ) -> Self {
             let base = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:test@localhost:15432/awa_test".to_string()
             });
             let name = format!("awa_soak_oracle_{}", uuid::Uuid::new_v4().simple());
-            let config = SoakConfig::for_test(replace_database_name(&base, &name));
+            let mut config = SoakConfig::for_test(replace_database_name(&base, &name));
+            configure(&mut config);
             db::recreate_database(&config)
                 .await
                 .expect("create isolated oracle database");
@@ -1160,6 +1268,9 @@ mod tests {
         }
 
         async fn drop(self) {
+            if let Some(proof) = self.shared.gate_proof.get() {
+                proof.close().await.expect("close proof pool");
+            }
             self.pool.close().await;
             let admin = db::connect_pool(&self.shared.config.admin_url(), "oracle_cleanup", 1)
                 .await
@@ -1427,6 +1538,322 @@ mod tests {
             1,
             "the failed lookup chunk must be accounted for"
         );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_handler_return_without_finalization_cannot_gain_terminal_proof() {
+        let mut run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.shared
+            .record_completed_return(Persona::Priya, &run.claim.job)
+            .await;
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM public.awa_soak_handler_returns),
+                    (SELECT count(*) FROM public.awa_soak_completed_inserts)",
+        )
+        .fetch_one(&run.pool)
+        .await
+        .expect("read independent witnesses");
+        assert_eq!(counts, (1, 0));
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        assert!(!run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("record")
+            .has_durable_terminal());
+        run.oracle.final_check(true).await;
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|row| row.kind == "stuck_job"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_completed_audit_survives_compact_and_materialized_terminal_pruning() {
+        for materialized in [false, true] {
+            let mut run = TestRun::create().await;
+            super::super::gate_proof::GateProof::install(&run.shared)
+                .await
+                .expect("install gate proof");
+            run.shared
+                .record_completed_return(Persona::Priya, &run.claim.job)
+                .await;
+            if materialized {
+                run.store
+                    .register_callback(
+                        &run.pool,
+                        run.claim.job.id,
+                        run.claim.job.run_lease,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("materialize receipt claim");
+            }
+            run.store
+                .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+                .await
+                .expect("complete");
+            let shape: String = sqlx::query_scalar("SELECT writer_shape FROM public.awa_soak_completed_inserts WHERE job_id=$1 AND run_lease=$2")
+                .bind(run.claim.job.id).bind(run.claim.job.run_lease).fetch_one(&run.pool).await.expect("audit insert");
+            assert_eq!(
+                shape,
+                if materialized {
+                    "done"
+                } else {
+                    "receipt_batch"
+                }
+            );
+            run.store
+                .reset(&run.pool)
+                .await
+                .expect("remove retained product evidence");
+            super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+            assert!(run
+                .shared
+                .ledger
+                .get(run.claim.job.id)
+                .expect("record")
+                .has_durable_terminal());
+            run.oracle.final_check(true).await;
+            super::super::gate_proof::reconcile(&run.shared).await;
+            assert_eq!(run.shared.run.get("gate_completed_unique_pairs"), 1);
+            assert!(run.shared.violations.lock().expect("violations").is_empty());
+            run.drop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_duplicate_completed_insert_evidence_is_visible_and_fatal() {
+        let run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete");
+        sqlx::query("INSERT INTO public.awa_soak_completed_inserts(job_id,run_lease,attempt,queue,writer_shape)
+                     SELECT job_id,run_lease,attempt,queue,writer_shape FROM public.awa_soak_completed_inserts")
+            .execute(&run.pool).await.expect("inject duplicate without pair uniqueness");
+        super::super::gate_proof::reconcile(&run.shared).await;
+        assert_eq!(run.shared.run.get("gate_completed_insert_rows"), 2);
+        assert_eq!(run.shared.run.get("gate_completed_unique_pairs"), 1);
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|row| row.kind == "duplicate_completed_inserts"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_completions_of_one_job_under_distinct_leases_are_fatal() {
+        let run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete");
+        // A stale attempt and its replacement both commit: one job, two run leases, each
+        // completed once.
+        sqlx::query("INSERT INTO public.awa_soak_completed_inserts(job_id,run_lease,attempt,queue,writer_shape)
+                     SELECT job_id,run_lease+1,attempt+1,queue,writer_shape FROM public.awa_soak_completed_inserts")
+            .execute(&run.pool).await.expect("inject a second attempt's completion");
+        super::super::gate_proof::reconcile(&run.shared).await;
+        assert_eq!(run.shared.run.get("gate_completed_insert_rows"), 2);
+        assert_eq!(run.shared.run.get("gate_completed_unique_pairs"), 2);
+        assert_eq!(run.shared.run.get("gate_completed_unique_jobs"), 1);
+        let violations = run.shared.violations.lock().expect("violations").clone();
+        let duplicate = violations
+            .iter()
+            .find(|row| row.kind == "duplicate_completed_jobs")
+            .expect("a job completed under two run leases is fatal");
+        let row: serde_json::Value =
+            serde_json::from_str(&duplicate.rows[0]).expect("violation row is JSON");
+        assert_eq!(duplicate.rows.len(), 1);
+        assert_eq!(row["job_id"], run.claim.job.id);
+        assert_eq!(
+            row["run_leases"],
+            serde_json::json!([run.claim.job.run_lease, run.claim.job.run_lease + 1])
+        );
+        assert!(!violations
+            .iter()
+            .any(|row| row.kind == "duplicate_completed_inserts"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn completion_stall_gives_up_on_a_held_lock_instead_of_hanging() {
+        let run = TestRun::create_configured(true, true, |config| {
+            config.load = Duration::ZERO;
+            config.completion_stall = Duration::from_secs(1);
+            config.completion_stall_acquire_timeout = Duration::from_millis(500);
+        })
+        .await;
+        let schema = schema(&run.shared);
+        let mut holder = run.pool.begin().await.expect("begin lock holder");
+        sqlx::query(awa::audited_sql(format!(
+            "LOCK TABLE {schema}.receipt_completion_batches IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *holder)
+        .await
+        .expect("hold the completion table");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            super::super::memory::stall_completions(run.shared.clone()),
+        )
+        .await
+        .expect("the stall gives up once its acquisition budget is spent");
+        holder
+            .rollback()
+            .await
+            .expect("release the completion table");
+        super::super::memory::evaluate(&run.shared, 0);
+        let violations = run.shared.violations.lock().expect("violations").clone();
+        let stall = violations
+            .iter()
+            .find(|row| row.kind == "memory_growth_under_stall")
+            .expect("a stall that could not start fails the gate");
+        assert!(
+            stall.summary.contains("could not start"),
+            "{}",
+            stall.summary
+        );
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn final_queue_ring_pin_is_read_from_storage() {
+        let run = TestRun::create().await;
+        let pinned =
+            super::super::maintenance_metrics::pinning_lanes_now(&run.pool, &schema(&run.shared))
+                .await
+                .expect("read the pin before any rotation");
+        assert_eq!(pinned, 0);
+        run.store
+            .enqueue_batch(&run.pool, "oracle_pinned", 2, 3)
+            .await
+            .expect("enqueue an unclaimed lane");
+        run.store
+            .rotate(&run.pool)
+            .await
+            .expect("rotate queue ring");
+        let pinned =
+            super::super::maintenance_metrics::pinning_lanes_now(&run.pool, &schema(&run.shared))
+                .await
+                .expect("read the pin after the lane's slot sealed");
+        assert_eq!(pinned, 1);
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_materialized_lease_duplicate_is_visible_without_counting_receipts() {
+        let run = TestRun::create().await;
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .register_callback(
+                &run.pool,
+                run.claim.job.id,
+                run.claim.job.run_lease,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("materialize receipt claim");
+        super::super::gate_proof::check_lease_duplicates(&run.shared).await;
+        assert!(run.shared.violations.lock().expect("violations").is_empty());
+        sqlx::query(
+            "INSERT INTO awa.leases SELECT (jsonb_populate_record(NULL::awa.leases,
+                     to_jsonb(lease)||jsonb_build_object('lane_seq',lease.lane_seq+1000000))).*
+                     FROM awa.leases AS lease WHERE job_id=$1 AND run_lease=$2",
+        )
+        .bind(run.claim.job.id)
+        .bind(run.claim.job.run_lease)
+        .execute(&run.pool)
+        .await
+        .expect("inject second materialized lease");
+        super::super::gate_proof::check_lease_duplicates(&run.shared).await;
+        assert!(run
+            .shared
+            .violations
+            .lock()
+            .expect("violations")
+            .iter()
+            .any(|row| row.kind == "duplicate_materialized_leases"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gate_imported_no_events_sample_with_unknown_lease_recovers_pruned_audit() {
+        let mut run = TestRun::create().await;
+        assert_eq!(
+            run.claim
+                .job
+                .id
+                .rem_euclid(super::super::ledger::TERMINAL_PROOF_STRIDE),
+            0
+        );
+        assert!(samples_terminal_proof(run.claim.job.id));
+        run.shared.ledger.with(
+            run.claim.job.id,
+            || unreachable!("registered"),
+            |record| {
+                let mut imported = JobRecord::new(
+                    Persona::ClaimAbandon,
+                    record.queue,
+                    0,
+                    expect::COMPLETED,
+                    flag::NO_EVENTS,
+                );
+                imported.executions = 1;
+                imported.max_attempt = run.claim.job.attempt;
+                *record = imported;
+            },
+        );
+        let imported = run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("imported start");
+        assert_eq!(imported.latest_run_lease, 0);
+        assert!(!imported.has(flag::RETURNED_COMPLETED));
+        assert!(!imported.has_durable_terminal());
+        super::super::gate_proof::GateProof::install(&run.shared)
+            .await
+            .expect("install gate proof");
+        run.store
+            .complete_runtime_batch(&run.pool, std::slice::from_ref(&run.claim))
+            .await
+            .expect("complete actual attempt");
+        run.store
+            .reset(&run.pool)
+            .await
+            .expect("remove retained product evidence");
+        super::super::terminal_proof::observe(&run.shared, &run.pool).await;
+        let observed = run
+            .shared
+            .ledger
+            .get(run.claim.job.id)
+            .expect("observed sample");
+        assert_eq!(observed.latest_run_lease, 0);
+        assert_eq!(observed.terminal_run_lease, Some(run.claim.job.run_lease));
+        assert!(observed.has_durable_terminal());
+        run.oracle.final_check(true).await;
+        assert!(!run.shared.oracle_incomplete.load(Ordering::Relaxed));
+        assert!(run.shared.violations.lock().expect("violations").is_empty());
         run.drop().await;
     }
 }

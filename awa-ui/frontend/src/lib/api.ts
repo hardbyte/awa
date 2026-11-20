@@ -1,5 +1,6 @@
 import { checkedJson, currentReadSignal, ReadProtocolError } from "./observation/read-control.ts";
 /** Typed fetch wrapper for the AWA API. */
+import { apiPath } from "./base-path.ts";
 
 export interface JobRow {
   id: number;
@@ -393,7 +394,7 @@ function jobFilterQuery(params: ListJobsParams): URLSearchParams {
 export { ApiError } from "./observation/read-control.ts";
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(apiPath(path), {
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin", cache: "no-store", redirect: "error",
     ...init,
@@ -648,7 +649,7 @@ export function fetchRuntime(): Promise<RuntimeOverview> {
 
 // Returns null if the backend is older than 0.5.5-alpha and lacks /storage.
 export async function fetchStorage(options: { history?: boolean } = {}): Promise<StorageStatusReport | null> {
-  const res = await fetch(`/api/storage${options.history ? "?history=true" : ""}`, {
+  const res = await fetch(apiPath(`/storage${options.history ? "?history=true" : ""}`), {
     headers: { "Content-Type": "application/json" }, credentials: "same-origin", cache: "no-store",
     redirect: "error", signal: currentReadSignal(),
   });

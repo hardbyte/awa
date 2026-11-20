@@ -18,6 +18,13 @@ const HEADROOM: u32 = 14;
 
 pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     let worker_errors = super::worker_errors::install(false)?;
+    super::gate_metrics::install("parent")?;
+    // OTLP capture, when on, owns the global meter provider, and its collector also
+    // receives the maintenance metrics, so the in-memory capture is only for runs without it.
+    let maintenance_metrics = (!super::gate_metrics::active()).then(|| {
+        super::maintenance_metrics::install(&config.report_dir)
+            .map_err(|error| format!("could not create the maintenance metrics file: {error}"))
+    });
     eprintln!(
         "{}: preparing database {}",
         report::HEADER,
@@ -56,6 +63,9 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         ));
     }
     let shared = Shared::new(config, info, budget);
+    if super::gate_proof::enabled_from_env()? {
+        super::gate_proof::GateProof::install(&shared).await?;
+    }
 
     // The UI personas talk to the real admin server, run as a child process.
     let ui_personas = [
@@ -134,6 +144,12 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         format!("load phase started: {}s", shared.config.load.as_secs()),
     );
     shared.started_load(Instant::now());
+    let load_started_ms = shared.now_ms();
+    let memory_sampler = tokio::spawn(super::memory::sample(
+        shared.clone(),
+        shared.drain_stop.clone(),
+    ));
+    let completion_stall = tokio::spawn(super::memory::stall_completions(shared.clone()));
 
     let load_deadline = Instant::now() + shared.config.load;
     let mut next_progress = Instant::now() + Duration::from_secs(30);
@@ -200,6 +216,13 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
     }
 
     shared.drain_stop.trigger();
+    completion_stall
+        .await
+        .map_err(|error| format!("completion stall task: {error}"))?;
+    memory_sampler
+        .await
+        .map_err(|error| format!("memory sampler task: {error}"))?;
+    super::memory::evaluate(&shared, load_started_ms);
     for (persona, task) in tasks {
         match tokio::time::timeout(
             crate::ci_timing::scaled_timeout(Duration::from_secs(180)),
@@ -241,11 +264,40 @@ pub async fn run_soak(config: SoakConfig) -> Result<Arc<Shared>, String> {
         server.stop();
     }
     super::worker_errors::reconcile(&shared, &worker_errors).await;
+    super::gate_proof::reconcile(&shared).await;
+    if let Some(proof) = shared.gate_proof.get() {
+        if let Err(error) = proof.close().await {
+            shared.incomplete(error, vec![]);
+        }
+    }
+    super::gate_metrics::reconcile(&shared);
+    let maintenance = match maintenance_metrics {
+        Some(Ok(capture)) => capture.finish(),
+        Some(Err(error)) => Err(error),
+        None => Err("captured by the OTLP collector, not in process".to_string()),
+    };
+    // The runtimes have stopped, and a leader zeroes the pinned-age gauge as it steps
+    // down, so the final pin state comes from storage rather than the last export.
+    let maintenance = match maintenance {
+        Ok(mut summary) => {
+            let schema = shared.info.queue_storage_schema.as_deref().unwrap_or("awa");
+            match super::maintenance_metrics::pinning_lanes_now(&oracle_pool, schema).await {
+                Ok(lanes) => summary.pinning_lanes_at_end = Some(lanes),
+                Err(error) => shared.note(
+                    "run",
+                    format!("could not read the final queue ring pin: {error}"),
+                ),
+            }
+            Ok(summary)
+        }
+        Err(reason) => Err(reason),
+    };
     let outcome = Outcome {
         quiesced,
         elapsed_seconds: shared.started.elapsed().as_secs_f64(),
         crash_excerpts: excerpts,
         log_tail,
+        maintenance,
     };
     if let Err(error) = report::write(&shared, &outcome) {
         eprintln!("could not write the report: {error}");
