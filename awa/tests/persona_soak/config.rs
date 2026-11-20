@@ -164,6 +164,9 @@ pub struct SoakConfig {
     pub completion_stall: Duration,
     /// Largest accepted rise of resident memory, in MiB, during and after that stall.
     pub completion_stall_memory_limit_mib: f64,
+    /// How long the stall may wait to connect and take its table locks before it is
+    /// reported as not started.
+    pub completion_stall_acquire_timeout: Duration,
     /// Queue and claim ring rotation intervals and the prune lock timeout of every
     /// in-process runtime. Unset keeps the library defaults.
     pub queue_rotate_interval: Option<Duration>,
@@ -192,6 +195,29 @@ pub fn pressure_rotation_interval() -> Result<Duration, String> {
             "AWA_PRESSURE_ROTATE_MULTIPLIER must be 1 or 4, got {value:?}"
         )),
     }
+}
+
+/// The memory sampling interval: 5 s unless set, and never zero, which would spin the
+/// sampler and grow its sample log as fast as it could append.
+fn memory_sample_interval(seconds: Option<u64>) -> Result<Duration, String> {
+    match seconds.unwrap_or(5) {
+        0 => Err("AWA_SOAK_MEMORY_SAMPLE_SECONDS must be at least 1".to_string()),
+        seconds => Ok(Duration::from_secs(seconds)),
+    }
+}
+
+/// The completion stall starts halfway through the load and ends early when the load
+/// does, so a stall must be shorter than half of the load to hold for its whole length.
+fn completion_stall(stall: Duration, load: Duration) -> Result<Duration, String> {
+    if !stall.is_zero() && stall >= load / 2 {
+        return Err(format!(
+            "AWA_SOAK_COMPLETION_STALL_SECONDS={} must be shorter than half of \
+             AWA_SOAK_SECONDS={}",
+            stall.as_secs(),
+            load.as_secs()
+        ));
+    }
+    Ok(stall)
 }
 
 impl SoakConfig {
@@ -240,10 +266,18 @@ impl SoakConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join(format!("awa-soak-{seed}")));
 
+        let load = Duration::from_secs(env_parse("AWA_SOAK_SECONDS").unwrap_or(900));
+        let memory_sample_every =
+            memory_sample_interval(env_parse("AWA_SOAK_MEMORY_SAMPLE_SECONDS"))?;
+        let completion_stall = completion_stall(
+            Duration::from_secs(env_parse("AWA_SOAK_COMPLETION_STALL_SECONDS").unwrap_or(0)),
+            load,
+        )?;
+
         Ok(Self {
             database_url,
             personas,
-            load: Duration::from_secs(env_parse("AWA_SOAK_SECONDS").unwrap_or(900)),
+            load,
             drain_grace: scaled_timeout(Duration::from_secs(
                 env_parse("AWA_SOAK_DRAIN_GRACE_SECONDS").unwrap_or(120),
             )),
@@ -298,20 +332,17 @@ impl SoakConfig {
             heartbeat_staleness: scaled_staleness(Duration::from_secs(
                 env_parse("AWA_SOAK_STALENESS_SECONDS").unwrap_or(DEFAULT_STALENESS_SECONDS),
             )),
-            memory_sample_every: Duration::from_secs(
-                env_parse("AWA_SOAK_MEMORY_SAMPLE_SECONDS").unwrap_or(5),
-            ),
+            memory_sample_every,
             memory_warmup: Duration::from_secs(
                 env_parse("AWA_SOAK_MEMORY_WARMUP_SECONDS").unwrap_or(120),
             ),
             memory_min_executions: env_parse("AWA_SOAK_MEMORY_MIN_EXECUTIONS").unwrap_or(20_000),
             memory_slope_limit_mib_per_100k: env_parse("AWA_SOAK_MEMORY_SLOPE_MIB_PER_100K")
                 .unwrap_or(64.0),
-            completion_stall: Duration::from_secs(
-                env_parse("AWA_SOAK_COMPLETION_STALL_SECONDS").unwrap_or(0),
-            ),
+            completion_stall,
             completion_stall_memory_limit_mib: env_parse("AWA_SOAK_COMPLETION_STALL_MEMORY_MIB")
                 .unwrap_or(128.0),
+            completion_stall_acquire_timeout: scaled_timeout(Duration::from_secs(30)),
             queue_rotate_interval: env_parse::<u64>("AWA_SOAK_QUEUE_ROTATE_MS")
                 .map(Duration::from_millis),
             claim_rotate_interval: env_parse::<u64>("AWA_SOAK_CLAIM_ROTATE_MS")
@@ -375,4 +406,30 @@ pub fn replace_credentials(url: &str, user: &str, password: &str) -> String {
         "{scheme}://{user}:{password}@{host}{}",
         &rest[authority_end..]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{completion_stall, memory_sample_interval};
+    use std::time::Duration;
+
+    #[test]
+    fn memory_sample_interval_must_be_positive() {
+        assert_eq!(memory_sample_interval(None), Ok(Duration::from_secs(5)));
+        assert_eq!(memory_sample_interval(Some(1)), Ok(Duration::from_secs(1)));
+        assert!(memory_sample_interval(Some(0))
+            .expect_err("a zero interval spins the sampler")
+            .contains("AWA_SOAK_MEMORY_SAMPLE_SECONDS"));
+    }
+
+    #[test]
+    fn completion_stall_must_fit_in_the_second_half_of_the_load() {
+        let load = Duration::from_secs(900);
+        assert_eq!(completion_stall(Duration::ZERO, load), Ok(Duration::ZERO));
+        assert_eq!(
+            completion_stall(Duration::from_secs(449), load),
+            Ok(Duration::from_secs(449))
+        );
+        assert!(completion_stall(Duration::from_secs(450), load).is_err());
+    }
 }

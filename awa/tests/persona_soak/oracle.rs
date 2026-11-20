@@ -1116,11 +1116,20 @@ mod tests {
         }
 
         async fn create_with(no_events: bool, sampled: bool) -> Self {
+            Self::create_configured(no_events, sampled, |_| {}).await
+        }
+
+        async fn create_configured(
+            no_events: bool,
+            sampled: bool,
+            configure: impl FnOnce(&mut SoakConfig),
+        ) -> Self {
             let base = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:test@localhost:15432/awa_test".to_string()
             });
             let name = format!("awa_soak_oracle_{}", uuid::Uuid::new_v4().simple());
-            let config = SoakConfig::for_test(replace_database_name(&base, &name));
+            let mut config = SoakConfig::for_test(replace_database_name(&base, &name));
+            configure(&mut config);
             db::recreate_database(&config)
                 .await
                 .expect("create isolated oracle database");
@@ -1557,6 +1566,46 @@ mod tests {
             .expect("violations")
             .iter()
             .any(|row| row.kind == "duplicate_completed_inserts"));
+        run.drop().await;
+    }
+
+    #[tokio::test]
+    async fn completion_stall_gives_up_on_a_held_lock_instead_of_hanging() {
+        let run = TestRun::create_configured(true, true, |config| {
+            config.load = Duration::ZERO;
+            config.completion_stall = Duration::from_secs(1);
+            config.completion_stall_acquire_timeout = Duration::from_millis(500);
+        })
+        .await;
+        let schema = schema(&run.shared);
+        let mut holder = run.pool.begin().await.expect("begin lock holder");
+        sqlx::query(awa::audited_sql(format!(
+            "LOCK TABLE {schema}.receipt_completion_batches IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *holder)
+        .await
+        .expect("hold the completion table");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            super::super::memory::stall_completions(run.shared.clone()),
+        )
+        .await
+        .expect("the stall gives up once its acquisition budget is spent");
+        holder
+            .rollback()
+            .await
+            .expect("release the completion table");
+        super::super::memory::evaluate(&run.shared, 0);
+        let violations = run.shared.violations.lock().expect("violations").clone();
+        let stall = violations
+            .iter()
+            .find(|row| row.kind == "memory_growth_under_stall")
+            .expect("a stall that could not start fails the gate");
+        assert!(
+            stall.summary.contains("could not start"),
+            "{}",
+            stall.summary
+        );
         run.drop().await;
     }
 
