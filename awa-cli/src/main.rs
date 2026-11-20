@@ -1440,6 +1440,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .connect(&db_url)
                 .await?;
 
+            // Run the command in a block so its queue wake-ups are sent
+            // whether it succeeds or fails after earlier work committed.
+            let outcome: Result<(), Box<dyn std::error::Error>> = async {
             match command {
                 Commands::Migrate { .. }
                 | Commands::Serve { .. }
@@ -2313,11 +2316,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
             }
+            Ok(())
+            }
+            .await;
 
             // Retries and other commands commit and leave their queues'
             // wake-ups to be sent in the background; send them before the
             // process exits so running workers claim the jobs now.
             awa_model::flush_wakeups(&pool, Duration::from_secs(1)).await;
+            outcome?;
         }
     }
 
