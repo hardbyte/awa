@@ -395,6 +395,10 @@ stall reclamation. See `docs/configuration.md` for the scheduling contract.
 Prefer PostgreSQL 18 where available; PG17 on some managed platforms caps
 throughput because readers queue behind the ring-rotation `ACCESS EXCLUSIVE`
 lock. Size for steady-state completion rate, not burst.
+PostgreSQL 19 passes the full test suite but has not been measured on a
+managed platform. It holds about half as many locks per unit of
+`max_locks_per_transaction` as earlier releases, so double a value carried
+over from 18; migrations across many queue-storage schemas need the room.
 
 - **MVCC discipline is the biggest footgun.** Any long-held snapshot — `idle in
   transaction`, a BI tool, `pg_dump`, a stuck migration — pins the database-wide
