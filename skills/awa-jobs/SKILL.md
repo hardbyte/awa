@@ -108,6 +108,14 @@ awa::insert_with(&mut *tx, &SendEmail { to, subject },
     InsertOpts { queue: "email".into(), priority: 1, ..Default::default() }).await?;
 ```
 
+Enqueues and retries that commit their own transaction (`QueueStorage::enqueue_batch`,
+`enqueue_params_copy`, `retry_job`, DLQ retries) send their queue wake-ups in the
+background after commit. A short-lived Rust producer calls
+`awa::flush_wakeups(&pool, Duration::from_secs(1)).await` before it exits or closes its
+pool; otherwise claimers find the jobs only at their next poll (up to 2 s).
+`Client::shutdown`, Python `close()` and the CLI already flush, so a Python script
+should close its client (or use `with awa.Client(...)`).
+
 **Python** — `await client.insert(args, queue=..., priority=..., run_at=..., ...)`.
 For transactional enqueue:
 

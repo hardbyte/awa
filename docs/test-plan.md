@@ -205,7 +205,7 @@ _HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not 
 | --- | ------------------------------------------------------------ | ---- |
 | AM1 | Heartbeat/progress-only UPDATEs do not dirty queues or kinds | ✓    |
 | AM2 | flush_dirty_admin_metadata() drains backlog > 100 keys       | ✓    |
-| AM3 | Enqueues inside application transactions never deadlock through dirty marks; ADR-045 lock contract over every trigger on `jobs_hot`/`scheduled_jobs`: allowlisted write targets only, no `ON CONFLICT`/`LOCK`/row locks, mark tables unconstrained, maintenance never `TRUNCATE`s | ✓    |
+| AM3 | Enqueues inside application transactions never deadlock through dirty marks; ADR-053 rule 1 lock contract over every trigger on `jobs_hot`/`scheduled_jobs`: allowlisted write targets only, no `ON CONFLICT`/`LOCK`/row locks, mark tables unconstrained, maintenance never `TRUNCATE`s | ✓    |
 | AM4 | Drain leaves marks of uncommitted transitions for the next pass (exact counts); concurrent re-schedules with drain + refresh never fail | ✓    |
 
 ### Benchmarks
