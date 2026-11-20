@@ -26,6 +26,81 @@ pub struct Outcome {
     pub elapsed_seconds: f64,
     pub crash_excerpts: Vec<String>,
     pub log_tail: Option<String>,
+    /// The in-process maintenance metrics, or why there are none.
+    pub maintenance: Result<super::maintenance_metrics::Summary, String>,
+}
+
+fn counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "none recorded".into();
+    }
+    counts
+        .iter()
+        .map(|(key, count)| format!("{key} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_maintenance(
+    out: &mut String,
+    maintenance: &Result<super::maintenance_metrics::Summary, String>,
+) {
+    let _ = writeln!(out, "## Maintenance");
+    match maintenance {
+        Ok(summary) => {
+            let _ = writeln!(
+                out,
+                "- prune attempts: {} ([maintenance-metrics.jsonl](maintenance-metrics.jsonl))",
+                counts(&summary.prune_attempts)
+            );
+            let _ = writeln!(
+                out,
+                "- rotate attempts: {}",
+                counts(&summary.rotate_attempts)
+            );
+            let generations = summary
+                .ring_generation
+                .iter()
+                .map(|(ring, (first, last))| format!("{ring} {first} to {last}"))
+                .collect::<Vec<_>>();
+            let _ = writeln!(
+                out,
+                "- ring generation: {}",
+                if generations.is_empty() {
+                    "none recorded".into()
+                } else {
+                    generations.join(", ")
+                }
+            );
+            let _ = match summary.oldest_pinned_ready_age_seconds {
+                Some(age) => writeln!(
+                    out,
+                    "- queue ring pinned by a ready lane: {} lane(s), oldest {age:.0} s",
+                    summary.pinning_lanes
+                ),
+                None => writeln!(out, "- queue ring pinned by a ready lane: never"),
+            };
+            let _ = writeln!(
+                out,
+                "- lanes pinning the queue ring after the runtimes stopped: {}",
+                summary
+                    .pinning_lanes_at_end
+                    .map_or("not read".into(), |lanes| lanes.to_string())
+            );
+            let _ = writeln!(
+                out,
+                "- claim cursor advances by prune: {}",
+                summary
+                    .claim_cursor_advances
+                    .as_ref()
+                    .map_or("not recorded".into(), counts)
+            );
+        }
+        Err(reason) => {
+            let _ = writeln!(out, "- not captured: {reason}");
+        }
+    }
+    let _ = writeln!(out);
 }
 
 pub fn render(shared: &Shared, outcome: &Outcome) -> String {
@@ -134,6 +209,42 @@ pub fn render(shared: &Shared, outcome: &Outcome) -> String {
     }
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "## Memory");
+    match shared.memory.verdict() {
+        Some(verdict) => {
+            let _ = writeln!(
+                out,
+                "- resident: start {:.0} MiB, end {:.0} MiB, peak {:.0} MiB ([memory.csv](memory.csv))",
+                verdict.start_rss_mib, verdict.end_rss_mib, verdict.peak_hwm_mib
+            );
+            let _ = match verdict.slope_mib_per_100k {
+                Some(slope) => writeln!(
+                    out,
+                    "- growth after warm-up: {slope:.1} MiB per 100k executions over {} executions (limit {:.1})",
+                    verdict.executions_evaluated, verdict.limit_mib_per_100k
+                ),
+                None => writeln!(
+                    out,
+                    "- growth after warm-up: not evaluated: {}",
+                    verdict.not_evaluated.as_deref().unwrap_or("no slope")
+                ),
+            };
+            if let Some(rise) = verdict.stall_rise_mib {
+                let _ = writeln!(
+                    out,
+                    "- rise while completions were stalled: {rise:.0} MiB (limit {:.0})",
+                    verdict.stall_limit_mib
+                );
+            }
+        }
+        None => {
+            let _ = writeln!(out, "- not sampled");
+        }
+    }
+    let _ = writeln!(out);
+
+    render_maintenance(&mut out, &outcome.maintenance);
+
     let findings = shared.findings.lock().expect("findings");
     let _ = writeln!(out, "## Findings, not fatal ({})", findings.len());
     for finding in findings.iter() {
@@ -201,6 +312,8 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "verdict": if violations.iter().any(|violation| violation.kind != "oracle_incomplete") { "fail" }
             else if shared.oracle_incomplete.load(std::sync::atomic::Ordering::Relaxed) { "inconclusive" } else { "pass" },
         "terminal_proof_sample_stride": super::ledger::TERMINAL_PROOF_STRIDE,
+        "gate_proof_enabled": shared.gate_proof.get().is_some(),
+        "gate_proof_policy": "when enabled: full unpruned committed completed-pair counts; per-job eventful/NO_EVENTS sample policy unchanged; handler returns are execution evidence; counts do not waive quiescence, caps or other violations",
         "oracle_complete": !shared.oracle_incomplete.load(std::sync::atomic::Ordering::Relaxed),
         "seed": shared.config.seed,
         "personas": shared.config.personas.iter().map(|p| p.name()).collect::<Vec<_>>(),
@@ -214,10 +327,19 @@ pub fn write(shared: &Shared, outcome: &Outcome) -> std::io::Result<()> {
         "personas_stats": per_persona,
         "abandon": shared.abandon.to_json(),
         "run": { "counters": shared.run.counters(), "samples": shared.run.summaries() },
+        "memory": shared.memory.verdict(),
+        "maintenance": match &outcome.maintenance {
+            Ok(summary) => json!(summary),
+            Err(reason) => json!({ "not_captured": reason }),
+        },
         "violations": violations,
         "findings": shared.findings.lock().expect("findings").clone(),
         "timeline": timeline,
     });
+    std::fs::write(
+        dir.join("memory.csv"),
+        super::memory::csv(&shared.memory.samples()),
+    )?;
     std::fs::write(
         dir.join("report.json"),
         serde_json::to_string_pretty(&summary).unwrap_or_default(),

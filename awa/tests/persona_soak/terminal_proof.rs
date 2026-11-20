@@ -26,6 +26,10 @@ pub async fn run(shared: Arc<Shared>, pool: PgPool, stop: Stop) {
 /// input/result counts and a two-second statement timeout. NO_EVENTS keeps its
 /// immutable sample; neither a returned handler nor a missed query proves a commit.
 pub async fn observe(shared: &Shared, pool: &PgPool) {
+    if shared.gate_proof.get().is_some() {
+        super::gate_proof::observe(shared).await;
+        return;
+    }
     let schema = shared.info.queue_storage_schema.as_deref().unwrap_or("awa");
     let mut pending = Vec::new();
     shared.ledger.for_each(|id, record| {

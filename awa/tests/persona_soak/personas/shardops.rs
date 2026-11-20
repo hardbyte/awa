@@ -12,7 +12,6 @@
 use super::super::config::Persona;
 use super::super::db::{connect_pool, ClientFactory};
 use super::super::fleet::Fleet;
-use super::super::ledger::flag;
 use super::super::registry::QueueInfo;
 use super::super::rng::Rng;
 use super::super::roles;
@@ -74,8 +73,8 @@ impl Worker for ShardOpsWorker {
             )));
         }
         self.shared
-            .ledger
-            .mark(ctx.job.id, flag::RETURNED_COMPLETED);
+            .record_completed_return(Persona::ShardOps, &ctx.job)
+            .await;
         Ok(JobResult::Completed)
     }
 }
