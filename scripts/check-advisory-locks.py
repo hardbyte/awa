@@ -64,6 +64,9 @@ class Block:
         self.handler_lines: list[str] = []
         # (line index, whether the lock is the shared form)
         self.locks: list[tuple[int, bool]] = []
+        # Open CASE statements or expressions in this block, so a bare END
+        # that closes a CASE expression is not taken for the block's END.
+        self.case_depth = 0
 
 
 BRANCH_START = re.compile(r"^\s*(?:EXCEPTION\s+)?WHEN\b", re.IGNORECASE)
@@ -166,9 +169,16 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
             stack[-1].exception = index
             stack[-1].handler_lines.append(line)
             continue
-        if stack and BLOCK_END.match(line):
-            close(stack.pop())
-            continue
+        if stack:
+            block = stack[-1]
+            end_case = len(END_CASE.findall(line))
+            opened = len(CASE.findall(line)) - end_case
+            closed = end_case + len(BARE_END.findall(line))
+            closes_case = block.case_depth > 0 and closed > 0
+            block.case_depth = max(0, block.case_depth + opened - closed)
+            if BLOCK_END.match(line) and not closes_case:
+                close(stack.pop())
+                continue
         if stack and stack[-1].exception is not None:
             stack[-1].handler_lines.append(line)
         if SESSION_LOCK.search(line) and not marked(lines, index, 1):
