@@ -11,6 +11,7 @@ pub mod dlq;
 pub mod error;
 pub mod filter;
 pub mod insert;
+pub mod isolation;
 pub mod job;
 mod job_query;
 pub mod kind;

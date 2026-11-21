@@ -7,6 +7,7 @@ use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::queue_storage::DlqExpiry;
 use awa_model::{
     AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
@@ -3577,7 +3578,7 @@ impl MaintenanceService {
         if specs.is_empty() {
             return;
         }
-        let mut tx = match self.pool.begin().await {
+        let mut tx = match self.pool.begin_read_committed().await {
             Ok(tx) => tx,
             Err(err) => {
                 error!(
@@ -3831,7 +3832,7 @@ impl MaintenanceService {
         &self,
         state: &'static str,
     ) -> Result<(usize, HashSet<String>), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let promote_start = std::time::Instant::now();
         let sql = Self::promote_sql(state);
         let promoted_rows: Vec<(String,)> = sqlx::query_as(audited_sql(sql))
@@ -5075,7 +5076,7 @@ mod tests {
 
         let mut receipt_lock_tx = service
             .pool
-            .begin()
+            .begin_read_committed()
             .await
             .expect("begin receipt lock transaction");
         sqlx::query(

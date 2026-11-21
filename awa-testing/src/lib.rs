@@ -5,6 +5,7 @@
 pub mod setup;
 
 use awa_model::audited_sql;
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::{AwaError, JobArgs, JobRow};
 use awa_worker::context::ProgressState;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
@@ -130,7 +131,7 @@ impl TestClient {
             Ok(JobResult::Completed) => {
                 // As in the runtime, staged follow-ups commit only with a
                 // completion that still holds this attempt's lease.
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_read_committed().await?;
                 let completed = sqlx::query(
                     "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL \
                      WHERE id = $1 AND state = 'running' AND run_lease = $2",
@@ -355,7 +356,7 @@ impl TestClient {
                 Ok(WorkResult::Completed(self.get_job(job.id).await?))
             }
             Ok(JobResult::Completed) => {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_read_committed().await?;
                 let completed = store
                     .complete_runtime_batch_slow_in_tx(&mut tx, std::slice::from_ref(&claimed))
                     .await?;
