@@ -414,6 +414,7 @@ async fn ensure_canonical_template() -> String {
 async fn ensure_template(name: String) -> String {
     let admin_url = admin_database_url();
     let mut admin = connect(&admin_url).await;
+    // advisory-lock: `admin` is a dedicated connection, closed when dropped.
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(TEMPLATE_BUILD_LOCK_KEY)
         .execute(&mut admin)
