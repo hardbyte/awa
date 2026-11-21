@@ -116,6 +116,37 @@ class SqlTests(unittest.TestCase):
             ],
         )
 
+    def test_case_arms_inside_a_branch_are_not_branches(self):
+        text = SAFE.replace(
+            "        PERFORM pg_advisory_unlock(42);\n        RAISE;\n    END;",
+            "        PERFORM pg_advisory_unlock(42);\n        CASE\n            WHEN true THEN\n"
+            "                RAISE;\n            ELSE\n                RAISE;\n        END CASE;\n    END;",
+        )
+        self.assertNotEqual(text, SAFE)
+        self.assertEqual(sql(text), [])
+        expression = SAFE.replace(
+            "        PERFORM pg_advisory_unlock(42);\n        RAISE;\n    END;",
+            "        PERFORM pg_advisory_unlock(42);\n        PERFORM CASE\n            WHEN true THEN 1\n"
+            "            ELSE 2\n        END;\n        RAISE;\n    END;",
+        )
+        self.assertNotEqual(expression, SAFE)
+        self.assertEqual(sql(expression), [])
+
+    def test_every_lock_on_a_line_is_checked(self):
+        text = SAFE.replace(
+            "PERFORM pg_advisory_lock(42);",
+            "PERFORM pg_advisory_lock(42); PERFORM pg_advisory_lock_shared(43);",
+        )
+        # The block's problem is reported against each lock it holds.
+        self.assertEqual(
+            sql(text),
+            [
+                "session advisory lock: its block's query_canceled branch does not unlock "
+                "with pg_advisory_unlock_shared, which the lock's form needs"
+            ]
+            * 2,
+        )
+
     def test_handler_must_cover_ordinary_errors(self):
         text = SAFE.replace("WHEN OTHERS OR query_canceled THEN", "WHEN query_canceled THEN")
         self.assertEqual(
