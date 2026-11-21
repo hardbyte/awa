@@ -1152,6 +1152,20 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
 
+    -- A floor left from an earlier run that could not hand it over (the
+    -- function was then left out) goes to the ring's owner first, while this
+    -- role still holds the privileges of the sequence's owner.
+    v_sequence := to_regclass(format('%I.queue_ring_generation_floor', p_schema));
+    IF v_sequence IS NOT NULL THEN
+        SELECT seq.relowner INTO v_object_owner FROM pg_class AS seq WHERE seq.oid = v_sequence;
+        IF v_object_owner <> v_owner
+           AND pg_has_role(current_user, v_object_owner, 'USAGE')
+           AND pg_has_role(current_user, v_owner, v_set_mode)
+           AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format('ALTER SEQUENCE %s OWNER TO %I', v_sequence, pg_get_userbyid(v_owner));
+        END IF;
+    END IF;
+
     -- Create, replace and grant as the ring's owner when the migration role
     -- may SET ROLE to it, so a migrator that does not inherit the owner's
     -- privileges (PostgreSQL 16+ INHERIT FALSE membership) can create in the

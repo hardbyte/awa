@@ -66,6 +66,10 @@ DECLARE
     v_function REGPROCEDURE;
     v_definition TEXT;
     v_updated TEXT;
+    v_schema_owner OID;
+    v_previous_role TEXT;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
 BEGIN
     FOR v_schema IN
         SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered
@@ -83,7 +87,38 @@ BEGIN
         PERFORM awa.refresh_ring_generation_floor_helper(v_schema);
         IF to_regclass(format('%I.queue_enqueue_heads', v_schema)) IS NOT NULL
            AND to_regclass(format('%I.queue_claim_heads', v_schema)) IS NOT NULL THEN
-            PERFORM awa.refresh_lane_sequence_helpers(v_schema);
+            -- The lane helpers are replaced in place, which needs their
+            -- owner's privileges. A migration role that may only SET ROLE to
+            -- the schema's owner gets a second try as that owner. One that
+            -- can do neither keeps the old helpers, with a warning, rather
+            -- than failing the migration: they work, but can leave a lane's
+            -- session lock held after a cancel.
+            BEGIN
+                PERFORM awa.refresh_lane_sequence_helpers(v_schema);
+            EXCEPTION WHEN insufficient_privilege THEN
+                SELECT namespace.nspowner INTO v_schema_owner
+                FROM pg_namespace AS namespace
+                WHERE namespace.nspname = v_schema;
+                BEGIN
+                    IF NOT pg_has_role(current_user, v_schema_owner, v_set_mode) THEN
+                        RAISE insufficient_privilege;
+                    END IF;
+                    v_previous_role := current_setting('role');
+                    PERFORM set_config('role', pg_get_userbyid(v_schema_owner), true);
+                    PERFORM awa.refresh_lane_sequence_helpers(v_schema);
+                    PERFORM set_config('role', v_previous_role, true);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    IF v_previous_role IS NOT NULL THEN
+                        PERFORM set_config('role', v_previous_role, true);
+                    END IF;
+                    RAISE WARNING 'v062: could not refresh the lane-sequence helpers of schema %: %', v_schema, SQLERRM
+                        USING HINT = format(
+                            'Run SELECT awa.refresh_lane_sequence_helpers(%L) as the owner of its lane functions.',
+                            v_schema
+                        );
+                END;
+                v_previous_role := NULL;
+            END;
         END IF;
     END LOOP;
 

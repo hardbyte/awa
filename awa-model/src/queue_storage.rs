@@ -22564,6 +22564,14 @@ impl QueueStorage {
     pub async fn queue_ring_pin(&self, pool: &PgPool) -> Result<Option<QueueRingPin>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        // One snapshot for the oldest sealed slot and the rows in it: the
+        // row probe counts every generation in the slot, so a rotation that
+        // reopened the slot between two statements would otherwise report
+        // the new current generation's rows as pinning the old one.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let authority = self.ring_authority_tx(&mut tx).await?;

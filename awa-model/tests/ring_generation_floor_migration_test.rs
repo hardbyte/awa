@@ -5,6 +5,26 @@ use sqlx::PgPool;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// Like `assert!`, but returns an error, so a test that created cluster-wide
+/// roles still drops them before it reports the failure.
+macro_rules! ensure {
+    ($cond:expr, $($arg:tt)+) => {
+        if !$cond {
+            return Err(format!($($arg)+).into());
+        }
+    };
+}
+
+/// Like `assert_eq!`, but returns an error; see [`ensure!`].
+macro_rules! ensure_eq {
+    ($left:expr, $right:expr, $($arg:tt)+) => {{
+        let (left, right) = (&$left, &$right);
+        if left != right {
+            return Err(format!("{}: left {:?}, right {:?}", format!($($arg)+), left, right).into());
+        }
+    }};
+}
+
 const CUSTOM: &str = "floor_custom";
 const COMPAT_FUNCTIONS: [&str; 2] = ["insert_job_compat", "insert_jobs_compat_batch"];
 
@@ -266,7 +286,7 @@ async fn v062_needs_no_new_runtime_grants(pool: PgPool) -> TestResult {
         .bind(&runtime)
         .fetch_one(&pool)
         .await?;
-        assert!(!floor_privilege, "the runtime has no grant on the floor");
+        ensure!(!floor_privilege, "the runtime has no grant on the floor");
 
         let runtime_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -290,8 +310,8 @@ async fn v062_needs_no_new_runtime_grants(pool: PgPool) -> TestResult {
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(written, (3, 3));
-        assert_eq!(floor(&pool, "awa").await?, Some(3), "the runtime raised it");
+        ensure_eq!(written, (3, 3), "written into the floor's generation");
+        ensure_eq!(floor(&pool, "awa").await?, Some(3), "the runtime raised it");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
@@ -343,7 +363,7 @@ async fn floor_helper_leaves_out_a_function_its_owner_could_not_run(pool: PgPool
             sqlx::query_scalar("SELECT to_regprocedure('awa.enqueue_ring_cursor()') IS NOT NULL")
                 .fetch_one(&pool)
                 .await?;
-        assert!(!present, "the function is left out");
+        ensure!(!present, "the function is left out");
 
         let store = QueueStorage::new(QueueStorageConfig::default())?;
         store.enqueue_batch(&pool, "fallback_queue", 2, 1).await?;
@@ -406,16 +426,21 @@ async fn floor_helper_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) ->
                     .password("floor_test"),
             )
             .await?;
+        // One transaction, as awa migrate runs it: the role the helper sets
+        // is transaction-local, so only a check inside the same transaction
+        // shows the helper restored the caller's role.
+        let mut tx = migrator_pool.begin().await?;
         for _ in 0..2 {
             sqlx::query("SELECT awa.refresh_ring_generation_floor_helper('awa')")
-                .execute(&migrator_pool)
+                .execute(&mut *tx)
                 .await?;
         }
         let role: String = sqlx::query_scalar("SELECT current_user::text")
-            .fetch_one(&migrator_pool)
+            .fetch_one(&mut *tx)
             .await?;
+        tx.commit().await?;
         migrator_pool.close().await;
-        assert_eq!(role, migrator, "the helper restores the caller's role");
+        ensure_eq!(role, migrator, "the helper restores the caller's role");
 
         let (function_owner, sequence_owner): (String, String) = sqlx::query_as(
             "SELECT pg_get_userbyid(p.proowner)::text, pg_get_userbyid(c.relowner)::text
@@ -425,9 +450,17 @@ async fn floor_helper_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) ->
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(function_owner, owner);
-        assert_eq!(sequence_owner, owner);
-        assert_eq!(floor(&pool, "awa").await?, Some(0), "seeded");
+        ensure_eq!(
+            function_owner,
+            owner,
+            "the function belongs to the ring's owner"
+        );
+        ensure_eq!(
+            sequence_owner,
+            owner,
+            "the floor belongs to the ring's owner"
+        );
+        ensure_eq!(floor(&pool, "awa").await?, Some(0), "seeded");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
