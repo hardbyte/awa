@@ -248,7 +248,13 @@ async fn build_early_snapshot_layout(
     sqlx::query("SELECT 1").execute(&mut *t1).await?;
 
     let rotated = store.rotate(pool).await?;
-    eprintln!("rotate: {rotated:?}");
+    assert!(
+        matches!(
+            rotated,
+            awa_model::RotateOutcome::Rotated { generation: 1, .. }
+        ),
+        "the ring must reach generation 1 before a is enqueued: {rotated:?}"
+    );
 
     let mut conn = pool.acquire().await?;
     produce(&mut conn, Producer::InsertJobCompat, "a").await?;
@@ -564,7 +570,13 @@ async fn repeatable_read_rust_enqueue_after_lock_wait_keeps_every_job(pool: PgPo
     wait_for_advisory_waiter(&pool).await?;
 
     let rotated = store.rotate(&pool).await?;
-    eprintln!("rotate: {rotated:?}");
+    assert!(
+        matches!(
+            rotated,
+            awa_model::RotateOutcome::Rotated { generation: 1, .. }
+        ),
+        "the ring must reach generation 1 before a is enqueued: {rotated:?}"
+    );
     produce(&mut holder, Producer::InsertJobCompat, "a").await?;
     holder.commit().await?;
 
@@ -654,7 +666,12 @@ async fn repeatable_read_snapshot_older_than_the_ring_keeps_the_job(pool: PgPool
             Err(err) => return Err(err.into()),
         }
     };
-    eprintln!("placement: {:?}", placement(&pool).await?);
+    let placed = placement(&pool).await?;
+    assert_eq!(
+        (placed["b"].1, placed["b"].2),
+        (0, 4),
+        "b takes the floor's generation, not its snapshot's: {placed:?}"
+    );
 
     // Nobody claims QUEUE while the ring turns once more. Rotation may stop
     // at b's slot while b is unclaimed in it, which is correct.
@@ -780,5 +797,102 @@ async fn prune_keeps_an_unclaimed_job_in_an_older_generation(pool: PgPool) -> Te
     let pin = store.queue_ring_pin(&pool).await?.expect("b pins the ring");
     assert_eq!(pin.slot, 0);
     assert_eq!(pin.lanes.len(), 1, "{pin:?}");
+    Ok(())
+}
+
+/// Writes b, before v062, into generation 0 of slot 0 after the ring has
+/// reused slot 0 for generation 4. Returns b's job id.
+async fn misplace_into_reused_slot(
+    pool: &PgPool,
+    store: &QueueStorage,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut t1 = begin_with(pool, Isolation::RepeatableRead).await?;
+    sqlx::query("SELECT 1").execute(&mut *t1).await?;
+    assert_eq!(advance_ring(pool, store, 4).await?, 4);
+    let b_id = produce(&mut t1, Producer::InsertJobCompat, "b").await?;
+    t1.commit().await?;
+    let placed = placement(pool).await?;
+    assert_eq!((placed["b"].1, placed["b"].2), (0, 0), "{placed:?}");
+    Ok(b_id)
+}
+
+/// A claim of the misplaced job holds slot 0 while it runs: prune checks
+/// leases and open claims of every generation in the slot, not only the
+/// slot's current one, so it does not truncate b's ready row under the
+/// running attempt.
+#[sqlx::test(migrations = false)]
+async fn prune_keeps_a_running_job_from_an_older_generation(pool: PgPool) -> TestResult {
+    setup(&pool).await?;
+    let store = without_generation_floor(&pool).await?;
+    let b_id = misplace_into_reused_slot(&pool, &store).await?;
+
+    let batch = store
+        .claim_runtime_batch(&pool, QUEUE, 10, Duration::ZERO)
+        .await?;
+    assert_eq!(batch.len(), 1, "b is claimed");
+
+    let reached = advance_ring(&pool, &store, 8).await?;
+    assert!(reached < 8, "the ring stops at b's slot while b runs");
+    let state = store
+        .load_job(&pool, b_id)
+        .await?
+        .map(|job| format!("{:?}", job.state));
+    assert_eq!(state.as_deref(), Some("Running"), "b's rows survive prune");
+
+    store.complete_runtime_batch(&pool, &batch).await?;
+    assert_eq!(
+        advance_ring(&pool, &store, 8).await?,
+        8,
+        "the ring moves on once b completes"
+    );
+    Ok(())
+}
+
+/// Terminal-count deltas of every generation in a slot are folded before the
+/// rollup truncates the slot's delta partition, so a cancelled job from an
+/// older generation still counts.
+#[sqlx::test(migrations = false)]
+async fn terminal_rollup_folds_every_generation_in_the_slot(pool: PgPool) -> TestResult {
+    setup(&pool).await?;
+    let store = without_generation_floor(&pool).await?;
+    let b_id = misplace_into_reused_slot(&pool, &store).await?;
+    let mut conn = pool.acquire().await?;
+    let c_id = produce(&mut conn, Producer::InsertJobCompat, "c").await?;
+    drop(conn);
+    let placed = placement(&pool).await?;
+    assert_eq!((placed["c"].1, placed["c"].2), (0, 4), "{placed:?}");
+
+    store.cancel_job(&pool, b_id).await?.expect("b");
+    store.cancel_job(&pool, c_id).await?.expect("c");
+    let generations: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT DISTINCT ready_generation FROM {SCHEMA}.queue_terminal_count_deltas
+         WHERE ready_slot = 0 AND queue = $1 ORDER BY 1"
+    )))
+    .bind(QUEUE)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(generations, vec![0, 4], "a delta in each generation");
+    let before = store.queue_counts(&pool, QUEUE).await?.terminal;
+
+    // Move the claim cursor over the cancelled rows and seal slot 0.
+    for _ in 0..4 {
+        store
+            .claim_runtime_batch(&pool, QUEUE, 10, Duration::ZERO)
+            .await?;
+    }
+    assert_eq!(advance_ring(&pool, &store, 5).await?, 5);
+    let rollup = store.rollup_terminal_count_deltas(&pool, 16).await?;
+    eprintln!("rollup: {rollup:?}");
+    let left: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {SCHEMA}.queue_terminal_count_deltas WHERE ready_slot = 0"
+    )))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(left, 0, "slot 0 was rolled up");
+    assert_eq!(
+        store.queue_counts(&pool, QUEUE).await?.terminal,
+        before,
+        "the rollup keeps both cancelled jobs counted"
+    );
     Ok(())
 }
