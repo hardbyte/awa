@@ -130,6 +130,69 @@ BEGIN
         p_schema
     );
 
+    -- set_sequence_next is defined here, beside the triggers that call it,
+    -- so a migration refreshing these helpers refreshes it too.
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next(p_seq_name TEXT, p_next BIGINT)
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_lock_key TEXT;
+        BEGIN
+            IF p_seq_name IS NULL THEN
+                RAISE EXCEPTION 'lane sequence name is NULL'
+                    USING ERRCODE = '55000';
+            END IF;
+
+            v_lock_key := format('%%I.%%I', %1$L, p_seq_name);
+
+            -- `setval` is not a compare-and-swap. Serialize it against
+            -- reservation-side block allocation so this helper's "move to at
+            -- least p_next" contract cannot rewind a hot enqueue sequence.
+            -- Every way out of the block releases the session lock,
+            -- including a cancel or statement timeout, which OTHERS does not
+            -- catch; see queue_enqueue_head_sequence_sync.
+            BEGIN
+                PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
+                p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
+
+                IF p_next <= 1 THEN
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, 1, false)',
+                        format('%%I.%%I', %1$L, p_seq_name)
+                    );
+                ELSE
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, %%s, true)',
+                        format('%%I.%%I', %1$L, p_seq_name),
+                        p_next - 1
+                    );
+                END IF;
+                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+            EXCEPTION WHEN OTHERS OR query_canceled THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_locks AS held
+                    WHERE held.locktype = 'advisory'
+                      AND held.pid = pg_backend_pid()
+                      AND held.granted
+                      AND held.objsubid = 1
+                      AND held.classid = ((hashtextextended(v_lock_key, 0) >> 32) & 4294967295)::oid
+                      AND held.objid = (hashtextextended(v_lock_key, 0) & 4294967295)::oid
+                ) THEN
+                    PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+                END IF;
+                RAISE;
+            END;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
     EXECUTE format(
         $ddl$
         CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
@@ -173,8 +236,14 @@ BEGIN
                AND NEW.next_seq > OLD.next_seq
             THEN
                 v_count := NEW.next_seq - OLD.next_seq;
-                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
+                -- A pooled connection keeps a session lock it leaks, which
+                -- would stall this lane's reservations, so every way out of
+                -- the block releases it, including a cancel or statement
+                -- timeout, which OTHERS does not catch. The lock is taken
+                -- inside the block and the handler checks pg_locks, because
+                -- the error can also come before the lock is granted.
                 BEGIN
+                    PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
                     EXECUTE format(
                         'SELECT nextval(%%L::regclass)::bigint',
                         v_qualified_seq
@@ -188,11 +257,22 @@ BEGIN
                             v_start + v_count - 1
                         );
                     END IF;
-                EXCEPTION WHEN OTHERS THEN
                     PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                EXCEPTION WHEN OTHERS OR query_canceled THEN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_locks AS held
+                        WHERE held.locktype = 'advisory'
+                          AND held.pid = pg_backend_pid()
+                          AND held.granted
+                          AND held.objsubid = 1
+                          AND held.classid = ((hashtextextended(v_qualified_seq, 0) >> 32) & 4294967295)::oid
+                          AND held.objid = (hashtextextended(v_qualified_seq, 0) & 4294967295)::oid
+                    ) THEN
+                        PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                    END IF;
                     RAISE;
                 END;
-                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
                 NEW.next_seq := v_start + v_count;
             ELSE
                 PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
@@ -2219,53 +2299,6 @@ BEGIN
                 RETURN v_last + 1;
             END IF;
             RETURN v_last;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next(p_seq_name TEXT, p_next BIGINT)
-        RETURNS VOID
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_lock_key TEXT;
-        BEGIN
-            IF p_seq_name IS NULL THEN
-                RAISE EXCEPTION 'lane sequence name is NULL'
-                    USING ERRCODE = '55000';
-            END IF;
-
-            v_lock_key := format('%%I.%%I', %1$L, p_seq_name);
-
-            -- `setval` is not a compare-and-swap. Serialize it against
-            -- reservation-side block allocation so this helper's "move to at
-            -- least p_next" contract cannot rewind a hot enqueue sequence.
-            PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
-            BEGIN
-                p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
-
-                IF p_next <= 1 THEN
-                    EXECUTE format(
-                        'SELECT setval(%%L::regclass, 1, false)',
-                        format('%%I.%%I', %1$L, p_seq_name)
-                    );
-                ELSE
-                    EXECUTE format(
-                        'SELECT setval(%%L::regclass, %%s, true)',
-                        format('%%I.%%I', %1$L, p_seq_name),
-                        p_next - 1
-                    );
-                END IF;
-            EXCEPTION WHEN OTHERS THEN
-                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
-                RAISE;
-            END;
-            PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
         END;
         $func$
         $ddl$,

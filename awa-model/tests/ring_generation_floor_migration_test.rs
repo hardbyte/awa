@@ -34,6 +34,21 @@ async fn apply(pool: &PgPool, from: i32, to: i32) -> TestResult {
     Ok(())
 }
 
+/// The definitions of `set_sequence_next` and the enqueue-head trigger
+/// function in `schema`.
+async fn lane_sequence_helpers(pool: &PgPool, schema: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT pg_get_functiondef(p.oid)
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = $1
+           AND p.proname IN ('set_sequence_next', 'queue_enqueue_head_sequence_sync')
+         ORDER BY p.proname",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+}
+
 /// The floor's last value, or `None` before its first raise.
 async fn floor(pool: &PgPool, schema: &str) -> Result<Option<i64>, sqlx::Error> {
     sqlx::query_scalar(audited_sql(format!(
@@ -89,12 +104,23 @@ async fn v062_installs_the_floor_and_rewrites_the_compat_producers(pool: PgPool)
     for (_, definition) in &installed {
         assert!(definition.contains("enqueue_ring_cursor()"));
     }
+    let installed_lane_helpers = lane_sequence_helpers(&pool, CUSTOM).await?;
 
     // Back to v061: the released compat producers, and no floor.
     apply(&pool, 17, 18).await?;
     apply(&pool, 56, 57).await?;
     for schema in ["awa", CUSTOM] {
         drop_floor(&pool, schema).await?;
+        // The lane-sequence helpers as released: their unlock handler does
+        // not catch a cancel.
+        for definition in lane_sequence_helpers(&pool, schema).await? {
+            assert!(definition.contains("OR query_canceled"));
+            sqlx::raw_sql(audited_sql(
+                definition.replace("WHEN OTHERS OR query_canceled THEN", "WHEN OTHERS THEN"),
+            ))
+            .execute(&pool)
+            .await?;
+        }
     }
     let released = compat_functions(&pool).await?;
     for (_, definition) in &released {
@@ -122,6 +148,11 @@ async fn v062_installs_the_floor_and_rewrites_the_compat_producers(pool: PgPool)
     assert_eq!(written, (2, 6));
 
     apply(&pool, 61, 62).await?;
+    assert_eq!(
+        lane_sequence_helpers(&pool, CUSTOM).await?,
+        installed_lane_helpers,
+        "v062 restores the cancel-safe lane-sequence helpers"
+    );
     let migrated = compat_functions(&pool).await?;
     for ((released_oid, _), (migrated_oid, migrated_definition)) in released.iter().zip(&migrated) {
         assert_eq!(released_oid, migrated_oid, "replaced in place");
@@ -510,5 +541,108 @@ async fn cancelled_floor_raise_leaves_no_session_lock(pool: PgPool) -> TestResul
             .fetch_one(&mut *gate)
             .await?;
     assert_eq!(cursor, (3, 3), "a later raise still succeeds");
+    Ok(())
+}
+
+/// Runs `statement` on `victim` while `gate` holds the session advisory lock
+/// `lock_key`, then releases the lock and cancels `victim` in one statement,
+/// so the victim is granted the lock before it handles the cancel. Returns
+/// whether the victim's session still holds an advisory lock afterwards.
+async fn cancel_as_granted(
+    pool: &PgPool,
+    lock_key: i64,
+    statement: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut gate = pool.acquire().await?;
+    let mut victim = pool.acquire().await?;
+    let victim_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *victim)
+        .await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *gate)
+        .await?;
+    let run = async {
+        sqlx::query(audited_sql(statement.to_string()))
+            .execute(&mut *victim)
+            .await
+    };
+    let cancel = async {
+        for _ in 0..500 {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                 WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')",
+            )
+            .bind(victim_pid)
+            .fetch_one(pool)
+            .await?;
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        sqlx::query("SELECT pg_advisory_unlock($1), pg_cancel_backend($2)")
+            .bind(lock_key)
+            .bind(victim_pid)
+            .execute(&mut *gate)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    };
+    let (ran, cancelled) = tokio::join!(run, cancel);
+    cancelled?;
+    let err = ran.expect_err("the statement is cancelled");
+    assert_eq!(
+        err.as_database_error().and_then(|db| db.code()).as_deref(),
+        Some("57014"),
+        "{statement}: {err}"
+    );
+    Ok(holds_advisory_lock(pool, victim_pid).await?)
+}
+
+/// The lane-sequence helpers take a session lock on the lane's sequence. A
+/// cancel must not leave it held: a leaked lock on a claim sequence stalls
+/// every claim cursor move on the lane, and one on an enqueue sequence stalls
+/// every reservation, until the pooled connection closes.
+#[sqlx::test(migrations = false)]
+async fn cancelled_lane_sequence_moves_leave_no_session_lock(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    let store = QueueStorage::new(QueueStorageConfig::default())?;
+    store.enqueue_batch(&pool, "lock_q", 2, 1).await?;
+    let lane_key = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, i64)>(audited_sql(format!(
+                "SELECT seq_name, hashtextextended(format('%I.%I', 'awa', seq_name), 0)
+                 FROM awa.{table} WHERE queue = 'lock_q'"
+            )))
+            .fetch_one(&pool)
+            .await
+        }
+    };
+
+    let (claim_seq, claim_key) = lane_key("queue_claim_heads").await?;
+    assert!(
+        !cancel_as_granted(
+            &pool,
+            claim_key,
+            &format!("SELECT awa.set_sequence_next('{claim_seq}', 5)"),
+        )
+        .await?,
+        "set_sequence_next kept the lane sequence lock"
+    );
+
+    let (_, enqueue_key) = lane_key("queue_enqueue_heads").await?;
+    assert!(
+        !cancel_as_granted(
+            &pool,
+            enqueue_key,
+            "UPDATE awa.queue_enqueue_heads SET next_seq = next_seq + 3 WHERE queue = 'lock_q'",
+        )
+        .await?,
+        "the enqueue-head trigger kept the lane sequence lock"
+    );
+
+    // The lane still takes work.
+    store.enqueue_batch(&pool, "lock_q", 2, 1).await?;
     Ok(())
 }

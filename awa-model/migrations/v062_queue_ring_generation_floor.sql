@@ -24,6 +24,20 @@
 --   warns and leaves the function out, so producers there keep reading the
 --   cursor directly, as before.
 --
+-- The same session-lock leak is fixed in two older helpers, which v062
+-- refreshes through awa.refresh_lane_sequence_helpers, as v049, v053 and
+-- v058 do: <schema>.set_sequence_next, which moves a lane's claim or enqueue
+-- cursor, and <schema>.queue_enqueue_head_sequence_sync, the enqueue-head
+-- trigger's block allocation. Both took a session advisory lock on the lane
+-- sequence and released it in a WHEN OTHERS handler, which does not catch a
+-- cancel or statement timeout. A cancel that landed after the lock was granted
+-- left it held on the pooled connection, and every later claim cursor move or
+-- enqueue reservation on that lane waited until the connection closed. Both
+-- now take the lock inside the block and release it on any error, including
+-- query_canceled. set_sequence_next is now defined by
+-- awa.refresh_lane_sequence_helpers rather than by the installer body, so a
+-- migrated schema and a fresh install carry the same definition.
+--
 -- The floor is seeded from the committed cursor. awa.insert_job_compat and
 -- awa.insert_jobs_compat_batch are rewritten in place, from their own
 -- definitions, to read enqueue_ring_cursor() when the active schema has it and
@@ -67,6 +81,10 @@ BEGIN
             hashtextextended(format('awa.queue_storage.install:%I', v_schema), 0)
         );
         PERFORM awa.refresh_ring_generation_floor_helper(v_schema);
+        IF to_regclass(format('%I.queue_enqueue_heads', v_schema)) IS NOT NULL
+           AND to_regclass(format('%I.queue_claim_heads', v_schema)) IS NOT NULL THEN
+            PERFORM awa.refresh_lane_sequence_helpers(v_schema);
+        END IF;
     END LOOP;
 
     FOREACH v_function IN ARRAY ARRAY[
