@@ -326,3 +326,189 @@ async fn floor_helper_leaves_out_a_function_its_owner_could_not_run(pool: PgPool
     .await?;
     result
 }
+
+/// A migration role that may SET ROLE to the ring's owner but does not
+/// inherit its privileges (PostgreSQL 16+), and has no CREATE on the schema,
+/// installs the floor as the owner and can replay it.
+#[sqlx::test(migrations = false)]
+async fn floor_helper_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) -> TestResult {
+    let server_version: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&pool)
+            .await?;
+    if server_version < 160000 {
+        return Ok(());
+    }
+    migrations::run(&pool).await?;
+    drop_floor(&pool, "awa").await?;
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("floor_owner_{suffix}");
+    let migrator = format!("floor_set_migrator_{suffix}");
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await?;
+    // The owner gets just what the floor needs: the ring tables, the cursor
+    // reader and CREATE on the schema.
+    sqlx::raw_sql(audited_sql(format!(
+        "CREATE ROLE {owner} NOLOGIN NOSUPERUSER;
+         CREATE ROLE {migrator} LOGIN NOSUPERUSER PASSWORD 'floor_test';
+         GRANT {owner} TO {migrator} WITH INHERIT FALSE, SET TRUE;
+         GRANT CONNECT ON DATABASE \"{database}\" TO {migrator};
+         GRANT USAGE, CREATE ON SCHEMA awa TO {owner};
+         GRANT USAGE ON SCHEMA awa TO {migrator};
+         ALTER TABLE awa.queue_ring_state OWNER TO {owner};
+         GRANT SELECT ON awa.queue_ring_rotations, awa.ring_cursor_authority TO {owner};
+         GRANT EXECUTE ON FUNCTION awa.ring_cursor(text) TO {owner};
+         GRANT EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(text) TO {migrator};"
+    )))
+    .execute(&pool)
+    .await?;
+    let result = async {
+        let migrator_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                pool.connect_options()
+                    .as_ref()
+                    .clone()
+                    .username(&migrator)
+                    .password("floor_test"),
+            )
+            .await?;
+        for _ in 0..2 {
+            sqlx::query("SELECT awa.refresh_ring_generation_floor_helper('awa')")
+                .execute(&migrator_pool)
+                .await?;
+        }
+        let role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&migrator_pool)
+            .await?;
+        migrator_pool.close().await;
+        assert_eq!(role, migrator, "the helper restores the caller's role");
+
+        let (function_owner, sequence_owner): (String, String) = sqlx::query_as(
+            "SELECT pg_get_userbyid(p.proowner)::text, pg_get_userbyid(c.relowner)::text
+             FROM pg_proc AS p, pg_class AS c
+             WHERE p.oid = 'awa.enqueue_ring_cursor()'::regprocedure
+               AND c.oid = 'awa.queue_ring_generation_floor'::regclass",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(function_owner, owner);
+        assert_eq!(sequence_owner, owner);
+        assert_eq!(floor(&pool, "awa").await?, Some(0), "seeded");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    sqlx::raw_sql(audited_sql(format!(
+        "ALTER TABLE awa.queue_ring_state OWNER TO CURRENT_USER;
+         REASSIGN OWNED BY {owner} TO CURRENT_USER;
+         DROP OWNED BY {owner}; DROP OWNED BY {migrator};
+         DROP ROLE {migrator}; DROP ROLE {owner};"
+    )))
+    .execute(&pool)
+    .await?;
+    result
+}
+
+/// Whether `pid` holds any advisory lock.
+async fn holds_advisory_lock(pool: &PgPool, pid: i32) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks
+         WHERE locktype = 'advisory' AND pid = $1 AND granted)",
+    )
+    .bind(pid)
+    .fetch_one(pool)
+    .await
+}
+
+/// A pooled connection keeps a session lock it leaks, so a raise of the floor
+/// that is cancelled must leave the floor's lock free. The gate releases the
+/// lock and cancels the waiting raiser in one statement, so the raiser is
+/// granted the lock before it handles the cancel: the error is raised with the
+/// lock held, inside the locked block. A cancel while still waiting is covered
+/// by the statement timeout round.
+#[sqlx::test(migrations = false)]
+async fn cancelled_floor_raise_leaves_no_session_lock(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    let lock_key: i64 = sqlx::query_scalar(
+        "SELECT hashtextextended('awa.queue_storage.ring_generation_floor:awa', 0)",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let mut gate = pool.acquire().await?;
+    let mut raiser = pool.acquire().await?;
+    let raiser_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *raiser)
+        .await?;
+
+    for (round, timeout) in [(1_i64, None), (2, None), (3, Some("200ms"))] {
+        rotate_to(&pool, "awa", round, 16).await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *gate)
+            .await?;
+        if let Some(timeout) = timeout {
+            sqlx::query(audited_sql(format!("SET statement_timeout = '{timeout}'")))
+                .execute(&mut *raiser)
+                .await?;
+        }
+        let raise = async {
+            sqlx::query("SELECT FROM awa.enqueue_ring_cursor()")
+                .execute(&mut *raiser)
+                .await
+        };
+        let cancel = async {
+            for _ in 0..500 {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                     WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')",
+                )
+                .bind(raiser_pid)
+                .fetch_one(&pool)
+                .await?;
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            if timeout.is_some() {
+                // Let the statement timeout fire while the raiser waits.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(lock_key)
+                    .execute(&mut *gate)
+                    .await?;
+            } else {
+                sqlx::query("SELECT pg_advisory_unlock($1), pg_cancel_backend($2)")
+                    .bind(lock_key)
+                    .bind(raiser_pid)
+                    .execute(&mut *gate)
+                    .await?;
+            }
+            Ok::<(), sqlx::Error>(())
+        };
+        let (raised, cancelled) = tokio::join!(raise, cancel);
+        cancelled?;
+        let err = raised.expect_err("the raise is cancelled");
+        assert_eq!(
+            err.as_database_error().and_then(|db| db.code()).as_deref(),
+            Some("57014"),
+            "round {round}: {err}"
+        );
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *raiser)
+            .await?;
+        assert!(
+            !holds_advisory_lock(&pool, raiser_pid).await?,
+            "round {round}: the raiser's session kept the floor lock"
+        );
+    }
+
+    let cursor: (i32, i64) =
+        sqlx::query_as("SELECT slot, generation FROM awa.enqueue_ring_cursor()")
+            .fetch_one(&mut *gate)
+            .await?;
+    assert_eq!(cursor, (3, 3), "a later raise still succeeds");
+    Ok(())
+}

@@ -1052,6 +1052,7 @@ DECLARE
     v_sequence REGCLASS;
     v_function REGPROCEDURE;
     v_object_owner OID;
+    v_previous_role TEXT;
     v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
                             THEN 'SET' ELSE 'MEMBER' END;
 BEGIN
@@ -1069,6 +1070,23 @@ BEGIN
         RAISE EXCEPTION 'refresh_ring_generation_floor_helper: schema % has no queue ring',
             p_schema
             USING ERRCODE = '22023';
+    END IF;
+
+    -- Create, replace and grant as the ring's owner when the migration role
+    -- may SET ROLE to it, so a migrator that does not inherit the owner's
+    -- privileges (PostgreSQL 16+ INHERIT FALSE membership) can create in the
+    -- schema and replace the function on a replay, and the objects belong to
+    -- the owner from the start.
+    IF v_owner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+       AND pg_has_role(current_user, v_owner, v_set_mode)
+       AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE')
+       AND COALESCE(
+           (SELECT routine.proowner FROM pg_proc AS routine
+            WHERE routine.oid = to_regprocedure(format('%I.enqueue_ring_cursor()', p_schema))),
+           v_owner
+       ) = v_owner THEN
+        v_previous_role := current_setting('role');
+        PERFORM set_config('role', pg_get_userbyid(v_owner), true);
     END IF;
 
     EXECUTE format(
@@ -1090,7 +1108,7 @@ BEGIN
             v_slot INT;
             v_generation BIGINT;
             v_floor BIGINT;
-            v_lock_key BIGINT;
+            v_lock_key BIGINT := hashtextextended(%3$L, 0);
         BEGIN
             SELECT rc.slot, rc.generation
             INTO v_slot, v_generation
@@ -1102,20 +1120,34 @@ BEGIN
                 -- setval is not a compare-and-set, so raise under a short
                 -- session lock, released before returning rather than at the
                 -- end of the caller's transaction. Only the first producer to
-                -- see each rotation gets here.
-                v_lock_key := hashtextextended(%3$L, 0);
-                PERFORM pg_advisory_lock(v_lock_key);
+                -- see each rotation gets here. A pooled connection would keep a
+                -- leaked session lock, so every way out releases it, including
+                -- a cancel or statement timeout, which OTHERS does not catch;
+                -- the handler checks pg_locks because the error may have come
+                -- before the lock was granted.
                 BEGIN
+                    PERFORM pg_advisory_lock(v_lock_key);
                     v_floor := pg_sequence_last_value(%2$L::regclass);
                     IF v_floor IS NULL OR v_floor < v_generation THEN
                         PERFORM setval(%2$L::regclass, v_generation, true);
                         v_floor := v_generation;
                     END IF;
-                EXCEPTION WHEN OTHERS THEN
                     PERFORM pg_advisory_unlock(v_lock_key);
+                EXCEPTION WHEN OTHERS OR query_canceled THEN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_locks AS held
+                        WHERE held.locktype = 'advisory'
+                          AND held.pid = pg_backend_pid()
+                          AND held.granted
+                          AND held.objsubid = 1
+                          AND held.classid = ((v_lock_key >> 32) & 4294967295)::oid
+                          AND held.objid = (v_lock_key & 4294967295)::oid
+                    ) THEN
+                        PERFORM pg_advisory_unlock(v_lock_key);
+                    END IF;
                     RAISE;
                 END;
-                PERFORM pg_advisory_unlock(v_lock_key);
             END IF;
 
             IF v_floor > v_generation THEN
@@ -1206,6 +1238,10 @@ BEGIN
                 quote_ident(pg_get_userbyid(v_owner)),
                 quote_ident(pg_get_userbyid(v_owner))
             );
+    END IF;
+
+    IF v_previous_role IS NOT NULL THEN
+        PERFORM set_config('role', v_previous_role, true);
     END IF;
 END;
 $refresh$;
