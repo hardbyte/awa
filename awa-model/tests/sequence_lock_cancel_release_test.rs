@@ -457,3 +457,49 @@ async fn a_lookalike_schema_is_left_alone(pool: PgPool) -> TestResult {
     assert!(pending_targets(&pool).await?.is_empty());
     Ok(())
 }
+
+/// The patch does not wait for a schema's install lock, which a concurrent
+/// `prepare_schema()` holds: in an `awa migrate --sql` bundle the earlier
+/// replica_identity patch can hold table locks that installer needs, so a wait
+/// could deadlock. It fails with 55P03 instead, changes nothing, and succeeds
+/// on a later run.
+#[sqlx::test(migrations = false)]
+async fn the_patch_does_not_wait_for_an_install_lock(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    restore_released_handlers(&pool, "awa").await?;
+    let patch = migrations::SCHEMA_PATCHES
+        .iter()
+        .find(|patch| patch.name == PATCH)
+        .ok_or("the patch is registered")?;
+
+    let mut installer = pool.begin().await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('awa.queue_storage.install:awa', 0))",
+    )
+    .execute(&mut *installer)
+    .await?;
+    let started = std::time::Instant::now();
+    let error = sqlx::raw_sql(patch.sql)
+        .execute(&pool)
+        .await
+        .expect_err("the install lock is held");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("55P03"),
+        "{error}"
+    );
+    assert_eq!(
+        pending_targets(&pool).await?,
+        vec!["lane locks in schema awa".to_string()],
+        "a refused run changes nothing"
+    );
+    installer.rollback().await?;
+
+    sqlx::raw_sql(patch.sql).execute(&pool).await?;
+    assert!(pending_targets(&pool).await?.is_empty());
+    Ok(())
+}

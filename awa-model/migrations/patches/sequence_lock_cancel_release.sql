@@ -31,7 +31,12 @@
 --
 -- Live load: function replacement only. The patch takes no table locks and
 -- reads no queue rows, so workers keep claiming and completing while it runs.
--- A call already inside a helper finishes on the old body.
+-- A call already inside a helper finishes on the old body. It does not wait
+-- for a schema's install lock, which prepare_schema() holds while it runs the
+-- installer: when the lock is taken the patch fails with 55P03, changes
+-- nothing, and can be run again. A schema whose prepare_schema() commits while
+-- this patch runs can keep the old helpers; the patch probe names it until the
+-- patch runs again.
 --
 -- 0.6 delivery: the 0.6 series cannot add a migration version, so this ships as
 -- an idempotent schema patch. `awa migrate` applies it when the schema is
@@ -533,7 +538,9 @@ BEGIN
     -- the lent privileges and the role switch.
     BEGIN
         IF v_owner IS NULL OR NOT pg_has_role(current_user, v_owner, v_set_mode) THEN
-            RAISE insufficient_privilege;
+            RAISE EXCEPTION 'cannot refresh the lane functions of schema % as their owner, and % cannot SET ROLE to its owner %',
+                p_schema, current_user, coalesce(v_owner_name, '(none)')
+                USING ERRCODE = 'insufficient_privilege';
         END IF;
         IF NOT has_function_privilege(v_owner, 'awa.refresh_lane_sequence_helpers(text)', 'EXECUTE') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) TO %I', v_owner_name);
@@ -599,10 +606,16 @@ BEGIN
     LOOP
         -- Serialize with a concurrent prepare_schema() of the same schema. This
         -- is an advisory lock, not a table lock: claims and completions do not
-        -- take it.
-        PERFORM pg_advisory_xact_lock(
+        -- take it. The patch does not wait for it: in an `awa migrate --sql`
+        -- bundle the earlier replica_identity patch still holds table locks the
+        -- installer takes, so waiting could deadlock with that prepare_schema().
+        IF NOT pg_try_advisory_xact_lock(
             hashtextextended(format('awa.queue_storage.install:%I', v_schema), 0)
-        );
+        ) THEN
+            RAISE EXCEPTION 'sequence_lock_cancel_release: schema % is being prepared', v_schema
+                USING ERRCODE = 'lock_not_available',
+                      HINT = 'A prepare_schema() of that schema holds its install lock. This patch changed nothing and is safe to run again.';
+        END IF;
         PERFORM awa.refresh_lane_sequence_helpers_as_migrator(v_schema);
     END LOOP;
 END;
