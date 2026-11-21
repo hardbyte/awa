@@ -494,7 +494,8 @@ macro_rules! replica_identity_pending_sql {
 /// Rows naming what still lacks the `sequence_lock_cancel_release` patch: the
 /// helper refresh functions and each installed queue-storage substrate
 /// (found as for `prepared_lane_sequences`) whose `set_sequence_next` or
-/// enqueue-head trigger function releases its session lock only on `OTHERS`.
+/// enqueue-head trigger function is missing or releases its session lock
+/// only on `OTHERS`.
 macro_rules! sequence_lock_cancel_release_pending_sql {
     () => {
         "SELECT 'awa.refresh_lane_sequence_helpers'::text AS target \
@@ -523,11 +524,19 @@ macro_rules! sequence_lock_cancel_release_pending_sql {
                        WHERE p.pronamespace = n.oid \
                          AND p.proname = 'queue_lane_sequence_name' \
                          AND oidvectortypes(p.proargtypes) = 'text, text, smallint, smallint') \
-           AND EXISTS (SELECT 1 FROM pg_proc AS p \
-                       WHERE p.pronamespace = n.oid \
-                         AND p.proname IN ('set_sequence_next', \
-                                           'queue_enqueue_head_sequence_sync') \
-                         AND p.prosrc NOT LIKE '%query_canceled%')"
+           AND (EXISTS (SELECT 1 FROM pg_proc AS p \
+                        WHERE p.pronamespace = n.oid \
+                          AND p.proname IN ('set_sequence_next', \
+                                            'queue_enqueue_head_sequence_sync') \
+                          AND p.prosrc NOT LIKE '%query_canceled%') \
+                OR NOT EXISTS (SELECT 1 FROM pg_proc AS p \
+                               WHERE p.pronamespace = n.oid \
+                                 AND p.proname = 'set_sequence_next' \
+                                 AND oidvectortypes(p.proargtypes) = 'text, bigint') \
+                OR NOT EXISTS (SELECT 1 FROM pg_proc AS p \
+                               WHERE p.pronamespace = n.oid \
+                                 AND p.proname = 'queue_enqueue_head_sequence_sync' \
+                                 AND p.pronargs = 0))"
     };
 }
 
@@ -965,12 +974,33 @@ pub const MIGRATION_LOCK_KEY: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
 /// storage routing before and after.
 pub async fn run_with_report(pool: &PgPool) -> Result<MigrationReport, AwaError> {
     // The guard closes the connection instead of pooling it if this future is
-    // dropped or the unlock fails, so the lock cannot outlive the run.
+    // dropped or the unlock fails. Closing the connection does not stop a
+    // statement the server is still running, such as DDL waiting for a table
+    // lock, so the server checks for a closed client while one runs, and the
+    // session, with the lock, ends within that interval.
     let mut lock = SessionAdvisoryLock::acquire(pool, MIGRATION_LOCK_KEY).await?;
+    let checks_client = lock
+        .connection()
+        .server_version_num()
+        .is_some_and(|version| version >= 140_000);
+    if checks_client {
+        sqlx::query("SET client_connection_check_interval = '1s'")
+            .execute(lock.connection())
+            .await?;
+    }
 
     let result = run_inner(lock.connection()).await;
 
-    let _ = lock.release().await;
+    // The connection returns to the pool only with the setting restored;
+    // otherwise dropping the guard closes it.
+    if !checks_client
+        || sqlx::query("RESET client_connection_check_interval")
+            .execute(lock.connection())
+            .await
+            .is_ok()
+    {
+        let _ = lock.release().await;
+    }
 
     result
 }

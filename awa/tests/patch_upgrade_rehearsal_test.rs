@@ -1198,11 +1198,12 @@ async fn released_patch_upgrade_and_rollback() {
     );
     let unexpected_lock_count = unexpected_locks.len();
     let mut expected_lines = vec!["Schema: v40 (unchanged)".to_string()];
+    // A retry after a replica_identity timeout re-applies that patch and the
+    // installer rewrites that follow it; everything else is already present.
+    let applied_on_retry = migrations::patches_to_apply(&["replica_identity"]);
     for patch in migrations::SCHEMA_PATCHES {
         let outcome = if expected_pending.contains(&patch.name)
-            && (migrate_attempts == 1
-                || patch.name == "replica_identity"
-                || patch.name == "spent_claim_prefix_gaps")
+            && (migrate_attempts == 1 || applied_on_retry.contains(&patch.name))
         {
             "applied"
         } else {

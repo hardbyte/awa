@@ -30,13 +30,15 @@ import sys
 from pathlib import Path
 
 SESSION_LOCK = re.compile(r"\bpg_(?:try_)?advisory_lock(?:_shared)?\s*\(", re.IGNORECASE)
-UNLOCK = re.compile(r"\bpg_advisory_unlock(?:_shared|_all)?\s*\(", re.IGNORECASE)
+UNLOCK_EXCLUSIVE = re.compile(r"\bpg_advisory_unlock\s*\(", re.IGNORECASE)
+UNLOCK_SHARED = re.compile(r"\bpg_advisory_unlock_shared\s*\(", re.IGNORECASE)
+UNLOCK_ALL = re.compile(r"\bpg_advisory_unlock_all\s*\(", re.IGNORECASE)
 MARKER = "advisory-lock:"
 
 # The versioned migration files are checksum-locked since 0.6.18 and fixes
 # ship as schema patches, so the patches are what can still change. The
 # released v023 lane helpers this lint would reject are replaced by
-# patches/lane_lock_cancel_release.sql.
+# patches/sequence_lock_cancel_release.sql.
 SQL_GLOBS = ["awa-model/migrations/patches/*.sql"]
 RUST_GLOBS = ["*/src/**/*.rs", "awa-python/src/**/*.rs"]
 # The guard every Rust session lock goes through.
@@ -60,7 +62,8 @@ class Block:
         self.start = start
         self.exception: int | None = None
         self.handler_lines: list[str] = []
-        self.locks: list[int] = []
+        # (line index, whether the lock is the shared form)
+        self.locks: list[tuple[int, bool]] = []
 
 
 BRANCH_START = re.compile(r"^\s*(?:EXCEPTION\s+)?WHEN\b", re.IGNORECASE)
@@ -82,10 +85,30 @@ def handler_branches(handler_lines: list[str]) -> list[tuple[str, str]]:
     return result
 
 
+def unlock_problem(body: str, modes: set[bool]) -> str | None:
+    """Why `body` does not release every lock mode in `modes` (True: shared)."""
+    if UNLOCK_ALL.search(body):
+        return None
+    missing = [
+        shared
+        for shared in sorted(modes)
+        if not (UNLOCK_SHARED if shared else UNLOCK_EXCLUSIVE).search(body)
+    ]
+    if not missing:
+        return None
+    if UNLOCK_EXCLUSIVE.search(body) or UNLOCK_SHARED.search(body):
+        # pg_advisory_unlock releases only exclusive holds, and
+        # pg_advisory_unlock_shared only shared ones.
+        form = "pg_advisory_unlock_shared" if missing[0] else "pg_advisory_unlock"
+        return f"does not unlock with {form}, which the lock's form needs"
+    return "does not unlock"
+
+
 def handler_problem(block: Block) -> str | None:
     if block.exception is None:
         return "its block has no EXCEPTION handler that unlocks"
     branches = handler_branches(block.handler_lines)
+    modes = {shared for _, shared in block.locks}
 
     def branch(condition: str) -> tuple[str, str] | None:
         pattern = re.compile(rf"\b{condition}\b", re.IGNORECASE)
@@ -96,10 +119,17 @@ def handler_problem(block: Block) -> str | None:
         return "its block's EXCEPTION handler does not name query_canceled"
     if others is None:
         return "its block's EXCEPTION handler does not handle OTHERS"
-    if not UNLOCK.search(cancel[1]):
-        return "its block's query_canceled branch does not unlock"
-    if not UNLOCK.search(others[1]):
-        return "its block's OTHERS branch does not unlock"
+    # Postgres runs the first branch whose conditions match, so a branch for a
+    # specific error that does not unlock leaks the lock even when a later
+    # OTHERS branch would have: every branch must unlock.
+    for name, chosen in (("query_canceled", cancel), ("OTHERS", others)):
+        problem = unlock_problem(chosen[1], modes)
+        if problem:
+            return f"its block's {name} branch {problem}"
+    for conditions, body in branches:
+        problem = unlock_problem(body, modes)
+        if problem:
+            return f"its block's {' '.join(conditions.split())} branch {problem}"
     return None
 
 
@@ -113,7 +143,7 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
         problem = handler_problem(block)
         if problem is None:
             return
-        for lock in block.locks:
+        for lock, _ in block.locks:
             findings.append((path, lock + 1, f"session advisory lock: {problem}"))
 
     for index, raw in enumerate(lines):
@@ -140,7 +170,8 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
                     (path, index + 1, "session advisory lock taken inside an EXCEPTION handler")
                 )
             else:
-                stack[-1].locks.append(index)
+                shared = bool(re.search(r"_shared\s*\(", SESSION_LOCK.search(line).group(0)))
+                stack[-1].locks.append((index, shared))
     for block in stack:
         close(block)
     return findings

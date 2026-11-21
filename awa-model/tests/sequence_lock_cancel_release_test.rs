@@ -133,19 +133,28 @@ async fn cancel_as_granted(
     }
 }
 
-/// Runs `statement(n)` for n = 1, 2, … until a cancel lands while it runs, and
-/// returns whether the lock was left held.
+/// Runs `statement(n)` for n = 1, 2, … 10 and returns whether any try that a
+/// cancel interrupted left the lock held. The victim can still handle the
+/// cancel while it waits, before it is granted the lock, and then holds
+/// nothing whatever its handler does, so one try that does not leak proves
+/// nothing either way.
 async fn cancel_until_it_lands(
     pool: &PgPool,
     lock_key: i64,
     statement: impl Fn(i64) -> String,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut landed = 0;
     for attempt in 1..=10 {
-        if let Some(held) = cancel_as_granted(pool, lock_key, &statement(attempt)).await? {
-            return Ok(held);
+        match cancel_as_granted(pool, lock_key, &statement(attempt)).await? {
+            Some(true) => return Ok(true),
+            Some(false) => landed += 1,
+            None => {}
         }
     }
-    Err("no cancel landed while the statement ran in 10 tries".into())
+    if landed == 0 {
+        return Err("no cancel landed while the statement ran in 10 tries".into());
+    }
+    Ok(false)
 }
 
 async fn lane_key(pool: &PgPool, table: &str) -> Result<(String, i64), sqlx::Error> {
@@ -155,6 +164,24 @@ async fn lane_key(pool: &PgPool, table: &str) -> Result<(String, i64), sqlx::Err
     ))
     .fetch_one(pool)
     .await
+}
+
+/// Ends the sessions in this database holding the lane lock `key`, so a lock a
+/// cancelled try leaked does not stall the next check. Advisory locks are per
+/// database, and `pg_locks` lists the whole cluster's.
+async fn end_lane_lock_holders(pool: &PgPool, key: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_locks
+         WHERE locktype = 'advisory' AND pid <> pg_backend_pid()
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND objsubid = 1
+           AND classid = (($1 >> 32) & 4294967295)::oid
+           AND objid = ($1 & 4294967295)::oid",
+    )
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Whether a cancel that lands as `set_sequence_next` or the enqueue-head
@@ -173,18 +200,14 @@ async fn cancelled_lane_moves_leave_lock(
     })
     .await?;
     // A leaked lock would stall the next try; release it for the trigger check.
-    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND pid <> pg_backend_pid()")
-        .execute(pool)
-        .await?;
+    end_lane_lock_holders(pool, claim_key).await?;
     let (_, enqueue_key) = lane_key(pool, "queue_enqueue_heads").await?;
     let trigger = cancel_until_it_lands(pool, enqueue_key, |_| {
         "UPDATE awa.queue_enqueue_heads SET next_seq = next_seq + 3 WHERE queue = 'lock_q'"
             .to_string()
     })
     .await?;
-    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND pid <> pg_backend_pid()")
-        .execute(pool)
-        .await?;
+    end_lane_lock_holders(pool, enqueue_key).await?;
     Ok((set_next, trigger))
 }
 
@@ -307,6 +330,36 @@ async fn the_patch_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) -> Te
         .execute(&migrator_pool)
         .await?;
         restore_released_handlers(&pool, "awa").await?;
+        // A second substrate owned by the same role, on which the migration
+        // role has no privileges at all, not even USAGE: the patch must find
+        // it from the catalogs and refresh it as the owner.
+        QueueStorage::new(QueueStorageConfig {
+            schema: "lane_custom".into(),
+            ..Default::default()
+        })?
+        .prepare_schema(&pool)
+        .await?;
+        sqlx::raw_sql(&format!(
+            "ALTER SCHEMA lane_custom OWNER TO {owner};
+             DO $$
+             DECLARE f regprocedure;
+             BEGIN
+                 FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
+                          WHERE p.pronamespace = 'lane_custom'::regnamespace
+                 LOOP
+                     EXECUTE format('ALTER FUNCTION %s OWNER TO {owner}', f);
+                 END LOOP;
+             END $$;"
+        ))
+        .execute(&pool)
+        .await?;
+        restore_released_handlers(&pool, "lane_custom").await?;
+        let migrator_usage: bool = sqlx::query_scalar(&format!(
+            "SELECT has_schema_privilege('{migrator}', 'lane_custom', 'USAGE')"
+        ))
+        .fetch_one(&pool)
+        .await?;
+        ensure!(!migrator_usage, "the migration role has no USAGE on lane_custom");
 
         let patch = migrations::SCHEMA_PATCHES
             .iter()
@@ -321,11 +374,13 @@ async fn the_patch_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) -> Te
         migrator_pool.close().await;
         ensure_eq!(role, migrator, "the migration role is restored");
 
-        for definition in lane_sequence_helpers(&pool, "awa").await? {
-            ensure!(
-                definition.contains("WHEN OTHERS OR query_canceled THEN"),
-                "the lane helpers were refreshed"
-            );
+        for schema in ["awa", "lane_custom"] {
+            for definition in lane_sequence_helpers(&pool, schema).await? {
+                ensure!(
+                    definition.contains("WHEN OTHERS OR query_canceled THEN"),
+                    "the lane helpers in {schema} were refreshed"
+                );
+            }
         }
         let (owners, lent_execute, lent_usage): (Vec<String>, bool, bool) =
             sqlx::query_as(&format!(
@@ -351,4 +406,28 @@ async fn the_patch_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) -> Te
     .execute(&pool)
     .await?;
     result
+}
+
+/// A schema that lost `set_sequence_next`, as a partial restore can leave it,
+/// still needs the patch, and applying it defines the helper again.
+#[sqlx::test(migrations = false)]
+async fn a_missing_lane_helper_keeps_the_patch_pending(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    sqlx::raw_sql("DROP FUNCTION awa.set_sequence_next(text, bigint)")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        pending_targets(&pool).await?,
+        vec!["lane locks in schema awa".to_string()]
+    );
+
+    let report = migrations::run_with_report(&pool).await?;
+    assert!(report.complete(), "{:?}", report.patches);
+    assert!(pending_targets(&pool).await?.is_empty());
+    let definitions = lane_sequence_helpers(&pool, "awa").await?;
+    assert_eq!(definitions.len(), 2, "both helpers are defined");
+    QueueStorage::new(QueueStorageConfig::default())?
+        .enqueue_batch(&pool, "lock_q", 2, 1)
+        .await?;
+    Ok(())
 }

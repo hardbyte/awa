@@ -572,26 +572,29 @@ DO $$
 DECLARE
     v_schema TEXT;
 BEGIN
+    -- Substrates are found from the catalogs alone, without USAGE on their
+    -- schemas: a migration role that may only SET ROLE to a schema's owner
+    -- has no USAGE of its own there, and refresh_lane_sequence_helpers_as_migrator
+    -- is what switches to the owner.
     FOR v_schema IN
         SELECT n.nspname
         FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
+        WHERE EXISTS (
+                  SELECT 1 FROM pg_proc AS p
+                  WHERE p.pronamespace = n.oid
+                    AND p.proname = 'claim_ready_runtime'
+                    AND oidvectortypes(p.proargtypes)
+                        = 'text, bigint, double precision, double precision')
+          AND EXISTS (SELECT 1 FROM pg_class AS c
+                      WHERE c.relnamespace = n.oid AND c.relname = 'queue_enqueue_heads')
+          AND EXISTS (SELECT 1 FROM pg_class AS c
+                      WHERE c.relnamespace = n.oid AND c.relname = 'queue_claim_heads')
+          AND EXISTS (SELECT 1 FROM pg_proc AS p
+                      WHERE p.pronamespace = n.oid
+                        AND p.proname = 'queue_lane_sequence_name'
+                        AND oidvectortypes(p.proargtypes) = 'text, text, smallint, smallint')
         ORDER BY n.nspname
     LOOP
-        IF to_regclass(format('%I.queue_enqueue_heads', v_schema)) IS NULL
-           OR to_regclass(format('%I.queue_claim_heads', v_schema)) IS NULL
-           OR to_regprocedure(format('%I.queue_lane_sequence_name(text,text,smallint,smallint)', v_schema)) IS NULL
-           OR to_regprocedure(format('%I.set_sequence_next(text,bigint)', v_schema)) IS NULL THEN
-            CONTINUE;
-        END IF;
-
         -- Serialize with a concurrent prepare_schema() of the same schema. This
         -- is an advisory lock, not a table lock: claims and completions do not
         -- take it.

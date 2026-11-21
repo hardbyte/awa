@@ -78,6 +78,39 @@ class SqlTests(unittest.TestCase):
         )
         self.assertEqual(sql(split), [])
 
+    def test_a_specific_branch_before_others_must_unlock(self):
+        # Postgres runs only the first matching branch, so the later cleanup
+        # never runs for a division by zero.
+        text = SAFE.replace(
+            "    EXCEPTION WHEN OTHERS OR query_canceled THEN\n",
+            "    EXCEPTION\n        WHEN division_by_zero THEN\n            RAISE;\n"
+            "        WHEN OTHERS OR query_canceled THEN\n",
+        )
+        self.assertEqual(
+            sql(text),
+            ["session advisory lock: its block's division_by_zero branch does not unlock"],
+        )
+
+    def test_unlock_must_match_the_lock_form(self):
+        shared = SAFE.replace("pg_advisory_lock(42)", "pg_advisory_lock_shared(42)")
+        self.assertEqual(
+            sql(shared),
+            [
+                "session advisory lock: its block's query_canceled branch does not unlock "
+                "with pg_advisory_unlock_shared, which the lock's form needs"
+            ],
+        )
+        self.assertEqual(sql(shared.replace("pg_advisory_unlock(", "pg_advisory_unlock_shared(")), [])
+        self.assertEqual(sql(shared.replace("pg_advisory_unlock(", "pg_advisory_unlock_all(")), [])
+        exclusive = SAFE.replace("pg_advisory_unlock(", "pg_advisory_unlock_shared(")
+        self.assertEqual(
+            sql(exclusive),
+            [
+                "session advisory lock: its block's query_canceled branch does not unlock "
+                "with pg_advisory_unlock, which the lock's form needs"
+            ],
+        )
+
     def test_handler_must_cover_ordinary_errors(self):
         text = SAFE.replace("WHEN OTHERS OR query_canceled THEN", "WHEN query_canceled THEN")
         self.assertEqual(

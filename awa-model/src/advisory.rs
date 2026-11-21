@@ -4,8 +4,8 @@
 //! connection that goes back to the pool still holding one keeps the lock
 //! until the pool closes that connection, which with a long `idle_timeout` or
 //! `max_lifetime` can be never. [`SessionAdvisoryLock`] returns the connection
-//! to the pool only after `pg_advisory_unlock` reports the lock released;
-//! every other way out, including a dropped future, a panic or a failed
+//! to the pool only after `pg_advisory_unlock` succeeds and `pg_locks` shows
+//! the session no longer holds the key; every other way out, including a dropped future, a panic or a failed
 //! unlock, closes the connection, and closing the session releases the lock.
 //!
 //! Prefer a transaction-scoped lock (`pg_advisory_xact_lock`) where the work
@@ -91,7 +91,9 @@ impl SessionAdvisoryLock {
     }
 
     /// Releases the lock. The connection goes back to the pool when the unlock
-    /// succeeds and is closed otherwise, so the lock is released either way;
+    /// succeeds and the session holds the key no more (session locks stack, so
+    /// a key taken again through [`connection`](Self::connection) stays held),
+    /// and is closed otherwise, so the lock is released either way;
     /// the error only reports that the explicit unlock failed.
     pub async fn release(mut self) -> Result<(), sqlx::Error> {
         // The unlock runs on the connection still owned by the guard, so a
@@ -101,7 +103,22 @@ impl SessionAdvisoryLock {
             .bind(key)
             .fetch_one(self.connection())
             .await?;
-        if released {
+        if !released {
+            return Ok(());
+        }
+        // Session advisory locks stack: one unlock releases one hold. The
+        // connection is pooled only once this session holds the key no more.
+        let still_held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks \
+             WHERE locktype = 'advisory' AND pid = pg_backend_pid() \
+               AND objsubid = 1 \
+               AND classid = (($1 >> 32) & 4294967295)::oid \
+               AND objid = ($1 & 4294967295)::oid)",
+        )
+        .bind(key)
+        .fetch_one(self.connection())
+        .await?;
+        if !still_held {
             drop(self.conn.take());
         }
         Ok(())
