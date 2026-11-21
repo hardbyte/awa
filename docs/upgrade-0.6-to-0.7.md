@@ -363,6 +363,23 @@ v061 rewrites `<schema>.claim_ready_runtime` in the default and every discovered
 
 v061 changes only the function's body: its name, arguments and results are unchanged, so binaries before v061 call it the same way before and after the migration. No rehearsal runs them against the migrated schema; `claim_spent_prefix_gaps_test` checks that the rewrite keeps the function in place and matches the installer. External migration runners apply the complete `awa migrate --sql --from 60 --to 61` bundle as the owner of the claim functions, or as a role that can `SET ROLE` to it.
 
+## v062: ring generation floor
+
+An enqueue reserves its lane positions under the lane's reservation lock and then reads the queue ring's cursor to choose the `(ready_slot, ready_generation)` its rows go into. In a `REPEATABLE READ` or `SERIALIZABLE` transaction that read uses the transaction's snapshot, which can be older than a ring rotation that committed while the enqueue waited for the lock. A job could then take a later lane position than a job committed into the newer generation and still land in the older one. A claim reads one generation's segment of a lane at a time, so it moved the lane's claim cursor past the job, and queue prune later deleted the slot holding it. A snapshot older than a whole turn of the ring could write into a slot the ring had since reused, and prune deleted that job too (#847).
+
+v062 adds to the default and every discovered custom queue-storage schema:
+
+- `<schema>.queue_ring_generation_floor`, a sequence holding the newest queue-ring generation some transaction has read as committed. Reading a sequence ignores the reader's snapshot. It is seeded from the current cursor.
+- `<schema>.enqueue_ring_cursor()`, which raises the floor to the generation its caller can see and returns the newer of the two, with that generation's slot. It is `SECURITY DEFINER`, owned by the owner of `queue_ring_state`, with a pinned `search_path`, and `PUBLIC` may execute it: it returns the cursor and can raise the floor only to a generation its caller can already see. Runtime roles need no new grant and no privilege on the sequence.
+
+Enqueues call `enqueue_ring_cursor()` while holding their lane locks, so every earlier enqueue in a lane raised the floor to its own generation before it committed, and a lane's generations never go backwards. The rotator calls it after each rotation commits, so a long-running snapshot writes into the current generation rather than a reused slot. v062 rewrites `awa.insert_job_compat` and `awa.insert_jobs_compat_batch` from their own definitions to read the cursor through `enqueue_ring_cursor()` when the active schema has it, keeping their signatures, owners and privileges; a function that already does is left alone, so a replay and a fresh install are no-ops. Binaries from this release do the same for every ready and terminal row they write. On a schema without the function they read the cursor as before, and check again every 30 seconds.
+
+Queue prune now counts an unclaimed ready row of any generation in the slot as pending, and `queue_ring_pin` reports it. A job written into an older generation before the upgrade therefore holds its slot, and the ring stops there, rather than being deleted. A lane whose generations went backwards before the upgrade can be cleared with `drain_queue`, which cancels across every generation of the lane.
+
+If the migration role can neither hand `enqueue_ring_cursor()` to the owner of `queue_ring_state` nor read the ring itself, v062 warns and leaves the function out of that schema, and enqueues there keep the old behaviour. Run it as the owner of the queue-storage tables, or as a migrator that can `SET ROLE` to it. It takes no lock on any `awa` or queue-storage table, and its work scales with the number of schemas. External migration runners apply the complete `awa migrate --sql --from 61 --to 62` bundle.
+
+Binaries before v062 keep reading the cursor directly and behave as before, including their `REPEATABLE READ` producers, so they can run before or after the migration and rolling back needs no schema change. Under 0.6-style compat ring authority, a 0.6 rotator does not raise the floor; producers still do, so lane order holds, but a snapshot older than a whole turn of the ring is protected only once rotation is done by this release.
+
 ## Tag indexes (ADR-049)
 
 Tags become the indexed way to find jobs on queue storage. There is no

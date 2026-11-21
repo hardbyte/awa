@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 61;
+pub const CURRENT_VERSION: i32 = 62;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -337,6 +337,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Let a claim cross rolled-back reservations ahead of spent rows",
         &[V23_UP, V61_UP],
     ),
+    (
+        62,
+        "Keep a lane's ring generations in order under REPEATABLE READ producers",
+        &[V23_UP, V62_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -406,6 +411,7 @@ const V58_UP: &str = include_str!("../migrations/v058_provision_lane_row_first.s
 const V59_UP: &str = include_str!("../migrations/v059_backoff_wider_jitter.sql");
 const V60_UP: &str = include_str!("../migrations/v060_correlated_claim_tombstones.sql");
 const V61_UP: &str = include_str!("../migrations/v061_claim_spent_prefix_gaps.sql");
+const V62_UP: &str = include_str!("../migrations/v062_queue_ring_generation_floor.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

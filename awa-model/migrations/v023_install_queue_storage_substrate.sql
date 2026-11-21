@@ -1012,6 +1012,206 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_claim_batch_job_index_helper(TEXT) FROM PUBLIC;
 
+-- The queue-ring generation floor (#847). A producer reserves its lane
+-- positions under the lane's reservation lock and then reads the queue-ring
+-- cursor. Under REPEATABLE READ or SERIALIZABLE the cursor comes from a
+-- snapshot taken before the lock wait, so a later lane position could land in
+-- an older generation than an earlier one. Claims scan one (slot, generation)
+-- segment at a time and would move the lane's claim cursor past it.
+--
+-- <schema>.queue_ring_generation_floor is a sequence whose last value is the
+-- newest queue-ring generation some transaction has read as committed.
+-- Reading a sequence ignores the reader's snapshot. <schema>.enqueue_ring_cursor()
+-- raises the floor to the generation its caller can see and returns the newer
+-- of the two. Producers call it while holding their lane locks, so every
+-- earlier enqueue in a lane raised the floor to its own generation before it
+-- committed, and generations never go backwards in a lane. The rotator calls
+-- it after committing a rotation, so a producer whose snapshot predates many
+-- rotations still writes into the current generation rather than a slot the
+-- ring has reused. The floor only ever holds a generation that was committed,
+-- whose slot rotation has prepared, and it only moves forward (except through
+-- QueueStorage::reset, which restarts the ring).
+--
+-- enqueue_ring_cursor() is SECURITY DEFINER, owned by the owner of
+-- queue_ring_state, with a pinned search_path, and PUBLIC may execute it: it
+-- returns the cursor and can raise the floor only to a generation the caller
+-- can already see, so no runtime role needs a new grant. If its owner cannot
+-- read the ring (the migration role could not hand it to the ring's owner),
+-- it is dropped again, with a warning, and producers keep reading the cursor
+-- directly.
+-- The helper seeds the floor from the committed cursor. Replacing the function
+-- takes no table locks. The installer calls this too.
+CREATE OR REPLACE FUNCTION awa.refresh_ring_generation_floor_helper(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $refresh$
+DECLARE
+    v_owner OID;
+    v_sequence REGCLASS;
+    v_function REGPROCEDURE;
+    v_object_owner OID;
+    v_set_mode TEXT := CASE WHEN current_setting('server_version_num')::int >= 160000
+                            THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
+        RAISE EXCEPTION 'refresh_ring_generation_floor_helper: schema name must match ^[a-z_][a-z0-9_]*$; got %',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT state.relowner INTO v_owner
+    FROM pg_class AS state
+    WHERE state.oid = to_regclass(format('%I.queue_ring_state', p_schema));
+    IF v_owner IS NULL
+       OR to_regprocedure(format('%I.ring_cursor(text)', p_schema)) IS NULL THEN
+        RAISE EXCEPTION 'refresh_ring_generation_floor_helper: schema % has no queue ring',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+
+    EXECUTE format(
+        'CREATE SEQUENCE IF NOT EXISTS %I.queue_ring_generation_floor AS BIGINT MINVALUE 0 START WITH 0',
+        p_schema
+    );
+    v_sequence := format('%I.queue_ring_generation_floor', p_schema)::regclass;
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.enqueue_ring_cursor()
+        RETURNS TABLE(slot INT, generation BIGINT)
+        LANGUAGE plpgsql
+        VOLATILE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp
+        AS $func$
+        DECLARE
+            v_slot INT;
+            v_generation BIGINT;
+            v_floor BIGINT;
+            v_lock_key BIGINT;
+        BEGIN
+            SELECT rc.slot, rc.generation
+            INTO v_slot, v_generation
+            FROM %1$I.ring_cursor('queue') AS rc;
+
+            -- NULL until the first raise after creation or a reset.
+            v_floor := pg_sequence_last_value(%2$L::regclass);
+            IF v_floor IS NULL OR v_floor < v_generation THEN
+                -- setval is not a compare-and-set, so raise under a short
+                -- session lock, released before returning rather than at the
+                -- end of the caller's transaction. Only the first producer to
+                -- see each rotation gets here.
+                v_lock_key := hashtextextended(%3$L, 0);
+                PERFORM pg_advisory_lock(v_lock_key);
+                BEGIN
+                    v_floor := pg_sequence_last_value(%2$L::regclass);
+                    IF v_floor IS NULL OR v_floor < v_generation THEN
+                        PERFORM setval(%2$L::regclass, v_generation, true);
+                        v_floor := v_generation;
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    PERFORM pg_advisory_unlock(v_lock_key);
+                    RAISE;
+                END;
+                PERFORM pg_advisory_unlock(v_lock_key);
+            END IF;
+
+            IF v_floor > v_generation THEN
+                -- Rotation advances slot and generation together from (0, 0)
+                -- and slot_count changes only when reset restarts the ring,
+                -- so the floor's slot is its generation modulo slot_count.
+                SELECT (v_floor %% state.slot_count)::int
+                INTO v_slot
+                FROM %1$I.queue_ring_state AS state
+                WHERE state.singleton;
+                v_generation := v_floor;
+            END IF;
+
+            slot := v_slot;
+            generation := v_generation;
+            RETURN NEXT;
+        END;
+        $func$
+        $ddl$,
+        p_schema,
+        format('%I.queue_ring_generation_floor', p_schema),
+        format('awa.queue_storage.ring_generation_floor:%s', p_schema)
+    );
+    v_function := format('%I.enqueue_ring_cursor()', p_schema)::regprocedure;
+
+    -- The function reads and sets the floor with its owner's privileges, so
+    -- the floor and the function belong to the queue ring's owner.
+    SELECT seq.relowner INTO v_object_owner FROM pg_class AS seq WHERE seq.oid = v_sequence;
+    IF v_object_owner <> v_owner THEN
+        IF pg_has_role(current_user, v_object_owner, 'USAGE')
+           AND pg_has_role(current_user, v_owner, v_set_mode)
+           AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format('ALTER SEQUENCE %s OWNER TO %I', v_sequence, pg_get_userbyid(v_owner));
+        ELSE
+            RAISE WARNING '% is owned by %, not the owner % of %.queue_ring_state',
+                v_sequence, pg_get_userbyid(v_object_owner), pg_get_userbyid(v_owner), p_schema
+                USING HINT = format(
+                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                    quote_ident(pg_get_userbyid(v_owner)),
+                    quote_ident(pg_get_userbyid(v_owner))
+                );
+        END IF;
+    END IF;
+
+    SELECT routine.proowner INTO v_object_owner FROM pg_proc AS routine WHERE routine.oid = v_function;
+    IF v_object_owner <> v_owner THEN
+        IF pg_has_role(current_user, v_object_owner, 'USAGE')
+           AND pg_has_role(current_user, v_owner, v_set_mode)
+           AND has_schema_privilege(v_owner, to_regnamespace(quote_ident(p_schema)), 'CREATE') THEN
+            EXECUTE format('ALTER FUNCTION %s OWNER TO %I', v_function, pg_get_userbyid(v_owner));
+            v_object_owner := v_owner;
+        ELSE
+            RAISE WARNING '% is owned by %, not the owner % of %.queue_ring_state',
+                v_function, pg_get_userbyid(v_object_owner), pg_get_userbyid(v_owner), p_schema
+                USING HINT = format(
+                    'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                    quote_ident(pg_get_userbyid(v_owner)),
+                    quote_ident(pg_get_userbyid(v_owner))
+                );
+        END IF;
+    END IF;
+
+    -- The function runs as its owner, so its owner must be able to read the
+    -- ring and the floor. If it cannot (the transfer above was not possible),
+    -- the function is dropped: producers then read the cursor as they did
+    -- before the floor existed, instead of failing.
+    IF has_function_privilege(
+           v_object_owner,
+           format('%I.ring_cursor(text)', p_schema)::regprocedure,
+           'EXECUTE'
+       )
+       AND has_table_privilege(v_object_owner, format('%I.ring_cursor_authority', p_schema), 'SELECT')
+       AND has_table_privilege(v_object_owner, format('%I.queue_ring_rotations', p_schema), 'SELECT')
+       AND has_table_privilege(v_object_owner, format('%I.queue_ring_state', p_schema), 'SELECT')
+       AND has_sequence_privilege(v_object_owner, v_sequence, 'SELECT')
+       AND has_sequence_privilege(v_object_owner, v_sequence, 'UPDATE') THEN
+        -- New functions are executable by PUBLIC already; this restores it
+        -- should anything have revoked it.
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', v_function);
+        -- Seed the floor from the committed cursor.
+        EXECUTE format('SELECT FROM %I.enqueue_ring_cursor()', p_schema);
+    ELSE
+        EXECUTE format('DROP FUNCTION %s', v_function);
+        RAISE WARNING '% cannot read the queue ring of schema %, so enqueues there keep writing without the generation floor (#847)',
+            pg_get_userbyid(v_object_owner), p_schema
+            USING HINT = format(
+                'Run awa migrate as a role that can SET ROLE to %s, or as %s itself.',
+                quote_ident(pg_get_userbyid(v_owner)),
+                quote_ident(pg_get_userbyid(v_owner))
+            );
+    END IF;
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_ring_generation_floor_helper(TEXT) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -5107,6 +5307,8 @@ BEGIN
             p_schema, v_slot
         );
     END LOOP;
+
+    PERFORM awa.refresh_ring_generation_floor_helper(p_schema);
 END;
 $install$;
 
