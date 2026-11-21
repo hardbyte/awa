@@ -3,7 +3,7 @@
 
 use awa_model::advisory::SessionAdvisoryLock;
 use sqlx::PgPool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -27,14 +27,16 @@ async fn held(pool: &PgPool, key: i64) -> Result<bool, sqlx::Error> {
 /// Waits up to five seconds for the lock to be released; a closed connection
 /// ends its session asynchronously.
 async fn released_within_five_seconds(pool: &PgPool, key: i64) -> Result<bool, sqlx::Error> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if !held(pool, key).await? {
-            return Ok(true);
+    let poll = async {
+        while held(pool, key).await? {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
+    };
+    match tokio::time::timeout(Duration::from_secs(5), poll).await {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
     }
-    Ok(false)
 }
 
 #[sqlx::test(migrations = false)]
@@ -65,6 +67,25 @@ async fn release_unlocks_and_returns_the_connection(pool: PgPool) -> TestResult 
             .fetch_one(&pool)
             .await?;
     assert!(alive, "the connection went back to the pool, not closed");
+    Ok(())
+}
+
+/// Session locks stack, so a key taken again on the guard's connection is
+/// still held after one unlock; release then closes the connection rather than
+/// pool it.
+#[sqlx::test(migrations = false)]
+async fn release_closes_a_connection_that_still_holds_the_key(pool: PgPool) -> TestResult {
+    let key = 7_105;
+    let mut lock = SessionAdvisoryLock::try_acquire(&pool, key)
+        .await?
+        .expect("the lock is free");
+    // advisory-lock: a second hold on the guard's own connection.
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(lock.connection())
+        .await?;
+    lock.release().await?;
+    assert!(released_within_five_seconds(&pool, key).await?);
     Ok(())
 }
 
