@@ -7,6 +7,7 @@
 use crate::audited_sql;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::filter::{DlqPage, JobFilter};
+use crate::isolation::BeginReadCommitted;
 use crate::job::JobRow;
 use crate::job_query::{dlq_predicate, set_statement_timeout, Bind, Predicate, ReadBudget};
 use crate::queue_storage::QueueStorage;
@@ -320,7 +321,7 @@ async fn list_dlq_where(
     let budget = ReadBudget::start();
     let rows: Vec<QueueStorageDlqRow> = budget
         .run(async {
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let mut tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
             set_statement_timeout(&mut tx, budget.remaining()?).await?;
             predicate
                 .bind_query_as(sqlx::query_as(audited_sql(sql)))

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod admin;
+pub mod advisory;
 pub mod batch_operations;
 pub mod bridge;
 pub mod callback_contract;
@@ -10,6 +11,7 @@ pub mod dlq;
 pub mod error;
 pub mod filter;
 pub mod insert;
+pub mod isolation;
 pub mod job;
 mod job_query;
 pub mod kind;

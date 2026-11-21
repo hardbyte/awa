@@ -2,10 +2,12 @@ use crate::executor::DlqPolicy;
 use crate::metrics::AwaMetrics;
 use crate::runtime::InFlightMap;
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::advisory::SessionAdvisoryLock;
 use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::queue_storage::DlqExpiry;
 use awa_model::{
     AwaError, JobRow, JobState, PeriodicJob, PromotionLane, PruneOutcome, QueueStorage,
@@ -14,8 +16,7 @@ use awa_model::{
 };
 use chrono::{DateTime, Utc};
 use croner::Cron;
-use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres};
+use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1706,7 +1707,7 @@ impl MaintenanceService {
         loop {
             // Try to acquire advisory lock for leader election.
             // We get back a dedicated connection that holds the lock.
-            let mut leader_conn = match self.try_become_leader().await {
+            let mut leader_lock = match self.try_become_leader().await {
                 Ok(Some(conn)) => conn,
                 Ok(None) => {
                     // Not leader — back off and try again
@@ -1880,7 +1881,7 @@ impl MaintenanceService {
                             // The advisory lock is session-scoped: if the
                             // connection is alive, the lock is held. If the
                             // query fails, the connection (and lock) are gone.
-                            if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
+                            if sqlx::query("SELECT 1").execute(leader_lock.connection()).await.is_err() {
                                 warn!("Leader connection lost, re-entering election loop");
                                 self.leader.store(false, Ordering::SeqCst);
                                 Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
@@ -2078,9 +2079,9 @@ impl MaintenanceService {
             Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
             if self.cancel.is_cancelled() {
                 debug!("Maintenance service shutting down");
-                // Release leader lock on the same connection that acquired it.
-                // If this fails, dropping the connection will release the lock anyway.
-                let _ = Self::release_leader(&mut leader_conn).await;
+                // A failed unlock closes the leader connection, which releases
+                // the lock.
+                let _ = leader_lock.release().await;
                 return;
             }
         }
@@ -2091,32 +2092,13 @@ impl MaintenanceService {
 
     /// Try to acquire the advisory lock for leader election.
     ///
-    /// Returns a dedicated connection holding the lock on success, or `None` if
-    /// another instance already holds the lock. The lock is session-scoped in
-    /// PostgreSQL, so it stays held as long as this connection is alive.
-    async fn try_become_leader(&self) -> Result<Option<PoolConnection<Postgres>>, sqlx::Error> {
-        let mut conn = self.pool.acquire().await?;
-        let result: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-            .bind(Self::LOCK_KEY)
-            .fetch_one(&mut *conn)
-            .await?;
-        if result.0 {
-            Ok(Some(conn))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Release the advisory lock on the same connection that acquired it.
-    ///
-    /// Dropping the connection also releases the lock (PG session-scoped behavior),
-    /// so this is a best-effort explicit release.
-    async fn release_leader(conn: &mut PoolConnection<Postgres>) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(Self::LOCK_KEY)
-            .execute(&mut **conn)
-            .await?;
-        Ok(())
+    /// Returns the lock, held on a dedicated pooled connection, or `None` if
+    /// another instance already holds it. The lock is session-scoped, so it
+    /// stays held while that connection is alive. Dropping the guard without
+    /// [`SessionAdvisoryLock::release`] closes the connection rather than
+    /// returning it to the pool with the lock still held.
+    async fn try_become_leader(&self) -> Result<Option<SessionAdvisoryLock>, sqlx::Error> {
+        SessionAdvisoryLock::try_acquire(&self.pool, Self::LOCK_KEY).await
     }
 
     async fn run_cron_evaluator(pool: PgPool, cancel: CancellationToken, interval: Duration) {
@@ -3596,7 +3578,7 @@ impl MaintenanceService {
         if specs.is_empty() {
             return;
         }
-        let mut tx = match self.pool.begin().await {
+        let mut tx = match self.pool.begin_read_committed().await {
             Ok(tx) => tx,
             Err(err) => {
                 error!(
@@ -3850,7 +3832,7 @@ impl MaintenanceService {
         &self,
         state: &'static str,
     ) -> Result<(usize, HashSet<String>), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_read_committed().await?;
         let promote_start = std::time::Instant::now();
         let sql = Self::promote_sql(state);
         let promoted_rows: Vec<(String,)> = sqlx::query_as(audited_sql(sql))
@@ -5094,7 +5076,7 @@ mod tests {
 
         let mut receipt_lock_tx = service
             .pool
-            .begin()
+            .begin_read_committed()
             .await
             .expect("begin receipt lock transaction");
         sqlx::query(

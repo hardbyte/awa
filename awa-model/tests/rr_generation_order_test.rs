@@ -123,13 +123,6 @@ async fn produce(
     Ok(rows[0].id)
 }
 
-fn is_serialization_failure(err: &AwaError) -> bool {
-    match err {
-        AwaError::Database(sqlx::Error::Database(db)) => db.code().as_deref() == Some("40001"),
-        _ => false,
-    }
-}
-
 /// `label -> (lane_seq, ready_slot, ready_generation, job_id)` for every
 /// ready row.
 async fn placement(pool: &PgPool) -> Result<BTreeMap<String, (i64, i32, i64, i64)>, sqlx::Error> {
@@ -267,7 +260,7 @@ async fn build_early_snapshot_layout(
                 Ok(()) => break,
                 Err(err) => {
                     let err = AwaError::Database(err);
-                    if is_serialization_failure(&err) && serialization_retries < 3 {
+                    if err.is_serialization_failure() && serialization_retries < 3 {
                         serialization_retries += 1;
                         eprintln!("b: commit failed with 40001, retrying: {err}");
                         t1 = begin_with(pool, isolation).await?;
@@ -276,7 +269,7 @@ async fn build_early_snapshot_layout(
                     return Err(err.into());
                 }
             },
-            Err(err) if is_serialization_failure(&err) && serialization_retries < 3 => {
+            Err(err) if err.is_serialization_failure() && serialization_retries < 3 => {
                 serialization_retries += 1;
                 eprintln!("b: enqueue failed with 40001, retrying: {err}");
                 t1.rollback().await?;
@@ -558,7 +551,7 @@ async fn repeatable_read_rust_enqueue_after_lock_wait_keeps_every_job(pool: PgPo
             loop {
                 match rr_store.enqueue_params_batch(&rr_pool, &[job("b")]).await {
                     Ok(_) => return Ok::<usize, AwaError>(retries),
-                    Err(err) if is_serialization_failure(&err) && retries < 3 => {
+                    Err(err) if err.is_serialization_failure() && retries < 3 => {
                         eprintln!("b: enqueue failed with 40001, retrying: {err}");
                         retries += 1;
                     }
@@ -657,7 +650,7 @@ async fn repeatable_read_snapshot_older_than_the_ring_keeps_the_job(pool: PgPool
                 t1.commit().await?;
                 break id;
             }
-            Err(err) if is_serialization_failure(&err) && serialization_retries < 3 => {
+            Err(err) if err.is_serialization_failure() && serialization_retries < 3 => {
                 serialization_retries += 1;
                 eprintln!("b: enqueue failed with 40001, retrying: {err}");
                 t1.rollback().await?;
