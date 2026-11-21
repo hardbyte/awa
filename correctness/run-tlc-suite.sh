@@ -50,7 +50,7 @@ AwaStorageLockOrder.tla        ;; AwaStorageLockOrderCompletionFollowUpDeadlock.
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderOldClaimPruneSlotRowDeadlock.cfg ;; NoDeadlock is violated ;; old claim-prune slot-row order against rescue witness
 AwaSessionAdvisoryLock.tla     ;; -                                       ;; pass ;; session locks released on cancel, error, drop and failed unlock
 AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockOthersOnly.cfg    ;; NoPooledLock is violated ;; WHEN OTHERS handler misses a cancel after the grant
-AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockLockBeforeBlock.cfg ;; NoPooledLock is violated ;; lock taken before the handler's block
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockLockBeforeBlock.cfg ;; NoPooledLock is violated ;; lock taken before the block whose handler unlocks
 AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockCancelOnly.cfg    ;; NoPooledLock is violated ;; handler without OTHERS misses an ordinary error
 AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockUnguardedPool.cfg ;; NoPooledLock is violated ;; dropped Rust holder pools its locked connection
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
