@@ -1,3 +1,4 @@
+use crate::advisory::SessionAdvisoryLock;
 use crate::error::AwaError;
 use sqlx::postgres::PgConnection;
 use sqlx::PgPool;
@@ -490,6 +491,46 @@ macro_rules! replica_identity_pending_sql {
     };
 }
 
+/// Rows naming what still lacks the `sequence_lock_cancel_release` patch: the
+/// helper refresh functions and each installed queue-storage substrate
+/// (found as for `prepared_lane_sequences`) whose `set_sequence_next` or
+/// enqueue-head trigger function releases its session lock only on `OTHERS`.
+macro_rules! sequence_lock_cancel_release_pending_sql {
+    () => {
+        "SELECT 'awa.refresh_lane_sequence_helpers'::text AS target \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pg_proc AS p \
+             WHERE p.pronamespace = 'awa'::regnamespace \
+               AND p.proname = 'refresh_lane_sequence_helpers' \
+               AND p.prosrc LIKE '%query_canceled%') \
+         UNION ALL \
+         SELECT 'awa.refresh_lane_sequence_helpers_as_migrator' \
+         WHERE to_regprocedure('awa.refresh_lane_sequence_helpers_as_migrator(text)') IS NULL \
+         UNION ALL \
+         SELECT format('lane locks in schema %s', n.nspname) \
+         FROM pg_namespace AS n \
+         WHERE EXISTS ( \
+                 SELECT 1 FROM pg_proc AS p \
+                 WHERE p.pronamespace = n.oid \
+                   AND p.proname = 'claim_ready_runtime' \
+                   AND oidvectortypes(p.proargtypes) \
+                       = 'text, bigint, double precision, double precision') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid AND c.relname = 'queue_enqueue_heads') \
+           AND EXISTS (SELECT 1 FROM pg_class AS c \
+                       WHERE c.relnamespace = n.oid AND c.relname = 'queue_claim_heads') \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname = 'queue_lane_sequence_name' \
+                         AND oidvectortypes(p.proargtypes) = 'text, text, smallint, smallint') \
+           AND EXISTS (SELECT 1 FROM pg_proc AS p \
+                       WHERE p.pronamespace = n.oid \
+                         AND p.proname IN ('set_sequence_next', \
+                                           'queue_enqueue_head_sequence_sync') \
+                         AND p.prosrc NOT LIKE '%query_canceled%')"
+    };
+}
+
 /// SQL returning one `text` row per object or schema that still needs the
 /// named patch, for patches that touch more than one place.
 fn patch_targets_sql(name: &str) -> Option<&'static str> {
@@ -511,6 +552,10 @@ fn patch_targets_sql(name: &str) -> Option<&'static str> {
         )),
         "spent_claim_prefix_gaps" => Some(concat!(
             spent_claim_prefix_gaps_pending_sql!(),
+            " ORDER BY 1"
+        )),
+        "sequence_lock_cancel_release" => Some(concat!(
+            sequence_lock_cancel_release_pending_sql!(),
             " ORDER BY 1"
         )),
         "replica_identity" => Some(concat!(replica_identity_pending_sql!(), " ORDER BY 1")),
@@ -652,6 +697,20 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
         applied_probe: concat!("SELECT NOT EXISTS (", replica_identity_pending_sql!(), ")"),
     },
     SchemaPatch {
+        name: "sequence_lock_cancel_release",
+        description: "Release lane-sequence session locks on cancel (awa 0.7 migration v062)",
+        // Replaces the helper refresh itself, since the versioned v023 file
+        // stays as released, then refreshes each installed schema's lane
+        // helpers. Keep after every patch that embeds the v023 installer,
+        // which would restore the released refresh function.
+        sql: include_str!("../migrations/patches/sequence_lock_cancel_release.sql"),
+        applied_probe: concat!(
+            "SELECT NOT EXISTS (",
+            sequence_lock_cancel_release_pending_sql!(),
+            ")"
+        ),
+    },
+    SchemaPatch {
         name: "spent_claim_prefix_gaps",
         description: "Let a claim cross rolled-back reservations ahead of spent ready rows",
         // Rewrites the installed installer and claim functions in place; the
@@ -701,6 +760,23 @@ async fn pending_schema_patches_conn(
     Ok(pending)
 }
 
+/// The patches `awa migrate` applies, in order, to a schema at
+/// [`CURRENT_VERSION`] that lacks exactly the patches named in `missing`:
+/// those, and every patch that rewrites the installer once a patch applied
+/// before it has put the released installer back. Tests use it to state which
+/// patches their setup removes rather than the full list `awa migrate` runs.
+pub fn patches_to_apply(missing: &[&str]) -> Vec<&'static str> {
+    let mut apply = Vec::new();
+    let mut installer_restored = false;
+    for patch in SCHEMA_PATCHES {
+        if missing.contains(&patch.name) || (installer_restored && rewrites_installer(patch)) {
+            installer_restored |= embeds_installer(patch);
+            apply.push(patch.name);
+        }
+    }
+    apply
+}
+
 /// Whether applying `patch` puts the released v023 installer back.
 fn embeds_installer(patch: &SchemaPatch) -> bool {
     patch.sql.contains(include_str!(
@@ -711,7 +787,10 @@ fn embeds_installer(patch: &SchemaPatch) -> bool {
 /// Whether `patch` rewrites the installer in place, so it must run again
 /// after any patch that [`embeds_installer`].
 fn rewrites_installer(patch: &SchemaPatch) -> bool {
-    patch.name == "spent_claim_prefix_gaps"
+    matches!(
+        patch.name,
+        "sequence_lock_cancel_release" | "spent_claim_prefix_gaps"
+    )
 }
 
 /// Whether one schema patch is present, and if not, where it is missing.
@@ -885,18 +964,13 @@ pub const MIGRATION_LOCK_KEY: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
 /// migrations and patches it applied, where each patch is still missing, and
 /// storage routing before and after.
 pub async fn run_with_report(pool: &PgPool) -> Result<MigrationReport, AwaError> {
-    let mut conn = pool.acquire().await?;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_LOCK_KEY)
-        .execute(&mut *conn)
-        .await?;
+    // The guard closes the connection instead of pooling it if this future is
+    // dropped or the unlock fails, so the lock cannot outlive the run.
+    let mut lock = SessionAdvisoryLock::acquire(pool, MIGRATION_LOCK_KEY).await?;
 
-    let result = run_inner(&mut conn).await;
+    let result = run_inner(lock.connection()).await;
 
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(MIGRATION_LOCK_KEY)
-        .execute(&mut *conn)
-        .await;
+    let _ = lock.release().await;
 
     result
 }
@@ -1567,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn spent_claim_prefix_gaps_runs_after_every_installer_patch() {
+    fn installer_rewriting_patches_run_after_every_installer_patch() {
         let installer = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
         let position = |name: &str| {
             SCHEMA_PATCHES
@@ -1575,18 +1649,51 @@ mod tests {
                 .position(|patch| patch.name == name)
                 .expect("registered patch")
         };
-        let fix = position("spent_claim_prefix_gaps");
-        assert!(rewrites_installer(&SCHEMA_PATCHES[fix]));
-        for patch in SCHEMA_PATCHES {
-            if embeds_installer(patch) {
+        for fix_name in ["sequence_lock_cancel_release", "spent_claim_prefix_gaps"] {
+            let fix = position(fix_name);
+            assert!(rewrites_installer(&SCHEMA_PATCHES[fix]));
+            // External runners apply the exported R__ scripts in name order.
+            for patch in SCHEMA_PATCHES {
+                if embeds_installer(patch) {
+                    assert!(
+                        position(patch.name) < fix && patch.name < fix_name,
+                        "{} restores the released installer, so it must run and sort before {fix_name}",
+                        patch.name
+                    );
+                }
+            }
+            assert!(!SCHEMA_PATCHES[fix].sql.contains(installer));
+        }
+    }
+
+    #[test]
+    fn patches_to_apply_reapplies_installer_rewrites() {
+        assert!(patches_to_apply(&[]).is_empty());
+        let all: Vec<_> = SCHEMA_PATCHES.iter().map(|patch| patch.name).collect();
+        assert_eq!(patches_to_apply(&all), all);
+        for patch in SCHEMA_PATCHES
+            .iter()
+            .filter(|patch| embeds_installer(patch))
+        {
+            let apply = patches_to_apply(&[patch.name]);
+            assert_eq!(apply[0], patch.name);
+            for rewrite in SCHEMA_PATCHES
+                .iter()
+                .filter(|patch| rewrites_installer(patch))
+            {
                 assert!(
-                    position(patch.name) < fix && patch.name < "spent_claim_prefix_gaps",
-                    "{} restores the released installer, so it must run and sort first",
+                    apply.contains(&rewrite.name),
+                    "{} after {}",
+                    rewrite.name,
                     patch.name
                 );
             }
         }
-        assert!(!SCHEMA_PATCHES[fix].sql.contains(installer));
+        let standalone = SCHEMA_PATCHES
+            .iter()
+            .find(|patch| !embeds_installer(patch) && !rewrites_installer(patch))
+            .expect("a patch that leaves the installer alone");
+        assert_eq!(patches_to_apply(&[standalone.name]), [standalone.name]);
     }
 
     #[test]
