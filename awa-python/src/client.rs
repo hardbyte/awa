@@ -1,4 +1,3 @@
-use awa_model::isolation::BeginReadCommitted;
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
 use crate::errors::{
     map_awa_error, map_connect_error, map_sqlx_error, state_error, validation_error,
@@ -14,6 +13,7 @@ use awa_model::batch_operations::{
     BatchOperationFilter, BatchOperationKind, BatchOperationSpec, BatchOperationState,
     ListBatchOperationsFilter, SubmitBatchOperation,
 };
+use awa_model::isolation::BeginReadCommitted;
 use awa_model::{
     CronMissedFirePolicy, InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage,
     QueueStorageConfig, RingRotationCadence,
