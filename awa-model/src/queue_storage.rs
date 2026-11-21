@@ -1792,11 +1792,15 @@ fn busy_indicator(has_rows: bool) -> i64 {
     }
 }
 
+/// Whether a lease still points at a ready row in the slot. Leases of any
+/// generation count, for the same reason as the pending-ready gate: a job
+/// written into an older generation before v062 (#847) can be claimed after
+/// the slot was reused, and truncating the slot would delete its ready row
+/// under the running attempt.
 async fn queue_prune_has_active_leases_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
     slot: i32,
-    generation: i64,
 ) -> Result<bool, AwaError> {
     sqlx::query_scalar(audited_sql(format!(
         r#"
@@ -1804,13 +1808,11 @@ async fn queue_prune_has_active_leases_tx(
             SELECT 1
             FROM {schema}.leases
             WHERE ready_slot = $1
-              AND ready_generation = $2
             LIMIT 1
         )
         "#
     )))
     .bind(slot)
-    .bind(generation)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)
@@ -1820,11 +1822,15 @@ async fn queue_prune_has_active_leases_tx(
 /// cursor. The `ready_slot` predicate lets each per-lane probe use the
 /// partition primary key `(ready_slot, queue, priority, enqueue_shard,
 /// lane_seq)`.
+///
+/// Rows of any generation count. Before v062 a REPEATABLE READ or
+/// SERIALIZABLE producer could write a ready row into an older generation
+/// than the slot's (#847); truncating the slot would delete that unclaimed
+/// job, so it holds the slot instead.
 async fn queue_prune_has_pending_ready_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
     slot: i32,
-    generation: i64,
 ) -> Result<bool, AwaError> {
     let ready_child = ready_child_name(schema, slot as usize);
     sqlx::query_scalar(audited_sql(format!(
@@ -1843,8 +1849,7 @@ async fn queue_prune_has_pending_ready_tx(
             CROSS JOIN LATERAL (
                 SELECT 1
                 FROM {ready_child} AS ready
-                WHERE ready.ready_slot = $2
-                  AND ready.ready_generation = $1
+                WHERE ready.ready_slot = $1
                   AND ready.queue = claims.queue
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
@@ -1855,18 +1860,18 @@ async fn queue_prune_has_pending_ready_tx(
         )
         "#
     )))
-    .bind(generation)
     .bind(slot)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)
 }
 
+/// Whether a claim on a ready row in the slot is not yet proven closed. Claims
+/// of any generation count, as in [`queue_prune_has_active_leases_tx`].
 async fn queue_prune_has_unclosed_claim_refs_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
     slot: i32,
-    generation: i64,
 ) -> Result<bool, AwaError> {
     let count_proves_claim_refs_closed: bool = sqlx::query_scalar(audited_sql(format!(
         r#"
@@ -1874,13 +1879,11 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
             SELECT count(*)::bigint AS total
             FROM {schema}.lease_claims AS claims
             WHERE claims.ready_slot = $1
-              AND claims.ready_generation = $2
         ),
         compact_claim_count AS (
             SELECT COALESCE(sum(claimed_count), 0)::bigint AS total
             FROM {schema}.lease_claim_batches AS batches
             WHERE batches.ready_slot = $1
-              AND batches.ready_generation = $2
         ),
         explicit_count AS (
             SELECT count(*)::bigint AS total
@@ -1890,13 +1893,11 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
              AND closures.job_id = claims.job_id
              AND closures.run_lease = claims.run_lease
             WHERE claims.ready_slot = $1
-              AND claims.ready_generation = $2
         ),
         compact_count AS (
             SELECT COALESCE(sum(closed_count), 0)::bigint AS total
             FROM {schema}.lease_claim_closure_batches AS batches
             WHERE batches.ready_slot = $1
-              AND batches.ready_generation = $2
         )
         SELECT claim_count.total + compact_claim_count.total =
                explicit_count.total + compact_count.total
@@ -1904,7 +1905,6 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
         "#
     )))
     .bind(slot)
-    .bind(generation)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)?;
@@ -4307,6 +4307,11 @@ pub struct QueueStorage {
     lane_provisioner_present: AtomicBool,
     /// Set once a provisioner failure has been logged.
     lane_provisioner_warned: AtomicBool,
+    /// Set once `{schema}.enqueue_ring_cursor()` (migration v062) was found
+    /// callable. A negative answer is not kept: until the function appears,
+    /// each enqueue checks again, so producers start using the floor with the
+    /// first enqueue after v062 commits rather than some time later.
+    enqueue_ring_cursor_present: AtomicBool,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
     cancel_phase_hook: CancelPhaseHookSlot,
@@ -4372,6 +4377,7 @@ impl QueueStorage {
             ensured_lanes: Mutex::new(HashSet::new()),
             lane_provisioner_present: AtomicBool::new(false),
             lane_provisioner_warned: AtomicBool::new(false),
+            enqueue_ring_cursor_present: AtomicBool::new(false),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
             cancel_phase_hook: CancelPhaseHookSlot(None),
@@ -5480,6 +5486,22 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // The ring restarts at generation 0, and so does its generation
+        // floor (#847). The next enqueue or rotation raises it again.
+        let has_generation_floor: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("{schema}.queue_ring_generation_floor"))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        if has_generation_floor {
+            sqlx::query(audited_sql(format!(
+                "ALTER SEQUENCE {schema}.queue_ring_generation_floor RESTART WITH 0"
+            )))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
         for (family, slot_count) in [
             (RingFamily::Queue, self.queue_slot_count()),
             (RingFamily::Lease, self.lease_slot_count()),
@@ -6201,16 +6223,63 @@ impl QueueStorage {
         }
     }
 
-    /// Current queue-ring cursor for the Rust-side enqueue paths, honouring
-    /// the schema's authority (#371 staged upgrade). Reads the authority row
-    /// (single cached page) then the O(1) cursor; callers that already hold
-    /// an authority for the transaction should use `ring_cursor_tx` directly.
+    /// The queue-ring cursor that ready and terminal rows are written into.
+    ///
+    /// `{schema}.enqueue_ring_cursor()` (#847) returns the newer of the
+    /// cursor this transaction can see and the schema's generation floor, and
+    /// raises the floor to the former. Enqueues call this after reserving
+    /// their lane positions, while they hold the lane locks, so a REPEATABLE
+    /// READ or SERIALIZABLE producer whose snapshot predates a rotation still
+    /// writes into a generation no older than any earlier enqueue in its lane.
+    ///
+    /// A schema before v062, or a role that may not execute the function,
+    /// reads the cursor through the schema's authority (#371) as before.
     async fn current_queue_ring<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<(i32, i64), AwaError> {
+        if self.enqueue_ring_cursor_callable(tx.as_mut()).await? {
+            let schema = self.schema();
+            return sqlx::query_as(audited_sql(format!(
+                "SELECT slot, generation FROM {schema}.enqueue_ring_cursor()"
+            )))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(|err| {
+                // Gone or no longer executable since it was probed: probe
+                // again next time rather than fail every enqueue.
+                if let sqlx::Error::Database(db) = &err {
+                    if matches!(db.code().as_deref(), Some("42883" | "42501")) {
+                        self.enqueue_ring_cursor_present
+                            .store(false, Ordering::Relaxed);
+                    }
+                }
+                map_sqlx_error(err)
+            });
+        }
         let authority = self.ring_authority_tx(tx).await?;
         self.ring_cursor_tx(tx, RingFamily::Queue, authority).await
+    }
+
+    async fn enqueue_ring_cursor_callable<'e, E>(&self, executor: E) -> Result<bool, AwaError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        if self.enqueue_ring_cursor_present.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let callable: bool = sqlx::query_scalar(
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), false)",
+        )
+        .bind(format!("{}.enqueue_ring_cursor()", self.schema()))
+        .fetch_one(executor)
+        .await
+        .map_err(map_sqlx_error)?;
+        if callable {
+            self.enqueue_ring_cursor_present
+                .store(true, Ordering::Relaxed);
+        }
+        Ok(callable)
     }
 
     async fn next_job_ids<'a>(
@@ -21139,6 +21208,35 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
+        // Raise the generation floor to the generation just committed, so a
+        // producer whose snapshot predates this rotation (or many) writes
+        // into it rather than into a slot the ring may since have reused
+        // (#847). Producers raise the floor themselves, so a failure here
+        // only leaves that case open until the next producer or rotation.
+        match self.enqueue_ring_cursor_callable(pool).await {
+            Ok(true) => {
+                if let Err(err) = sqlx::query(audited_sql(format!(
+                    "SELECT FROM {schema}.enqueue_ring_cursor()"
+                )))
+                .execute(pool)
+                .await
+                {
+                    tracing::warn!(
+                        schema,
+                        generation = next_generation,
+                        error = %err,
+                        "Failed to raise the queue-ring generation floor after rotation"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                schema,
+                generation = next_generation,
+                error = %err,
+                "Failed to check for the queue-ring generation floor after rotation"
+            ),
+        }
         Ok(RotateOutcome::Rotated {
             slot: next_slot,
             generation: next_generation,
@@ -21581,13 +21679,11 @@ impl QueueStorage {
                 SELECT EXISTS (
                     SELECT 1
                     FROM {delta_child}
-                    WHERE ready_generation = $1
                     LIMIT 1
                 )
                 "#
             )))
             .persistent(false)
-            .bind(generation)
             .fetch_one(pool)
             .await
             .map_err(map_sqlx_error)?;
@@ -21667,8 +21763,7 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
-        let pending_ready =
-            queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
+        let pending_ready = queue_prune_has_pending_ready_tx(&mut tx, schema, slot).await?;
 
         if pending_ready {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -21687,14 +21782,14 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             let active_leases =
-                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot).await?;
 
             if active_leases {
                 return Ok(TerminalDeltaSlotRollup::SkippedActive);
             }
 
             let unclosed_claim_refs =
-                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot).await?;
 
             if unclosed_claim_refs {
                 return Ok(TerminalDeltaSlotRollup::SkippedActive);
@@ -21704,10 +21799,8 @@ impl QueueStorage {
                 r#"
                 SELECT count(*)::bigint
                 FROM {delta_child}
-                WHERE ready_generation = $1
                 "#
             )))
-            .bind(generation)
             .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -21733,7 +21826,6 @@ impl QueueStorage {
                         enqueue_shard,
                         SUM(terminal_delta)::bigint AS delta
                     FROM {delta_child}
-                    WHERE ready_generation = $1
                     GROUP BY ready_slot, queue, priority, enqueue_shard
                     HAVING SUM(terminal_delta) <> 0
                 ),
@@ -21796,7 +21888,6 @@ impl QueueStorage {
                 SELECT count(*)::bigint FROM grouped
                 "#
                 )))
-                .bind(generation)
                 .fetch_one(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?,
@@ -21811,7 +21902,6 @@ impl QueueStorage {
                         counter_bucket,
                         SUM(terminal_delta)::bigint AS delta
                     FROM {delta_child}
-                    WHERE ready_generation = $1
                     GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
                     HAVING SUM(terminal_delta) <> 0
                 ),
@@ -21867,7 +21957,6 @@ impl QueueStorage {
                 SELECT count(*)::bigint FROM grouped
                 "#
                 )))
-                .bind(generation)
                 .fetch_one(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?,
@@ -22100,8 +22189,7 @@ impl QueueStorage {
         // a known-busy slot does not block hot claim reads behind a
         // doomed truncate attempt. These are only MVCC snapshots; the
         // same gates are checked again after the exclusive locks.
-        let active_leases =
-            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+        let active_leases = queue_prune_has_active_leases_tx(&mut tx, schema, slot).await?;
 
         if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -22112,7 +22200,7 @@ impl QueueStorage {
             });
         }
 
-        let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
+        let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot).await?;
 
         if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -22124,7 +22212,7 @@ impl QueueStorage {
         }
 
         let unclosed_claim_refs =
-            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot).await?;
 
         if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -22164,7 +22252,7 @@ impl QueueStorage {
             // producer or claimer committed while the exclusive partition
             // lock waited, these post-lock gates see it before TRUNCATE.
             let active_leases =
-                queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_active_leases_tx(&mut tx, schema, slot).await?;
             if active_leases {
                 return Ok(PruneOutcome::SkippedActive {
                     slot,
@@ -22173,7 +22261,7 @@ impl QueueStorage {
                 });
             }
 
-            let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
+            let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot).await?;
             if pending {
                 return Ok(PruneOutcome::SkippedActive {
                     slot,
@@ -22183,7 +22271,7 @@ impl QueueStorage {
             }
 
             let unclosed_claim_refs =
-                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+                queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot).await?;
             if unclosed_claim_refs {
                 return Ok(PruneOutcome::SkippedActive {
                     slot,
@@ -22476,6 +22564,14 @@ impl QueueStorage {
     pub async fn queue_ring_pin(&self, pool: &PgPool) -> Result<Option<QueueRingPin>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        // One snapshot for the oldest sealed slot and the rows in it: the
+        // row probe counts every generation in the slot, so a rotation that
+        // reopened the slot between two statements would otherwise report
+        // the new current generation's rows as pinning the old one.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         set_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let authority = self.ring_authority_tx(&mut tx).await?;
@@ -22513,8 +22609,7 @@ impl QueueStorage {
             CROSS JOIN LATERAL (
                 SELECT ready.lane_seq, ready.run_at
                 FROM {ready_child} AS ready
-                WHERE ready.ready_slot = $2
-                  AND ready.ready_generation = $1
+                WHERE ready.ready_slot = $1
                   AND ready.queue = claims.queue
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
@@ -22525,7 +22620,6 @@ impl QueueStorage {
             ORDER BY head.run_at ASC, claims.queue, claims.priority, claims.enqueue_shard
             "#
             )))
-            .bind(generation)
             .bind(slot)
             .fetch_all(tx.as_mut())
             .await
