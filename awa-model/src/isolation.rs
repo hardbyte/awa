@@ -1,4 +1,4 @@
-//! Transactions awa opens on its own pool connections run at READ COMMITTED.
+//! The isolation level of the transactions awa opens for its own work.
 //!
 //! Queue storage takes a lock and then reads what earlier holders of that
 //! lock committed: a producer reads the ring cursor after its lane's
@@ -8,7 +8,9 @@
 //! At REPEATABLE READ or SERIALIZABLE the transaction keeps its first snapshot
 //! and those rows stay hidden (#847). A role or database
 //! `default_transaction_isolation` would otherwise apply to awa's own
-//! transactions, so they name their isolation level instead of inheriting it.
+//! transactions, so they name their isolation level instead of inheriting it:
+//! READ COMMITTED for every transaction that writes, and REPEATABLE READ,
+//! READ ONLY for the few reads that want one consistent snapshot.
 //! A transaction a caller passes in, or one awa opens and hands to the
 //! application (the Python client's `transaction()`), keeps the caller's level.
 //!
