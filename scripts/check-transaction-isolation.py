@@ -31,21 +31,55 @@ def strip_comments(text: str) -> str:
     return "\n".join(line.split("//", 1)[0] for line in text.split("\n"))
 
 
-def blank_test_modules(code: str) -> str:
-    """Blanks the bodies of `#[cfg(test)]` modules, keeping line numbers."""
-    for module in reversed(list(TEST_MODULE.finditer(code))):
-        open_brace = code.find("{", module.end())
-        if open_brace < 0:
+RAW_STRING = re.compile(r'b?r(#*)"')
+CHAR_LITERAL = re.compile(r"'(?:\\.|[^'\\])'")
+
+
+def matching_brace(code: str, open_brace: int) -> int:
+    """The index just past the brace that closes `open_brace`, skipping string
+    literals, raw strings, char literals and block comments."""
+    depth, index = 0, open_brace
+    while index < len(code):
+        char = code[index]
+        if code.startswith("/*", index):
+            end = code.find("*/", index + 2)
+            index = len(code) if end < 0 else end + 2
             continue
-        depth, end = 0, len(code)
-        for index in range(open_brace, len(code)):
-            if code[index] == "{":
-                depth += 1
-            elif code[index] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = index + 1
-                    break
+        raw = RAW_STRING.match(code, index)
+        if raw and (index == 0 or not (code[index - 1].isalnum() or code[index - 1] == "_")):
+            terminator = '"' + raw.group(1)
+            end = code.find(terminator, raw.end())
+            index = len(code) if end < 0 else end + len(terminator)
+            continue
+        if char == '"':
+            index += 1
+            while index < len(code) and code[index] != '"':
+                index += 2 if code[index] == "\\" else 1
+            index += 1
+            continue
+        char_literal = CHAR_LITERAL.match(code, index)
+        if char_literal:
+            index = char_literal.end()
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return len(code)
+
+
+def blank_test_modules(code: str) -> str:
+    """Blanks the bodies of inline `#[cfg(test)]` modules, keeping line
+    numbers. An out-of-line `mod name;` has no body here."""
+    for module in reversed(list(TEST_MODULE.finditer(code))):
+        declaration = re.match(r"\s*\w+\s*([{;])", code[module.end() :])
+        if not declaration or declaration.group(1) == ";":
+            continue
+        open_brace = module.end() + declaration.start(1)
+        end = matching_brace(code, open_brace)
         body = re.sub(r"[^\n]", " ", code[module.start() : end])
         code = code[: module.start()] + body + code[end:]
     return code

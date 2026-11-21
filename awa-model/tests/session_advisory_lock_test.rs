@@ -82,10 +82,12 @@ async fn a_dropped_guard_releases_the_lock(pool: PgPool) -> TestResult {
 #[sqlx::test(migrations = false)]
 async fn a_cancelled_holder_releases_the_lock(pool: PgPool) -> TestResult {
     let key = 7_103;
-    let holder = async {
-        let lock = SessionAdvisoryLock::try_acquire(&pool, key)
-            .await?
-            .expect("the lock is free");
+    // Acquired before the timeout starts, so the timeout cancels a holder
+    // that owns the lock rather than the acquisition.
+    let lock = SessionAdvisoryLock::try_acquire(&pool, key)
+        .await?
+        .expect("the lock is free");
+    let holder = async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         lock.release().await
     };

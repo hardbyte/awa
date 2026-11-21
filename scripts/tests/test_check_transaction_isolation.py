@@ -43,6 +43,22 @@ class TransactionIsolationTests(unittest.TestCase):
         )
         self.assertEqual(lines(text), [7])
 
+    def test_out_of_line_test_module_hides_nothing(self):
+        text = "#[cfg(test)]\nmod tests;\n\nfn g() {\n    let tx = pool.begin();\n}"
+        self.assertEqual(lines(text), [5])
+
+    def test_braces_in_literals_and_comments_do_not_end_the_module(self):
+        text = (
+            "#[cfg(test)]\nmod tests {\n"
+            "    const A: &str = \"}\";\n"
+            "    const B: &str = r#\"}}\"#;\n"
+            "    const C: char = '}';\n"
+            "    /* } */\n"
+            "    fn f() { let tx = pool.begin(); }\n"
+            "}\n\nfn g() {\n    let tx = pool.begin();\n}"
+        )
+        self.assertEqual(lines(text), [11])
+
     def test_begin_statements_name_their_isolation(self):
         self.assertEqual(lines('const B: &str = "BEGIN; SET LOCAL jit = off";'), [1])
         self.assertEqual(
