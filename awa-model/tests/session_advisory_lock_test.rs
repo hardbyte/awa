@@ -141,3 +141,76 @@ async fn a_dropped_pooled_connection_keeps_the_lock(pool: PgPool) -> TestResult 
     );
     Ok(())
 }
+
+/// A cancelled `awa migrate` whose statement is still waiting on the server,
+/// here for a table lock another transaction holds, gives up the migration
+/// lock within seconds rather than when that wait ends.
+#[sqlx::test(migrations = false)]
+async fn a_cancelled_migration_run_releases_the_migration_lock(pool: PgPool) -> TestResult {
+    awa_model::migrations::run(&pool).await?;
+    let mut blocker = pool.begin().await?;
+    sqlx::query("LOCK TABLE awa.schema_version IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await?;
+
+    let key = awa_model::migrations::MIGRATION_LOCK_KEY;
+    let mut run = Box::pin(awa_model::migrations::run(&pool));
+    let waiting = async {
+        for _ in 0..200 {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_locks AS held
+                     JOIN pg_stat_activity AS activity ON activity.pid = held.pid
+                     WHERE held.locktype = 'advisory' AND held.granted AND held.objsubid = 1
+                       AND held.classid = (($1 >> 32) & 4294967295)::oid
+                       AND held.objid = ($1 & 4294967295)::oid
+                       AND activity.wait_event_type = 'Lock'
+                       AND activity.wait_event = 'relation'
+                 )",
+            )
+            .bind(key)
+            .fetch_one(&pool)
+            .await?;
+            if waiting {
+                return Ok::<bool, sqlx::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(false)
+    };
+    let waiting = tokio::select! {
+        result = &mut run => panic!("the run finished while the table was locked: {result:?}"),
+        waiting = waiting => waiting?,
+    };
+    assert!(
+        waiting,
+        "the run holds the migration lock and waits for the table"
+    );
+
+    // Cancel the run: dropping its future closes the connection.
+    drop(run);
+    let held = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+             WHERE locktype = 'advisory' AND objsubid = 1
+               AND classid = (($1 >> 32) & 4294967295)::oid
+               AND objid = ($1 & 4294967295)::oid)",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+    };
+    let released = tokio::time::timeout(Duration::from_secs(5), async {
+        while held(pool.clone()).await? {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<(), sqlx::Error>(())
+    })
+    .await;
+    blocker.rollback().await?;
+    assert!(
+        matches!(released, Ok(Ok(()))),
+        "the migration lock outlived the cancelled run"
+    );
+    Ok(())
+}

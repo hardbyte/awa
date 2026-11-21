@@ -978,16 +978,18 @@ pub async fn run_with_report(pool: &PgPool) -> Result<MigrationReport, AwaError>
     // statement the server is still running, such as DDL waiting for a table
     // lock, so the server checks for a closed client while one runs, and the
     // session, with the lock, ends within that interval.
+    // The check needs PostgreSQL 14 and a server platform that can detect a
+    // closed socket; elsewhere the setting is refused and the run goes ahead
+    // without it.
     let mut lock = SessionAdvisoryLock::acquire(pool, MIGRATION_LOCK_KEY).await?;
     let checks_client = lock
         .connection()
         .server_version_num()
-        .is_some_and(|version| version >= 140_000);
-    if checks_client {
-        sqlx::query("SET client_connection_check_interval = '1s'")
+        .is_some_and(|version| version >= 140_000)
+        && sqlx::query("SET client_connection_check_interval = '1s'")
             .execute(lock.connection())
-            .await?;
-    }
+            .await
+            .is_ok();
 
     let result = run_inner(lock.connection()).await;
 

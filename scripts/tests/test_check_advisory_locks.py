@@ -102,6 +102,11 @@ class SqlTests(unittest.TestCase):
         )
         self.assertEqual(sql(shared.replace("pg_advisory_unlock(", "pg_advisory_unlock_shared(")), [])
         self.assertEqual(sql(shared.replace("pg_advisory_unlock(", "pg_advisory_unlock_all(")), [])
+        self.assertEqual(
+            len(sql(shared.replace("pg_advisory_lock_shared(", "PG_ADVISORY_LOCK_SHARED("))),
+            1,
+            "the lock's form is read whatever its case",
+        )
         exclusive = SAFE.replace("pg_advisory_unlock(", "pg_advisory_unlock_shared(")
         self.assertEqual(
             sql(exclusive),
