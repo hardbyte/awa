@@ -162,6 +162,7 @@ async fn a_cancelled_migration_run_releases_the_migration_lock(pool: PgPool) -> 
                      SELECT 1 FROM pg_locks AS held
                      JOIN pg_stat_activity AS activity ON activity.pid = held.pid
                      WHERE held.locktype = 'advisory' AND held.granted AND held.objsubid = 1
+                       AND held.database = (SELECT oid FROM pg_database WHERE datname = current_database())
                        AND held.classid = (($1 >> 32) & 4294967295)::oid
                        AND held.objid = ($1 & 4294967295)::oid
                        AND activity.wait_event_type = 'Lock'
@@ -193,6 +194,7 @@ async fn a_cancelled_migration_run_releases_the_migration_lock(pool: PgPool) -> 
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM pg_locks
              WHERE locktype = 'advisory' AND objsubid = 1
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
                AND classid = (($1 >> 32) & 4294967295)::oid
                AND objid = ($1 & 4294967295)::oid)",
         )

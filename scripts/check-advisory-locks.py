@@ -67,16 +67,27 @@ class Block:
 
 
 BRANCH_START = re.compile(r"^\s*(?:EXCEPTION\s+)?WHEN\b", re.IGNORECASE)
+CASE = re.compile(r"\bCASE\b", re.IGNORECASE)
+END_CASE = re.compile(r"\bEND\s+CASE\b", re.IGNORECASE)
+# Inside a handler a bare END closes a CASE expression; nested blocks are
+# tracked separately and never reach the handler's lines.
+BARE_END = re.compile(r"\bEND\b(?!\s+(?:CASE|IF|LOOP)\b)", re.IGNORECASE)
 
 
 def handler_branches(handler_lines: list[str]) -> list[tuple[str, str]]:
     """Splits an EXCEPTION section into (conditions, body) branches."""
     branches: list[list[str]] = []
+    # A WHEN inside a CASE in a branch body is a CASE arm, not a new branch.
+    case_depth = 0
     for line in handler_lines:
-        if BRANCH_START.match(line):
+        if case_depth == 0 and BRANCH_START.match(line):
             branches.append([line, ""])
         elif branches:
             branches[-1][1] += " " + line
+        end_case = len(END_CASE.findall(line))
+        opened = len(CASE.findall(line)) - end_case
+        closed = end_case + len(BARE_END.findall(line))
+        case_depth = max(0, case_depth + opened - closed)
     result = []
     for head, body in branches:
         match = re.search(r"\bWHEN\b(.*?)\bTHEN\b(.*)", head + body, re.IGNORECASE | re.DOTALL)
@@ -170,10 +181,9 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
                     (path, index + 1, "session advisory lock taken inside an EXCEPTION handler")
                 )
             else:
-                shared = bool(
-                    re.search(r"_shared\s*\(", SESSION_LOCK.search(line).group(0), re.IGNORECASE)
-                )
-                stack[-1].locks.append((index, shared))
+                for match in SESSION_LOCK.finditer(line):
+                    shared = bool(re.search(r"_shared\s*\(", match.group(0), re.IGNORECASE))
+                    stack[-1].locks.append((index, shared))
     for block in stack:
         close(block)
     return findings
