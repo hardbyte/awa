@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 540" role="img" aria-labelledby="title desc">
+  <title id="title">Storage written by one AWA attempt</title>
+  <desc id="desc">Claiming writes an append-only receipt in the claim ring. Heartbeats and progress upsert a single attempt-state row. Waiting for an external callback writes a lease in the lease ring. Finishing closes the receipt, deletes the attempt-state and lease rows, and appends terminal history to the queue ring.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="context-stroke"/></marker>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line class="hatch-l" x1="0" y1="0" x2="0" y2="8"/></pattern>
+    <style>
+.canvas{fill:#eef8f1}.card{fill:#fff;stroke:#b9d6c4;stroke-width:2}
+.h{fill:#173324}.c{fill:#52675a}.lbl{fill:#376248}
+.line{fill:none;stroke:#47725a;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.thin{fill:none;stroke:#47725a;stroke-width:2;stroke-linecap:round}
+.dash{stroke-dasharray:7 6}
+.ready{fill:#dff3e6;stroke:#4f9a6c;stroke-width:2}.ready-t{fill:#1d4d31}
+.claim{fill:#e7f0fb;stroke:#77a2cf;stroke-width:2}.claim-t{fill:#244f76}
+.lease{fill:#fff5d9;stroke:#d7ad4f;stroke-width:2}.lease-t{fill:#644b16}
+.term{fill:#f8e6e3;stroke:#bd746a;stroke-width:2}.term-t{fill:#71342d}
+.muted{fill:#f1f4f2;stroke:#c6d3cb;stroke-width:2}.muted-t{fill:#6b7d72}
+.bad{fill:none;stroke:#b5483b;stroke-width:3;stroke-linecap:round}.bad-t{fill:#9a3a2f}
+.good-t{fill:#2f7a4b}
+.hatch-l{stroke:#8fbf9f;stroke-width:2}
+@media (prefers-color-scheme:dark){
+.canvas{fill:#101713}.card{fill:#17221b;stroke:#3f6b50}
+.h{fill:#eff8f2}.c{fill:#b9c9bf}.lbl{fill:#a9dfbd}
+.line,.thin{stroke:#72c997}
+.ready{fill:#173826;stroke:#4fae76}.ready-t{fill:#c8f0d6}
+.claim{fill:#16283b;stroke:#5d8fc4}.claim-t{fill:#cfe3f7}
+.lease{fill:#33290f;stroke:#c49a3f}.lease-t{fill:#f3e2b6}
+.term{fill:#3a1d1a;stroke:#b8665d}.term-t{fill:#f4d2cd}
+.muted{fill:#1c2620;stroke:#3b4a41}.muted-t{fill:#93a69a}
+.bad{stroke:#e0786a}.bad-t{fill:#f0a196}.good-t{fill:#8ee0ad}
+.hatch-l{stroke:#3f7a55}
+}
+</style>
+  </defs>
+  <rect class="canvas" width="1200" height="540" rx="24"/>
+  <g font-family="Inter,system-ui,sans-serif">
+<text class="lbl" x="600" y="46" font-size="22.5" font-weight="760" text-anchor="middle">WHAT ONE ATTEMPT WRITES</text>
+<text class="h" x="440.0" y="100" font-size="18.75" font-weight="700" text-anchor="middle">claim</text>
+<text class="h" x="600.0" y="100" font-size="18.75" font-weight="700" text-anchor="middle">heartbeat</text>
+<text class="h" x="760.0" y="100" font-size="18.75" font-weight="700" text-anchor="middle">progress</text>
+<text class="h" x="920.0" y="100" font-size="18.75" font-weight="700" text-anchor="middle">wait for callback</text>
+<text class="h" x="1080.0" y="100" font-size="18.75" font-weight="700" text-anchor="middle">finish</text>
+<path class="thin" d="M380 114H1150" marker-end="url(#arrow)"/>
+<rect class="claim" x="40" y="136" width="290" height="78" rx="14"/>
+<text class="claim-t" x="60" y="170" font-size="22.5" font-weight="700" text-anchor="start">Claim receipt</text>
+<text class="claim-t" x="60" y="194" font-size="16.25" font-weight="600" text-anchor="start">claim ring · append-only</text>
+<path class="thin dash" d="M340 175H1160" stroke-opacity=".35"/>
+<rect class="claim" x="390.0" y="156" width="100" height="38" rx="19"/>
+<text class="claim-t" x="440.0" y="181" font-size="17.5" font-weight="700" text-anchor="middle">write</text>
+<rect class="claim" x="1030.0" y="156" width="100" height="38" rx="19"/>
+<text class="claim-t" x="1080.0" y="181" font-size="17.5" font-weight="700" text-anchor="middle">close</text>
+<rect class="muted" x="40" y="232" width="290" height="78" rx="14"/>
+<text class="muted-t" x="60" y="266" font-size="22.5" font-weight="700" text-anchor="start">Attempt state</text>
+<text class="muted-t" x="60" y="290" font-size="16.25" font-weight="600" text-anchor="start">one small row · updated in place</text>
+<path class="thin dash" d="M340 271H1160" stroke-opacity=".35"/>
+<rect class="muted" x="550.0" y="252" width="100" height="38" rx="19"/>
+<text class="muted-t" x="600.0" y="277" font-size="17.5" font-weight="700" text-anchor="middle">upsert</text>
+<rect class="muted" x="710.0" y="252" width="100" height="38" rx="19"/>
+<text class="muted-t" x="760.0" y="277" font-size="17.5" font-weight="700" text-anchor="middle">upsert</text>
+<rect class="muted" x="1030.0" y="252" width="100" height="38" rx="19"/>
+<text class="muted-t" x="1080.0" y="277" font-size="17.5" font-weight="700" text-anchor="middle">delete</text>
+<rect class="lease" x="40" y="328" width="290" height="78" rx="14"/>
+<text class="lease-t" x="60" y="362" font-size="22.5" font-weight="700" text-anchor="start">Lease</text>
+<text class="lease-t" x="60" y="386" font-size="16.25" font-weight="600" text-anchor="start">lease ring · callback waits only</text>
+<path class="thin dash" d="M340 367H1160" stroke-opacity=".35"/>
+<rect class="lease" x="870.0" y="348" width="100" height="38" rx="19"/>
+<text class="lease-t" x="920.0" y="373" font-size="17.5" font-weight="700" text-anchor="middle">write</text>
+<rect class="lease" x="1030.0" y="348" width="100" height="38" rx="19"/>
+<text class="lease-t" x="1080.0" y="373" font-size="17.5" font-weight="700" text-anchor="middle">delete</text>
+<rect class="term" x="40" y="424" width="290" height="78" rx="14"/>
+<text class="term-t" x="60" y="458" font-size="22.5" font-weight="700" text-anchor="start">Terminal history</text>
+<text class="term-t" x="60" y="482" font-size="16.25" font-weight="600" text-anchor="start">queue ring · append-only</text>
+<path class="thin dash" d="M340 463H1160" stroke-opacity=".35"/>
+<rect class="term" x="1030.0" y="444" width="100" height="38" rx="19"/>
+<text class="term-t" x="1080.0" y="469" font-size="17.5" font-weight="700" text-anchor="middle">append</text>
+  </g>
+</svg>
