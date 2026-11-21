@@ -711,10 +711,13 @@ const LANE_FUNCTIONS: &str = "'ensure_lane_sequences', 'queue_enqueue_head_seque
      'set_sequence_next'";
 
 /// v062 refreshes the lane helpers through
-/// `awa.refresh_lane_sequence_helpers_as_migrator`. A migration role that may
-/// only SET ROLE to the owner of the schema and its lane functions refreshes
-/// them as that owner, lending it EXECUTE on the refresh helper for the call,
-/// and gets its own role back inside the same transaction.
+/// `awa.refresh_lane_sequence_helpers_as_migrator`. Here the migration role
+/// owns the `awa` functions, as after a migration run without `SET ROLE`, while
+/// the `awa` schema and its lane functions belong to an owner it may only
+/// `SET ROLE` to, and that owner lacks `USAGE` on `awa` and `EXECUTE` on the
+/// refresh helper. The whole 61 to 62 bundle, run as the migration role,
+/// refreshes the helpers as the owner, takes back what it lent, and leaves the
+/// migration role as the current user inside the same transaction.
 #[sqlx::test(migrations = false)]
 async fn lane_refresh_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) -> TestResult {
     let server_version: i32 =
@@ -724,7 +727,6 @@ async fn lane_refresh_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) ->
     if server_version < 160000 {
         return Ok(());
     }
-    migrations::run(&pool).await?;
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let owner = format!("lane_owner_{suffix}");
@@ -736,33 +738,9 @@ async fn lane_refresh_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) ->
         "CREATE ROLE {owner} NOLOGIN NOSUPERUSER;
          CREATE ROLE {migrator} LOGIN NOSUPERUSER PASSWORD 'floor_test';
          GRANT {owner} TO {migrator} WITH INHERIT FALSE, SET TRUE;
-         GRANT CONNECT ON DATABASE \"{database}\" TO {migrator};
-         GRANT USAGE ON SCHEMA awa TO {migrator};
-         GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers_as_migrator(text) TO {migrator};
-         GRANT EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(text) TO {migrator} WITH GRANT OPTION;
-         ALTER SCHEMA awa OWNER TO {owner};
-         DO $$
-         DECLARE f regprocedure;
-         BEGIN
-             FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
-                      WHERE p.pronamespace = 'awa'::regnamespace
-                        AND p.proname IN ({LANE_FUNCTIONS})
-             LOOP
-                 EXECUTE format('ALTER FUNCTION %s OWNER TO {owner}', f);
-             END LOOP;
-         END $$;"
+         GRANT CONNECT, CREATE ON DATABASE \"{database}\" TO {migrator};
+         GRANT CREATE ON DATABASE \"{database}\" TO {owner};"
     )))
-    .execute(&pool)
-    .await?;
-    // The released set_sequence_next, whose unlock handler misses a cancel.
-    let current: String = sqlx::query_scalar(
-        "SELECT pg_get_functiondef('awa.set_sequence_next(text,bigint)'::regprocedure)",
-    )
-    .fetch_one(&pool)
-    .await?;
-    sqlx::raw_sql(audited_sql(
-        current.replace("WHEN OTHERS OR query_canceled THEN", "WHEN OTHERS THEN"),
-    ))
     .execute(&pool)
     .await?;
 
@@ -777,18 +755,56 @@ async fn lane_refresh_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) ->
                     .password("floor_test"),
             )
             .await?;
+        migrations::run(&migrator_pool).await?;
+        sqlx::raw_sql(audited_sql(format!("ALTER SCHEMA awa OWNER TO {owner}")))
+            .execute(&migrator_pool)
+            .await?;
+        // The migration role keeps the schema privileges it created the awa
+        // functions with, and the grant option to lend USAGE, which the owner
+        // has given up.
+        sqlx::raw_sql(audited_sql(format!(
+            "GRANT USAGE, CREATE ON SCHEMA awa TO {migrator} WITH GRANT OPTION;
+             REVOKE USAGE ON SCHEMA awa FROM {owner};
+             DELETE FROM awa.schema_version WHERE version = 62;"
+        )))
+        .execute(&pool)
+        .await?;
+        sqlx::raw_sql(audited_sql(format!(
+            "DO $$
+             DECLARE f regprocedure;
+             BEGIN
+                 FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
+                          WHERE p.pronamespace = 'awa'::regnamespace
+                            AND p.proname IN ({LANE_FUNCTIONS})
+                 LOOP
+                     EXECUTE format('ALTER FUNCTION %s OWNER TO {owner}', f);
+                 END LOOP;
+             END $$;"
+        )))
+        .execute(&migrator_pool)
+        .await?;
+        // The released set_sequence_next, whose unlock handler misses a cancel.
+        let current: String = sqlx::query_scalar(
+            "SELECT pg_get_functiondef('awa.set_sequence_next(text,bigint)'::regprocedure)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        sqlx::raw_sql(audited_sql(
+            current.replace("WHEN OTHERS OR query_canceled THEN", "WHEN OTHERS THEN"),
+        ))
+        .execute(&pool)
+        .await?;
+
         let mut tx = migrator_pool.begin().await?;
-        let refreshed: bool =
-            sqlx::query_scalar("SELECT awa.refresh_lane_sequence_helpers_as_migrator('awa')")
-                .fetch_one(&mut *tx)
-                .await?;
+        for (_, _, sql) in migrations::migration_sql_range(61, 62) {
+            sqlx::raw_sql(audited_sql(sql)).execute(&mut *tx).await?;
+        }
         let role: String = sqlx::query_scalar("SELECT current_user::text")
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
         migrator_pool.close().await;
-        ensure!(refreshed, "the refresh reported success");
-        ensure_eq!(role, migrator, "the caller's role is restored");
+        ensure_eq!(role, migrator, "the migration role is restored");
 
         let definition: String = sqlx::query_scalar(
             "SELECT pg_get_functiondef('awa.set_sequence_next(text,bigint)'::regprocedure)",
@@ -799,22 +815,26 @@ async fn lane_refresh_runs_as_the_owner_for_a_set_role_migrator(pool: PgPool) ->
             definition.contains("OR query_canceled"),
             "set_sequence_next was refreshed"
         );
-        let (owners, lent): (Vec<String>, bool) = sqlx::query_as(audited_sql(format!(
-            "SELECT array_agg(DISTINCT pg_get_userbyid(p.proowner)::text),
-                    has_function_privilege('{owner}', 'awa.refresh_lane_sequence_helpers(text)', 'EXECUTE')
-             FROM pg_proc p
-             WHERE p.pronamespace = 'awa'::regnamespace AND p.proname IN ({LANE_FUNCTIONS})"
-        )))
-        .fetch_one(&pool)
-        .await?;
+        let (owners, lent_execute, lent_usage, recorded): (Vec<String>, bool, bool, bool) =
+            sqlx::query_as(audited_sql(format!(
+                "SELECT array_agg(DISTINCT pg_get_userbyid(p.proowner)::text),
+                        has_function_privilege('{owner}', 'awa.refresh_lane_sequence_helpers(text)', 'EXECUTE'),
+                        has_schema_privilege('{owner}', 'awa', 'USAGE'),
+                        EXISTS (SELECT 1 FROM awa.schema_version WHERE version = 62)
+                 FROM pg_proc p
+                 WHERE p.pronamespace = 'awa'::regnamespace AND p.proname IN ({LANE_FUNCTIONS})"
+            )))
+            .fetch_one(&pool)
+            .await?;
         ensure_eq!(owners, vec![owner.clone()], "the lane functions keep their owner");
-        ensure!(!lent, "EXECUTE lent to the owner was taken back");
+        ensure!(!lent_execute, "EXECUTE lent to the owner was taken back");
+        ensure!(!lent_usage, "USAGE lent to the owner was taken back");
+        ensure!(recorded, "v062 recorded its version");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
     sqlx::raw_sql(audited_sql(format!(
-        "ALTER SCHEMA awa OWNER TO CURRENT_USER;
-         REASSIGN OWNED BY {owner} TO CURRENT_USER;
+        "REASSIGN OWNED BY {owner}, {migrator} TO CURRENT_USER;
          DROP OWNED BY {owner}; DROP OWNED BY {migrator};
          DROP ROLE {migrator}; DROP ROLE {owner};"
     )))

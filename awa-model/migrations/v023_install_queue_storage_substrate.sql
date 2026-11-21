@@ -551,7 +551,8 @@ BEGIN
     EXCEPTION WHEN insufficient_privilege THEN
         RAISE WARNING 'could not refresh the lane-sequence helpers of schema %: %', p_schema, SQLERRM
             USING HINT = format(
-                'Run SELECT awa.refresh_lane_sequence_helpers(%L) as the owner of its lane functions.',
+                'Run SELECT awa.refresh_lane_sequence_helpers(%L) as the owner of its lane functions; '
+                'that role needs USAGE on schema awa and EXECUTE on the function.',
                 p_schema
             );
         RETURN false;
