@@ -510,7 +510,8 @@ macro_rules! sequence_lock_cancel_release_pending_sql {
          UNION ALL \
          SELECT format('lane locks in schema %s', n.nspname) \
          FROM pg_namespace AS n \
-         WHERE EXISTS ( \
+         WHERE n.nspname ~ '^[a-z_][a-z0-9_]*$' \
+           AND EXISTS ( \
                  SELECT 1 FROM pg_proc AS p \
                  WHERE p.pronamespace = n.oid \
                    AND p.proname = 'claim_ready_runtime' \

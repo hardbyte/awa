@@ -575,11 +575,13 @@ BEGIN
     -- Substrates are found from the catalogs alone, without USAGE on their
     -- schemas: a migration role that may only SET ROLE to a schema's owner
     -- has no USAGE of its own there, and refresh_lane_sequence_helpers_as_migrator
-    -- is what switches to the owner.
+    -- is what switches to the owner. Only names awa can install a substrate
+    -- under are considered; refresh_lane_sequence_helpers refuses any other.
     FOR v_schema IN
         SELECT n.nspname
         FROM pg_namespace AS n
-        WHERE EXISTS (
+        WHERE n.nspname ~ '^[a-z_][a-z0-9_]*$'
+          AND EXISTS (
                   SELECT 1 FROM pg_proc AS p
                   WHERE p.pronamespace = n.oid
                     AND p.proname = 'claim_ready_runtime'

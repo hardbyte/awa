@@ -172,7 +172,7 @@ async fn lane_key(pool: &PgPool, table: &str) -> Result<(String, i64), sqlx::Err
 async fn end_lane_lock_holders(pool: &PgPool, key: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "SELECT pg_terminate_backend(pid) FROM pg_locks
-         WHERE locktype = 'advisory' AND pid <> pg_backend_pid()
+         WHERE locktype = 'advisory' AND granted AND pid <> pg_backend_pid()
            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
            AND objsubid = 1
            AND classid = (($1 >> 32) & 4294967295)::oid
@@ -429,5 +429,31 @@ async fn a_missing_lane_helper_keeps_the_patch_pending(pool: PgPool) -> TestResu
     QueueStorage::new(QueueStorageConfig::default())?
         .enqueue_batch(&pool, "lock_q", 2, 1)
         .await?;
+    Ok(())
+}
+
+/// A schema with the substrate's object names under a name awa cannot install
+/// a substrate under is not one: the patch skips it rather than fail on it,
+/// and does not report it as pending.
+#[sqlx::test(migrations = false)]
+async fn a_lookalike_schema_is_left_alone(pool: PgPool) -> TestResult {
+    migrations::run(&pool).await?;
+    sqlx::raw_sql(
+        r#"CREATE SCHEMA "Lookalike";
+           CREATE TABLE "Lookalike".queue_enqueue_heads ();
+           CREATE TABLE "Lookalike".queue_claim_heads ();
+           CREATE FUNCTION "Lookalike".claim_ready_runtime(text, bigint, double precision, double precision)
+               RETURNS void LANGUAGE sql AS '';
+           CREATE FUNCTION "Lookalike".queue_lane_sequence_name(text, text, smallint, smallint)
+               RETURNS text LANGUAGE sql AS 'SELECT NULL::text';"#,
+    )
+    .execute(&pool)
+    .await?;
+    assert!(pending_targets(&pool).await?.is_empty());
+
+    restore_released_handlers(&pool, "awa").await?;
+    let report = migrations::run_with_report(&pool).await?;
+    assert!(report.complete(), "{:?}", report.patches);
+    assert!(pending_targets(&pool).await?.is_empty());
     Ok(())
 }
