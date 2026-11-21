@@ -5,7 +5,9 @@ Queue storage takes a lock and then reads what earlier holders committed. A
 role or database default_transaction_isolation above READ COMMITTED keeps the
 transaction's first snapshot and hides those rows (#847), so library code opens
 its own transactions with awa_model::isolation::BeginReadCommitted rather than
-PgPool::begin. Test modules (`#[cfg(test)] mod ...`) are not checked.
+PgPool::begin. A transaction handed to the application, which keeps the
+session's level, is marked with an `isolation:` comment on the line or in the
+three lines above. Test modules (`#[cfg(test)] mod ...`) are not checked.
 
 Usage: check-transaction-isolation.py [repository root]
 """
@@ -19,6 +21,7 @@ from pathlib import Path
 POOL_BEGIN = re.compile(r"\bpool(?:\(\))?\s*\.\s*(?:try_)?begin\(\)")
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s")
 RUST_GLOBS = ["*/src/**/*.rs", "awa-python/src/**/*.rs"]
+MARKER = "isolation:"
 
 
 def strip_comments(text: str) -> str:
@@ -27,19 +30,26 @@ def strip_comments(text: str) -> str:
 
 
 def findings(path: str, text: str) -> list[tuple[str, int, str]]:
+    lines = text.split("\n")
     code = strip_comments(text)
     test_module = TEST_MODULE.search(code)
     if test_module:
         code = code[: test_module.start()]
-    return [
-        (
-            path,
-            code.count("\n", 0, match.start()) + 1,
-            "pool.begin() inherits the session's default isolation; "
-            "use BeginReadCommitted::begin_read_committed",
+    found = []
+    for match in POOL_BEGIN.finditer(code):
+        line = code.count("\n", 0, match.start()) + 1
+        if any(MARKER in lines[i] for i in range(max(0, line - 4), line)):
+            continue
+        found.append(
+            (
+                path,
+                line,
+                "pool.begin() inherits the session's default isolation; use "
+                "BeginReadCommitted::begin_read_committed, or mark a transaction "
+                f"the application owns with `// {MARKER} <why>`",
+            )
         )
-        for match in POOL_BEGIN.finditer(code)
-    ]
+    return found
 
 
 def check(root: Path) -> list[tuple[str, int, str]]:

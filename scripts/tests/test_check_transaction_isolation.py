@@ -25,6 +25,12 @@ class TransactionIsolationTests(unittest.TestCase):
         self.assertEqual(lines("let savepoint = tx.begin().await?;"), [])
         self.assertEqual(lines("let tx = conn.begin().await?;"), [])
 
+    def test_application_owned_transaction_is_marked(self):
+        text = "// isolation: the application owns this transaction\nlet tx = pool.begin().await?;"
+        self.assertEqual(lines(text), [])
+        text = "// isolation: owned\n\n\n\nlet tx = pool.begin().await?;"
+        self.assertEqual(lines(text), [5])
+
     def test_comments_and_test_modules(self):
         self.assertEqual(lines("// pool.begin() would inherit the default"), [])
         text = "fn f() {}\n\n#[cfg(test)]\nmod tests {\n    let tx = pool.begin().await;\n}"

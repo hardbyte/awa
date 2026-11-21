@@ -9,7 +9,8 @@
 //! and those rows stay hidden (#847). A role or database
 //! `default_transaction_isolation` would otherwise apply to awa's own
 //! transactions, so they name their isolation level instead of inheriting it.
-//! A transaction a caller passes in keeps the caller's level.
+//! A transaction a caller passes in, or one awa opens and hands to the
+//! application (the Python client's `transaction()`), keeps the caller's level.
 //!
 //! `scripts/check-transaction-isolation.py` rejects `begin()` on a pool in
 //! library code.

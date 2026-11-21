@@ -13,7 +13,6 @@ use awa_model::batch_operations::{
     BatchOperationFilter, BatchOperationKind, BatchOperationSpec, BatchOperationState,
     ListBatchOperationsFilter, SubmitBatchOperation,
 };
-use awa_model::isolation::BeginReadCommitted;
 use awa_model::{
     CronMissedFirePolicy, InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage,
     QueueStorageConfig, RingRotationCadence,
@@ -753,7 +752,9 @@ impl PyClient {
     fn transaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+            // isolation: the application owns this transaction, so it keeps the
+            // session's default isolation level.
+            let tx = pool.begin().await.map_err(map_sqlx_error)?;
             Ok(PyTransaction::new(tx))
         })
     }
@@ -2908,7 +2909,9 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let tx = pool.begin_read_committed().await.map_err(map_sqlx_error)?;
+                // isolation: the application owns this transaction, so it keeps the
+                // session's default isolation level.
+                let tx = pool.begin().await.map_err(map_sqlx_error)?;
                 Ok(PySyncTransaction::new(tx))
             })
         })
