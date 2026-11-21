@@ -166,7 +166,9 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
                     (path, index + 1, "session advisory lock taken inside an EXCEPTION handler")
                 )
             else:
-                shared = bool(re.search(r"_shared\s*\(", SESSION_LOCK.search(line).group(0)))
+                shared = bool(
+                    re.search(r"_shared\s*\(", SESSION_LOCK.search(line).group(0), re.IGNORECASE)
+                )
                 stack[-1].locks.append((index, shared))
     for block in stack:
         close(block)
