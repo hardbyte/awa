@@ -73,6 +73,11 @@ AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrder.cfg            ;; pass
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrderBroken.cfg      ;; NoDeadlock is violated ;; old retry lane-before-claim witness
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKey.cfg             ;; pass ;; unique claims in key order
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKeyBroken.cfg       ;; NoDeadlock is violated ;; reversed batch key-order witness
+AwaSessionAdvisoryLock.tla     ;; -                                       ;; pass ;; session locks released on cancel, error, drop and failed unlock
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockOthersOnly.cfg    ;; NoPooledLock is violated ;; WHEN OTHERS handler misses a cancel after the grant
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockLockBeforeBlock.cfg ;; NoPooledLock is violated ;; lock taken before the handler's block
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockCancelOnly.cfg    ;; NoPooledLock is violated ;; handler without OTHERS misses an ordinary error
+AwaSessionAdvisoryLock.tla     ;; AwaSessionAdvisoryLockUnguardedPool.cfg ;; NoPooledLock is violated ;; dropped Rust holder pools its locked connection
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + 0.7 migrate gate
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence
