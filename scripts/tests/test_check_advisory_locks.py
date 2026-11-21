@@ -132,6 +132,23 @@ class SqlTests(unittest.TestCase):
         self.assertNotEqual(expression, SAFE)
         self.assertEqual(sql(expression), [])
 
+    def test_a_case_expression_end_does_not_close_the_block(self):
+        # A CASE expression ending in a bare END inside the query_canceled
+        # branch, with OTHERS handled by a later branch.
+        text = SAFE.replace(
+            "    EXCEPTION WHEN OTHERS OR query_canceled THEN\n        PERFORM pg_advisory_unlock(42);\n        RAISE;\n",
+            "    EXCEPTION\n        WHEN query_canceled THEN\n            PERFORM pg_advisory_unlock(42);\n"
+            "            PERFORM CASE\n                WHEN true THEN 1\n                ELSE 2\n            END;\n"
+            "            RAISE;\n        WHEN OTHERS THEN\n            PERFORM pg_advisory_unlock(42);\n            RAISE;\n",
+        )
+        self.assertNotEqual(text, SAFE)
+        self.assertEqual(sql(text), [])
+        leaky = text.replace(
+            "        WHEN OTHERS THEN\n            PERFORM pg_advisory_unlock(42);\n",
+            "        WHEN OTHERS THEN\n",
+        )
+        self.assertEqual(sql(leaky), ["session advisory lock: its block's OTHERS branch does not unlock"])
+
     def test_every_lock_on_a_line_is_checked(self):
         text = SAFE.replace(
             "PERFORM pg_advisory_lock(42);",
