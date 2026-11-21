@@ -60,7 +60,28 @@ class SqlTests(unittest.TestCase):
             "    EXCEPTION WHEN OTHERS OR query_canceled THEN\n        PERFORM 2;",
         )
         self.assertEqual(
-            sql(text), ["session advisory lock: its block's EXCEPTION handler does not unlock"]
+            sql(text), ["session advisory lock: its block's query_canceled branch does not unlock"]
+        )
+
+    def test_each_branch_must_unlock(self):
+        text = SAFE.replace(
+            "    EXCEPTION WHEN OTHERS OR query_canceled THEN\n",
+            "    EXCEPTION\n        WHEN query_canceled THEN\n            RAISE;\n        WHEN OTHERS THEN\n",
+        )
+        self.assertEqual(
+            sql(text), ["session advisory lock: its block's query_canceled branch does not unlock"]
+        )
+        split = SAFE.replace(
+            "    EXCEPTION WHEN OTHERS OR query_canceled THEN\n        PERFORM pg_advisory_unlock(42);\n        RAISE;\n",
+            "    EXCEPTION\n        WHEN query_canceled THEN\n            PERFORM pg_advisory_unlock(42);\n            RAISE;\n"
+            "        WHEN OTHERS THEN\n            PERFORM pg_advisory_unlock(42);\n            RAISE;\n",
+        )
+        self.assertEqual(sql(split), [])
+
+    def test_handler_must_cover_ordinary_errors(self):
+        text = SAFE.replace("WHEN OTHERS OR query_canceled THEN", "WHEN query_canceled THEN")
+        self.assertEqual(
+            sql(text), ["session advisory lock: its block's EXCEPTION handler does not handle OTHERS"]
         )
 
     def test_try_and_shared_forms(self):

@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 
 POOL_BEGIN = re.compile(r"\bpool(?:\(\))?\s*\.\s*(?:try_)?begin\(\)")
+# A BEGIN statement in a string literal that does not name its isolation level.
+BARE_BEGIN = re.compile(r'"BEGIN\b(?![^"]*ISOLATION LEVEL)[^"]*"', re.IGNORECASE)
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s")
 RUST_GLOBS = ["*/src/**/*.rs", "awa-python/src/**/*.rs"]
 MARKER = "isolation:"
@@ -29,13 +31,39 @@ def strip_comments(text: str) -> str:
     return "\n".join(line.split("//", 1)[0] for line in text.split("\n"))
 
 
+def blank_test_modules(code: str) -> str:
+    """Blanks the bodies of `#[cfg(test)]` modules, keeping line numbers."""
+    for module in reversed(list(TEST_MODULE.finditer(code))):
+        open_brace = code.find("{", module.end())
+        if open_brace < 0:
+            continue
+        depth, end = 0, len(code)
+        for index in range(open_brace, len(code)):
+            if code[index] == "{":
+                depth += 1
+            elif code[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        body = re.sub(r"[^\n]", " ", code[module.start() : end])
+        code = code[: module.start()] + body + code[end:]
+    return code
+
+
 def findings(path: str, text: str) -> list[tuple[str, int, str]]:
     lines = text.split("\n")
-    code = strip_comments(text)
-    test_module = TEST_MODULE.search(code)
-    if test_module:
-        code = code[: test_module.start()]
+    code = blank_test_modules(strip_comments(text))
     found = []
+    for match in BARE_BEGIN.finditer(code):
+        found.append(
+            (
+                path,
+                code.count("\n", 0, match.start()) + 1,
+                "a BEGIN statement without ISOLATION LEVEL takes the session's default; "
+                "start it with BEGIN ISOLATION LEVEL READ COMMITTED",
+            )
+        )
     for match in POOL_BEGIN.finditer(code):
         line = code.count("\n", 0, match.start()) + 1
         if any(MARKER in lines[i] for i in range(max(0, line - 4), line)):

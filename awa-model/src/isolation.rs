@@ -15,11 +15,33 @@
 //! `scripts/check-transaction-isolation.py` rejects `begin()` on a pool in
 //! library code.
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 use std::future::Future;
 
 /// The statement awa's own transactions start with.
 pub const BEGIN_READ_COMMITTED: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
+
+/// The prefix awa's own multi-statement `BEGIN`s start with, followed by their
+/// `SET LOCAL` settings.
+macro_rules! begin_read_committed_with {
+    ($settings:literal) => {
+        concat!("BEGIN ISOLATION LEVEL READ COMMITTED; ", $settings)
+    };
+}
+pub(crate) use begin_read_committed_with;
+
+/// Opens a READ COMMITTED transaction on a connection awa holds for its own
+/// work. Inside a transaction already open on `conn`, it opens a savepoint
+/// instead, which runs at the outer transaction's level.
+pub async fn begin_read_committed_on(
+    conn: &mut PgConnection,
+) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+    if conn.is_in_transaction() {
+        conn.begin().await
+    } else {
+        Connection::begin_with(conn, BEGIN_READ_COMMITTED).await
+    }
+}
 
 /// Opens a READ COMMITTED transaction whatever the session's default
 /// isolation level. The level is part of the `BEGIN`, so it costs no extra

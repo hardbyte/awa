@@ -35,18 +35,21 @@ pub(crate) const COPY_MIN_ROWS: usize = 2048;
 /// Claim and claim-cursor transactions commit without waiting for the WAL
 /// flush. A claim lost to a server crash leaves its job claimable again, and
 /// any later synchronous commit flushes every earlier claim first.
-const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off";
+const CLAIM_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL synchronous_commit = off");
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RESCUED_DUPLICATE_ERROR: &str = "rescued as duplicate: unique claim held by a newer job";
 const DRAIN_BATCH_SIZE: i64 = 1_000;
 // The planner overestimates the drain statements enough to JIT-compile them,
 // which takes seconds against milliseconds of execution.
-const DRAIN_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const DRAIN_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const DRAIN_CLAIM_CHECK_ROWS: i64 = 64;
 // Rescue cursor scans are estimated far above their real cost, enough to
 // JIT-compile them, which takes seconds against about 100 ms of execution.
-const RESCUE_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL jit = off";
+const RESCUE_TRANSACTION_BEGIN: &str =
+    crate::isolation::begin_read_committed_with!("SET LOCAL jit = off");
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -4994,7 +4997,9 @@ impl QueueStorage {
         // and the tag-index pass instead of returned; the pool permit is held
         // until the close completes.
         let mut install_conn = pool.acquire().await.map_err(map_sqlx_error)?;
-        let mut install_tx = install_conn.begin().await.map_err(map_sqlx_error)?;
+        let mut install_tx = crate::isolation::begin_read_committed_on(&mut install_conn)
+            .await
+            .map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)

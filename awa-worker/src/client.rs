@@ -1816,8 +1816,9 @@ impl Client {
         }
     }
 
-    /// awa's own transactions name READ COMMITTED, but statements it runs
-    /// outside one, such as a claim, take the session's default isolation.
+    /// awa's own transactions name READ COMMITTED, but single statements it
+    /// runs outside one, such as heartbeats, take the session's default
+    /// isolation.
     /// Above READ COMMITTED those fail with serialization errors under
     /// contention instead of waiting and seeing the rows they waited for.
     async fn warn_on_default_isolation_above_read_committed(&self) {
@@ -1830,7 +1831,7 @@ impl Client {
                 warn!(
                     default_transaction_isolation = %isolation,
                     "The worker pool's default_transaction_isolation is above read committed; \
-                     claims and other single statements run at that level and can fail with \
+                     single statements outside awa's transactions run at that level and can fail with \
                      serialization errors. Give the pool's connections \
                      default_transaction_isolation = 'read committed'"
                 )

@@ -36,6 +36,20 @@ class TransactionIsolationTests(unittest.TestCase):
         text = "fn f() {}\n\n#[cfg(test)]\nmod tests {\n    let tx = pool.begin().await;\n}"
         self.assertEqual(lines(text), [])
 
+    def test_code_after_a_test_module_is_checked(self):
+        text = (
+            "#[cfg(test)]\nmod tests {\n    fn f() { let tx = pool.begin(); }\n}\n\n"
+            "fn g() {\n    let tx = pool.begin();\n}"
+        )
+        self.assertEqual(lines(text), [7])
+
+    def test_begin_statements_name_their_isolation(self):
+        self.assertEqual(lines('const B: &str = "BEGIN; SET LOCAL jit = off";'), [1])
+        self.assertEqual(
+            lines('const B: &str = "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL jit = off";'), []
+        )
+        self.assertEqual(lines('begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")'), [])
+
     def test_repository_is_clean(self):
         self.assertEqual(module.check(Path(__file__).parents[2]), [])
 

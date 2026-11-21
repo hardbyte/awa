@@ -41,7 +41,6 @@ RUST_GUARD = "awa-model/src/advisory.rs"
 BLOCK_BEGIN = re.compile(r"^\s*(?:<<\w+>>\s*)?BEGIN\s*$", re.IGNORECASE)
 BLOCK_EXCEPTION = re.compile(r"^\s*EXCEPTION\b", re.IGNORECASE)
 BLOCK_END = re.compile(r"^\s*END\s*(?!IF\b|LOOP\b|CASE\b)(\w+\s*)?;", re.IGNORECASE)
-CONDITION = re.compile(r"\bWHEN\b(.*?)\bTHEN\b", re.IGNORECASE | re.DOTALL)
 
 
 def strip_sql_comment(line: str) -> str:
@@ -60,6 +59,46 @@ class Block:
         self.locks: list[int] = []
 
 
+BRANCH_START = re.compile(r"^\s*(?:EXCEPTION\s+)?WHEN\b", re.IGNORECASE)
+
+
+def handler_branches(handler_lines: list[str]) -> list[tuple[str, str]]:
+    """Splits an EXCEPTION section into (conditions, body) branches."""
+    branches: list[list[str]] = []
+    for line in handler_lines:
+        if BRANCH_START.match(line):
+            branches.append([line, ""])
+        elif branches:
+            branches[-1][1] += " " + line
+    result = []
+    for head, body in branches:
+        match = re.search(r"\bWHEN\b(.*?)\bTHEN\b(.*)", head + body, re.IGNORECASE | re.DOTALL)
+        if match:
+            result.append((match.group(1), match.group(2)))
+    return result
+
+
+def handler_problem(block: Block) -> str | None:
+    if block.exception is None:
+        return "its block has no EXCEPTION handler that unlocks"
+    branches = handler_branches(block.handler_lines)
+
+    def branch(condition: str) -> tuple[str, str] | None:
+        pattern = re.compile(rf"\b{condition}\b", re.IGNORECASE)
+        return next((b for b in branches if pattern.search(b[0])), None)
+
+    cancel, others = branch("query_canceled"), branch("OTHERS")
+    if cancel is None:
+        return "its block's EXCEPTION handler does not name query_canceled"
+    if others is None:
+        return "its block's EXCEPTION handler does not handle OTHERS"
+    if not UNLOCK.search(cancel[1]):
+        return "its block's query_canceled branch does not unlock"
+    if not UNLOCK.search(others[1]):
+        return "its block's OTHERS branch does not unlock"
+    return None
+
+
 def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
     """Session locks in PL/pgSQL whose block does not release them on cancel."""
     lines = text.splitlines()
@@ -67,19 +106,10 @@ def sql_findings(path: str, text: str) -> list[tuple[str, int, str]]:
     stack: list[Block] = []
 
     def close(block: Block) -> None:
-        handler = " ".join(block.handler_lines)
-        conditions = " ".join(match.group(1) for match in CONDITION.finditer(handler))
-        catches_cancel = re.search(r"\bquery_canceled\b", conditions, re.IGNORECASE)
-        unlocks = UNLOCK.search(handler)
+        problem = handler_problem(block)
+        if problem is None:
+            return
         for lock in block.locks:
-            if block.exception is None:
-                problem = "its block has no EXCEPTION handler that unlocks"
-            elif not catches_cancel:
-                problem = "its block's EXCEPTION handler does not name query_canceled"
-            elif not unlocks:
-                problem = "its block's EXCEPTION handler does not unlock"
-            else:
-                continue
             findings.append((path, lock + 1, f"session advisory lock: {problem}"))
 
     for index, raw in enumerate(lines):

@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Whether any session holds the session advisory lock `key` (a small
-/// positive key, so it fits in `objid`).
+/// Whether any session in this database holds the session advisory lock
+/// `key` (a small positive key, so it fits in `objid`). Advisory locks are
+/// per database, and `pg_locks` lists the whole cluster's.
 async fn held(pool: &PgPool, key: i64) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT EXISTS (
              SELECT 1 FROM pg_locks
              WHERE locktype = 'advisory' AND granted AND objsubid = 1
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
                AND classid = 0 AND objid = $1::bigint::oid
          )",
     )
